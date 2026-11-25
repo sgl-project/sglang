@@ -25,8 +25,14 @@ from sglang.srt.layers.moe import k3_die_local_moe as policy
 BASE = [10, 20, 40, 80, 160, 235]
 AR_FUSION = [80, 160, 235]
 PREFIX = "SGLANG_K3_ROUTED_MOE_DEEPGEMM"
-CONTROLS = (PREFIX, PREFIX + "_WEIGHT_PLACEMENT", PREFIX + "_DISPATCH", PREFIX + "_VERIFY_WIDTHS", "SGLANG_K3_AR_FUSION",
-            "SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION")
+CONTROLS = (
+    PREFIX,
+    PREFIX + "_WEIGHT_PLACEMENT",
+    PREFIX + "_DISPATCH",
+    PREFIX + "_VERIFY_WIDTHS",
+    "SGLANG_K3_AR_FUSION",
+    "SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION",
+)
 # Largest row count whose finalize the push all-reduce folds under SGLANG_K3_AR_FUSION
 FOLD_MAX_ROWS = 73
 
@@ -43,9 +49,13 @@ def _env(table=None, **values):
                 stack.enter_context(field.override(""))
                 field.clear()
         if table is not None:
-            path = Path(stack.enter_context(tempfile.TemporaryDirectory()), "widths.json")
+            path = Path(
+                stack.enter_context(tempfile.TemporaryDirectory()), "widths.json"
+            )
             path.write_text(table if isinstance(table, str) else json.dumps(table))
-            stack.enter_context(envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS.override(str(path)))
+            stack.enter_context(
+                envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS.override(str(path))
+            )
         policy.reset_caches()
         stack.callback(policy.reset_caches)
         yield
@@ -80,7 +90,9 @@ class TestInTreeTable(unittest.TestCase):
         widths, fused = self.table["widths"], self.table["widths_ar_fusion"]
         for rows in (widths, fused):
             self.assertEqual(rows, sorted(set(rows)))
-            self.assertTrue(all(type(r) is int and 1 <= r <= policy.MAX_VERIFY_ROWS for r in rows))
+            self.assertTrue(
+                all(type(r) is int and 1 <= r <= policy.MAX_VERIFY_ROWS for r in rows)
+            )
         # under AR fusion: the base widths above the fold limit, none at or below it
         self.assertEqual(self.table["ar_fusion_fold_max_rows"], FOLD_MAX_ROWS)
         self.assertEqual(fused, [r for r in widths if r > FOLD_MAX_ROWS])
@@ -94,14 +106,22 @@ class TestInTreeTable(unittest.TestCase):
     def test_text_names_the_switches_and_how_to_regenerate(self):
         for key in ("description", "scope", "rule", "regenerate"):
             self.assertIsInstance(self.table[key], str)
-        self.assertIn("SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS", self.table["regenerate"])
+        self.assertIn(
+            "SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS", self.table["regenerate"]
+        )
 
 
 class TestDispatch(unittest.TestCase):
     def test_off_reads_nothing(self):
         # the override names a file that does not exist: with the switch off nothing may read it
-        for extra in ({}, {"SGLANG_K3_AR_FUSION": True}, {"SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION": True}):
-            with _env(**extra, **{PREFIX + "_VERIFY_WIDTHS": "/nonexistent/widths.json"}):
+        for extra in (
+            {},
+            {"SGLANG_K3_AR_FUSION": True},
+            {"SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION": True},
+        ):
+            with _env(
+                **extra, **{PREFIX + "_VERIFY_WIDTHS": "/nonexistent/widths.json"}
+            ):
                 self.assertFalse(policy.enabled())
                 self.assertEqual(policy.verify_widths(), frozenset())
                 self.assertEqual(_taken(), [])
@@ -116,9 +136,15 @@ class TestDispatch(unittest.TestCase):
             scoped = policy.target_forward(forward)
             self.assertIsNot(scoped, forward)
             seen = []
-            batch = types.SimpleNamespace(forward_mode=types.SimpleNamespace(is_target_verify=lambda: True))
-            with mock.patch.object(torch.cuda, "is_current_stream_capturing", lambda: False):
-                scoped_out = policy.target_forward(lambda s, i, p, b: seen.append(policy.takes(80)) or "out")(None, None, None, batch)
+            batch = types.SimpleNamespace(
+                forward_mode=types.SimpleNamespace(is_target_verify=lambda: True)
+            )
+            with mock.patch.object(
+                torch.cuda, "is_current_stream_capturing", lambda: False
+            ):
+                scoped_out = policy.target_forward(
+                    lambda s, i, p, b: seen.append(policy.takes(80)) or "out"
+                )(None, None, None, batch)
             self.assertEqual((scoped_out, seen), ("out", [True]))
             self.assertFalse(policy.takes(80))  # reset after the forward
 
@@ -130,14 +156,22 @@ class TestDispatch(unittest.TestCase):
             self.assertEqual(_taken(verify=False), [])
 
     def test_ar_fusion_uses_its_list(self):
-        for extra in ({"SGLANG_K3_AR_FUSION": True}, {"SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION": True}):
+        for extra in (
+            {"SGLANG_K3_AR_FUSION": True},
+            {"SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION": True},
+        ):
             with _env(**ON, table=TABLE, **extra):
                 self.assertTrue(policy.ar_fusion())
                 self.assertEqual(_taken(), AR_FUSION)
                 self.assertEqual(_taken(verify=False), [])
 
     def test_ar_fusion_switch_wins_over_the_runtime_bundle(self):
-        with _env(**ON, table=TABLE, SGLANG_K3_AR_FUSION=False, SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION=True):
+        with _env(
+            **ON,
+            table=TABLE,
+            SGLANG_K3_AR_FUSION=False,
+            SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION=True,
+        ):
             self.assertEqual(_taken(), BASE)
 
     def test_dispatch_off_never_takes_a_call(self):
@@ -148,8 +182,12 @@ class TestDispatch(unittest.TestCase):
         with _env(**ON, **{PREFIX + "_VERIFY_WIDTHS": "/nonexistent/widths.json"}):
             with self.assertRaises(FileNotFoundError):
                 policy.verify_widths()
-        for bad in (dict(widths=BASE), dict(widths=BASE, widths_ar_fusion=[]), dict(widths=BASE, widths_ar_fusion=[80, 257]),
-                    dict(widths=BASE, widths_ar_fusion=[80.0])):
+        for bad in (
+            dict(widths=BASE),
+            dict(widths=BASE, widths_ar_fusion=[]),
+            dict(widths=BASE, widths_ar_fusion=[80, 257]),
+            dict(widths=BASE, widths_ar_fusion=[80.0]),
+        ):
             with _env(**ON, table=bad, SGLANG_K3_AR_FUSION=True):
                 with self.assertRaises(ValueError):
                     policy.verify_widths()
@@ -166,19 +204,35 @@ class TestDispatch(unittest.TestCase):
             token = policy._verify.set((True, False))
             try:
                 for rows in (5, 20, 70, 80, 235):
-                    self.assertFalse(routed.handles(stock, rows))  # trtllm-gen: may defer its finalize
+                    self.assertFalse(
+                        routed.handles(stock, rows)
+                    )  # trtllm-gen: may defer its finalize
                     self.assertEqual(routed.handles(prepared, rows), rows in AR_FUSION)
             finally:
                 policy._verify.reset(token)
             # outside target verify a prepared layer leaves every call to trtllm-gen
-            self.assertFalse(any(routed.handles(prepared, rows) for rows in (5, 20, 80, 235)))
+            self.assertFalse(
+                any(routed.handles(prepared, rows) for rows in (5, 20, 80, 235))
+            )
 
 
 def _k31_layer(**overrides):
-    cfg = types.SimpleNamespace(activation="situ", gemm1_alpha=4.0, gemm1_clamp_limit=25.0, gate_up_interleaved=False)
-    weight = lambda *shape: types.SimpleNamespace(shape=shape, device=types.SimpleNamespace(index=0), element_size=lambda: 1)
-    layer = dict(moe_runner_config=cfg, num_experts=896, num_local_experts=112,
-                 w13_weight=weight(112, 6144, 1792), w2_weight=weight(112, 3584, 1536))
+    cfg = types.SimpleNamespace(
+        activation="situ",
+        gemm1_alpha=4.0,
+        gemm1_clamp_limit=25.0,
+        gate_up_interleaved=False,
+    )
+    weight = lambda *shape: types.SimpleNamespace(
+        shape=shape, device=types.SimpleNamespace(index=0), element_size=lambda: 1
+    )
+    layer = dict(
+        moe_runner_config=cfg,
+        num_experts=896,
+        num_local_experts=112,
+        w13_weight=weight(112, 6144, 1792),
+        w2_weight=weight(112, 3584, 1536),
+    )
     layer.update(overrides)
     return types.SimpleNamespace(**layer)
 
@@ -188,14 +242,28 @@ class TestFallback(unittest.TestCase):
 
     def _wanted(self, layers, *, capability=None, sm=(10, 7), placement=None, env=None):
         warnings = []
-        with _env(**ON, table=TABLE, **(env or {})), \
-                mock.patch.object(routed, "missing_capability", lambda: capability), \
-                mock.patch.object(torch.distributed, "is_initialized", lambda: True), \
-                mock.patch.object(routed, "_deep_gemm", lambda: types.SimpleNamespace(get_num_locality_domains=lambda: 2)), \
-                mock.patch.object(torch.cuda, "get_device_capability", lambda device=None: sm), \
-                mock.patch.object(policy, "_placement_unavailable", lambda shape, itemsize, device: placement), \
-                mock.patch.object(policy, "print_warning_once", warnings.append):
-            return [policy.wanted(layer, False, "default") for layer in layers], warnings
+        with (
+            _env(**ON, table=TABLE, **(env or {})),
+            mock.patch.object(routed, "missing_capability", lambda: capability),
+            mock.patch.object(torch.distributed, "is_initialized", lambda: True),
+            mock.patch.object(
+                routed,
+                "_deep_gemm",
+                lambda: types.SimpleNamespace(get_num_locality_domains=lambda: 2),
+            ),
+            mock.patch.object(
+                torch.cuda, "get_device_capability", lambda device=None: sm
+            ),
+            mock.patch.object(
+                policy,
+                "_placement_unavailable",
+                lambda shape, itemsize, device: placement,
+            ),
+            mock.patch.object(policy, "print_warning_once", warnings.append),
+        ):
+            return [
+                policy.wanted(layer, False, "default") for layer in layers
+            ], warnings
 
     def test_switch_off_asks_nothing(self):
         with _env(), mock.patch.object(routed, "mismatch") as mismatch:
@@ -207,8 +275,12 @@ class TestFallback(unittest.TestCase):
         self.assertEqual((got, warnings), ([True], []))
 
     def test_deep_gemm_without_the_api(self):
-        reason = "deep_gemm 0.2.9 lacks the one-rank MegaMoE API (numerics, topk_format)"
-        got, warnings = self._wanted([_k31_layer() for _ in range(92)], capability=reason)
+        reason = (
+            "deep_gemm 0.2.9 lacks the one-rank MegaMoE API (numerics, topk_format)"
+        )
+        got, warnings = self._wanted(
+            [_k31_layer() for _ in range(92)], capability=reason
+        )
         self.assertEqual(got, [False] * 92)
         # the same text for every layer: print_warning_once logs it once per process
         self.assertEqual(len(set(warnings)), 1)
@@ -222,7 +294,13 @@ class TestFallback(unittest.TestCase):
             (dict(sm=(9, 0)), _k31_layer(), "SM 9.0"),
             (dict(), _k31_layer(num_local_experts=448), "expert shape"),
             (dict(), _k31_layer(num_experts=256), "expert shape"),
-            (dict(placement="die-local placement is not available: no locality-domain API"), _k31_layer(), "placement"),
+            (
+                dict(
+                    placement="die-local placement is not available: no locality-domain API"
+                ),
+                _k31_layer(),
+                "placement",
+            ),
         ):
             got, warnings = self._wanted([layer], **kwargs)
             self.assertEqual(got, [False])
@@ -230,13 +308,20 @@ class TestFallback(unittest.TestCase):
             self.assertIn(text, warnings[0])
 
     def test_default_placement_needs_no_placement_api(self):
-        got, warnings = self._wanted([_k31_layer()], placement="unavailable", env={PREFIX + "_WEIGHT_PLACEMENT": "default"})
+        got, warnings = self._wanted(
+            [_k31_layer()],
+            placement="unavailable",
+            env={PREFIX + "_WEIGHT_PLACEMENT": "default"},
+        )
         self.assertEqual((got, warnings), ([True], []))
 
     def test_layer_rule_comes_first(self):
         got, warnings = self._wanted([_k31_layer()], capability="no api")
         self.assertIn("no api", warnings[0])
-        with _env(**ON, table=TABLE), mock.patch.object(policy, "print_warning_once") as warn:
+        with (
+            _env(**ON, table=TABLE),
+            mock.patch.object(policy, "print_warning_once") as warn,
+        ):
             self.assertFalse(policy.wanted(_k31_layer(), True, "default"))
             self.assertIn("expert bias", warn.call_args[0][0])
 
@@ -244,12 +329,27 @@ class TestFallback(unittest.TestCase):
         # the real probe: no cuda.bindings locality-domain API (or no CUDA at all) reads as "not available"
         policy._page_bytes.cache_clear()
         self.addCleanup(policy._page_bytes.cache_clear)
-        with mock.patch.object(policy, "_page_bytes", side_effect=RuntimeError("cuda.bindings has no locality-domain API")):
-            reason = policy._placement_unavailable((112, 6144, 1792), 1, types.SimpleNamespace(index=0))
+        with mock.patch.object(
+            policy,
+            "_page_bytes",
+            side_effect=RuntimeError("cuda.bindings has no locality-domain API"),
+        ):
+            reason = policy._placement_unavailable(
+                (112, 6144, 1792), 1, types.SimpleNamespace(index=0)
+            )
         self.assertIn("not available", reason)
         with mock.patch.object(policy, "_page_bytes", return_value=2 << 20):
-            self.assertIsNone(policy._placement_unavailable((112, 6144, 1792), 1, types.SimpleNamespace(index=0)))
-            self.assertIn("does not split", policy._placement_unavailable((112, 6144, 1793), 1, types.SimpleNamespace(index=0)))
+            self.assertIsNone(
+                policy._placement_unavailable(
+                    (112, 6144, 1792), 1, types.SimpleNamespace(index=0)
+                )
+            )
+            self.assertIn(
+                "does not split",
+                policy._placement_unavailable(
+                    (112, 6144, 1793), 1, types.SimpleNamespace(index=0)
+                ),
+            )
 
 
 class TestPageHomes(unittest.TestCase):
@@ -262,25 +362,38 @@ class TestPageHomes(unittest.TestCase):
             self.assertEqual(homes.count(0), homes.count(1))
             # bytes read from the other domain's pages: about a quarter, against a half for alternating pages
             half = shape[1] * shape[2] // 2
-            misplaced = sum(
-                1 for page, home in enumerate(homes) for byte in range(page * self.PAGE, (page + 1) * self.PAGE, 4096)
-                if byte // half % 2 != home
-            ) * 4096
+            misplaced = (
+                sum(
+                    1
+                    for page, home in enumerate(homes)
+                    for byte in range(page * self.PAGE, (page + 1) * self.PAGE, 4096)
+                    if byte // half % 2 != home
+                )
+                * 4096
+            )
             self.assertLess(misplaced / (len(homes) * self.PAGE), 0.26)
 
     def test_page_aligned_halves_are_exact(self):
-        self.assertEqual(policy.page_homes((3, 4, self.PAGE), 1, self.PAGE), [0, 0, 1, 1] * 3)
+        self.assertEqual(
+            policy.page_homes((3, 4, self.PAGE), 1, self.PAGE), [0, 0, 1, 1] * 3
+        )
 
     def test_even_split_alternates(self):
         # every page holds half of each domain's rows: homes alternate by page index
-        self.assertEqual(policy.page_homes((4, 2, self.PAGE // 2), 1, self.PAGE), [0, 1, 0, 1])
+        self.assertEqual(
+            policy.page_homes((4, 2, self.PAGE // 2), 1, self.PAGE), [0, 1, 0, 1]
+        )
 
 
 class TestAssumptions(unittest.TestCase):
     """Each fails when the surrounding code moves, so the table and the load order get re-derived."""
 
     def test_fold_threshold(self):
-        for slot, last in ((1 << 30, FOLD_MAX_ROWS), (16 << 20, FOLD_MAX_ROWS), (256 << 10, 36)):
+        for slot, last in (
+            (1 << 30, FOLD_MAX_ROWS),
+            (16 << 20, FOLD_MAX_ROWS),
+            (256 << 10, 36),
+        ):
             state = types.SimpleNamespace(push_slot_bytes=slot)
             with mock.patch.object(k3_ar_fusion, "_get_state", return_value=state):
                 self.assertTrue(k3_ar_fusion.finalize_push_fits(last))

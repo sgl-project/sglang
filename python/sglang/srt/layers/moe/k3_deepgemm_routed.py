@@ -92,8 +92,7 @@ def missing_capability() -> Optional[str]:
         except Exception:
             version = "unknown"
         return (
-            f"deep_gemm {version} lacks the one-rank MegaMoE API "
-            f"({', '.join(missing)})"
+            f"deep_gemm {version} lacks the one-rank MegaMoE API ({', '.join(missing)})"
         )
     return None
 
@@ -263,8 +262,7 @@ def reserve_buffer(
         # no device communicator (an NCCL one costs ~0.4 GB of device memory).
         backend = "gloo" if dist.is_gloo_available() else None
         groups = [
-            dist.new_group([r], backend=backend)
-            for r in range(dist.get_world_size())
+            dist.new_group([r], backend=backend) for r in range(dist.get_world_size())
         ]
         _group.buf = deep_gemm.mega.SymmBuffer(
             groups[dist.get_rank()],
@@ -322,11 +320,7 @@ def route_quant_into_buffer(
     (the caller then routes as before and `run` stages the inputs)."""
     buf = _group.buf
     num_tokens = x.shape[0]
-    if (
-        buf is None
-        or num_tokens > buf.x.shape[0]
-        or top_k != _group.packed.shape[1]
-    ):
+    if buf is None or num_tokens > buf.x.shape[0] or top_k != _group.packed.shape[1]:
         return None
     from sglang.kernels.ops.moe import (
         k3_route_quant_packed,
@@ -337,11 +331,16 @@ def route_quant_into_buffer(
     # trtllm-gen takes bf16 routing weights where the fused route + quant kernel
     # applies and fp32 above: the same split keeps the outputs bit-identical
     bf16_weights = moe_route_quant_fused.covered(scores, bias, top_k, x)
-    if not (
-        bf16_weights or kimi_k3_fused_routing.covered(scores, bias, top_k, x)
-    ) or not k3_route_quant_packed.available():
+    if (
+        not (bf16_weights or kimi_k3_fused_routing.covered(scores, bias, top_k, x))
+        or not k3_route_quant_packed.available()
+    ):
         return None
-    packed, x_q, x_s = _group.packed[:num_tokens], buf.x[:num_tokens], buf.x_sf[:num_tokens]
+    packed, x_q, x_s = (
+        _group.packed[:num_tokens],
+        buf.x[:num_tokens],
+        buf.x_sf[:num_tokens],
+    )
     weights, ids = k3_route_quant_packed.route_quant(
         scores,
         bias,

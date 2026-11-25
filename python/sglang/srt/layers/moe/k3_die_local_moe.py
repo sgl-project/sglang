@@ -287,7 +287,9 @@ def _placement_unavailable(shape, itemsize: int, device) -> Optional[str]:
         return f"die-local placement is not available: {e}"
     total = math.prod(shape) * itemsize
     if total % page or total % (shape[0] * 2):
-        return f"a {shape} weight does not split into {page}-byte pages and expert halves"
+        return (
+            f"a {shape} weight does not split into {page}-byte pages and expert halves"
+        )
     return None
 
 

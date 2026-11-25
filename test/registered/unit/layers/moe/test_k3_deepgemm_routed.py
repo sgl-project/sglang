@@ -62,9 +62,16 @@ class TestLayerRules(_Capability):
         self.assertFalse(envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM.get())
 
     def test_mismatch_reasons(self):
-        self.assertIn("activation", routed.mismatch(_layer(activation="silu"), False, "default"))
-        self.assertIn("SiTU", routed.mismatch(_layer(gemm1_alpha=1.0), False, "default"))
-        self.assertIn("interleaved", routed.mismatch(_layer(gate_up_interleaved=True), False, "default"))
+        self.assertIn(
+            "activation", routed.mismatch(_layer(activation="silu"), False, "default")
+        )
+        self.assertIn(
+            "SiTU", routed.mismatch(_layer(gemm1_alpha=1.0), False, "default")
+        )
+        self.assertIn(
+            "interleaved",
+            routed.mismatch(_layer(gate_up_interleaved=True), False, "default"),
+        )
         self.assertEqual(routed.mismatch(_layer(), True, "default"), "expert bias")
         self.assertIn("bf16", routed.mismatch(_layer(), False, "bf16"))
 
@@ -87,15 +94,33 @@ class TestLayerRules(_Capability):
         self.assertIs(routed.select_routing(None, None, lambda: std), std)
 
     def test_call_keywords(self):
-        with mock.patch.object(routed._group, "first_expert", 336), mock.patch.object(routed._group, "stats", "stats"):
+        with (
+            mock.patch.object(routed._group, "first_expert", 336),
+            mock.patch.object(routed._group, "stats", "stats"),
+        ):
             small, large = routed._call_keywords(84), routed._call_keywords(85)
         # trtllm-gen: four accumulators up to 84 tokens, one chain above
         self.assertEqual(small["split4_combine_max_tokens"], 84)
         self.assertEqual(large["split4_combine_max_tokens"], 0)
         for keywords in (small, large):
             self.assertEqual(
-                {k: keywords[k] for k in ("weight_layout", "numerics", "topk_format", "topk_first_expert", "activation")},
-                dict(weight_layout="trtllm", numerics="trtllm", topk_format="packed", topk_first_expert=336, activation="situ"),
+                {
+                    k: keywords[k]
+                    for k in (
+                        "weight_layout",
+                        "numerics",
+                        "topk_format",
+                        "topk_first_expert",
+                        "activation",
+                    )
+                },
+                dict(
+                    weight_layout="trtllm",
+                    numerics="trtllm",
+                    topk_format="packed",
+                    topk_first_expert=336,
+                    activation="situ",
+                ),
             )
             # every keyword the capability check asks for is one the call passes
             self.assertLessEqual(set(routed._CALL_KEYWORDS), set(keywords))
@@ -104,16 +129,28 @@ class TestLayerRules(_Capability):
 class TestCapability(_Capability):
     def test_not_installed(self):
         with self._with(None):
-            self.assertEqual(routed.missing_capability(), "deep_gemm cannot be imported")
+            self.assertEqual(
+                routed.missing_capability(), "deep_gemm cannot be imported"
+            )
 
     def test_released_wheel_lacks_the_api(self):
-        with self._with(_fake_deep_gemm(RELEASED_CALL, RELEASED_BUFFER, version="0.2.9")):
+        with self._with(
+            _fake_deep_gemm(RELEASED_CALL, RELEASED_BUFFER, version="0.2.9")
+        ):
             reason = routed.missing_capability()
             self.assertIn("deep_gemm 0.2.9 lacks", reason)
-            for name in ("numerics", "split4_combine_max_tokens", "topk_format", "topk_first_expert",
-                         "exact_num_max_tokens", "max_block_m"):
+            for name in (
+                "numerics",
+                "split4_combine_max_tokens",
+                "topk_format",
+                "topk_first_expert",
+                "exact_num_max_tokens",
+                "max_block_m",
+            ):
                 self.assertIn(name, reason)
-            self.assertNotIn("weight_layout", reason)  # present in the release, for NVFP4 only
+            self.assertNotIn(
+                "weight_layout", reason
+            )  # present in the release, for NVFP4 only
             self.assertEqual(routed.mismatch(_layer(), False, "default"), reason)
 
     def test_call_keywords_without_the_buffer_keywords(self):
@@ -125,7 +162,9 @@ class TestCapability(_Capability):
 
     def test_module_without_mega_moe(self):
         with self._with(types.SimpleNamespace()):
-            self.assertIn("no inspectable fp8_fp4_mega_moe", routed.missing_capability())
+            self.assertIn(
+                "no inspectable fp8_fp4_mega_moe", routed.missing_capability()
+            )
 
     def test_never_raises_on_an_unusual_build(self):
         # A build may expose its entry points through a proxy whose attribute lookup fails with something other
@@ -134,10 +173,16 @@ class TestCapability(_Capability):
             def __getattr__(self, name):
                 raise RuntimeError(f"no op {name}")
 
-        native_op = types.SimpleNamespace(fp8_fp4_mega_moe=len.__call__, mega=types.SimpleNamespace(SymmBuffer=int))
+        native_op = types.SimpleNamespace(
+            fp8_fp4_mega_moe=len.__call__, mega=types.SimpleNamespace(SymmBuffer=int)
+        )
         no_version = _fake_deep_gemm(RELEASED_CALL, RELEASED_BUFFER)
         del no_version.__version__
-        for module, text in ((Proxy(), "no inspectable"), (native_op, None), (no_version, "deep_gemm unknown lacks")):
+        for module, text in (
+            (Proxy(), "no inspectable"),
+            (native_op, None),
+            (no_version, "deep_gemm unknown lacks"),
+        ):
             with self._with(module):
                 reason = routed.missing_capability()
                 self.assertIsInstance(reason, str)
@@ -145,17 +190,27 @@ class TestCapability(_Capability):
                     self.assertIn(text, reason)
         capable = _fake_deep_gemm(routed._CALL_KEYWORDS, routed._BUFFER_KEYWORDS)
         capable.get_num_locality_domains = Proxy().__getattr__
-        with self._with(capable), mock.patch("torch.distributed.is_initialized", return_value=True):
-            self.assertIn("cannot report locality domains", routed.mismatch(_layer(), False, "default"))
+        with (
+            self._with(capable),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+        ):
+            self.assertIn(
+                "cannot report locality domains",
+                routed.mismatch(_layer(), False, "default"),
+            )
 
     def test_capable_build(self):
-        module = _fake_deep_gemm(routed._CALL_KEYWORDS, routed._BUFFER_KEYWORDS + RELEASED_BUFFER)
+        module = _fake_deep_gemm(
+            routed._CALL_KEYWORDS, routed._BUFFER_KEYWORDS + RELEASED_BUFFER
+        )
         with self._with(module):
             self.assertIsNone(routed.missing_capability())
             with mock.patch("torch.distributed.is_initialized", return_value=True):
                 self.assertIsNone(routed.mismatch(_layer(), False, "default"))
                 module.get_num_locality_domains = lambda: 1
-                self.assertIn("locality domain", routed.mismatch(_layer(), False, "default"))
+                self.assertIn(
+                    "locality domain", routed.mismatch(_layer(), False, "default")
+                )
 
 
 if __name__ == "__main__":

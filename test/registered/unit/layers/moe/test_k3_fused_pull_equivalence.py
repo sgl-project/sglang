@@ -25,8 +25,19 @@ NORM_DIM = k3_ar_fusion.NORM_DIM  # 3584
 ROW_VECS = NORM_DIM // 8  # 448 16-byte vectors per norm-width row
 PULL_BLOCK = 512
 WARP = 32
-CUH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(k3_ar_fusion.__file__))))),
-                   "kernels", "jit", "csrc", "kimi_k3", "comm", "ar_fusion.cuh")
+CUH = os.path.join(
+    os.path.dirname(
+        os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(k3_ar_fusion.__file__)))
+        )
+    ),
+    "kernels",
+    "jit",
+    "csrc",
+    "kimi_k3",
+    "comm",
+    "ar_fusion.cuh",
+)
 
 
 def pull_res_vecs(num_vecs, rank, grid, unroll, world=WORLD):
@@ -36,7 +47,9 @@ def pull_res_vecs(num_vecs, rank, grid, unroll, world=WORLD):
     mine = avg + (1 if rank < rem else 0)
     step = PULL_BLOCK * grid
     out = []
-    for start in range(min(step, mine)):  # start = bx * 512 + tx; starts beyond the shard do nothing
+    for start in range(
+        min(step, mine)
+    ):  # start = bx * 512 + tx; starts beyond the shard do nothing
         vid, width = start, unroll
         while width >= 1:  # pull_reduce_pass<kWidth> then <kWidth / 2> ... <1>
             while vid + (width - 1) * step < mine:
@@ -105,7 +118,9 @@ def norm_row(reduced_row, weight, eps):
     """The epilogue of all_reduce_pull_norm_kernel on one reduced row: per-warp sums of squares, their total over the 14
     warps, rsqrt, scale by the weight, bf16. A function of the row only: no rank, block or unroll index enters."""
     x = reduced_row.float()
-    per_thread = (x * x).view(ROW_VECS, 8).sum(1)  # 448 threads, one 16-byte vector each
+    per_thread = (
+        (x * x).view(ROW_VECS, 8).sum(1)
+    )  # 448 threads, one 16-byte vector each
     total = per_thread.view(ROW_VECS // WARP, WARP).sum(1).sum()
     factor = torch.rsqrt(total / NORM_DIM + eps)
     return (x * factor * weight.float()).to(torch.bfloat16)
@@ -116,9 +131,11 @@ def execute(plan, per_rank, weight, eps):
     out = torch.full((per_rank.shape[1],), float("nan"), dtype=torch.bfloat16)
     reduced = mc_reduce(per_rank)
     for row in normed:
-        out[row * NORM_DIM:(row + 1) * NORM_DIM] = norm_row(reduced[row * NORM_DIM:(row + 1) * NORM_DIM], weight, eps)
+        out[row * NORM_DIM : (row + 1) * NORM_DIM] = norm_row(
+            reduced[row * NORM_DIM : (row + 1) * NORM_DIM], weight, eps
+        )
     for vid in plain:
-        out[vid * 8:(vid + 1) * 8] = reduced[vid * 8:(vid + 1) * 8]
+        out[vid * 8 : (vid + 1) * 8] = reduced[vid * 8 : (vid + 1) * 8]
     return out
 
 
@@ -126,9 +143,20 @@ class TestKernelSourceIsWhatWasTranscribed(unittest.TestCase):
     def test_pinned_lines(self):
         with open(CUH) as f:
             src = f.read()
-        norm = src[src.index("void all_reduce_pull_norm_kernel("):src.index("inline auto choose_block_size")]
-        res = src[src.index("pull_reduce_pass(uint32_t& vid"):src.index("void all_reduce_pull_norm_kernel(")]
-        for line in ("constexpr uint32_t kNormDim = 3584;", "inline constexpr uint32_t kPullBlockSize = 512;"):
+        norm = src[
+            src.index("void all_reduce_pull_norm_kernel(") : src.index(
+                "inline auto choose_block_size"
+            )
+        ]
+        res = src[
+            src.index("pull_reduce_pass(uint32_t& vid") : src.index(
+                "void all_reduce_pull_norm_kernel("
+            )
+        ]
+        for line in (
+            "constexpr uint32_t kNormDim = 3584;",
+            "inline constexpr uint32_t kPullBlockSize = 512;",
+        ):
             self.assertIn(line, src)
         for line in (
             "const auto num_rows = params.num_vecs / kNormRowVecs;",
@@ -143,9 +171,22 @@ class TestKernelSourceIsWhatWasTranscribed(unittest.TestCase):
         ):
             self.assertIn(line, norm, line)
         # a non-normed row is the load followed by the store, nothing in between: what pull_res does to the shared output
-        plain = norm[norm.index("} else {", norm.index("if (row_bias + row0 + u < params.num_norm_rows) {")):]
-        self.assertTrue(plain.split("\n")[1].strip().startswith("ptx::st_multimem_16B(vec[u], params.input_mc, vid0 + u * kNormRowVecs);"))
-        self.assertEqual(norm.count("barrier.arrive_relaxed();"), 1)  # one entry barrier
+        plain = norm[
+            norm.index(
+                "} else {",
+                norm.index("if (row_bias + row0 + u < params.num_norm_rows) {"),
+            ) :
+        ]
+        self.assertTrue(
+            plain.split("\n")[1]
+            .strip()
+            .startswith(
+                "ptx::st_multimem_16B(vec[u], params.input_mc, vid0 + u * kNormRowVecs);"
+            )
+        )
+        self.assertEqual(
+            norm.count("barrier.arrive_relaxed();"), 1
+        )  # one entry barrier
         self.assertEqual(norm.count("barrier.arrive_rel_acq();"), 1)  # one exit barrier
         for line in (
             "for (; vid + (kWidth - 1) * step < num_vecs; vid += kWidth * step) {",
@@ -165,7 +206,9 @@ class TestKernelSourceIsWhatWasTranscribed(unittest.TestCase):
         self.assertEqual(geometry(arr.NORM_TUNING, 160 * 3 * NORM_DIM * 2), (24, 2))
         self.assertEqual(geometry(arr.NORM_TUNING, 80 * NORM_DIM * 2), (12, 2))
         self.assertEqual(geometry(arr.RES_TUNING, 80 * 2 * NORM_DIM * 2), (16, 8))
-        self.assertEqual(geometry(arr.NORM_TUNING, 80 * 3 * NORM_DIM * 2, 16, 4), (16, 4))
+        self.assertEqual(
+            geometry(arr.NORM_TUNING, 80 * 3 * NORM_DIM * 2, 16, 4), (16, 4)
+        )
 
 
 class TestCoverage(unittest.TestCase):
@@ -173,8 +216,12 @@ class TestCoverage(unittest.TestCase):
 
     def check(self, n, plan, what):
         normed, plain = plan
-        self.assertEqual(sorted(normed), list(range(n)), (what, n))  # exactly the latent rows, each once
-        self.assertEqual(sorted(plain), list(range(n * ROW_VECS, 3 * n * ROW_VECS)), (what, n))  # every shared vector once
+        self.assertEqual(
+            sorted(normed), list(range(n)), (what, n)
+        )  # exactly the latent rows, each once
+        self.assertEqual(
+            sorted(plain), list(range(n * ROW_VECS, 3 * n * ROW_VECS)), (what, n)
+        )  # every shared vector once
 
     def test_both_ways_reduce_every_vector_once_and_norm_the_latent_rows(self):
         for n in self.ROWS:
@@ -185,7 +232,9 @@ class TestCoverage(unittest.TestCase):
         for n in (80, 160, 235):
             for blocks in (1, 8, 12, 16, 24, 32, 64):
                 for unroll in (2, 4, 8, 16):
-                    self.check(n, plan_fused(n, blocks, unroll), ("fused", blocks, unroll))
+                    self.check(
+                        n, plan_fused(n, blocks, unroll), ("fused", blocks, unroll)
+                    )
 
     def test_work_per_rank(self):
         # fused: every rank handles 3n/8 rows; the normed rows sit on the first ranks (rank 0-2 at n = 80)
@@ -194,7 +243,10 @@ class TestCoverage(unittest.TestCase):
         g = geometry(arr.NORM_TUNING, num_vecs * 16)
         rows = [pull_norm_rows(num_vecs, n, rank, *g) for rank in range(WORLD)]
         self.assertEqual([len(r) for r in rows], [30] * WORLD)
-        self.assertEqual([sum(is_norm for _, is_norm in r) for r in rows], [30, 30, 20, 0, 0, 0, 0, 0])
+        self.assertEqual(
+            [sum(is_norm for _, is_norm in r) for r in rows],
+            [30, 30, 20, 0, 0, 0, 0, 0],
+        )
 
 
 class TestBitIdentical(unittest.TestCase):
@@ -203,19 +255,39 @@ class TestBitIdentical(unittest.TestCase):
         eps = 1e-6
         weight = (torch.rand(NORM_DIM, generator=g) + 0.5).to(torch.bfloat16)
         for n in (3, 8, 13, 21):
-            per_rank = (torch.randn(WORLD, 3 * n * NORM_DIM, generator=g) * 0.37).to(torch.bfloat16)
+            per_rank = (torch.randn(WORLD, 3 * n * NORM_DIM, generator=g) * 0.37).to(
+                torch.bfloat16
+            )
             split = execute(plan_split(n), per_rank, weight, eps)
             fused = execute(plan_fused(n), per_rank, weight, eps)
             tuned = execute(plan_fused(n, 16, 4), per_rank, weight, eps)
             self.assertFalse(torch.isnan(split.float()).any())
-            self.assertTrue(torch.equal(split.view(torch.int16), fused.view(torch.int16)), n)
-            self.assertTrue(torch.equal(split.view(torch.int16), tuned.view(torch.int16)), n)
+            self.assertTrue(
+                torch.equal(split.view(torch.int16), fused.view(torch.int16)), n
+            )
+            self.assertTrue(
+                torch.equal(split.view(torch.int16), tuned.view(torch.int16)), n
+            )
             # and both are the plain definition: all-reduce, then RMSNorm over the first n rows
             reduced = mc_reduce(per_rank)
-            lat = reduced[:n * NORM_DIM].view(n, NORM_DIM).float()
-            ref = (lat * torch.rsqrt(lat.pow(2).mean(-1, keepdim=True) + eps) * weight.float()).to(torch.bfloat16)
-            self.assertTrue(torch.equal(fused[n * NORM_DIM:].view(torch.int16), reduced[n * NORM_DIM:].view(torch.int16)))
-            torch.testing.assert_close(fused[:n * NORM_DIM].view(n, NORM_DIM).float(), ref.float(), atol=2e-2, rtol=2e-2)
+            lat = reduced[: n * NORM_DIM].view(n, NORM_DIM).float()
+            ref = (
+                lat
+                * torch.rsqrt(lat.pow(2).mean(-1, keepdim=True) + eps)
+                * weight.float()
+            ).to(torch.bfloat16)
+            self.assertTrue(
+                torch.equal(
+                    fused[n * NORM_DIM :].view(torch.int16),
+                    reduced[n * NORM_DIM :].view(torch.int16),
+                )
+            )
+            torch.testing.assert_close(
+                fused[: n * NORM_DIM].view(n, NORM_DIM).float(),
+                ref.float(),
+                atol=2e-2,
+                rtol=2e-2,
+            )
 
 
 if __name__ == "__main__":
