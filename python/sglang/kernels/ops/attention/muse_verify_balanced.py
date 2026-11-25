@@ -17,6 +17,7 @@ import triton.language as tl
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from sglang.kernels.ops.attention.muse_verify_flydsl import CHUNK, QL, _launcher
+from sglang.srt.environ import envs
 
 # slot groups per chunk group of the kernel's main loop (``slots`` of verify_fly_partials)
 NS = 2
@@ -104,6 +105,28 @@ def verify_plan(seqused_k, segments, window=0):
         CHUNK, NS, MIN_SEGMENT_CHUNKS, block_p, num_warps=2,
     )  # fmt: skip
     return plan, seg_start, seg_count
+
+
+# (key, plan, seg_start, seg_count, the lengths it was built from)
+_last_plan = None
+
+
+def _forward_plan(seqused_k, segments, window):
+    """``verify_plan``, reused while the same lengths are passed. The capture state is part of the key (a plan built
+    outside a capture would leave the planning kernel out of the graph); the lengths stay referenced so their
+    address cannot be reused under a kept plan."""
+    global _last_plan
+    key = (
+        seqused_k.data_ptr(),
+        seqused_k._version,
+        seqused_k.numel(),
+        segments,
+        window,
+        torch.cuda.is_current_stream_capturing(),
+    )
+    if _last_plan is None or _last_plan[0] != key:
+        _last_plan = (key, *verify_plan(seqused_k, segments, window), seqused_k)
+    return _last_plan[1:4]
 
 
 @triton.jit
@@ -266,7 +289,7 @@ def gqa_verify_flydsl_balanced(
     # two segments per workgroup at 2 KV heads: 4 waves per CU keep enough KV bytes in flight
     spw = spw or (2 if kvh // hpg * hpg == kvh and hpg == 2 else 1)
     segs = segments or segments_for(num_seqs, kvh, hpg) * wg_per_cu * spw
-    plan, seg_start, seg_count = verify_plan(seqused_k, segs, window)
+    plan, seg_start, seg_count = _forward_plan(seqused_k, segs, window)
     st = (segs + 1, QL, heads)
     part = torch.empty((*st, 64), dtype=torch.float32, device=q.device)
     maxi = torch.empty(st, dtype=torch.float32, device=q.device)
@@ -323,9 +346,13 @@ def swa_verify_flydsl(
         block_table = block_table.to(torch.int32)
     work = 16 if num_seqs <= 16 else (8 if num_seqs <= 32 else 4)
     splits = work
+    # the third chunk loop takes the kernel past 256 VGPRs: compile it for the two waves per EU that the two
+    # workgroups per CU need
+    interior = envs.SGLANG_ROCM_MUSE_VERIFY_SWA_INTERIOR.get()
     partial, maximum, denom = verify_fly_partials(
         q, k, v, seqused_k, block_table, softmax_scale, k_descale, splits,
-        waves_per_eu=1, fence_vmem=True, wg_per_cu=2, work_splits=work, window=window,
+        waves_per_eu=2 if interior else 1, fence_vmem=True, wg_per_cu=2, work_splits=work, window=window,
+        swa_interior=interior,
     )  # fmt: skip
     if defer_reduce:
         return partial, maximum, denom
