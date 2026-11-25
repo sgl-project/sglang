@@ -353,7 +353,7 @@ def reserve_mla_split_host_memory(
     if buffers.index_k is not None:
         total_bytes += num_indexer_rows * buffers.index_width * dtype.itemsize
     if buffers.index_scales is not None:
-        total_bytes += num_indexer_rows * 4  # Host scales are FP32.
+        total_bytes += num_indexer_rows * buffers.index_scales.dtype.itemsize
 
     backend.ensure_capacity(total_bytes, torch.npu.current_device())
 

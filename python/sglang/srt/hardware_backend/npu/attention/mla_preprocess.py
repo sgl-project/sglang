@@ -338,6 +338,10 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.q_b_proj_scale = (
                 self.q_b_proj.weight_scale.float().view(1, -1).contiguous()
             )
+            # Match the A3 C8 Prolog contract without allocating on every step.
+            self.k_nope_clip_alpha = torch.ones(
+                1, dtype=torch.float32, device=self.w_kc.device
+            )
         elif self.weight_quant_mode == 3:
             checkpoint_scales = []
             for layer, (k_dim, n_dim) in zip(projections, expected_shapes):
@@ -583,20 +587,24 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.cos, self.sin = self.get_sin_cos(positions)
         k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
         pool = get_token_to_kv_pool()
-        packed = pool.dsa_kv_cache_store_fp8
-        if packed and self.weight_quant_mode != 3:
-            raise RuntimeError(
-                "Packed FP8 KV with MLAProlog requires MXFP8 QKV-A and Q-B weights; "
-                "use BF16 draft KV for BF16 draft weights"
-            )
+        packed = pool.dsa_kv_cache_store_c8
+        if packed:
+            expected_weight_mode = 2 if k_cache.dtype == torch.int8 else 3
+            if self.weight_quant_mode != expected_weight_mode:
+                raise RuntimeError(
+                    "Packed C8 MLAProlog requires dynamic INT8 projections for INT8 "
+                    "KV or MXFP8 projections for FP8 KV; use BF16 draft KV for "
+                    "BF16 draft weights"
+                )
         token_x = hidden_states
         if self.weight_quant_mode == 2:
-            if any(
-                t.dtype != torch.bfloat16
-                for t in (hidden_states, k_cache, v_cache, self.w_kc)
+            expected_cache_dtype = torch.int8 if packed else torch.bfloat16
+            if k_cache.dtype != expected_cache_dtype or any(
+                t.dtype != torch.bfloat16 for t in (hidden_states, v_cache, self.w_kc)
             ):
                 raise RuntimeError(
-                    "Dynamic INT8 MLAProlog requires BF16 activations and KV cache"
+                    "Dynamic INT8 MLAProlog requires BF16 activations and "
+                    "BF16 or packed INT8 KV cache"
                 )
             token_x, token_x_scale = torch.ops.npu.npu_dynamic_quant(
                 hidden_states.contiguous()
@@ -640,7 +648,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 dequant_scale_w_dq=self.qkv_a_proj_scale_q,
                 dequant_scale_w_dkv_kr=self.qkv_a_proj_scale_kv,
                 dequant_scale_w_uq_qr=self.q_b_proj_scale,
-                kv_cache_quant_mode=0,
+                kv_cache_quant_mode=3 if packed else 0,
                 query_quant_mode=0,
             )
         elif self.weight_quant_mode == 3:
@@ -659,6 +667,8 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             mla_prolog_input_args.update(
                 ckvkr_repo_mode=1, quant_scale_repo_mode=1, tile_size=128
             )
+            if self.weight_quant_mode == 2:
+                mla_prolog_input_args["k_nope_clip_alpha"] = self.k_nope_clip_alpha
         if self.kv_quant_scheme is not None:
             mla_prolog_input_args.update(
                 kv_cache_quant_mode=1,
@@ -679,7 +689,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         if self.weight_quant_mode == 2 and q_nope.dtype != torch.bfloat16:
             raise RuntimeError(
                 "This torch_npu/CANN MLAProlog implementation does not return BF16 "
-                "query for weight_quant_mode=2, kv_cache_quant_mode=0"
+                f"query for weight_quant_mode=2, kv_cache_quant_mode={3 if packed else 0}"
             )
         return (
             q_pe,
@@ -735,6 +745,11 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         # with the mlaprolog enabled, the kv_b_proj layers are unquantized
         _is_mlaprolog = self.uses_mlaprolog()
         q_descale = None
+        if get_token_to_kv_pool().dsa_kv_cache_store_c8 and not _is_mlaprolog:
+            raise RuntimeError(
+                "Packed C8 KV requires MLAProlog; disable SGLANG_NPU_USE_MLAPO "
+                "to use native DSA preprocessing with these projections."
+            )
         if _is_w8a8 and not _is_mlaprolog:
             result = self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator

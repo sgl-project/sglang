@@ -1962,8 +1962,8 @@ class AscendAttnBackend(AttentionBackend):
         # V2: Q is already sharded to local by the strategy; single sparse-attn
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
-        if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-            return self._forward_fp8_sparse(
+        if self.token_to_kv_pool.dsa_kv_cache_store_c8:
+            return self._forward_c8_sparse(
                 q_nope,
                 q_pe,
                 k_nope,
@@ -1996,7 +1996,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out
 
-    def _forward_fp8_sparse(
+    def _forward_c8_sparse(
         self,
         q_nope,
         q_pe,
@@ -2007,7 +2007,7 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv,
     ):
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-        packed = packed_kv.view(torch.float8_e4m3fn)
+        packed = packed_kv.view(self.kv_cache_dtype)
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
             key=packed,
@@ -2259,8 +2259,8 @@ class AscendAttnBackend(AttentionBackend):
                     scaling=layer.scaling,
                     fp8_attention=self.dcp_fp8_sparse_attention,
                 )
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
-                attn_out = self._forward_fp8_sparse(
+            if self.token_to_kv_pool.dsa_kv_cache_store_c8:
+                attn_out = self._forward_c8_sparse(
                     q_nope,
                     q_pe,
                     k_nope,
