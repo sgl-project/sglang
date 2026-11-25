@@ -879,7 +879,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is None
             and not self.runner.is_draft_worker
-            and self._kv_shard_pool is None
         ):
             parallel = get_parallel()
             tp_size = parallel.attn_tp_size
