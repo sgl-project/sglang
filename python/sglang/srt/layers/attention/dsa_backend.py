@@ -578,8 +578,6 @@ def _resolve_k31_sparse_prefill_reader(
     available: Callable[[], bool],
     prefill_impl: Optional[str] = "flashmla_kv",
 ) -> str:
-    """Active mode of --k31-sparse-prefill-reader: "off", "packed" or "unpacked".
-    See _k31_sparse_prefill_reader_decision."""
     return _k31_sparse_prefill_reader_decision(
         requested=requested,
         deterministic=deterministic,
@@ -615,16 +613,7 @@ def _k31_sparse_prefill_reader_decision(
     available: Callable[[], bool],
     prefill_impl: Optional[str] = "flashmla_kv",
 ) -> Tuple[str, str]:
-    """(active mode of --k31-sparse-prefill-reader, why): the mode is "off", "packed"
-    or "unpacked"; the reason says which requirement keeps a requested reader off.
-
-    The reader replaces the flashmla_kv extend (the FlashMLA decode kernel on the FP8
-    V32 cache), so it needs that backend; the raw-FP8 backends (trtllm, prims_ts) keep
-    another cache layout and never reach it. It dequantizes every row of the buffer it
-    is given, so it only takes the request-ordered rows dcp_gather_kv_cache builds
-    (sharded index-K, no prefill CP), never the KV pool. ``available`` is asked last,
-    so a deployment the reader does not cover never looks for the FlashMLA operators.
-    Packing is not batch invariant; deterministic inference runs unpacked."""
+    """(active mode, reason) for --k31-sparse-prefill-reader."""
     if requested == "off":
         return "off", "not requested"
     requirements = (
@@ -991,14 +980,11 @@ class DeepseekSparseAttnBackend(
             )
 
             self.flashmla_prefill_token_packing = flashmla_token_pack_available()
-        # Opt-in Kimi-K3.1 prefill reader: FlashMLA's sparse prefill kernel on a bf16 copy of
-        # the DCP-gathered rows (see kernels/ops/attention/dsa/k31_prefill_reader.py).
+        # Opt-in Kimi-K3.1 sparse-MLA prefill reader for DCP extends.
         _k31_reader = get_exec().kernel.k31_sparse_prefill_reader
         self.k31_sparse_prefill_reader = "off"
         _k31_reader_why = "not requested"
         if _k31_reader != "off":
-            # Nothing below is evaluated, and the reader module is not imported, when
-            # the flag is off.
             from sglang.kernels.ops.attention.dsa.k31_prefill_reader import (
                 k31_prefill_reader_available,
             )
@@ -1023,7 +1009,6 @@ class DeepseekSparseAttnBackend(
                 available=k31_prefill_reader_available,
             )
         if _k31_reader != "off":
-            # A requested reader that stays off says why, at warning level.
             (
                 logger.warning
                 if self.k31_sparse_prefill_reader == "off"
@@ -2840,8 +2825,7 @@ class DeepseekSparseAttnBackend(
     def _k31_prefill_reader_extend(
         self, layer, forward_batch, q_nope, q_rope, q_all, kv_cache, page_table_1
     ) -> Optional[torch.Tensor]:
-        """Opt-in Kimi-K3.1 prefill reader for a flashmla_kv extend. Returns None when it
-        is off or declines the call; the stock packing and decode kernel then run."""
+        """Returns None when the reader is off or declines; the stock path then runs."""
         if (
             self.k31_sparse_prefill_reader == "off"
             or not forward_batch.forward_mode.is_extend_without_speculative()

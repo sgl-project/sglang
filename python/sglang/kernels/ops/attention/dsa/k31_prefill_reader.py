@@ -1,30 +1,3 @@
-"""Kimi-K3.1 sparse-MLA prefill reader: FlashMLA's sparse PREFILL kernel on a bf16 copy of the gathered KV rows,
-with the rank's real head count and token packing read by the kernel.
-
-The stock extend path for Kimi-K3.1 (``dsa_impl == "flashmla_kv"``) packs G = min(64 // heads, 5) adjacent query
-tokens into one tile and runs FlashMLA's sparse DECODE kernel, which dequantizes FP8 KV inside the kernel. This
-reader instead
-  1. dequantizes the batch's gathered V32 rows once per call (``flash_mla_dequant_v32_kv``: fp8 value x fp32 scale
-     per 128 dims, bf16 RoPE tail copied),
-  2. builds the per-group union of the top-k lists with a deterministic pack (``flash_mla_sparse_pack_indices``;
-     the query is packed as a view, no copy), and
-  3. runs the 64-head sparse prefill kernel with ``heads_per_group`` (``flash_mla_sparse_fwd_packed``).
-The T mod G tail rows run as a second, unpacked launch into the same output tensor.
-
-The three operators come from ``sgl-flash-mla`` (``flash_mla_interface.supports_sparse_prefill_token_packing``).
-With a wheel that does not have them the backend logs one warning and keeps the stock path.
-
-Packing pays only when the tokens of a group share keys. The reader samples the union fraction of the packed lists
-(union length / sum of the group's valid top-k lengths) and runs unpacked for a while when it exceeds
-``SGLANG_K31_PREFILL_READER_MAX_UNION_FRACTION`` (see ``_OverlapGuard``).
-
-Any call the reader does not cover returns ``None`` and the caller runs the stock path; a runtime failure inside the
-reader disables it for the rest of the process the same way.
-
-Not bitwise equal to the decode kernel (it dequantizes with bf16 scales). The unpacked form is run-to-run
-deterministic and bitwise equal to FlashMLA's sparse prefill kernel on zero-padded heads.
-"""
-
 import logging
 from typing import Optional
 
@@ -45,13 +18,6 @@ _WARNED_UNAVAILABLE = False
 
 
 class _OverlapGuard:
-    """Packed-or-unpacked choice from the measured key overlap, without a per-call host sync.
-
-    Every ``probe_every``-th packed call leaves the union fraction of its groups on the device. The next call reads
-    it (one scalar; the launch it belongs to has been queued already). Above ``max_fraction`` the following ``hold``
-    calls run unpacked, then packing is probed again. Never reads or stores anything while a CUDA graph is captured.
-    ``max_fraction`` >= 1 turns the guard off."""
-
     def __init__(self, max_fraction, probe_every=64, hold=1024):
         self.max_fraction = max_fraction
         self.probe_every = probe_every
@@ -86,7 +52,7 @@ class _OverlapGuard:
         if self.unpacked_left > 0:
             self.unpacked_left -= 1
             if self.unpacked_left == 0:
-                self.until_probe = 0  # measure again on the first packed call
+                self.until_probe = 0
             return False
         return True
 
@@ -150,8 +116,6 @@ def _flash_mla():
 
 
 def _load():
-    """(attention, pack, dequant) with the calling conventions of flash_mla_sparse_fwd_packed,
-    flash_mla_sparse_pack_indices and flash_mla_dequant_v32_kv."""
     global _OPS
     if _OPS is None:
         fm = _flash_mla()
@@ -173,9 +137,7 @@ def k31_prefill_reader_available() -> bool:
     try:
         _load()
         return True
-    except (
-        Exception
-    ) as e:  # no wheel, or one without the operators: the caller keeps the stock path
+    except Exception as e:
         if not _WARNED_UNAVAILABLE:
             _WARNED_UNAVAILABLE = True
             logger.warning(
@@ -187,8 +149,7 @@ def k31_prefill_reader_available() -> bool:
 
 def _ws(name, like, shape, dtype, capturing=False):
     if capturing:
-        # A captured graph keeps the pointers it saw. The shared workspace may be replaced by a larger one later, so
-        # a capture gets its own buffer (owned by the graph's memory pool).
+        # A captured graph keeps the pointers it saw; the shared workspace can move.
         return torch.empty(tuple(shape), dtype=dtype, device=like.device)
     key = (like.device.index, name)
     w = _WS.get(key)
@@ -239,7 +200,6 @@ def _forward_packed(q_all, kv, indices, sm_scale, topk_length, capturing=False):
 
 
 def _decline_reason(q, q_rope, kv_cache, indices, max_bf16_bytes) -> Optional[str]:
-    """Why this call is not covered, or None. Shape and dtype screening only; no device work."""
     if q.dtype != torch.bfloat16 or q.dim() != 3:
         return "q is not a 3-d bf16 tensor"
     if q.shape[0] == 0:
@@ -282,10 +242,7 @@ def k31_prefill_reader(
     pack: bool = True,
     max_bf16_bytes: int = 1 << 30,
 ) -> Optional[torch.Tensor]:
-    """q [T, H, 512] (+ q_rope [T, H, 64]) or q [T, H, 576]; kv_cache [pages, 64, 1, 656] holding exactly the rows
-    the top-k ids address (the DCP-gathered, request-ordered buffer); indices [>= T, topk] int32, -1 padded (rows
-    beyond T are padding and ignored).
-    Returns [T, 1, H, 512], or None when the call is not covered (the caller then runs the stock path)."""
+    """Returns [T, 1, H, 512], or None when the caller should run the stock path."""
     global _DISABLED
     if _DISABLED is not None:
         return None
@@ -295,9 +252,7 @@ def k31_prefill_reader(
         return None
     try:
         return _run(q, q_rope, kv_cache, indices[: q.shape[0]], sm_scale, pack)
-    except (
-        RuntimeError
-    ) as error:  # includes CUDA out of memory and operator argument checks
+    except RuntimeError as error:
         _DISABLED = error
         logger.error(
             "Kimi-K3.1 sparse prefill reader failed and is disabled for this process; the stock path runs: %r",

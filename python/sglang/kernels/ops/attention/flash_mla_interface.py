@@ -45,9 +45,7 @@ def supports_native_heads() -> bool:
 
 
 def supports_sparse_prefill_token_packing() -> bool:
-    """Whether the installed wheel's legacy sparse prefill runs on the real head
-    count with token packing (``flash_mla_sparse_fwd_packed``) and has the index
-    pack and V3.2 dequant operators that feed it."""
+    """Whether the installed wheel has the token-packed sparse prefill operators."""
     has = getattr(flash_mla, "has_sparse_prefill_token_packing", None)
     return has is not None and bool(has())
 
@@ -274,16 +272,14 @@ def flash_mla_sparse_fwd_small_heads(
 def flash_mla_sparse_fwd_packed(
     q, kv, indices, sm_scale, heads_per_group=0, topk_length=None, out=None
 ):
-    """Output-only BF16 sparse prefill on the real head count (no padding to
-    64 heads); ``heads_per_group`` > 0 reads token-packed ``indices``."""
+    """BF16 sparse prefill; ``heads_per_group`` > 0 reads token-packed ``indices``."""
     return flash_mla.flash_mla_sparse_fwd_packed(
         q, kv, indices, sm_scale, heads_per_group, topk_length, out
     )
 
 
 def flash_mla_sparse_pack_indices(indices, group, packed=None, lengths=None):
-    """Deterministic union of the top-k lists of each ``group`` consecutive rows,
-    in the token-packing index format: (packed, lengths)."""
+    """Union of the top-k lists of each ``group`` rows: (packed, lengths)."""
     return flash_mla.flash_mla_sparse_pack_indices(indices, group, packed, lengths)
 
 

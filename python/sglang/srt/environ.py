@@ -2224,9 +2224,7 @@ class Envs:
     SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
-    # Kimi-K3.1 sparse-MLA prefill reader (--k31-sparse-prefill-reader): the packed
-    # reader switches to unpacked calls while the sampled union fraction of a token
-    # group's top-k lists is above this; 1 disables the guard.
+    # --k31-sparse-prefill-reader packed: unpacked above this union fraction; 1 disables.
     SGLANG_K31_PREFILL_READER_MAX_UNION_FRACTION = EnvFloat(0.8)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.

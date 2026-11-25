@@ -417,15 +417,9 @@ class ExecKernel(msgspec.Struct):
     k31_sparse_prefill_reader: A[
         str,
         Arg(
-            help="Kimi-K3.1 sparse-MLA prefill reader for DCP extends: 'off' (default) keeps "
-            "the token-packed FlashMLA decode kernel; 'packed' dequantizes the gathered KV "
-            "rows to BF16 once per call and runs FlashMLA's sparse prefill kernel with token "
-            "packing; 'unpacked' is the same without packing (run-to-run deterministic). "
-            "Requires SM100-family, --dsa-prefill-backend flashmla_kv (not the prims_ts "
-            "default of Kimi-K3.1), DCP with sharded index-K, FP8 V32 KV cache, at most 32 "
-            "heads per TP rank and an sgl-flash-mla with token-packed sparse prefill "
-            "(flash_mla_sparse_fwd_packed); otherwise the stock path runs. "
-            "Deterministic inference forces 'unpacked'.",
+            help="Kimi-K3.1 sparse-MLA prefill reader for DCP extends on "
+            "--dsa-prefill-backend flashmla_kv, with ('packed') or without ('unpacked') "
+            "token packing; the stock path runs when it is unsupported.",
             choices=["off", "packed", "unpacked"],
         ),
     ] = "off"
