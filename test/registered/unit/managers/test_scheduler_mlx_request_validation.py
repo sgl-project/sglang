@@ -21,12 +21,13 @@ class TestSchedulerMlxRequestValidation(CustomTestCase):
         scheduler.enable_session_radix_cache = False
         scheduler.model_config = SimpleNamespace(
             hf_eos_token_id={1},
-            vocab_size=128,
+            token_id_vocab_size=128,
         )
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.kv_events_publisher = SimpleNamespace(enable_kv_cache_events=False)
         scheduler.tokenizer = None
+        scheduler.uocr_runtime = None
         scheduler.dllm_config = None
         scheduler.validate_dllm_request = MagicMock(return_value=None)
         scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
@@ -47,7 +48,7 @@ class TestSchedulerMlxRequestValidation(CustomTestCase):
             token_ids_logprob=None,
             mm_inputs=None,
         )
-        req = MagicMock(return_logprob=True, return_sampling_mask=False)
+        req = MagicMock(return_logprob=True, return_sampling_mask=False, kv_hints=None)
         with (
             patch(
                 "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
