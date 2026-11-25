@@ -181,9 +181,7 @@ if _is_hip:
     from sglang.srt.models.minimax_common.amd import minimax_m3_hip as _hip
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
-        split_qkv_rmsnorm_rope_pos_cache_half_npu,
-    )
+    from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope_pos_cache_half_npu
 
     from sglang.srt.hardware_backend.npu.utils import (
         process_shared_expert,
@@ -302,7 +300,7 @@ class MiniMaxM3MLP(nn.Module):
     @staticmethod
     def _swigluoai_fused(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
         """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
-        from sgl_kernel_npu.activation.swiglu_oai_quant import swiglu_oai_quant
+        from sgl_kernel_npu.operators.activation import swiglu_oai_quant
 
         out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
         return out
@@ -507,9 +505,6 @@ class MiniMaxM3MoE(nn.Module):
             raise ValueError(
                 "M3.1 hybrid MoE requires matching attention TP and MoE EP groups"
             )
-
-        if get_moe_a2a_backend().is_deepep():
-            self.top_k = config.num_experts_per_tok
 
         # The finalize kernels never rescale: the routed scaling factor is already
         # in the top-k weights (apply_routed_scaling_factor_on_output).
