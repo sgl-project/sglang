@@ -776,9 +776,9 @@ def _topk_index_partial_kernel(
     stride_ti_b,
     stride_ti_t,
     # META
-    TIE_BY_ID: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    TIE_BY_ID: tl.constexpr = False,
 ):
     tl.static_assert(BLOCK_SIZE_K > topk)
     pid_b = tl.program_id(0)
@@ -911,9 +911,9 @@ def _topk_index_merge_kernel(
     stride_tif_t,
     # META
     NUM_TOPK_CHUNKS: tl.constexpr,
-    TIE_BY_ID: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    TIE_BY_ID: tl.constexpr = False,
 ):
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
