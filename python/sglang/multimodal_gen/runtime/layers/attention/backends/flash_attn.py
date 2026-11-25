@@ -412,6 +412,10 @@ class FlashAttentionImpl(AttentionImpl):
     ):
         use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
         if use_trtllm:
+            assert self.sinks is None, (
+                "run_skip_softmax does not accept per-head sink logits; "
+                "set sinks=None when constructing this attention impl"
+            )
             if return_softmax_lse:
                 raise NotImplementedError(
                     "Skip Softmax does not support the LSE output required by "
@@ -530,6 +534,12 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k = attn_metadata.max_seqlen_k or key.shape[1]
         else:
             max_seqlen_q, max_seqlen_k = query.shape[1], key.shape[1]
+        # forward_into receives a head-shard from Ulysses; self.sinks has impl-wide
+        # shape and cannot be sliced per call site, so reject rather than corrupt.
+        assert self.sinks is None, (
+            "forward_into does not support per-head sink logits; "
+            "set sinks=None when constructing this attention impl"
+        )
         flash_attn_varlen_func(
             q=query,
             k=key,
@@ -540,7 +550,7 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
-            window_size=(-1, -1),
+            window_size=tuple(self.window_size),
             ver=fa_ver,
             out=out,
         )
@@ -558,6 +568,10 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
         if use_trtllm:
+            assert self.sinks is None, (
+                "run_skip_softmax does not accept per-head sink logits; "
+                "set sinks=None when constructing this attention impl"
+            )
             bounds = cu_seqlens_host
             used = (
                 trailing_padding_used_len(
@@ -673,6 +687,14 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one non-causal FlashAttention ring chunk with LSE output."""
+        # A sink would enter every chunk's softmax denominator and be counted
+        # once per ring step, and a window cannot be expressed against the
+        # chunk-local key positions the ring hands over.
+        assert self.sinks is None and tuple(self.window_size) == (-1, -1), (
+            "ring attention cannot carry per-head sink logits or a local window; "
+            "set sinks=None and window_size=(-1, -1) when constructing this "
+            "attention impl"
+        )
         result = flash_attn_varlen_func(
             query,
             key,

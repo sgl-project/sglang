@@ -7,7 +7,7 @@ import math
 import torch
 from torch import nn
 
-from sglang.multimodal_gen.runtime.layers.magi2_mhc_kernel import mhc_mix_output
+from sglang.multimodal_gen.runtime.models.dits.magi2_mhc_kernel import mhc_mix_output
 
 
 def sinkhorn_knopp(h: torch.Tensor, *, num_iters: int, eps: float) -> torch.Tensor:

@@ -26,10 +26,11 @@ from sglang.multimodal_gen.configs.models.vaes.magi2 import (
     Magi2TurboVAEConfig,
     Magi2VideoVAEConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.magi2 import Magi2PipelineConfig
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.layers.attention.magi2_block_grid_attention import (
+from sglang.multimodal_gen.runtime.models.dits.magi2_block_grid_attention import (
     Magi2BlockGridAttention,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
@@ -57,12 +58,8 @@ logger = init_logger(__name__)
 _INDEX_NAME = "model.safetensors.index.json"
 _SINGLE_NAME = "model.safetensors"
 
-_PREVIEW_DIR = "preview"
-_REFINER_DIR = "refiner"
-_TEXT_ENCODER_DIR = "text_encoder"
-_VIDEO_VAE_FILE = os.path.join("vae", "Wan2.2_VAE.pth")
-_TURBO_VAE_FILE = os.path.join("turbo_vae", "checkpoint.ckpt")
-_AUDIO_VAE_DIR = "stable-audio-open-1.0"
+_VIDEO_VAE_FILE = "Wan2.2_VAE.pth"
+_TURBO_VAE_FILE = "checkpoint.ckpt"
 
 # Training state that would trip the strict load.
 _TURBO_VAE_TRAINING_ONLY_PREFIXES = ("aligned_feature_projection_heads.",)
@@ -392,7 +389,7 @@ def _load_dit_from_shards(
 
 def load_magi2_preview_dit(
     *,
-    checkpoint_root: str,
+    component_path: str,
     config: Magi2PreviewConfig,
     ep_group: dist.ProcessGroup | None,
     device: torch.device,
@@ -418,7 +415,7 @@ def load_magi2_preview_dit(
     mark_magi2_params_required(model)
     return _load_dit_from_shards(
         model,
-        checkpoint_dir=os.path.join(checkpoint_root, _PREVIEW_DIR),
+        checkpoint_dir=component_path,
         renames=_PREVIEW_RENAMES,
         config_mapping=arch.param_names_mapping,
         shard=shard,
@@ -430,7 +427,7 @@ def load_magi2_preview_dit(
 
 def load_magi2_refiner_dit(
     *,
-    checkpoint_root: str,
+    component_path: str,
     config: Magi2RefinerConfig,
     device: torch.device,
     param_dtype: torch.dtype,
@@ -450,7 +447,7 @@ def load_magi2_refiner_dit(
     mark_magi2_params_required(model)
     return _load_dit_from_shards(
         model,
-        checkpoint_dir=os.path.join(checkpoint_root, _REFINER_DIR),
+        checkpoint_dir=component_path,
         renames=_REFINER_RENAMES,
         config_mapping=arch.param_names_mapping,
         shard=Magi2ExpertShard.from_group(ep_group=None, num_heads=1, num_experts=1),
@@ -553,13 +550,13 @@ def remap_wan_pth_state_dict(
 
 def load_magi2_video_vae(
     *,
-    checkpoint_root: str,
+    component_path: str,
     config: Magi2VideoVAEConfig,
     device: torch.device,
     param_dtype: torch.dtype,
 ) -> AutoencoderKLWan:
     """``conv1`` is the quant conv, ``conv2`` the post-quant conv (vae2_2.py:868-870)."""
-    path = os.path.join(checkpoint_root, _VIDEO_VAE_FILE)
+    path = os.path.join(component_path, _VIDEO_VAE_FILE)
     with set_default_torch_dtype(param_dtype), torch.device("meta"):
         vae = AutoencoderKLWan(config)
 
@@ -575,13 +572,13 @@ def load_magi2_video_vae(
 
 def load_magi2_turbo_vae(
     *,
-    checkpoint_root: str,
+    component_path: str,
     config: Magi2TurboVAEConfig,
     device: torch.device,
     param_dtype: torch.dtype,
 ) -> Magi2TurboVAE:
     """Three payload shapes are normalized by ``strip_turbo_vae_state_dict_prefix`` (magi2_core/model/turbo_vaed.py:1038-1061)."""
-    path = os.path.join(checkpoint_root, _TURBO_VAE_FILE)
+    path = os.path.join(component_path, _TURBO_VAE_FILE)
     with set_default_torch_dtype(param_dtype), torch.device("meta"):
         vae = Magi2TurboVAE(config)
 
@@ -598,16 +595,15 @@ def load_magi2_turbo_vae(
 
 def load_magi2_audio_vae(
     *,
-    checkpoint_root: str,
+    component_path: str,
     config: Magi2AudioVAEConfig,
     device: torch.device,
     param_dtype: torch.dtype,
 ) -> Magi2AudioVAE:
     """Weights sit under ``pretransform.model.`` (magi2_core/pipeline/audio_decoder.py:104-108); the encoder half is dropped."""
-    directory = os.path.join(checkpoint_root, _AUDIO_VAE_DIR)
     audio_vae = Magi2AudioVAE(config)
 
-    weight_map = _read_weight_map(directory)
+    weight_map = _read_weight_map(component_path)
     raw: dict[str, torch.Tensor] = {}
     by_shard: dict[str, list[str]] = defaultdict(list)
     for name, path in weight_map.items():
@@ -647,12 +643,18 @@ def _isolate_cjk_characters(tokenizer) -> None:
     backend._magi2_cjk_isolated = True
 
 
-def load_magi2_text_encoder(
-    *, checkpoint_root: str, device: torch.device, param_dtype: torch.dtype
-):
-    """``AutoModel`` here resolves the multimodal wrapper, so the text model is named explicitly (magi2_core/model/qwen35.py:250)."""
+def load_magi2_tokenizer(*, component_path: str):
     from transformers import AutoTokenizer
 
+    tokenizer = AutoTokenizer.from_pretrained(component_path, padding_side="right")
+    _isolate_cjk_characters(tokenizer)
+    return tokenizer
+
+
+def load_magi2_text_encoder(
+    *, component_path: str, device: torch.device, param_dtype: torch.dtype
+):
+    """``AutoModel`` here resolves the multimodal wrapper, so the text model is named explicitly (magi2_core/model/qwen35.py:250)."""
     try:
         from transformers import Qwen3_5TextModel
     except ImportError as e:
@@ -662,119 +664,150 @@ def load_magi2_text_encoder(
             "module and a different hidden state"
         ) from e
 
-    path = os.path.join(checkpoint_root, _TEXT_ENCODER_DIR)
-    tokenizer = AutoTokenizer.from_pretrained(path, padding_side="right")
-    _isolate_cjk_characters(tokenizer)
-    text_encoder = Qwen3_5TextModel.from_pretrained(path, torch_dtype=param_dtype)
+    text_encoder = Qwen3_5TextModel.from_pretrained(
+        component_path, torch_dtype=param_dtype
+    )
     text_encoder = text_encoder.to(device).eval()
     text_encoder.requires_grad_(False)
-    return text_encoder, tokenizer
+    return text_encoder
 
 
-def _resolve_magi2_dtypes(server_args: ServerArgs) -> dict[str, torch.dtype]:
-    """Honour ``--component-precisions.<name>`` over the pipeline-config defaults."""
-    dit_dtype = resolve_precision(
-        server_args, "transformer", precision_attr="dit_precision"
-    )
-    return {
-        "transformer": dit_dtype,
-        "transformer_2": resolve_precision(
-            server_args, "transformer_2", precision_attr="dit_precision"
-        ),
-        "text_encoder": resolve_component_precision(server_args, "text_encoder"),
-        "vae": resolve_precision(server_args, "vae", precision_attr="vae_precision"),
-        # No turbo_vae_precision field: it defaults to the DiT dtype.
-        "turbo_vae": resolve_component_precision_override(server_args, "turbo_vae")
-        or dit_dtype,
-        "audio_vae": resolve_precision(
-            server_args, "audio_vae", precision_attr="audio_vae_precision"
-        ),
-    }
-
-
-def load_magi2_modules(
-    *,
-    server_args: ServerArgs,
-    pipeline,
-    ep_group: dist.ProcessGroup | None,
-) -> dict[str, nn.Module | None]:
-    """Bypasses ``PipelineComponentLoader``: its diffusers retry (component_loader.py:264-297) masks real bugs, and its subclass registry (:85-91) is process-wide."""
-    config: Magi2PipelineConfig = server_args.pipeline_config
-    checkpoint_root = pipeline.model_path
-    device = get_local_torch_device()
-    dtypes = _resolve_magi2_dtypes(server_args)
-
-    # The layerwise offload manager streams blocks from host to device during
-    # each forward. Load the DiT to CPU when the manager is active so the full
-    # per-rank expert shard (≥50 GiB at ep=4) is never resident on-device at
-    # once — matching the pattern of transformer_loader._resolve_checkpoint_load_device
-    # and server_args.should_start_component_on_cpu.
-    dit_load_device = (
-        torch.device("cpu")
-        if server_args.should_start_component_on_cpu("transformer")
-        else device
+def build_expert_parallel_group(server_args: ServerArgs) -> dist.ProcessGroup | None:
+    """``None`` for a single-rank deployment, so the MoE skips its collectives."""
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_dit_group,
     )
 
-    # The text encoder runs once per request before either DiT, and as a plain
-    # transformers module sglang's layerwise offload cannot hook it. Staged in by
-    # Magi2TextEncodingStage.
-    text_encoder_device = torch.device("cpu")
+    if not dist.is_initialized():
+        return None
 
-    transformer = load_magi2_preview_dit(
-        checkpoint_root=checkpoint_root,
-        config=config.dit_config,
-        ep_group=ep_group,
-        device=dit_load_device,
-        param_dtype=dtypes["transformer"],
-    )
-    transformer_2 = (
-        load_magi2_refiner_dit(
-            checkpoint_root=checkpoint_root,
-            config=config.refiner_dit_config,
-            device=dit_load_device,
-            param_dtype=dtypes["transformer_2"],
+    world_size = dist.get_world_size(group=get_dit_group())
+    ep_size = server_args.pipeline_config.ep_size or world_size
+    if ep_size <= 1:
+        return None
+
+    # Rank within the DIT group, not the global rank: the subgroups below are
+    # built over DIT-group ranks.
+    rank = dist.get_rank(group=get_dit_group())
+    my_group = None
+    # new_group is collective: all ranks enter every group, keep the one they are in.
+    for start in range(0, world_size, ep_size):
+        ranks = list(range(start, start + ep_size))
+        group = dist.new_group(ranks=ranks)
+        if rank in ranks:
+            my_group = group
+
+    logger.info("[magi2] expert parallel: world=%d ep=%d", world_size, ep_size)
+    return my_group
+
+
+def _dit_dtype(server_args: ServerArgs, component_name: str) -> torch.dtype:
+    return resolve_precision(server_args, component_name, precision_attr="dit_precision")
+
+
+class _Magi2WeightsLoader(ComponentLoader):
+    """Reads one component of the native checkpoint.
+
+    Wired through ``Magi2Pipeline.component_loaders``; ``component_names`` stays
+    empty, so nothing registers process-wide.
+    """
+
+    expected_library = "diffusers"
+
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        # Accepted: load_customized resolves the override itself.
+        return server_args.component_precisions.get(component_name)
+
+    def load_device(self, server_args: ServerArgs, component_name: str) -> torch.device:
+        """Where ``ComponentLoader.load`` places the result. Loading there directly
+        keeps an offloaded DiT's per-rank expert shard (about 50 GiB at ep=4) off
+        the device."""
+        return self.target_device(
+            server_args.should_start_component_on_cpu(component_name)
         )
-        if config.enable_refiner
-        else None
-    )
 
-    text_encoder, tokenizer = load_magi2_text_encoder(
-        checkpoint_root=checkpoint_root,
-        device=text_encoder_device,
-        param_dtype=dtypes["text_encoder"],
-    )
 
-    vae = load_magi2_video_vae(
-        checkpoint_root=checkpoint_root,
-        config=config.vae_config,
-        device=device,
-        param_dtype=dtypes["vae"],
-    )
-    turbo_vae = (
-        load_magi2_turbo_vae(
-            checkpoint_root=checkpoint_root,
-            config=config.turbo_vae_config,
-            device=device,
-            param_dtype=dtypes["turbo_vae"],
+class Magi2PreviewDiTLoader(_Magi2WeightsLoader):
+    def load_customized(self, component_model_path, server_args, component_name):
+        return load_magi2_preview_dit(
+            component_path=component_model_path,
+            config=server_args.pipeline_config.dit_config,
+            # The MoE takes its process group at construction time.
+            ep_group=build_expert_parallel_group(server_args),
+            device=self.load_device(server_args, component_name),
+            param_dtype=_dit_dtype(server_args, component_name),
         )
-        if config.use_turbo_vae
-        else None
-    )
-    audio_vae = load_magi2_audio_vae(
-        checkpoint_root=checkpoint_root,
-        config=config.audio_vae_config,
-        device=device,
-        param_dtype=dtypes["audio_vae"],
-    )
 
-    # transformer_2 and turbo_vae must be present as keys even when disabled: the
-    # pipeline reads them through get_module() as eager add_stage_if arguments.
-    return {
-        "transformer": transformer,
-        "transformer_2": transformer_2,
-        "text_encoder": text_encoder,
-        "tokenizer": tokenizer,
-        "vae": vae,
-        "turbo_vae": turbo_vae,
-        "audio_vae": audio_vae,
-    }
+
+class Magi2RefinerDiTLoader(_Magi2WeightsLoader):
+    def load_customized(self, component_model_path, server_args, component_name):
+        return load_magi2_refiner_dit(
+            component_path=component_model_path,
+            config=server_args.pipeline_config.refiner_dit_config,
+            device=self.load_device(server_args, component_name),
+            param_dtype=_dit_dtype(server_args, component_name),
+        )
+
+
+class Magi2TextEncoderLoader(_Magi2WeightsLoader):
+    expected_library = "transformers"
+
+    @staticmethod
+    def target_device(component_starts_on_cpu: bool) -> torch.device:
+        # Magi2TextEncodingStage runs the forward on the CPU under any residency,
+        # and as a plain transformers module the encoder cannot be layer-streamed.
+        return torch.device("cpu")
+
+    def load_customized(self, component_model_path, server_args, component_name):
+        return load_magi2_text_encoder(
+            component_path=component_model_path,
+            device=self.load_device(server_args, component_name),
+            param_dtype=resolve_component_precision(server_args, component_name),
+        )
+
+
+class Magi2TokenizerLoader(ComponentLoader):
+    expected_library = "transformers"
+
+    def load_customized(self, component_model_path, server_args, component_name):
+        return load_magi2_tokenizer(component_path=component_model_path)
+
+
+class Magi2VideoVAELoader(_Magi2WeightsLoader):
+    def load_customized(self, component_model_path, server_args, component_name):
+        return load_magi2_video_vae(
+            component_path=component_model_path,
+            config=server_args.pipeline_config.vae_config,
+            device=self.load_device(server_args, component_name),
+            param_dtype=resolve_precision(
+                server_args, component_name, precision_attr="vae_precision"
+            ),
+        )
+
+
+class Magi2TurboVAELoader(_Magi2WeightsLoader):
+    def load_customized(self, component_model_path, server_args, component_name):
+        return load_magi2_turbo_vae(
+            component_path=component_model_path,
+            config=server_args.pipeline_config.turbo_vae_config,
+            device=self.load_device(server_args, component_name),
+            # No turbo_vae_precision field: it follows the preview DiT.
+            param_dtype=resolve_component_precision_override(
+                server_args, component_name
+            )
+            or _dit_dtype(server_args, "transformer"),
+        )
+
+
+class Magi2AudioVAELoader(_Magi2WeightsLoader):
+    def load_customized(self, component_model_path, server_args, component_name):
+        return load_magi2_audio_vae(
+            component_path=component_model_path,
+            config=server_args.pipeline_config.audio_vae_config,
+            device=self.load_device(server_args, component_name),
+            param_dtype=resolve_precision(
+                server_args, component_name, precision_attr="audio_vae_precision"
+            ),
+        )

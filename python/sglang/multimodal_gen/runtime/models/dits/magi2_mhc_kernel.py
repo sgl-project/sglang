@@ -60,8 +60,17 @@ def _mhc_mix_output(
     The torch spelling reads the 4-stream residual three times and materializes the
     ``post`` outer product at full width only to add it.
     """
+    # The kernel indexes every tensor by raw offset (token-major, last dim 1),
+    # so a strided view would be read wrong with no error. Every in-tree
+    # producer is contiguous; normalise the two activations and keep the
+    # explicit copies of the small parameter tensors.
+    if not streams.is_contiguous():
+        streams = streams.contiguous()
+    if not block_out.is_contiguous():
+        block_out = block_out.contiguous()
     tokens, num_stream, hidden = streams.shape
-    out = torch.empty_like(streams)
+    # Always contiguous so the fake and the real impl agree on output strides.
+    out = torch.empty(streams.shape, dtype=streams.dtype, device=streams.device)
     block_c = min(1024, triton.next_power_of_2(hidden))
     _mhc_mix_output_kernel[(tokens, triton.cdiv(hidden, block_c))](
         streams,

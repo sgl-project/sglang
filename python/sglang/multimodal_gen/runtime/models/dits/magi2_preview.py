@@ -13,7 +13,7 @@ from sglang.multimodal_gen.configs.models.dits.magi2 import (
     Magi2PreviewConfig,
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_block
-from sglang.multimodal_gen.runtime.layers.attention.magi2_sink_attention import (
+from sglang.multimodal_gen.runtime.models.dits.magi2_sink_attention import (
     Magi2SinkAttention,
 )
 from sglang.multimodal_gen.runtime.layers.moe_multihead import Magi2MultiHeadMoE

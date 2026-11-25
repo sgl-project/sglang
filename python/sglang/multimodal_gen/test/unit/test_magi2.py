@@ -21,9 +21,9 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
-from sglang.multimodal_gen.runtime.layers.attention import magi2_sink_attention
+from sglang.multimodal_gen.runtime.models.dits import magi2_sink_attention
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
-from sglang.multimodal_gen.runtime.layers.attention.magi2_block_grid_attention import (
+from sglang.multimodal_gen.runtime.models.dits.magi2_block_grid_attention import (
     SEQ_BUCKET,
     Magi2BlockGrid,
     Magi2BlockGridAttention,
@@ -31,7 +31,7 @@ from sglang.multimodal_gen.runtime.layers.attention.magi2_block_grid_attention i
     build_mask_mod,
     cached_block_mask,
 )
-from sglang.multimodal_gen.runtime.layers.attention.magi2_sink_attention import (
+from sglang.multimodal_gen.runtime.models.dits.magi2_sink_attention import (
     Magi2SinkAttention,
 )
 from sglang.multimodal_gen.runtime.layers.moe_multihead import (
@@ -41,6 +41,12 @@ from sglang.multimodal_gen.runtime.layers.moe_multihead import (
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import magi2_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.magi2_loader import (
+    Magi2AudioVAELoader,
+    Magi2PreviewDiTLoader,
+    Magi2RefinerDiTLoader,
+    Magi2TextEncoderLoader,
+    Magi2TurboVAELoader,
+    Magi2VideoVAELoader,
     _is_ep_sharded,
 )
 from sglang.multimodal_gen.runtime.models.dits.magi2_common import (
@@ -1146,46 +1152,50 @@ class TestSinkAttentionBackend(unittest.TestCase):
 
 
 class TestLoaderPrecision(unittest.TestCase):
-    _LOADERS = {
-        "load_magi2_preview_dit": "transformer",
-        "load_magi2_refiner_dit": "transformer_2",
-        "load_magi2_text_encoder": "text_encoder",
-        "load_magi2_video_vae": "vae",
-        "load_magi2_turbo_vae": "turbo_vae",
-        "load_magi2_audio_vae": "audio_vae",
+    _LOADER_CLASSES = {
+        "transformer": Magi2PreviewDiTLoader,
+        "transformer_2": Magi2RefinerDiTLoader,
+        "text_encoder": Magi2TextEncoderLoader,
+        "vae": Magi2VideoVAELoader,
+        "turbo_vae": Magi2TurboVAELoader,
+        "audio_vae": Magi2AudioVAELoader,
+    }
+    _FUNCTION_NAMES = {
+        "transformer": "load_magi2_preview_dit",
+        "transformer_2": "load_magi2_refiner_dit",
+        "text_encoder": "load_magi2_text_encoder",
+        "vae": "load_magi2_video_vae",
+        "turbo_vae": "load_magi2_turbo_vae",
+        "audio_vae": "load_magi2_audio_vae",
     }
 
     def _loaded_dtypes(self, component_precisions):
         server_args = SimpleNamespace(
             pipeline_config=Magi2PipelineConfig(),
             component_precisions=component_precisions,
+            should_start_component_on_cpu=lambda name: False,
         )
         seen = {}
 
         def recorder(component):
             def load(**kwargs):
                 seen[component] = kwargs["param_dtype"]
-                return (_M(), object()) if component == "text_encoder" else _M()
+                return _M()
 
             return load
 
         with contextlib.ExitStack() as stack:
-            for loader, component in self._LOADERS.items():
+            for component, fn_name in self._FUNCTION_NAMES.items():
                 stack.enter_context(
-                    mock.patch.object(magi2_loader, loader, recorder(component))
+                    mock.patch.object(magi2_loader, fn_name, recorder(component))
                 )
             stack.enter_context(
                 mock.patch.object(
-                    magi2_loader,
-                    "get_local_torch_device",
-                    return_value=torch.device("cpu"),
+                    magi2_loader, "build_expert_parallel_group", return_value=None
                 )
             )
-            magi2_loader.load_magi2_modules(
-                server_args=server_args,
-                pipeline=SimpleNamespace(model_path="unused"),
-                ep_group=None,
-            )
+            for component, loader_cls in self._LOADER_CLASSES.items():
+                loader_cls().load_customized("unused", server_args, component)
         return seen
 
     def test_defaults_are_unchanged(self):

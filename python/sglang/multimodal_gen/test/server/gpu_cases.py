@@ -997,10 +997,21 @@ MAGI2_FOUR_GPU_H100_CASES = [
             num_outputs_per_prompt=1,
             extras={"num_inference_steps": 2, "seed": 42},
         ),
-        run_perf_check=False,
+        # Consistency: no golden file in sgl-project/ci-data-diffusion yet.
         run_consistency_check=False,
+        # Component accuracy: FOUR_GPU_H100_CASES is not wired to any CI lane
+        # (test_server_4_gpu_h100.py has no registered bridge), so this case
+        # never runs component-accuracy in CI — a future lane addition can
+        # enable it once the golden artifacts exist.
         run_component_accuracy_check=False,
+        # Perf: run_perf_check=False keeps perf noise off until a stable
+        # baseline on matching hardware is added to h100.json. The e2e and load
+        # guards in _validate_and_record still run unconditionally.
+        run_perf_check=False,
+        # models-api: not disabled by design — left False until the two-stage
+        # tier is covered by a separate case so this smoke run stays fast.
         run_models_api_check=False,
+        # t2v_input_reference: TI2V task type, so the base check is a no-op.
         run_t2v_input_reference_check=False,
     ),
 ]

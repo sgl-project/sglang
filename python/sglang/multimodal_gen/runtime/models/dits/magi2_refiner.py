@@ -14,7 +14,7 @@ from sglang.multimodal_gen.configs.models.dits.magi2 import (
     Magi2RefinerConfig,
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_block
-from sglang.multimodal_gen.runtime.layers.attention.magi2_block_grid_attention import (
+from sglang.multimodal_gen.runtime.models.dits.magi2_block_grid_attention import (
     SEQ_BUCKET,
     Magi2BlockGrid,
     cached_block_scan_order,

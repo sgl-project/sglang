@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
-import os
-
-import torch
+from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.magi2 import Magi2PipelineConfig
 from sglang.multimodal_gen.configs.sample.magi2 import Magi2SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.loader.component_loaders.magi2_loader import (
+    Magi2AudioVAELoader,
+    Magi2PreviewDiTLoader,
+    Magi2RefinerDiTLoader,
+    Magi2TextEncoderLoader,
+    Magi2TokenizerLoader,
+    Magi2TurboVAELoader,
+    Magi2VideoVAELoader,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     ComponentResidencyStrategy,
 )
@@ -27,40 +34,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     Magi2TimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 
-logger = init_logger(__name__)
-
-
-def _build_expert_parallel_group(server_args: ServerArgs):
-    """``None`` for a single-rank deployment, so the MoE skips its collectives."""
-    import torch.distributed as dist
-
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_dit_group,
-    )
-
-    if not dist.is_initialized():
-        return None
-
-    world_size = dist.get_world_size(group=get_dit_group())
-    ep_size = server_args.pipeline_config.ep_size or world_size
-    if ep_size <= 1:
-        return None
-
-    # Rank within the DIT group, not the global rank: the subgroups below are
-    # built over DIT-group ranks.
-    rank = dist.get_rank(group=get_dit_group())
-    my_group = None
-    # new_group is collective: all ranks enter every group, keep the one they are in.
-    for start in range(0, world_size, ep_size):
-        ranks = list(range(start, start + ep_size))
-        group = dist.new_group(ranks=ranks)
-        if rank in ranks:
-            my_group = group
-
-    logger.info("[magi2] expert parallel: world=%d ep=%d", world_size, ep_size)
-    return my_group
+# The checkpoint has no model_index.json and is not a diffusers tree: each
+# component sits in its own directory, named apart from its module.
+_COMPONENT_DIRS: dict[str, str] = {
+    "transformer": "preview",
+    "transformer_2": "refiner",
+    "text_encoder": "text_encoder",
+    "tokenizer": "text_encoder",
+    "vae": "vae",
+    "turbo_vae": "turbo_vae",
+    "audio_vae": "stable-audio-open-1.0",
+}
 
 
 class Magi2Pipeline(ComposedPipelineBase):
@@ -69,7 +55,16 @@ class Magi2Pipeline(ComposedPipelineBase):
     pipeline_config_cls = Magi2PipelineConfig
     sampling_params_cls = Magi2SamplingParams
 
-    _required_config_modules = []
+    _required_config_modules = list(_COMPONENT_DIRS)
+    component_loaders = {
+        "transformer": Magi2PreviewDiTLoader,
+        "transformer_2": Magi2RefinerDiTLoader,
+        "text_encoder": Magi2TextEncoderLoader,
+        "tokenizer": Magi2TokenizerLoader,
+        "vae": Magi2VideoVAELoader,
+        "turbo_vae": Magi2TurboVAELoader,
+        "audio_vae": Magi2AudioVAELoader,
+    }
 
     def validate_disagg_role(self, role: RoleType) -> None:
         # add_stage silently drops role_affinity mismatches, yielding an empty pipeline.
@@ -79,38 +74,31 @@ class Magi2Pipeline(ComposedPipelineBase):
                 f"disaggregation role {role.value!r} is not supported"
             )
 
-    def load_modules(
-        self,
-        server_args: ServerArgs,
-        loaded_modules: dict[str, torch.nn.Module] | None = None,
-    ) -> dict:
-        """Bypasses the base, whose unconditional ``_load_config`` needs a ``model_index.json`` this checkpoint lacks."""
-        from sglang.multimodal_gen.runtime.loader.component_loaders.magi2_loader import (
-            load_magi2_modules,
+    def _load_config(self) -> dict[str, Any]:
+        self.model_path = maybe_download_model(
+            self.model_path, revision=self.server_args.revision
         )
+        config = self.server_args.pipeline_config
+        return {
+            "_class_name": self.pipeline_name,
+            "_diffusers_version": "0.36.0",
+            "transformer": ["diffusers", "Magi2PreviewDiT"],
+            # null drops a disabled tier from the required modules.
+            "transformer_2": (
+                ["diffusers", "Magi2RefinerDiT"] if config.enable_refiner else None
+            ),
+            "text_encoder": ["transformers", "Qwen3_5TextModel"],
+            "tokenizer": ["transformers", "AutoTokenizer"],
+            "vae": ["diffusers", "AutoencoderKLWan"],
+            "turbo_vae": (
+                ["diffusers", "Magi2TurboVAE"] if config.use_turbo_vae else None
+            ),
+            "audio_vae": ["diffusers", "Magi2AudioVAE"],
+        }
 
-        if loaded_modules:
-            return dict(loaded_modules)
-
-        # initialize_pipeline runs after load_modules, so the base class has not yet
-        # resolved the HF model ID to a local snapshot path. Resolve it here so the
-        # loader can open the safetensors shards by file path.
-        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-            maybe_download_model,
-        )
-
-        if not os.path.isdir(self.model_path):
-            self.model_path = maybe_download_model(
-                self.model_path,
-                revision=server_args.revision,
-            )
-            logger.info("[magi2] resolved model path: %s", self.model_path)
-
-        # Not in initialize_pipeline: that hook runs after load_modules, but the MoE
-        # takes its process group at construction time.
-        self.ep_group = _build_expert_parallel_group(server_args)
-        return load_magi2_modules(
-            server_args=server_args, pipeline=self, ep_group=self.ep_group
+    def _resolve_component_path(self, server_args, module_name, load_module_name):
+        return super()._resolve_component_path(
+            server_args, module_name, _COMPONENT_DIRS[module_name]
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:

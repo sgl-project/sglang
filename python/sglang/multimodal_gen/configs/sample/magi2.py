@@ -92,20 +92,50 @@ class Magi2SamplingParams(SamplingParams):
                 f"MAGI-2 supports {MAGI2_RESOLUTIONS}, got {self.width}x{self.height}"
             )
 
-        # Tolerance: causal decode yields 4k+1 frames, and num_frames is rounded up
-        # so the latent count divides the sequence-parallel degree.
+        if (self.preview_width, self.preview_height) not in MAGI2_RESOLUTIONS:
+            raise ValueError(
+                f"preview_width/preview_height must be one of {MAGI2_RESOLUTIONS}; "
+                f"got {self.preview_width}x{self.preview_height}"
+            )
+
+        # The clip length is fixed: both preview and refiner grids derive their
+        # time dimension from MAGI2_BASE_FRAMES, not from this field. The ±5%
+        # window accommodates the per-GPU rounding that _adjust applies
+        # (e.g. 253 at 4/8 GPUs); values outside it are almost certainly wrong.
         nominal_frames = MAGI2_CLIP_SECONDS * self.fps
         if abs(self.num_frames - nominal_frames) > 0.05 * nominal_frames:
             raise ValueError(
-                f"MAGI-2 only generates {MAGI2_CLIP_SECONDS:g}s clips, i.e. "
-                f"about {round(nominal_frames)} frames at fps={self.fps}; got "
-                f"{self.num_frames}"
+                f"MAGI-2 only generates {MAGI2_CLIP_SECONDS:g}s clips "
+                f"({round(nominal_frames)} frames at fps={self.fps}); "
+                f"got num_frames={self.num_frames}. The actual clip length is "
+                "always fixed by the model; this field is validated but ignored."
             )
 
         if self.num_inference_steps is not None and self.num_inference_steps < 1:
             raise ValueError("num_inference_steps must be >= 1")
         if self.refiner_num_inference_steps < 1:
             raise ValueError("refiner_num_inference_steps must be >= 1")
+
+        for name in ("attention_backend_override", "skip_softmax_params"):
+            if getattr(self, name, None) is not None:
+                raise ValueError(
+                    f"MAGI-2 does not support per-request {name}; set it to None"
+                )
+
+    def _validate_with_pipeline_config(self, pipeline_config) -> None:
+        super()._validate_with_pipeline_config(pipeline_config)
+        # When the refiner is disabled the server can only deliver 896×512.
+        # Silently downgrading a 1920×1088 request would produce a file whose
+        # size disagrees with the job metadata; reject it explicitly instead.
+        if (
+            not getattr(pipeline_config, "enable_refiner", True)
+            and (self.width, self.height) != (self.preview_width, self.preview_height)
+        ):
+            raise ValueError(
+                f"This server runs MAGI-2 in preview-only mode and can only deliver "
+                f"{self.preview_width}x{self.preview_height}; "
+                f"got {self.width}x{self.height}"
+            )
 
     def prepare_synthetic_warmup_request_for_queue(
         self, req: Any, server_args: Any

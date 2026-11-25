@@ -182,7 +182,9 @@ class Magi2DenoisingStage(DenoisingStage):
 
 
 def _reject_unsupported_overrides(batch: Req) -> None:
-    # The base stage applies these in _prepare_denoising_loop, which this loop never calls.
+    # Magi2SamplingParams._validate rejects these at request time (before queueing).
+    # This guard is a defence-in-depth fallback for requests that bypass _validate
+    # (e.g. loaded via loaded_modules without HTTP validation).
     params = batch.sampling_params
     for name, value in (
         ("attention_backend_override", params.attention_backend_override),
