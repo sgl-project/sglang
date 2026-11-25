@@ -99,7 +99,7 @@ impl NormalizedPDRouting {
 /// Python's router header override (`request_headers.py`), when enabled.
 const OVERRIDE_HEADER: &str = "x-override-routed-dp-rank";
 /// Python's OpenAI header (`OpenAIServingBase.extract_routed_dp_rank_from_header`).
-const DATA_PARALLEL_RANK_HEADER: &str = "x-data-parallel-rank";
+pub(crate) const DATA_PARALLEL_RANK_HEADER: &str = "x-data-parallel-rank";
 
 /// An OpenAI route Python reads `routed_dp_rank` on, and which headers it
 /// reads it from.
@@ -147,7 +147,7 @@ impl HintRoute {
 /// Python's `int(text)` for an ASCII decimal: surrounding whitespace, a sign,
 /// and single underscores between digits. A value past `i64` saturates, so
 /// the range check refuses it rather than the parse.
-fn python_int(text: &str) -> Option<i64> {
+pub(crate) fn python_int(text: &str) -> Option<i64> {
     let text = text.trim();
     let (negative, digits) = match text.as_bytes().first()? {
         b'-' => (true, &text[1..]),
