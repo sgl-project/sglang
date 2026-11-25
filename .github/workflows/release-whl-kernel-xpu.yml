@@ -66,7 +66,7 @@ jobs:
             --build-arg SG_LANG_BRANCH=main \
             --build-arg SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git \
             --build-arg SG_LANG_KERNEL_BRANCH=${{ steps.xpu_meta.outputs.branch }} \
-            --no-cache --progress=plain \
+            --pull --no-cache --progress=plain \
             -t "${IMAGE}"
           echo "XPU_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
 
