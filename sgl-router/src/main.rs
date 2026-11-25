@@ -428,7 +428,11 @@ fn build_app_context(
             let tree = engine_state.tree();
             tree.media().enable(ttl);
             tree.media_ranks().enable(ttl);
-            let ids = app_context.tokenizers.media_token_ids().to_vec();
+            let ids = app_context
+                .preprocessor
+                .tokenizers()
+                .media_token_ids()
+                .to_vec();
             if ids.is_empty() {
                 tracing::warn!(
                     "--cache-media-affinity-ttl-ms is set but the tokenizer declares no image \
