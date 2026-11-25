@@ -1225,7 +1225,9 @@ class MqaAttentionBase(nn.Module):
     def use_flashinfer_mxfp8_wo_b(self) -> bool:
         """Whether wo_b consumes FlashInfer-swizzled MXFP8, so wo_a can fuse the
         quantization into its epilogue. Not known until wo_b's weights load."""
-        quant_method = self.wo_b.quant_method
+        # Test harnesses stand non-module objects in for wo_b, so the fetch must
+        # tolerate a missing quant_method (isinstance(None, ...) is False).
+        quant_method = getattr(self.wo_b, "quant_method", None)
         # Fp8LinearMethod sets `block_fp8_mxfp8_ready` on the layer while its
         # weights load, only under the method's `block_fp8_as_mxfp8` gate.
         ok = (
