@@ -6,6 +6,10 @@ A name is ``None`` where the platform has no kernel for it.
 from sglang._lazy_import import LazyImport
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
 
+# Only the NPU wheel ships a fused top-p/top-k kernel today. Where the name is
+# None the caller runs the two single-filter kernels in sequence.
+top_k_top_p_renorm_prob = None
+
 if is_cuda():
     # Resolved on first call: CUDA builds without FlashInfer must still import
     # this module.
@@ -24,6 +28,13 @@ elif is_npu():
     except ImportError:
         top_k_renorm_prob = None
         top_p_renorm_prob = None
+
+    # Newer than the two kernels above, and optional: a wheel that predates it
+    # keeps the two-step path instead of failing to import.
+    try:
+        from sgl_kernel_npu.operators.sample import top_k_top_p_renorm_prob
+    except ImportError:
+        pass
 elif is_musa() or is_xpu():
     try:
         from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
@@ -34,4 +45,4 @@ else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
 
-__all__ = ["top_k_renorm_prob", "top_p_renorm_prob"]
+__all__ = ["top_k_renorm_prob", "top_k_top_p_renorm_prob", "top_p_renorm_prob"]

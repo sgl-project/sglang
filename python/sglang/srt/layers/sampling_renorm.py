@@ -95,6 +95,23 @@ def _top_k_renorm_prob(
     return _platform.top_k_renorm_prob(probs, top_k)
 
 
+def joint_top_k_top_p_renorm_prob(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    max_keep: Optional[int] = None,
+) -> torch.Tensor:
+    """Apply top-p to the original distribution, then top-k, in one pass.
+
+    The fused kernel filters only the leading max_keep columns, which is exact
+    when that bound covers every row's top-k. Without a bound, or on a platform
+    without the kernel, the two single-filter kernels run in sequence.
+    """
+    if _platform.top_k_top_p_renorm_prob is not None and max_keep:
+        return _platform.top_k_top_p_renorm_prob(probs, top_ks, top_ps, int(max_keep))
+    return _top_k_renorm_prob(_top_p_renorm_prob(probs, top_ps), top_ks)
+
+
 def min_p_renorm_prob(probs: torch.Tensor, min_ps: torch.Tensor) -> torch.Tensor:
     """Zero each row's probabilities below ``min_ps`` times its largest one and
     renormalize, in place: the sampler's min-p, applied after top-k and top-p."""
@@ -110,6 +127,7 @@ top_k_renorm_prob = (
 )
 
 __all__ = [
+    "joint_top_k_top_p_renorm_prob",
     "min_p_renorm_prob",
     "renorm_deterministic",
     "top_k_renorm_prob",

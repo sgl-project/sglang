@@ -27,6 +27,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
 from sglang.srt.layers.sampling_renorm import (
+    joint_top_k_top_p_renorm_prob,
     min_p_renorm_prob,
     top_k_renorm_prob,
     top_p_renorm_prob,
@@ -699,6 +700,21 @@ def _apply_joint_top_k_top_p(
     top_p_renorm_prob,
 ) -> torch.Tensor:
     """Apply top-p to the original distribution before top-k renormalization."""
+    if (
+        sampling_info.need_top_p_sampling
+        and sampling_info.need_top_k_sampling
+        and sampling_info.max_top_k
+    ):
+        # One kernel for both filters; max_top_k bounds the rows that can
+        # survive, so the fusion does not need a full-vocabulary pass.
+        probs = joint_top_k_top_p_renorm_prob(
+            probs,
+            torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+            torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            max_keep=sampling_info.max_top_k,
+        )
+        maybe_detect_nan(probs, "verify: target_probs after joint top-p/top-k renorm")
+        return probs
     if sampling_info.need_top_p_sampling:
         probs = top_p_renorm_prob(
             probs,
