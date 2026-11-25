@@ -185,11 +185,16 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
-_gdn_online_mxfp4 = (
-    ("in_proj_qkvz", "out_proj")
-    if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
-    else ()
-)
+
+
+def _get_gdn_online_mxfp4() -> Tuple[str, ...]:
+    return (
+        ("in_proj_qkvz", "out_proj")
+        if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
+        else ()
+    )
+
+
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
@@ -512,14 +517,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
-        if _gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+        gdn_online_mxfp4 = _get_gdn_online_mxfp4()
+        if gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
                 AiterMxfp4OnlineLinearMethod,
             )
 
             # The loader quantizes these in process_weights_after_loading.
             # gemm_a4w4 needs N, K % 256 == 0; other shapes stay BF16.
-            for name in _gdn_online_mxfp4:
+            for name in gdn_online_mxfp4:
                 proj = getattr(self, name)
                 if (
                     isinstance(proj.quant_method, UnquantizedLinearMethod)
@@ -1872,23 +1878,24 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+            gdn_online_mxfp4 = _get_gdn_online_mxfp4()
             packed = 0
             mxfp4 = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
                     mxfp4 += sum(
                         hasattr(getattr(module, name, None), "mxfp4_preshuffle_tuned")
-                        for name in _gdn_online_mxfp4
+                        for name in gdn_online_mxfp4
                     )
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
-            if _gdn_online_mxfp4:
+            if gdn_online_mxfp4:
                 logger.info(
                     "Online MXFP4 GDN %s: %d projections",
-                    ",".join(_gdn_online_mxfp4),
+                    ",".join(gdn_online_mxfp4),
                     mxfp4,
                 )
 
