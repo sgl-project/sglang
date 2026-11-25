@@ -39,9 +39,8 @@ on:
 
 concurrency:
   group: release-docker-ci-${{ inputs.gpu_family || 'blackwell' }}-${{ inputs.tag || 'nightly' }}
-  # Runs that publish the rolling tag queue behind each other, so a manual
-  # dispatch never cancels a running build (a newer run still replaces a pending
-  # one); custom-tag runs replace older ones.
+  # Rolling-tag runs queue rather than cancel a running build (a newer run still
+  # replaces a pending one); custom-tag runs replace older ones.
   cancel-in-progress: ${{ inputs.tag != '' }}
 
 permissions:
