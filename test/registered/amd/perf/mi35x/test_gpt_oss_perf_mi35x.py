@@ -5,7 +5,7 @@ openai/gpt-oss-120b) with the same TP8 AITER server configuration the MI35x
 GPT-OSS accuracy test uses, so a throughput change here points at the
 serving stack rather than at a different recipe.
 
-Registry: nightly-perf-8-gpu-mi35x-gpt-oss suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-gpt-oss suite
 
 Example usage:
     python3 test_gpt_oss_perf_mi35x.py
@@ -20,7 +20,9 @@ from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - MI35x GPT-OSS perf benchmark (~60 min for both sizes)
-register_amd_ci(est_time=3600, suite="nightly-perf-8-gpu-mi35x-gpt-oss", nightly=True)
+register_amd_ci(
+    est_time=3600, suite="nightly-perf-test-8-gpu-amd-mi35x-gpt-oss", nightly=True
+)
 
 RESULT_DIR = "performance_results_gpt_oss_mi35x"
 

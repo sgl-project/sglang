@@ -1,4 +1,5 @@
 import json
+import logging
 from abc import ABC, abstractmethod
 from array import array
 from functools import lru_cache
@@ -13,6 +14,9 @@ from sglang.srt.models.unlimited_ocr_v2_support.window_params import KEY_LOOKAHE
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+logger = logging.getLogger(__name__)
 
 UOCR_PAGE_GUARD_PROCESSOR = "sglang:uocr-page-guard"
 
@@ -505,3 +509,54 @@ class _RowEdits:
             logits.index_put_(
                 (rows[n_forced:], cols[n_forced:]), logits.new_full((), -float("inf"))
             )
+
+
+def apply_custom_logit_processor(
+    logits: torch.Tensor,
+    sampling_info: "SamplingBatchInfo",
+    *,
+    rows_per_request: int = 1,
+):
+    """Apply each request's custom logit processor to its `rows_per_request`
+    consecutive logits rows, in place."""
+    if not sampling_info.has_custom_logit_processor:
+        return
+
+    batch_size = len(sampling_info.custom_params)
+    assert logits.shape[0] == batch_size * rows_per_request, (
+        f"The batch size of logits ({logits.shape[0]}) does not match the number of "
+        f"custom params ({batch_size}) x rows_per_request ({rows_per_request})"
+    )
+
+    token_offsets = (
+        None
+        if rows_per_request == 1
+        else torch.arange(rows_per_request, device=sampling_info.device)
+    )
+    for entry in sampling_info.custom_logit_processor.values():
+        rows, indices = entry.rows, entry.indices
+        custom_params = [
+            sampling_info.custom_params[i]
+            for i in rows
+            for _ in range(rows_per_request)
+        ]
+        if len(rows) == batch_size:
+            # Rows are ascending and duplicate-free, so every row opted in and
+            # gather and scatter-back are the identity.
+            result = entry.processor(logits, custom_params)
+            if result is not logits:
+                # The gather path scatters the return value back implicitly, so
+                # a processor that builds a fresh tensor must still land here.
+                logits.copy_(result)
+        else:
+            if token_offsets is not None:
+                indices = (
+                    indices[:, None] * rows_per_request + token_offsets
+                ).flatten()
+            selected = logits.index_select(0, indices)
+            result = entry.processor(selected, custom_params)
+            logits.index_copy_(0, indices, result.to(logits.dtype))
+
+        logger.debug(
+            f"Custom logit processor {entry.processor.__class__.__name__} is applied."
+        )

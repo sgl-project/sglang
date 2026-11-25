@@ -111,7 +111,7 @@ def _init_state():
 
 @marker.parametrize("hidden", HIDDENS)
 @marker.parametrize("num_tokens", NUM_TOKENS)
-@marker.benchmark("provider", PROVIDERS)
+@marker.benchmark("provider", PROVIDERS, gate=["mm_safe", "mm", "mm_skipsync"])
 def benchmark(num_tokens: int, hidden: int, provider: str):
     gpu_group = _init_nccl_group()
     state = _init_state()

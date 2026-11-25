@@ -10,6 +10,9 @@ from sglang.test.kernels.qknorm import torch_impl_qknorm
 register_cuda_ci(
     est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
+register_cuda_ci(
+    est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
+)
 
 alt_stream = torch.cuda.Stream()
 
@@ -44,7 +47,7 @@ FN_MAP = {
 @marker.parametrize("GQA", [4, 8], [4])
 @marker.parametrize("num_kv_heads", [1, 2, 4, 8], [1])
 @marker.parametrize("batch_size", [2**n for n in range(0, 14)], [16])
-@marker.benchmark("impl", ["aot", "jit", "torch"])
+@marker.benchmark("impl", ["aot", "jit", "torch"], gate=["jit"])
 def benchmark(head_dim: int, GQA: int, num_kv_heads: int, batch_size: int, impl: str):
     num_qo_heads = GQA * num_kv_heads
     q = create_random(batch_size, num_qo_heads, head_dim)
