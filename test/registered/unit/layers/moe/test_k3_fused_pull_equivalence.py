@@ -1,6 +1,6 @@
-"""One pull over the K3 [latent | shared] buffer (SHARED_AR_ORDER=fused) against the two
-pulls it replaces, without a GPU: the index arithmetic of both ar_fusion.cuh kernels is
-transcribed and run for every rank, and the source lines it rests on are pinned. The
+"""One pull over the K3 [latent | shared] buffer (a MegaMoE kernel call) against the two
+pulls of a stock call, without a GPU: the index arithmetic of both ar_fusion.cuh kernels
+is transcribed and run for every rank, and the source lines it rests on are pinned. The
 model: a multicast reduce load returns the same value whichever rank issues it."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -168,7 +168,7 @@ class TestFusedPullEquivalence(CustomTestCase):
         for n in (1, 5, 12, 13, 40, 73, 74, 80, 81, 120, 160, 200, 235, 256):
             self.check(n, plan_split(n), "split")
             self.check(n, plan_fused(n), "fused")
-        # the fused pull with a launch geometry override
+        # the fused pull at other launch geometries of the kernel
         for blocks, unroll in ((1, 2), (12, 4), (16, 8), (64, 16)):
             for n in (80, 235):
                 self.check(n, plan_fused(n, blocks, unroll), (blocks, unroll))
@@ -183,10 +183,8 @@ class TestFusedPullEquivalence(CustomTestCase):
             )
             split = execute(plan_split(n), per_rank, weight, eps)
             fused = execute(plan_fused(n), per_rank, weight, eps)
-            tuned = execute(plan_fused(n, 16, 4), per_rank, weight, eps)
             self.assertFalse(torch.isnan(split.float()).any())
             self.assertTrue(bits_equal(split, fused), n)
-            self.assertTrue(bits_equal(split, tuned), n)
             # and both are the plain definition: all-reduce, then RMSNorm of the n rows
             reduced = mc_reduce(per_rank)
             self.assertTrue(bits_equal(fused[n * NORM_DIM :], reduced[n * NORM_DIM :]))

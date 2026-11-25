@@ -1765,32 +1765,21 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         fused_norm = False
         if self.alt_stream is not None and k3_ar_fusion.enabled():
-            # "overlap" (the stock order) for a trtllm-gen call. A call on the
-            # MegaMoE kernel cannot share the GPU with the shared experts' AR
-            # (see k3_deepgemm_routed.shared_ar_order): "before" / "after" run
-            # that AR ahead of the kernel or behind the latent AR instead, and
-            # "fused" reduces latent and shared in one pull behind the kernel.
-            # A sequence-parallel pass (scatters) is prefill, which the kernel
-            # never takes: it keeps the stock order.
-            shared_ar = (
-                "overlap"
-                if scatters
-                else k3_deepgemm_routed.shared_ar_order(self.experts, num_tokens)
+            # A call on the MegaMoE kernel cannot share the GPU with the shared
+            # experts' AR (see k3_deepgemm_routed.handles): latent and shared are
+            # reduced in one pull behind the kernel. A sequence-parallel pass
+            # (scatters) is prefill, which the kernel never takes.
+            fused_pull = not scatters and k3_deepgemm_routed.handles(
+                self.experts, num_tokens
             )
             defer_finalize = (
                 not scatters
                 and self._defer_moe_finalize
                 and self.fuse_ar_norm
                 and k3_ar_fusion.finalize_push_fits(num_tokens)
-                # the MegaMoE kernel finalizes in-kernel: its calls take the
-                # in-op branch below (finalized latent, then all_reduce_norm)
-                and not k3_deepgemm_routed.handles(self.experts, num_tokens)
+                # the MegaMoE kernel finalizes in-kernel
+                and not fused_pull
             )
-            # "fused" needs the finalized latent in the buffer; a call that
-            # defers its finalize into the push AR keeps a separate shared AR
-            if shared_ar == "fused" and defer_finalize:
-                shared_ar = "before"
-            fused_pull = shared_ar == "fused"
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             if sharded:
@@ -1801,7 +1790,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 router_logits, routed_input = self._sharded_front_gather(
                     front_block, hidden_states
                 )
-                if shared_ar not in ("after", "fused"):
+                if fused_pull:
+                    # the kernel starts on an idle GPU, behind the shared GEMM
+                    current_stream.wait_stream(self.alt_stream)
+                else:
                     self.alt_stream.wait_stream(current_stream)
                     with torch.cuda.stream(self.alt_stream):
                         if scatters:
@@ -1810,10 +1802,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                             )
                         else:
                             k3_ar_fusion.all_reduce_low_sm(shared_output)
-                if shared_ar != "overlap":
-                    # the kernel starts on an idle GPU: behind the shared GEMM
-                    # ("after", "fused") or behind the shared AR as well ("before")
-                    current_stream.wait_stream(self.alt_stream)
             elif fused_pull:
                 # unsharded front: the shared GEMM runs ahead of the kernel
                 # here too, so that the one pull behind the kernel finds both
@@ -1828,9 +1816,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
             if not sharded and not fused_pull:
-                if shared_ar != "overlap":
-                    # unsharded front: the shared GEMM and its AR follow the kernel
-                    self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     self._forward_shared(gate_up, shared_output)
                     # low-SM pull so the side-stream AR leaves the SMs to the
@@ -1843,9 +1828,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                         k3_ar_fusion.all_reduce_low_sm(
                             shared_output, num_blocks=4, unroll=8
                         )
-            shared_ar_pending = sharded and shared_ar == "after"
-            if not shared_ar_pending:
-                current_stream.wait_stream(self.alt_stream)
+            current_stream.wait_stream(self.alt_stream)
             # The latent AR must stay serialized after the shared AR (both
             # reuse the v2 pull semaphores); the join above does it.
             if scatters:
@@ -1862,19 +1845,14 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     *self._get_fused_norm_params(),
                 )
             elif fused_pull:
-                # ONE collective over the flat [latent | shared] pair, as in the
-                # single-stream branch below: the shared GEMM finished before
-                # the kernel started and the kernel is this stream's previous
-                # launch, so both halves are written. No shared AR is queued
-                # anywhere for this call: the tail reads shared_output from
-                # this stream's own chain (pull -> slice GEMM -> gather_add3).
+                # one collective over the flat [latent | shared] pair, as in the
+                # single-stream branch below; both halves are already written
                 if self.fuse_ar_norm:
                     fused_norm = True
                     k3_ar_fusion.all_reduce_norm(
                         buf.view(-1, k3_ar_fusion.NORM_DIM),
                         *self._get_fused_norm_params(),
                         num_tokens=num_tokens,
-                        **k3_deepgemm_routed.fused_pull_tuning(),
                     )
                 else:
                     k3_ar_fusion.all_reduce(buf)
@@ -1887,13 +1865,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 )
             else:
                 k3_ar_fusion.all_reduce(latent)
-            if shared_ar_pending:
-                # "after": the shared AR is serialized behind the latent AR (the
-                # same pull semaphores, the other order) and runs next to the
-                # tail's local GEMM; whoever reads shared_output joins it first
-                self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    k3_ar_fusion.all_reduce_low_sm(shared_output)
             # the gemm_ag tail wants the normed latent straight out of the
             # fused-norm AR (its GEMV chains on it via PDL)
             if (
@@ -1906,10 +1877,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     self.routed_expert_up_proj.weight,  # type: ignore
                     shared_output,
                     prefix_sum,
-                    b_stream=self.alt_stream if shared_ar_pending else None,
                 )
-            if shared_ar_pending:
-                current_stream.wait_stream(self.alt_stream)
         else:  # single collective over the flat [latent | shared] pair
             self._forward_shared(gate_up, shared_output)
             self._forward_routed(hidden_states, router_logits, routed_input, latent)

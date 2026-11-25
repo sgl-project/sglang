@@ -30,8 +30,7 @@ TABLE = dict(widths=BASE, widths_ar_fusion=AR_FUSION)
 PREFIX = "SGLANG_K3_ROUTED_MOE_DEEPGEMM"
 FUSION = "SGLANG_K3_AR_FUSION"
 BUNDLE = "SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION"
-SUFFIXES = ("", "_WEIGHT_PLACEMENT", "_DISPATCH", "_VERIFY_WIDTHS")
-CONTROLS = (*(PREFIX + suffix for suffix in SUFFIXES), FUSION, BUNDLE)
+CONTROLS = (PREFIX, PREFIX + "_VERIFY_WIDTHS", FUSION, BUNDLE)
 ON = {PREFIX: True}
 # Largest row count whose finalize the push all-reduce folds under SGLANG_K3_AR_FUSION
 FOLD_MAX_ROWS = 73
@@ -272,14 +271,13 @@ class TestDispatch(CustomTestCase):
             ({FUSION: True}, AR_FUSION),
             ({BUNDLE: True}, AR_FUSION),
             ({FUSION: False, BUNDLE: True}, BASE),  # the AR fusion switch wins
-            ({PREFIX + "_DISPATCH": False}, []),
         ):
             with self.subTest(switches=switches), _env(**ON, table=TABLE, **switches):
                 self.assertEqual(_taken(), want)
                 # prefill / extend / plain decode never dispatch
                 self.assertEqual(_taken(verify=False), [])
 
-    def test_bad_table_or_placement_fails_when_read(self):
+    def test_bad_table_fails_when_read(self):
         missing = {PREFIX + "_VERIFY_WIDTHS": "/nonexistent/widths.json"}
         with _env(**ON, **missing), self.assertRaises(FileNotFoundError):
             policy.verify_widths()
@@ -289,9 +287,6 @@ class TestDispatch(CustomTestCase):
                 policy.verify_widths()
         with _env(**ON, table=dict(widths=BASE), **{FUSION: True}):  # no fused list
             self.assertRaises(ValueError, policy.verify_widths)
-        placement = {PREFIX + "_WEIGHT_PLACEMENT": "majority"}
-        with _env(**ON, **placement), self.assertRaises(ValueError):
-            policy.weight_placement()
 
     def test_handles(self):
         prepared = types.SimpleNamespace(mega_l1_weights=(object(), object()))
@@ -308,11 +303,11 @@ class TestDispatch(CustomTestCase):
 class TestFallback(CustomTestCase):
     """Switch on: what does not qualify keeps the default path and says so once."""
 
-    def _wanted(self, layers, *, capability=None, sm=(10, 7), placement=None, env=None):
+    def _wanted(self, layers, *, capability=None, sm=(10, 7), placement=None):
         warnings = []
         deep_gemm = types.SimpleNamespace(get_num_locality_domains=lambda: 2)
         with (
-            _env(**ON, table=TABLE, **(env or {})),
+            _env(**ON, table=TABLE),
             mock.patch.object(routed, "missing_capability", lambda: capability),
             mock.patch.object(torch.distributed, "is_initialized", lambda: True),
             mock.patch.object(routed, "_deep_gemm", lambda: deep_gemm),
@@ -330,10 +325,6 @@ class TestFallback(CustomTestCase):
 
     def test_qualifying_layer(self):
         self.assertEqual(self._wanted([_layer()]), ([True], []))
-        # the default placement needs no placement API
-        default = {PREFIX + "_WEIGHT_PLACEMENT": "default"}
-        got = self._wanted([_layer()], placement="unavailable", env=default)
-        self.assertEqual(got, ([True], []))
 
     def test_deep_gemm_without_the_api(self):
         reason = "deep_gemm 0.2.9 lacks the one-rank MegaMoE API (numerics)"
@@ -411,16 +402,6 @@ class TestAssumptions(CustomTestCase):
         with mock.patch.object(k3_ar_fusion, "_get_state", return_value=state):
             self.assertTrue(k3_ar_fusion.finalize_push_fits(FOLD_MAX_ROWS))
             self.assertFalse(k3_ar_fusion.finalize_push_fits(FOLD_MAX_ROWS + 1))
-
-    def test_deferral_gate(self):
-        from sglang.srt.models import kimi_k3
-
-        source = inspect.getsource(kimi_k3.KimiK3MoE._forward_fused)
-        start = source.index("defer_finalize = (")
-        gate = source[start : source.index("\n            )\n", start)]
-        # only the push-window rule and the MegaMoE check decide for a verify batch
-        self.assertIn("k3_ar_fusion.finalize_push_fits(num_tokens)", gate)
-        self.assertIn("not k3_deepgemm_routed.handles(self.experts, num_tokens)", gate)
 
     def test_load_keeps_the_trtllm_workspace(self):
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod

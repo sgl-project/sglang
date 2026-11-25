@@ -25,7 +25,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -130,99 +129,18 @@ def mismatch(layer: torch.nn.Module, with_bias: bool, precision: str) -> Optiona
 
 def handles(layer: torch.nn.Module, num_tokens: int) -> bool:
     """Whether a routed call of `num_tokens` rows on this layer runs on the
-    MegaMoE kernel. That kernel finalizes (top-k weighted combine) in-kernel, so
-    a caller that would defer the finalize into its all-reduce
-    (SGLANG_K3_AR_FUSION) must not defer such a call."""
+    MegaMoE kernel. Under SGLANG_K3_AR_FUSION such a call changes two things in
+    KimiK3MoE._forward_fused. The kernel finalizes (top-k weighted combine)
+    in-kernel, so the finalize is not deferred into the all-reduce. And the
+    kernel is persistent, one CTA per SM, so the shared experts' pull cannot
+    overlap it as it overlaps trtllm-gen (measured on Kimi K3.1, EP8: +7.0 ms
+    per verify round at 80 rows): latent and shared are reduced in one pull
+    behind the kernel instead."""
     if getattr(layer, "mega_l1_weights", None) is None:
         return False
     from sglang.srt.layers.moe.k3_die_local_moe import takes
 
     return takes(num_tokens)
-
-
-_SHARED_AR_ORDERS = ("fused", "after", "before", "overlap")
-_FUSED_PULL_UNROLLS = (2, 4, 8, 16)  # the widths compiled into all_reduce_pull_norm
-
-
-def _fused_pull_env(field) -> Optional[int]:
-    if not field.is_set():
-        return None
-    number = field.get()
-    if number < 1:
-        raise ValueError(f"{field.name} is a positive integer, got {number}")
-    return number
-
-
-@functools.lru_cache(maxsize=1)
-def fused_pull_tuning() -> dict:
-    """Launch geometry of the one pull over the [latent | shared] pair, as
-    keyword arguments of k3_ar_fusion.all_reduce_norm. Empty (the default) =
-    the kernel's own tuned table, which is keyed by the byte size of what it
-    reduces and so already sees the whole pair. The environment is the same on
-    every rank, which the pull's barrier needs (one block count per call)."""
-    blocks = _fused_pull_env(envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM_FUSED_PULL_BLOCKS)
-    unroll = _fused_pull_env(envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM_FUSED_PULL_UNROLL)
-    if unroll is not None and unroll not in _FUSED_PULL_UNROLLS:
-        raise ValueError(
-            f"SGLANG_K3_ROUTED_MOE_DEEPGEMM_FUSED_PULL_UNROLL is one of {_FUSED_PULL_UNROLLS}, got {unroll}"
-        )
-    tuning = {}
-    if blocks is not None:
-        tuning["num_blocks"] = blocks
-    if unroll is not None:
-        tuning["unroll"] = unroll
-    return tuning
-
-
-@functools.lru_cache(maxsize=1)
-def configured_shared_ar_order() -> str:
-    order = envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM_SHARED_AR_ORDER.get()
-    if order not in _SHARED_AR_ORDERS:
-        raise ValueError(
-            f"SGLANG_K3_ROUTED_MOE_DEEPGEMM_SHARED_AR_ORDER is one of {_SHARED_AR_ORDERS}, got {order!r}"
-        )
-    if order == "fused":
-        fused_pull_tuning()  # a bad geometry fails with the order, not mid-forward
-    return order
-
-
-def shared_ar_order(layer: torch.nn.Module, num_tokens: int) -> str:
-    """Where KimiK3MoE._forward_fused puts the shared experts' pull all-reduce
-    under SGLANG_K3_AR_FUSION, relative to this routed call.
-
-    Stock queues it on the side stream right before the routed call ("overlap"):
-    trtllm-gen's blocks leave room for its 16 blocks. The MegaMoE kernel does not:
-    it is persistent, one CTA per SM with the whole register file and shared
-    memory, and it starts with a grid-wide sync. A pull block that reaches an SM
-    first holds the kernel back until every rank has arrived at the pull's
-    barriers; a rank whose kernel got there first only starts its pull when the
-    kernel exits. The two orders mix across ranks and layers, and each mixed
-    layer costs a second kernel time on every rank (measured on Kimi K3.1, EP8:
-    +7.0 ms per verify round at 80 rows, +4.8 ms at 160).
-
-    For a call the kernel takes (:func:`handles`) the order is therefore fixed,
-    the same on every rank
-    (SGLANG_K3_ROUTED_MOE_DEEPGEMM_SHARED_AR_ORDER):
-      after   kernel, latent all-reduce, then the shared all-reduce next to the
-              tail's local up_proj GEMM (A/B control: level with stock, and the
-              two pulls were seen to overlap by about 8 us in the engine)
-      before  shared all-reduce, then the kernel
-      overlap the stock order (the measured regression; A/B control only)
-      fused   (default) kernel, then ONE pull over the whole [latent | shared]
-              pair with the RMSNorm on the latent rows: the collective of
-              _forward_fused's single-stream branch (all_reduce_pull_norm takes the pair
-              with num_norm_rows = the latent rows). One barrier entry and
-              exit instead of two, nothing left on the side stream after the
-              kernel, and no second pull that could meet the first one on the
-              pull semaphores.
-    The same kernels read the same inputs in after / before / overlap (the two
-    all-reduces work on disjoint parts of the [latent | shared] buffer), so the
-    result does not depend on the order. Under fused every element is still
-    reduced once by the same multicast load and the latent rows get the same
-    epilogue; only the rank that issues the load for a given element changes."""
-    if not handles(layer, num_tokens):
-        return "overlap"
-    return configured_shared_ar_order()
 
 
 class _Group:

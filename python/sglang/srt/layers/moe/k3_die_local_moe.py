@@ -47,7 +47,6 @@ logger = logging.getLogger(__name__)
 
 _SWITCH = "SGLANG_K3_ROUTED_MOE_DEEPGEMM"
 _DEFAULT_TABLE = Path(__file__).with_name("k3_die_local_moe_widths.json")
-_PLACEMENTS = ("die_local", "default")
 # Rows of the MegaMoE buffer; no dispatched width may exceed it
 MAX_VERIFY_ROWS = 256
 # (num_experts, num_local_experts, w13 shape, w2 shape) the kernel's shared
@@ -58,16 +57,6 @@ _VALIDATED_SM = (10, 7)
 
 def enabled() -> bool:
     return envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM.get()
-
-
-@functools.lru_cache(maxsize=1)
-def weight_placement() -> str:
-    value = envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM_WEIGHT_PLACEMENT.get()
-    if value not in _PLACEMENTS:
-        raise ValueError(
-            f"{_SWITCH}_WEIGHT_PLACEMENT is one of {_PLACEMENTS}, got {value!r}"
-        )
-    return value
 
 
 @functools.lru_cache(maxsize=1)
@@ -85,7 +74,7 @@ def table_path() -> Path:
 def verify_widths() -> FrozenSet[int]:
     """Row counts of a target-verify call that run on the MegaMoE kernel. Read
     once per process; a malformed table raises (at model load, see `wanted`)."""
-    if not enabled() or not envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM_DISPATCH.get():
+    if not enabled():
         return frozenset()
     path = table_path()
     key = "widths_ar_fusion" if ar_fusion() else "widths"
@@ -104,7 +93,7 @@ def verify_widths() -> FrozenSet[int]:
 
 def reset_caches() -> None:
     """Forget what was read from the environment (tests)."""
-    for cached in (weight_placement, ar_fusion, table_path, verify_widths):
+    for cached in (ar_fusion, table_path, verify_widths):
         cached.cache_clear()
     _seen.clear()
 
@@ -178,14 +167,12 @@ def _ineligible(layer: torch.nn.Module) -> Optional[str]:
             f"expert shape {shape} (experts, experts per rank, FC1, FC2) is not one "
             f"the shared weight layout was validated for: {_VALIDATED_SHAPES}"
         )
-    if weight_placement() == "die_local":
-        for name in ("w13_weight", "w2_weight"):
-            weight = getattr(layer, name)
-            reason = _placement_unavailable(
-                tuple(weight.shape), weight.element_size(), device
-            )
-            if reason is not None:
-                return reason
+    for weight in (layer.w13_weight, layer.w2_weight):
+        reason = _placement_unavailable(
+            tuple(weight.shape), weight.element_size(), device
+        )
+        if reason is not None:
+            return reason
     return None
 
 
@@ -375,15 +362,14 @@ def _empty_die_local(shape, dtype: torch.dtype, device) -> torch.Tensor:
 
 
 def stack_final(parts: List[torch.Tensor]) -> torch.Tensor:
-    """`torch.stack(parts)` as the layer's final `[E, N, K]` weight: on
-    die-local pages (SGLANG_K3_ROUTED_MOE_DEEPGEMM_WEIGHT_PLACEMENT=die_local,
-    the default) or in torch's allocator (`default`, the A/B control)."""
+    """`torch.stack(parts)` as the layer's final `[E, N, K]` weight, on
+    die-local pages."""
     first = parts[0]
     device = first.device
     # Die-local weights are allocated outside torch's allocator, which would
     # keep the checkpoint and permute slabs it no longer uses: hand idle blocks
     # back before the next final allocation (the engine sizes its KV pool from
-    # free device memory). Model loading only; the same rule for both placements.
+    # free device memory). Model loading only.
     reserved = torch.cuda.memory_reserved(device)
     allocated = torch.cuda.memory_allocated(device)
     free_before = torch.cuda.mem_get_info(device)[0]
@@ -398,8 +384,6 @@ def stack_final(parts: List[torch.Tensor]) -> torch.Tensor:
             free_before,
             torch.cuda.mem_get_info(device)[0],
         )
-    if weight_placement() == "default":
-        return torch.stack(parts)
     with torch.cuda.device(device):
         dest = _empty_die_local((len(parts), *first.shape), first.dtype, device)
     torch.stack(parts, out=dest)
@@ -425,13 +409,12 @@ def finish(layer: torch.nn.Module, prefix: str) -> None:
         weight_bytes=w13.nbytes + w2.nbytes,
     )
     logger.debug(
-        "K3 die-local routed MoE: %s rank %d on %s, w13 %d bytes, w2 %d bytes, placement %s",
+        "K3 die-local routed MoE: %s rank %d on %s, w13 %d bytes, w2 %d bytes",
         prefix,
         layer.moe_ep_rank,
         w13.device,
         w13.nbytes,
         w2.nbytes,
-        weight_placement(),
     )
 
 
@@ -440,21 +423,16 @@ def _log_startup() -> None:
     if _summary["logged"] or not _summary["layers"]:
         return
     _summary["logged"] = True
-    from sglang.srt.layers.moe import k3_deepgemm_routed
-
     widths = sorted(verify_widths())
     logger.info(
         "K3 die-local routed MoE active: rank=%d layers=%d experts_per_rank=%d "
-        "weight_bytes_per_layer=%d placement=%s verify_widths=%d (%s rows) "
-        "ar_fusion=%s shared_ar_order=%s table=%s",
+        "weight_bytes_per_layer=%d verify_widths=%d (%s rows) ar_fusion=%s table=%s",
         _summary["rank"],
         _summary["layers"],
         _summary["experts"],
         _summary["weight_bytes"],
-        weight_placement(),
         len(widths),
         f"{widths[0]}-{widths[-1]}" if widths else "none",
         ar_fusion(),
-        k3_deepgemm_routed.configured_shared_ar_order() if ar_fusion() else "n/a",
         table_path().name,
     )
