@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import copy
 import logging
 import math
+from contextlib import contextmanager
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from importlib import import_module
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
-from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.kernels.ops.speculative.spec_tree import (
     TreeMaskMode,
     build_tree_kernel_efficient_func,
@@ -18,8 +22,14 @@ from sglang.kernels.ops.speculative.verify_sampling import (
     chain_speculative_sampling_triton,
     tree_speculative_sampling_target_only,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
+)
+from sglang.srt.layers.sampling_renorm import (
+    min_p_renorm_prob,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
@@ -27,13 +37,23 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.sharded_verify import (
+    VocabShard,
+    gather_full_logits,
+    key_splits,
+    reduce_sharded_token_keys,
+    sampling_allows_vocab_shards,
+    sharded_target_tokens,
+    spec_allows_vocab_shards,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
     is_xpu,
 )
-from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -43,15 +63,30 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.sampling.watermarking.core import WatermarkState
+    from sglang.srt.sampling.watermarking.interface import VerifyWatermark
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
+_COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
+_PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
+
+# The binding defaults probe this explicit capability once instead of relying on
+# exception handling in the hot path.  Runtime itself remains independent of the
+# optional binding contract.
+LOCAL_KEYS_SUPPORTED = True
+LocalKeysFn = Callable[[Any], Optional[torch.Tensor]]
+_provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
+_ShardedLogitsView = getattr(_provider_spec, "ShardedLogitsView", None)
+_VocabShardView = getattr(_provider_spec, "VocabShardView", None)
 
 logger = logging.getLogger(__name__)
+
+
+def _fused_accept_enabled() -> bool:
+    return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
 
 
 def per_step_draft_out_cache_loc(
@@ -71,11 +106,44 @@ def per_step_draft_out_cache_loc(
         f"out_cache_loc.shape[0]={out_cache_loc.shape[0]} != "
         f"batch_size * topk * num_steps = {batch_size}*{topk}*{num_steps}={expected}"
     )
+    # Contiguous so each step's row is a dense loc: the KV write and metadata
+    # kernels read locs by flat offset, ignoring strides.
     return (
         out_cache_loc.view(batch_size, topk, num_steps)
         .permute(2, 0, 1)
         .reshape(num_steps, -1)
+        .contiguous()
     )
+
+
+@contextmanager
+def draft_step_writes(
+    forward_batch, step: int, *, topk: int, num_steps: int, enabled: bool
+):
+    """Bind draft step ``step``'s slice of the batch's write ids, as
+    `EagleWorkerV2.draft_forward` slices them, and its columns of the
+    iteration's write window, while a per-step backend derives its write
+    targets (the window ids included) from the batch. A no-op unless
+    ``enabled`` (the step's backend writes a window sub-pool)."""
+    loc, cols = forward_batch.out_cache_loc, forward_batch.iteration_cols
+    if loc is None or not enabled:
+        yield
+        return
+    if cols is None:
+        # The draft's own window, each row laid out (topk, num_steps).
+        step_cols = slice(step, None, num_steps)
+    else:
+        # A chain draft writes the leading columns of the verify window.
+        assert topk == 1 and isinstance(cols, slice) and cols.step is None
+        step_cols = slice(cols.start + step, cols.start + step + 1)
+    forward_batch.out_cache_loc = per_step_draft_out_cache_loc(
+        loc, forward_batch.batch_size, topk, num_steps
+    )[step]
+    forward_batch.iteration_cols = step_cols
+    try:
+        yield
+    finally:
+        forward_batch.out_cache_loc, forward_batch.iteration_cols = loc, cols
 
 
 def _eagle_prefill_tail_tokens(
@@ -95,6 +163,105 @@ def _eagle_prefill_tail_tokens(
                 tail_tokens[i : i + 1].fill_(next_prompt_token)
                 break
     return tail_tokens
+
+
+# Measured on H200 with GLM-5.3-Flash: the KV-only pass is one more eager draft forward,
+# a fixed CPU cost that batches of at most this many KV-only tokens did not win back.
+_MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS = 4096
+
+
+def should_split_prefill_draft_extend(
+    batch: ScheduleBatch,
+    *,
+    mm_input_embeds: Optional[torch.Tensor],
+    draft_prefill_graph_max_tokens: int,
+    target_prefill_graph_max_tokens: int,
+) -> bool:
+    """Whether the draft extend after this prefill runs as a KV-only pass over
+    every request's tokens but its last, plus a pass over the last tokens."""
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    return (
+        batch.forward_mode == ForwardMode.EXTEND
+        and batch.input_embeds is None
+        and batch.replace_embeds is None
+        and batch.tbo_split_seq_index is None
+        # The KV-only pass embeds token ids, which do not cover image tokens.
+        and (
+            mm_input_embeds is not None
+            or all(req.multimodal_inputs is None for req in batch.reqs)
+        )
+        # The KV-only batch would get an empty extend, which the kpool planner rejects.
+        and min(batch.extend_lens) > 1
+        # DSA attends to requests no longer than this densely, which costs little to skip;
+        # the last-token pass would also read their prefixes back from the cache.
+        and batch.seq_lens_cpu.max().item()
+        > envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()
+        # A captured draft prefill graph replays the full layer for batches it fits.
+        and batch.extend_num_tokens - len(batch.extend_lens)
+        > max(_MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS, draft_prefill_graph_max_tokens)
+        # 0 = the target captured no prefill graph. A batch above that bound can
+        # replay none of them, and splitting those measured slower on B300.
+        and (
+            target_prefill_graph_max_tokens == 0
+            or batch.extend_num_tokens <= target_prefill_graph_max_tokens
+        )
+    )
+
+
+def split_prefill_draft_extend(
+    batch: ScheduleBatch, *, tail_tokens: torch.Tensor
+) -> Tuple[ScheduleBatch, ScheduleBatch, torch.Tensor, torch.Tensor]:
+    """Split the prefill's draft extend into a batch of every request's tokens but
+    its last and a batch of the last tokens; also return the prefill rows of each."""
+    extend_lens = batch.extend_lens
+    bs = len(extend_lens)
+    last_rows = torch.tensor(extend_lens, dtype=torch.int64).cumsum(0) - 1
+    keep = torch.ones(batch.extend_num_tokens, dtype=torch.bool)
+    keep[last_rows] = False
+    kv_rows = keep.nonzero().squeeze(1)
+
+    device = batch.input_ids.device
+    if is_pin_memory_available(device):
+        kv_rows, last_rows = kv_rows.pin_memory(), last_rows.pin_memory()
+    kv_rows = kv_rows.to(device, non_blocking=True)
+    last_rows = last_rows.to(device, non_blocking=True)
+
+    # The draft input at a prompt row is the next prompt token.
+    kv_batch = copy.copy(batch)
+    kv_batch.input_ids = batch.input_ids[kv_rows + 1]
+    kv_batch.out_cache_loc = batch.out_cache_loc[kv_rows]
+    kv_batch.extend_lens = [n - 1 for n in extend_lens]
+    kv_batch.extend_num_tokens = batch.extend_num_tokens - bs
+    kv_batch.seq_lens = batch.seq_lens - 1
+    kv_batch.seq_lens_cpu = batch.seq_lens_cpu - 1
+    kv_batch.seq_lens_sum = (
+        batch.seq_lens_sum - bs if batch.seq_lens_sum is not None else None
+    )
+
+    last_batch = copy.copy(batch)
+    last_batch.input_ids = tail_tokens
+    last_batch.out_cache_loc = batch.out_cache_loc[last_rows]
+    last_batch.prefix_lens = [
+        p + n - 1 for p, n in zip(batch.prefix_lens, extend_lens, strict=True)
+    ]
+    last_batch.extend_lens = [1] * bs
+    last_batch.extend_num_tokens = bs
+
+    for sub_batch in (kv_batch, last_batch):
+        # The draft never returns logprobs; the per-token logprob inputs
+        # describe the full prefill rows.
+        sub_batch.return_logprob = False
+        sub_batch.extend_input_logprob_token_ids = None
+        # With MLP sync but no attention DP, each list holds this rank's token
+        # count; a pass padded to the whole prefill would compute all its rows.
+        if batch.global_num_tokens is not None:
+            sub_batch.global_num_tokens = [sub_batch.extend_num_tokens]
+            sub_batch.global_num_tokens_for_logprob = [bs]
+        if batch.draft_global_num_tokens is not None:
+            sub_batch.draft_global_num_tokens = [sub_batch.extend_num_tokens]
+            sub_batch.draft_global_num_tokens_for_logprob = [bs]
+    return kv_batch, last_batch, kv_rows, last_rows
 
 
 def organize_draft_results(
@@ -315,9 +482,9 @@ def eagle_prepare_for_verify(
         from sglang.kernels.ops.speculative.cache_locs import (
             assign_extend_cache_locs_uniform_func,
         )
-        from sglang.srt.model_executor.forward_batch_info import (
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.forward_mode import (
             CaptureHiddenMode,
-            ForwardBatch,
             ForwardMode,
         )
         from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
@@ -340,6 +507,12 @@ def eagle_prepare_for_verify(
     if not batch.forward_mode.is_idle():
         # Assign cache locations
         bs = len(batch.req_pool_indices)
+        # Host upper bound of this batch's final KV lengths: bounds the
+        # backend's replay page-table copies in mirrorless mode without a D2H sync.
+        batch.max_seq_len_host = (
+            max((req.seqlen for req in batch.reqs), default=0)
+            + verify_input.draft_token_num
+        )
         batch.input_ids = verify_input.draft_token
         maybe_detect_oob(
             batch.input_ids,
@@ -392,7 +565,7 @@ def eagle_prepare_for_verify(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
         spec_mrope_positions=verify_input.prepared_mrope_positions,
-        kv_loc_plan=verify_input.kv_loc_plan,
+        iteration_ids=verify_input.iteration_ids,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -518,6 +691,167 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+def _apply_joint_top_k_top_p(
+    probs: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    draft_token_num: int,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+) -> torch.Tensor:
+    """Apply top-p to the original distribution before top-k renormalization."""
+    if sampling_info.need_top_p_sampling:
+        probs = top_p_renorm_prob(
+            probs,
+            torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+        )
+        maybe_detect_nan(probs, "verify: target_probs after top_p_renorm")
+    if sampling_info.need_top_k_sampling:
+        probs = top_k_renorm_prob(
+            probs,
+            torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+        )
+        maybe_detect_nan(probs, "verify: target_probs after top_k_renorm")
+    return probs
+
+
+def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
+    """The support for eagle_sample's compact top-k branch under
+    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING, or None for the dense branch: every
+    request must sample with a finite top-k within the compact limit."""
+    if not _COMPACT_VERIFY_SAMPLING or batch.forward_mode.is_idle():
+        return None
+    from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
+
+    top_ks = [req.sampling_params.top_k for req in batch.reqs]
+    if not top_ks or any(k <= 1 or k > _SPARSE_TOP_K_LIMIT for k in top_ks):
+        return None
+    return max(top_ks)
+
+
+def _local_key_view(
+    *,
+    logits: torch.Tensor,
+    vocab_shard: VocabShard,
+    temperatures: Optional[torch.Tensor],
+    seeds: Optional[torch.Tensor],
+    splits: int,
+) -> Any:
+    """Build the canonical provider view when binding is installed.
+
+    Runtime-only trees deliberately do not define or import provider contracts.
+    A structural fallback keeps local runtime tests useful without creating an
+    ordering dependency between the two PRs.
+    """
+    shard = (
+        _VocabShardView(
+            start=vocab_shard.start,
+            valid=vocab_shard.valid,
+            vocab_size=vocab_shard.vocab_size,
+        )
+        if _VocabShardView is not None
+        else SimpleNamespace(
+            start=vocab_shard.start,
+            valid=vocab_shard.valid,
+            vocab_size=vocab_shard.vocab_size,
+        )
+    )
+    fields = dict(
+        values=logits,
+        shard=shard,
+        temperatures=temperatures,
+        seeds=seeds,
+        splits=splits,
+    )
+    return (
+        _ShardedLogitsView(**fields)
+        if _ShardedLogitsView is not None
+        else SimpleNamespace(**fields)
+    )
+
+
+def _sharded_tokens(
+    logits: torch.Tensor,
+    vocab_shard: VocabShard,
+    *,
+    local_keys: Optional[LocalKeysFn],
+    temperatures: Optional[torch.Tensor] = None,
+    seeds: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Use a local key policy while keeping every cross-rank step in runtime."""
+    from sglang.srt.runtime_context import get_parallel
+
+    tp_group = get_parallel().tp_group
+    if local_keys is None:
+        # Runtime's built-in key path is greedy-only.  A temperature policy must
+        # come through ``local_keys`` and may decline before stock sampling draws.
+        if temperatures is not None:
+            return None
+        return sharded_target_tokens(logits, vocab_shard, tp_group)
+
+    # Runtime selects a rank-uniform collective shape.  The final TP rank may
+    # have a shorter valid vocabulary tail, while its padded local logits width
+    # remains identical to every other rank.
+    splits = key_splits(logits.shape[-1])
+    keys = local_keys(
+        _local_key_view(
+            logits=logits,
+            vocab_shard=vocab_shard,
+            temperatures=temperatures,
+            seeds=seeds,
+            splits=splits,
+        )
+    )
+    if keys is None:
+        return None
+    if not isinstance(keys, torch.Tensor):
+        raise TypeError("local keys must be a torch.Tensor or None")
+    expected_shape = (logits.shape[0],) if splits == 1 else (logits.shape[0], splits)
+    if tuple(keys.shape) != expected_shape:
+        raise ValueError(
+            f"local keys have shape {tuple(keys.shape)}, expected {expected_shape}"
+        )
+    if keys.device != logits.device:
+        raise ValueError(
+            f"local keys are on {keys.device}, expected logits device {logits.device}"
+        )
+    return reduce_sharded_token_keys(keys, tp_group, splits=splits)
+
+
+def _sharded_sampling_applies(
+    *,
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    grammar_mask: Optional[GrammarMask],
+    watermark: bool,
+    has_custom_logit_processor: bool,
+    has_local_keys: bool = False,
+) -> bool:
+    """Whether this verify can consume vocabulary-sharded logits directly.
+
+    Greedy rows are bitwise-preserving and dispatch automatically. Temperature-only
+    rows require a local key policy; a policy that declines returns to the stock
+    gathered path before sampling. Anything that reads or edits full logits also
+    stays on the stock gathered path.
+    """
+    info = batch.sampling_info
+    return (
+        _is_cuda
+        and verify_input.tree_topk == 1
+        and sampling_allows_vocab_shards(
+            info,
+            # Not adjusts_logits: info may be the provider's VerifySamplingView.
+            adjusts_logits=grammar_mask is not None
+            or watermark
+            or has_custom_logit_processor
+            or info.step_penalties is not None
+            or info.logit_bias is not None,
+            return_logprob=batch.return_logprob,
+            has_local_keys=has_local_keys,
+        )
+        and spec_allows_vocab_shards(get_spec())
+    )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -525,29 +859,31 @@ def eagle_sample(
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
     *,
-    watermark_state: Optional[WatermarkState] = None,
-    watermark_full_mask: bool = True,
+    watermark: Optional[VerifyWatermark] = None,
+    simulated_acc_len: Optional[torch.Tensor] = None,
+    simulated_acc_len_rng: Optional[torch.Generator] = None,
+    sparse_bonus_argmax: bool = False,
+    local_keys: Optional[LocalKeysFn] = None,
+    has_custom_logit_processor: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
-    (which contains spec decoding information).
+    (which contains spec decoding information). simulated_acc_len: the injected
+    acceptance length already drawn on the host, as a device int64 [1], so a CUDA
+    graph can replay the injection. simulated_acc_len_rng: the generator to draw
+    it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
+    injected acceptance's bonus is the target argmax on the compact top-k branch
+    too, as on the dense one.
     """
-    from sglang.srt.layers.dp_attention import (
-        is_dp_attention_enabled,
-    )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-        apply_scaling_penalties,
-    )
-    from sglang.srt.speculative.spec_utils import (
-        SIMULATE_ACC_LEN,
-        SIMULATE_ACC_TOKEN_MODE,
-        generate_simulated_accept_index,
-    )
-    from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
+    from sglang.srt.speculative.target_verify import adjust_verify_logits
+    from sglang.srt.utils.async_probe import sanitize_nan_logits
 
     device = batch.device
-    if batch.forward_mode.is_idle():
+    is_idle = getattr(batch, "is_idle", None)
+    if is_idle is None:
+        is_idle = batch.forward_mode.is_idle()
+    if is_idle:
         predict = torch.empty(0, dtype=torch.int32, device=device)
         num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
         accept_index = torch.empty(0, dtype=torch.int32, device=device)
@@ -556,108 +892,184 @@ def eagle_sample(
     bs = len(batch.seq_lens)
     sampling_info = batch.sampling_info
     next_token_logits = logits_output.next_token_logits
+    vocab_shard = logits_output.next_token_logits_vocab_shard
+    if vocab_shard is not None and not _sharded_sampling_applies(
+        verify_input=verify_input,
+        batch=batch,
+        grammar_mask=grammar_mask,
+        watermark=watermark is not None,
+        has_custom_logit_processor=has_custom_logit_processor,
+        has_local_keys=local_keys is not None,
+    ):
+        next_token_logits = gather_full_logits(
+            next_token_logits, vocab_shard, get_parallel().tp_group
+        )
+        logits_output.next_token_logits = next_token_logits
+        logits_output.next_token_logits_vocab_shard = vocab_shard = None
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.acc_additive_penalties,
-                verify_input.draft_token_num,
-                dim=0,
-            )
-        )
-    if sampling_info.acc_scaling_penalties is not None:
-        apply_scaling_penalties(
-            next_token_logits,
-            torch.repeat_interleave(
-                sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
-            ),
-        )
-    if sampling_info.logit_bias is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-            )
-        )
-
-    # Apply grammar mask if provided
-    if grammar_mask is not None:
-        grammar_mask.apply(next_token_logits)
-
-    watermark_context_hashes = None
-    watermark_selected = None
-    if watermark_state is not None and sampling_info.has_watermark_candidates:
-        if batch.return_logprob:
-            # compute_spec_logprobs reads logits_output after verify.
-            next_token_logits = next_token_logits.clone()
-        if next_token_logits.is_cuda:
-            watermark_context_hashes, watermark_selected = (
-                watermark_state.force_speculative_from_tree(
-                    logits=next_token_logits,
-                    req_pool_indices=batch.req_pool_indices,
-                    draft_tokens=verify_input.draft_token,
-                    custom_mask=verify_input.custom_mask,
-                    positions=verify_input.positions,
-                    sampling_info=sampling_info,
-                    draft_token_num=verify_input.draft_token_num,
-                    full_mask=watermark_full_mask,
-                )
-            )
-        else:
-            contexts, context_lengths = watermark_state.speculative_contexts(
-                req_pool_indices=batch.req_pool_indices,
-                draft_tokens=verify_input.draft_token,
-                custom_mask=verify_input.custom_mask,
-                positions=verify_input.positions,
-                draft_token_num=verify_input.draft_token_num,
-                full_mask=watermark_full_mask,
-                context_windows=watermark_state.context_windows(sampling_info),
-            )
-            watermark_context_hashes, watermark_selected = (
-                watermark_state.force_speculative(
-                    logits=next_token_logits,
-                    req_pool_indices=batch.req_pool_indices,
-                    contexts=contexts,
-                    context_lengths=context_lengths,
-                    sampling_info=sampling_info,
-                    draft_token_num=verify_input.draft_token_num,
-                )
-            )
-
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+    adjust_verify_logits(
+        next_token_logits,
+        sampling_info=sampling_info,
+        grammar_mask=grammar_mask,
+        draft_tokens=candidates,
+        next_child=verify_input.retrieve_next_token,
+        next_sibling=verify_input.retrieve_next_sibling,
+        has_custom_logit_processor=has_custom_logit_processor,
     )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+    if watermark is not None:
+        next_token_logits, sampling_info = watermark.apply(
+            next_token_logits,
+            sampling_info=sampling_info,
+            req_pool_indices=batch.req_pool_indices,
+            draft_tokens=verify_input.draft_token,
+            positions=verify_input.positions,
+            draft_token_num=verify_input.draft_token_num,
+            custom_mask=verify_input.custom_mask,
+            # compute_spec_logprobs reads logits_output after verify.
+            keep_logits=batch.return_logprob,
+        )
 
-    # Sample tokens
-    target_predict = None
+    return _tree_accept(
+        verify_input=verify_input,
+        batch=batch,
+        logits_output=logits_output,
+        next_token_logits=next_token_logits,
+        vocab_shard=vocab_shard,
+        sampling_info=sampling_info,
+        candidates=candidates,
+        uno_target_max_top_k=uno_target_max_top_k,
+        watermark=watermark is not None,
+        simulated_acc_len=simulated_acc_len,
+        simulated_acc_len_rng=simulated_acc_len_rng,
+        sparse_bonus_argmax=sparse_bonus_argmax,
+        local_keys=local_keys,
+    )
+
+
+def _tree_accept(
+    *,
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    logits_output: LogitsProcessorOutput,
+    next_token_logits: torch.Tensor,
+    vocab_shard: Optional[VocabShard],
+    sampling_info: SamplingBatchInfo,
+    candidates: torch.Tensor,
+    uno_target_max_top_k: Optional[int],
+    watermark: bool,
+    simulated_acc_len: Optional[torch.Tensor],
+    simulated_acc_len_rng: Optional[torch.Generator],
+    sparse_bonus_argmax: bool,
+    local_keys: Optional[LocalKeysFn],
+):
+    """A gather it still needs is published to ``logits_output``."""
+    from sglang.srt.layers.dp_attention import (
+        is_dp_attention_enabled,
+    )
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.speculative.spec_utils import (
+        SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
+        generate_simulated_accept_index,
+        generate_simulated_accept_index_device,
+    )
+
+    device = batch.device
+    bs = len(batch.seq_lens)
+    predict_shape = list(next_token_logits.shape)[:-1]
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if _verify_uses_greedy(
+    greedy = _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
-    ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=verify_input.tree_topk,
+    )
+    sparse = not greedy and _can_use_sparse_uno_tree_target_sampling(
+        uno_target_max_top_k,
+        sampling_info,
+    )
+    sharded_predict = None
+    if vocab_shard is not None:
+        temperatures = None
+        if not greedy:
+            temperatures = torch.repeat_interleave(
+                sampling_info.temperatures.view(-1),
+                verify_input.draft_token_num,
+                dim=0,
+            )
+        sharded_predict = _sharded_tokens(
+            next_token_logits,
+            vocab_shard,
+            local_keys=local_keys,
+            temperatures=temperatures,
+            seeds=sampling_info.sampling_seed,
         )
+        if sharded_predict is None:
+            # A local policy declines before consuming RNG. Rebuild the exact stock
+            # logits, publish that mutation, and let the stock sampler consume RNG
+            # in its original order.
+            next_token_logits = gather_full_logits(
+                next_token_logits, vocab_shard, get_parallel().tp_group
+            )
+            logits_output.next_token_logits = next_token_logits
+            logits_output.next_token_logits_vocab_shard = vocab_shard = None
+    # The generic fused chain acceptance writes every verify output itself.
+    chain = _chain_accept_applies(
+        verify_input=verify_input,
+        logits=next_token_logits,
+        simulated_acc_len=simulated_acc_len,
+        simulate_acc_len=SIMULATE_ACC_LEN,
+        simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+        watermark=watermark,
+    )
+    fused_verify = chain and (greedy or sparse or vocab_shard is not None)
+    predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
+        rows=math.prod(predict_shape),
+        bs=bs,
+        depth=verify_input.max_tree_depth,
+        device=device,
+        packed=_PACKED_VERIFY_BCAST,
+        init=not fused_verify,
+    )
+
+    # Sample tokens
+    target_predict = None
+    accept_lens = None
+    if greedy:
+        target_predict = (
+            sampling_argmax(next_token_logits)
+            if sharded_predict is None
+            else sharded_predict
+        )
+        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        if fused_verify:
+            accept_lens, accept_index = _chain_accept(
+                predict=predict,
+                accept_index=accept_index,
+                num_correct_drafts=num_correct_drafts,
+                candidates=candidates,
+                verify_input=verify_input,
+                target_predict=target_predict,
+                bonus_target=target_predict,
+                simulated_acc_len=simulated_acc_len if SIMULATE_ACC_LEN > 0 else None,
+                real_draft_tokens=SIMULATE_ACC_TOKEN_MODE == "real-draft-token",
+                finish=True,
+            )
+        else:
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+            )
 
         if _is_hip:
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a
@@ -673,10 +1085,35 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
-    elif _can_use_sparse_uno_tree_target_sampling(
-        uno_target_max_top_k,
-        sampling_info,
-    ):
+    elif vocab_shard is not None:
+        # temperature-only rows: a Gumbel-max target sample per row, then the greedy
+        # check against it (exact for a topk-1 chain, whose drafts are deterministic)
+        target_predict = sharded_predict.reshape(bs, verify_input.draft_token_num)
+        if fused_verify:
+            _chain_accept(
+                predict=predict,
+                accept_index=accept_index,
+                num_correct_drafts=num_correct_drafts,
+                candidates=candidates,
+                verify_input=verify_input,
+                target_predict=target_predict,
+                bonus_target=None,
+                simulated_acc_len=None,
+                real_draft_tokens=False,
+                finish=False,
+            )
+        else:
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+            )
+    elif sparse:
         from sglang.srt.speculative.uno_utils import (
             sample_uno_tree_target_tokens,
         )
@@ -688,17 +1125,30 @@ def eagle_sample(
             verify_width=verify_input.draft_token_num,
             max_top_k=uno_target_max_top_k,
         )
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=num_correct_drafts,
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=verify_input.tree_topk,
-        )
+        if fused_verify:
+            _chain_accept(
+                predict=predict,
+                accept_index=accept_index,
+                num_correct_drafts=num_correct_drafts,
+                candidates=candidates,
+                verify_input=verify_input,
+                target_predict=target_predict,
+                bonus_target=None,
+                simulated_acc_len=None,
+                real_draft_tokens=False,
+                finish=False,
+            )
+        else:
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+            )
 
         tp_group = (
             get_parallel().attn_tp_group
@@ -706,9 +1156,12 @@ def eagle_sample(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
     else:
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
@@ -717,30 +1170,26 @@ def eagle_sample(
         else:
             sampling_fn = tree_speculative_sampling_target_only
 
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
-
         target_probs = sampling_softmax(
-            next_token_logits, temperatures=expanded_temperature
+            next_token_logits,
+            temperatures=sampling_info.temperatures,
+            rows_per_request=verify_input.draft_token_num,
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
+        target_probs = _apply_joint_top_k_top_p(
+            target_probs,
+            sampling_info,
+            verify_input.draft_token_num,
+            top_k_renorm_prob,
+            top_p_renorm_prob,
+        )
+        if sampling_info.need_min_p_sampling:
+            target_probs = min_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                    sampling_info.min_ps, verify_input.draft_token_num, dim=0
                 ),
             )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
@@ -783,7 +1232,6 @@ def eagle_sample(
             deterministic=True,
         )
         del (
-            expanded_temperature,
             target_probs,
             draft_probs,
             coins,
@@ -800,11 +1248,14 @@ def eagle_sample(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
 
-    if SIMULATE_ACC_LEN > 0:
+    if SIMULATE_ACC_LEN > 0 and accept_lens is None:
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
         # to keep the simulated width identical to the real one.
@@ -823,44 +1274,160 @@ def eagle_sample(
                 )
 
             # Use target argmax as the synthetic bonus for non-greedy requests.
-            if target_predict is None:
-                target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
-                    bs, verify_input.draft_token_num
-                )
-        accept_index = generate_simulated_accept_index(
-            accept_index=accept_index,
-            predict=predict,  # mutable
-            num_correct_drafts=num_correct_drafts,  # mutable
-            candidates=candidates,
-            target_predict=target_predict,
-            simulate_acc_len=SIMULATE_ACC_LEN,
-            simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-            bs=bs,
-            spec_steps=verify_input.max_tree_depth - 1,
-        )
+            if target_predict is None or sparse_bonus_argmax or vocab_shard is not None:
+                bonus_predict = None
+                if vocab_shard is not None:
+                    bonus_predict = _sharded_tokens(
+                        next_token_logits,
+                        vocab_shard,
+                        local_keys=local_keys,
+                    )
+                    if bonus_predict is None:
+                        next_token_logits = gather_full_logits(
+                            next_token_logits,
+                            vocab_shard,
+                            get_parallel().tp_group,
+                        )
+                        logits_output.next_token_logits = next_token_logits
+                        logits_output.next_token_logits_vocab_shard = None
+                        vocab_shard = None
+                if bonus_predict is None:
+                    bonus_predict = sampling_argmax(next_token_logits)
+                target_predict = bonus_predict.reshape(bs, verify_input.draft_token_num)
+        if chain:
+            accept_lens, accept_index = _chain_accept(
+                predict=predict,
+                accept_index=accept_index,
+                num_correct_drafts=num_correct_drafts,
+                candidates=candidates,
+                verify_input=verify_input,
+                target_predict=None,
+                bonus_target=target_predict,
+                simulated_acc_len=simulated_acc_len,
+                real_draft_tokens=SIMULATE_ACC_TOKEN_MODE == "real-draft-token",
+                finish=True,
+            )
+        elif simulated_acc_len is not None:
+            accept_index = generate_simulated_accept_index_device(
+                accept_index=accept_index,
+                predict=predict,  # mutable
+                num_correct_drafts=num_correct_drafts,  # mutable
+                candidates=candidates,
+                target_predict=target_predict,
+                bs=bs,
+                spec_steps=verify_input.max_tree_depth - 1,
+                simulate_acc_len=simulated_acc_len,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+            )
+        else:
+            accept_index = generate_simulated_accept_index(
+                accept_index=accept_index,
+                predict=predict,  # mutable
+                num_correct_drafts=num_correct_drafts,  # mutable
+                candidates=candidates,
+                target_predict=target_predict,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                bs=bs,
+                spec_steps=verify_input.max_tree_depth - 1,
+                generator=simulated_acc_len_rng,
+            )
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
-    accept_lens = num_correct_drafts + 1
-    if watermark_state is not None and sampling_info.has_watermark_candidates:
-        watermark_state.record_speculative(
-            batch.req_pool_indices,
-            watermark_context_hashes,
-            watermark_selected,
-            accept_index,
-            accept_lens,
-        )
+    if accept_lens is None:
+        accept_lens = num_correct_drafts + 1
     return predict, accept_lens, accept_index
+
+
+def _chain_accept_applies(
+    *,
+    verify_input: EagleVerifyInput,
+    logits: torch.Tensor,
+    simulated_acc_len: Optional[torch.Tensor],
+    simulate_acc_len: float,
+    simulate_acc_token_mode: str,
+    watermark: bool,
+) -> bool:
+    """Whether runtime can fuse ``eagle_sample``'s chain tail.
+
+    This requires CUDA, a chain draft whose tree width is the accept width, an
+    injected length (if any) already on the device, and no watermark.
+    """
+    if not _fused_accept_enabled() or not logits.is_cuda or _is_hip or watermark:
+        return False
+    if verify_input.tree_topk != 1:
+        return False
+    if verify_input.draft_token_num != verify_input.max_tree_depth:
+        return False
+    if simulate_acc_len > 0:
+        return simulated_acc_len is not None and simulate_acc_token_mode in (
+            "fixed",
+            "real-draft-token",
+        )
+    return True
+
+
+def _chain_accept(
+    *,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    candidates: torch.Tensor,
+    verify_input: EagleVerifyInput,
+    target_predict: Optional[torch.Tensor],
+    bonus_target: Optional[torch.Tensor],
+    simulated_acc_len: Optional[torch.Tensor],
+    real_draft_tokens: bool,
+    finish: bool,
+):
+    from sglang.kernels.ops.speculative.eagle import chain_accept
+
+    return chain_accept(
+        predict=predict,
+        accept_index=accept_index,
+        num_correct_drafts=num_correct_drafts,
+        candidates=candidates,
+        retrieve_index=verify_input.retrieve_index,
+        retrieve_next_token=verify_input.retrieve_next_token,
+        retrieve_next_sibling=verify_input.retrieve_next_sibling,
+        target_predict=target_predict,
+        bonus_target=bonus_target,
+        simulated_acc_len=simulated_acc_len,
+        real_draft_tokens=real_draft_tokens,
+        verify=target_predict is not None,
+        finish=finish,
+    )
+
+
+def _verify_outputs(
+    *, rows: int, bs: int, depth: int, device, packed: bool, init: bool = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """predict [rows] (zeros), accept_index [bs, depth] (-1) and num_correct_drafts
+    [bs] int32; packed (SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST): views of one buffer,
+    returned last so a sampled result goes to the TP group in one broadcast. Without
+    init they are left unset, for chain_accept to write whole."""
+    if not packed:
+        if not init:
+            predict = torch.empty((rows,), dtype=torch.int32, device=device)
+            accept_index = torch.empty((bs, depth), dtype=torch.int32, device=device)
+        else:
+            predict = torch.zeros((rows,), dtype=torch.int32, device=device)
+            accept_index = torch.full((bs, depth), -1, dtype=torch.int32, device=device)
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+        return predict, accept_index, num_correct_drafts, None
+    out = torch.empty((rows + bs * depth + bs,), dtype=torch.int32, device=device)
+    predict = out[:rows]
+    accept_index = out[rows : rows + bs * depth].view(bs, depth)
+    if init:
+        predict.zero_()
+        accept_index.fill_(-1)
+    return predict, accept_index, out[rows + bs * depth :], out
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()

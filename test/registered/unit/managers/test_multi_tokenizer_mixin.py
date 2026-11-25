@@ -1,5 +1,9 @@
+import asyncio
+import os
 import pickle
+import threading
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import DEFAULT, MagicMock, patch
@@ -18,6 +22,7 @@ from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.entrypoints import http_server
 from sglang.srt.environ import envs
 from sglang.srt.managers import multi_tokenizer_mixin
+from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -25,12 +30,12 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BeamSearchOutput,
     ConfigureLoggingReq,
-    unwrap_from_pickle,
-    wrap_as_pickle,
+    RequestOutputStats,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
     MultiHttpWorkerDetokenizerMixin,
+    MultiTokenizerRouter,
     _cached_output_fields,
     _handle_output_by_index,
     _handle_output_by_indices,
@@ -41,6 +46,22 @@ from sglang.srt.runtime_context import get_context
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+def _request_stats(prompt_tokens, cached_tokens, cached_tokens_details=None):
+    return RequestOutputStats(
+        prompt_tokens=prompt_tokens,
+        cached_tokens=cached_tokens,
+        cached_tokens_details=cached_tokens_details,
+        retraction_count=0,
+        image_tokens=0,
+        audio_tokens=0,
+        video_tokens=0,
+        time_stats=None,
+    )
+
+
+_REQUEST_STATS_1 = _request_stats(20, 4, {"device": 1, "host": 3})
+
+
 def _make_batch_str_output() -> BatchStrOutput:
     return BatchStrOutput(
         rids=["rid-0", "rid-1"],
@@ -49,15 +70,13 @@ def _make_batch_str_output() -> BatchStrOutput:
         spec_correct_drafts_histogram=[[], []],
         finished_reasons=[None, {"type": "length"}],
         output_strs=["first", "second"],
-        output_ids=[[1], [2]],
-        prompt_tokens=[10, 20],
+        # Rows [1] and [2, 3].
+        output_ids_flat=array("q", [1, 2, 3]),
+        output_ids_offsets=[0, 1, 3],
         completion_tokens=[1, 2],
         reasoning_tokens=[0, 0],
-        cached_tokens=[3, 4],
-        cached_tokens_details=[
-            {"device": 3, "host": 0},
-            {"device": 1, "host": 3},
-        ],
+        # Only rid-1 has new request stats in this step.
+        request_stats=[None, _REQUEST_STATS_1],
         input_token_logprobs_val=[[], []],
         input_token_logprobs_idx=[[], []],
         output_token_logprobs_val=[[], []],
@@ -88,7 +107,6 @@ def _make_batch_str_output() -> BatchStrOutput:
         indexer_topk=[None, None],
         placeholder_tokens_idx=[None, None],
         placeholder_tokens_val=[None, None],
-        retraction_counts=[0, 0],
         weight_versions=[
             [
                 WeightVersionSpan(version="v1", start=0, end=3),
@@ -108,6 +126,10 @@ def _make_batch_str_output() -> BatchStrOutput:
             None,
         ],
         token_steps=[[1], [2]],
+        prefill_weight_versions=[
+            [WeightVersionSpan(version="v0", start=0, end=7)],
+            None,
+        ],
     )
 
 
@@ -122,17 +144,11 @@ def _make_batch_token_id_output() -> BatchTokenIDOutput:
         spec_num_cap_tokens=[],
         spec_cap_lens_histogram=[],
         finished_reasons=[None, None],
-        decoded_texts=["first", "second"],
-        decode_ids=[[1], [2]],
-        read_offsets=[0, 1],
-        output_ids=[[1], [2]],
-        skip_special_tokens=[True, True],
-        spaces_between_special_tokens=[True, True],
-        no_stop_trim=[False, False],
-        prompt_tokens=[10, 20],
+        # Rows [1] and [].
+        output_ids_flat=array("q", [1]),
+        output_ids_offsets=[0, 1, 1],
         reasoning_tokens=[0, 0],
         completion_tokens=[1, 2],
-        cached_tokens=[3, 4],
         input_token_logprobs_val=[[], []],
         input_token_logprobs_idx=[[], []],
         output_token_logprobs_val=[[], []],
@@ -160,22 +176,25 @@ def _make_batch_embedding_output() -> BatchEmbeddingOutput:
         rids=["embedding-rid-0", "embedding-rid-1"],
         finished_reasons=[None, None],
         embeddings=[[0.1, 0.2], [0.3, 0.4]],
-        prompt_tokens=[10, 20],
-        cached_tokens=[3, 4],
+        request_stats=[_request_stats(10, 3), _request_stats(20, 4)],
         placeholder_tokens_idx=[None, None],
         placeholder_tokens_val=[None, None],
     )
 
 
-def _make_router() -> MultiDetokenizerRouter:
+def _make_router(targets_by_rid=None) -> MultiDetokenizerRouter:
     router = MultiDetokenizerRouter.__new__(MultiDetokenizerRouter)
     router.ipc_name_list = ["detok-a", "detok-b"]
     router.num_workers = 2
-    router._pick = lambda key: {
-        "worker-a": "detok-a",
-        "worker-b": "detok-b",
-    }[key]
+    router._pick = (targets_by_rid or {}).__getitem__
     return router
+
+
+async def _cancel_loop_tasks():
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class TestMultiTokenizerMixin(CustomTestCase):
@@ -239,17 +258,65 @@ class TestMultiTokenizerMixin(CustomTestCase):
                     mocks["start_cpu_monitor_thread"].call_count, 1 if enabled else 0
                 )
 
-    def test_batch_str_output_preserves_cached_tokens_details(self):
+    def test_tokenizer_router_loop_failure_kills_the_server(self):
+        """A failure in either router loop takes the whole server down; it must
+        not leave a live server that no longer forwards requests or outputs."""
+        port_args = SimpleNamespace(
+            tokenizer_ipc_name="from-detokenizer",
+            scheduler_input_ipc_name="to-scheduler",
+            tokenizer_worker_ipc_name="from-worker",
+        )
+        for failing_socket in ("from-worker", "from-detokenizer"):
+            with self.subTest(failing_socket=failing_socket):
+                killed = threading.Event()
+                kill_calls = []
+
+                def fake_kill(pid, include_parent=True):
+                    kill_calls.append((pid, include_parent))
+                    killed.set()
+
+                async def fake_recv(socket):
+                    if socket == failing_socket:
+                        raise RuntimeError("recv failed")
+                    await asyncio.Event().wait()
+
+                with (
+                    patch.multiple(
+                        multi_tokenizer_mixin,
+                        get_observability=MagicMock(
+                            return_value=SimpleNamespace(enable_trace=False)
+                        ),
+                        get_zmq_socket=lambda context, socket_type, endpoint, bind: (
+                            endpoint
+                        ),
+                        zmq_reader_owner=lambda caller: False,
+                        start_disagg_service=lambda: None,
+                        async_sock_recv=fake_recv,
+                        kill_process_tree=fake_kill,
+                    ),
+                    # The handler exits the router thread after the kill.
+                    patch.object(multi_tokenizer_mixin.sys, "exit"),
+                ):
+                    router = MultiTokenizerRouter(MagicMock(), port_args)
+                    try:
+                        self.assertTrue(killed.wait(timeout=5))
+                    finally:
+                        asyncio.run_coroutine_threadsafe(
+                            _cancel_loop_tasks(), router._loop
+                        ).result(timeout=5)
+                        router._loop.call_soon_threadsafe(router._loop.stop)
+                        router._thread.join(timeout=5)
+
+                self.assertEqual(kill_calls, [(os.getpid(), True)])
+
+    def test_batch_str_output_keeps_request_stats_per_request(self):
         output = _make_batch_str_output()
 
         single_output = _handle_output_by_index(output, 1)
 
         self.assertEqual(single_output.rids, ["rid-1"])
-        self.assertEqual(single_output.cached_tokens, [4])
-        self.assertEqual(
-            single_output.cached_tokens_details,
-            [{"device": 1, "host": 3}],
-        )
+        self.assertEqual(single_output.request_stats, [_REQUEST_STATS_1])
+        self.assertEqual(_handle_output_by_index(output, 0).request_stats, [None])
 
     def test_batch_str_output_keeps_weight_versions_nested_per_request(self):
         """Per-request segment lists stay one level nested after the split."""
@@ -293,10 +360,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
         self.assertEqual(grouped.rids, ["rid-1", "rid-0"])
         self.assertEqual(grouped.output_strs, ["second", "first"])
-        self.assertEqual(
-            grouped.cached_tokens_details,
-            [{"device": 1, "host": 3}, {"device": 3, "host": 0}],
-        )
+        self.assertEqual(grouped.request_stats, [_REQUEST_STATS_1, None])
         self.assertEqual(
             grouped.weight_versions,
             [
@@ -317,6 +381,24 @@ class TestMultiTokenizerMixin(CustomTestCase):
             grouped.input_top_logprobs_val_flat[1], np.array([[1.0]], np.float32)
         )
 
+    def test_split_slices_each_rows_output_ids(self):
+        """Rows of different lengths, an empty one included, keep their ids."""
+        for output, rows in (
+            (_make_batch_str_output(), [[1], [2, 3]]),
+            (_make_batch_token_id_output(), [[1], []]),
+        ):
+            with self.subTest(type=type(output).__name__):
+                for i, ids in enumerate(rows):
+                    one = _handle_output_by_index(output, i)
+                    self.assertEqual(one.output_ids_flat, array("q", ids))
+                    self.assertEqual(one.output_ids_offsets, [0, len(ids)])
+                grouped = _handle_output_by_indices(output, [1, 0])
+                self.assertEqual(grouped.output_ids_flat, array("q", rows[1] + rows[0]))
+                self.assertEqual(
+                    grouped.output_ids_offsets,
+                    [0, len(rows[1]), len(rows[1]) + len(rows[0])],
+                )
+
     def test_grouped_split_caches_struct_fields_by_output_type(self):
         self.addCleanup(_cached_output_fields.cache_clear)
         _cached_output_fields.cache_clear()
@@ -336,7 +418,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
     def test_router_groups_by_target_and_preserves_owner_ipcs(self):
         output = _make_batch_str_output()
         output.http_worker_ipcs = ["worker-a", "worker-a"]
-        router = _make_router()
+        router = _make_router({"rid-0": "detok-a", "rid-1": "detok-a"})
         sent = []
         router._send = lambda target, obj: sent.append((target, obj))
 
@@ -352,7 +434,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
     def test_router_keeps_first_target_order_and_does_not_cross_messages(self):
         output = _make_batch_str_output()
         output.http_worker_ipcs = ["worker-b", "worker-a"]
-        router = _make_router()
+        router = _make_router({"rid-0": "detok-b", "rid-1": "detok-a"})
         sent = []
         router._send = lambda target, obj: sent.append((target, obj))
 
@@ -368,8 +450,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
     def test_router_groups_token_output_without_speculative_decoding(self):
         output = _make_batch_token_id_output()
-        output.http_worker_ipcs = ["worker-a", "worker-a"]
-        router = _make_router()
+        router = _make_router({"token-rid-0": "detok-a", "token-rid-1": "detok-a"})
         sent = []
         router._send = lambda target, obj: sent.append((target, obj))
 
@@ -378,23 +459,45 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], "detok-a")
         self.assertEqual(sent[0][1].rids, ["token-rid-0", "token-rid-1"])
-        self.assertEqual(sent[0][1].decoded_texts, ["first", "second"])
+        self.assertEqual(sent[0][1].output_ids_flat, array("q", [1]))
+        self.assertEqual(sent[0][1].output_ids_offsets, [0, 1, 1])
         self.assertIsNone(sent[0][1].spec_verify_ct)
+
+    def test_router_split_keeps_each_finished_rows_route(self):
+        output = _make_batch_token_id_output()
+        output.finished_reasons = [None, {"type": "length"}]
+        output.http_worker_ipcs = [None, "worker-b"]
+        header = DetokenizeHeader(
+            prompt_tail_ids=array("q", [1, 2]),
+            skip_special_tokens=True,
+            spaces_between_special_tokens=True,
+            no_stop_trim=False,
+            http_worker_ipc="worker-a",
+        )
+        output.detokenize_headers = [header, None]
+        router = _make_router({"token-rid-0": "detok-a", "token-rid-1": "detok-b"})
+        sent = []
+        router._send = lambda target, obj: sent.append((target, obj))
+
+        router._send_batch(output)
+
+        self.assertEqual(
+            [
+                (target, obj.detokenize_headers, obj.http_worker_ipcs)
+                for target, obj in sent
+            ],
+            [("detok-a", [header], [None]), ("detok-b", [None], ["worker-b"])],
+        )
 
     def test_embedding_split_preserves_per_request_fields(self):
         output = _make_batch_embedding_output()
-        output.retraction_counts = [0, 7]
-        output.cached_tokens_details = [{"radix": 0}, {"radix": 2}]
-        output.time_stats = wrap_as_pickle(["stats-0", "stats-1"])
         output.pooled_hidden_states = [[1.0], [2.0]]
 
         split = _handle_output_by_index(output, 1)
 
         self.assertEqual(split.rids, ["embedding-rid-1"])
         self.assertEqual(split.embeddings, [[0.3, 0.4]])
-        self.assertEqual(split.retraction_counts, [7])
-        self.assertEqual(split.cached_tokens_details, [{"radix": 2}])
-        self.assertEqual(unwrap_from_pickle(split.time_stats), ["stats-1"])
+        self.assertEqual(split.request_stats, [_request_stats(20, 4)])
         self.assertEqual(split.pooled_hidden_states, [[2.0]])
 
     def test_embedding_split_takes_a_row_of_stacked_pooled_hidden_states(self):
@@ -410,14 +513,14 @@ class TestMultiTokenizerMixin(CustomTestCase):
         split = _handle_output_by_index(_make_batch_embedding_output(), 0)
 
         self.assertEqual(split.rids, ["embedding-rid-0"])
-        self.assertIsNone(split.retraction_counts)
-        self.assertIsNone(split.time_stats)
         self.assertIsNone(split.pooled_hidden_states)
 
     def test_router_sends_embedding_output_per_request(self):
         output = _make_batch_embedding_output()
         output.http_worker_ipcs = ["worker-a", "worker-a"]
-        router = _make_router()
+        router = _make_router(
+            {"embedding-rid-0": "detok-a", "embedding-rid-1": "detok-a"}
+        )
         sent = []
         router._send = lambda target, obj: sent.append((target, obj))
 
@@ -428,9 +531,28 @@ class TestMultiTokenizerMixin(CustomTestCase):
             [("detok-a", ["embedding-rid-0"]), ("detok-a", ["embedding-rid-1"])],
         )
 
-    def test_router_keys_on_rid_without_tokenizer_worker_ipcs(self):
+    def test_batch_str_output_keeps_prefill_weight_versions_nested_per_request(self):
+        """Prefill spans split per request the same way the sampling spans do."""
         output = _make_batch_str_output()
-        output.http_worker_ipcs = [None, None]
+
+        self.assertEqual(
+            _handle_output_by_index(output, 0).prefill_weight_versions,
+            [[WeightVersionSpan(version="v0", start=0, end=7)]],
+        )
+        self.assertEqual(
+            _handle_output_by_index(output, 1).prefill_weight_versions, [None]
+        )
+
+    def test_batch_str_output_without_prefill_weight_versions_stays_none(self):
+        """An output produced without the flag splits into None."""
+        output = _make_batch_str_output()
+        output.prefill_weight_versions = None
+
+        self.assertIsNone(_handle_output_by_index(output, 0).prefill_weight_versions)
+
+    def test_router_keys_on_rid_not_tokenizer_worker_ipc(self):
+        output = _make_batch_str_output()
+        output.http_worker_ipcs = ["worker-a", None]
         router = _make_router()
         router._pick = lambda key: f"detok-for-{key}"
         sent = []
@@ -443,7 +565,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(
             sent,
             [
-                ("detok-for-rid-0", ["rid-0"], [None]),
+                ("detok-for-rid-0", ["rid-0"], ["worker-a"]),
                 ("detok-for-rid-1", ["rid-1"], [None]),
             ],
         )
@@ -460,7 +582,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
                 "sglang.srt.managers.multi_tokenizer_mixin.sock_recv",
                 side_effect=[
                     ConfigureLoggingReq(log_level="debug"),
-                    AbortReq(rid="rid-0"),
+                    AbortReq(rid="rid-0", http_worker_ipc="worker-a"),
                     EOFError("end of input"),
                 ],
             ),
@@ -522,8 +644,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         output = _make_batch_embedding_output()
         output.rids.append("embedding-rid-2")
         output.embeddings.append([0.5, 0.6])
-        output.prompt_tokens.append(30)
-        output.cached_tokens.append(5)
+        output.request_stats.append(_request_stats(30, 5))
         output.finished_reasons.append(None)
         sent = []
         mapping = SimpleNamespace(

@@ -31,12 +31,12 @@ def maybe_publish_prefill_shared_read_done(
     if not model_runner.spec_algorithm.supports_prefill_shared_read_done():
         return
     # Host and storage offload copy a stashed chunk's KV ordered only behind the
-    # schedule stream, so they need the whole-forward barrier.
+    # schedule stream, so they need the whole-forward barrier unless every such
+    # copy waits for the forward stream itself.
     memory = get_memory()
-    if (
-        memory.enable_hierarchical_cache
-        or memory.hicache_storage_backend is not None
-        or memory.enable_lmcache
+    if memory.enable_lmcache or (
+        (memory.enable_hierarchical_cache or memory.hicache_storage_backend is not None)
+        and not model_runner.kv_offload_fenced_on_forward_stream
     ):
         return
     logger.info_once(

@@ -1,4 +1,4 @@
-"""Unit tests for the sglang.srt.utils.hf_transformers subpackage.
+"""Unit tests for the sglang.srt.hf_transformers subpackage.
 
 Tests cover the pure utility functions (compat patches, config helpers,
 context length, GGUF detection, etc.) that don't require actual model files.
@@ -6,8 +6,10 @@ context length, GGUF detection, etc.) that don't require actual model files.
 
 import inspect
 import io
+import json
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -18,9 +20,9 @@ from transformers import PretrainedConfig
 from transformers.image_processing_backends import PilBackend
 from transformers.image_processing_utils import BaseImageProcessor
 
-import sglang.srt.utils.hf_transformers.processor as processor_utils
-from sglang.srt.utils import hf_transformers_patches
-from sglang.srt.utils.hf_transformers.common import (
+import sglang.srt.hf_transformers.processor as processor_utils
+import sglang.srt.hf_transformers.tokenizer as tokenizer_utils
+from sglang.srt.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
@@ -32,8 +34,12 @@ from sglang.srt.utils.hf_transformers.common import (
     get_rope_config,
     resolve_hf_gguf_reference,
 )
-from sglang.srt.utils.hf_transformers.config import _apply_gemma4_attention_overrides
-from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from sglang.srt.hf_transformers.config import (
+    _apply_gemma4_attention_overrides,
+    get_config,
+)
+from sglang.srt.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -47,6 +53,61 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestGetProcessor(CustomTestCase):
+    def test_applies_v5_bos_eos_fix_to_processor_tokenizer(self):
+        class ProcessorTokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self._add_bos_token = False
+                self._add_eos_token = False
+                self.update_post_processor_calls = 0
+
+            @property
+            def add_bos_token(self):
+                return self._add_bos_token
+
+            @property
+            def add_eos_token(self):
+                return self._add_eos_token
+
+            def update_post_processor(self):
+                self.update_post_processor_calls += 1
+
+        with tempfile.TemporaryDirectory() as model_path:
+            Path(model_path, "tokenizer_config.json").write_text(
+                json.dumps(
+                    {
+                        "tokenizer_class": "GemmaTokenizer",
+                        "add_bos_token": True,
+                        "add_eos_token": False,
+                    }
+                )
+            )
+            config = SimpleNamespace(model_type="test_vlm", auto_map={})
+            tokenizer = ProcessorTokenizer()
+            loaded_processor = SimpleNamespace(tokenizer=tokenizer)
+            auto_config = MagicMock()
+            auto_config.from_pretrained.return_value = config
+            auto_processor = MagicMock()
+            auto_processor.from_pretrained.return_value = loaded_processor
+
+            with patch.multiple(
+                processor_utils,
+                AutoConfig=auto_config,
+                AutoProcessor=auto_processor,
+                _install_tokenizer_warnings_filter=MagicMock(),
+                patch_mistral_common_tokenizer=MagicMock(),
+                _fix_special_tokens_pattern=MagicMock(),
+                _fix_added_tokens_encoding=MagicMock(),
+                attach_additional_stop_token_ids=MagicMock(),
+            ):
+                processor = processor_utils.get_processor(model_path)
+
+        self.assertIs(processor, loaded_processor)
+        self.assertTrue(tokenizer.add_bos_token)
+        self.assertFalse(tokenizer.add_eos_token)
+        self.assertEqual(tokenizer.update_post_processor_calls, 1)
+
     def test_does_not_forward_backend_to_auto_processor(self):
         config = SimpleNamespace(model_type="test_vlm", auto_map={})
         loaded_processor = MagicMock()
@@ -175,10 +236,122 @@ class TestGetProcessor(CustomTestCase):
             revision=None,
         )
 
+    def test_unlimited_ocr_loads_for_both_model_type_spellings(self):
+        """baidu/Unlimited-OCR was re-saved with model_type "unlimited_ocr"; that
+        checkpoint must still build its sub-configs and get SGLang's processor,
+        not a bare tokenizer."""
+        from sglang.srt.configs.unlimited_ocr import UnlimitedOCRHFProcessor
+
+        for model_type in ("unlimited-ocr", "unlimited_ocr"):
+            with (
+                self.subTest(model_type=model_type),
+                tempfile.TemporaryDirectory() as d,
+            ):
+                with open(f"{d}/config.json", "w") as f:
+                    json.dump(
+                        {
+                            "model_type": model_type,
+                            "architectures": ["UnlimitedOCRForCausalLM"],
+                            "language_config": {"vocab_size": 1234},
+                        },
+                        f,
+                    )
+                config = get_config(d, trust_remote_code=False)
+                self.assertEqual(config.text_config.vocab_size, 1234)
+
+                loaded_processor = MagicMock()
+                loaded_processor.tokenizer.chat_template = "template"
+                with patch.object(
+                    UnlimitedOCRHFProcessor,
+                    "from_pretrained",
+                    return_value=loaded_processor,
+                ) as from_pretrained:
+                    processor = processor_utils.get_processor(d)
+
+                self.assertIs(processor, loaded_processor)
+                from_pretrained.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # _patch_image_processor_kwargs
 # ---------------------------------------------------------------------------
+
+
+class TestGetTokenizerRevision(CustomTestCase):
+    def _load(self, **revision_kwargs):
+        from tokenizers import Tokenizer, models
+        from transformers import PreTrainedTokenizerFast
+
+        # A named subclass, so the load is not retried as a generic TokenizersBackend.
+        class TinyTokenizer(PreTrainedTokenizerFast):
+            pass
+
+        vocab = {"a": 0, "[UNK]": 1}
+        loaded = TinyTokenizer(
+            tokenizer_object=Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+        )
+        cache_lookups = []
+
+        def fake_cache_lookup(model_name_or_path, filename, revision=None):
+            cache_lookups.append((filename, revision))
+            raise FileNotFoundError(filename)
+
+        auto_tokenizer = MagicMock()
+        auto_tokenizer.from_pretrained.return_value = loaded
+        tekken_probe = MagicMock(return_value=False)
+        with patch.multiple(
+            tokenizer_utils,
+            AutoTokenizer=auto_tokenizer,
+            is_bare_tekken_checkpoint=tekken_probe,
+            _resolve_local_or_cached_file=fake_cache_lookup,
+        ):
+            tokenizer_utils.get_tokenizer("org/model", **revision_kwargs)
+        return (
+            auto_tokenizer.from_pretrained.call_args.kwargs,
+            tekken_probe,
+            cache_lookups,
+        )
+
+    def test_revision_selects_the_branch_of_every_tokenizer_file(self):
+        """With `revision=`, the tekken probe and the post-load fix-ups must read
+        the files of that revision, not of the default branch."""
+        load_kwargs, tekken_probe, cache_lookups = self._load(revision="rev-a")
+
+        self.assertEqual(load_kwargs["revision"], "rev-a")
+        self.assertEqual(tekken_probe.call_args.args, ("org/model", "rev-a"))
+        self.assertEqual(
+            cache_lookups,
+            [("tokenizer.json", "rev-a"), ("tokenizer_config.json", "rev-a")],
+        )
+
+    def test_tokenizer_revision_is_loaded_as_the_revision(self):
+        """`tokenizer_revision=`, the spelling the processor reload passes, must
+        load that revision: AutoTokenizer only reads `revision`."""
+        load_kwargs, _, cache_lookups = self._load(tokenizer_revision="rev-a")
+
+        self.assertEqual(load_kwargs["revision"], "rev-a")
+        self.assertEqual({revision for _, revision in cache_lookups}, {"rev-a"})
+
+
+class TestMistralConfigRevision(CustomTestCase):
+    def test_params_json_is_fetched_at_the_requested_revision(self):
+        """A Mistral-format config must be parsed from the requested revision's
+        params.json, not from the default branch's."""
+        from sglang.srt.hf_transformers import common as hf_common
+        from sglang.srt.hf_transformers.mistral_utils import load_mistral_config
+
+        params = {"dim": 8, "n_layers": 1, "n_heads": 1, "hidden_dim": 16}
+        with tempfile.TemporaryDirectory() as snapshot_dir:
+            Path(snapshot_dir, "params.json").write_text(json.dumps(params))
+            with patch.object(
+                hf_common, "snapshot_download", return_value=snapshot_dir
+            ) as snapshot_download:
+                config = load_mistral_config(
+                    "org/mistral-revision-test", revision="rev-a"
+                )
+
+        self.assertEqual(config.hidden_size, 8)
+        self.assertEqual(snapshot_download.call_args.kwargs.get("revision"), "rev-a")
 
 
 class TestImageProcessorKwargsPatch(CustomTestCase):
@@ -204,6 +377,16 @@ class TestImageProcessorKwargsPatch(CustomTestCase):
 
 
 class TestPilImageProcessorTensorPatch(CustomTestCase):
+    def test_npu_tensor_is_copied_to_cpu_before_pil_processing(self):
+        tensor = MagicMock(spec=torch.Tensor)
+        tensor.device.type = "npu"
+        pixels = torch.arange(3 * 5 * 7, dtype=torch.uint8).reshape(3, 5, 7)
+        tensor.cpu.return_value = pixels
+
+        result = PilBackend().process_image(tensor, do_convert_rgb=False)
+        tensor.cpu.assert_called_once_with()
+        np.testing.assert_array_equal(result, pixels.numpy())
+
     def test_grayscale_jpeg_tensor_matches_pil_rgb(self):
         """A grayscale JPEG tensor should match the PIL RGB backend output."""
         image = Image.new("L", (56, 56), 128)
@@ -276,14 +459,12 @@ class TestNormalizeRopeScalingCompat(CustomTestCase):
         self.assertEqual(llm_cfg.rope_scaling["type"], "dynamic")
 
     def test_no_crash_on_non_dict_rope_scaling(self):
-        cfg = PretrainedConfig()
-        cfg.rope_scaling = "not_a_dict"
+        cfg = SimpleNamespace(rope_scaling="not_a_dict")
         normalize_rope_scaling_compat(cfg)
         self.assertEqual(cfg.rope_scaling, "not_a_dict")
 
     def test_no_crash_on_dict_without_rope_type(self):
-        cfg = PretrainedConfig()
-        cfg.rope_scaling = {"factor": 4.0}
+        cfg = SimpleNamespace(rope_scaling={"factor": 4.0})
         normalize_rope_scaling_compat(cfg)
         self.assertNotIn("type", cfg.rope_scaling)
 
@@ -707,22 +888,12 @@ class TestFixSpecialTokensPattern(CustomTestCase):
 
 class TestModuleReExports(CustomTestCase):
     def test_all_public_symbols_importable(self):
-        import sglang.srt.utils.hf_transformers as pkg
+        import sglang.srt.hf_transformers as pkg
 
         for name in pkg.__all__:
             self.assertTrue(
                 hasattr(pkg, name),
                 f"{name} listed in __all__ but not importable from package",
-            )
-
-    def test_shim_module_exports_match(self):
-        import sglang.srt.utils.hf_transformers as pkg
-        import sglang.srt.utils.hf_transformers_utils as shim
-
-        for name in pkg.__all__:
-            self.assertTrue(
-                hasattr(shim, name),
-                f"{name} not available through shim module hf_transformers_utils",
             )
 
 
@@ -796,7 +967,7 @@ class TestAutoConfigRegistration(CustomTestCase):
             CONFIG_MAPPING_NAMES,
         )
 
-        import sglang.srt.configs  # noqa: F401  (populates the registrations)
+        import sglang.srt.configs.all_configs  # noqa: F401  (populates the registrations)
 
         # `_extra_content` is exactly the set of classes SGLang registered, so
         # this covers `_CONFIG_REGISTRY` and the standalone registrations alike.
@@ -959,13 +1130,21 @@ class TestNormalizeTpStyle(CustomTestCase):
     plan naming an unknown one stops the model loading at all."""
 
     def test_tied_embedding_plan_normalizes(self):
-        from transformers import AutoConfig
+        from transformers import AutoConfig, AutoModel
 
         from sglang.srt.models.transformers import _normalize_tp_style
 
-        plan = AutoConfig.for_model(
-            "llama", tie_word_embeddings=True
-        ).base_model_tp_plan
+        config = AutoConfig.for_model(
+            "llama",
+            tie_word_embeddings=True,
+            vocab_size=16,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+        )
+        plan = AutoModel.from_config(config).tp_plan
         self.assertIn("embedding_rowwise", plan.values())
         for pattern, style in plan.items():
             with self.subTest(pattern=pattern):

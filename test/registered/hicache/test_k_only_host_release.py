@@ -11,10 +11,11 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     MHATokenToKVPoolHost,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 class TestKOnlyHostRelease(CustomTestCase):
@@ -46,7 +47,11 @@ class TestKOnlyHostRelease(CustomTestCase):
             write_back_staging=main_pool.hicache_write_back_staging,
         )
         self.addCleanup(anchor.destroy)
-        host = MHATokenToKOnlyPoolHost(index_pool, anchor, "layer_first")
+        host = MHATokenToKOnlyPoolHost(
+            buffer_info=index_pool.get_device_pool_infos()[0].buffer_info,
+            anchor_host=anchor,
+            layout="layer_first",
+        )
         buffer = host.k_buffer
         self.addCleanup(_cuda_host_unregister, buffer)
         host.destroy()

@@ -293,7 +293,7 @@ SGLang's built-in `bench_serving` requires no extra installation. Make sure the 
 <Note>See the [Bench Serving Guide](/docs/developer_guide/bench_serving) for all backends, datasets, and advanced options.</Note>
 
 ```shell Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang-oai \
   --base-url http://127.0.0.1:30000 \
   --model Qwen/Qwen2.5-7B-Instruct \
@@ -611,7 +611,7 @@ Set `--dataset-name image` for image datasets. `bench_serving` will generate ran
 <Note>See the [Bench Serving Guide](/docs/developer_guide/bench_serving) for the full list of image-related flags.</Note>
 
 ```shell Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --base-url http://127.0.0.1:30000 \
   --model Qwen/Qwen2.5-VL-7B-Instruct \
@@ -702,7 +702,7 @@ evalscope perf \
 `bench_serving` is built into SGLang. Use `--backend sglang-embedding` to target the `/v1/embeddings` endpoint. Make sure the server is running with `--is-embedding` at `http://127.0.0.1:30000`.
 
 ```shell Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang-embedding \
   --base-url http://127.0.0.1:30000 \
   --model Qwen/Qwen3-Embedding-8B \

@@ -11,9 +11,8 @@ import numpy as np
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
-from sglang.multimodal_gen.configs.task_type import get_request_task_type
+from sglang.multimodal_gen.configs.task_type import ModelTaskType, get_request_task_type
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
 )
@@ -331,12 +330,7 @@ class InputValidationStage(PipelineStage):
                 image = image[0]  # not support multi image input yet.
 
             max_area = server_args.pipeline_config.max_area
-            if hasattr(batch, "height") and hasattr(batch, "width"):
-                aspect_ratio = batch.height / batch.width
-            else:
-                aspect_ratio = (
-                    batch.sampling_params.height / batch.sampling_params.width
-                )
+            aspect_ratio = batch.height / batch.width
             mod_value = (
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
@@ -345,7 +339,6 @@ class InputValidationStage(PipelineStage):
                 max_area, aspect_ratio, mod_value
             )
 
-            config = server_args.pipeline_config
             image, (final_w, final_h) = (
                 server_args.pipeline_config.preprocess_condition_image(
                     image, width, height, self.vae_image_processor

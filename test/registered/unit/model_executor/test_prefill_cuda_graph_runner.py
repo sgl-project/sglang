@@ -3,32 +3,25 @@
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.managers.scheduler_components.dp_attn import (
     _local_prefill_cuda_graph_vote,
 )
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_prefill_graph,
@@ -37,6 +30,10 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    BreakableCudaGraphBackend,
+)
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -45,11 +42,13 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _static_pool_translator():
-    """A static pool's translator: its plans hand every batch its own ids."""
-    return KVIndexTranslator(
+    """A static pool's runner_ids: its plans hand every batch its own ids."""
+    return RunnerIds(
         req_to_token=torch.zeros((1, 8), dtype=torch.int32),
         token_to_kv_pool_allocator=None,
-        token_to_kv_pool=object(),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=1,
         device="cpu",
     )
@@ -116,6 +115,60 @@ class _FakeBatchRegistry:
 
     def get_slot(self, name):
         return self.slots[name]
+
+
+def _load_batch_runner(backend):
+    """A runner with the state load_batch reads, over one 4-token bucket."""
+    runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+    runner.capture_num_tokens = [4]
+    runner.max_context_size = None
+    runner.max_seq_len = None
+    runner._capture_chunked_prefix = False
+    runner.buffer_registry = _FakeBatchRegistry()
+    runner.model_runner = SimpleNamespace(
+        attn_tp_sequence_sharded=lambda _: False,
+        prepare_dummy_forward_batch=lambda batch: batch,
+        runner_ids=_static_pool_translator(),
+    )
+    runner.enable_cp_bcg_capture = False
+    runner._is_full_backend = False
+    runner._is_breakable_backend = isinstance(backend, BreakableCudaGraphBackend)
+    runner.backend = backend
+    runner.has_mha_companion_layers = False
+    runner._prefill_static_buffers = None
+    runner.static_draft_hidden_states = None
+    runner.capture_return_pooled_hidden_states = False
+    runner._next_token_logits_buffer = lambda _rows: None
+    runner._prefill_logits_buffer_rows = lambda _batch: 1
+    runner._prepare_forward_metadata_for_replay = lambda *_args: None
+    return runner
+
+
+def _three_token_extend(runner, **fields):
+    """Three tokens of one request behind a 5-token prefix, bound to the
+    runner's ids."""
+    forward_batch = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=1,
+        input_ids=torch.arange(3, dtype=torch.int64),
+        req_pool_indices=torch.zeros(1, dtype=torch.int64),
+        seq_lens=torch.tensor([8], dtype=torch.int32),
+        out_cache_loc=torch.arange(3, dtype=torch.int64),
+        seq_lens_sum=8,
+        positions=torch.arange(5, 8, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([3], dtype=torch.int32),
+        extend_prefix_lens=torch.full((1,), 5, dtype=torch.int32),
+        extend_start_loc=torch.zeros(1, dtype=torch.int32),
+        extend_seq_lens_cpu=[3],
+        extend_prefix_lens_cpu=[5],
+        mm_inputs=None,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        global_forward_mode=ForwardMode.EXTEND,
+        **fields,
+    )
+    runner.model_runner.runner_ids.bind_own_plan(forward_batch)
+    return forward_batch
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
@@ -212,7 +265,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             prepare_dummy_forward_batch=lambda batch: prepared.append(batch) or batch,
             attn_tp_sequence_sharded=lambda _: False,
             attn_backend=attention_backend,
-            kv_index_translator=_static_pool_translator(),
+            runner_ids=_static_pool_translator(),
         )
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.model_runner = model_runner
@@ -284,6 +337,45 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         self.assertIs(output.customized_info, customized_info)
 
+    def test_trim_logits_output_preserves_input_logprobs(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+        )
+        runner.raw_bs = 1
+        runner._is_full_backend = True
+        # Per request, not per padded token: the scheduler reads each of them
+        # off the replayed output.
+        untrimmed = LogitsProcessorOutput(
+            next_token_logits=torch.zeros((4, 8)),
+            input_token_logprobs=object(),
+            input_top_logprobs_val=object(),
+            input_top_logprobs_idx=object(),
+            input_top_logprobs_weights=object(),
+            input_token_ids_logprobs_val=object(),
+            input_token_ids_logprobs_idx=object(),
+            input_logprobs_copy_done=object(),
+        )
+        output = runner._trim_logits_output(untrimmed)
+
+        self.assertIs(output.input_token_logprobs, untrimmed.input_token_logprobs)
+        self.assertIs(output.input_top_logprobs_val, untrimmed.input_top_logprobs_val)
+        self.assertIs(output.input_top_logprobs_idx, untrimmed.input_top_logprobs_idx)
+        self.assertIs(
+            output.input_top_logprobs_weights, untrimmed.input_top_logprobs_weights
+        )
+        self.assertIs(
+            output.input_token_ids_logprobs_val,
+            untrimmed.input_token_ids_logprobs_val,
+        )
+        self.assertIs(
+            output.input_token_ids_logprobs_idx,
+            untrimmed.input_token_ids_logprobs_idx,
+        )
+        self.assertIs(
+            output.input_logprobs_copy_done, untrimmed.input_logprobs_copy_done
+        )
+
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()
         prefill_runner = object()
@@ -345,6 +437,46 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         self.assertIs(capture.runner, prefill_runner)
 
+    def test_no_fitting_capture_size_falls_back_to_eager(self):
+        """When every prefill bucket exceeds what a capture batch can hold, the
+        caller must get an eager capture record, not a startup AttributeError."""
+        eager_runner = object()
+        override = get_context().override_server_args(
+            enable_lora=False,
+            enable_prefill_cp=False,
+            pp_size=1,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(bs=[4096], backend=Backend.BREAKABLE)
+            ),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        model_runner = SimpleNamespace(
+            device="cuda",
+            is_draft_worker=False,
+            lora_manager=None,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
+            server_args=SimpleNamespace(),
+            model=SimpleNamespace(),
+            # One request of 512 tokens is the largest capture batch.
+            model_config=SimpleNamespace(context_len=512),
+            req_to_token_pool=SimpleNamespace(size=1),
+        )
+
+        with (
+            patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                graph_setup, "resolve_language_model", return_value=SimpleNamespace()
+            ),
+        ):
+            capture = capture_prefill_graph(
+                model_runner=model_runner,
+                eager_runner=eager_runner,
+            )
+
+        self.assertIs(capture.runner, eager_runner)
+        self.assertEqual(capture.memory_usage, {"prefill": 0})
+
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()
         # The server-side hidden-state ceiling and graph config are bag leaves.
@@ -386,55 +518,38 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
     def test_static_batch_preserves_consumed_multimodal_embeddings(self):
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner.capture_num_tokens = [4]
-        runner.max_context_size = None
-        runner.max_seq_len = None
-        runner._capture_chunked_prefix = False
-        runner.buffer_registry = _FakeBatchRegistry()
-        translator = _static_pool_translator()
-        runner.model_runner = SimpleNamespace(
-            attn_tp_sequence_sharded=lambda _: False,
-            prepare_dummy_forward_batch=lambda batch: batch,
-            kv_index_translator=translator,
-        )
-        runner.enable_cp_bcg_capture = False
-        runner._is_full_backend = False
-        runner.backend = SimpleNamespace()
-        runner.has_mha_companion_layers = False
-        runner._prefill_static_buffers = None
-        runner.static_draft_hidden_states = None
-        runner.capture_return_pooled_hidden_states = False
-        runner._next_token_logits_buffer = lambda _rows: None
-        runner._prefill_logits_buffer_rows = lambda _batch: 1
-        runner._prepare_forward_metadata_for_replay = lambda *_args: None
-
+        runner = _load_batch_runner(SimpleNamespace())
         mm_input_embeds = torch.randn(3, 8)
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=1,
-            input_ids=torch.arange(3, dtype=torch.int64),
-            req_pool_indices=torch.zeros(1, dtype=torch.int64),
-            seq_lens=torch.tensor([3], dtype=torch.int32),
-            out_cache_loc=torch.arange(3, dtype=torch.int64),
-            seq_lens_sum=3,
-            positions=torch.arange(3, dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
-            extend_seq_lens=torch.tensor([3], dtype=torch.int32),
-            extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
-            extend_start_loc=torch.zeros(1, dtype=torch.int32),
-            extend_seq_lens_cpu=[3],
-            extend_prefix_lens_cpu=[0],
-            mm_inputs=None,
-            mm_input_embeds=mm_input_embeds,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            global_forward_mode=ForwardMode.EXTEND,
-        )
-        translator.bind_own_plan(forward_batch)
+        forward_batch = _three_token_extend(runner, mm_input_embeds=mm_input_embeds)
 
         static_batch, _ = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+
+    def test_breakable_static_batch_carries_the_input_logprob_request(self):
+        """A Breakable replay runs the logits processor on the static batch,
+        which must ask it for what the raw batch asks."""
+        runner = _load_batch_runner(
+            BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        )
+        selectors = [object()]
+        forward_batch = _three_token_extend(
+            runner,
+            return_logprob=True,
+            extend_logprob_start_lens_cpu=[1],
+            top_logprobs_nums=[5],
+            input_candidate_selectors=selectors,
+            token_ids_logprobs=[[7]],
+        )
+
+        static_batch, _ = runner.load_batch(forward_batch)
+
+        self.assertTrue(static_batch.return_logprob)
+        self.assertEqual(static_batch.extend_prefix_lens_cpu, [5])
+        self.assertEqual(static_batch.extend_logprob_start_lens_cpu, [1])
+        self.assertEqual(static_batch.top_logprobs_nums, [5])
+        self.assertIs(static_batch.input_candidate_selectors, selectors)
+        self.assertEqual(static_batch.token_ids_logprobs, [[7]])
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(
@@ -762,7 +877,8 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = is_full_backend
         runner.model_runner = SimpleNamespace(
-            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter),
+            model=torch.nn.Module(),
         )
         return runner
 
@@ -798,6 +914,45 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
         waiter.start()
         waiter.join(timeout=5)
         self.assertFalse(waiter.is_alive())
+
+    def test_breakable_replay_of_an_external_body_waits_for_every_layer(self):
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        runner = self._runner(counter, is_full_backend=False)
+        runner_module.set_external_prefill_body(runner.model_runner.model, object())
+        waiter = threading.Thread(target=runner._wait_for_layer_loads, daemon=True)
+        waiter.start()
+        waiter.join(timeout=0.2)
+        self.assertTrue(waiter.is_alive())
+        for layer in range(3):
+            counter.complete(0, layer)
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
+
+
+class TestPrefillCudaGraphRunnerBodyTables(CustomTestCase):
+    def test_an_external_body_refills_its_tables_at_capture_and_replay(self):
+        backend = MagicMock()
+        backend.init_forward_metadata_for_breakable_cuda_graph_capture.return_value = (
+            "meta"
+        )
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._dcp_extend_active = runner._is_full_backend = False
+        runner.use_captured_attn_metadata = True
+        runner.attn_metadata_buffers = {}
+        runner.model_runner = SimpleNamespace(
+            attn_backend=backend, model=torch.nn.Module()
+        )
+        body = MagicMock()
+        runner_module.set_external_prefill_body(runner.model_runner.model, body)
+        forward_batch = SimpleNamespace(moe_num_token_non_padded=None)
+        runner._init_forward_metadata_for_capture(forward_batch, "bucket")
+        runner._prepare_forward_metadata_for_replay(
+            forward_batch, SimpleNamespace(), "bucket"
+        )
+        self.assertEqual(
+            body.refill_prefill_graph.call_args_list, [call("meta", forward_batch)] * 2
+        )
 
 
 if __name__ == "__main__":

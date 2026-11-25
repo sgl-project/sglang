@@ -3,19 +3,22 @@
 The e2e counterpart, over the real scheduler load-report path, is
 test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
-Fragility: scheduler tests bypass `DataParallelController.__init__` via
-`__new__` and inject only the attrs the schedulers read (`workers`, `status`,
-`_active_workers`, `round_robin_counter`, `dp_budget`). Update `_make_controller`
-if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
-is exercised as the real method, no mock. The refresh-throttle tests inject
-`load_snapshot_reader` and `_last_refresh_time` on top of those.
+Fragility: scheduler tests bypass `DataParallelController.__init__` via `__new__` and
+inject only the attrs the schedulers read (`workers`, `_active_workers`,
+`round_robin_counter`, `dp_budget`). `status` / `dp_active` / `max_dp_size` are for
+`update_active_ranks`. Update `_make_controller` if a scheduler starts reading another
+attr. `maybe_external_dp_rank_routing` is exercised as the real method, no mock. The
+refresh-throttle tests inject `load_snapshot_reader` and `_last_refresh_time` on top of
+those. The abort-route test also sets `control_message_step` and builds the real
+dispatch table with `init_dispatcher`.
 """
 
+import importlib
 import threading
 import time
 import unittest
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import msgspec.structs
@@ -25,16 +28,39 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    ActiveRanksOutput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+# Dispatch is asserted through worker.send_pyobj on SimpleNamespace reqs, which
+# only the pickle codec sends.
+_pickle_ipc = patch.object(io_struct, "_USE_PICKLE_IPC", True)
+
+
+def setUpModule():
+    _pickle_ipc.start()
+
+
+def tearDownModule():
+    _pickle_ipc.stop()
 
 
 _BASE_LOAD = msgspec.structs.replace(
@@ -48,12 +74,20 @@ def _load(**overrides) -> LoadSnapshot:
     return msgspec.structs.replace(_BASE_LOAD, **overrides)
 
 
-def _make_controller(num_dp_ranks: int) -> DataParallelController:
+def _make_controller(
+    num_dp_ranks: int, max_dp_size: int | None = None
+) -> DataParallelController:
     """Bypass __init__; inject only the attrs dispatch methods read."""
+    if max_dp_size is None:
+        max_dp_size = num_dp_ranks
     ctl = DataParallelController.__new__(DataParallelController)
-    ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(num_dp_ranks)]
-    ctl.status = [True] * num_dp_ranks
+    ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(max_dp_size)]
+    ctl.max_dp_size = max_dp_size
+    ctl.launch_dp_size = num_dp_ranks
+    ctl.dp_active = [True] * num_dp_ranks + [False] * (max_dp_size - num_dp_ranks)
+    ctl.status = list(ctl.dp_active)
     ctl._active_workers = list(range(num_dp_ranks))
+    ctl._active_count_cache = num_dp_ranks
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
@@ -67,14 +101,19 @@ def _req(
     input_ids=None,
     rid="USER",
     time_stats=None,
+    input_embeds=None,
 ):
-    """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
+    """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema.
+
+    As with a real input_embeds request, passing input_embeds leaves input_ids None.
+    """
     return SimpleNamespace(
         time_stats=time_stats,
         rid=rid,
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
-        input_ids=input_ids or [],
+        input_ids=None if input_embeds is not None else (input_ids or []),
+        input_embeds=input_embeds,
     )
 
 
@@ -170,6 +209,7 @@ class TestLocalKvEventSources(CustomTestCase):
         scheduler.startup_time = {}
         scheduler.page_size = 64
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.kv_events_publisher = component
         publisher = MagicMock()
         publisher.describe_local_source.return_value = self._source(4, 256)
@@ -215,8 +255,7 @@ class TestLocalKvEventSources(CustomTestCase):
         with (
             get_context().override_server_args(
                 tp_size=8,
-                dp_size=4,
-                enable_dp_attention=True,
+                attn_dp_size=4,
                 nnodes=2,
                 node_rank=1,
                 pp_size=1,
@@ -241,6 +280,112 @@ class TestLocalKvEventSources(CustomTestCase):
         self.assertEqual(
             controller.local_kv_event_sources, [self._source(2), self._source(3)]
         )
+
+
+class TestRayAttentionDpPortArgs(CustomTestCase):
+    def test_scheduler_actors_share_the_launcher_instance_id(self):
+        """Under DP attention every scheduler actor derives its own PortArgs but must
+        keep the launcher's instance_id, which names the load-snapshot SHM file and
+        the drain notification; this holds for both placement-group branches."""
+        ray = ModuleType("ray")
+        ray.remote = lambda cls: cls
+        ray.get = lambda refs: []
+        placement = ModuleType("ray.util.placement_group")
+        placement.PlacementGroup = object
+        strategies = ModuleType("ray.util.scheduling_strategies")
+        strategies.PlacementGroupSchedulingStrategy = object
+        stubs = {
+            "ray": ray,
+            "ray.util": ModuleType("ray.util"),
+            "ray.util.placement_group": placement,
+            "ray.util.scheduling_strategies": strategies,
+        }
+        parallel = SimpleNamespace(
+            nnodes=1,
+            attn_dp_enabled=True,
+            tp_size=2,
+            pp_size=1,
+            attn_dp_size=2,
+            attn_cp_size=1,
+        )
+        launcher_port_args = SimpleNamespace(
+            nccl_port=1234,
+            instance_id="launcher",
+            detokenizer_ipc_name="detokenizer",
+            tokenizer_ipc_name="tokenizer",
+        )
+        srt_package = importlib.import_module("sglang.srt")
+        with patch.dict("sys.modules", stubs), patch.dict(vars(srt_package)):
+            ray_dp = importlib.import_module("sglang.srt.ray.data_parallel_controller")
+            for is_custom_pg in (False, True):
+                with self.subTest(is_custom_pg=is_custom_pg):
+                    controller = ray_dp.RayDataParallelController.__new__(
+                        ray_dp.RayDataParallelController
+                    )
+                    controller.scheduler_actors = []
+                    controller.event_loop_refs = []
+                    controller.is_custom_pg = is_custom_pg
+                    controller.bundle_for_node = [0]
+                    controller.rank0_node_ip = "127.0.0.1"
+                    controller.pg = object()
+                    # Like the real init_new, each call mints a new instance_id.
+                    rank_port_args = [
+                        SimpleNamespace(instance_id=f"rank-{i}") for i in range(2)
+                    ]
+                    actor_port_args = []
+
+                    def create_actor(**kwargs):
+                        actor_port_args.append(kwargs["port_args"])
+                        remote = SimpleNamespace(remote=lambda: None)
+                        return SimpleNamespace(get_info=remote, run_event_loop=remote)
+
+                    with (
+                        patch.object(ray_dp, "get_parallel", return_value=parallel),
+                        patch.object(
+                            ray_dp,
+                            "_calculate_rank_ranges",
+                            return_value=(range(1), range(2), 1, 2),
+                        ),
+                        patch.object(ray_dp, "_compute_world_size", return_value=2),
+                        patch.object(
+                            ray_dp, "_resolve_bundle_indices", return_value=[0, 1]
+                        ),
+                        patch.object(
+                            ray_dp.PortArgs, "init_new", side_effect=rank_port_args
+                        ),
+                        patch.object(
+                            ray_dp, "_create_scheduler_actor", side_effect=create_actor
+                        ),
+                    ):
+                        controller._launch_ray_tp_group(
+                            SimpleNamespace(),
+                            launcher_port_args,
+                            dp_rank=None,
+                            worker_ports=[7000, 7001],
+                        )
+                    self.assertEqual(
+                        [args.instance_id for args in actor_port_args],
+                        ["launcher", "launcher"],
+                    )
+
+
+class TestInitInfoReply(CustomTestCase):
+    @staticmethod
+    def _reply(*scheduler_infos):
+        controller = DataParallelController.__new__(DataParallelController)
+        controller._scheduler_init_info_lock = threading.Lock()
+        controller._scheduler_init_infos = []
+        controller._record_scheduler_init_infos(list(scheduler_infos))
+        return controller.get_init_info()
+
+    def test_router_l3_layout_is_forwarded_only_when_a_scheduler_reports_it(self):
+        """The reply holds only the keys the controller names, so it must name this one."""
+        info = {"max_total_num_tokens": 64, "max_req_input_len": 32}
+        reporting = {**info, "router_l3_layout": "layout-a"}
+        self.assertEqual(
+            self._reply(reporting, reporting)["router_l3_layout"], "layout-a"
+        )
+        self.assertNotIn("router_l3_layout", self._reply(info, info))
 
 
 class TestDPBudgetUpdateBudget(CustomTestCase):
@@ -316,8 +461,7 @@ class TestRoundRobinScheduler(CustomTestCase):
 
     def test_skips_inactive_workers(self):
         ctl = _make_controller(num_dp_ranks=4)
-        ctl.status[1] = False
-        ctl.status[3] = False
+        ctl._active_workers = [0, 2]
         for _ in range(6):
             ctl.round_robin_scheduler(_req())
         # Only workers 0 and 2 are active — should split 6 reqs evenly
@@ -325,6 +469,12 @@ class TestRoundRobinScheduler(CustomTestCase):
         ctl.workers[1].send_pyobj.assert_not_called()
         self.assertEqual(ctl.workers[2].send_pyobj.call_count, 3)
         ctl.workers[3].send_pyobj.assert_not_called()
+
+    def test_raises_when_no_active_workers(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl._active_workers = []
+        with self.assertRaisesRegex(RuntimeError, "No active DP workers"):
+            ctl.round_robin_scheduler(_req())
 
     def test_routed_dp_rank_bypasses_counter(self):
         """External dp-rank routing must not advance the counter."""
@@ -476,12 +626,23 @@ class TestTotalRequestsScheduler(CustomTestCase):
         )
 
 
+class TestTotalTokensScheduler(CustomTestCase):
+    def test_input_embeds_request_is_counted_by_embedding_rows(self):
+        # input_embeds requests carry input_ids=None.
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.dp_budget.total_tokens = [10, 0]
+        ctl.total_tokens_scheduler(_req(input_embeds=[[0.0] * 4] * 3))
+        ctl.workers[1].send_pyobj.assert_called_once()
+        ctl.workers[0].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.dp_budget.total_tokens, [10, 3])
+
+
 class TestStatusAwarenessInconsistency(CustomTestCase):
-    """Document a divergence: ``round_robin_scheduler`` skips workers whose
-    ``status`` is False, but ``total_requests_scheduler`` /
-    ``total_tokens_scheduler`` route purely by DPBudget — they do NOT
-    consult ``self.status``. If a future change unifies this behaviour,
-    this test will fail and force a reviewer to confirm intent."""
+    """Document a divergence: ``round_robin_scheduler`` routes only through
+    ``_active_workers``, but ``total_requests_scheduler`` / ``total_tokens_scheduler``
+    route purely by DPBudget — they do NOT consult ``self.status`` or
+    ``_active_workers``. If a future change unifies this behaviour, this test will fail
+    and force a reviewer to confirm intent."""
 
     def test_total_requests_ignores_status(self):
         ctl = _make_controller(num_dp_ranks=4)
@@ -491,6 +652,36 @@ class TestStatusAwarenessInconsistency(CustomTestCase):
         ctl.total_requests_scheduler(_req())
         # Current behaviour: still dispatches to the inactive worker.
         ctl.workers[2].send_pyobj.assert_called_once()
+
+
+class TestUpdateActiveRanks(CustomTestCase):
+    def test_refreshes_active_workers_and_masks_unprovisioned_slots(self):
+        """Verify that status updates refresh the worker cache and preserve masking of
+        unprovisioned slots."""
+        ctl = _make_controller(num_dp_ranks=2, max_dp_size=4)
+        # Rank 1 dies; trailing True values would leak onto slots 2 and 3
+        # if we copied ranks.status without intersecting dp_active.
+        ctl.update_active_ranks(ActiveRanksOutput(status=[True, False, True, True]))
+        self.assertEqual(ctl.status, [True, False, False, False])
+        self.assertEqual(ctl._active_workers, [0])
+        self.assertEqual(ctl._active_count_cache, 1)
+
+        ctl.round_robin_scheduler(_req())
+        ctl.round_robin_scheduler(_req())
+        self.assertEqual(ctl.workers[0].send_pyobj.call_count, 2)
+        for i in (1, 2, 3):
+            ctl.workers[i].send_pyobj.assert_not_called()
+
+        ctl.update_active_ranks(ActiveRanksOutput(status=[True, True, False, False]))
+        self.assertEqual(ctl._active_workers, [0, 1])
+
+    def test_length_mismatch_is_ignored(self):
+        ctl = _make_controller(num_dp_ranks=2, max_dp_size=4)
+        before_status = list(ctl.status)
+        before_active = list(ctl._active_workers)
+        ctl.update_active_ranks(ActiveRanksOutput(status=[True, False]))
+        self.assertEqual(ctl.status, before_status)
+        self.assertEqual(ctl._active_workers, before_active)
 
 
 class TestRefreshLoadBudgetThrottle(CustomTestCase):
@@ -563,6 +754,113 @@ class TestRefreshLoadBudgetThrottle(CustomTestCase):
             after_burst,
             "a stale-timestamp snapshot must not wipe the speculative state",
         )
+
+
+_RECEIVER = "sglang.srt.managers.scheduler_components.request_receiver."
+
+
+def _dp_attention_leader(*, rank: int, local_control: bool) -> SimpleNamespace:
+    """Leader of DP group `rank` under --tp 2 --attn-dp-size 2."""
+    return SimpleNamespace(
+        attn_dp_enabled=True,
+        enable_dp_attention_local_control_broadcast=local_control,
+        attn_tp_rank=0,
+        attn_cp_rank=0,
+        attn_tp_size=1,
+        attn_cp_size=1,
+        tp_size=2,
+        tp_group=SimpleNamespace(rank=rank, ranks=[0, 1], cpu_group=object()),
+    )
+
+
+def _receive_round(*, pulled_by_rank: list, local_control: bool) -> list:
+    """One lock-step iteration of both leaders; returns what each one applies.
+
+    Global rank 0 is the source of the tp_group control broadcast.
+    """
+    receiver = SchedulerRequestReceiver(
+        recv_from_tokenizer=None,
+        recv_skipper=None,
+        input_blocker=None,
+        mm_receiver=None,
+        model_config=SimpleNamespace(is_multimodal=False),
+        max_recv_per_poll=-1,
+        request_retirer=None,
+        get_last_batch=lambda: None,
+        rust_server_mode=False,
+    )
+    sent_by_src = []
+
+    def broadcast_pyobj(data, rank, dist_group, src):
+        if rank == src:
+            sent_by_src.append(data)
+        return sent_by_src[-1]
+
+    applied = []
+    for rank, pulled in enumerate(pulled_by_rank):
+        with (
+            patch(
+                _RECEIVER + "get_parallel",
+                return_value=_dp_attention_leader(
+                    rank=rank, local_control=local_control
+                ),
+            ),
+            patch(
+                _RECEIVER + "is_control_broadcast_local",
+                return_value=local_control,
+            ),
+            patch(
+                _RECEIVER + "attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda reqs: reqs,
+            ),
+            patch(_RECEIVER + "broadcast_pyobj", side_effect=broadcast_pyobj),
+        ):
+            applied.append(receiver._broadcast_reqs_across_ranks(list(pulled)))
+    return applied
+
+
+class TestDPAttentionAbortRoute(CustomTestCase):
+    def test_abort_is_applied_after_its_request_on_the_owner_rank(self):
+        """An accepted abort for a request on DP rank 1 must reach rank 1 after the
+        request, even when rank 1 drained its socket just before the request arrived."""
+        for local_control in (False, True):
+            with self.subTest(local_control=local_control):
+                ctl = _make_controller(num_dp_ranks=2)
+                ctl.control_message_step = 1 if local_control else 2  # tp_size
+                ctl.init_dispatcher()
+                gen = TokenizedGenerateReqInput(
+                    rid="victim",
+                    routed_dp_rank=1,
+                    input_text="",
+                    input_ids=[1],
+                    input_embeds=None,
+                    mm_inputs=None,
+                    token_type_ids=None,
+                    sampling_params=SamplingParams(),
+                    return_logprob=False,
+                    logprob_start_len=0,
+                    top_logprobs_num=0,
+                    token_ids_logprob=None,
+                    stream=False,
+                )
+                abort = AbortReq(rid="victim")
+
+                ctl.round_robin_scheduler(gen)
+                ctl._request_dispatcher(abort)
+                sockets = [
+                    [c.args[0] for c in worker.send_pyobj.call_args_list]
+                    for worker in ctl.workers
+                ]
+                # Rank 1 polls before the controller forwards; rank 0 polls after.
+                first = _receive_round(
+                    pulled_by_rank=[sockets[0], []], local_control=local_control
+                )
+                second = _receive_round(
+                    pulled_by_rank=[[], sockets[1]], local_control=local_control
+                )
+
+                self.assertEqual(first[1] + second[1], [gen, abort])
+                self.assertEqual((first[0] + second[0]).count(abort), 1)
 
 
 if __name__ == "__main__":

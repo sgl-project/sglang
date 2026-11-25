@@ -17,6 +17,10 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.managers import request_watchdog
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import get_metrics
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -133,10 +137,8 @@ def get_git_commit_hash() -> str:
                 .strip()
                 .decode("utf-8")
             )
-        _CACHED_COMMIT_HASH = commit_hash
         return commit_hash
     except (subprocess.CalledProcessError, FileNotFoundError):
-        _CACHED_COMMIT_HASH = "N/A"
         return "N/A"
 
 
@@ -311,6 +313,8 @@ class StageProfiler:
             torch.get_device_module().synchronize()
 
     def __enter__(self):
+        if (reporter := request_watchdog.execution_reporter) is not None:
+            reporter.enter_region(self.stage_name, self._should_record_as_step())
         if self.log_stage_start_end:
             msg = f"[{self.stage_name}] started..."
             if self.logger.isEnabledFor(logging.DEBUG):
@@ -345,6 +349,9 @@ class StageProfiler:
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
+            # each rank stops a cancelled request; the worker logs it once
+            if issubclass(exc_type, RequestCancelledError):
+                return False
             self.logger.error(
                 "[%s] Error during execution after %.4f ms: %s",
                 self.stage_name,
@@ -476,6 +483,9 @@ class PerformanceLogger:
         try:
             if get_is_main_process():
                 log_dir = get_diffusion_perf_log_dir()
+                if not log_dir:
+                    # An empty SGLANG_PERF_LOG_DIR disables the performance log.
+                    return
                 if not os.path.exists(log_dir):
                     os.makedirs(log_dir, exist_ok=True)
 

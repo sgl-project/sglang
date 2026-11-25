@@ -8,22 +8,23 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.sampling.sampling_batch_info import adjusts_logits
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     run_eagle_verify,
 )
@@ -40,10 +41,8 @@ from sglang.srt.speculative.uno_utils import (
     sample_uno_candidates,
     sample_uno_clean_root,
 )
-from sglang.srt.utils.common import (
-    get_available_gpu_memory,
-    log_info_on_rank0,
-)
+from sglang.srt.utils.device import get_available_gpu_memory
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -56,6 +55,8 @@ logger = logging.getLogger(__name__)
 
 class UnoWorkerV2(BaseSpecWorker):
     """Single-model UNO worker with linear and native-EAGLE tree decode."""
+
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
 
     def __init__(
         self,
@@ -143,6 +144,9 @@ class UnoWorkerV2(BaseSpecWorker):
 
         if self.tree_mode:
             self._uno_draft_attn_backend = self._build_uno_draft_attn_backend()
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=False
+        )
 
     def init_cuda_graphs(self):
         """Capture only the private F-wide tree-draft graph."""
@@ -248,29 +252,17 @@ class UnoWorkerV2(BaseSpecWorker):
         if sampling_info.need_min_p_sampling:
             raise NotImplementedError("UNO does not support min-p sampling.")
 
-        if batch.has_grammar:
-            raise NotImplementedError("UNO does not support grammar decoding.")
+        if adjusts_logits(sampling_info, has_grammar=batch.has_grammar):
+            raise NotImplementedError(
+                "UNO does not support logit adjustments (grammar, penalties, "
+                "logit bias, custom logit processors, or watermarks)."
+            )
 
         if batch.return_logprob:
             raise NotImplementedError("UNO does not support returned logprobs.")
 
         if batch.return_hidden_states:
             raise NotImplementedError("UNO does not support returned hidden states.")
-
-        penalizer = sampling_info.penalizer_orchestrator
-        penalties_active = (
-            (penalizer is not None and penalizer.is_required)
-            or sampling_info.acc_additive_penalties is not None
-            or sampling_info.acc_scaling_penalties is not None
-        )
-        if penalties_active:
-            raise NotImplementedError("UNO does not support sampling penalties.")
-
-        if sampling_info.logit_bias is not None:
-            raise NotImplementedError("UNO does not support logit bias.")
-
-        if sampling_info.has_custom_logit_processor:
-            raise NotImplementedError("UNO does not support custom logit processors.")
 
         if any(req.lora_id is not None for req in batch.reqs):
             raise NotImplementedError("UNO does not support multi-LoRA.")
@@ -312,7 +304,7 @@ class UnoWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_hidden_states_before_norm=False,
         )
-        self.model_runner.kv_index_translator.bind_own_plan(forward_batch)
+        self.model_runner.runner_ids.bind_own_plan(forward_batch)
         return forward_batch
 
     def _run_target_block(
@@ -346,7 +338,7 @@ class UnoWorkerV2(BaseSpecWorker):
         if not need_top1:
             return result, None
 
-        predictions = torch.argmax(logits, dim=-1).view(
+        predictions = sampling_argmax(logits).view(
             forward_batch.batch_size,
             self.forward_width,
         )
@@ -571,6 +563,7 @@ class UnoWorkerV2(BaseSpecWorker):
             )
         eagle_result = run_eagle_verify(
             verify_batch,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
             target_worker=self.target_worker,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=(self.model_runner.token_to_kv_pool_allocator),
@@ -579,7 +572,6 @@ class UnoWorkerV2(BaseSpecWorker):
             topk=self.candidate_top_k,
             num_draft_tokens=self.verify_width,
             device=self.device,
-            metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             uno_target_max_top_k=draft_state.max_top_k,
         )

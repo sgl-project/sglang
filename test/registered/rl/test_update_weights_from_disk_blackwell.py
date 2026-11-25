@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=745, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=745, stage="nightly", runner_config="4-gpu-b200")
 
 import time
 import unittest
@@ -14,9 +14,11 @@ from sglang.srt.constants import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
 )
 
@@ -58,7 +60,7 @@ class UpdateWeightsFromDiskBase:
         other_args = (
             *backend_test_suite.get("other_args", ()),
             "--enable-memory-saver",
-            "--cuda-graph-backend-prefill=disabled",
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         )
         return popen_launch_server(
             self.model,
@@ -77,7 +79,7 @@ class UpdateWeightsFromDiskBase:
         return response.json()
 
     def _post_json(self, endpoint, payload, timeout=None):
-        response = requests.post(
+        response = admin_post(
             f"{self.base_url}{endpoint}",
             json=payload,
             timeout=timeout or self.request_timeout,
@@ -103,6 +105,11 @@ class UpdateWeightsFromDiskBase:
 
     def _assert_non_empty_decode(self):
         self.assertTrue(len(self._run_decode()) > 0)
+
+    def _assert_prefill_cuda_graph_captured(self):
+        internal_state = self._get_json("/server_info")["internal_states"][0]
+        # Zero means startup fell back to eager prefill instead of capturing.
+        self.assertGreater(internal_state["memory_usage"]["graph"]["prefill"], 0)
 
     def _get_decode_logprob_signature(self):
         ret = self._post_json(
@@ -172,6 +179,8 @@ class UpdateWeightsFromDiskBase:
                 try:
                     origin_model_path = self._get_model_info()
                     self.assertEqual(origin_model_path, self.model)
+                    if backend_test_suite.get("prefill_cuda_graph", True):
+                        self._assert_prefill_cuda_graph_captured()
                     self._assert_non_empty_decode()
                     baseline_sig = self._get_decode_logprob_signature()
 
@@ -204,6 +213,8 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
     backend_test_suites = (
         {
             "name": "flashinfer_trtllm_routed_mxfp8",
+            # DeepSeek-V3 on trtllm_mla disables prefill CUDA graphs by default.
+            "prefill_cuda_graph": False,
             "other_args": (
                 "--tp-size",
                 "4",

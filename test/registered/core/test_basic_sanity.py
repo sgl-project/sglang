@@ -6,7 +6,11 @@ MMLU accuracy."""
 import unittest
 
 from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
@@ -21,7 +25,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=116, stage="base-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=160, suite="stage-a-test-1-gpu-small-amd")
+register_amd_ci(est_time=160, suite="base-a-test-1-gpu-small-amd")
+register_ppu_ci(est_time=500, suite="extra-test-1-gpu-ppu")
 
 
 class TestBasicSanity(

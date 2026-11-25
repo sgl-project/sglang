@@ -1,12 +1,18 @@
 import os
 import unittest
+from types import SimpleNamespace
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd")
 
 _TRITON_OK = torch.cuda.is_available() or os.environ.get("TRITON_INTERPRET") == "1"
 
@@ -117,13 +123,16 @@ class TestDraftSamplerVerifyIds(unittest.TestCase):
         s.out = torch.zeros(max_bs * gamma, dtype=torch.int64)
         s.verify_ids = torch.full((max_bs, gamma + 1), -1, dtype=torch.int64)
         s.confidence_out = None
+        s.acceptance_estimator = None
         draft = torch.arange(bs * gamma, dtype=torch.int64).view(bs, gamma) + 100
 
         def step(model_hidden, anchor):
             s.out[: bs * gamma].copy_(draft.reshape(-1))
             return draft, None
 
-        s._megakernel_steps = lambda b: step
+        s._draft_strategy = SimpleNamespace(
+            run=lambda **kw: step(kw["model_hidden"], kw["anchor_tokens"])
+        )
         input_ids = torch.arange(bs * gamma, dtype=torch.int64) * 3
         s(torch.zeros(bs * gamma, hidden), input_ids)
         anchor = input_ids.view(bs, gamma)[:, :1]
@@ -208,6 +217,8 @@ class TestPostFoldRelay(unittest.TestCase):
         self.assertIs(overlap_utils._offered_relay, relay)
 
         fm = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        # Deferred relays arrive in R7; production initializes this in __init__.
+        fm._deferred_relay = None
         fm.needs_confidence_relay = False
         fm.spec_algo = SimpleNamespace(is_some=lambda: False, is_ngram=lambda: False)
         fm._adopt_relay(relay)

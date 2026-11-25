@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
 use serde_json::{Value, json};
 
-use super::pydantic_dump::{engine_message, normalize_tools, split_continuation};
+use super::pydantic_dump::{
+    continues_final_message, engine_message, normalize_tools, split_continuation,
+};
 use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -55,7 +57,7 @@ pub(crate) fn render(
         .into_iter()
         .map(template_message)
         .collect::<Result<Vec<_>, _>>()?;
-    let prefix = split_continuation(&mut messages, &request)?;
+    let prefix = split_continuation(&mut messages, continues_final_message(&request)?);
     // `apply_chat_template` fails on an empty conversation.
     if messages.is_empty() {
         return Err("no messages to render".into());
@@ -257,7 +259,7 @@ fn has_python_only_space(value: &Value) -> bool {
 
 /// Whether `value` holds a negative zero: serde_json reads JSON `-0` as `-0.0`,
 /// where the engine's orjson reads the integer `0`.
-fn has_negative_zero(value: &Value) -> bool {
+pub(super) fn has_negative_zero(value: &Value) -> bool {
     match value {
         Value::Number(number) => number
             .as_f64()

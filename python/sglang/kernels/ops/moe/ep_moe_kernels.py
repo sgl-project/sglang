@@ -1,4 +1,3 @@
-import logging
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -7,9 +6,6 @@ import triton
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_div, is_cuda, is_musa
-
-logger = logging.getLogger(__name__)
-
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -949,7 +945,6 @@ def post_reorder_triton_kernel_for_cutlass_moe(
             if (expert_id >= 0) & (expert_id < num_local_experts):
                 dst_idx_int32 = tl.load(token_src2dst_ptr + idx)
                 dst_idx = dst_idx_int32.to(tl.int64)
-                dst_idx = dst_idx
                 weight_scale = tl.load(token_topk_weights_ptr + idx).to(tl.float32)
                 load_ptr_offs = down_output_ptr_offs + dst_idx * hidden_size
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
@@ -1036,7 +1031,6 @@ def post_reorder_deepgemm_triton_kernel(
     ):
         src_idx = src_idx_int32.to(tl.int64)
         token_src2dst_ptr = src2dst_ptr + src_idx * topk
-        token_topk_ids_ptr = topk_ids_ptr + src_idx * topk
         token_topk_weights_ptr = topk_weights_ptr + src_idx * topk
 
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
@@ -1111,10 +1105,12 @@ def _fwd_kernel_ep_scatter_1(
         mask=offset_cumsum < num_experts,
         other=0,
     )
-    cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
-    tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
-
-    cur_expert_start = tl.load(expert_start_loc + cur_expert)
+    # Compute the prefix locally instead of reading back a cross-warp store.
+    cur_expert_start = tl.sum(
+        tl.where(offset_cumsum < cur_expert, tokens_per_expert, 0), axis=0
+    )
+    # Each program owns one entry, consumed by the subsequent scatter kernel.
+    tl.store(expert_start_loc + cur_expert, cur_expert_start)
     cur_expert_padded_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
     cur_expert_valid_token_num = tl.load(num_valid_tokens_per_expert + cur_expert)
 
@@ -1783,7 +1779,7 @@ def moe_ep_deepgemm_preprocess(
     if block_shape is None:
         block_shape = [128, 128]
     assert len(block_shape) == 2
-    block_n, block_k = block_shape[0], block_shape[1]
+    block_k = block_shape[1]
     is_fp8 = output_dtype == torch.float8_e4m3fn
     # Quantize FP8 values with the UE8M0 scale directly. Rounding only the
     # scale afterward can change the represented activation by up to 2x.
@@ -1907,9 +1903,7 @@ def compute_identity_kernel(
 def zero_experts_compute_triton(
     expert_indices, expert_scales, num_experts, zero_expert_type, hidden_states
 ):
-    N = expert_indices.numel()
     top_k = expert_indices.size(-1)
-    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]),)
 
     if zero_expert_type == "identity":
         zero_expert_mask = expert_indices < num_experts
@@ -2524,7 +2518,8 @@ def expand_to_masked_slab(
         NUM_WORKERS=num_workers,
         num_warps=4,
     )
-    # Capture relies on max_m = cap * ep_group_size; eager also checks counts.
+    # Capture relies on max_m covering every source token that could route to
+    # one expert; eager also checks the actual counts.
     if check_overflow and int(overflow.item()) != 0:
         raise RuntimeError(
             f"DeepEP v2 masked slab overflow: an expert received more than max_m="

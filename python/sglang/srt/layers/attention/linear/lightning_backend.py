@@ -93,27 +93,18 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 "--speculative-eagle-topk 1."
             )
         # lightning attn does not need conv cache, but to keep the interface for mamba cache
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
 
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
-        # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
-        self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
-        self.decode_cuda_graph_metadata = {}
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
-        self.BLOCK = (
-            model_runner.model_config.block
-            if hasattr(model_runner.model_config, "block")
-            else 256
-        )
+        self.BLOCK = 256
         config = model_runner.model_config.hf_config
         total_num_heads = getattr(
             config, "num_linear_key_value_heads", config.num_attention_heads
@@ -151,6 +142,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
         self.forward_metadata = BailingLinearMetadata.prepare_decode(
             metadata.query_start_loc,
@@ -399,7 +391,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         save_kv_cache=True,
         **kwargs,
     ):
-        layer_id = layer.layer_id if layer else kwargs["layer_id"]
+        layer_id = layer.layer_id
 
         metadata = self.forward_metadata
 
@@ -407,7 +399,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             q = q.to(self.kv_cache_dtype)
 
         cache_indices = self.forward_metadata.mamba_cache_indices
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        mamba_cache_params = self.state_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
         if self.linear_backend == "minimax":
             o = self._prefill_and_mix_infer(
@@ -489,7 +481,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         save_kv_cache=True,
         **kwargs,
     ) -> torch.Tensor:
-        layer_id = layer.layer_id if layer else kwargs["layer_id"]
+        layer_id = layer.layer_id
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
@@ -499,7 +491,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
         # Do linear attention
         cache_indices = self.forward_metadata.mamba_cache_indices
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        mamba_cache_params = self.state_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
         if self.linear_backend == "minimax":
             o = self._decode_infer(q, k, v, ssm_states, cache_indices, metadata, layer)

@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
     make_dense_cases,
@@ -15,7 +15,8 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=18, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=75, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

@@ -16,7 +16,7 @@ mod wire;
 use serde::Deserialize;
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 
-pub use chat::{ChatModel, ChatResponder, ReasoningToggle, lower_chat};
+pub use chat::{ChatModel, ChatResponder, DeepSeekOutputError, ReasoningToggle, lower_chat};
 pub use completions::{CompletionResponder, lower_completion};
 pub use pieces::TokenPieces;
 pub use sglang_api_types::api::v1::GenerateRequest;
@@ -98,11 +98,17 @@ pub struct OpenAiSettings {
     pub return_input_ids: bool,
     pub return_output_ids: bool,
     pub sampling_defaults: Option<String>,
+    /// `--served-model-name`, which a `model:adapter` request may contain.
+    pub served_model_name: Option<String>,
     pub stream_response_default_include_usage: bool,
     pub tokenizer_metrics_custom_labels_header: Option<String>,
     pub tokenizer_metrics_allowed_custom_labels: Option<Vec<String>>,
     pub tool_call_parser: Option<String>,
 }
+
+/// The routing-key request header; must equal `ROUTING_KEY_HEADER` in
+/// python/sglang/srt/constants.py.
+pub const ROUTING_KEY_HEADER: &str = "x-sgl-routing-key";
 
 /// The request headers Python's OpenAI layer reads.
 #[derive(Debug, Clone, Copy, Default)]

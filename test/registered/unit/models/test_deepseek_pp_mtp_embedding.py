@@ -10,7 +10,7 @@ from sglang.srt.layers.layer_boundary import PLAIN_ADD, SumGroup
 from sglang.srt.layers.layer_boundary.output import DeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import stream as residual_stream
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import deepseek_v2
 from sglang.srt.models.deepseek_v2 import DeepseekV2Model, pp_stage_needs_embedding
 from sglang.test.ci.ci_register import register_cpu_ci

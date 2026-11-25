@@ -6,11 +6,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.jit.utils import (
-    get_ci_test_range,
-    get_jit_cuda_arch,
-    is_hip_runtime,
-)
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.gemm.dsv3_fused_a_gemm import dsv3_fused_a_gemm
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -30,7 +27,7 @@ NUM_TOKENS = get_ci_test_range(list(range(1, 17)), [1, 8, 16])
 @pytest.mark.parametrize("hd_in", HD_INS)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 def test_dsv3_fused_a_gemm(num_tokens, hd_in, hd_out):
-    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+    if not current_arch().is_sm_at_least(9):
         pytest.skip("SM90+ required")
 
     mat_a = torch.randn(num_tokens, hd_in, dtype=torch.bfloat16, device="cuda")

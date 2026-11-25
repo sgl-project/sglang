@@ -11,8 +11,8 @@ from sglang.srt.layers.attention import vision
 from sglang.test.ci.ci_register import register_cpu_ci, register_npu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-register_npu_ci(est_time=2, suite="base-b-test-1-npu-a3")
-register_npu_ci(est_time=2, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=2, suite="extra-b-test-1-npu-a3")
+register_npu_ci(est_time=2, suite="nightly-test-1-npu-a3", nightly=True)
 
 
 @pytest.fixture
@@ -101,6 +101,115 @@ def test_fa4_seqlens_from_vit_cuda_graph_list(monkeypatch, graph_env):
         assert torch.equal(kwargs["cu_seqlens_q"], cu_seqlens)
         assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 4
     assert calls[0]["cu_seqlens_q"] is cu_seqlens
+
+
+def test_fa3_tensor_seqlens_with_vit_cuda_graph_env(monkeypatch):
+    # A model without a ViT CUDA graph runner passes tensor cu_seqlens; setting
+    # SGLANG_VIT_ENABLE_CUDA_GRAPH for another model must not make FA3 raise.
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(vision, "_is_cuda", True)
+    calls = []
+
+    def fake_flash_attn_func(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return q
+
+    monkeypatch.setattr(vision, "flash_attn_func", fake_flash_attn_func, raising=False)
+    q = torch.randn(6, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 6], dtype=torch.int32)
+    backend = vision.VisionFlash3Attention()
+
+    backend(q, q, q, cu_seqlens=[cu_seqlens, 4], bsz=1, seq_len=6)
+    backend(q, q, q, cu_seqlens=cu_seqlens, bsz=1, seq_len=6, max_seqlen=4)
+
+    for kwargs in calls:
+        assert torch.equal(kwargs["cu_seqlens_q"], cu_seqlens)
+        assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 4
+    assert calls[0]["cu_seqlens_q"] is cu_seqlens
+
+
+def test_triton_tensor_seqlens_with_vit_cuda_graph_env(monkeypatch):
+    # Same contract for the Triton backend: the list form (with its output
+    # workspace) comes only from a graph runner, tensors take the eager path.
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
+    calls = []
+
+    def fake_context_attention_fwd(
+        q, k, v, o, cu_seqlens, seq_lens, max_seqlen, **kwargs
+    ):
+        calls.append((o, cu_seqlens, seq_lens, max_seqlen))
+
+    monkeypatch.setattr(vision, "context_attention_fwd", fake_context_attention_fwd)
+    q = torch.randn(6, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 6], dtype=torch.int32)
+    seq_lens = torch.tensor([4, 2], dtype=torch.int32)
+    output_ws = torch.empty_like(q)
+    backend = vision.VisionTritonAttention()
+
+    out = backend(
+        q,
+        q,
+        q,
+        cu_seqlens=[cu_seqlens, seq_lens, 4],
+        bsz=1,
+        seq_len=6,
+        output_ws=output_ws,
+    )
+    backend(
+        q, q, q, cu_seqlens=cu_seqlens, bsz=1, seq_len=6, max_seqlen=4, output_ws=None
+    )
+
+    assert out is output_ws
+    assert calls[0][1] is cu_seqlens
+    for o, cu, lens, max_seqlen in calls:
+        assert o.shape == q.shape
+        assert torch.equal(cu, cu_seqlens)
+        assert torch.equal(lens, seq_lens)
+        assert max_seqlen == 4
+
+
+def test_triton_graph_list_requires_output_workspace(monkeypatch):
+    # VisionAttention forwards output_ws=None when its caller has no workspace;
+    # the graph form must reject that instead of handing None to the kernel.
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(vision, "context_attention_fwd", lambda *args, **kwargs: None)
+    q = torch.randn(6, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 6], dtype=torch.int32)
+    seq_lens = torch.tensor([4, 2], dtype=torch.int32)
+    backend = vision.VisionTritonAttention()
+
+    with pytest.raises(RuntimeError, match="output_ws should be prepared"):
+        backend(
+            q,
+            q,
+            q,
+            cu_seqlens=[cu_seqlens, seq_lens, 4],
+            bsz=1,
+            seq_len=6,
+            output_ws=None,
+        )
+
+
+@pytest.mark.parametrize("missing", ["sequence_lengths", "max_seqlen"])
+def test_flashinfer_rejects_seqlen_inputs_forwarded_as_none(monkeypatch, missing):
+    # Same contract for the FlashInfer backend: VisionAttention forwards both
+    # values as None when the encoder did not prepare them.
+    monkeypatch.setattr(vision, "_is_cuda", True)
+    q = torch.randn(6, 2, 8)
+    inputs = dict(sequence_lengths=torch.tensor([4, 2]), max_seqlen=4)
+    inputs[missing] = None
+    backend = vision.VisionFlashInferAttention()
+
+    with pytest.raises(RuntimeError, match=f"{missing} should be prepared"):
+        backend(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 4, 6], dtype=torch.int32),
+            bsz=1,
+            seq_len=6,
+            **inputs,
+        )
 
 
 def test_explicit_backend_without_published_mm_context(monkeypatch, npu_platform):
@@ -259,3 +368,64 @@ def test_ascend_attention_unmasked_inputs_keep_fused_path(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+SDPA_NUM_HEADS = 2
+SDPA_HEAD_DIM = 8
+
+
+def _sdpa_qkv(s):
+    torch.manual_seed(0)
+    return [torch.randn(s, SDPA_NUM_HEADS, SDPA_HEAD_DIM) for _ in range(3)]
+
+
+def _masked_forward(backend, q, k, v, cu_seqlens):
+    """The original path: an explicit attention_mask bypasses the per-sequence split."""
+    mask = backend.generate_patch_attention_mask(
+        q.shape[0], cu_seqlens, flatten_batch=backend.flatten_batch
+    )
+    return backend(q=q, k=k, v=v, bsz=1, cu_seqlens=cu_seqlens, attention_mask=mask)
+
+
+@pytest.mark.parametrize(
+    ("flatten_batch", "cu"),
+    [
+        (False, [0, 12]),  # one image: the mask is all-True
+        (True, [0, 12]),
+        (True, [0, 5, 12, 20]),  # several images: block-diagonal mask
+        (True, [0, 5, 5, 12]),  # zero-length segment
+    ],
+)
+def test_per_sequence_sdpa_matches_masked(flatten_batch, cu):
+    backend = vision.VisionSdpaAttention(
+        head_dim=SDPA_HEAD_DIM,
+        num_heads=SDPA_NUM_HEADS,
+        num_kv_heads=SDPA_NUM_HEADS,
+        flatten_batch=flatten_batch,
+    )
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32)
+    q, k, v = _sdpa_qkv(cu[-1])
+
+    assert backend._maskless_seq_lens(s=cu[-1], bsz=1, cu_seqlens=cu_seqlens)
+    output = backend(q=q, k=k, v=v, bsz=1, cu_seqlens=cu_seqlens)
+
+    torch.testing.assert_close(output, _masked_forward(backend, q, k, v, cu_seqlens))
+
+
+@pytest.mark.parametrize(
+    ("flatten_batch", "cu", "s"),
+    [
+        (True, [0, 6, 10], 12),  # cu_seqlens does not cover the padded tail
+        (False, [0, 6, 12], 12),  # non-flatten masks are padding masks, not blocks
+    ],
+)
+def test_mask_kept_when_not_block_diagonal(flatten_batch, cu, s):
+    backend = vision.VisionSdpaAttention(
+        head_dim=SDPA_HEAD_DIM,
+        num_heads=SDPA_NUM_HEADS,
+        num_kv_heads=SDPA_NUM_HEADS,
+        flatten_batch=flatten_batch,
+    )
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32)
+
+    assert backend._maskless_seq_lens(s=s, bsz=1, cu_seqlens=cu_seqlens) is None

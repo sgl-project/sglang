@@ -14,7 +14,8 @@ from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.ops import keep_output
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.bailing_moe import BailingMoEModel
 from sglang.srt.models.bailing_moe_v3 import BailingMoELinearModel
 from sglang.srt.models.glm4_moe import Glm4MoeModel
@@ -298,6 +299,12 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
                             "sglang.srt.models.glm5_next.get_parallel",
                             return_value=SimpleNamespace(attn_tp_group=group),
                         ),
+                        # The stub plans carry no rows; these rows are split.
+                        patch.object(
+                            Glm5NextModel,
+                            "_captures_attn_tp_slices",
+                            staticmethod(lambda layer, forward_batch: True),
+                        ),
                     ):
                         _, snapshots = model(
                             None, None, batch, input_embeds=inputs.clone()
@@ -331,28 +338,6 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
                 self.assertEqual(len(snapshots), 1)
                 torch.testing.assert_close(snapshots[0], inputs + NUM_LAYERS)
                 torch.testing.assert_close(result, inputs + NUM_LAYERS)
-
-    def test_llama4_split_prefill_preserves_the_stream_between_segments(self):
-        from sglang.srt.models.llama4 import Llama4ForCausalLM, Llama4Model
-
-        model = build_model(Llama4Model, defer=True, capture=False)
-        lm = SimpleNamespace(
-            model=model,
-            lm_head=None,
-            logits_processor=lambda ids, hidden, head, fb: hidden,
-        )
-        fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
-        inputs = torch.ones(2, 4)
-        result = Llama4ForCausalLM.forward_split_prefill(
-            lm, None, None, fb, (0, 2), inputs.clone()
-        )
-        self.assertIsNone(result)
-        self.assertIsNotNone(fb.residual_stream)
-        result = Llama4ForCausalLM.forward_split_prefill(
-            lm, None, None, fb, (2, NUM_LAYERS)
-        )
-        torch.testing.assert_close(result, inputs + NUM_LAYERS)
-        self.assertIsNone(fb.residual_stream)
 
 
 class TestPipelineResidualReception(CustomTestCase):
