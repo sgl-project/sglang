@@ -220,10 +220,17 @@ class StagedMediaLayout:
                 )
 
         staged_layout = getattr(processor, "get_staged_media_layout", None)
-        if staged_layout is None:
-            mm = processor.get_mm_data(list(prompt), embeddings=None, **kwargs)
-        else:
-            mm = staged_layout(list(prompt), **kwargs)
+        try:
+            if staged_layout is None:
+                mm = processor.get_mm_data(list(prompt), embeddings=None, **kwargs)
+            else:
+                mm = staged_layout(list(prompt), **kwargs)
+        except (AssertionError, IndexError, TypeError) as exc:
+            # Processors index the staged grids by the prompt's placeholders;
+            # a client prompt with a different placeholder count is a bad request.
+            raise ValueError(
+                "prompt placeholders differ from the staged media layout"
+            ) from exc
         if len(mm.input_ids) >= max_length:
             raise ValueError("staged media exceed the model's input length limit")
         if explicit:

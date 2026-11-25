@@ -594,6 +594,21 @@ def test_invalid_audio_descriptor(change):
         EncoderHandoff.parse(msgspec.json.encode(data), 0, 0, count)
 
 
+@pytest.mark.parametrize("error", [AssertionError, IndexError, TypeError])
+def test_placeholder_mismatch_in_a_processor_is_a_client_error(error):
+    """A prompt whose placeholders disagree with the handoff must not surface as 500."""
+    from sglang.srt.multimodal.staged_layout import StagedMediaLayout
+
+    def get_mm_data(prompt, embeddings, **kwargs):
+        raise error("grid index out of range")
+
+    handoff = SimpleNamespace(version=2, images=[], videos=[], audios=[])
+    with pytest.raises(ValueError, match="placeholders differ"):
+        StagedMediaLayout().build(
+            SimpleNamespace(get_mm_data=get_mm_data), handoff, [8, 9], 24
+        )
+
+
 def test_staged_layout_id_distinguishes_model_and_wire_changes():
     layout = QwenVLImageProcessor.staged_layouts["qwen3_omni_moe"]
     original = layout.wire_id("qwen3_omni_moe")
