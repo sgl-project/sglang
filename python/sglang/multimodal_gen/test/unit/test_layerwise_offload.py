@@ -446,6 +446,52 @@ def test_layerwise_pipeline_selection_uses_dit_group(monkeypatch):
     assert is_layerwise_offloaded_module(layerwise_module)
 
 
+@pytest.mark.skipif(
+    not pathlib.Path("/proc/self/maps").exists(), reason="needs Linux file mappings"
+)
+@pytest.mark.parametrize("room_mib, expected_pins", [(9, 4), (64, 12)])
+def test_pipeline_reserves_streaming_memory_before_first_forward(
+    tmp_path, monkeypatch, room_mib, expected_pins
+):
+    """A tight host keeps a partial mapped store. A roomy host pins the whole stack."""
+    mib = 1 << 20
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    # Exercise placement on CPU without requiring a page-locking driver.
+    monkeypatch.setattr(layerwise_offload_mod, "_pinned_empty", torch.empty)
+    monkeypatch.setattr(
+        layerwise_offload_mod.current_platform,
+        "device_shares_host_memory",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        host_memory_budget,
+        "host_memory_available_bytes",
+        lambda: host_memory_budget.HOST_COPY_RESERVE_BYTES + room_mib * mib,
+    )
+    model = _NestedDummyModel()
+    model.encoder.blocks = torch.nn.ModuleList()
+    for index in range(12):
+        block = torch.nn.Module()
+        weight = torch.from_file(
+            str(tmp_path / f"layer-{index}"),
+            shared=True,
+            size=mib // 4,
+            dtype=torch.float32,
+        )
+        block.weight = torch.nn.Parameter(weight)
+        model.encoder.blocks.append(block)
+
+    args = _server_args(pin_cpu_memory=True)
+    modules = {"transformer": model, "alias": model}
+    configure_layerwise_offload_modules(modules, args)
+    (manager,) = model.layerwise_offload_managers
+    assert manager._pin_budget.committed_bytes == expected_pins * mib
+    assert manager._mapped_bytes == (12 - expected_pins) * mib
+
+
 def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
@@ -481,6 +527,43 @@ def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
         "so the stepped DiT must claim the pin budget before the "
         "once-per-request encoder"
     )
+
+
+def test_pin_budget_resolves_pdd_steps_when_sampling_steps_unset(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    import sglang.multimodal_gen.registry as registry_mod
+
+    class _Sampling:
+        num_inference_steps = None
+
+    monkeypatch.setattr(
+        registry_mod,
+        "get_model_info",
+        lambda *args, **kwargs: SimpleNamespace(sampling_param_cls=_Sampling),
+    )
+
+    text_encoder = _NestedEncoderDummyModel()
+    transformer = _NestedDummyModel()
+    modules = {"text_encoder": text_encoder, "transformer": transformer}
+
+    pipeline_config = SimpleNamespace(
+        model_path="/models/minimax-h3-image",
+        release_pdd_steps=lambda: 6,
+    )
+    configured = configure_layerwise_offload_modules(
+        modules,
+        _server_args(
+            model_path="/models/minimax-h3-image",
+            pipeline_config=pipeline_config,
+        ),
+        component_names=["text_encoder", "transformer"],
+    )
+
+    assert configured == ["transformer", "text_encoder"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
