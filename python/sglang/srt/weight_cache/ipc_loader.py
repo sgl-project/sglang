@@ -24,15 +24,13 @@ from sglang.srt.model_loader.loader import (
     _initialize_model,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel
 
+from .config import build_cache_config
 from .protocol import (
-    CacheConfig,
     check_ipc_quant_support,
-    compute_env_stamp,
     get_quant_method_name,
     get_socket_path,
-    hash_quant_config,
     recv_msg,
     send_msg,
 )
@@ -575,49 +573,14 @@ class WeightCacheModelLoader(BaseModelLoader):
             ) from e
 
         try:
-            # Build engine's config fingerprint
-            parallel = get_parallel()
-            tp_size = parallel.tp_size
-            tp_rank = parallel.tp_rank
-
-            pp_size = parallel.pp_size
-            pp_rank = parallel.pp_rank
-
-            ep_size = parallel.moe_ep_size
-            # The configured width, as the daemon states it: the MoE
-            # communicator is wider when it aliases attention CP.
-            moe_dp_size = parallel.moe_dp_size
-            moe_dp_rank = parallel.moe_dp_rank
-            moe_ep_rank = parallel.moe_ep_rank
-
             quant_method, quant_config = self._resolve_engine_quant(model_config)
-
-            engine_config = CacheConfig(
-                model_path=model_config.model_path,
-                model_arch=(
-                    model_config.hf_config.architectures[0]
-                    if model_config.hf_config.architectures
-                    else ""
-                ),
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                pp_size=pp_size,
-                pp_rank=pp_rank,
-                dp_size=parallel.dp_size,
-                ep_size=ep_size,
-                moe_dp_size=moe_dp_size,
-                moe_dp_rank=moe_dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_dp_size=parallel.attn_dp_size,
-                enable_dp_lm_head=parallel.enable_dp_lm_head,
-                attn_cp_size=parallel.attn_cp_size,
-                moe_dense_tp_size=parallel.moe_dense_tp_size,
-                moe_a2a_backend=get_exec().moe.moe_a2a_backend,
+            engine_config = build_cache_config(
+                model_config,
                 quant_method=quant_method,
-                quant_config_hash=hash_quant_config(quant_config),
-                dtype=str(model_config.dtype),
-                revision=model_config.revision or "",
-                **compute_env_stamp(),
+                quant_config=quant_config,
+                model_path=model_config.model_path,
+                revision=model_config.revision,
+                ep_size=get_parallel().moe_ep_size,
             )
 
             logger.info(

@@ -7,14 +7,17 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import msgspec
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 import sglang.srt.model_loader.loader as loader_mod
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.weight_cache import load_diff, schema, snapshot_loader, validator
+from sglang.srt.weight_cache.config import build_cache_config, build_load_spec
 from sglang.srt.weight_cache.coordinator import Ballot
 from sglang.srt.weight_cache.schema import LoadSpec, SnapshotManifest, StorageMeta
 from sglang.srt.weight_cache.transport import WeightTransport
@@ -29,8 +32,44 @@ _MODEL_CONFIG = SimpleNamespace(
 _CPU = DeviceConfig("cpu")
 
 
-def _spec(tp_rank: int, tp_size: str = "2") -> LoadSpec:
-    return LoadSpec(model={"ckpt": "c"}, settings={"tp": tp_size}, rank={"tp": tp_rank})
+def _spec(
+    tp_rank: int,
+    tp_size: int = 2,
+    *,
+    hf_config=None,
+    model_path="m",
+    draft_model_idx=None,
+) -> LoadSpec:
+    hf_config = hf_config if hf_config is not None else PretrainedConfig()
+    with (
+        get_parallel().override(
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            attn_tp_size=tp_size,
+            attn_tp_rank=tp_rank,
+            moe_tp_size=tp_size,
+            moe_tp_rank=tp_rank,
+            pp_rank=0,
+            moe_dp_rank=0,
+            moe_ep_rank=0,
+        ),
+        mock.patch("sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1),
+    ):
+        cache = build_cache_config(
+            SimpleNamespace(hf_config=hf_config, dtype=torch.float32),
+            quant_method="",
+            quant_config=None,
+            model_path=model_path,
+            revision=None,
+            ep_size=1,
+        )
+        return build_load_spec(
+            cache,
+            checkpoint_id="rev1",
+            hf_config=hf_config,
+            load_config=LoadConfig(draft_model_idx=draft_model_idx),
+            target_device=_CPU.device,
+        )
 
 
 class _QuantMethod:
@@ -313,6 +352,40 @@ class TestSnapshotLoader(CustomTestCase):
                     self._read(**{f"{step}_error": RuntimeError(step)})
                 self.assertTrue(self.transport.closed)
 
+    def test_load_spec_separates_shard_identity_from_shared_settings(self):
+        spec = _spec(0)
+        self.assertEqual(
+            msgspec.json.decode(msgspec.json.encode(spec), type=LoadSpec), spec
+        )
+        for field in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
+            with self.subTest(field=field):
+                peer = msgspec.structs.replace(spec, **{field: 1})
+                self.assertNotEqual(spec.digest(), peer.digest())
+                self.assertEqual(
+                    spec.digest(include_rank=False), peer.digest(include_rank=False)
+                )
+        staged = _spec(
+            0,
+            hf_config=PretrainedConfig(name_or_path="/tmp/staging"),
+            model_path="/tmp/staging",
+        )
+        self.assertEqual(spec.digest(), staged.digest())
+        self.assertEqual(
+            spec.digest(include_rank=False), staged.digest(include_rank=False)
+        )
+        for other in (
+            _spec(0, tp_size=4),
+            _spec(0, draft_model_idx=1),
+            _spec(0, hf_config=PretrainedConfig(hidden_size=128)),
+            msgspec.structs.replace(spec, checkpoint_id="rev2"),
+            msgspec.structs.replace(spec, flashinfer_cutedsl_swap_ab=True),
+            msgspec.structs.replace(spec, fp4_gemm_runner_backend="flashinfer_trtllm"),
+        ):
+            self.assertNotEqual(spec.digest(), other.digest())
+            self.assertNotEqual(
+                spec.digest(include_rank=False), other.digest(include_rank=False)
+            )
+
     def test_pre_load_check_votes_on_every_outcome_but_the_rank(self):
         ballots = []
         manifest = SnapshotManifest(
@@ -324,9 +397,9 @@ class TestSnapshotLoader(CustomTestCase):
         loaders_and_specs = [
             (_Source(LoadConfig()), _spec(0)),
             (_Source(LoadConfig()), _spec(1)),
-            (failing, _spec(2)),
-            (found, _spec(3)),
-            (_Source(LoadConfig()), _spec(4, tp_size="4")),
+            (failing, _spec(0)),
+            (found, _spec(1)),
+            (_Source(LoadConfig()), _spec(0, tp_size=4)),
         ]
         with mock.patch.object(
             snapshot_loader, "vote", lambda *, group, ballot: ballots.append(ballot)

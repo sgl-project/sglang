@@ -9,25 +9,73 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Optional
 
 import msgspec
-import msgspec.structs
 
 
-class LoadSpec(msgspec.Struct, frozen=True, kw_only=True):
-    """What this rank is about to build: the key a snapshot is published under."""
+class WeightConfig(msgspec.Struct):
+    """Typed model, topology and environment fields used by the daemon and snapshots."""
 
-    model: dict[str, str]  # checkpoint identity, hf_config digest, dtype, quantization
-    settings: dict[str, str]  # resolved parallel, kernel and environment settings
-    rank: dict[str, int]  # which shard this rank builds: tp, pp, moe_ep, ...
+    model_path: str
+    model_arch: str
+    tp_size: int
+    tp_rank: int
+    pp_size: int
+    pp_rank: int
+    dp_size: int
+    ep_size: int
+    moe_dp_size: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+    attn_dp_size: int
+    enable_dp_lm_head: bool
+    attn_cp_size: int
+    moe_dense_tp_size: Optional[int]
+    moe_a2a_backend: str
+    quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
+    quant_config_hash: str  # SHA-256 hash of quantization config
+    dtype: str  # e.g. "torch.float16"
+    revision: str  # model revision the weights were loaded from ("" if unset)
+    # Environment stamp: a daemon and a client that ran different post-processing
+    # branches (different GPU compute capability or torch/kernel version) can
+    # produce incompatible weights that would map cleanly yet serve garbage.
+    # Comparing these turns that into a clean mismatch. See compute_env_stamp().
+    device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
+    torch_version: str  # torch.__version__ of the process that built the weights
 
-    def without_rank(self) -> LoadSpec:
-        """What every rank of one load must agree on."""
-        return msgspec.structs.replace(self, rank={})
 
-    def digest(self) -> str:
-        encoded = json.dumps(msgspec.to_builtins(self), sort_keys=True)
+class LoadSpec(WeightConfig, frozen=True, kw_only=True):
+    """Inputs to the snapshot lookup key. Sources index snapshots by digest()."""
+
+    checkpoint_id: str
+    hf_config_hash: str
+    draft_model_idx: Optional[int]
+    moe_runner_backend: str
+    fp4_gemm_runner_backend: str
+    fp8_gemm_runner_backend: str
+    bf16_gemm_backend: str
+    moe_cp_size: int
+    enable_fp32_lm_head: bool
+    ep_num_redundant_experts: int
+    enable_eplb: bool
+    init_expert_location: Optional[str]
+    flashinfer_cutedsl_swap_ab: Optional[bool]
+
+    def __post_init__(self):
+        if not self.checkpoint_id:
+            raise ValueError("A snapshot requires an immutable checkpoint identifier")
+
+    def digest(self, *, include_rank: bool = True) -> str:
+        """Identify this shard for lookup, or its shared configuration for a vote."""
+        fields = msgspec.to_builtins(self)
+        # A remote checkpoint can be staged in a different directory on each rank.
+        # checkpoint_id already identifies the contents across paths and revision aliases.
+        del fields["model_path"], fields["revision"]
+        if not include_rank:
+            for name in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
+                del fields[name]
+        encoded = json.dumps(fields, sort_keys=True)
         return hashlib.sha256(encoded.encode()).hexdigest()
 
 

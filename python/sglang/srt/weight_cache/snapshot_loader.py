@@ -62,7 +62,7 @@ def pre_load_check(
     except Exception as e:  # every rank must learn it before any rank moves on
         error = repr(e)
     version = manifest.version if manifest is not None else ""
-    agree = f"{spec.without_rank().digest()}/{version}".encode()
+    agree = f"{spec.digest(include_rank=False)}/{version}".encode()
     try:
         vote(group=group, ballot=Ballot(error=error, agree=agree))
     except BaseException:
@@ -103,7 +103,7 @@ class SnapshotLoader(BaseModelLoader):
     def _find(
         self, *, spec: LoadSpec, device_config: DeviceConfig
     ) -> Optional[tuple[SnapshotManifest, WeightTransport]]:
-        """The snapshot published for exactly ``spec``, with a transport to fetch it.
+        """Look up ``spec.digest()`` and return the manifest and its transport.
 
         Read-only and bounded in time; raises if this rank cannot load at all.
         """
@@ -192,7 +192,7 @@ class SnapshotLoader(BaseModelLoader):
                 group=group,
                 ballot=Ballot(
                     error=error,
-                    agree=spec.without_rank().digest().encode(),
+                    agree=spec.digest(include_rank=False).encode(),
                     payload=hashlib.sha256(exported.attestation).digest(),
                 ),
             )

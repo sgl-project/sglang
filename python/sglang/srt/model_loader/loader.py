@@ -146,6 +146,10 @@ from sglang.srt.utils import (
     is_pin_memory_available,
     rank0_log,
 )
+from sglang.srt.weight_cache.weight_layout import (
+    flashinfer_cutedsl_swap_ab,
+    normalize_init_expert_location,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -1883,10 +1887,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                 return 1
 
         from sglang.srt.layers.dp_attention import get_moe_cp_size
-        from sglang.srt.layers.moe.utils import (
-            get_moe_a2a_backend,
-            get_moe_runner_backend,
-        )
 
         parallel = get_parallel()
         shard_config = {
@@ -1907,32 +1907,12 @@ class PreshardedModelLoader(DefaultModelLoader):
             ),
             "structural_signature": self._compute_structural_signature(model_config),
         }
-        a2a_backend = get_moe_a2a_backend()
-        if get_moe_runner_backend().is_flashinfer_cutedsl() and (
-            a2a_backend.is_none() or a2a_backend.is_flashinfer()
-        ):
-            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-                use_cutedsl_moe_swap_ab,
-            )
-
-            # Presharded files contain processed rows; equal shapes do not
-            # distinguish old up64/gate64 weights from swap-AB up16/gate16.
-            shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
-                target_device or torch.device(current_platform.device_type)
-            )
+        swap_ab = flashinfer_cutedsl_swap_ab(target_device)
+        if swap_ab is not None:
+            shard_config["flashinfer_cutedsl_swap_ab"] = swap_ab
         return shard_config
 
-    @staticmethod
-    def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:
-        if value is None or value == "trivial":
-            return value
-        if value.endswith((".json", ".pt")) and os.path.isfile(value):
-            h = hashlib.sha1()
-            with open(value, "rb") as f:
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    h.update(chunk)
-            return f"file:{os.path.basename(value)}:sha1:{h.hexdigest()[:16]}"
-        return value
+    _normalize_init_expert_location = staticmethod(normalize_init_expert_location)
 
     def _build_subfolder_name(self, shard_config: Dict[str, Any]) -> str:
         combined = hashlib.sha1(
