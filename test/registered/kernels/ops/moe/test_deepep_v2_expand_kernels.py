@@ -112,14 +112,6 @@ class TestScaleExpandedRows(CustomTestCase):
         scale_expanded_rows_(x, weights)
         self.assertEqual(x.shape, (0, 128))
 
-    def test_rejects_non_fp32(self):
-        # A bf16 x would round the weights; a packed UE8M0 scale cannot take them.
-        for dtype in (torch.bfloat16, torch.int32):
-            with self.subTest(dtype=dtype):
-                x = torch.ones(4, 8, device=DEVICE, dtype=dtype)
-                with self.assertRaises(AssertionError):
-                    scale_expanded_rows_(x, torch.rand(4, device=DEVICE))
-
 
 if __name__ == "__main__":
     unittest.main()

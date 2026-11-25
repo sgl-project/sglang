@@ -163,7 +163,6 @@ def use_fused_moe_lora_kernel(
         *shrink_tiles,
         *expand_tiles,
         mul_routed_weight,
-        fully_sharded=False,
         offset=0,
     )
 

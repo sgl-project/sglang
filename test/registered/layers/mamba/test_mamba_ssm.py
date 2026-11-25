@@ -5,7 +5,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 # The stochastic-rounding cases need SM10x; the 5090 above is SM120.
 register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=20, suite="base-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
@@ -90,6 +90,45 @@ def selective_state_update_ref(
     if not has_heads:
         out = out.squeeze(1)
     return out
+
+
+@pytest.mark.parametrize("capacity", [4, 8])
+@pytest.mark.parametrize("tree", [False, True])
+def test_verify_intermediate_state_row_stride(capacity, tree):
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    batch, steps, heads, dim, dstate = 2, 4, 1, 4, 4
+    state = torch.zeros(batch, heads, dim, dstate, device=device)
+    rows = torch.arange(batch, device=device, dtype=torch.int32)
+    x = (rows + 1).float().view(batch, 1, 1, 1).expand(batch, steps, heads, dim)
+    B = torch.ones(batch, steps, 1, dstate, device=device)
+    zeros = state.new_zeros((heads, dim))
+    cache = state.new_full((batch, capacity, heads, dim, dstate), -1)
+    parents = torch.tensor([[-1, 0, 0, 1]], device=device).expand(batch, -1)
+    selective_state_update(
+        state,
+        x,
+        torch.ones_like(x),
+        torch.zeros_like(state[0]),
+        B,
+        B,
+        D=zeros,
+        dt_bias=zeros,
+        out=torch.empty_like(x),
+        state_batch_indices=rows,
+        disable_state_update=True,
+        intermediate_states_buffer=cache,
+        cache_steps=steps,
+        retrieve_parent_token=parents if tree else None,
+    )
+
+    # Each step adds x to its parent's state.
+    depth = torch.tensor([1, 2, 2, 3] if tree else [1, 2, 3, 4], device=device)
+    expected = (x * depth.view(1, steps, 1, 1)).unsqueeze(-1)
+    torch.testing.assert_close(cache[:, :steps], expected.expand_as(cache[:, :steps]))
+    assert (cache[:, steps:] == -1).all()
 
 
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
