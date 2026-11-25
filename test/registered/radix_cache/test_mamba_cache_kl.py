@@ -14,7 +14,7 @@ from transformers import AutoConfig, AutoTokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=112, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=185, stage="extra-a", runner_config="1-gpu-small")
 
 
 class MambaCacheKLMixin:
@@ -190,20 +190,21 @@ class TestMambaSpecTruncationKL(MambaCacheKLMixin, DefaultServerBase):
         "4",
     ]
 
+    cases = (
+        (
+            "count",
+            "Continue the sequence with numbers separated by spaces: 1 2 3 4 5 6 7 8 9 10",
+            9,
+        ),
+        ("story", "Write a story about a cat who likes fish.", 5),
+    )
+
     def test_reuse_distribution_after_length_truncation(self):
         tokenizer = AutoTokenizer.from_pretrained(self.model, revision=self.revision)
         config = AutoConfig.from_pretrained(self.model, revision=self.revision)
         self.vocab_ids = list(range(config.get_text_config().vocab_size))
         newline = tokenizer.encode("\n", add_special_tokens=False)
-        cases = (
-            (
-                "count",
-                "Continue the sequence with numbers separated by spaces: 1 2 3 4 5 6 7 8 9 10",
-                9,
-            ),
-            ("story", "Write a story about a cat who likes fish.", 5),
-        )
-        for name, text, limit in cases:
+        for name, text, limit in self.cases:
             with self.subTest(case=name):
                 prompt = tokenizer.apply_chat_template(
                     [{"role": "user", "content": text}],
@@ -238,6 +239,22 @@ class TestMambaSpecTruncationKL(MambaCacheKLMixin, DefaultServerBase):
                 self.assertLess(
                     kl, 5e-3, "Truncated speculative state corrupted cache reuse"
                 )
+
+
+class TestMambaSpecReplaySSMFinishedReuseKL(TestMambaSpecTruncationKL):
+    """With the speculative ReplaySSM ring, a finished request's state must be
+    cached at the length its key says: a state left behind its pending ring
+    entries makes the next turn's distribution diverge from a cold prefill."""
+
+    other_args = TestMambaSpecTruncationKL.other_args + [
+        "--enable-linear-replayssm-spec"
+    ]
+    # Lengths whose last verify leaves accepted tokens in the ring.
+    cases = (
+        ("story", "Write a story about a cat who likes fish.", 9),
+        ("countdown", "Count down from 30 to 1, separated by commas.", 9),
+        ("explain", "Explain in two sentences why the sky is blue.", 5),
+    )
 
 
 if __name__ == "__main__":

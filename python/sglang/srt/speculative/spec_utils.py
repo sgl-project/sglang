@@ -1386,7 +1386,10 @@ def commit_mamba_states_after_verify(
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
             max_spec_len=draft_token_num,
-            fold_every_commit=spec_state.temporal.dtype != torch.float32,
+            # no_buffer donates the working slot at finish with no track row to
+            # fold into, so `temporal` must already be the committed state.
+            fold_every_commit=spec_state.temporal.dtype != torch.float32
+            or not get_exec().mamba.enable_mamba_extra_buffer,
             mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
