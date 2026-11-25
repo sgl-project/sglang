@@ -490,12 +490,11 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None, cache_salt=N
 
 class _RenderedPromptChecks:
     """Per tokenizer: prompts that passed the check against a whole encode,
-    registered checks still running, and whether a check found a mismatch
-    (terminal)."""
+    checks still running, and whether a check found a mismatch (terminal)."""
 
     def __init__(self):
         self.passed = 0
-        self.pending = 0
+        self.running = 0
         self.failed = False
 
 
@@ -527,12 +526,12 @@ def _rendered_split_failed(tokenizer):
 def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None):
     """Encode a rendered chat prompt, splitting it at added (special) tokens so
     the text between them goes through the segment cache; earlier turns of a
-    conversation are then encoded once. The first prompts per tokenizer, and
-    any prompt that arrives while one of them is still being checked, are
-    checked against a whole encode and return it; a mismatch disables the
-    split for good, also for prompts already split but not yet returned. Only
-    the first prompts register their check, so overlapping requests cannot
-    keep the checks running past them."""
+    conversation are then encoded once. Prompts are checked against a whole
+    encode, and return it, until enough checks passed; a mismatch disables the
+    split for good, also for prompts already split but not yet returned. After
+    that no new check starts, and prompts return the whole encode until the
+    checks still running finish, so no split ids are returned while a check
+    that could still fail is in flight."""
     encode_kwargs = encode_kwargs or {}
     plan = None
     if (
@@ -553,19 +552,13 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
     ids = encode_prompt_segments(tokenizer, segments, encode_kwargs, cache_salt)
     with _rendered_prompt_checks_lock:
         state = _rendered_checks(tokenizer)
-        failed = state.failed
-        # Unchecked only once enough prompts passed and no registered check
-        # is running: a mismatch such a check finds then reaches every prompt
-        # that has not returned yet.
-        check = not failed and (state.pending or state.passed < _RENDERED_PROMPT_CHECKS)
-        # Only the first prompts register (count as pending until they
-        # finish). Prompts arriving while those run are still compared and
-        # return the whole encode, but nothing waits for them, so a burst of
-        # overlapping requests cannot hold `pending` up.
-        register = check and state.passed + state.pending < _RENDERED_PROMPT_CHECKS
-        if register:
-            state.pending += 1
-    if failed:
+        check = not state.failed and state.passed < _RENDERED_PROMPT_CHECKS
+        # Checks stop starting once enough passed, so `running` drains; the
+        # split ids are used only when no check that could still fail runs.
+        whole = state.failed or (not check and state.running > 0)
+        if check:
+            state.running += 1
+    if whole:
         return tokenizer.encode(text, **encode_kwargs)
     if not check:
         return ids
@@ -575,8 +568,7 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
         matched = list(ids) == list(expected)
     finally:
         with _rendered_prompt_checks_lock:
-            if register:
-                state.pending -= 1
+            state.running -= 1
             if matched:
                 state.passed += 1
             elif matched is False:
