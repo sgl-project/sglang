@@ -109,8 +109,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     BumpAllocator,
     cpu_has_amx_support,
-    get_bool_env_var,
-    get_device_sm,
     is_cpu,
     is_cuda,
     is_hip,
@@ -121,14 +119,12 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_device_sm = get_device_sm()
 
 if _is_npu:
-    from sgl_kernel_npu.moe.zero_experts_compute_identity import (
-        zero_experts_compute_identity_triton as zero_experts_compute_triton,
+    from sgl_kernel_npu.operators.moe import (
+        zero_experts_compute_identity as zero_experts_compute_triton,
     )
 else:
     from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton

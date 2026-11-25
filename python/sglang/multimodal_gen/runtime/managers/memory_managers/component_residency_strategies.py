@@ -10,8 +10,11 @@ import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.utils import MappedRegions
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HostPinBudget,
+    host_copies_would_not_fit,
+    module_weight_bytes,
     physical_host_memory_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -30,6 +33,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 SHARED_POOL_NEXT_STAGE_HEADROOM_BYTES = 12 * 1024**3
 # Leave headroom for the allocator when deciding whether a warmup preload fits.
 _WARMUP_PRELOAD_MARGIN_BYTES = 1 * 1024**3
+# Arbitrary allocator headroom for an early component load; not measured.
+_PREFETCH_MARGIN_BYTES = 1 * 1024**3
 
 logger = init_logger(__name__)
 
@@ -103,6 +108,30 @@ def _device_free_bytes() -> int | None:
     except RuntimeError:
         # Some backends expose mem_get_info without implementing it.
         return None
+
+
+def _prefetch_fits_device_memory(module: nn.Module, use: ComponentUse) -> bool:
+    if _module_ready_on_local_device(module, dtype=use.target_dtype):
+        return True
+    required_bytes = _cpu_module_nbytes(module, dtype=use.target_dtype)
+    # Not torch.xpu.mem_get_info: with torch 2.14.0+xpu it reports free memory
+    # equal to total even when memory is allocated, so a full device looks empty.
+    free_bytes = int(
+        current_platform.get_available_gpu_memory(
+            device_id=get_local_torch_device().index or 0, empty_cache=False
+        )
+        * 1024**3
+    )
+    if required_bytes <= free_bytes - _PREFETCH_MARGIN_BYTES:
+        return True
+    logger.warning_once(
+        "Skipping prefetch of %s (%.2f GiB needed, %.2f GiB free); "
+        "it will load on first use instead.",
+        use.component_name,
+        required_bytes / 1024**3,
+        free_bytes / 1024**3,
+    )
+    return False
 
 
 def _is_out_of_memory_error(error: BaseException) -> bool:
@@ -189,6 +218,29 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         self._ready_events: dict[str, object] = {}
 
     def _load_component(self, module: nn.Module, use: ComponentUse) -> None:
+        if (
+            current_platform.is_cuda()
+            and not current_platform.device_shares_host_memory()
+            and weight_snapshot(module) is None
+        ):
+            parameters = list(module.parameters())
+            if parameters and all(
+                p.device.type == "cpu"
+                and not p.is_pinned()
+                and (
+                    use.target_dtype is None
+                    or not p.is_floating_point()
+                    or p.dtype == use.target_dtype
+                )
+                for p in parameters
+            ):
+                regions = MappedRegions()
+                if all(
+                    regions.holds(p) for p in parameters
+                ) and host_copies_would_not_fit(module_weight_bytes(module)):
+                    # preserve reclaimable mappings under host pressure; with
+                    # room, the normal swap-out yields faster pinned H2D next time
+                    capture_weight_snapshot(module)
         _module_to_local_device(module, dtype=use.target_dtype)
 
     def prepare_for_use(
@@ -216,6 +268,8 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> bool:
+        if current_platform.is_xpu() and not _prefetch_fits_device_memory(module, use):
+            return False
         if not current_platform.is_cuda():
             self.prepare_for_use(module, use, state)
             return True
@@ -239,6 +293,9 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         state: ResidencyState,
     ) -> None:
         self.wait_for_use(module, use, state)
+        if restore_weight_snapshot(module):
+            self._ready_events.pop(use.component_name, None)
+            return
         # a failed H2D may leave children on device while the first parameter is on CPU
         if any(
             tensor.device.type != "cpu"
@@ -319,15 +376,6 @@ class SnapshotOffloadStrategy(ComponentOffloadStrategy):
                 module, pin_budget=self._pin_budget, component_name=use.component_name
             )
         super()._load_component(module, use)
-
-    def finish_use(
-        self, module: nn.Module, use: ComponentUse, state: ResidencyState
-    ) -> None:
-        self.wait_for_use(module, use, state)
-        if restore_weight_snapshot(module):
-            self._ready_events.pop(use.component_name, None)
-        else:
-            super().finish_use(module, use, state)
 
 
 class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
