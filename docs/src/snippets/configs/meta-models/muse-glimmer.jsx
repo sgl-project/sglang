@@ -104,6 +104,7 @@ export const config = {
   dockerImages: {
     b200:    "lmsysorg/sglang:dev-muse-glimmer",
     h200:    "lmsysorg/sglang:dev-muse-glimmer",
+    h100:    "lmsysorg/sglang:dev-muse-glimmer",
     rtx5090: "lmsysorg/sglang:dev-muse-glimmer",
     rtxpro6000: "lmsysorg/sglang:dev-muse-glimmer",
     // GB10 needs an aarch64 manifest under this tag to resolve natively
@@ -387,6 +388,20 @@ export const config = {
         "--tool-call-parser muse",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path {{DRAFT_PATH}}",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "standard", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser muse",
+        "--tool-call-parser muse",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
