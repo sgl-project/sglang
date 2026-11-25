@@ -440,6 +440,11 @@ class Envs:
     # ===================================================================
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+    # Maximum UTF-8 byte length for json_schema, regex, and ebnf grammars (<= 0 disables).
+    SGLANG_GRAMMAR_MAX_BYTES = EnvInt(65536)
+    # Maximum UTF-8 byte length for structural_tag grammars (<= 0 disables).
+    # Higher than SGLANG_GRAMMAR_MAX_BYTES to accommodate server-generated multi-tool tags.
+    SGLANG_GRAMMAR_STRUCTURAL_TAG_MAX_BYTES = EnvInt(262144)
 
     # ===================================================================
     # Fault injection and regression tests

@@ -23,6 +23,7 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.constrained.grammar_limits import validate_grammar_limits
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import (
     get_context,
@@ -305,6 +306,11 @@ class BaseGrammarBackend:
             return InvalidGrammarObject(
                 f"Invalid {key_type}: NUL bytes (\\u0000) are not allowed"
             )
+        try:
+            validate_grammar_limits(key_type, key_string)
+        except ValueError as e:
+            logger.error(f"Rejecting {key_type} grammar: {e}")
+            return InvalidGrammarObject(str(e))
         if key_type == "json":
             grammar = self.dispatch_json(key_string)
         elif key_type == "regex":
