@@ -716,6 +716,10 @@ class DSV4Metadata:
     fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
     # only on the metadata built for the late layers under decoder SWA bounded replay
     late_layer_tail: Optional[LateLayerTail] = None
+    # Captured with the late layers on a tail block; replay rebuilds the tail metadata
+    # iff set. A field (as on the CUDA DSV4Metadata) so a graph captured without the
+    # tail, e.g. with decoder SWA bounded replay off, replays without it.
+    prefill_graph_tail: bool = False
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -752,6 +756,8 @@ class DSV4Metadata:
     BREAKABLE_CUDA_GRAPH_KEEP_FIELDS: ClassVar[Tuple[str, ...]] = (
         "q_pad_buffer",
         "q_pad_captured",
+        # set at capture; the live metadata a replay refreshes from never sets it
+        "prefill_graph_tail",
     )
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4Metadata) -> None:
