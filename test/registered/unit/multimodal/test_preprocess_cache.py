@@ -45,13 +45,13 @@ from sglang.srt.multimodal.cache import (
     DiskPreprocessCache,
     MultimodalPreprocessCache,
     build_artifact_key,
-    build_cache_key,
     build_processor_fingerprint,
     estimate_cache_size_bytes,
     parse_content_hash,
     resolve_multimodal_item_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.cache.identity import resolve_multimodal_item_identity
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import publish, reset_context
@@ -69,7 +69,7 @@ class TestDiskPreprocessCache(unittest.TestCase):
 
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        key = build_cache_key("video.mp4")
+        key = structured_digest("video.mp4").hex()
         value = {
             "pixel_values_videos": torch.arange(6.0).reshape(2, 3),
             "second_per_grid_ts": [0.5],
@@ -84,7 +84,7 @@ class TestDiskPreprocessCache(unittest.TestCase):
         )
         self.assertEqual(loaded["second_per_grid_ts"], [0.5])
         self.assertEqual(loaded["video_metadata"], value["video_metadata"])
-        self.assertIsNone(reader.get(build_cache_key("image.png")))
+        self.assertIsNone(reader.get(structured_digest("image.png").hex()))
         # The temporary file was renamed into place, so no partial file is left.
         files = [path for path in Path(directory.name).rglob("*") if path.is_file()]
         self.assertEqual(
@@ -104,7 +104,7 @@ class TestDiskPreprocessCache(unittest.TestCase):
         """Concurrent misses on one image must not each serialize and rewrite its file."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        key = build_cache_key("image.png")
+        key = structured_digest("image.png").hex()
         first = DiskPreprocessCache(directory.name)
         first[key] = torch.zeros(1024)
         inode = first._path(key).stat().st_ino
