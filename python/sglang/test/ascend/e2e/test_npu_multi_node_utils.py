@@ -12,6 +12,7 @@ from typing import Iterable, Optional, Union
 
 import requests
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.server_fixtures.disaggregation_fixture import (
     SGL_ROUTER_REQUEST_TIMEOUT_SECS,
     find_sgl_router_binary,
@@ -49,6 +50,7 @@ PD_WORKER_READY_TIMEOUT = 600
 MOONCAKE_MASTER_READY_TIMEOUT = 300
 SERVER_INITIALIZATION_DELAY = 30
 SERVICE_EXIT_WAIT_SECONDS = 120
+NODE_EXIT_WAIT_SECONDS = 60
 
 
 def get_nic_name():
@@ -839,6 +841,123 @@ def launch_pd_mix_node(model_config):
     return process
 
 
+def launch_pd_mix_master_node_ready(model_config, base_url, initialization_delay):
+    """Launch the pd mix master node and block until its /health answers.
+
+    The health poll runs in 60 s slices so a launcher that raised fails the pod
+    early instead of polling until timeout. Liveness is checked only after a
+    failed probe, because a successful launch ends the launcher thread as soon
+    as the node turns healthy.
+    """
+    sglang_thread = threading.Thread(
+        target=launch_pd_mix_node, args=(model_config,), daemon=True
+    )
+    sglang_thread.start()
+
+    while True:
+        try:
+            wait_server_ready(f"{base_url}/health", timeout=60)
+            break
+        except RuntimeError:
+            if not sglang_thread.is_alive():
+                raise RuntimeError(
+                    "sglang launch thread exited before the server became ready; "
+                    "check the server logs for the first rank that died"
+                ) from None
+
+    logger.info(f"Wait {initialization_delay}s, starting run benchmark ......")
+    time.sleep(initialization_delay)
+
+
+def launch_pd_mix_node_keep_alive(model_config, keep_alive_time, role, host):
+    """Launch a pd mix node in a background thread and hold this process alive.
+
+    A worker blocks until ``keep_alive_time`` elapses, or returns as soon as the
+    launch failed so the pod fails fast instead of sleeping out the window.
+    """
+    launch_error = threading.Event()
+
+    def _launch():
+        try:
+            launch_pd_mix_node(model_config)
+        except BaseException:
+            launch_error.set()
+            raise
+
+    sglang_thread = threading.Thread(target=_launch, daemon=True)
+    sglang_thread.start()
+
+    logger.info(
+        f"{role} node is launching in the background; keeping this process alive "
+        f"for up to {keep_alive_time} seconds"
+    )
+    if launch_error.wait(keep_alive_time):
+        raise RuntimeError(
+            f"Failed to start node on {host}; see the launcher traceback above"
+        )
+
+
+def kill_storage_service_process(test_cls):
+    """Kill the hicache storage service started for ``test_cls``, if any."""
+    storage_service_process = getattr(test_cls, "storage_service_process", None)
+    if not storage_service_process:
+        return
+    try:
+        kill_process_tree(storage_service_process.pid)
+    except Exception as e:
+        logger.error(f"Error during storage service teardown: {e}")
+
+
+class PdMixNodeMixin:
+    """Role-aware startup shared by multi-node pd-mix test classes.
+
+    Subclasses must define ``model_config``, ``initialization_delay`` (seconds
+    to wait after the master turns healthy) and ``keep_alive_time`` (seconds a
+    worker holds its pod). Subclasses that need to adjust class-level config
+    first should override ``setUpClass`` and call ``super().setUpClass()``.
+    """
+
+    model_config = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.local_ip = "127.0.0.1"
+        cls.host = os.getenv("POD_IP")
+        cls.port = SERVICE_PORT
+        cls.base_url = f"http://{cls.host}:{cls.port}"
+        cls.hostname = os.getenv("HOSTNAME")
+        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
+        logger.info(f"Init {cls.host} {cls.role=}!")
+
+        cls.start_pd_mix_master_node()
+        cls.start_pd_mix_worker_node()
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_storage_service_process(cls)
+
+    @classmethod
+    @check_role(allowed_roles=["master"])
+    def start_pd_mix_master_node(cls):
+        from sglang.test.ascend.test_ascend_utils import (
+            maybe_start_hicache_storage_service,
+        )
+
+        cls.storage_service_process = maybe_start_hicache_storage_service(
+            cls.model_config.get("other_args")
+        )
+        launch_pd_mix_master_node_ready(
+            cls.model_config, cls.base_url, cls.initialization_delay
+        )
+
+    @classmethod
+    @check_role(allowed_roles=["worker"])
+    def start_pd_mix_worker_node(cls):
+        launch_pd_mix_node_keep_alive(
+            cls.model_config, cls.keep_alive_time, cls.role, cls.host
+        )
+
+
 # Launch prefill/decode separation node
 def launch_pd_separation_node(model_config):
     logger.info(f"Launch pd separation node start ......")
@@ -1061,6 +1180,100 @@ def launch_pd_separation_node(model_config):
         raise RuntimeError(f"Failed to start {role} node on {host_ip}: {e}")
 
     return process
+
+
+class PdSepNodeMixin:
+    """Role-aware startup shared by multi-node PD-separation test classes.
+
+    Subclasses must define ``model_config`` and ``initialization_delay``.
+    Subclasses that need to adjust class-level config first should override
+    ``setUpClass`` and call ``super().setUpClass()``. The router
+    records the running class in the ConfigMap so the previous class's
+    prefill/decode pods exit their wait and free the NPUs.
+    """
+
+    model_config = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.process = None
+        cls.local_ip = "127.0.0.1"
+        cls.host = os.getenv("POD_IP")
+        cls.port = SERVICE_PORT
+        cls.base_url = f"http://{cls.host}:{cls.port}"
+        cls.hostname = os.getenv("HOSTNAME")
+        cls.role = (
+            "router"
+            if "router" in cls.hostname
+            else "prefill"
+            if "prefill" in cls.hostname
+            else "decode"
+        )
+        logger.info(f"Init {cls.host} {cls.role=}!")
+
+        cls.start_pd_server()
+        cls.start_router_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process:
+            try:
+                kill_process_tree(cls.process.pid)
+                for _ in range(NODE_EXIT_WAIT_SECONDS):
+                    if cls.process.poll() is not None:
+                        logger.info("Process fully exited")
+                        break
+                    time.sleep(1)
+                else:
+                    logger.warning("Process did NOT exit in time")
+            except Exception as e:
+                logger.error(f"Error during tearDown: {e}")
+        kill_storage_service_process(cls)
+
+    @classmethod
+    @check_role(allowed_roles=["router"])
+    def start_router_server(cls):
+        wait_for_prefill_decode_exit(key=ACTIVE_TEST_CLASS, value=cls.__name__)
+        start_router_thread(cls.model_config, cls.base_url)
+
+        logger.info(
+            f"Waiting {cls.initialization_delay} seconds for the server to fully initialize..."
+        )
+        time.sleep(cls.initialization_delay)
+
+    @classmethod
+    @check_role(allowed_roles=["prefill", "decode"])
+    def start_pd_server(cls):
+        from sglang.test.ascend.test_ascend_utils import (
+            maybe_start_hicache_storage_service,
+        )
+
+        if cls.hostname.endswith("prefill-0"):
+            cls.storage_service_process = maybe_start_hicache_storage_service(
+                cls.model_config.get("prefill_args")
+            )
+        logger.info(f"Starting pd separation node...")
+        cls.process = launch_pd_separation_node(cls.model_config)
+        logger.info(f"Pd separation node started with PID: {cls.process.pid}")
+
+        while True:
+            if cls._another_class_started():
+                logger.info(f"[{cls.__name__}] exec completed, exiting waiter.")
+                return
+            if cls.process.poll() is not None:
+                exit_code = cls.process.poll()
+                raise Exception(
+                    f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
+                )
+            time.sleep(30)
+
+    @classmethod
+    def _another_class_started(cls):
+        configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
+        if not configmap or not configmap.data:
+            return False
+        executing_class = configmap.data.get(ACTIVE_TEST_CLASS)
+        return bool(executing_class) and executing_class != cls.__name__
 
 
 # Launch router node
