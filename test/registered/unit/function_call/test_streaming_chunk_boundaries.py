@@ -557,7 +557,6 @@ _SECTION_END_DROPS_CALLS = "section end discards buffered calls"
 # (parser, mode) pairs that fail on main. Remove an entry when its fix lands.
 KNOWN_FAILURES = {
     ("hermes", "both_calls_in_one_chunk"): "`</tool_call>` leaks into content",
-    ("interns1", "one_token_per_chunk"): "drops a split start marker of call 2",
     ("mistral", "one_call_per_chunk"): _LATER_CALLS_TO_CONTENT,
     ("mistral", "both_calls_in_one_chunk"): _LATER_CALLS_TO_CONTENT,
     ("mistral", "one_token_per_chunk"): _LATER_CALLS_TO_CONTENT,
