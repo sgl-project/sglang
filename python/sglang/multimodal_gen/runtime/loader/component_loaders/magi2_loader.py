@@ -704,6 +704,17 @@ def load_magi2_modules(
     device = get_local_torch_device()
     dtypes = _resolve_magi2_dtypes(server_args)
 
+    # The layerwise offload manager streams blocks from host to device during
+    # each forward. Load the DiT to CPU when the manager is active so the full
+    # per-rank expert shard (≥50 GiB at ep=4) is never resident on-device at
+    # once — matching the pattern of transformer_loader._resolve_checkpoint_load_device
+    # and server_args.should_start_component_on_cpu.
+    dit_load_device = (
+        torch.device("cpu")
+        if server_args.should_start_component_on_cpu("transformer")
+        else device
+    )
+
     # The text encoder runs once per request before either DiT, and as a plain
     # transformers module sglang's layerwise offload cannot hook it. Staged in by
     # Magi2TextEncodingStage.
@@ -713,14 +724,14 @@ def load_magi2_modules(
         checkpoint_root=checkpoint_root,
         config=config.dit_config,
         ep_group=ep_group,
-        device=device,
+        device=dit_load_device,
         param_dtype=dtypes["transformer"],
     )
     transformer_2 = (
         load_magi2_refiner_dit(
             checkpoint_root=checkpoint_root,
             config=config.refiner_dit_config,
-            device=device,
+            device=dit_load_device,
             param_dtype=dtypes["transformer_2"],
         )
         if config.enable_refiner
