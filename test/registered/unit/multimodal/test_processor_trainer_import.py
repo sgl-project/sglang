@@ -66,6 +66,9 @@ def test_trainer_uses_shared_pools_without_inference_imports():
         from sglang.srt.multimodal.token_space_mm_process.processor import TokenSpaceProcessor
         from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
         from sglang.srt.multimodal.token_space_mm_process.models.qwen_vl import QwenTokenSpaceProcessStrategy
+        # register_token_space_models skips a module that fails to import, so only
+        # an explicit import shows a trainer-side break instead of a silent fallback.
+        from sglang.srt.multimodal.token_space_mm_process.models.deepseek_v41 import DeepseekV41TokenSpaceProcessStrategy
         from sglang.srt.utils import ImageData
 
         import torch
