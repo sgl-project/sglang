@@ -2324,7 +2324,7 @@ def _consistency_failure_record(
     }
 
 
-def _save_generated_artifact_images(
+def save_generated_artifact_images(
     out_dir: Path,
     case_id: str,
     num_gpus: int,
@@ -2456,7 +2456,7 @@ def save_consistency_failure_artifact(
     )
     comparison.save(image_path)
 
-    generated_files = _save_generated_artifact_images(
+    generated_files = save_generated_artifact_images(
         out_dir=out_dir,
         case_id=case_id,
         num_gpus=num_gpus,
