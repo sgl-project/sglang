@@ -4,7 +4,11 @@ import argparse
 import unittest
 
 from sglang.benchmark.goodput import calculate_goodput
-from sglang.benchmark.serving import RequestFuncOutput, _goodput_slo
+from sglang.benchmark.serving import (
+    RequestFuncOutput,
+    _goodput_slo,
+    calculate_metrics,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -31,6 +35,37 @@ OUTPUTS = [
 
 
 class TestBenchServingGoodput(CustomTestCase):
+    def test_all_failed_requests_return_zero_latency_metrics(self):
+        """If every request fails, benchmark metrics must still be produced."""
+        outputs = [_output(0.0, 0.0, 0, success=False) for _ in range(4)]
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return text.split()
+
+        with self.assertWarnsRegex(UserWarning, "All requests failed"):
+            metrics, output_lens = calculate_metrics(
+                input_requests=None,
+                outputs=outputs,
+                dur_s=DURATION_S,
+                tokenizer=Tokenizer(),
+                backend="sglang-oai",
+            )
+
+        self.assertEqual(metrics.completed, 0)
+        self.assertEqual(output_lens, [0] * len(outputs))
+        self.assertEqual(
+            [
+                metrics.mean_e2e_latency_ms,
+                metrics.median_e2e_latency_ms,
+                metrics.std_e2e_latency_ms,
+                metrics.p90_e2e_latency_ms,
+                metrics.p95_e2e_latency_ms,
+                metrics.p99_e2e_latency_ms,
+            ],
+            [0.0] * 6,
+        )
+
     def test_request_is_good_only_if_it_meets_every_listed_slo(self):
         all_three = {"ttft": 3 / 5, "tpot": 3 / 5, "e2el": 3 / 5}
         # (--goodput entries, good requests, attainment of each listed SLO alone)
