@@ -16,7 +16,10 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
+    KVEventsConfig,
+    build_advertised_publisher_entry,
     is_kv_publisher_rank,
+    offset_advertisable_tcp,
     select_kv_publisher_dp_rank,
 )
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
@@ -106,6 +109,40 @@ class SchedulerKvEventsPublisher:
             return []
         source = self.kv_event_publisher.describe_local_source(block_size)
         return [source] if source is not None else []
+
+    def describe_advertised_publisher(
+        self,
+        load_endpoint: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Describe this rank's routable KV-event (and optional replay/load)
+        publisher for ``/server_info["kv_events"]["publishers"]``.
+
+        Returns ``None`` on non-publishing ranks, when publishing is disabled,
+        or when the configured endpoint is not a routable TCP address.
+        """
+        if (
+            not self.enable_kv_cache_events
+            or self.kv_event_publisher is None
+            or not self.kv_events_config
+        ):
+            return None
+        try:
+            cfg = KVEventsConfig.from_cli(self.kv_events_config)
+        except Exception:
+            return None
+        if cfg.publisher == "null" or not cfg.endpoint:
+            return None
+        parallel = get_parallel()
+        dp_rank = select_kv_publisher_dp_rank(
+            parallel.attn_dp_size, parallel.attn_dp_rank, parallel.dp_rank
+        )
+        return build_advertised_publisher_entry(
+            dp_rank=dp_rank,
+            kv_endpoint=offset_advertisable_tcp(cfg.endpoint, dp_rank),
+            replay_endpoint=offset_advertisable_tcp(cfg.replay_endpoint, dp_rank),
+            load_endpoint=load_endpoint,
+            advertise_host=cfg.advertise_host,
+        )
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:

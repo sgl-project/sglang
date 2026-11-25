@@ -41,6 +41,7 @@ from typing import (
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
+    describe_kv_events_publisher,
     get_context,
     get_device,
     get_disagg,
@@ -58,6 +59,7 @@ from sglang.srt.runtime_context import (
     publish,
     spawn_world_rank,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 from sglang.srt.utils.log_utils import suppress_noisy_warnings  # isort: skip
 
@@ -102,7 +104,12 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
-from sglang.srt.disaggregation.kv_events import uses_dynamo_format
+from sglang.srt.disaggregation.kv_events import (
+    is_loopback_host,
+    merge_kv_event_publishers,
+    parse_advertisable_tcp,
+    uses_dynamo_format,
+)
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -529,6 +536,8 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    # Gathered per-DP-rank KV-event & load publisher endpoints for /server_info.
+    kv_event_publishers: Optional[List[Dict[str, Any]]] = None
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
@@ -731,10 +740,12 @@ class Scheduler(
         self.init_metrics_reporter()
         self.scheduler_stage_metrics = self.metrics_reporter.scheduler_stage_metrics
 
-        # The Rust frontend snapshots local KV-event discovery metadata while it
-        # builds its typed server info, so the publisher must exist before the
-        # frontend starts.
+        # The Rust frontend snapshots KV-event & load discovery metadata while
+        # it builds its server info, so both publishers and the cross-rank
+        # gather must run before the frontend starts.
         self.init_kv_events_publisher()
+        self.init_load_publisher()
+        self.init_kv_event_publishers()
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -796,8 +807,6 @@ class Scheduler(
 
         self.init_invariant_checker()
         self.init_gc_freezer()
-
-        self.init_load_publisher()
 
         self.init_load_inquirer()
 
@@ -2130,6 +2139,9 @@ class Scheduler(
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
+        if self.kv_event_publishers:
+            result_dict["kv_event_publishers"] = self.kv_event_publishers
+
         if get_serving().grpc_port is not None:
             result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
@@ -2910,6 +2922,69 @@ class Scheduler(
             load_publish_endpoint=get_observability().load_publish_endpoint,
             publish_interval=get_observability().load_snapshot_publish_interval,
         )
+
+    def init_kv_event_publishers(self) -> None:
+        """Gather per-DP-rank KV-event (and optional replay/load) publisher
+        endpoints across ``world_group`` for ``/server_info["kv_events"]["publishers"]``.
+
+        Reuses the existing ``world_group`` CPU collective so no extra socket
+        or port offset is allocated.
+        """
+        kv_events_config = get_observability().kv_events_config
+        if (
+            not kv_events_config
+            or describe_kv_events_publisher(self.server_args) is None
+        ):
+            self.kv_event_publishers = []
+            return
+
+        load_publisher = getattr(self, "load_publisher", None)
+        load_endpoint = (
+            load_publisher.endpoint
+            if load_publisher is not None
+            and isinstance(getattr(load_publisher, "endpoint", None), str)
+            else None
+        )
+        local_entry = self.kv_events_publisher.describe_advertised_publisher(
+            load_endpoint=load_endpoint
+        )
+
+        parallel = get_parallel()
+        if local_entry is not None and parallel.nnodes > 1:
+            parsed_ep = parse_advertisable_tcp(local_entry["endpoint"])
+            if parsed_ep is not None and is_loopback_host(parsed_ep[0]):
+                dist_init_addr = parallel.dist_init_addr
+                dist_is_loopback = False
+                if dist_init_addr:
+                    try:
+                        dist_is_loopback = is_loopback_host(
+                            NetworkAddress.parse(dist_init_addr).host
+                        )
+                    except ValueError:
+                        pass
+                if not dist_is_loopback:
+                    logger.warning(
+                        "KV-event publisher for dp_rank=%s resolved to loopback %r "
+                        "across %d nodes (rendezvous %r); remote routers cannot "
+                        "reach this rank. Set advertise_host in --kv-events-config "
+                        "or SGLANG_HOST_IP.",
+                        local_entry["dp_rank"],
+                        local_entry["endpoint"],
+                        parallel.nnodes,
+                        dist_init_addr,
+                    )
+
+        world_group = getattr(parallel, "world_group", None)
+        if (
+            get_exec().moe.is_ep_joiner
+            or world_group is None
+            or world_group.world_size <= 1
+        ):
+            self.kv_event_publishers = merge_kv_event_publishers([local_entry])
+            return
+
+        gathered = world_group.all_gather_object(local_entry)
+        self.kv_event_publishers = merge_kv_event_publishers(gathered)
 
     def init_load_inquirer(self) -> None:
         self.total_prefill_uncached_tokens = 0

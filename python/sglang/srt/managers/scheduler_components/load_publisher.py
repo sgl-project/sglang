@@ -138,6 +138,7 @@ class SchedulerLoadPublisher:
         # _socket is None == disabled: every early return below leaves it so,
         # and publish_load_stat then skips the snapshot entirely.
         self._socket: Optional[zmq.Socket] = None
+        self._endpoint: Optional[str] = None
         self._rank = 0
         self._seq = count()
         self._publish_counter = 0
@@ -179,6 +180,7 @@ class SchedulerLoadPublisher:
         endpoint = NetworkAddress(host, base + self._rank).to_tcp()
         try:
             self._socket = _open_pub_socket(endpoint)
+            self._endpoint = endpoint
             # No scheduler shutdown hook to close() from; LINGER=0 keeps a
             # hard exit safe. (The KV-event publisher cleans up the same way.)
             atexit.register(self.close)
@@ -196,6 +198,11 @@ class SchedulerLoadPublisher:
     def enable(self) -> bool:
         """True when a real load PUB socket is bound."""
         return self._socket is not None
+
+    @property
+    def endpoint(self) -> Optional[str]:
+        """Bound load PUB endpoint, or None when disabled / bind failed."""
+        return self._endpoint if self._socket is not None else None
 
     def publish_load_stat(
         self,
@@ -282,3 +289,4 @@ class SchedulerLoadPublisher:
         if self._socket is not None:
             self._socket.close()
             self._socket = None
+        self._endpoint = None

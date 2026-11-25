@@ -55,6 +55,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.disaggregation.kv_events import merge_kv_event_publishers
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -62,6 +63,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.server_utils import (
+    build_server_info,
     launch_dummy_health_check_server,
     set_prometheus_multiproc_dir,
     start_follower_grpc_server,
@@ -1013,6 +1015,10 @@ class Engine(EngineScoreMixin, EngineBase):
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            if any("kv_event_publishers" in info for info in infos):
+                infos[0]["kv_event_publishers"] = merge_kv_event_publishers(
+                    pub for info in infos for pub in info.get("kv_event_publishers", [])
+                )
             if any("kv_event_sources" in info for info in infos):
                 # Both gRPC entrypoints consume the first scheduler info. Keep
                 # the sources from every local scheduler, not just the first.
@@ -1642,11 +1648,10 @@ class Engine(EngineScoreMixin, EngineBase):
         return msgspec_to_builtins(
             redact_watermark_secrets(
                 {
-                    **redact_server_args_secrets(
-                        self.tokenizer_manager.server_args.resolved_dict()
+                    **build_server_info(
+                        self.tokenizer_manager.server_args,
+                        self._scheduler_init_result.scheduler_infos[0],
                     ),
-                    "launch_command": self.tokenizer_manager.server_args.launch_command,
-                    **self._scheduler_init_result.scheduler_infos[0],
                     "startup_time": self.tokenizer_manager.startup_time,
                     "internal_states": internal_states,
                     "version": __version__,

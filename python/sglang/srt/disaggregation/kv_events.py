@@ -20,6 +20,7 @@ KV caching events
 import atexit
 import enum
 import hashlib
+import ipaddress
 import logging
 import os
 import queue
@@ -27,6 +28,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
+from collections.abc import Iterable
 from itertools import count
 from queue import Queue
 from typing import Any, Callable, Literal, Optional, Union
@@ -36,7 +38,7 @@ import zmq
 from pydantic import BaseModel
 
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 
@@ -161,12 +163,11 @@ def resolve_load_pub_range(
     is unremarkable (feature off). Callers log it once; /server_info calls
     this per request, so it must not log here.
 
-    Two inherited limits, both from the KV-event discovery structure: with
+    Inherited limit from the KV-event discovery structure: with
     ``page_size`` <= 0 `describe_kv_events_publisher` suppresses the whole
-    block, so the range binds unadvertised; and with DP-attention across
-    ``nnodes`` > 1 the single advertised base is paired with one worker-URL
-    host, so ranks on other nodes are unreachable at that host
-    (`warn_multi_node_kv_events` says so at startup).
+    block, so the range binds unadvertised. For multi-node DP deployments,
+    each publishing rank advertises its resolved ``load_endpoint`` under
+    ``/server_info["kv_events"]["publishers"]``.
     """
     # Opt-in: off unless the operator sets `auto` (derive) or an address, so an
     # upgrade never claims a port a co-hosted neighbor's KV publisher binds.
@@ -229,6 +230,143 @@ def resolve_load_pub_range(
     if base + dp_size - 1 > 65535:
         return None, f"load port range from {base} would run past the u16 ceiling"
     return (host, base), None
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return whether *host* names a loopback address (``localhost``, ``127.0.0.0/8``, ``::1``)."""
+    stripped = host.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        stripped = stripped[1:-1]
+    if stripped.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(stripped).is_loopback
+    except ValueError:
+        return False
+
+
+def offset_advertisable_tcp(endpoint: Optional[str], dp_rank: int) -> Optional[str]:
+    """Offset a routable ``tcp://`` endpoint's port by ``dp_rank``, else None."""
+    parsed = parse_advertisable_tcp(endpoint)
+    if parsed is None:
+        return None
+    host, base_port = parsed
+    port = base_port + dp_rank
+    if not (0 < port <= 65535):
+        return None
+    return NetworkAddress(host, port).to_tcp()
+
+
+def resolve_advertised_host(
+    bind_host: str,
+    *,
+    advertise_host: Optional[str] = None,
+) -> str:
+    """Resolve a bind host into a reachable host for external subscribers.
+
+    Concrete hosts (IPv4, IPv6, or hostnames) are preserved (unbracketed;
+    callers format with :meth:`NetworkAddress.to_tcp` to re-bracket IPv6).
+    Wildcard bind hosts (``*``, ``0.0.0.0``, ``::``, ``[::]``) resolve to
+    ``advertise_host`` when provided, otherwise ``get_local_ip_auto()``.
+    """
+    normalized = bind_host.strip()
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    if normalized not in _BIND_WILDCARD_HOSTS:
+        return normalized
+
+    if advertise_host is not None:
+        explicit = advertise_host.strip()
+        if explicit.startswith("[") and explicit.endswith("]"):
+            explicit = explicit[1:-1]
+        if explicit:
+            return explicit
+
+    detected = get_local_ip_auto(fallback="127.0.0.1")
+    if detected.startswith("[") and detected.endswith("]"):
+        detected = detected[1:-1]
+    if (
+        normalized == "0.0.0.0"
+        and NetworkAddress(detected, 0).is_ipv6
+        and is_loopback_host(detected)
+    ):
+        detected = "127.0.0.1"
+    return detected
+
+
+def resolve_advertised_tcp_endpoint(
+    endpoint: Optional[str],
+    *,
+    advertise_host: Optional[str] = None,
+) -> Optional[str]:
+    """Convert a routable ``tcp://`` endpoint into a dialable ``tcp://<host>:<port>``.
+
+    Wildcard hosts (``*``, ``0.0.0.0``, ``::``, ``[::]``) are resolved via
+    :func:`resolve_advertised_host`; IPv6 hosts are properly bracketed.
+    """
+    parsed = parse_advertisable_tcp(endpoint)
+    if parsed is None:
+        return None
+    raw_host, port = parsed
+    resolved_host = resolve_advertised_host(raw_host, advertise_host=advertise_host)
+    return NetworkAddress(resolved_host, port).to_tcp()
+
+
+def build_advertised_publisher_entry(
+    *,
+    dp_rank: int,
+    kv_endpoint: Optional[str],
+    replay_endpoint: Optional[str] = None,
+    load_endpoint: Optional[str] = None,
+    advertise_host: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Build one per-DP-rank entry for ``/server_info["kv_events"]["publishers"]``.
+
+    Returns ``None`` if ``kv_endpoint`` is not a routable TCP address.
+    Optional ``replay_endpoint`` and ``load_endpoint`` keys are omitted when
+    not configured or not routable TCP addresses.
+    """
+    resolved_kv = resolve_advertised_tcp_endpoint(
+        kv_endpoint, advertise_host=advertise_host
+    )
+    if resolved_kv is None:
+        return None
+    entry: dict[str, Any] = {
+        "dp_rank": int(dp_rank),
+        "endpoint": resolved_kv,
+    }
+    resolved_replay = resolve_advertised_tcp_endpoint(
+        replay_endpoint, advertise_host=advertise_host
+    )
+    if resolved_replay is not None:
+        entry["replay_endpoint"] = resolved_replay
+    resolved_load = resolve_advertised_tcp_endpoint(
+        load_endpoint, advertise_host=advertise_host
+    )
+    if resolved_load is not None:
+        entry["load_endpoint"] = resolved_load
+    return entry
+
+
+def merge_kv_event_publishers(
+    entries: Iterable[Optional[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Deduplicate and sort per-DP-rank KV-event publisher records by ``dp_rank``."""
+    by_rank: dict[int, dict[str, Any]] = {}
+    for entry in entries:
+        if not entry or "dp_rank" not in entry or not entry.get("endpoint"):
+            continue
+        dp_rank = int(entry["dp_rank"])
+        cleaned: dict[str, Any] = {
+            "dp_rank": dp_rank,
+            "endpoint": entry["endpoint"],
+        }
+        if entry.get("replay_endpoint"):
+            cleaned["replay_endpoint"] = entry["replay_endpoint"]
+        if entry.get("load_endpoint"):
+            cleaned["load_endpoint"] = entry["load_endpoint"]
+        by_rank[dp_rank] = cleaned
+    return [by_rank[rank] for rank in sorted(by_rank)]
 
 
 class EventBatch(
@@ -788,6 +926,13 @@ class KVEventsConfig(BaseModel):
     and, for requests with mm_routing_labels, mm_routing_spans.
     """
 
+    advertise_host: Optional[str] = None
+    """Optional reachable host/IP to advertise in
+    ``/server_info["kv_events"]["publishers"]`` when the publisher binds a
+    wildcard address (``*``, ``0.0.0.0``, ``::``, ``[::]``). When unset, each
+    publishing rank resolves its host via ``get_local_ip_auto()``.
+    """
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
@@ -819,8 +964,10 @@ class EventPublisherFactory:
             return NullEventPublisher()
         config = KVEventsConfig.from_cli(config)
         config_dict = config.model_dump()
-        # The cache event recorder uses the format. The publisher does not accept it.
-        config_dict.pop("format")
+        # The cache event recorder uses format; /server_info discovery uses advertise_host.
+        # Publishers do not accept these keys.
+        config_dict.pop("format", None)
+        config_dict.pop("advertise_host", None)
 
         kind = config_dict.pop("publisher", "null")
         if kind == "null":

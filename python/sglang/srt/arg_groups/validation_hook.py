@@ -695,10 +695,14 @@ def check_load_publish_args(server_args: Any):
 
 
 def warn_multi_node_kv_events(server_args: Any) -> None:
-    """Warn when /server_info's kv_events block cannot reach every
-    publishing rank: it advertises one host and one port base, while rank
-    ``r`` binds ``base + r`` on the node it runs on. Not an error, since
-    serving is unaffected; a subscriber just misses the remote ranks."""
+    """Warn when a multi-node KV-event or load publisher binds or advertises
+    a loopback address that remote subscribers cannot reach.
+
+    Per-rank endpoints are gathered across nodes into
+    ``/server_info["kv_events"]["publishers"]``, so wildcard binds
+    (``*``, ``0.0.0.0``, ``::``) resolve to each node's reachable host and do
+    not warn unless ``advertise_host`` points to loopback.
+    """
     descriptor = describe_kv_events_publisher(server_args)
     if descriptor is None or descriptor["dp_size"] < 2:
         return
@@ -711,6 +715,8 @@ def warn_multi_node_kv_events(server_args: Any) -> None:
         return
     from sglang.srt.disaggregation.kv_events import (
         KVEventsConfig,
+        is_loopback_host,
+        parse_advertisable_tcp,
         parse_bindable_tcp,
     )
 
@@ -720,28 +726,35 @@ def warn_multi_node_kv_events(server_args: Any) -> None:
     kv_binds = kv_config.bind
     if kv_binds is None:
         kv_binds = parse_bindable_tcp(kv_config.endpoint) is not None
+    parsed_kv = parse_advertisable_tcp(kv_config.endpoint)
+    kv_host = parsed_kv[0] if parsed_kv is not None else ""
+    kv_is_wildcard = parse_bindable_tcp(kv_config.endpoint) is not None
+    advertise_host = (kv_config.advertise_host or "").strip()
+    advertise_is_loopback = bool(advertise_host) and is_loopback_host(advertise_host)
+
+    kv_loopback = kv_binds and (
+        is_loopback_host(kv_host) or (kv_is_wildcard and advertise_is_loopback)
+    )
+    load_loopback = "load_endpoint_port_base" in descriptor and advertise_is_loopback
     published = [
         name
-        for name, binds in (
-            ("KV events", kv_binds),
-            # The load range always binds a wildcard host.
-            (
-                "load reports (--load-publish-endpoint)",
-                "load_endpoint_port_base" in descriptor,
-            ),
+        for name, bad in (
+            ("KV events", kv_loopback),
+            ("load reports (--load-publish-endpoint)", load_loopback),
         )
-        if binds
+        if bad
     ]
     if not published:
         return
+    bad_host = advertise_host if advertise_is_loopback else kv_host
     logger.warning(
-        f"{' and '.join(published)} are published per DP rank, and the "
-        f"{descriptor['dp_size']} publishing ranks span several of the "
-        f"{cfg.nnodes} nodes, but /server_info advertises one host and one "
-        f"port base for all of them. Only the ranks on the head node are "
-        f"reachable at the advertised address, so a router subscribing "
-        f"through /server_info (e.g. sgl-router's cache_aware policy) sees "
-        f"only part of the KV cache. Serving is unaffected."
+        f"{' and '.join(published)} are published per DP rank across "
+        f"{cfg.nnodes} nodes, but the configured bind/advertise host is "
+        f"loopback ({bad_host!r}). Remote routers subscribing through "
+        f"/server_info['kv_events']['publishers'] cannot reach loopback "
+        f"sockets on other nodes. Bind a wildcard address (e.g. tcp://*:5557) "
+        f"and optionally set advertise_host or SGLANG_HOST_IP. Serving is "
+        f"unaffected."
     )
 
 

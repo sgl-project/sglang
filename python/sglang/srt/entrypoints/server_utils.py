@@ -211,7 +211,10 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
     result = redact_server_args_secrets(server_args.resolved_dict())
     result["launch_command"] = server_args.launch_command
     result.update(scheduler_info)
-    result["kv_events"] = describe_kv_events_publisher(server_args)
+    kv_event_publishers = result.pop("kv_event_publishers", None)
+    result["kv_events"] = describe_kv_events_publisher(
+        server_args, publishers=kv_event_publishers
+    )
     return result
 
 

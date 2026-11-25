@@ -32,7 +32,7 @@ import os
 import sys
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence
 
 import msgspec
 
@@ -2101,7 +2101,10 @@ def cutedsl_moe_max_num_tokens() -> int:
     return max(prefill_tokens, decode_max_bs * num_tokens_per_req)
 
 
-def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
+def describe_kv_events_publisher(
+    server_args: Any,
+    publishers: Optional[Sequence[dict[str, Any]]] = None,
+) -> Optional[dict]:
     """Return a structured description of this server's KV-event
     publisher, or `None` if publishing is disabled / misconfigured.
 
@@ -2152,6 +2155,15 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
                                               # as the SUB endpoints;
                                               # present only when
                                               # replay_endpoint is tcp
+            "publishers": [                   # optional per-DP-rank list
+                                              # gathered across nodes/ranks;
+                {                             # omitted when unavailable
+                    "dp_rank": 0,
+                    "endpoint": "tcp://<reachable_host>:<kv_port>",
+                    "replay_endpoint": "tcp://<reachable_host>:<replay_port>",
+                    "load_endpoint": "tcp://<reachable_host>:<load_port>",
+                }
+            ],
         }
 
     Returns None (i.e. "no publisher to describe") when any of:
@@ -2183,6 +2195,7 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     from sglang.srt.disaggregation.kv_events import (
         LOAD_TOPIC,
         KVEventsConfig,
+        merge_kv_event_publishers,
         parse_advertisable_tcp,
         resolve_load_pub_range,
     )
@@ -2230,4 +2243,8 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     resolved_replay = parse_advertisable_tcp(cfg.replay_endpoint)
     if resolved_replay is not None:
         descriptor["replay_endpoint_port_base"] = resolved_replay[1]
+    if publishers:
+        merged_publishers = merge_kv_event_publishers(publishers)
+        if merged_publishers:
+            descriptor["publishers"] = merged_publishers
     return descriptor

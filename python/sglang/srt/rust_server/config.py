@@ -491,6 +491,9 @@ def _launch_server_info(scheduler: Scheduler) -> str:
         "max_total_num_tokens": scheduler.max_total_num_tokens,
         "max_req_input_len": scheduler.max_req_input_len,
     }
+    kv_event_publishers = getattr(scheduler, "kv_event_publishers", None)
+    if kv_event_publishers:
+        scheduler_info["kv_event_publishers"] = kv_event_publishers
     info = msgspec_to_builtins(
         redact_watermark_secrets(
             build_server_info(scheduler.server_args, scheduler_info)

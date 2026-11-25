@@ -29,6 +29,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.disaggregation.kv_events import merge_kv_event_publishers
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_rank_to_dp_rank,
@@ -237,6 +238,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.local_kv_event_sources = []
+        self.kv_event_publishers = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
@@ -806,6 +808,16 @@ class DataParallelController:
                 for info in scheduler_info
                 for source in info.get("kv_event_sources", [])
             )
+            self.kv_event_publishers = merge_kv_event_publishers(
+                [
+                    *getattr(self, "kv_event_publishers", []),
+                    *(
+                        pub
+                        for info in scheduler_info
+                        for pub in info.get("kv_event_publishers", [])
+                    ),
+                ]
+            )
 
         self._record_scheduler_init_infos(scheduler_info)
 
@@ -980,6 +992,8 @@ def run_data_parallel_controller_process(
             **controller.get_init_info(),
             SCHEDULER_PIDS_ARG: scheduler_pids,
         }
+        if getattr(controller, "kv_event_publishers", None):
+            init_info["kv_event_publishers"] = controller.kv_event_publishers
         if get_serving().grpc_port is not None:
             init_info["kv_event_sources"] = sorted(
                 controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
