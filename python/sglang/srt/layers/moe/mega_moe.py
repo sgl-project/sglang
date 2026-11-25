@@ -125,22 +125,12 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
         )
 
 
-# sgl-deep-gemm 0.2.9 (the python/pyproject.toml pin) sizes the SM100 MegaMoE
-# signal block for at most this many experts in the EP group and on one rank:
-# MegaMoESignals::kNumMaxExperts / kNumMaxExpertsPerRank in
-# deep_gemm/include/deep_gemm/layout/mega_moe.cuh. They are compile-time
-# constants with no Python accessor, so update them together with the pin.
+# MegaMoESignals limits in sgl-deep-gemm.
 _DEEPGEMM_MEGA_MOE_MAX_EXPERTS = 2048
 _DEEPGEMM_MEGA_MOE_MAX_EXPERTS_PER_RANK = 512
 
 
 def check_mega_moe_num_experts(num_experts: int, ep_size: int) -> None:
-    """Reject an expert layout the SM100 DeepGEMM MegaMoE kernels cannot hold.
-
-    DeepGEMM asserts on these limits when the symmetric buffer is created,
-    which is the first forward for most models; call this while the model is
-    built so the server stops before it loads weights.
-    """
     num_experts_per_rank = num_experts // ep_size
     if (
         num_experts <= _DEEPGEMM_MEGA_MOE_MAX_EXPERTS

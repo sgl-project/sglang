@@ -602,8 +602,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         if get_exec().moe.ep_num_redundant_experts:
             raise ValueError("Kimi-K3 does not support redundant experts.")
         if get_moe_a2a_backend().is_megamoe() and not _is_hip:
-            # DeepGEMM would assert on this in the first forward, after the
-            # weights are loaded and repacked.
             from sglang.srt.layers.moe.mega_moe import check_mega_moe_num_experts
 
             check_mega_moe_num_experts(
