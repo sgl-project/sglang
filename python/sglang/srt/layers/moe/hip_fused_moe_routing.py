@@ -87,12 +87,12 @@ def clear() -> None:
 
 def prepare(device) -> None:
     """Build the kernel's buffers and compile both sort-block variants eagerly (model init, not inside a graph
-    capture): RouteA zeroes its workspace once, and FlyDSL compiles on a kernel's first launch."""
+    capture): MoeRouteSortQuant zeroes its workspace once, and FlyDSL compiles on a kernel's first launch."""
     if not _ENABLED or _state["router"] is not None:
         return
-    from aiter.ops.flydsl.moe_route_sort_quant import RouteA
+    from aiter.ops.flydsl.moe_route_sort_quant import MoeRouteSortQuant
 
-    r = RouteA(device)
+    r = MoeRouteSortQuant(device)
     bias = torch.zeros(384, dtype=torch.float32, device=device)
     for m in (300, 1100):  # sort block 32 and 64
         r(
