@@ -880,7 +880,8 @@ def fused_qk_rope_reshape_and_cache(
     else:
         zeros_out = None
 
-    if _use_tiled(
+    # Only the untiled kernel can skip a reserved destination slot.
+    if reserved_skip_index < 0 and _use_tiled(
         t,
         t_slot,
         qh,

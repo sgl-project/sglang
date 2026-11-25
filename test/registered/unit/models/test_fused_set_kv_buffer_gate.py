@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -208,6 +208,56 @@ class TestHipFusedStoreGate(CustomTestCase):
         self.assertEqual(arg["reserved_skip_index"], 0)
         static = _hip_fused_args(_static_window_pool(), _layer(0, -1), batch)
         self.assertEqual(static["reserved_skip_index"], -1)
+
+    def test_gfx1250_tiling_requires_no_reserved_slot(self):
+        from sglang.kernels.ops.attention import fused_qk_rope_reshape_and_cache as rope
+        from sglang.srt.environ import envs
+
+        tokens = 256  # Meets the gfx1250 tiled path's token threshold.
+        q = torch.empty((tokens, 8, 16), dtype=torch.bfloat16, device="cpu")
+        k = torch.empty((tokens, 1, 16), dtype=q.dtype, device=q.device)
+        cache = torch.empty((tokens // 16, 16, 1, 16), dtype=q.dtype, device=q.device)
+        slots = torch.arange(tokens, device=q.device)
+        cos_sin = torch.empty((tokens, 16), dtype=torch.float32, device=q.device)
+
+        for reserved_slot in (0, 7, -1):
+            with (
+                self.subTest(reserved_slot=reserved_slot),
+                envs.SGLANG_FUSED_ROPE_KV_TILED.override(True),
+                patch.object(rope, "is_gfx1250_supported", return_value=True),
+                patch.object(
+                    rope, "_fused_qk_rope_cache_tiled_kernel", MagicMock()
+                ) as tiled,
+                patch.object(
+                    rope, "_fused_qk_rope_reshape_and_cache_kernel", MagicMock()
+                ) as untiled,
+            ):
+                rope.fused_qk_rope_reshape_and_cache(
+                    q,
+                    k,
+                    torch.empty_like(k),
+                    cache,
+                    torch.empty_like(cache),
+                    slot_mapping=slots,
+                    pos=slots,
+                    cos_sin=cos_sin,
+                    k_scale=None,
+                    v_scale=None,
+                    is_neox=True,
+                    flash_layout=True,
+                    output_zeros=False,
+                    reserved_skip_index=reserved_slot,
+                )
+                if reserved_slot >= 0:
+                    tiled.__getitem__.assert_not_called()
+                    launch = untiled.__getitem__.return_value
+                    launch.assert_called_once()
+                    self.assertEqual(
+                        launch.call_args.kwargs["RESERVED_SKIP_INDEX"], reserved_slot
+                    )
+                else:
+                    untiled.__getitem__.assert_not_called()
+                    tiled.__getitem__.return_value.assert_called_once()
 
     def test_window_metadata_routes_through_active_wrappers(self):
         from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
