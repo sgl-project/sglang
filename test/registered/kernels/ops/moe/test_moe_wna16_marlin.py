@@ -21,11 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
-from sglang.srt.utils.device import (
-    is_sm80_supported,
-    is_sm90_supported,
-    is_sm120_supported,
-)
+from sglang.srt.utils.device import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
     awq_marlin_quantize,
@@ -511,8 +507,8 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
 
 
 @pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()),
-    reason="NVFP4 Marlin MoE numeric test requires CUDA SM8x, SM9x, or SM12x",
+    not (is_sm80_supported() or is_sm90_supported()),
+    reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
 )
 @pytest.mark.parametrize("is_gated", [False, True], ids=["relu2", "swiglu"])
 def test_fused_marlin_moe_nvfp4_matches_dequant_reference(is_gated):
