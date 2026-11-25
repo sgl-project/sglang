@@ -2,7 +2,6 @@
 """Protocol definitions for the weight cache daemon.
 
 Defines CacheConfig for validation and socket message protocol helpers.
-See README.md in this directory for the protocol compatibility policy.
 """
 
 import hashlib
