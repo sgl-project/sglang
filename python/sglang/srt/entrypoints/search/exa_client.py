@@ -29,9 +29,9 @@ class ExaSearchConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     @classmethod
     def from_env(cls) -> "ExaSearchConfig":
-        # EnvField handles type parsing (int/bool) and falls back to its own
-        # default on a parse error; here we only enforce the semantic bounds
-        # that the generic descriptors cannot express.
+        # EnvField handles type parsing (int/bool) and rejects a value that
+        # does not parse; here we only enforce the semantic bounds that the
+        # generic descriptors cannot express.
         num_results = envs.SGLANG_EXA_NUM_RESULTS.get()
         if not 1 <= num_results <= 100:
             print_warning_once(

@@ -4076,9 +4076,9 @@ class ServingChatTestCase(CustomTestCase):
             first_chunk_call.tool_index = 0
             first_chunk_call.name = "get_weather"
             first_chunk_call.parameters = ""
-            parser_instance.parse_stream_chunk.side_effect = [
-                ("", [first_chunk_call]),
-                ("", []),
+            parser_instance.parse_stream_segments.side_effect = [
+                [("", [first_chunk_call])],
+                [("", [])],
             ]
 
             async def collect_first_tool_chunk():
@@ -4107,6 +4107,43 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(payload["created"], 123)
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
+
+    def test_tool_call_stream_keeps_generation_order_within_a_delta(self):
+        """Text after a call in the same delta is sent after that call."""
+        self.chat.tool_call_parser = "glm47"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=True,
+        )
+        delta = (
+            "Sure.<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>Paris</arg_value></tool_call> Done."
+        )
+
+        async def collect():
+            return [
+                line
+                async for line in self.chat._process_tool_call_stream(
+                    index=0,
+                    delta=delta,
+                    parser_dict={},
+                    content={"meta_info": {"id": "chatcmpl-test"}},
+                    request=req,
+                    has_tool_calls={},
+                    created=0,
+                )
+            ]
+
+        lines = get_or_create_event_loop().run_until_complete(collect())
+        order = []
+        for line in lines:
+            message = json.loads(line[len("data: ") :])["choices"][0]["delta"]
+            part = message["content"] or "<call>"
+            if not order or part != order[-1]:
+                order.append(part)
+        self.assertEqual(order, ["Sure.", "<call>", " Done."])
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
