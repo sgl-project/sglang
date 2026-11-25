@@ -12,6 +12,7 @@ import tqdm
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
 from sglang.srt.layers.cp.base import ContextParallelStrategyKind, get_cp_strategy
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -19,6 +20,9 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
 from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.runtime_context import get_disagg, get_flags, get_parallel, get_schedule
 
@@ -28,8 +32,6 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v4_replay_tail import DecoderReplayTail
 
 logger = logging.getLogger(__name__)
-# Decoder bounded replay retains one SWA window per request.
-_TAIL_WINDOW = 128
 
 
 @contextmanager
@@ -128,7 +130,7 @@ def _skip_reason(tail: DecoderReplayTail, model_runner: ModelRunner) -> str | No
     if get_disagg().disaggregation_mode == "decode":
         return "decode worker"
     if p.pp_size != 1 or p.attn_dp_size != 1:
-        return "startup preparation requires PP=1 and attention DP=1"
+        return "CP startup preparation requires PP=1 and attention DP=1"
     if is_unified_kv_triton() or envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get():
         return "incompatible graph/KV backend"
     if get_global_expert_distribution_recorder().recording:
@@ -139,7 +141,6 @@ def _skip_reason(tail: DecoderReplayTail, model_runner: ModelRunner) -> str | No
             cp is None
             or cp.kind != ContextParallelStrategyKind.INTERLEAVE
             or p.attn_tp_size != 1
-            or _TAIL_WINDOW % p.attn_cp_size
             or not (
                 get_moe_a2a_backend().is_megamoe() or get_moe_a2a_backend().is_none()
             )
@@ -158,13 +159,18 @@ def capture_decoder_tail_graphs(
     prefill_runner=None,
 ) -> tuple[float, float]:
     """Run a full eager chunk, then capture all reachable buckets largest first."""
-    if tail._startup_prepared:
+    # Non-CP paths use the shared prefill startup prime and synchronized
+    # capture gate; their eager-prefill capture behavior is unchanged.
+    if get_parallel().attn_cp_size == 1 or tail._startup_prepared:
         return 0.0, 0.0
     reason = _skip_reason(tail, model_runner)
     if reason is not None:
-        logger.info(
-            "Decoder tail graph startup skipped: %s; runtime capture disabled", reason
+        log = (
+            logger.info
+            if reason in ("row graphs disabled", "draft worker", "decode worker")
+            else logger.warning
         )
+        log("Decoder CP tail graph startup skipped: %s; using eager", reason)
         return 0.0, 0.0
     assert not get_flags().dp.capturing_prefill_graph
     assert not capture_mode.is_capture_mode
@@ -176,20 +182,25 @@ def capture_decoder_tail_graphs(
         model_runner.max_running_requests,
         model_runner.req_to_token_pool.available_size(),
     )
-    rows = min(rows, request_limit * _TAIL_WINDOW // cp_size)
+    rows = min(rows, (request_limit * SWA_WINDOW + cp_size - 1) // cp_size)
     rows -= rows % tail.runner.row_step
     if rows == 0:
         raise RuntimeError("Decoder tail startup: no reachable row buckets")
     configured_chunk = get_schedule().chunked_prefill_size
-    chunk = configured_chunk if configured_chunk and configured_chunk > 0 else 8192
+    chunk = (
+        configured_chunk
+        if configured_chunk and configured_chunk > 0
+        else get_schedule().max_prefill_tokens
+    )
     chunk = min(chunk, model_runner.model_config.context_len)
-    if chunk < _TAIL_WINDOW:
+    if chunk < SWA_WINDOW:
         raise RuntimeError("Decoder tail startup requires at least one SWA window")
     # Replay a supported outer BCG shape during startup as well. Its fused
     # boundary can present a different HcState than the eager prefix.
     bcg_runner = (
         prefill_runner
-        if getattr(prefill_runner, "prefill_backend_name", None) == Backend.BREAKABLE
+        if isinstance(prefill_runner, PrefillCudaGraphRunner)
+        and prefill_runner.prefill_backend_name == Backend.BREAKABLE
         else None
     )
     capture_tokens = (
@@ -197,27 +208,23 @@ def capture_decoder_tail_graphs(
         if bcg_runner is not None
         else chunk
     )
-    rows = min(rows, capture_tokens // _TAIL_WINDOW * _TAIL_WINDOW // cp_size)
+    rows = min(rows, (capture_tokens + cp_size - 1) // cp_size)
     rows -= rows % tail.runner.row_step
     if rows == 0:
         raise RuntimeError("Decoder tail startup: no buckets fit the prefill shape")
 
     def lengths_for(bucket):
-        requests = bucket * cp_size // _TAIL_WINDOW
-        length, remainder = divmod(capture_tokens, requests)
-        return [length + (rank < remainder) for rank in range(requests)]
+        # A short final request fills non-dividing CP buckets without inventing
+        # extra full windows. The first full-window request absorbs the prefix.
+        tail_tokens = min(bucket * cp_size, request_limit * SWA_WINDOW, capture_tokens)
+        requests = (tail_tokens + SWA_WINDOW - 1) // SWA_WINDOW
+        lengths = [SWA_WINDOW] * (requests - 1)
+        lengths.append(tail_tokens - (requests - 1) * SWA_WINDOW)
+        lengths[0] += capture_tokens - tail_tokens
+        return lengths
 
     device_module = torch.get_device_module(model_runner.device)
     backend = model_runner.attn_backend
-    saved = {
-        name: getattr(backend, name)
-        for name in (
-            "forward_metadata",
-            "tail_forward_metadata",
-            "prefill_graph_replay_batch",
-        )
-        if hasattr(backend, name)
-    }
     start = time.perf_counter()
     device_module.synchronize()
     free_before = device_module.mem_get_info()[0]
@@ -235,6 +242,7 @@ def capture_decoder_tail_graphs(
     try:
         with (
             torch.no_grad(),
+            backend.preserve_tail_graph_state(),
             forward_context(ForwardContext(attn_backend=backend)),
         ):
             tail._startup_warming = True
@@ -278,9 +286,7 @@ def capture_decoder_tail_graphs(
                                 bcg_runner.execute(batch)
                                 if tail._last_run_replayed:
                                     bcg_buckets += 1
-                                elif getattr(
-                                    bcg_runner, "enable_cp_bcg_capture", False
-                                ):
+                                elif bcg_runner.enable_cp_bcg_capture:
                                     raise RuntimeError(
                                         f"CP BCG startup did not replay tail bucket {bucket}"
                                     )
@@ -293,8 +299,6 @@ def capture_decoder_tail_graphs(
     finally:
         tail._startup_capture = False
         tail._startup_warming = False
-        for name, value in saved.items():
-            setattr(backend, name, value)
     device_module.synchronize()
     used_gb = (free_before - device_module.mem_get_info()[0]) / 2**30
     seconds = time.perf_counter() - start

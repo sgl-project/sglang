@@ -11,9 +11,10 @@ rank's rows from the pre-forward exchange.
 Interleave CP prefills keep the prefix in BCG and execute the exact CP tail
 at one eager break. A fixed full-shard bridge preserves the outer graph
 and DSpark output coordinates. Eligible CP tails replay row-bucket graphs;
-capture warmup and unsupported layouts keep the eager fallback. Tail graphs
-are warmed and captured at worker startup; serving never captures a missing
-bucket or variant.
+capture warmup and unsupported layouts keep the eager fallback. CP tail graphs
+are warmed and captured at worker startup; CP serving never captures a missing
+bucket or variant. Non-CP BCG uses the shared startup prime and captures a
+missing graph only when every participating DP rank reaches its break.
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     attn_cp_interleave_gather,
@@ -203,7 +206,7 @@ class DecoderReplayTail:
         # Keep the CP BCG bridge when dedicated tail graphs are not requested.
         max_rows = (
             envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
-            if get_exec().graph.enable_decoder_tail_cuda_graph
+            if get_exec().graph.enable_decoder_tail_cuda_graph is not False
             else 0
         )
         row_graphs = max_rows > 0 and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
@@ -214,8 +217,6 @@ class DecoderReplayTail:
             and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
         ):
             return None
-        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
-
         # The budget is in global tail rows; CP owns a fraction on each rank.
         cp_size = get_parallel().attn_cp_size
         row_step = max(1, (SWA_WINDOW + cp_size - 1) // cp_size)
@@ -281,10 +282,6 @@ class DecoderReplayTail:
     ) -> Tuple[bool, Optional[List[int]]]:
         """Whether this step uses a tail graph and, under DP attention, every rank's
         tail rows; also feeds the warm gate."""
-        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
-            is_unified_kv_triton,
-        )
-
         dp = get_parallel().attn_dp_size > 1
         if not (tail is not None or (dp and forward_batch.is_extend_in_batch)):
             return False, None
@@ -381,10 +378,6 @@ class DecoderReplayTail:
     def breaks_out_of_prefill_graph(
         self, tail: LateLayerTail, *, num_tokens: int
     ) -> bool:
-        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
-            is_unified_kv_triton,
-        )
-
         return (
             num_tokens >= envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS.get()
             and tail.cp_metadata is None
@@ -404,6 +397,7 @@ class DecoderReplayTail:
         capture_dspark: bool,
         dp_rows: Optional[List[int]] = None,
         out_rows: Optional[int] = None,
+        may_capture: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
         """Returns views of graph buffers valid until the next replay, cut to
         ``out_rows`` rows. Under DP every rank replays the bucket of the largest
@@ -466,7 +460,10 @@ class DecoderReplayTail:
             else None
         )
         self._last_run_replayed = False
-        if not self._startup_capture and not self.runner.can_replay(
+        # CP is prepared completely at startup. Non-CP keeps the established
+        # eager capture path; BCG breaks additionally require every DP rank.
+        allow_capture = self._startup_capture or (not cp_tail and may_capture)
+        if not allow_capture and not self.runner.can_replay(
             key=key,
             live=live,
             forward_batch=forward_batch,
@@ -551,7 +548,7 @@ class DecoderReplayTail:
             finally:
                 exit_late_layer_dp(batch, saved)
 
-        residual, pre, *aux = self.runner.run(
+        outputs = self.runner.run(
             key=key,
             live=live,
             forward_batch=forward_batch,
@@ -564,9 +561,11 @@ class DecoderReplayTail:
             # mHC tail inputs contain the whole attention-DP sequence before
             # any MoE transport, including when attention TP shards its inputs.
             global_num_rows=global_num_rows,
-            allow_capture=self._startup_capture,
-            capture_all_buckets=False,
+            allow_capture=allow_capture,
+            capture_all_buckets=not self._startup_capture,
         )
+        assert outputs is not None
+        residual, pre, *aux = outputs
         self._last_run_replayed = True
         replay_batch.tail_cuda_graph_replayed = True
         return residual, pre, aux
@@ -917,7 +916,7 @@ def _tail_layers_in_prefill_graph(
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
 ) -> None:
-    # The tail captures its row-bucket graphs on first use.
+    # Tail captures require every participating DP rank to reach this break.
     note_rank_barrier_in_prefill_graph()
     backend = get_attn_backend()
     graph_batch = get_tc_piecewise_forward_context().forward_batch
@@ -974,7 +973,9 @@ def _tail_layers_in_prefill_graph(
             and runner.bucket_rows(max(dp_rows) if dp else num_rows) is not None
         )
         if use_tail_graph:
-            residual, pre, aux = tail_layers.run(**kwargs)
+            residual, pre, aux = tail_layers.run(
+                **kwargs, may_capture=get_flags().dp.every_rank_reaches_rank_barrier
+            )
         else:
             residual, pre, aux = tail_layers._run_layers_eagerly(**kwargs)
         graph_batch.tail_cuda_graph_replayed = (

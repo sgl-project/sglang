@@ -43,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_interfaces import (
     CPBoundedTailLogits,
     CPLogitsInputs,
+    CPOutputPostprocessing,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -328,14 +329,13 @@ def execute_prefill_cp_bcg(
 
         # Model-owned CP output layouts (DSV4 bounded replay / DSpark) must be
         # gathered before the generic full-row trimming and logits adapter.
-        postprocess_cp_output = getattr(model, "postprocess_cp_output", None)
-        if postprocess_cp_output is not None:
+        if isinstance(model, CPOutputPostprocessing):
             # load_batch prepares CP geometry on the static graph batch only.
             # Logits still need the live request lengths and token IDs. A view
             # keeps the caller's raw batch unchanged, including on failures.
             postprocess_batch = copy.copy(forward_batch)
             postprocess_batch.attn_cp_metadata = static_forward_batch.attn_cp_metadata
-            return postprocess_cp_output(local_output, postprocess_batch)
+            return model.postprocess_cp_output(local_output, postprocess_batch)
 
         local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)

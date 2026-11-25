@@ -103,7 +103,9 @@ class RowBucketGraphRunner:
         """
         if not self._warm:
             chunk = get_schedule().chunked_prefill_size
-            self._warm = num_tokens >= (chunk if chunk and chunk > 0 else 8192)
+            self._warm = num_tokens >= (
+                chunk if chunk and chunk > 0 else get_schedule().max_prefill_tokens
+            )
         return self._warm
 
     @property
@@ -130,7 +132,7 @@ class RowBucketGraphRunner:
         local_num_rows: int | None = None,
         allow_capture: bool = True,
         capture_all_buckets: bool = True,
-    ) -> List[Optional[torch.Tensor]]:
+    ) -> Optional[List[Optional[torch.Tensor]]]:
         """Run ``body`` on the ``live`` rows from their bucket's graph, capturing
         it on first use. ``key`` names what besides row count and input shapes
         changes the recording; ``context`` and ``batch_scope`` wrap capture and
@@ -140,7 +142,7 @@ class RowBucketGraphRunner:
         device count and localizes the LOCAL count for the bucket's TP shards.
         local_num_rows bounds valid local rows when live includes CP collective
         padding; eager breaks still receive every physical live row.
-        allow_capture=False requires the exact graph before touching static inputs.
+        allow_capture=False returns None on a miss without touching static inputs.
         capture_all_buckets=False records only this bucket, using its own metadata.
         """
         if not allow_capture and not self.can_replay(
@@ -150,7 +152,7 @@ class RowBucketGraphRunner:
             bucket_from=bucket_from,
             global_num_rows=global_num_rows,
         ):
-            raise RuntimeError(f"{self.label}: graph was not captured during startup")
+            return None
         num_rows = live[0].shape[0]
         out_rows = num_rows if out_rows is None else out_rows
         if local_num_rows is not None:

@@ -4846,6 +4846,12 @@ class DeepseekV4ForCausalLM(
 ):
     supports_cuda_vmm_feature_transport = True
 
+    def capture_decoder_tail_graphs(self, model_runner, eager_runner, prefill_runner):
+        tail = self.model.decoder_replay_tail
+        if tail is None:
+            return 0.0, 0.0
+        return tail.capture_at_startup(model_runner, eager_runner, prefill_runner)
+
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
         # The loader hands this mapper to every quant config; other formats were

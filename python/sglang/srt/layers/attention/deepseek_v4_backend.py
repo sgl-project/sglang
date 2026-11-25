@@ -3,7 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -1341,6 +1341,22 @@ class DeepseekV4AttnBackend(
                 return SharedReadEnds.IN_REPLAY
             return SharedReadEnds.POST_REPLAY
         return super().shared_read_ends(fm)
+
+    @contextmanager
+    def preserve_tail_graph_state(self):
+        saved = (
+            self.forward_metadata,
+            self.tail_forward_metadata,
+            self.prefill_graph_replay_batch,
+        )
+        try:
+            yield
+        finally:
+            (
+                self.forward_metadata,
+                self.tail_forward_metadata,
+                self.prefill_graph_replay_batch,
+            ) = saved
 
     def __init__(
         self,

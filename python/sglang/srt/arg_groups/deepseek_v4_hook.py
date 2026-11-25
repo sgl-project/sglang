@@ -472,6 +472,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         return
 
     if cfg.enable_decoder_swa_bounded_replay is False:
+        if cfg.enable_decoder_tail_cuda_graph is True:
+            raise ValueError(
+                "--enable-decoder-tail-cuda-graph requires decoder SWA bounded replay"
+            )
         return
 
     enabled = (
@@ -483,6 +487,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         and not cfg.enable_return_hidden_states
         and not any(enabled for _, enabled in incompatible)
     )
+    if cfg.enable_decoder_tail_cuda_graph is True and not enabled:
+        raise ValueError(
+            "--enable-decoder-tail-cuda-graph requires decoder SWA bounded replay"
+        )
     declare_resolution(
         server_args,
         "validate_deepseek_v41_features",

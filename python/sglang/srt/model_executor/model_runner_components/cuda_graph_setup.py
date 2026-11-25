@@ -35,6 +35,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_interfaces import DecoderTailGraphCapture
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
@@ -465,12 +466,12 @@ def capture_cuda_graphs(
     # after the ordinary runners, before hooks and init-finished publication.
     # DSpark drafts need not expose a target model body. Keep this optional
     # target-only step out of draft/deferred setup and standalone models.
-    tail = None
-    if not model_runner.is_draft_worker and not defer_distributed_setup:
-        language_model = getattr(model_runner.model, "model", None)
-        tail = getattr(language_model, "decoder_replay_tail", None)
-    if tail is not None:
-        memory_gb, seconds = tail.capture_at_startup(
+    if (
+        not model_runner.is_draft_worker
+        and not defer_distributed_setup
+        and isinstance(model_runner.model, DecoderTailGraphCapture)
+    ):
+        memory_gb, seconds = model_runner.model.capture_decoder_tail_graphs(
             model_runner, eager_runner, prefill.runner
         )
         prefill = GraphCapture(

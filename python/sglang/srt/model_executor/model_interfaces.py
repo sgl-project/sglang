@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Protocol, Tuple, Union, runtime_checkable
 
 if TYPE_CHECKING:
     import torch
@@ -58,3 +58,20 @@ class CPBoundedTailLogits(ABC):
     ) -> CPLogitsInputs:
         """Return model-owned logits inputs and the optional output row mapping."""
         raise NotImplementedError
+
+
+@runtime_checkable
+class ModelForwardPreparation(Protocol):
+    def prepare_for_forward(self, forward_batch: ForwardBatch) -> None: ...
+
+
+@runtime_checkable
+class CPOutputPostprocessing(Protocol):
+    def postprocess_cp_output(self, output, forward_batch: ForwardBatch): ...
+
+
+@runtime_checkable
+class DecoderTailGraphCapture(Protocol):
+    def capture_decoder_tail_graphs(
+        self, model_runner, eager_runner, prefill_runner
+    ) -> tuple[float, float]: ...

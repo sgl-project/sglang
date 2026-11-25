@@ -288,6 +288,8 @@ class TestDecoderTailMoeBound(CustomTestCase):
                     for step, (physical, logical) in enumerate(
                         ((6, 5), (3, 2), (3, 0), (6, 1), (3, 3), (6, 6))
                     ):
+                        # Prime both buckets at startup; later steps only replay.
+                        tail._startup_capture = step < 2
                         counts = [physical] * 4
                         counts[rank] = logical
                         cp_count = torch.tensor(99, device="cuda", dtype=torch.int32)
@@ -397,6 +399,8 @@ class TestDecoderTailMoeBound(CustomTestCase):
                 patch.object(tail.runner, "_record", side_effect=record),
             ):
                 for step, physical in enumerate((6, 3, 6, 3)):
+                    # The two startup buckets must suffice for all serving steps.
+                    tail._startup_capture = step < 2
                     cp = InterleaveContextParallelMetadata(
                         per_rank_actual_token=[physical] * 4,
                         per_rank_logical_token=[physical] * 4,
