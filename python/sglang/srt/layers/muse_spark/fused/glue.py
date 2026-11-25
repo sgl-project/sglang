@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention import muse_spark_extend_sm90 as extend_sm90
 from sglang.kernels.ops.attention import muse_spark_verify_sm90 as verify_sm90
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.layernorm_sp import all_gather_token_rows, sp_reduce_scatter
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     get_breakable_capture_recorder,
@@ -60,12 +61,6 @@ def _row_split_group(x: torch.Tensor):
     return None if get_forward().sp_active or group.world_size <= 1 else group
 
 
-def _gather_rows(group, local: torch.Tensor, num_tokens: int) -> torch.Tensor:
-    out = local.new_empty((local.shape[0] * group.world_size, local.shape[1]))
-    group.all_gather_into_tensor(out, local)
-    return out[:num_tokens]
-
-
 def row_split(group, x: torch.Tensor, fn) -> torch.Tensor:
     """``fn`` over this rank's block of ``x``'s rows, all-gathered back into ``x``'s rows."""
     t = x.shape[0]
@@ -75,7 +70,7 @@ def row_split(group, x: torch.Tensor, fn) -> torch.Tensor:
         local = torch.cat(
             [local, local.new_zeros((rows - local.shape[0], local.shape[1]))]
         )
-    return _gather_rows(group, local, t)
+    return all_gather_token_rows(local, total_rows=t, group=group)
 
 
 def sliced_prefill_projection(
@@ -98,13 +93,12 @@ def reduce_scatter_projection(
     group = _row_split_group(partial)
     if group is None:
         return None
-    from sglang.srt.layers.layernorm_sp import sp_reduce_scatter
     from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
 
-    return _gather_rows(
-        group,
+    return all_gather_token_rows(
         bf16_gemm_dispatch(sp_reduce_scatter(partial), weight, None),
-        partial.shape[0],
+        total_rows=partial.shape[0],
+        group=group,
     )
 
 
