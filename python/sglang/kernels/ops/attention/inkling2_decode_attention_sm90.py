@@ -1,9 +1,10 @@
 """Paged decode attention with a compact relative bias for Hopper: the split-KV
 partials of paged_rel_bias_decode (unnormalized o, max, sum), reduced by
 combine_gate_sink, for one query per sequence or a causal block of queries per
-sequence (MTP verify). Each split takes an equal share of the sequence's own keys;
-on a global layer's verify of up to 64 padded rows, an equal share of their cost, where
-the keys at least the bias extent behind every query run as larger unmasked tiles."""
+sequence (MTP verify). Each split takes an equal share of the sequence's own keys; on
+a global layer's verify of a block that pads to 64 rows, the keys at least the bias
+extent behind every query row run as larger unmasked tiles, and a split takes an equal
+share of the tiles."""
 
 import torch
 import triton
@@ -93,8 +94,6 @@ def _decode_partials(
     WINDOW: tl.constexpr,
     BLOCK_N: tl.constexpr,
     INTERIOR: tl.constexpr,
-    INTERIOR_COST: tl.constexpr,
-    MASKED_COST: tl.constexpr,
 ):
     tl.extra.cuda.gdc_wait()
     tl.extra.cuda.gdc_launch_dependents()
@@ -114,22 +113,21 @@ def _decode_partials(
     else:
         # No window: keys [0, inner) are at least EXTENT behind every query row and
         # run as INTERIOR-key tiles, the rest as BLOCK_N-key masked tiles. A split
-        # takes an equal share of the cost, a tile costing INTERIOR_COST or
-        # MASKED_COST; it runs the tiles whose cost starts inside its share.
+        # takes an equal share of the tiles of both kinds, interior ones first, so a
+        # sequence with no interior tile is split as main splits it.
         tl.static_assert(WINDOW < 0)
         tl.static_assert(INTERIOR % BLOCK_N == 0)
         inner = tl.maximum(seqlen - QLEN - EXTENT + 1, 0)
         big = inner // INTERIOR
         small_lo = big * (INTERIOR // BLOCK_N)
-        cost = big * INTERIOR_COST
-        total = cost + (tl.cdiv(seqlen, BLOCK_N) - small_lo) * MASKED_COST
-        per_split = tl.cdiv(total, splits)
-        lo = tl.minimum(split * per_split, total)
-        hi = tl.minimum(lo + per_split, total)
-        big_lo = tl.minimum(tl.cdiv(lo, INTERIOR_COST), big)
-        big_hi = tl.minimum(tl.cdiv(hi, INTERIOR_COST), big)
-        tile_lo = small_lo + tl.cdiv(tl.maximum(lo - cost, 0), MASKED_COST)
-        tile_hi = small_lo + tl.cdiv(tl.maximum(hi - cost, 0), MASKED_COST)
+        tiles = big + tl.cdiv(seqlen, BLOCK_N) - small_lo
+        per_split = tl.cdiv(tiles, splits)
+        lo = tl.minimum(split * per_split, tiles)
+        hi = tl.minimum(lo + per_split, tiles)
+        big_lo = tl.minimum(lo, big)
+        big_hi = tl.minimum(hi, big)
+        tile_lo = small_lo + tl.maximum(lo - big, 0)
+        tile_hi = small_lo + tl.maximum(hi - big, 0)
 
     rows = tl.arange(0, ROWS)
     head_mask = rows < QLEN * GROUP
@@ -146,12 +144,6 @@ def _decode_partials(
     l = tl.zeros((ROWS,), tl.float32)
     acc = tl.zeros((ROWS, D), tl.float32)
     cols = tl.arange(0, BLOCK_N)
-    if INTERIOR > 0:
-        for tile in range(big_lo, big_hi):
-            m, l, acc = _interior_tile(
-                q, m, l, acc, tile * INTERIOR, b, hk, d, scale, K, V, PageTable,
-                SK0, SK1, SK2, SP, PAGE, INTERIOR,
-            )  # fmt: skip
     # Keep inline rather than share a helper with _interior_tile:
     # a helper changes the sliding-window verify SASS (1.7% slower at qlen 5 on H200).
     for tile in range(tile_lo, tile_hi):
@@ -190,6 +182,14 @@ def _decode_partials(
         v = tl.load(V + kv_offset, valid[:, None], other=0)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m = m_new
+    if INTERIOR > 0:
+        # After the masked loop, so its first loads issue as early as main's (up to 7%
+        # slower on short keys before it); unpipelined, so shared memory stays main's.
+        for tile in tl.range(big_lo, big_hi, num_stages=1):
+            m, l, acc = _interior_tile(
+                q, m, l, acc, tile * INTERIOR, b, hk, d, scale, K, V, PageTable,
+                SK0, SK1, SK2, SP, PAGE, INTERIOR,
+            )  # fmt: skip
     stat = (split * batch * QLEN + token) * (HEADS_K * GROUP) + qh
     tl.store(MPartial + stat, m, head_mask)
     tl.store(LPartial + stat, l, head_mask)
@@ -227,14 +227,7 @@ def decode_partials(
     max_splits = max(1, min(2 * sms // max(1, batch * heads_k), MAX_SPLITS))
     block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32
     splits = min(triton.cdiv(span, block_n), max_splits)
-    interior, interior_cost, masked_cost = 0, 1, 1
-    num_stages = 2 if qlen == 1 else 3
-    # Tuned on blocks of up to 8 tokens x 6 heads, which pad to 64 rows;
-    # at 128 rows, interior tiles add spills and ran up to 13% slower at batch 1-4.
-    if qlen > 1 and window_size_left is None and qlen * group <= 64:
-        interior, interior_cost, masked_cost, num_stages = _global_verify_tiles(
-            batch * heads_k
-        )
+    interior = _interior_tile_keys(qlen, group, window_size_left)
     o = torch.empty(
         (splits, tokens, 1, heads_q, head_dim), dtype=torch.float32, device=q.device
     )
@@ -270,21 +263,21 @@ def decode_partials(
         -1 if window_size_left is None else window_size_left,
         block_n,
         interior,
-        interior_cost,
-        masked_cost,
         num_warps=4,
-        num_stages=num_stages,
+        num_stages=2 if qlen == 1 or interior else 3,
+        # main's register allocation: at 242 registers the chain ran 4% slower than main
+        # at 32 sequences of 64 keys on H200, though the kernel alone was not slower.
+        maxnreg=232 if interior else None,
         launch_pdl=True,
     )
     return o, m, l
 
 
-def _global_verify_tiles(units):
-    """(interior tile, its cost, masked tile cost, pipeline stages) for global-layer
-    verify, by sequences x KV heads. Measured on H200 with 2- to 8-token blocks, 2K
-    to 128K keys and the launcher's split counts; re-tune when the kernel changes."""
-    if units < 4:
-        return 128, 2, 1, 2
-    if units < 16:
-        return 64, 4, 3, 2
-    return 64, 3, 4, 3
+def _interior_tile_keys(qlen, group, window_size_left):
+    """Keys per unmasked interior tile of a global layer's verify, 0 for none.
+    Measured on H200 for blocks that pad to 64 rows (6 to 10 tokens x 6 heads); at
+    128 rows they spilled, and at 16 and 32 rows they ran up to 18% slower than main
+    on short keys."""
+    if qlen == 1 or window_size_left is not None or not 32 < qlen * group <= 64:
+        return 0
+    return 64

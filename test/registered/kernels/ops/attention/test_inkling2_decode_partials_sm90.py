@@ -116,7 +116,7 @@ def _check_partials(partials, inputs, window):
     "heads_q,heads_k,qlen,window,page",
     [
         (6, 1, 8, None, 128),  # verify on a global layer, TP8 rank
-        (12, 2, 5, None, 48),  # page size that is no multiple of any tile
+        (12, 2, 8, None, 48),  # page size that is no multiple of any tile
         (6, 1, 2, None, 128),  # short verify block, 16 rows
         (6, 1, 8, 1023, 128),  # verify on a sliding-window layer
         (12, 2, 1, None, 128),  # decode
@@ -134,16 +134,11 @@ def test_decode_partials_matches_reference(heads_q, heads_k, qlen, window, page)
 
 
 @hopper
-@pytest.mark.parametrize(
-    "interior,interior_cost,masked_cost,splits",
-    [(128, 2, 1, 1), (128, 3, 4, 7), (64, 8, 9, 64)],
-)
-def test_interior_split_partition(
-    monkeypatch, interior, interior_cost, masked_cost, splits
-):
-    """On global-layer verify, any split count and tile costs partition the
-    interior tiles and the masked tail into disjoint ranges that cover every key
-    once, including splits left without keys."""
+@pytest.mark.parametrize("splits", [1, 7, 64])
+def test_interior_split_partition(monkeypatch, splits):
+    """On global-layer verify, any split count partitions the interior tiles and
+    the masked tail into disjoint ranges that cover every key once, including
+    splits left without keys."""
     from sglang.kernels.ops.attention import inkling2_decode_attention_sm90 as attn
 
     # Enough SMs for any batch, so MAX_SPLITS alone sets the split count.
@@ -151,15 +146,30 @@ def test_interior_split_partition(
         attn, "current_arch", lambda: types.SimpleNamespace(num_sms=1 << 16)
     )
     monkeypatch.setattr(attn, "MAX_SPLITS", splits)
-    monkeypatch.setattr(
-        attn,
-        "_global_verify_tiles",
-        lambda units: (interior, interior_cost, masked_cost, 2),
-    )
     inputs = _attention_inputs(6, 1, 8, None, 128)
     partials = attn.decode_partials(*inputs, SCALE)
     assert partials[0].shape[0] == splits
     _check_partials(partials, inputs, None)
+
+
+@hopper
+def test_sequences_without_interior_tiles_keep_main_split(monkeypatch):
+    """In a batch that mixes sequences with and without interior tiles, the ones
+    without get the same splits and partials, bit for bit, as on the launch with
+    no interior path, so short contexts run main's work layout."""
+    from sglang.kernels.ops.attention import inkling2_decode_attention_sm90 as attn
+
+    inputs = _attention_inputs(6, 1, 8, None, 128)
+    seqused = inputs[4]
+    tile = attn._interior_tile_keys(8, 6, None)
+    has_interior = (seqused - 8 - EXTENT + 1) // tile > 0
+    assert has_interior.any() and not has_interior.all()
+    mixed = attn.decode_partials(*inputs, SCALE)
+    monkeypatch.setattr(attn, "_interior_tile_keys", lambda *args: 0)
+    plain = attn.decode_partials(*inputs, SCALE)
+    rows = (~has_interior).repeat_interleave(8)
+    for got, want in zip(mixed, plain):
+        assert torch.equal(got[:, rows], want[:, rows])
 
 
 if __name__ == "__main__":
