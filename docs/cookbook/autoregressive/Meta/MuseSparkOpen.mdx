@@ -454,6 +454,7 @@ DFlash V2 on MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.se
 - **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-mi355-1106`.
 - **Monokernels.** At low concurrency, add the monokernel flags below.
 - **HiCache.** At high concurrency, add the TP4 HiCache flags below instead. `--hicache-size` is the host tier in GB per rank, so 310 GB needs about 1.24 TB of host memory across the four ranks.
+- **SWA slot reuse.** The HiCache flags set `SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1`, which frees SWA KV slots that have left the sliding window, so the SWA pool no longer saturates above concurrency 40 and throughput keeps scaling to concurrency 58. They also set `HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0`, which avoids `HSA_STATUS_ERROR_OUT_OF_RESOURCES` on the TP4 ranks. The InferenceX points through concurrency 40 ran without these two variables; [InferenceX #5193](https://github.com/SemiAnalysisAI/InferenceX/pull/5193) adds the concurrency 58 point with them.
 
 ```bash Command
 SGLANG_USE_AITER=1 \
@@ -498,6 +499,8 @@ python -m sglang.launch_server \
 PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
+HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0 \
   --tp-size 4 \
   --ep-size 4 \
   --page-size 128 \
@@ -1184,3 +1187,22 @@ python -m sglang.launch_server \
 </Accordion>
 
 Pair this worker with a compatible prefill worker using the same target checkpoint, TP4, `--kv-cache-dtype fp8_e4m3`, `--page-size 128`, and `--served-model-name external`, with bootstrap port `8998`. Use the [Playground](#playground) PD router command with `--model-id external` and the decode URL pointing to this worker on port `30002`; send client requests to the router on port `8000`.
+
+### 3.7 Expert TP
+
+Expert TP (`--ep-size 1`) shards every expert across all TP ranks instead of assigning whole experts to each rank: each GPU holds all 256 experts and 1/TP of each expert's intermediate dimension, which avoids the expert-load imbalance of EP at low concurrency. With **DFlash V2 at concurrency 1**, TP8/EP1 is roughly **3% faster** than TP8/EP8 on 8×B300.
+
+<Accordion title="Expert TP server (8×B300)">
+
+```bash Command
+sglang serve \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --tp-size 8 \
+  --ep-size 1 \
+  --reasoning-parser muse \
+  --tool-call-parser muse \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2
+```
+
+</Accordion>

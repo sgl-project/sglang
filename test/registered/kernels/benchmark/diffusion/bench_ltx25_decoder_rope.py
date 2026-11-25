@@ -78,7 +78,7 @@ def eager_rope(
 
 
 @marker.parametrize("case_name", list(CASES), ci_vals=["stage5_tile"])
-@marker.benchmark("impl", ["eager", "jit"], unit="ms")
+@marker.benchmark("impl", ["eager", "jit"], unit="ms", gate=["jit"])
 def benchmark(case_name: str, impl: str) -> marker.BenchResult:
     case = CASES[case_name]
     generator = torch.Generator(device="cuda").manual_seed(42)
