@@ -12,6 +12,7 @@ from sglang.srt.entrypoints.warmup import (
     concurrent_prefill_limits,
     concurrent_prefill_plan,
 )
+from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,7 +42,11 @@ def _internal_state(**overrides):
         "max_queued_requests": None,
         "chunked_prefill_size": 16384,
         "page_size": 1,
-        "memory_usage": {"token_capacity": 1888043},
+        "memory_usage": {
+            "token_capacity": 1888043,
+            "token_capacity_swa": None,
+            "token_capacity_window": {},
+        },
         "speculative_algorithm": None,
         "mlx_enable_sampling": False,
         "disaggregation_mode": "null",
@@ -198,6 +203,35 @@ class TestConcurrentPrefillPlan(CustomTestCase):
         longest = max(max(r) for r in concurrent_prefill_plan(limits).rounds)
         charged = -(-longest // page) * page + page + 8
         self.assertLessEqual(charged, 32768)
+
+    def test_prompt_fits_the_window_pool_without_chunking(self):
+        """A 4,096-token sliding-window pool with chunked prefill off: the whole
+        prompt is charged to the window pool at once, and admission needs it
+        to fit below the pool (strictly), so a longer prompt waits forever."""
+        for window in (1024, 8192):
+            state = _internal_state(
+                chunked_prefill_size=-1,
+                memory_usage={
+                    "token_capacity": 1888043,
+                    "token_capacity_swa": 4096,
+                    "token_capacity_window": {"swa": 4096},
+                },
+            )
+            limits = concurrent_prefill_limits(
+                [state],
+                context_len=131072,
+                max_req_input_len=131066,
+                num_reserved_tokens=0,
+            )
+            plan = concurrent_prefill_plan(limits)
+            longest = max(max(r) for r in plan.rounds)
+            charged = estimate_swa_kv_tokens(
+                longest, 8, sliding_window_size=window, page_size=1
+            )
+            self.assertLess(charged, 4096, window)
+        # Chunked prefill shrinks the chunk to the window pool instead.
+        plan = concurrent_prefill_plan(_limits(window_pool_tokens=4096))
+        self.assertEqual(plan.rounds[0], [40001])
 
     def test_skips_logprob_probes_the_server_refuses(self):
         for overrides in (

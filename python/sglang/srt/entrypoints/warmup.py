@@ -200,6 +200,8 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
     num_reserved_tokens: int
     # Smallest full-attention KV pool over DP ranks, in tokens.
     kv_pool_tokens: int
+    # Smallest sliding-window pool over DP ranks, in tokens; None without one.
+    window_pool_tokens: Optional[int] = None
     page_size: int
     serves_input_logprobs: bool
 
@@ -240,6 +242,18 @@ def concurrent_prefill_limits(
         kv_pool_tokens=min(
             s["memory_usage"]["token_capacity"] for s in internal_states
         ),
+        window_pool_tokens=min(
+            (
+                tokens
+                for s in internal_states
+                for tokens in (
+                    s["memory_usage"]["token_capacity_swa"],
+                    *s["memory_usage"]["token_capacity_window"].values(),
+                )
+                if tokens is not None
+            ),
+            default=None,
+        ),
         page_size=state["page_size"] or 1,
         # UNO refuses logprob requests; the MLX sampling path refuses prompt logprobs.
         serves_input_logprobs=not (
@@ -259,15 +273,25 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     """
     page = limits.page_size
     new_tokens = _CONCURRENT_PREFILL_NEW_TOKENS
+    chunk = limits.chunked_prefill_size
+    chunked = chunk is not None and chunk > 0
+
+    def pool_bound(pool_tokens: int) -> int:
+        # Admission rounds the prompt up to whole pages and reserves one more page.
+        reserved = limits.num_reserved_tokens + new_tokens
+        return (pool_tokens - reserved) // page * page - 2 * page
+
     max_prompt = min(
         # The scheduler aborts a prompt of max_req_input_len tokens or more.
         limits.max_req_input_len - 1,
         # The tokenizer counts the reserved slots and the new tokens in the context.
         limits.context_len - limits.num_reserved_tokens - new_tokens - 1,
-        # Admission rounds the prompt up to whole pages and reserves one more page.
-        (limits.kv_pool_tokens - limits.num_reserved_tokens - new_tokens) // page * page
-        - 2 * page,
+        pool_bound(limits.kv_pool_tokens),
     )
+    if not chunked and limits.window_pool_tokens is not None:
+        # Admission shrinks a chunk to fit the sliding-window pool; without
+        # chunking the whole prompt must fit, or it waits forever.
+        max_prompt = min(max_prompt, pool_bound(limits.window_pool_tokens))
     slots = limits.max_running_requests
     if limits.max_queued_requests is not None:
         # A rank's share of a round can arrive in one scheduler poll, so the
@@ -276,9 +300,8 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     if max_prompt < 1 or slots < 1:
         return ConcurrentPrefillPlan(rounds=[], logprob_sizes=[])
 
-    chunk = limits.chunked_prefill_size
     budget = _CONCURRENT_PREFILL_TOKENS
-    if chunk is not None and chunk > 0:
+    if chunked:
         budget = max(budget, 2 * chunk)
     rounds = []
     for n in sorted({1, slots // 8 or 1, slots}):
