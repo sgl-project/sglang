@@ -49,7 +49,7 @@ class KVSizingInputs(msgspec.Struct, frozen=True, kw_only=True):
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     pre_alloc_rows: int = 0
-    extra_context_len: int = 0
+    req_to_token_headroom: int = 0
     alignment: int = 4096
 
 
@@ -99,7 +99,7 @@ def _request_estimate(plan, inp):
 def _fixed_terms(plan, inp, running, strategy):
     scratch_rows = running + 1
     request_rows = scratch_rows + inp.pre_alloc_rows
-    row_bytes = 4 * ((inp.context_len or 0) + inp.extra_context_len)
+    row_bytes = 4 * ((inp.context_len or 0) + inp.req_to_token_headroom)
     row_bytes += sum(
         4 + 8 * strategy.tracking_slots
         for s in plan.sub_pools
