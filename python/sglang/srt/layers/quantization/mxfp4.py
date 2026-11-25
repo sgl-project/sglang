@@ -787,6 +787,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 and layer.w2_weight_bias.shape[1] == self.hidden_size
             )
 
+            from sglang.srt.layers.moe import k3_deepgemm_routed, k3_die_local_moe
+
+            # SGLANG_K3_ROUTED_MOE_DEEPGEMM: one weight copy on die-local pages,
+            # shared by trtllm-gen and the MegaMoE kernel
+            die_local = k3_die_local_moe.wanted(
+                layer, self.with_bias, self.flashinfer_mxfp4_moe_precision
+            )
+            if die_local:
+                k3_deepgemm_routed.reserve_buffer(
+                    num_experts=E,
+                    top_k=layer.moe_runner_config.top_k,
+                    hidden=self.hidden_size,
+                    intermediate=self.intermediate_size_per_partition,
+                    device=layer.w13_weight.device,
+                    first_expert=layer.moe_ep_rank * E,
+                )
+
             w13_weight_scale = layer.w13_weight_scale.data
             w2_weight_scale = layer.w2_weight_scale.data
             w13_weight = layer.w13_weight.data
@@ -906,7 +923,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w2_bias[i].reshape(-1, 1)[w2_bias_permute_indices].contiguous()
                 )
 
-            w13_weight = torch.stack(gemm1_weights_mxfp4_shuffled)
+            stack_matrix = k3_die_local_moe.stack_final if die_local else torch.stack
+            w13_weight = stack_matrix(gemm1_weights_mxfp4_shuffled)
             w13_weight_scale = (
                 torch.stack(gemm1_scales_mxfp4_shuffled)
                 .reshape(
@@ -917,7 +935,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .view(torch.float8_e4m3fn)
             )
 
-            w2_weight = torch.stack(gemm2_weights_mxfp4_shuffled)
+            w2_weight = stack_matrix(gemm2_weights_mxfp4_shuffled)
             w2_weight_scale = (
                 torch.stack(gemm2_scales_mxfp4_shuffled)
                 .reshape(
@@ -932,14 +950,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight, requires_grad=False)
             layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
-            layer.w13_weight_bias = Parameter(
-                torch.stack(gemm1_bias_shuffled).reshape(E, -1),
-                requires_grad=False,
-            )
-            layer.w2_weight_bias = Parameter(
-                torch.stack(gemm2_bias_shuffled).reshape(E, -1),
-                requires_grad=False,
-            )
+            if die_local:
+                # These experts have no bias and both kernels are passed None:
+                # keep one-element stubs of the parameters' shape
+                for name in ("w13_weight_bias", "w2_weight_bias"):
+                    param = getattr(layer, name)
+                    param.data = torch.zeros(
+                        (), dtype=torch.float32, device=param.device
+                    ).expand(param.shape)
+            else:
+                layer.w13_weight_bias = Parameter(
+                    torch.stack(gemm1_bias_shuffled).reshape(E, -1),
+                    requires_grad=False,
+                )
+                layer.w2_weight_bias = Parameter(
+                    torch.stack(gemm2_bias_shuffled).reshape(E, -1),
+                    requires_grad=False,
+                )
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 cuda_mxfp4_decode_moe_supported,
                 reserve_trtllm_mxfp4_moe_workspace,
@@ -959,6 +986,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size=self.intermediate_size_per_partition,
                 precision=self.flashinfer_mxfp4_moe_precision,
             )
+            if die_local:
+                k3_die_local_moe.finish(layer, self.prefix)
             return
         if self.use_aiter_moe:
             if getattr(layer, "w13_weight_bias", None) is not None:
@@ -1591,6 +1620,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
             routing_bias=routing_bias,
             use_cuda_mxfp4_decode_moe=layer.use_cuda_mxfp4_decode_moe,
+            mega_l1_weights=getattr(layer, "mega_l1_weights", None),
+            mega_l2_weights=getattr(layer, "mega_l2_weights", None),
         )
         return self.runner.run(dispatch_output, quant_info)
 

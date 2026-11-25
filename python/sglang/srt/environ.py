@@ -2633,6 +2633,34 @@ class Envs:
     # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
     # gemm_ag_up_fits). Online weight updates are rejected while on.
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
+    # Die-local routed experts for DFlash target verify on a GPU with two
+    # locality domains (opt-in; Kimi K3.1 with 112 experts per EP rank on SM
+    # 10.7). Each EP rank keeps its routed-expert weights once, in the
+    # trtllm-gen layout, on pages homed on the die that reads them, and
+    # target-verify calls whose row count is in a per-width table run DeepGEMM's
+    # one-rank MegaMoE kernel on those weights; every other call runs
+    # trtllm-gen as before. Needs a DeepGEMM with the one-rank API; a layer,
+    # device or DeepGEMM that does not qualify keeps the default path and logs
+    # one warning. See srt/layers/moe/k3_die_local_moe.py.
+    SGLANG_K3_ROUTED_MOE_DEEPGEMM = EnvBool(False)
+    # A/B controls of the above. Placement: "die_local", or "default" for the
+    # same single weight copy in torch's allocator. Dispatch off: the weights
+    # are placed but every call runs trtllm-gen.
+    SGLANG_K3_ROUTED_MOE_DEEPGEMM_WEIGHT_PLACEMENT = EnvStr("die_local")
+    SGLANG_K3_ROUTED_MOE_DEEPGEMM_DISPATCH = EnvBool(True)
+    # JSON file that replaces the in-tree per-width table
+    # (srt/layers/moe/k3_die_local_moe_widths.json, same format). Empty: in-tree.
+    SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS = EnvStr("")
+    # With SGLANG_K3_AR_FUSION: where the shared experts' all-reduce goes around
+    # a call the MegaMoE kernel takes. "fused" reduces latent and shared in one
+    # pull behind the kernel; "after" / "before" / "overlap" are A/B controls
+    # ("overlap" is the order of a trtllm-gen call and regresses here). See
+    # k3_deepgemm_routed.shared_ar_order.
+    SGLANG_K3_ROUTED_MOE_DEEPGEMM_SHARED_AR_ORDER = EnvStr("fused")
+    # Block count and unroll (2, 4, 8 or 16) of that one pull; 0 keeps the
+    # pull kernel's tuned table. Must be the same on every rank.
+    SGLANG_K3_ROUTED_MOE_DEEPGEMM_FUSED_PULL_BLOCKS = EnvInt(0)
+    SGLANG_K3_ROUTED_MOE_DEEPGEMM_FUSED_PULL_UNROLL = EnvInt(0)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

@@ -330,9 +330,14 @@ def all_reduce_norm(
     eps: float = 1e-6,
     *,
     num_tokens: int,
+    num_blocks: Optional[int] = None,
+    unroll: Optional[int] = None,
 ) -> torch.Tensor:
     """In-place ``x = allreduce(x)`` with a fused RMSNorm over the first
-    ``num_tokens`` rows of the 2D ``[rows, NORM_DIM]`` input."""
+    ``num_tokens`` rows of the 2D ``[rows, NORM_DIM]`` input.
+
+    ``num_blocks`` / ``unroll`` override the pull's tuned table (they must be
+    the same on every rank); the push ignores them."""
     from sglang.kernels.ops.communication import all_reduce_residual as mod
 
     state = _get_state()
@@ -355,6 +360,8 @@ def all_reduce_norm(
         eps,
         num_norm_rows=num_tokens,
         input_mc_ptr=get_mc_ptr(x),
+        num_blocks=num_blocks,
+        unroll=unroll,
     )
 
 
@@ -432,10 +439,15 @@ def gemm_ag_up_proj(
     weight: torch.Tensor,
     b: torch.Tensor,
     c: Optional[torch.Tensor],
+    *,
+    b_stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
     """``up_proj(x) + b (+ c)`` with the up_proj sharded by output column over
     TP. ``weight`` is the FULL replicated up_proj. Caller checked
-    :func:`gemm_ag_up_fits`."""
+    :func:`gemm_ag_up_fits`.
+
+    ``b_stream``: ``b`` is still being produced on that stream; the kernel that
+    reads ``b`` waits for it (the local slice GEMM does not)."""
     from sglang.kernels.ops.communication import gemm_ag as mod
 
     state = _get_state()
@@ -444,7 +456,11 @@ def gemm_ag_up_proj(
         rows = weight.shape[0] // state.world_size
         rank = state.rank
         local = slice_gemm(x, weight[rank * rows : (rank + 1) * rows])
+        if b_stream is not None:
+            torch.cuda.current_stream().wait_stream(b_stream)
         return mod.gather_add3(state.world_size, local, b, c, torch.empty_like(b))
+    if b_stream is not None:
+        torch.cuda.current_stream().wait_stream(b_stream)
     return mod.gemm_ag_up_proj(
         state.world_size,
         x,

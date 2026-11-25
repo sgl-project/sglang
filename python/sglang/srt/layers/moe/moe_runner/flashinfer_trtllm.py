@@ -1416,6 +1416,10 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     routing_bias: Optional[torch.Tensor] = None
     # CUDA MXFP4 decode MoE kernels usable for this layer (cuda_mxfp4_decode_moe_supported)
     use_cuda_mxfp4_decode_moe: bool = False
+    # (weights, scales) views of the trtllm-gen tensors for DeepGEMM's one-rank
+    # MegaMoE kernel, set on layers k3_die_local_moe prepared
+    mega_l1_weights: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    mega_l2_weights: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
 
 def _cuda_mxfp4_decode_moe_mismatch(
@@ -1702,6 +1706,39 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 dtype=torch.bfloat16,
                 device=x_quant.device,
             )
+
+    if quant_info.mega_l1_weights is not None:
+        from sglang.srt.layers.moe import k3_die_local_moe
+
+        run_mega_moe = k3_die_local_moe.dispatch(num_tokens)
+    else:
+        run_mega_moe = False
+    if run_mega_moe:
+        # SGLANG_K3_ROUTED_MOE_DEEPGEMM: a target-verify width of the table
+        from sglang.srt.layers.moe import k3_deepgemm_routed, route_quant_handoff
+
+        assert is_standard and not _deferred_finalize_enabled.get(), (
+            "k3_deepgemm_routed: standard top-k and in-kernel finalize only"
+        )
+        routing = k3_deepgemm_routed.select_routing(
+            prepared_packed_topk,
+            (
+                route_quant_handoff.take_prepared_routing(prepared_packed_topk)
+                if prepared_packed_topk is not None
+                else None
+            ),
+            lambda: _get_routing_for_flashinfer_routed(topk_output),
+        )
+        k3_deepgemm_routed.run(
+            quant_info.mega_l1_weights,
+            quant_info.mega_l2_weights,
+            x_quant,
+            x_scale,
+            routing,
+            quant_info.local_expert_offset,
+            symm_output,
+        )
+        return StandardCombineInput(hidden_states=symm_output)
 
     if use_cuda_decode_moe:
         _run_cuda_mxfp4_decode_moe(
