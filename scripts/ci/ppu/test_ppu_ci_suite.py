@@ -215,6 +215,60 @@ class TestPPUCIWorkflow(CustomTestCase):
         )
         self.assertIn("${{ matrix.runner }}", upload["with"]["name"])
 
+    def test_sanity_prints_full_runtime_log_on_failure(self):
+        steps = self.jobs["ppu-sanity"]["steps"]
+        names = [step.get("name") for step in steps]
+        run_idx = names.index("Run the PPU model sanity suite in isolated Docker")
+        print_idx = names.index("Print full PPU runtime log on failure")
+        upload_idx = names.index("Upload runtime diagnostics")
+        self.assertLess(run_idx, print_idx)
+        self.assertLess(print_idx, upload_idx)
+
+        step = steps[print_idx]
+        self.assertEqual(step.get("if"), "failure()")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = Path(tmp) / "artifacts"
+            runtime_dir = artifacts / "runtime.abcd1234"
+            runtime_dir.mkdir(parents=True)
+            log_file = runtime_dir / "docker.log"
+            expected = "line 1\nTraceback (most recent call last):\nline 3\n"
+            log_file.write_text(expected)
+
+            result = subprocess.run(
+                ["bash", "-e", "-u", "-o", "pipefail", "-c", step["run"]],
+                env=dict(os.environ, PPU_CI_ARTIFACT_DIR=str(artifacts)),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(str(log_file), result.stdout)
+            self.assertIn(expected, result.stdout)
+
+            # Must also exit cleanly when no docker.log exists or the env var is unset.
+            for env_override in (
+                {"PPU_CI_ARTIFACT_DIR": str(Path(tmp) / "empty")},
+                {},
+            ):
+                env = {
+                    k: v for k, v in os.environ.items() if k != "PPU_CI_ARTIFACT_DIR"
+                }
+                env.update(env_override)
+                empty_result = subprocess.run(
+                    ["bash", "-e", "-u", "-o", "pipefail", "-c", step["run"]],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(
+                    empty_result.returncode,
+                    0,
+                    empty_result.stdout + empty_result.stderr,
+                )
+                self.assertIn("No PPU runtime docker.log found.", empty_result.stdout)
+
     def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
         finish = self.jobs["pr-test-ppu-finish"]["steps"][0]
         statuses = ("success", "failure", "cancelled", "skipped")

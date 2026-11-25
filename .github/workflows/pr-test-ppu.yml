@@ -228,6 +228,24 @@ jobs:
           done
           exec bash scripts/ci/ppu/run_test.sh
 
+      - name: Print full PPU runtime log on failure
+        if: failure()
+        run: |
+          shopt -s nullglob
+          artifact_dir="${PPU_CI_ARTIFACT_DIR:-}"
+          logs=()
+          if [[ -n "$artifact_dir" ]]; then
+            logs=("$artifact_dir"/runtime.*/docker.log)
+          fi
+          if ((${#logs[@]} == 0)); then
+            printf '%s\n' 'No PPU runtime docker.log found.'
+            exit 0
+          fi
+          for log in "${logs[@]}"; do
+            printf '===== %s =====\n' "$log"
+            cat "$log"
+          done
+
       - name: Upload runtime diagnostics
         if: always()
         uses: actions/upload-artifact@v4
