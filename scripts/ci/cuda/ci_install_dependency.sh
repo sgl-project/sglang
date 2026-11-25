@@ -21,6 +21,8 @@ set -x
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+# docker/ci.Dockerfile points this at a fixed path: a job container's HOME changes per job.
+CI_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}"
 
 # shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
 source "${SCRIPT_DIR}/../utils/git_clone_with_retry.sh"
@@ -266,15 +268,27 @@ install_apt_packages() {
 install_gdrcopy() {
     # DeepEP tests only run on 4+ GPU hosts. Keep GDRCopy in the shared CUDA
     # bootstrap while avoiding the libgdrapi package build on the 1- and 2-GPU jobs.
-    local gpu_count=0
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        gpu_count=$(
-            (nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true) |
-                awk 'NF {count++} END {print count + 0}'
-        )
+    # INSTALL_GDRCOPY overrides the GPU count either way, e.g. docker/ci.Dockerfile
+    # builds with no GPU visible.
+    local install=0
+    if [ "${INSTALL_GDRCOPY+set}" = set ]; then
+        case "$INSTALL_GDRCOPY" in 1 | true | yes) install=1 ;; esac
+        echo "INSTALL_GDRCOPY=${INSTALL_GDRCOPY} (manually set via environment)"
+    else
+        local gpu_count=0
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            gpu_count=$(
+                (nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true) |
+                    awk 'NF {count++} END {print count + 0}'
+            )
+        fi
+        echo "${gpu_count}-GPU runner"
+        if [ "${gpu_count}" -ge 4 ]; then
+            install=1
+        fi
     fi
-    if [ "${gpu_count}" -lt 4 ]; then
-        echo "Skipping GDRCopy install on ${gpu_count}-GPU runner"
+    if [ "${install}" != 1 ]; then
+        echo "Skipping GDRCopy install"
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
@@ -385,15 +399,15 @@ setup_cargo_cache() {
     # rust/target, so every job recompiles the whole dependency graph. Move the
     # target dir out of the tree: setuptools-rust has no target-dir option of its
     # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
-    # Runner containers built from different images share ${HOME}/.cache, and
+    # Runner containers built from different images share CI_CACHE_DIR, and
     # cargo reruns a cached build-script binary without rebuilding it when only
     # the libc changed, so each glibc gets its own tree.
-    local cargo_target_root="${HOME}/.cache/sglang-cargo-target"
+    local cargo_target_root="${CI_CACHE_DIR}/sglang-cargo-target"
     local libc_tag
     libc_tag="$(getconf GNU_LIBC_VERSION 2>/dev/null | tr ' ' '-')"
     export CARGO_TARGET_DIR="${cargo_target_root}/${libc_tag:-unknown-libc}"
-    local cargo_target_lock="${HOME}/.cache/sglang-cargo-target.lock"
-    mkdir -p "${HOME}/.cache"
+    local cargo_target_lock="${CI_CACHE_DIR}/sglang-cargo-target.lock"
+    mkdir -p "${CI_CACHE_DIR}"
     exec 9>"${cargo_target_lock}"
     echo "Waiting for exclusive cargo target lock: ${cargo_target_lock}"
     flock --exclusive 9
@@ -640,7 +654,7 @@ install_sglang() {
     echo "Installing python extras: [${EXTRAS}]"
     # editable checkout paths are identical across runner containers; keep
     # distribution locks separate while reusing each runner's warm cache
-    local editable_cache_dir="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+    local editable_cache_dir="${UV_CACHE_DIR:-${CI_CACHE_DIR}/uv}"
     if [ -n "${RUNNER_NAME:-}" ]; then
         editable_cache_dir="${editable_cache_dir}/runners/${RUNNER_NAME}"
     fi
@@ -772,6 +786,7 @@ download_flashinfer_cache() {
         CU_VERSION="$CU_VERSION" \
         PIP_CMD="$PIP_CMD" \
         PIP_INSTALL_SUFFIX="$PIP_INSTALL_SUFFIX" \
+        CI_CACHE_DIR="$CI_CACHE_DIR" \
         bash "${SCRIPT_DIR}/ci_download_flashinfer_jit_cache.sh"
 
     mark_step_done "${FUNCNAME[0]}"
@@ -785,10 +800,10 @@ stabilize_flashinfer_jit_paths() {
         return
     fi
 
-    STABLE_FI_DIR="${HOME}/.cache/flashinfer/_stable_src"
+    STABLE_FI_DIR="${CI_CACHE_DIR}/flashinfer/_stable_src"
 
     # Clear stale cached_ops (keep valid compiled kernels)
-    if [ -d "${HOME}/.cache/flashinfer" ]; then
+    if [ -d "${CI_CACHE_DIR}/flashinfer" ]; then
         STALE_COUNT=0
         while IFS= read -r ninja_file; do
             STALE_PATH=$(grep -o '/tmp/sglang-ci-[^ ]*\|flashinfer-src' "$ninja_file" 2>/dev/null | head -1 || true)
@@ -798,7 +813,7 @@ stabilize_flashinfer_jit_paths() {
                     STALE_COUNT=$((STALE_COUNT + 1))
                 fi
             fi
-        done < <(find "${HOME}/.cache/flashinfer" -name "build.ninja" -type f 2>/dev/null)
+        done < <(find "${CI_CACHE_DIR}/flashinfer" -name "build.ninja" -type f 2>/dev/null)
         echo "Cleaned $STALE_COUNT stale FlashInfer cached_ops (kept valid ones)"
     fi
 
@@ -893,11 +908,11 @@ install_msa() {
         echo "FATAL: no MSA_COMMIT default in docker/Dockerfile.cu134"
         exit 1
     fi
-    msa_dir="${HOME}/.cache/sglang-ci/minimax-msa/${msa_commit}"
-    # Runner containers share ${HOME}/.cache: without the lock, one job's rm -rf
+    msa_dir="${CI_CACHE_DIR}/sglang-ci/minimax-msa/${msa_commit}"
+    # Runner containers share CI_CACHE_DIR: without the lock, one job's rm -rf
     # deletes the tree another job is still cloning.
-    mkdir -p "${HOME}/.cache/sglang-ci"
-    exec 8>"${HOME}/.cache/sglang-ci/minimax-msa.lock"
+    mkdir -p "${CI_CACHE_DIR}/sglang-ci"
+    exec 8>"${CI_CACHE_DIR}/sglang-ci/minimax-msa.lock"
     flock --exclusive 8
     if [ ! -f "${msa_dir}/.complete" ]; then
         rm -rf "$msa_dir"
