@@ -5,6 +5,7 @@ members = [
     "sglang-api-types",
     "sglang-bench",
     "sglang-grpc",
+    "sglang-kv-events",
     "sglang-mm",
     "sglang-processor",
     "sglang-runtime-v1-types",

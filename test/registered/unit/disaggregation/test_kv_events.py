@@ -26,40 +26,56 @@ from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
     NullEventPublisher,
+    RustZmqEventPublisher,
     StorageMedium,
     ZmqEventPublisher,
     kv_event_namespace_seed,
     namespaced_block_hash,
     resolve_load_pub_range,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import describe_kv_events_publisher
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.network import get_free_port
+from sglang.srt.utils.network import get_free_port, get_free_port_below_ephemeral
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class TestLocalKvEventSource(CustomTestCase):
-    def _publisher(self, attn_dp_rank=0, **config):
+def create_zmq_publisher(test, *, backend="python", attn_dp_rank=0, **config):
+    with envs.SGLANG_KV_EVENT_PUBLISHER_BACKEND.override(backend):
         publisher = EventPublisherFactory.create(
             json.dumps({"publisher": "zmq", **config}), attn_dp_rank=attn_dp_rank
         )
-        atexit.unregister(publisher.shutdown)
-        self.addCleanup(publisher.shutdown)
-        return publisher
+    atexit.unregister(publisher.shutdown)
+    test.addCleanup(publisher.shutdown)
+    return publisher
 
+
+class TestLocalKvEventSource(CustomTestCase):
     def test_advertised_source_delivers_events(self):
-        for host, bind, topic in (("*", None, "kv"), ("127.0.0.1", True, "")):
-            with self.subTest(host=host):
-                with zmq.Context.instance().socket(zmq.PUB) as probe:
-                    port = probe.bind_to_random_port("tcp://127.0.0.1")
-                publisher = self._publisher(
+        cases = [
+            (backend, host, bind, topic)
+            for backend in ("python", "rust")
+            for host, bind, topic in (("*", None, "kv"), ("127.0.0.1", True, ""))
+        ]
+        for backend, host, bind, topic in cases:
+            with self.subTest(backend=backend, host=host):
+                # Below the ephemeral range: a subscriber's source port can take
+                # an ephemeral one between this probe and the publisher's bind.
+                port = get_free_port_below_ephemeral()
+                publisher = create_zmq_publisher(
+                    self,
+                    backend=backend,
                     attn_dp_rank=4,
                     endpoint=f"tcp://{host}:{port - 4}",
                     bind=bind,
                     topic=topic,
+                )
+                self.assertIsInstance(
+                    publisher,
+                    RustZmqEventPublisher if backend == "rust" else ZmqEventPublisher,
                 )
                 source = publisher.describe_local_source(64)
                 self.assertEqual(
@@ -89,6 +105,32 @@ class TestLocalKvEventSource(CustomTestCase):
                     break
             else:
                 self.fail("No event received from the advertised local source")
+
+
+class TestKvEventPublisherBackend(CustomTestCase):
+    def test_rust_backend_leaves_unsupported_endpoints_to_python(self):
+        """The Rust publisher only binds, has no inproc or abstract ipc transport
+        and does not resolve host names; selecting it there would turn a working
+        config into a startup failure or a bind on another address."""
+        for config in (
+            dict(endpoint="inproc://kv-fallback-test"),
+            dict(endpoint=f"ipc://@kv-fallback-{get_free_port()}"),
+            dict(endpoint=f"tcp://127.0.0.1:{get_free_port()}"),
+            dict(endpoint=f"tcp://localhost:{get_free_port()}", bind=True),
+            dict(
+                endpoint=f"tcp://*:{get_free_port()}",
+                replay_endpoint="inproc://kv-fallback-replay",
+            ),
+        ):
+            with self.subTest(config=config):
+                publisher = create_zmq_publisher(self, backend="rust", **config)
+                self.assertIsInstance(publisher, ZmqEventPublisher)
+
+    def test_unknown_backend_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_KV_EVENT_PUBLISHER_BACKEND"):
+            create_zmq_publisher(
+                self, backend="cpp", endpoint=f"tcp://*:{get_free_port()}"
+            )
 
 
 class TestNullPublisherConfig(CustomTestCase):
@@ -216,25 +258,36 @@ class TestReplay(CustomTestCase):
 
     def test_router_serves_buffered_batches_then_end_seq(self):
         # The router's DEALER client relies on this exact framing.
+        for backend in ("python", "rust"):
+            with self.subTest(backend=backend):
+                self._assert_replay_framing(backend)
+
+    def _assert_replay_framing(self, backend):
         replay = f"tcp://127.0.0.1:{get_free_port()}"
-        publisher = ZmqEventPublisher(
-            attn_dp_rank=0,
-            endpoint="inproc://kv-replay-test",
+        publisher = create_zmq_publisher(
+            self,
+            backend=backend,
+            endpoint=f"tcp://*:{get_free_port()}",
             replay_endpoint=replay,
             topic="kv@prefill@model",
         )
         dealer = zmq.Context.instance().socket(zmq.DEALER)
+        self.addCleanup(dealer.close, linger=0)
         dealer.setsockopt(zmq.RCVTIMEO, 5000)
         dealer.connect(replay)
-        try:
-            for _ in range(3):
-                publisher.publish(KVEventBatch(ts=1.0, events=[AllBlocksCleared()]))
-            publisher._event_queue.join()
+        for _ in range(3):
+            publisher.publish(KVEventBatch(ts=1.0, events=[AllBlocksCleared()]))
+        # Ask until batch 1 is buffered; a replay that comes too early holds only
+        # the end marker.
+        deadline = time.monotonic() + 5
+        while True:
             dealer.send_multipart([b"", (1).to_bytes(8, "big")])
-            frames = [dealer.recv_multipart() for _ in range(3)]
-        finally:
-            dealer.close(linger=0)
-            publisher.shutdown()
+            frames = [dealer.recv_multipart()]
+            while frames[-1][2] != ZmqEventPublisher.END_SEQ:
+                frames.append(dealer.recv_multipart())
+            if len(frames) == 3 or time.monotonic() > deadline:
+                break
+            time.sleep(0.01)
         self.assertEqual([len(f) for f in frames], [4, 4, 4])
         seqs = [int.from_bytes(f[2], "big", signed=True) for f in frames]
         self.assertEqual(seqs, [1, 2, -1])

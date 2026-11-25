@@ -622,7 +622,7 @@ require_prebuilt_rust_exts() {
     suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
     local missing=()
     local module
-    for module in server grpc multimodal; do
+    for module in server grpc multimodal kv_events; do
         [ -f "python/sglang/srt/rust_extensions/_${module}${suffix}" ] || missing+=("${module}")
     done
     [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache${suffix}" ] \
@@ -1007,7 +1007,7 @@ print(f"sglang resolves to {spec.origin}")
 # so a .so that cannot load passes find_spec and only fails inside some suite.
 import importlib
 if os.environ["SGLANG_CI_OPTIONAL_DEPS"] != "diffusion":
-    for mod in ("server", "grpc", "multimodal"):
+    for mod in ("server", "grpc", "multimodal", "kv_events"):
         name = f"sglang.srt.rust_extensions._{mod}"
         try:
             importlib.import_module(name)

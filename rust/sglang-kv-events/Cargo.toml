@@ -1,0 +1,39 @@
+[package]
+name = "sglang-kv-events"
+description = "Rust ZMQ publisher for SGLang's KV cache events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Consumed by python/setup.py: registers this crate as a PyO3 extension module
+# of the main sglang wheel at the given import path.
+[package.metadata.sglang]
+python-module = "sglang.srt.rust_extensions._kv_events"
+# Always build optimized, even for an editable install.
+debug = false
+features = ["python"]
+
+[lib]
+name = "sglang_kv_events"
+# cdylib: the PyO3 module. rlib: the publisher, for the crate's own tests.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The PyO3 bindings stay off by default so `cargo test --workspace` links no libpython.
+default = []
+python = ["dep:pyo3", "dep:tracing-subscriber"]
+
+[dependencies]
+bytes = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+# Pure Rust, so the extension needs no C toolchain or libzmq.
+zeromq = { version = "0.7", default-features = false, features = [
+    "tokio-runtime",
+    "tcp-transport",
+    "ipc-transport",
+] }
