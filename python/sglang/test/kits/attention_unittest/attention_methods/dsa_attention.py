@@ -623,6 +623,7 @@ def build_dsa_attention_fixture(
     dsa_prefill_backend: str = "flashmla_auto",
     dsa_decode_backend: str = "flashmla_kv",
     loc_layout: str = "shuffled_pages",
+    require_mha: bool = False,
 ) -> DSAAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -656,6 +657,8 @@ def build_dsa_attention_fixture(
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
+        if require_mha:
+            raise
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
 
     actual_module = ProjectedDSADenseFallbackAttention(
@@ -1063,6 +1066,7 @@ def run_dsa_attention_case(
         dtype=dtype,
         device=device,
         loc_layout=loc_layout,
+        require_mha=require_mha,
     )
     actual = run_dsa_fixture_eager(
         fixture,
