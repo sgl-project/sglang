@@ -2,19 +2,24 @@
 4xx from a real server, which keeps serving: a valid request to the same route
 succeeds after every case, and /health passes at the end.
 
-Type cases are derived from each route's request schema: every field gets each
-JSON kind its annotation rejects. Value cases are listed by hand: the right JSON
-kind with a value a validation rule rejects.
+Every case comes from the route's request schema, nested objects included: each
+field gets each JSON kind its annotation rejects (for a Literal, a value outside
+it), and a value just outside each numeric bound it declares. Rules that live
+only in code, such as sampling-parameter checks and batch normalization, are
+not covered here.
 """
 
+import collections
 import types
 import typing
 import unittest
 from typing import Callable, NamedTuple
 
+import annotated_types
 import msgspec
 import requests
-from pydantic import BaseModel
+from pydantic import AfterValidator, BaseModel, Strict
+from pydantic.fields import FieldInfo
 
 from sglang.api.v1 import api_types
 from sglang.srt.entrypoints.openai import protocol
@@ -28,14 +33,13 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-small")
 
 COMPLETIONS = "/v1/completions"
 CHAT = "/v1/chat/completions"
 GENERATE = "/generate"
 
 MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-_GENERATE_SAMPLING = {"max_new_tokens": 1, "temperature": 0}
 VALID_BODIES = {
     COMPLETIONS: {
         "model": MODEL,
@@ -51,16 +55,23 @@ VALID_BODIES = {
     },
     GENERATE: {
         "text": "The capital of France is",
-        "sampling_params": _GENERATE_SAMPLING,
+        "sampling_params": {"max_new_tokens": 1, "temperature": 0},
     },
+}
+
+REQUEST_MODELS = {
+    COMPLETIONS: protocol.CompletionRequest,
+    CHAT: protocol.ChatCompletionRequest,
+    GENERATE: api_types.GenerateRequest,
 }
 
 
 class Case(NamedTuple):
+    # JSON path from the request root; a nested object names its model, e.g.
+    # "messages[0]<ChatCompletionMessageUserParam>.role".
     field: str
     case_id: str
-    # Merged over the route's valid body.
-    overrides: dict
+    body: dict
 
 
 # One value per JSON kind that lax-mode coercion cannot make valid: no numeric
@@ -77,6 +88,12 @@ _MALFORMED = {
 }
 
 
+def _is_model(annotation) -> bool:
+    return isinstance(annotation, type) and issubclass(
+        annotation, (BaseModel, msgspec.Struct)
+    )
+
+
 def _accepted_kinds(annotation) -> set[str]:
     """JSON kinds that pydantic (lax mode) or msgspec may accept for this annotation."""
     origin = typing.get_origin(annotation)
@@ -85,18 +102,18 @@ def _accepted_kinds(annotation) -> set[str]:
     if origin is typing.Annotated:
         return _accepted_kinds(typing.get_args(annotation)[0])
     if origin is typing.Literal:
-        # A non-matching value of a literal's own type is still malformed.
-        return set()
+        # Only the malformed values that happen to be members; any other value,
+        # of the literal's own type included, is malformed.
+        members = typing.get_args(annotation)
+        return {kind for kind, value in _MALFORMED.items() if value in members}
     if annotation in (typing.Any, object):
-        # protocol.py falls back to Any for StructuralTag when xgrammar is missing.
+        # Any accepts every kind, so the field gets no type case.
         return set(_MALFORMED)
     if origin in (list, typing.List):
         return {"list"}
     if origin in (dict, typing.Dict) or annotation in (dict, typing.Dict):
         return {"object"}
-    if isinstance(annotation, type) and issubclass(
-        annotation, (BaseModel, msgspec.Struct)
-    ):
+    if _is_model(annotation):
         return {"object"}
     if annotation is type(None):
         return set()
@@ -113,496 +130,243 @@ def _accepted_kinds(annotation) -> set[str]:
     raise TypeError(f"no type-case rule for annotation {annotation!r}")
 
 
-def _wire_fields(model) -> list[tuple[str, typing.Any]]:
-    """(JSON key, annotation) for a pydantic model or a msgspec struct."""
+def _metadata(annotated) -> list:
+    """The metadata of an Annotated[...], with a FieldInfo's constraints unpacked."""
+    extras = typing.get_args(annotated)[1:]
+    return [
+        c
+        for extra in extras
+        for c in (extra.metadata if isinstance(extra, FieldInfo) else [extra])
+    ]
+
+
+def _annotated_constraints(annotation) -> list:
+    """Constraints an Annotated[...] inside the annotation declares, through unions."""
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin in (typing.Union, types.UnionType):
+        return [c for a in args for c in _annotated_constraints(a)]
+    if origin is typing.Annotated:
+        return _metadata(annotation) + _annotated_constraints(args[0])
+    if any(_declares_values(a) for a in args):
+        raise TypeError(f"no rule for a bound or Literal inside {annotation!r}")
+    return []
+
+
+def _declares_values(annotation) -> bool:
+    """Whether the annotation holds a Literal or a numeric bound at any depth."""
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin is typing.Literal:
+        return True
+    if origin is typing.Annotated and _bound_cases(_metadata(annotation)):
+        return True
+    return any(_declares_values(a) for a in args)
+
+
+def _bound_cases(constraints) -> list[tuple[str, object]]:
+    """(case id, value) just outside each numeric bound."""
+    cases = []
+    for c in constraints:
+        if isinstance(c, annotated_types.Ge):
+            cases.append(("below_ge", c.ge - 1))
+        elif isinstance(c, annotated_types.Gt):
+            cases.append(("at_gt", c.gt))
+        elif isinstance(c, annotated_types.Le):
+            cases.append(("above_le", c.le + 1))
+        elif isinstance(c, annotated_types.Lt):
+            cases.append(("at_lt", c.lt))
+        elif isinstance(c, (Strict, AfterValidator)):
+            # Both only reject more: Strict narrows the kinds lax mode accepts,
+            # and an after-validator runs once the type is valid.
+            continue
+        elif getattr(c, "__dict__", None) == {"allow_inf_nan": False}:
+            # JSON has no inf or nan.
+            continue
+        else:
+            raise TypeError(f"no constraint-case rule for {c!r}")
+    return cases
+
+
+class WireField(NamedTuple):
+    key: str
+    annotation: typing.Any
+    # pydantic Field(...) constraints; Annotated ones stay in the annotation.
+    constraints: list
+    required: bool
+
+
+def _wire_fields(model) -> list[WireField]:
+    """The fields of a pydantic model or a msgspec struct, by JSON key."""
     if issubclass(model, msgspec.Struct):
-        return [(f.encode_name, f.type) for f in msgspec.structs.fields(model)]
+        return [
+            WireField(f.encode_name, f.type, [], f.required)
+            for f in msgspec.structs.fields(model)
+        ]
     # The alias is the wire key, e.g. "schema" for JsonSchemaResponseFormat.schema_.
     return [
-        (info.alias or name, info.annotation)
+        WireField(
+            info.alias or name, info.annotation, info.metadata, info.is_required()
+        )
         for name, info in model.model_fields.items()
     ]
 
 
-def type_cases(model) -> list[Case]:
-    """One case per (field, JSON kind the field's annotation rejects)."""
-    return [
-        Case(field, f"type_{kind}", {field: value})
-        for field, annotation in _wire_fields(model)
+def _bad_values(field: WireField) -> list[tuple[str, object]]:
+    """(case id, value) for each value the field's schema rejects."""
+    type_cases = [
+        (f"type_{kind}", value)
         for kind, value in _MALFORMED.items()
-        if kind not in _accepted_kinds(annotation)
+        if kind not in _accepted_kinds(field.annotation)
     ]
+    constraints = field.constraints + _annotated_constraints(field.annotation)
+    return type_cases + _bound_cases(constraints)
 
 
-def nested_type_cases(
-    model,
-    *,
-    path: str,
-    valid: dict,
-    wrap: Callable[[dict], dict],
-    skip: tuple[str, ...] = (),
-) -> list[Case]:
-    """type_cases for a nested object: each case puts one malformed field into
-    `valid` (a valid instance of `model`), and `wrap` builds the request overrides."""
-    return [
-        Case(f"{path}.{case.field}", case.case_id, wrap({**valid, **case.overrides}))
-        for case in type_cases(model)
-        if case.field not in skip
-    ]
+def _valid_value(annotation):
+    """A minimal value the annotation accepts, for a required field."""
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin in (typing.Union, types.UnionType):
+        return _valid_value(next(a for a in args if a is not type(None)))
+    if origin is typing.Annotated:
+        return _valid_value(args[0])
+    if origin is typing.Literal:
+        return args[0]
+    if origin in (list, typing.List):
+        return []
+    if _is_model(annotation):
+        return _valid_instance(annotation)
+    if annotation is str:
+        return "x"
+    raise TypeError(f"no valid-value rule for annotation {annotation!r}")
 
 
-def _value(field, case_id, value, **extra) -> Case:
-    return Case(field, case_id, {field: value, **extra})
+def _valid_instance(model) -> dict:
+    """A valid instance of a nested model: its required fields, nothing else."""
+    return {
+        field.key: _valid_value(field.annotation)
+        for field in _wire_fields(model)
+        if field.required
+    }
 
 
-def _sampling(case_id, **params) -> Case:
-    """A /generate case on sampling_params; the first keyword is the field under
-    test, any others support it."""
-    field = next(iter(params))
-    return Case(
-        f"sampling_params.{field}",
-        case_id,
-        {"sampling_params": {**_GENERATE_SAMPLING, **params}},
-    )
+def _nested_models(annotation) -> list[tuple[str, Callable, type]]:
+    """(path step, embed, model) for each model the annotation holds; `embed`
+    turns an instance of the model into a value of the annotation."""
+    if isinstance(annotation, typing.ForwardRef):
+        raise TypeError(f"unresolved forward reference {annotation!r}")
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin in (typing.Union, types.UnionType):
+        return [nested for a in args for nested in _nested_models(a)]
+    if origin is typing.Annotated:
+        return _nested_models(args[0])
+    if origin in (list, typing.List):
+        return [
+            (f"[0]{step}", lambda instance, embed=embed: [embed(instance)], model)
+            for step, embed, model in _nested_models(args[0])
+        ]
+    if _is_model(annotation):
+        return [("", lambda instance: instance, annotation)]
+    if any(_nested_models(a) for a in args):
+        raise TypeError(f"no rule to place the model nested in {annotation!r}")
+    return []
 
 
-# Far past any test model's vocabulary and context length, so the cases hold for
-# every model.
-_HUGE = 10**9
+def _placer(place, valid, key, embed) -> Callable[[dict], dict]:
+    """Turns an instance of a model nested at `valid[key]` into a request body.
+    A function, so the caller's loop variables are bound now, not when it runs."""
+    return lambda instance: place({**valid, key: embed(instance)})
 
-# Value cases are grouped by the stage that rejects them.
-COMPLETIONS_VALUE_CASES = [
-    # OpenAIServingCompletion._validate_request
-    _value("prompt", "empty_str", ""),
-    _value("prompt", "empty_list", []),
-    _value("prompt", "empty_nested_list", [[]]),
-    _value("logprobs", "negative", -1),
-    _value("logprobs", "above_vocab", _HUGE),
-    # CompletionRequest field constraints
-    _value("n", "zero", 0),
-    _value("n", "above_max", 129),
-    _value("max_tokens", "zero", 0),
-    _value("max_tokens", "negative", -1),
-    _value("return_hidden_states", "unknown_literal", "first"),
-    _value("response_format", "unknown_type", {"type": "bogus"}),
-    _value("stream_options", "include_usage_not_bool", {"include_usage": "maybe"}),
-    # orjson reads an integer beyond 64 bits as a float, which an int field rejects.
-    _value("priority", "above_int64", 2**70),
-    # _convert_to_internal_request
-    _value("response_format", "json_schema_without_schema", {"type": "json_schema"}),
-    # GenerateReqInput.normalize_batch_and_arguments
-    _value("cache_salt", "list_for_single_prompt", ["a", "b"]),
-    _value("extra_key", "list_for_single_prompt", ["a", "b"]),
-    # SamplingParams.normalize / verify
-    _value("min_tokens", "negative", -1),
-    _value("min_tokens", "above_max_tokens", 100),
-    _value("temperature", "negative", -1.0),
-    _value("top_p", "zero", 0.0),
-    _value("top_p", "above_one", 1.5),
-    # temperature=0 forces greedy top_k=1, which would hide a bad top_k.
-    _value("top_k", "zero", 0, temperature=1.0),
-    _value("top_k", "below_minus_one", -2, temperature=1.0),
-    _value("min_p", "negative", -0.1),
-    _value("min_p", "above_one", 1.5),
-    _value("frequency_penalty", "above_two", 3.0),
-    _value("presence_penalty", "below_minus_two", -3.0),
-    _value("repetition_penalty", "zero", 0.0),
-    _value("repetition_penalty", "above_two", 3.0),
-    _value("seed", "above_int64", 2**63),
-    _value("logit_bias", "key_not_integer", {"abc": 1.0}),
-    _value("logit_bias", "key_out_of_vocab", {str(_HUGE): 1.0}),
-    _value("logit_bias", "value_above_max", {"1": 1e31}),
-    _value("watermark", "unknown_field", {"bogus": 1}),
-    _value("json_schema", "with_regex", "{}", regex="a"),
-    _value("stop_regex", "unbalanced_paren", "("),
-    # TokenizerManager.generate_request
-    _value("prompt", "token_id_negative", [-1]),
-    _value("prompt", "token_id_out_of_vocab", [_HUGE]),
-    _value("routed_dp_rank", "negative", -5),
-    _value("custom_logit_processor", "not_enabled", "x"),
-    _value("rid", "list_for_single_prompt", ["a", "b"]),
-    # No session_params cases: /v1/completions does not forward the field (#28140).
-]
 
-_USER = {"role": "user", "content": "Hello"}
-_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_weather",
-        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
-    },
+def schema_cases(request_model, valid_body) -> list[Case]:
+    """Each bad value of each field of `request_model` and of every model nested
+    in it, placed in an otherwise valid body. Breadth first, so a model nested
+    in several places is tried once, where it sits least deep."""
+    cases = []
+    seen = {request_model}
+    queue = collections.deque([(request_model, "", valid_body, lambda body: body)])
+    while queue:
+        model, path, valid, place = queue.popleft()
+        for field in _wire_fields(model):
+            if (model, field.key) in NOT_FUZZED:
+                continue
+            for case_id, value in _bad_values(field):
+                if (model, field.key, case_id) in NOT_FUZZED:
+                    continue
+                body = place({**valid, field.key: value})
+                cases.append(Case(path + field.key, case_id, body))
+            for step, embed, nested in _nested_models(field.annotation):
+                if nested in seen or (nested,) in NOT_FUZZED:
+                    continue
+                seen.add(nested)
+                queue.append(
+                    (
+                        nested,
+                        f"{path}{field.key}{step}<{nested.__name__}>.",
+                        _valid_instance(nested),
+                        _placer(place, valid, field.key, embed),
+                    )
+                )
+    return cases
+
+
+# What the scan leaves out, by (model,), (model, field), or (model, field,
+# case_id) -> the reason.
+NOT_FUZZED: dict[tuple, str] = {
+    (protocol.StructuralTag,): (
+        "xgrammar's format tree, not SGLang's schema: it changes with the xgrammar "
+        "version, and OrFormat.elements is an unresolved forward reference"
+    ),
+    (protocol.Function, "key_order"): (
+        "internal: a before-validator overwrites it from the keys sent"
+    ),
+    (protocol.ChatCompletionMessageContentImagePart, "image_url", "type_str"): (
+        "a before-validator accepts a bare URL string"
+    ),
 }
-_TOOL_CALL = {
-    "id": "call_0",
-    "type": "function",
-    "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'},
-}
-_ASSISTANT = {"role": "assistant", "content": "Hi", "tool_calls": [_TOOL_CALL]}
-_NAMED_TOOL_CHOICE = {"type": "function", "function": {"name": "get_weather"}}
 
-
-def _with_tool_call(**fields) -> dict:
-    return {"messages": [_USER, {**_ASSISTANT, "tool_calls": [fields]}]}
-
-
-# type_cases for the objects nested in messages, tools and tool_choice.
-CHAT_NESTED_TYPE_CASES = [
-    *nested_type_cases(
-        protocol.ChatCompletionMessageUserParam,
-        path="messages[0]",
-        valid=_USER,
-        wrap=lambda message: {"messages": [message]},
-    ),
-    *nested_type_cases(
-        protocol.ChatCompletionMessageContentTextPart,
-        path="messages[0].content[0]",
-        valid={"type": "text", "text": "Hello"},
-        wrap=lambda part: {"messages": [{"role": "user", "content": [part]}]},
-    ),
-    *nested_type_cases(
-        protocol.ChatCompletionMessageGenericParam,
-        path="messages[1]",
-        valid=_ASSISTANT,
-        wrap=lambda message: {"messages": [_USER, message]},
-    ),
-    *nested_type_cases(
-        protocol.ToolCall,
-        path="messages[1].tool_calls[0]",
-        valid=_TOOL_CALL,
-        wrap=lambda call: _with_tool_call(**call),
-    ),
-    *nested_type_cases(
-        protocol.FunctionResponse,
-        path="messages[1].tool_calls[0].function",
-        valid=_TOOL_CALL["function"],
-        wrap=lambda fn: _with_tool_call(**{**_TOOL_CALL, "function": fn}),
-    ),
-    *nested_type_cases(
-        protocol.Tool,
-        path="tools[0]",
-        valid=_TOOL,
-        wrap=lambda tool: {"tools": [tool]},
-    ),
-    *nested_type_cases(
-        protocol.Function,
-        path="tools[0].function",
-        valid=_TOOL["function"],
-        wrap=lambda fn: {"tools": [{"type": "function", "function": fn}]},
-        # Internal: a before-validator overwrites it from the keys sent.
-        skip=("key_order",),
-    ),
-    *nested_type_cases(
-        protocol.ToolChoice,
-        path="tool_choice",
-        valid=_NAMED_TOOL_CHOICE,
-        wrap=lambda choice: {"tool_choice": choice, "tools": [_TOOL]},
-    ),
-    *nested_type_cases(
-        protocol.ToolChoiceFuncName,
-        path="tool_choice.function",
-        valid={"name": "get_weather"},
-        wrap=lambda fn: {
-            "tool_choice": {"type": "function", "function": fn},
-            "tools": [_TOOL],
-        },
-    ),
-    *nested_type_cases(
-        protocol.JsonSchemaResponseFormat,
-        path="response_format.json_schema",
-        valid={"name": "answer", "schema": {"type": "object"}},
-        wrap=lambda js: {"response_format": {"type": "json_schema", "json_schema": js}},
-    ),
-    *nested_type_cases(
-        protocol.StreamOptions,
-        path="stream_options",
-        valid={"include_usage": True},
-        wrap=lambda options: {"stream_options": options},
-    ),
-]
-
-CHAT_VALUE_CASES = [
-    # OpenAIServingChat._validate_request
-    _value("messages", "empty_list", []),
-    _value(
-        "messages",
-        "image_on_text_model",
-        [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "http://x/a.png"}}
-                ],
-            }
-        ],
-    ),
-    _value(
-        "messages",
-        "duplicate_tool_names",
-        [{"role": "system", "content": "s", "tools": [_TOOL]}, _USER],
-        tools=[_TOOL],
-    ),
-    _value("chat_template_kwargs", "chat_template_not_trusted", {"chat_template": "x"}),
-    _value("return_sampling_mask", "without_return_meta_info", True),
-    _value("return_flat_raw_output_top_logprobs", "without_return_meta_info", True),
-    _value("top_logprobs", "above_vocab", _HUGE, logprobs=True),
-    _value("tool_choice", "required_without_tools", "required"),
-    _value("tool_choice", "named_without_tools", _NAMED_TOOL_CHOICE),
-    _value(
-        "tool_choice",
-        "named_not_in_tools",
-        {"type": "function", "function": {"name": "nope"}},
-        tools=[_TOOL],
-    ),
-    _value(
-        "tools",
-        "invalid_parameters_schema",
-        [
-            {
-                "type": "function",
-                "function": {"name": "f", "parameters": {"type": "bogus"}},
-            }
-        ],
-    ),
-    _value(
-        "response_format",
-        "json_schema_without_schema",
-        {"type": "json_schema", "json_schema": {"name": "answer"}},
-    ),
-    # ChatCompletionRequest field constraints and validators
-    _value("messages", "unknown_role", [{"role": "wizard", "content": "hi"}]),
-    _value("messages", "user_without_content", [{"role": "user"}]),
-    _value(
-        "messages",
-        "unknown_content_part",
-        [{"role": "user", "content": [{"type": "bogus"}]}],
-    ),
-    _value(
-        "messages",
-        "tool_call_without_name",
-        [
-            _USER,
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": "call_0",
-                        "type": "function",
-                        "function": {"arguments": "{}"},
-                    }
-                ],
-            },
-        ],
-    ),
-    _value("n", "zero", 0),
-    _value("n", "above_max", 129),
-    _value("max_tokens", "negative", -1),
-    _value("max_completion_tokens", "negative", -1),
-    _value("max_completion_tokens", "bool", True),
-    _value("top_logprobs", "negative", -1, logprobs=True),
-    _value("temperature", "negative", -1.0),
-    _value("reasoning_effort", "unknown_tier", "bogus"),
-    _value("reasoning_effort", "above_max", 1.5),
-    _value("reasoning_effort", "bool", True),
-    _value("thinking", "unknown_effort", {"effort": "bogus"}),
-    _value("response_format", "unknown_type", {"type": "bogus"}),
-    _value(
-        "response_format",
-        "json_schema_strict_not_bool",
-        {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "answer",
-                "schema": {"type": "object"},
-                "strict": "yes",
-            },
-        },
-    ),
-    _value("doc_split_options", "zero_pages", {"max_batch_pages": 0}),
-    # orjson reads an integer beyond 64 bits as a float, which an int field rejects.
-    _value("priority", "above_int64", 2**70),
-    # OpenAIServingChat._convert_to_internal_request
-    _value("return_meta_info", "with_stream", True, stream=True),
-    _value("return_prompt_token_ids", "with_stream", True, stream=True),
-    _value("return_token_ids", "with_stream", True, stream=True),
-    _value(
-        "messages",
-        "tool_call_arguments_not_json",
-        [
-            _USER,
-            {
-                **_ASSISTANT,
-                "tool_calls": [
-                    {
-                        **_TOOL_CALL,
-                        "function": {"name": "get_weather", "arguments": "{x"},
-                    }
-                ],
-            },
-        ],
-    ),
-    _value(
-        "tool_choice",
-        "required_with_response_format",
-        "required",
-        tools=[_TOOL],
-        response_format={"type": "json_object"},
-    ),
-    # GenerateReqInput.normalize_batch_and_arguments
-    _value("cache_salt", "list_for_single_prompt", ["a", "b"]),
-    _value("extra_key", "list_for_single_prompt", ["a", "b"]),
-    _value("input_ids", "empty", []),
-    # SamplingParams.normalize / verify
-    _value("min_tokens", "negative", -1),
-    _value("min_tokens", "above_max_tokens", 100),
-    _value("top_p", "zero", 0.0),
-    _value("top_p", "above_one", 1.5),
-    # temperature=0 forces greedy top_k=1, which would hide a bad top_k.
-    _value("top_k", "zero", 0, temperature=1.0),
-    _value("top_k", "below_minus_one", -2, temperature=1.0),
-    _value("min_p", "negative", -0.1),
-    _value("min_p", "above_one", 1.5),
-    _value("frequency_penalty", "above_two", 3.0),
-    _value("presence_penalty", "below_minus_two", -3.0),
-    _value("repetition_penalty", "zero", 0.0),
-    _value("repetition_penalty", "above_two", 3.0),
-    _value("seed", "above_int64", 2**63),
-    _value("logit_bias", "key_not_integer", {"abc": 1.0}),
-    _value("logit_bias", "key_out_of_vocab", {str(_HUGE): 1.0}),
-    _value("logit_bias", "value_above_max", {"1": 1e31}),
-    _value("regex", "with_ebnf", "a", ebnf='root ::= "a"'),
-    _value("watermark", "unknown_field", {"bogus": 1}),
-    _value("stop_regex", "unbalanced_paren", "("),
-    # Served model's context length and TokenizerManager state
-    _value("max_completion_tokens", "above_context", _HUGE),
-    _value("lora_path", "not_enabled", "does-not-exist"),
-    _value("routed_dp_rank", "negative", -5),
-    _value("custom_logit_processor", "not_enabled", "x"),
-    _value("rid", "list_for_single_prompt", ["a", "b"]),
-    _value("input_ids", "token_id_negative", [-1]),
-    _value("input_ids", "token_id_out_of_vocab", [_HUGE]),
-    # No session_params cases: /v1/chat/completions does not forward the field.
-]
 
 # Values ChatCompletionRequest accepts on purpose (see the NOTE on its OpenAI
 # limits); a later stage that starts rejecting them breaks existing clients.
-CHAT_ACCEPTED_CASES = [
-    _value("temperature", "above_openai_max", 5.0),
-    _value("top_logprobs", "without_logprobs", 5),
-    _value("logit_bias", "beyond_openai_range", {"1": 1000.0}),
-]
-
-_BATCH = {"text": ["a", "b"]}
-
-GENERATE_VALUE_CASES = [
-    # The api.v1 JSON contract (generate_contract_error)
-    _sampling("unknown_field", bogus=1),
-    _sampling("unknown_field", watermark={"bogus": 1}),
-    _value("max_thinking_tokens", "negative", -1),
-    # GenerateReqInput dataclass parse; orjson reads an int beyond 64 bits as a float.
-    _value("text", "list_of_int", [1, 2]),
-    _value("priority", "above_int64", 2**70),
-    _value("custom_labels", "value_not_string", {"a": 1}),
-    # GenerateReqInput.normalize_batch_and_arguments
-    _value("text", "null_without_input_ids", None),
-    _value("input_ids", "empty", [], text=None),
-    _value("session_id", "with_session_params", "s", session_params={"id": "s"}),
-    _value("return_flat_raw_top_logprobs_b64", "without_flat_raw", True),
-    _value("kv_hints", "list_for_single_prompt", [{}]),
-    _value("cache_salt", "list_for_single_prompt", ["a", "b"]),
-    _value("extra_key", "list_for_single_prompt", ["a", "b"]),
-    _value("rid", "batch_length_mismatch", ["x"], **_BATCH),
-    _value("rid", "batch_duplicate", ["x", "x"], **_BATCH),
-    _value("cache_salt", "batch_length_mismatch", ["a"], **_BATCH),
-    _value("extra_key", "batch_length_mismatch", ["a"], **_BATCH),
-    _value("return_hidden_states", "batch_length_mismatch", [True], **_BATCH),
-    _value("image_data", "batch_length_mismatch", [["x"]], **_BATCH),
-    # SamplingParams.normalize / verify
-    _sampling("negative", max_new_tokens=-1),
-    _sampling("negative", min_new_tokens=-1),
-    _sampling("above_max_new_tokens", min_new_tokens=100),
-    _sampling("negative", temperature=-1.0),
-    _sampling("zero", top_p=0.0),
-    _sampling("above_one", top_p=1.5),
-    # temperature=0 forces greedy top_k=1, which would hide a bad top_k.
-    _sampling("zero", top_k=0, temperature=1.0),
-    _sampling("below_minus_one", top_k=-2, temperature=1.0),
-    _sampling("negative", min_p=-0.1),
-    _sampling("above_one", min_p=1.5),
-    _sampling("above_two", frequency_penalty=3.0),
-    _sampling("below_minus_two", presence_penalty=-3.0),
-    _sampling("zero", repetition_penalty=0.0),
-    _sampling("above_two", repetition_penalty=3.0),
-    _sampling("above_int64", sampling_seed=2**63),
-    _sampling("zero", n=0),
-    _sampling("zero", beam_width=0),
-    _sampling("key_not_integer", logit_bias={"abc": 1.0}),
-    _sampling("key_out_of_vocab", logit_bias={str(_HUGE): 1.0}),
-    _sampling("value_above_max", logit_bias={"1": 1e31}),
-    _sampling("with_ebnf", regex="a", ebnf='root ::= "a"'),
-    _sampling("unbalanced_paren", stop_regex="("),
-    # TokenizerManager._validate_one_request and request state
-    _value("top_logprobs_num", "above_vocab", _HUGE, return_logprob=True),
-    _value("top_logprobs_num", "negative", -1, return_logprob=True),
-    _value("logprob_start_len", "below_minus_one", -2, return_logprob=True),
-    _value("token_ids_logprob", "negative", [-1]),
-    _value("token_ids_logprob", "out_of_vocab", [_HUGE]),
-    _value("routed_dp_rank", "negative", -5),
-    _value("custom_logit_processor", "not_enabled", "x"),
-    _value("lora_path", "not_enabled", "does-not-exist"),
-    _value("rid", "list_for_single_prompt", ["a", "b"]),
-    _value("return_logprob", "batch_length_mismatch", [True], **_BATCH),
-    _value("input_ids", "token_id_negative", [-1], text=None),
-    _value("input_ids", "token_id_out_of_vocab", [_HUGE], text=None),
-    # A prompt that tokenizes to zero tokens (no BOS) reaches the model forward.
-    _value("text", "empty_str", ""),
-]
-
-CASES = {
-    COMPLETIONS: type_cases(protocol.CompletionRequest) + COMPLETIONS_VALUE_CASES,
-    CHAT: (
-        type_cases(protocol.ChatCompletionRequest)
-        + CHAT_NESTED_TYPE_CASES
-        + CHAT_VALUE_CASES
-    ),
-    GENERATE: (
-        type_cases(api_types.GenerateRequest)
-        + nested_type_cases(
-            api_types.SamplingParams,
-            path="sampling_params",
-            valid=_GENERATE_SAMPLING,
-            wrap=lambda params: {"sampling_params": params},
-        )
-        + GENERATE_VALUE_CASES
-    ),
+CHAT_ACCEPTED = {
+    "temperature_above_openai_max": {"temperature": 5.0},
+    "top_logprobs_without_logprobs": {"top_logprobs": 5},
+    "logit_bias_beyond_openai_range": {"logit_bias": {"1": 1000.0}},
 }
 
 # (route, field, case_id) -> the open fix. These still get a 5xx, and the test
 # asserts they do: once a fix changes that, the test fails until its entry
 # here is dropped.
 KNOWN_FAILURES: dict[tuple[str, str, str], str] = {
-    (COMPLETIONS, "stop_regex", "unbalanced_paren"): "#40985",
-    (CHAT, "stop_regex", "unbalanced_paren"): "#40985",
-    (GENERATE, "sampling_params.stop_regex", "unbalanced_paren"): "#40985",
     # set_json_schema calls .get on a non-object response_format.
     **{
         (CHAT, "response_format", f"type_{kind}"): "#36011"
         for kind in ("list", "str", "float", "int", "bool")
     },
-    (GENERATE, "return_logprob", "batch_length_mismatch"): "#44333",
 }
 
 # (route, field, case_id) -> the open fix. These take the server down, so they
 # are never sent; drop the entry when its fix lands.
-KNOWN_CRASHES: dict[tuple[str, str, str], str] = {
-    # Out-of-vocabulary ids index the embedding out of bounds.
-    (COMPLETIONS, "prompt", "token_id_negative"): "#31908",
-    (COMPLETIONS, "prompt", "token_id_out_of_vocab"): "#31908",
-    (CHAT, "input_ids", "token_id_negative"): "#31908",
-    (CHAT, "input_ids", "token_id_out_of_vocab"): "#31908",
-    (GENERATE, "input_ids", "token_id_negative"): "#31908",
-    (GENERATE, "input_ids", "token_id_out_of_vocab"): "#31908",
-    (GENERATE, "text", "empty_str"): "#44330",
+KNOWN_CRASHES: dict[tuple[str, str, str], str] = {}
+
+
+CASES = {
+    route: schema_cases(REQUEST_MODELS[route], VALID_BODIES[route])
+    for route in VALID_BODIES
 }
+_CASE_KEYS = [
+    (route, case.field, case.case_id)
+    for route, cases in CASES.items()
+    for case in cases
+]
+# KNOWN_FAILURES and KNOWN_CRASHES name cases by key: a shared key matches two
+# cases, and a stale one leaves its renamed case unlisted, so a crash is sent.
+_shared = [key for key, n in collections.Counter(_CASE_KEYS).items() if n > 1]
+assert not _shared, f"cases share a key: {_shared}"
+_stale = (set(KNOWN_FAILURES) | set(KNOWN_CRASHES)) - set(_CASE_KEYS)
+assert not _stale, f"known entries name no case: {sorted(_stale)}"
 
 
 class TestMalformedRequests(CustomTestCase):
@@ -620,12 +384,8 @@ class TestMalformedRequests(CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             terminate_and_kill_process_tree(cls.process)
 
-    def _post(self, route, overrides):
-        return requests.post(
-            f"{self.base_url}{route}",
-            json={**VALID_BODIES[route], **overrides},
-            timeout=30,
-        )
+    def _post(self, route, body):
+        return requests.post(f"{self.base_url}{route}", json=body, timeout=30)
 
     def test_malformed_requests_get_4xx_and_server_keeps_serving(self):
         for route, cases in CASES.items():
@@ -634,9 +394,11 @@ class TestMalformedRequests(CustomTestCase):
                 if key in KNOWN_CRASHES:
                     continue
                 with self.subTest(route=route, field=case.field, case=case.case_id):
-                    response = self._post(route, case.overrides)
+                    response = self._post(route, case.body)
                     rejected = 400 <= response.status_code < 500
-                    detail = f"{case.overrides!r}: {response.status_code} {response.text[:300]}"
+                    detail = (
+                        f"{case.body!r}: {response.status_code} {response.text[:300]}"
+                    )
                     fix = KNOWN_FAILURES.get(key)
                     if fix is None:
                         self.assertTrue(rejected, detail)
@@ -646,15 +408,15 @@ class TestMalformedRequests(CustomTestCase):
                             500,
                             f"no longer a 5xx, drop its KNOWN_FAILURES entry ({fix}): {detail}",
                         )
-                    valid = self._post(route, {})
+                    valid = self._post(route, VALID_BODIES[route])
                     self.assertEqual(valid.status_code, 200, valid.text[:300])
         health = requests.get(f"{self.base_url}/health", timeout=30)
         self.assertEqual(health.status_code, 200, health.text[:300])
 
     def test_values_accepted_on_purpose_still_succeed(self):
-        for case in CHAT_ACCEPTED_CASES:
-            with self.subTest(field=case.field, case=case.case_id):
-                response = self._post(CHAT, case.overrides)
+        for name, overrides in CHAT_ACCEPTED.items():
+            with self.subTest(case=name):
+                response = self._post(CHAT, {**VALID_BODIES[CHAT], **overrides})
                 self.assertEqual(response.status_code, 200, response.text[:300])
 
 
