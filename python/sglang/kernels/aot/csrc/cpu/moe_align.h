@@ -39,13 +39,19 @@ int moe_align_block_size(
   int32_t* total_cnts_t_1 = T_INDEX(num_threads);
 
   cumsums[0] = 0;
+  offsets[0] = 0;
+  int compact_offset = 0;
   for (int e = 0; e < num_experts; ++e) {
+    const int expert_tokens = total_cnts_t_1[e];
+    const int expert_start = cumsums[e];
     // accumulate `num_tokens_post_pad`, also as the expert offset
-    cumsums[e + 1] = cumsums[e] + div_up(total_cnts_t_1[e], BLOCK_M) * BLOCK_M;
+    cumsums[e + 1] = expert_start + div_up(expert_tokens, BLOCK_M) * BLOCK_M;
 
-    for (int k = cumsums[e]; k < cumsums[e + 1]; k += BLOCK_M) {
+    for (int k = expert_start; k < cumsums[e + 1]; k += BLOCK_M) {
       expert_ids[k / BLOCK_M] = e;
+      offsets[k / BLOCK_M + 1] = compact_offset + std::min(k - expert_start + BLOCK_M, expert_tokens);
     }
+    compact_offset += expert_tokens;
   }
   int num_tokens_post_pad = cumsums[num_experts];
 
@@ -69,31 +75,8 @@ int moe_align_block_size(
     TORCH_CHECK(total_cnts_t_1[e] == total_cnts_t_2[e]);
   }
 
-  // padding value for sorted_ids: numel
-  auto sorted_id_size = [=](const int32_t* sorted_ids_ptr) {
-    for (int d = 0; d < BLOCK_M; ++d) {
-      if (sorted_ids_ptr[d] == numel) {
-        return d;
-      }
-    }
-    return BLOCK_M;
-  };
-
-  // offsets holds starting offset for each valida M blocks
-  //   shape : [num_token_blocks + 1]
-  offsets[0] = 0;
-  const int num_token_blocks = num_tokens_post_pad / BLOCK_M;
-  at::parallel_for(0, num_token_blocks, GRAIN_SIZE / BLOCK_M, [&](int begin, int end) {
-    for (int mb = begin; mb < end; ++mb) {
-      offsets[mb + 1] = sorted_id_size(sorted_ids + mb * BLOCK_M);
-    }
-  });
-  // TODO: do we need to vecterize this ?
-  for (int mb = 0; mb < num_token_blocks; ++mb) {
-    offsets[mb + 1] += offsets[mb];
-  }
   // debug: the last value of offsets should be `numel`
-  TORCH_CHECK(offsets[num_token_blocks] == numel);
+  TORCH_CHECK(offsets[num_tokens_post_pad / BLOCK_M] == numel);
 
   return num_tokens_post_pad;
 }
