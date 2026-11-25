@@ -1908,6 +1908,12 @@ class IndexerKPool(MultiPlatformOp):
             _compress_write_npu,
             _get_topk_npu,
         )
+        from sglang.srt.layers.cp.interleave_kpool import materialize_compression_inputs
+
+        # Compression uses global token order; Q, positions and weights stay local.
+        key, gate_score, _ = materialize_compression_inputs(
+            key, gate_score, positions, forward_batch
+        )
 
         # --- Write Phase ---
         _compress_write_npu(

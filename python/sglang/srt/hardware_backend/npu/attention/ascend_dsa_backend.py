@@ -19,6 +19,8 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     init_kpool_write_plan_capture,
     update_kpool_write_plan,
 )
+from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.interleave import is_interleave_extend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -38,7 +40,7 @@ class AscendDSAForwardMetadata(ForwardMetadata):
     )
     real_page_table: Optional[torch.Tensor] = None  # [B, Pkv], int32
 
-    # Inputs for pooled_key_indexer (batch-level)
+    # Inputs for pooled_key_indexer (one logical request per local Q under CP)
     pool_query_ends: Optional[torch.Tensor] = (
         None  # [B], int64, cumsum of query token lengths
     )
@@ -50,6 +52,10 @@ class AscendDSAForwardMetadata(ForwardMetadata):
     )
     pool_page_table: Optional[torch.Tensor] = (
         None  # [B, Pi], int32, pooled key page table, real_page_table[:, ::r] // r
+    )
+
+    kpool_cp_query_positions: torch.Tensor | None = (
+        None  # [local Q rows], -1 for padding
     )
 
     # Inputs for compress_write_npu
@@ -318,6 +324,43 @@ class AscendDSAAttnBackend(AscendAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         super().init_forward_metadata(forward_batch)
         self._initialize_dsa_metadata(forward_batch)
+        if self.dsa_index_kpool > 1 and is_interleave_extend(forward_batch):
+            self._prepare_kpool_interleave_metadata(forward_batch)
+
+    def _prepare_kpool_interleave_metadata(self, forward_batch: ForwardBatch) -> None:
+        metadata = self.forward_metadata
+        strategy = get_cp_strategy()
+        rank = strategy.cp_rank
+        local_rows = torch.arange(
+            forward_batch.attn_cp_metadata.per_rank_actual_token[rank],
+            dtype=torch.int64,
+            device=metadata.pool_query_ends.device,
+        )
+        global_rows = local_rows * strategy.cp_size + rank
+        query_ends = metadata.pool_query_ends
+        req_ids = torch.searchsorted(query_ends, global_rows, right=True)
+        valid = req_ids < query_ends.numel()
+        req_ids = req_ids.masked_fill(~valid, 0)
+
+        # In packed extend order, the last Q of a request sees its full KV.
+        visible = (
+            metadata.cache_lens_int32[req_ids] + global_rows - query_ends[req_ids] + 1
+        ).masked_fill(~valid, 0)
+        local_ends = local_rows + 1
+
+        # Each local Q is a one-row logical request. Padding sees no real
+        # pools and position -1 makes the existing packing kernel emit -1.
+        metadata.pool_query_ends = local_ends
+        metadata.pool_key_lens = visible // self.dsa_index_kpool
+        metadata.pool_tail_lens = visible % self.dsa_index_kpool
+        metadata.pool_page_table = metadata.pool_page_table.index_select(0, req_ids)
+        metadata.kpool_cp_query_positions = visible - 1
+
+        # Sparse attention consumes the same local rows, with token lengths
+        # and its own physical KV page table rather than pooled lengths/pages.
+        metadata.actual_seq_lengths_q = local_ends.to(torch.int32)
+        metadata.actual_seq_lengths_kv = visible.clamp_min(1).to(torch.int32)
+        metadata.block_tables = metadata.block_tables.index_select(0, req_ids)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
@@ -434,6 +477,8 @@ def _get_topk_npu(
         return_value=False,
         **indexer_kwargs,
     )
+    if metadata.kpool_cp_query_positions is not None:
+        positions = metadata.kpool_cp_query_positions
     return pack_pool_key_indexer_indices(
         indices=indices[: query.shape[0]],
         positions=positions,
