@@ -15,6 +15,7 @@ import re
 from typing import Any, Dict, List, Mapping, Sequence
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -185,12 +186,17 @@ class Xing4_0Detector(BaseFormatDetector):
         try:
             for match in TOOL_CALL_REGEX.finditer(text):
                 tool_name, arguments = _parse_payload(match.group(1), tools)
-                if not tool_name or tool_name not in tool_indices:
-                    logger.warning("Xing4_0Detector: unknown tool '%s'", tool_name)
+                if not tool_name:
                     continue
+                if tool_name not in tool_indices:
+                    logger.warning(
+                        "Model attempted to call undefined function: %s", tool_name
+                    )
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        continue
                 calls.append(
                     ToolCallItem(
-                        tool_index=tool_indices[tool_name],
+                        tool_index=len(calls),
                         name=tool_name,
                         parameters=json.dumps(arguments, ensure_ascii=False),
                     )
@@ -231,10 +237,10 @@ class Xing4_0Detector(BaseFormatDetector):
             tool_text = self._buffer[:end_pos]
             extracted = self.detect_and_parse(tool_text, tools)
 
-            if not extracted.calls:
-                content += tool_text
-            else:
-                calls.extend(extracted.calls)
+            for call in extracted.calls:
+                self.current_tool_id += 1
+                call.tool_index = self.current_tool_id
+                calls.append(call)
 
             self._buffer = self._buffer[end_pos:]
 
