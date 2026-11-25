@@ -20,7 +20,7 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
 )
-from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+from sglang.srt.utils import ceil_align, get_bool_env_var, is_gfx95_supported, is_hip
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
 logger = logging.getLogger(__name__)
@@ -591,6 +591,10 @@ class SchedulePolicy:
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        # The waiting tree matches raw tokens, but the serving cache reuses whole pages.
+        min_defer_prefix_len = ceil_align(
+            IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD, self.tree_cache.page_size
+        )
 
         # In-batch prefix caching: of the requests with almost nothing cached that
         # share a prefix, only one runs, so the shared prefix is computed once.
@@ -599,8 +603,7 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             match_kv_cache(r, self.tree_cache, prefix_ids)
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
-                key_ids = prefix_ids[:IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD]
+                key_ids = prefix_ids[:min_defer_prefix_len]
                 candidates.append((r, key_ids))
 
         if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
@@ -631,10 +634,7 @@ class SchedulePolicy:
                 match_result = zero_match_result(
                     self.waiting_queue_radix_tree, match_result, extra_key=extra_key
                 )
-            if (
-                match_result.device_prefix_len
-                >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
-            ):
+            if match_result.device_prefix_len >= min_defer_prefix_len:
                 temporary_deprioritized.add(r.rid)
             else:
                 # Insert with a dummy key

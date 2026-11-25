@@ -2,6 +2,7 @@ import unittest
 from array import array
 from unittest.mock import patch
 
+from sglang.srt.managers import schedule_policy
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
@@ -191,6 +192,35 @@ class TestShortestPrefillFirst(CustomTestCase):
             req.time_stats.wait_queue_entry_time = arrived
         queue = self.policy.calc_priority([long, other, short])
         self.assertEqual([req.rid for req in queue], ["short", "other", "long"])
+
+    def test_shared_prefix_deferral_uses_whole_pages(self):
+        """A partial KV page must not let a longer request overtake the follower."""
+        self.policy.tree_cache = RadixCache.create_simulated(page_size=64)
+        for threshold, shared_len, defer_follower in (
+            (32, 63, False),
+            (32, 64, True),
+            (65, 127, False),
+            (65, 128, True),
+        ):
+            with (
+                self.subTest(threshold=threshold, shared_len=shared_len),
+                patch.object(
+                    schedule_policy,
+                    "IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD",
+                    threshold,
+                ),
+            ):
+                shared = [1] * shared_len
+                leader = _make_req("leader", "", shared + [2])
+                follower = _make_req("follower", "", shared + [3, 3])
+                unrelated = _make_req("unrelated", "", [4] * 256)
+                ordered = self.policy.calc_priority([unrelated, follower, leader])
+                self.assertEqual(
+                    [req.rid for req in ordered],
+                    ["leader", "unrelated", "follower"]
+                    if defer_follower
+                    else ["leader", "follower", "unrelated"],
+                )
 
     def test_retracted_output_is_part_of_uncached_work(self):
         replay = self.make_req("replay", 16, cached=1024)
