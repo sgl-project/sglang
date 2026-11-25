@@ -177,6 +177,13 @@ class TestNanoNemotronVLProcessor(CustomTestCase):
                 )
                 self.assertEqual(mm.data_offsets, [start - 1, len(text)])
 
+    def test_video_decodes_on_cpu(self):
+        """Video frames go through PIL.Image.fromarray, which cannot read CUDA tensors."""
+        module = "sglang.srt.multimodal.multimodal_processor_mixin"
+        with patch(f"{module}.load_video") as load_video:
+            NanoNemotronVLImageProcessor._load_single_item(b"clip", Modality.VIDEO)
+        load_video.assert_called_once_with(b"clip", use_gpu=False)
+
     def test_tubelet_label_matches_hf_reference(self):
         """Multi-frame tubelet labels must match the HF processor's prompt format."""
         processor = object.__new__(NanoNemotronVLImageProcessor)

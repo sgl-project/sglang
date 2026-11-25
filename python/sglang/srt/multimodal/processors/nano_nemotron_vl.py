@@ -106,6 +106,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
     gpu_image_decode = (
         False  # NanoNemotronVL processes loaded image as PIL image explicitly
     )
+    gpu_video_decode = False  # Video frames also go through PIL.Image.fromarray
 
     def __init__(self, hf_config, server_args, _image_processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _image_processor, *args, **kwargs)
