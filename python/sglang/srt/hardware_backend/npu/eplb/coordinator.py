@@ -42,6 +42,8 @@ class Control(Protocol):
         self, epoch: int, phase: int, layer: int, ready: bool, error: bool
     ) -> tuple[bool, bool]: ...
 
+    def close(self) -> None: ...
+
 
 WeightWriteback = Callable[[], None]
 
@@ -257,6 +259,7 @@ class AsyncEplbCoordinator:
         self.cancel()
         try:
             self.runtime.close()
+            self.control.close()
         except Exception as error:
             self._fatal("EPLB transport close failed", error)
         self._executor.shutdown(wait=True)

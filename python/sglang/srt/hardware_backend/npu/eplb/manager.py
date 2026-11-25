@@ -51,25 +51,28 @@ class _AsyncStatAccumulator(_StatAccumulator):
     def snapshot_counts(self, spec):
         # A completed migration resets the window before the next epoch.
         assert not self._previous_layouts
-        buffered = self._global_physical_count_of_buffered_step.get_all()
-        counts = (
-            buffered.clone()
-            if spec.physical_count_mode
-            else self._logical_counts(buffered)
-        )
+        counts = self._global_physical_count_of_buffered_step.get_all()
+        group = self._communication_group
+        rank = dist.get_rank(group)
         sources = None
         source_groups = spec.source_groups
         if source_groups:
-            group = self._communication_group
             ranks_per_group = dist.get_world_size(group) // source_groups
-            source = dist.get_rank(group) // ranks_per_group
+            source = rank // ranks_per_group
             sources = counts.new_zeros(
                 (source_groups, *counts.shape[1:]), dtype=torch.int64
             )
             torch.sum(counts, dim=0, out=sources[source])
             dist.reduce(sources, dst=0, group=group)
-        dist.all_reduce(counts, group=self._communication_group)
-        return counts, sources
+        # The caller resets the recorder immediately after this snapshot. Reduce
+        # its buffer in place and give only the planner an independent copy.
+        dist.all_reduce(counts, group=group)
+        if rank != 0:
+            return None, None
+        snapshot = (
+            counts.clone() if spec.physical_count_mode else self._logical_counts(counts)
+        )
+        return snapshot, sources
 
     def _logical_counts(self, physical_counts):
         logical = super()._logical_counts(physical_counts)

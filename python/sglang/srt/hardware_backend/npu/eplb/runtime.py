@@ -71,6 +71,9 @@ class EplbControl:
             raise RuntimeError("EPLB ranks reached different protocol boundaries")
         return values[6] == 0, bool(values[7])
 
+    def close(self) -> None:
+        dist.destroy_process_group(self.group)
+
 
 def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
     # The NPU adapter exposes dense byte rows. Merge adjacent copies only
@@ -370,9 +373,9 @@ class NpuEplbRuntime:
         rank: int,
         world_size: int,
         ranks_per_node: int,
-        plan_group: dist.ProcessGroup,
         *,
         order_submissions: bool = False,
+        pack_small_fields: bool = False,
         use_prefill_admission: bool = False,
     ):
         # Peer batches must use the size checked across ranks at startup.
@@ -384,8 +387,8 @@ class NpuEplbRuntime:
         self.rank = rank
         self.world_size = world_size
         self.ranks_per_node = ranks_per_node
-        self.plan_group = plan_group
-        # Assigned after all ranks validate the startup configuration.
+        # Opened together after all ranks agree on the startup configuration.
+        self.plan_group: dist.ProcessGroup
         self.p2p_group: dist.ProcessGroup
         self.log_metrics = get_bool_env_var(
             "SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS"
@@ -402,9 +405,7 @@ class NpuEplbRuntime:
         }
         self.staging = adapter.create_temp_buffers()
         self._packed_fields = (
-            _PackedExpertFields.create(self.staging)
-            if order_submissions and world_size == ranks_per_node
-            else None
+            _PackedExpertFields.create(self.staging) if pack_small_fields else None
         )
         # Reserve one layer before KV sizing. The owner event fences its reuse
         # after writes from the preceding layer have been enqueued.
@@ -452,8 +453,6 @@ class NpuEplbRuntime:
                 self._owner_ready.record(self._owner_stream)
             except Exception as error:
                 event_error = str(error)
-        else:
-            counts = sources = None
 
         def compute():
             nonlocal counts, sources
@@ -671,8 +670,22 @@ class NpuEplbRuntime:
         self._owner_stream.synchronize()
         self._routing_plan = None
 
-    def close(self):
+    def open_transport(self, timeout, p2p_options) -> None:
+        self.plan_group = dist.new_group(backend="gloo", timeout=timeout)
+        # Background P2P and foreground TP can be submitted in different orders.
+        self.p2p_group = dist.new_group(
+            backend="hccl", timeout=timeout, pg_options=p2p_options
+        )
+        # Warm the recorder's TP reduction before KV sizing.
+        dist.all_reduce(
+            torch.zeros(1, dtype=torch.int32, device=self.device),
+            group=get_eplb_group(),
+        )
+        prewarm_eplb_communication(self.p2p_group)
+
+    def close(self) -> None:
         dist.destroy_process_group(self.p2p_group)
+        dist.destroy_process_group(self.plan_group)
 
 
 def _make_planning_spec(model_config, metadata, moe, nodes, *, decode_worker):
@@ -719,24 +732,21 @@ def create_npu_async_eplb(model_config, weights, metadata):
         reports_expert_balancedness,
     )
 
-    parallel = get_parallel()
     world_size = dist.get_world_size()
-    _validate_migration_topology(world_size)
-    moe = get_exec().moe
-    serving_mode = get_disagg().disaggregation_mode
-    decode_worker = serving_mode == "decode"
-    spec = _make_planning_spec(
-        model_config, metadata, moe, parallel.nnodes, decode_worker=decode_worker
-    )
-    # Fixed PP=1 TP=EP=WORLD: group construction order is identical on all ranks.
     timeout = timedelta(seconds=90)
-    control_group = dist.new_group(backend="gloo", timeout=timeout)
-    plan_group = dist.new_group(backend="gloo", timeout=timeout)
+    control = EplbControl(dist.new_group(backend="gloo", timeout=timeout))
     error = None
-    setup = None
     try:
         import torch_npu
 
+        _validate_migration_topology(world_size)
+        parallel = get_parallel()
+        moe = get_exec().moe
+        serving_mode = get_disagg().disaggregation_mode
+        decode_worker = serving_mode == "decode"
+        spec = _make_planning_spec(
+            model_config, metadata, moe, parallel.nnodes, decode_worker=decode_worker
+        )
         p2p_buffer_mib = int(os.environ.get("HCCL_BUFFSIZE") or 64)
         if p2p_buffer_mib < 1:
             raise ValueError("HCCL_BUFFSIZE must be positive")
@@ -749,8 +759,8 @@ def create_npu_async_eplb(model_config, weights, metadata):
             parallel.tp_rank,
             world_size,
             world_size // parallel.nnodes,
-            plan_group,
             order_submissions=decode_worker,
+            pack_small_fields=decode_worker and parallel.nnodes == 1,
             use_prefill_admission=(
                 serving_mode == "null"
                 and not get_schedule().disable_overlap_schedule
@@ -782,29 +792,24 @@ def create_npu_async_eplb(model_config, weights, metadata):
         setup = (signature, sorted(runtime.narrowed_replica_layers))
     except Exception as exc:
         error = exc
+        setup = f"{type(exc).__name__}: {exc}"
     peers = [None] * world_size
-    dist.all_gather_object(peers, setup, group=control_group)
-    if None in peers:
-        raise RuntimeError("Async EPLB setup failed on at least one rank") from error
+    dist.all_gather_object(peers, setup, group=control.group)
+    for rank, result in enumerate(peers):
+        if isinstance(result, str):
+            control.close()
+            raise RuntimeError(
+                f"Async EPLB setup failed on rank {rank}: {result}"
+            ) from error
     if any(s != signature for s, _ in peers):
+        control.close()
         raise ValueError(
             "Async EPLB ranks disagree on transport, placement, expert weight format, "
             "batching, scheduling or recorder configuration"
         )
     for _, narrowed_layers in peers:
         runtime.narrowed_replica_layers.update(narrowed_layers)
-    # Background P2P and foreground TP collectives can be submitted in different
-    # orders across ranks. Give migrations their own communicator for all layers.
-    runtime.p2p_group = dist.new_group(
-        backend="hccl", timeout=timeout, pg_options=p2p_options
-    )
-    # The recorder reduces int32 counts on TP. Initialize its HCCL collective
-    # before KV sizing and before prewarm_eplb_communication releases the cache.
-    dist.all_reduce(
-        torch.zeros(1, dtype=torch.int32, device=runtime.device),
-        group=get_eplb_group(),
-    )
-    prewarm_eplb_communication(runtime.p2p_group)
+    runtime.open_transport(timeout, p2p_options)
     weight_staging_bytes = sum(t.nbytes for t in runtime.staging)
     packed_fields = runtime._packed_fields
     if packed_fields is not None:
@@ -817,4 +822,4 @@ def create_npu_async_eplb(model_config, weights, metadata):
         p2p_buffer_mib,
         len(packed_fields.small) if packed_fields is not None else 0,
     )
-    return AsyncEplbCoordinator(EplbControl(control_group), runtime)
+    return AsyncEplbCoordinator(control, runtime)
