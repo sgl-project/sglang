@@ -34,7 +34,6 @@ class Fp4Indexer(Indexer):
 
     # 64 bytes of packed E2M1 values and four exponent bytes per token.
     _HEAD_DIM_WITH_SF = 68
-    _PROJECT_VERIFY_QUERY_ON_MAIN_STREAM = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
