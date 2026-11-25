@@ -907,14 +907,28 @@ class DeepseekV4HipRadixBackend(
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
             return True
-        if self.enable_decoder_swa_bounded_replay:
-            extend_lens_cpu = forward_batch.extend_seq_lens_cpu
-            if (
-                extend_lens_cpu is not None
-                and sum(extend_lens_cpu) > _HIP_PREFILL_GRAPH_MAX_EXTEND_TOKENS
-            ):
-                return False
+        return self._hip_prefill_graph_rows_fit(
+            forward_batch.extend_seq_lens_cpu, forward_batch.extend_prefix_lens_cpu
+        )
+
+    def _hip_prefill_graph_rows_fit(self, extend_lens, prefix_lens) -> bool:
+        # The graph check and the DP vote both use this rule, so no DP rank
+        # replays the graph while a peer runs the step eagerly.
+        if not self.enable_decoder_swa_bounded_replay:
+            return True
+        if (
+            extend_lens is not None
+            and sum(extend_lens) > _HIP_PREFILL_GRAPH_MAX_EXTEND_TOKENS
+        ):
+            return False
+        # A prefix hit can replay late-layer rows that the eager prefill never wrote.
+        if prefix_lens is not None and any(prefix_lens):
+            return False
         return True
+
+    def vote_prefill_cuda_graph(self, batch):
+        # HIP had no DP vote before, so ranks could disagree on the graph.
+        return self._hip_prefill_graph_rows_fit(batch.extend_lens, batch.prefix_lens)
 
     _prefill_graph_seq_limit = DeepseekV4AttnBackend._prefill_graph_seq_limit
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
