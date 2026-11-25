@@ -30,6 +30,7 @@ from sglang.srt.hardware_backend.npu.eplb.coordinator import (
 from sglang.srt.hardware_backend.npu.eplb.placement import (
     MigrationPlacement,
     PlanningSpec,
+    RecordedWindow,
     plan_migration,
 )
 from sglang.srt.hardware_backend.npu.eplb.weights import (
@@ -242,6 +243,34 @@ def _populated_replica_width(logical: torch.Tensor) -> int:
     return int(occupied[-1, 0]) + 1 if occupied.numel() else 0
 
 
+def _pack_placement(
+    placement: MigrationPlacement,
+    physical_shape: torch.Size,
+    num_logical: int,
+    num_ranks: int | None,
+) -> tuple[torch.Tensor, int, list[torch.Tensor] | None]:
+    changed, physical, logical, dispatch = placement
+    if physical.shape != physical_shape or logical.shape[:-1] != (
+        physical_shape[0],
+        num_logical,
+    ):
+        raise ValueError("EPLB placement changed the routing geometry")
+
+    ids = torch.tensor(changed, dtype=torch.int64, device="cpu")
+    logical_rows = logical.index_select(0, ids)
+    width = _populated_replica_width(logical_rows)
+    fields = (ids, physical.index_select(0, ids), logical_rows[..., :width])
+    payload = torch.cat([field.reshape(-1) for field in fields]).long()
+    rank_tables = None
+    if dispatch is not None:
+        if dispatch.shape != (physical_shape[0], num_logical, num_ranks):
+            raise ValueError("EPLB placement changed the static routing geometry")
+        rank_tables = list(
+            dispatch.index_select(0, ids).permute(2, 0, 1).long().contiguous().unbind()
+        )
+    return payload, width, rank_tables
+
+
 def _broadcast_placement(
     placement: MigrationPlacement | None,
     error: str | None,
@@ -251,49 +280,23 @@ def _broadcast_placement(
     num_logical: int,
 ) -> _PlacementRows | None:
     """Broadcast changed rows; scatter only the static picks each rank uses."""
-    # The first header value is -1 on failure, 0 for an empty plan, or the
-    # number of layers to install. The second is the replica table width.
+    # Header: [changed layers (-1 on failure), replica width, static dispatch flag].
     header = torch.zeros(3, dtype=torch.int64, device="cpu")
     rank_tables = None
     if rank == 0:
         if error is None and placement is not None:
             try:
-                changed, physical, logical, dispatch = placement
-                width = logical.size(-1)
-                if physical.shape != physical_shape or logical.shape != (
-                    physical_shape[0],
-                    num_logical,
-                    width,
-                ):
-                    raise ValueError("EPLB placement changed the routing geometry")
-                ids = torch.tensor(changed, dtype=torch.int64, device="cpu")
-                logical_rows = logical.index_select(0, ids)
-                width = _populated_replica_width(logical_rows)
-                fields = [
-                    ids,
-                    physical.index_select(0, ids),
-                    logical_rows[..., :width],
-                ]
-                if dispatch is not None:
-                    if dispatch.shape != (
-                        physical_shape[0],
-                        num_logical,
-                        dist.get_world_size(group),
-                    ):
-                        raise ValueError(
-                            "EPLB placement changed the static routing geometry"
-                        )
-                    rank_tables = list(
-                        dispatch.index_select(0, ids)
-                        .permute(2, 0, 1)
-                        .long()
-                        .contiguous()
-                        .unbind()
-                    )
-                    header[2] = 1
-                payload = torch.cat([field.reshape(-1) for field in fields]).long()
-                header[0] = len(changed)
+                num_ranks = (
+                    dist.get_world_size(group)
+                    if placement.static_dispatch is not None
+                    else None
+                )
+                payload, width, rank_tables = _pack_placement(
+                    placement, physical_shape, num_logical, num_ranks
+                )
+                header[0] = len(placement.layers)
                 header[1] = width
+                header[2] = int(rank_tables is not None)
             except Exception as exc:
                 error = str(exc)
         if error is not None:
@@ -452,7 +455,7 @@ class NpuEplbRuntime:
             :, :, : self._replica_width
         ]
 
-    def planner(self, counts, sources=None, active_sources=None):
+    def planner(self, window: RecordedWindow):
         self.stage_seconds = self.install_enqueue_seconds = 0.0
         self.interleaved_layers = 0
         self._owner_stream = self.device_module.current_stream()
@@ -464,34 +467,29 @@ class NpuEplbRuntime:
             except Exception as error:
                 event_error = str(error)
 
-        def compute():
-            nonlocal counts, sources, active_sources
+        device_window: RecordedWindow | None = window
+
+        def compute() -> _PlacementRows | None:
+            nonlocal device_window
             error = event_error
             placement = None
             if self.rank == 0 and error is None:
                 try:
-                    host_counts = self._copy_counts_to_host(counts)
-                    host_sources = (
-                        self._copy_counts_to_host(sources)
-                        if sources is not None
-                        else None
-                    )
-                    host_active_sources = (
-                        self._copy_counts_to_host(active_sources)
-                        if active_sources is not None
-                        else None
-                    )
-                    counts = sources = active_sources = None
-                    if host_counts.any().item():
+                    assert device_window is not None
+                    host_window = self._copy_window_to_host(device_window)
+                    device_window = None
+                    slot_counts = host_window.slot_counts
+                    assert slot_counts is not None
+                    if slot_counts.any().item():
                         placement = plan_migration(
-                            host_counts,
+                            slot_counts,
                             self.metadata.physical_to_logical_map_cpu,
                             self.spec,
                             self.ranks_per_node,
                             self.layer_ids,
                             num_logical_experts=self.metadata.num_logical_experts,
-                            source_totals=host_sources,
-                            active_sources=host_active_sources,
+                            source_totals=host_window.source_totals,
+                            active_sources=host_window.active_sources,
                             narrowed_layers=self.narrowed_replica_layers,
                         )
                 except Exception as exc:
@@ -507,35 +505,50 @@ class NpuEplbRuntime:
 
         return compute
 
-    def _copy_counts_to_host(self, counts):
+    def _copy_window_to_host(self, window: RecordedWindow) -> RecordedWindow:
+        assert window.slot_counts is not None
         self.device_module.set_device(self.device)
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
-            return counts.cpu()
+            return RecordedWindow(
+                slot_counts=window.slot_counts.cpu(),
+                source_totals=(
+                    window.source_totals.cpu()
+                    if window.source_totals is not None
+                    else None
+                ),
+                active_sources=(
+                    window.active_sources.cpu()
+                    if window.active_sources is not None
+                    else None
+                ),
+            )
 
     def prepare(self, placement: _PlacementRows | None) -> tuple[int, ...]:
         if placement is None:
             return ()
         changed, physical, logical, dispatch = placement
-        width = logical.size(-1)
+        incoming_width = logical.size(-1)
         # Include the previous populated columns so shrinking the active width
         # overwrites stale replicas. The graph still points to the full table.
-        self._replica_width = max(self._replica_width, width)
+        install_width = max(self._replica_width, incoming_width)
+        self._replica_width = install_width
+        num_experts = logical.size(1)
+        replica_buffer = self._routing_buffers["logical_to_all_physical_map"]
         device_rows = dict(
             self._routing_buffers,
-            logical_to_all_physical_map=self._routing_buffers[
-                "logical_to_all_physical_map"
-            ]
-            .view(-1)[: logical.size(1) * self._replica_width]
-            .view(logical.size(1), self._replica_width),
+            logical_to_all_physical_map=replica_buffer.view(-1)[
+                : num_experts * install_width
+            ].view(num_experts, install_width),
         )
+        padded_logical = logical
+        if incoming_width < install_width:
+            padded_logical = torch.nn.functional.pad(
+                logical, (0, install_width - incoming_width), value=-1
+            )
         host_rows = {
             "physical_to_logical_map": physical,
-            "logical_to_all_physical_map": torch.nn.functional.pad(
-                logical, (0, self._replica_width - width), value=-1
-            )
-            if width < self._replica_width
-            else logical,
+            "logical_to_all_physical_map": padded_logical,
             "logical_to_all_physical_map_num_valid": (logical != -1).sum(dim=-1),
         }
         if "logical_to_rank_dispatch_physical_map" in device_rows:
@@ -614,18 +627,6 @@ class NpuEplbRuntime:
         self.interleaved_layers += p2p_expert_order is not None
         expert_order = p2p_expert_order or range(len(old_layout))
 
-        def stage_transfers(p2p_op_infos, rows):
-            staged_rows.extend(rows)
-            if (
-                packed is not None
-                and not packed_for_local_copy
-                and any(op.op == dist.isend for _, ops in p2p_op_infos for op in ops)
-            ):
-                packed.pack(weights)
-            _submit_hccl_batches(
-                p2p_op_infos, expert_order, self._p2p_batch_size, pending_work
-            )
-
         weights, staging = self.weights[layer], self.staging
         sends, receives = weights, staging
         packed = self._packed_fields
@@ -645,6 +646,19 @@ class NpuEplbRuntime:
                 packed.pack(weights)
             sends = [weights[i] for i in packed.direct] + [packed.send]
             receives = packed.receive
+
+        def stage_transfers(p2p_op_infos, rows):
+            staged_rows.extend(rows)
+            if (
+                packed is not None
+                and not packed_for_local_copy
+                and any(op.op == dist.isend for _, ops in p2p_op_infos for op in ops)
+            ):
+                packed.pack(weights)
+            _submit_hccl_batches(
+                p2p_op_infos, expert_order, self._p2p_batch_size, pending_work
+            )
+
         update_expert_weights_single_layer(
             routed_experts_weights=sends,
             temp_buffers=receives,

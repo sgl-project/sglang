@@ -33,6 +33,15 @@ class MigrationPlacement(NamedTuple):
 
 
 @dataclass(frozen=True)
+class RecordedWindow:
+    """Recorder snapshot buffers. Only planner rank 0 keeps the reduced tensors."""
+
+    slot_counts: torch.Tensor | None = None  # [step, layer, physical slot]
+    source_totals: torch.Tensor | None = None  # [source group, layer, physical slot]
+    active_sources: torch.Tensor | None = None  # [step, layer]
+
+
+@dataclass(frozen=True)
 class PlanningSpec:
     physical_experts: int
     local_experts: int
@@ -102,10 +111,10 @@ def plan_migration(
     )
 
     physical_counts = slot_counts.numpy()
-    observed_peaks, layer_ids = _rank_peaks_and_eligible_layers(
+    observed_peaks, eligible_layers = _rank_peaks_and_eligible_layers(
         physical_counts, spec, layer_ids
     )
-    if not layer_ids:
+    if not eligible_layers:
         return None
     if spec.dispatch_mode == "unique":
         logical_to_slot = current.argsort(dim=-1)
@@ -122,10 +131,10 @@ def plan_migration(
     replicated = physical.size(1) > logical.size(1)
     # Aggregate counts cannot predict the load on replicas pinned to source
     # ranks. Keep the base planner's rank assignments for static dispatch.
-    replicated_static = spec.dispatch_mode == "static"
-    score_steps = spec.nodes == 1 and not replicated_static
+    uses_static_dispatch = spec.dispatch_mode == "static"
+    refine_on_one_node = spec.nodes == 1 and not uses_static_dispatch
     fallbacks = {}
-    if score_steps and replicated:
+    if refine_on_one_node and replicated:
         base_physical, base_logical = physical, logical
         physical, logical = _balance_recorded_steps(
             physical,
@@ -133,13 +142,13 @@ def plan_migration(
             counts,
             spec.local_experts,
             current,
-            layer_ids,
+            eligible_layers,
             observed_peaks=observed_peaks,
         )
         # Refinement uses a cheaper score. Retry the base layout if final admission fails.
         fallbacks = {
             i: (base_physical[i : i + 1], base_logical[i : i + 1])
-            for i in layer_ids
+            for i in eligible_layers
             if not torch.equal(base_logical[i], logical[i])
         }
     physical, logical = _align_placement(
@@ -148,20 +157,20 @@ def plan_migration(
         logical,
         spec.local_experts,
         ranks_per_node,
-        preserve_rank_assignment=replicated_static,
-        layer_ids=layer_ids,
+        preserve_rank_assignment=uses_static_dispatch,
+        layer_ids=eligible_layers,
     )
     known_gains = {}
     static_dispatch = None
-    if score_steps and not replicated:
+    if refine_on_one_node and not replicated:
         physical, logical, known_gains = _prefer_fewer_moves(
-            current, physical, logical, counts, spec.local_experts, layer_ids
+            current, physical, logical, counts, spec.local_experts, eligible_layers
         )
     moved = (physical != current).any(dim=1).tolist()
     candidates = tuple(
-        i for i in layer_ids if moved[i] or i in fallbacks or i in narrowed_layers
+        i for i in eligible_layers if moved[i] or i in fallbacks or i in narrowed_layers
     )
-    if candidates and replicated_static:
+    if candidates and uses_static_dispatch:
         from sglang.srt.eplb.expert_location import (
             compute_logical_to_rank_dispatch_physical_map,
         )
@@ -171,24 +180,33 @@ def plan_migration(
             logical, spec.source_groups, spec.physical_experts, ep_rank=None
         )
     if spec.dispatch_mode != "unique" or spec.nodes > 1:
+        logical_counts = counts.numpy()
+        current_layout = current.numpy()
+        dispatch_by_rank = (
+            static_dispatch.numpy() if static_dispatch is not None else None
+        )
+        source_counts = source_totals.numpy() if source_totals is not None else None
+        active_source_counts = (
+            active_sources.numpy() if active_sources is not None else None
+        )
 
         def score(layer, target, inverse):
             if layer not in narrowed_layers and torch.equal(target, current[layer]):
                 return 0.0
             return _a2a_migration_gain(
-                counts[:, layer].numpy(),
+                logical_counts[:, layer],
                 physical_counts[:, layer],
                 observed_peaks[:, layer],
-                current[layer].numpy(),
+                current_layout[layer],
                 inverse.numpy(),
                 spec.local_experts,
                 ranks_per_node,
-                static_dispatch[layer].numpy() if static_dispatch is not None else None,
-                source_totals[:, layer].numpy() if source_totals is not None else None,
+                dispatch_by_rank[layer] if dispatch_by_rank is not None else None,
+                source_counts[:, layer] if source_counts is not None else None,
                 score_locality=spec.score_locality,
                 active_sources=(
-                    active_sources[:, layer].numpy()
-                    if active_sources is not None
+                    active_source_counts[:, layer]
+                    if active_source_counts is not None
                     else None
                 ),
             )
@@ -574,7 +592,7 @@ def _admit_dispatch_layers(
     fallbacks,
     score,
 ):
-    """Keep a passing refinement, or try the base placement for that layer."""
+    """Score each candidate, writing passing base fallbacks into the layout."""
     gains = {}
     for layer in layer_ids:
         gain = score(layer, physical[layer], logical[layer])

@@ -217,6 +217,25 @@ class AsyncEplbCoordinator:
         finally:
             self.submission_wait_seconds += time.perf_counter() - start
 
+    def _drain_local_work(self) -> None:
+        future = self._future
+        if future is not None:
+            remaining = max(0.0, self._deadline - time.monotonic())
+            if self.phase == Phase.PLANNING:
+                # The CPU planner may finish shortly after its work deadline.
+                remaining = max(remaining, self._planning_drain_timeout)
+            if not wait((future,), timeout=remaining).done:
+                raise TimeoutError("EPLB worker did not drain")
+            try:
+                future.result()
+            except Exception:
+                if self.phase == Phase.STAGING:
+                    # A submission can fail after enqueuing work on peers.
+                    raise
+        if self.phase == Phase.STAGING and self._error is not None:
+            raise self._error
+        self.runtime.synchronize()
+
     def cancel(self) -> None:
         """Collective: no rank may restart or free storage until all are drained."""
         if self._closed:
@@ -225,25 +244,7 @@ class AsyncEplbCoordinator:
             raise UnsafeRebalanceFailure("Cannot reuse a failed EPLB coordinator")
         local_error = None
         try:
-            if self._future is not None:
-                # Distinguish an unfinished Future from a worker that finished
-                # by raising TimeoutError (for example, a failed CPU plan).
-                remaining = max(0.0, self._deadline - time.monotonic())
-                if self.phase == Phase.PLANNING:
-                    # The planner may finish shortly after the work deadline.
-                    # Give it a bounded grace period before failing the worker.
-                    remaining = max(remaining, self._planning_drain_timeout)
-                if not wait((self._future,), timeout=remaining).done:
-                    raise TimeoutError("EPLB worker did not drain")
-                try:
-                    self._future.result()
-                except Exception:
-                    if self.phase == Phase.STAGING:
-                        # A submission can fail after enqueuing work on peers.
-                        raise
-            if self.phase == Phase.STAGING and self._error is not None:
-                raise self._error
-            self.runtime.synchronize()
+            self._drain_local_work()
         except Exception as error:
             local_error = error
         try:
