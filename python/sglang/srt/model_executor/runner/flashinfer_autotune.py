@@ -334,10 +334,12 @@ def uses_flashinfer_capture_replay(runner: DecodeCudaGraphRunner) -> bool:
     mr = runner.model_runner
     # Draft runners subclass the decode runner without its full field set, so they
     # are ruled out before any runner field is read.
-    # FlashInfer's strict replay is single-rank only, as is the managed store here.
+    # FlashInfer's strict replay is single-rank only: on a miss one rank would tune
+    # while the others capture. Checked here, not inherited from the store's scope.
     # Foundry captures or restores each shape itself; a restored graph looks nothing up.
     return (
         not mr.is_draft_worker
+        and get_parallel().max_world_size == 1
         and uses_flashinfer_managed_autotune_cache()
         and not get_foundry_adapter().enabled
         and isinstance(runner.backend, FullCudaGraphBackend)

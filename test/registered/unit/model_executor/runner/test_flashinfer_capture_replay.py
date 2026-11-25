@@ -291,8 +291,19 @@ class TestCaptureReplayEligibility(_PublishedConfig):
             self.assert_eligible(_decode_runner(), False)
 
     def test_processes_without_the_managed_store(self):
-        # Strict replay is single-rank; so is the store here.
-        with get_parallel().override(max_world_size=2):
+        with patch.object(
+            autotune, "uses_flashinfer_managed_autotune_cache", return_value=False
+        ):
+            self.assert_eligible(_decode_runner(), False)
+
+    def test_multi_rank_processes_even_with_the_managed_store(self):
+        # Strict replay is single-rank, whatever processes the store covers.
+        with (
+            patch.object(
+                autotune, "uses_flashinfer_managed_autotune_cache", return_value=True
+            ),
+            get_parallel().override(max_world_size=2),
+        ):
             self.assert_eligible(_decode_runner(), False)
 
     def test_runners_that_decline_tuning(self):
