@@ -2421,7 +2421,7 @@ class Envs:
     # on the (N, K) shapes in hopper_bf16_small_m_gemv's tables.
     SGLANG_HOPPER_SMALL_M_GEMV = EnvBool(False)
 
-    # Chunk cap for requests returning input logprobs (0: none).
+    # Chunk tokens per prefill batch for requests returning input logprobs (0: no cap).
     SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS = EnvInt(0)
 
     # ===================================================================

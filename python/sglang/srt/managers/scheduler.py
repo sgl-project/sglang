@@ -277,6 +277,9 @@ from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
 )
+from sglang.srt.managers.scheduler_components.input_logprob_chunk_cap import (
+    InputLogprobChunkCap,
+)
 from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
 )
@@ -4696,20 +4699,7 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
-        logprob_cap = envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.get()
-        if (
-            logprob_cap > 0
-            and chunked_prefill_size is not None
-            and chunked_prefill_size > logprob_cap
-            and any(
-                r.return_logprob and 0 <= r.logprob_start_len < len(r.origin_input_ids)
-                for r in (self.chunked_req, *self.waiting_queue)
-                if r
-            )
-        ):
-            # Input logprobs materialize fp32 full-vocab logits for every row of a chunk,
-            # outside the prefill graph: a shorter chunk bounds that memory.
-            chunked_prefill_size = logprob_cap
+        logprob_cap = InputLogprobChunkCap.for_batch(chunked_prefill_size)
         max_prefill_tokens = self.max_prefill_tokens
         # a mixed DFlash batch carries each running request's verify block
         num_mixed_decode_tokens = (
@@ -4772,7 +4762,7 @@ class Scheduler(
                 self.page_size,
                 processed_tokens=self.processed_tokens_counter,
             )
-            if adder.add_chunked_req(resumed_req) is None:
+            if logprob_cap.add_chunked_req(adder, resumed_req) is None:
                 # Its last chunk is in this batch.
                 move([resumed_req], self.prefill_launched_reqs)
 
@@ -4928,7 +4918,8 @@ class Scheduler(
                     if bounded_active:
                         self.policy.mark_admission_skipped(req)
                     continue
-            res = adder.add_one_req(
+            res = logprob_cap.add_one_req(
+                adder,
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,

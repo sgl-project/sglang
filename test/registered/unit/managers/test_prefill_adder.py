@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
@@ -19,6 +20,9 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
+)
+from sglang.srt.managers.scheduler_components.input_logprob_chunk_cap import (
+    InputLogprobChunkCap,
 )
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
@@ -1332,6 +1336,40 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    def test_input_logprob_cap_cuts_only_requests_reading_input_logprobs(self):
+        """SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS bounds the input-logprob rows of one
+        batch; a prefill without input logprobs keeps the batch's chunk budget."""
+        self.mock_token_allocator.available_size.return_value = 100000
+        adder = self.create_adder(
+            self.create_running_batch(), rem_input_tokens=100000, rem_chunk_tokens=4096
+        )
+        with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(1024):
+            cap = InputLogprobChunkCap.for_batch(4096)
+
+        def req(rid, n, logprob):
+            r = self._create_delayer_req(n, rid=rid)
+            r.return_logprob, r.logprob_start_len = logprob, 0
+            r.origin_input_ids = r.full_untruncated_fill_ids
+            return r
+
+        reqs = [
+            req("lp_a", 600, True),
+            req("plain", 2000, False),
+            req("lp_b", 1000, True),  # takes the 424 left of the cap
+            req("lp_c", 10, True),  # no cap left
+        ]
+        results = [
+            cap.add_one_req(adder, r, has_chunked_req=False, truncation_align_size=None)
+            for r in reqs
+        ]
+        self.assertEqual([r.rid for r in adder.can_run_list], ["lp_a", "plain", "lp_b"])
+        self.assertEqual([r.extend_len for r in adder.can_run_list], [600, 2000, 424])
+        self.assertIs(adder.new_chunked_req, reqs[2])
+        self.assertEqual(results[3], AddReqResult.OTHER)
+        self.assertEqual(adder.rem_chunk_tokens, 4096 - 3024)
+        with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(1024):
+            self.assertIsNone(InputLogprobChunkCap.for_batch(1024).room)
 
     @patch(
         "sglang.srt.managers.schedule_policy.page_interleave_shard_size",
