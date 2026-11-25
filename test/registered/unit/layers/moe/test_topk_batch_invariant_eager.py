@@ -18,7 +18,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 ROUTING_FUNCTIONS = (
     "grouped_topk_gpu",
-    "kimi_k2_biased_topk_impl",
     "biased_topk_impl",
     "biased_grouped_topk_impl",
     "_biased_grouped_topk_postprocess",
