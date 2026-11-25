@@ -215,19 +215,23 @@ client sent. The router picks the first of these that applies:
 2. The rank with the deepest cached prefix in the local KV tree.
 3. The rank with the fewest requests this router has in flight on it; with
    `--dp-rank-policy round_robin`, the worker's ranks in turn; or with
-   `--dp-rank-policy least_tokens`, the lighter of two ranks drawn at
-   random, by KV tokens committed, in use plus the prompts of requests still
-   queued, as the engine reports them on its `--load-publish-endpoint` feed,
-   which sees every router replica's traffic, plus the requests this router
-   has sent to the rank since that reading at the worker's mean KV per
-   request. Two random ranks rather than the lightest because every router
-   replica reads the same report, and all taking its minimum would send
-   their next requests to one rank until the next report. Ties, and a worker
-   without a fresh reading for every one of its ranks, fall back to the
-   in-flight count.
+   `--dp-rank-policy least_tokens`, the rank expected to hold the fewest KV
+   tokens: the tokens it has committed, in use plus the prompts of requests
+   still queued, as the engine reports them on its `--load-publish-endpoint`
+   feed, which sees every router replica's traffic, plus every request it
+   holds, and every request this router has sent it since that reading, at
+   a typical request's KV (the median request's KV, from the ranks' mean KV
+   per request weighted by the requests each holds, so a few long-context
+   requests do not inflate what short requests are charged). Expected rather
+   than current KV because KV in use lags: a rank whose requests are all
+   young holds little now and the most later. Ties, and a worker without a
+   fresh reading for every one of its ranks, fall back to the in-flight
+   count.
 
-In PD mode, decode is ranked by step 3 only. The decode request names the
-prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
+In PD mode, decode is ranked by step 3 only, under `--decode-dp-rank-policy`
+when set and `--dp-rank-policy` otherwise, so prefill and decode can balance
+by different signals. The decode request names the prefill rank in
+`disagg_prefill_dp_rank`, and the bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`.
 
 A decode rank picked on arrival only starts decoding once prefill has queued,
@@ -585,6 +589,49 @@ forwarded as sent, since the engine renders and tokenizes each query-document
 pair. Routing is on load, with each pair's size estimated from its text. As for
 embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
+## OpenAI Responses
+
+`/v1/responses` converts each request to a chat completion at ingress, so it is
+routed exactly like `/v1/chat/completions`, and converts the reply (or stream)
+back to a Response object or the Responses event sequence, with a gapless
+`sequence_number` and `usage` (including `cached_tokens`) on every finished
+Response. Conversion works on the raw JSON, so sglang chat extensions such as
+`top_k` and `chat_template_kwargs` pass through.
+
+Input: a string or input items; `message` items (`developer` is sent as
+`system`, its text labelled `Developer instructions:` as the engine's own
+`/v1/responses` does), `reasoning`, `function_call` / `function_call_output`
+and their `custom_tool_call` forms; `input_text` and `input_image` parts.
+Consecutive reasoning, assistant and function-call items form one assistant
+turn. `instructions`, `max_output_tokens`, `reasoning.effort`, `text.format`
+(JSON schema) and `tool_choice` (including `allowed_tools`) are translated.
+
+Tools: `function`, plus the shapes Codex sends: `namespace` groups, flattened
+to `<namespace>__<name>` chat functions, and `custom` freeform tools, shimmed
+into a function with one `input` string (a grammar is described to the model,
+not enforced). Calls map back to namespaced `function_call` /
+`custom_tool_call` items. Built-in tools (`web_search`, ...) are rejected.
+
+A developer item after the first turn stays in place only when every worker of
+the model reports `supports_inline_system` in `/server_info`; otherwise its
+text joins the leading system message, where the engine's own `/v1/responses`
+puts it, and the turns either side of it stay apart.
+
+Reasoning items carry the trace in `content`; `reasoning.summary` mirrors it
+into `summary`, and `include: ["reasoning.encrypted_content"]` also packs it
+into `encrypted_content` in the engine's own encoding, so a `store: false`
+client (Codex) can replay reasoning across turns through either the router or
+the engine. Replayed items are read as `summary`, then `content`, then the
+blob.
+
+The router is stateless: `previous_response_id`, `conversation`, `background`,
+stored `prompt` templates and `item_reference` items are rejected with 400, as
+are `top_logprobs` and `include: ["message.output_text.logprobs"]`. The
+stored-response routes under `/v1/responses/` answer 501. Every error uses the
+OpenAI `{"error": {...}}` envelope; 5xx messages are replaced with a generic
+one. A generation cut off by `max_output_tokens` ends `incomplete`; an engine
+abort or a broken stream ends `failed`, with open items closed `incomplete`.
+
 ## Anthropic Messages
 
 `/v1/messages` converts each request to a chat completion at ingress, so it is
@@ -733,38 +780,37 @@ is re-registered; its circuit breaker will open in the meantime.
 
 ## Native gRPC
 
-`--grpc-port` serves the engine's own gRPC API, `sglang.runtime.v1.SglangService`
-(`proto/sglang/runtime/v1/sglang.proto`), so a gRPC client can point at the
-router or at an engine. A call is routed exactly like its HTTP route and sent to
-the same RPC on the selected engine's native gRPC server, which engines run
-beside HTTP with their own `--grpc-port`; the router reads that port from each
-worker's `/server_info`. HTTP requests are unaffected and still reach engines
-over HTTP.
+`--grpc-port` serves `sglang.api.v1.SglangService/Generate`
+(`proto/sglang/api/v1/service.proto`). A single text prompt or token sequence is
+routed like HTTP `/generate` and forwarded to the selected engine's native
+`api.v1` gRPC server. Engines must run with `--grpc-port`; the router reads that
+port from each worker's `/server_info`. HTTP requests still reach engines over
+HTTP.
 
-| RPC | Routed like |
-|---|---|
-| `ChatComplete` | `/v1/chat/completions`: same rendering, `input_ids` forwarding, PD and DP-rank handling |
-| `Complete` | `/v1/completions` |
-| `Generate`, `TextGenerate` | `/generate` with `input_ids` or `text` |
-| `Embed`, `TextEmbed`, `OpenAIEmbed` | `/v1/embeddings` |
-| `Classify`, `OpenAIClassify` | `/v1/classify` |
-| `Rerank` | `/v1/rerank` |
+This replaces the legacy runtime service. Clients and workers must use `api.v1`;
+there is no legacy fallback. OpenAI, embedding, classify, and rerank gRPC methods
+are no longer served. Their HTTP endpoints remain available. The other `api.v1`
+RPCs, including health, metadata, detokenization, and administrative calls, answer
+`UNIMPLEMENTED` at the router.
 
-The OpenAI RPCs carry the HTTP route's JSON body, so they are prepared exactly as
-over HTTP. A typed RPC is prepared from its fields with the same rules, and the
-router's additions (rid, PD bootstrap, DP rank, sampling defaults) are set on the
-proto it forwards. A text prompt is tokenized once, as its HTTP route forwards
-`input_ids`: `TextGenerate` is sent as `Generate` with `return_text`, so the engine
-still supplies the text, and `TextEmbed` as `Embed`. They stay text RPCs under
-`--disable-input-ids-forwarding`, without a tokenizer, or, for `TextGenerate`, with
-`return_text_in_logprobs`. Other RPCs, such as
-`Tokenize`, `HealthCheck` and the admin RPCs, answer `UNIMPLEMENTED`. Request metadata and `trace_headers`
-act as HTTP headers for routing and forwarding, and a cancelled call aborts the
-engine request. Router errors arrive as a gRPC status carrying the HTTP path's
-message and an `x-router-error-code` trailer; an engine's status passes through
-unchanged. An engine without `--grpc-port` (including one launched with
-`--api-key`, which native gRPC rejects) cannot serve gRPC calls: the router warns
-when it registers, and calls routed to it fail with `UNAVAILABLE`.
+`Generate` accepts one prompt, a scalar request ID, and scalar sampling parameters.
+List variants of these fields, including one-element lists, are rejected with
+`INVALID_ARGUMENT`. The router does not expand `n` into parallel requests; the
+engine validates sampling support. Replies are typed `GenerateStreamItem` frames
+or item errors. With `stream=false`, the router collects the engine result before
+returning it through the same server-streaming RPC.
+
+The router adds its request ID, PD bootstrap fields, DP placement, and missing
+sampling defaults directly to the protobuf request. Text is tokenized once and
+forwarded as token IDs unless input-ID forwarding is disabled, no tokenizer is
+available, media is present, or text logprobs are requested.
+
+Request metadata supplies routing headers and forwarded trace context; there is
+no `trace_headers` payload field. Router errors arrive as gRPC statuses with an
+`x-router-error-code` trailer; upstream statuses and typed item errors retain
+their wire representation. Cancellation drops the upstream call and also aborts
+the router-generated request ID, when present. An engine without `--grpc-port`
+cannot serve gRPC calls: registration warns, and calls fail with `UNAVAILABLE`.
 
 ## Upgrading from `cache_aware_zmq`
 

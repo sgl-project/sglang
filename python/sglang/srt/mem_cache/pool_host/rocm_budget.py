@@ -6,10 +6,9 @@ leaves main's behavior unchanged off gfx950."""
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import resource
-from typing import TYPE_CHECKING, ContextManager, Optional
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host import base
@@ -45,16 +44,6 @@ def clamp_plain_budget(plain: int) -> int:
     if pinnable is not None:
         plain = min(plain, pinnable)
     return plain
-
-
-def explicit_size_scope(enabled: bool) -> ContextManager:
-    """With explicit HiCache sizes on gfx950, book every host pool against one
-    pinnable-share snapshot, so the ratio-sized Mamba pool built last clamps to
-    what the others left. A nullcontext when HiCache is off, off gfx950, or when
-    the TTM limit is not visible."""
-    if not enabled or rocm_pinnable_share_bytes() is None:
-        return contextlib.nullcontext()
-    return base.host_memory_budget_scope(base.host_memory_budget_plain_hugetlb())
 
 
 def mamba_host_ratio(hicache_ratio: float) -> float:

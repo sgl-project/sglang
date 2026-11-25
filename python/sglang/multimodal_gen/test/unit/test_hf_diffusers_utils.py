@@ -375,6 +375,83 @@ def test_cached_snapshot_respects_requested_revision(monkeypatch, tmp_path):
     ]
 
 
+@pytest.mark.parametrize("index_name", ["model_index.json", "modular_model_index.json"])
+@pytest.mark.parametrize(
+    "cached", ["missing_index", "metadata_only", "partial", "complete"]
+)
+def test_pipeline_load_repairs_only_its_requested_cached_subfolder(
+    monkeypatch, tmp_path, index_name, cached
+):
+    # The root and another partition can be cached independently of Ref2VA.
+    _write_model_index(tmp_path)
+    _populate_components(tmp_path / "T2VA", ("transformer",))
+    selected = tmp_path / "Ref2VA"
+    selected.mkdir()
+    external_text_encoder = index_name == "model_index.json"
+    local_components = ("transformer", "vae")
+    text_encoder = _h3_text_encoder_spec()
+    if not external_text_encoder:
+        local_components += ("text_encoder",)
+        text_encoder = text_encoder[:2]
+    config = {
+        "_class_name": "MiniMaxH3Ref2VAPipeline",
+        "_diffusers_version": "0.37.0",
+        "text_encoder": text_encoder,
+        "transformer": ["diffusers", "MiniMaxH3DiTModel"],
+        "vae": ["diffusers", "AutoencoderKL"],
+    }
+    if cached != "missing_index":
+        (selected / index_name).write_text(json.dumps(config))
+    if cached in ("partial", "complete"):
+        _populate_components(selected, ("vae",))
+    if cached == "complete":
+        _populate_components(selected, local_components)
+    calls = []
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            (selected / index_name).write_text(json.dumps(config))
+            _populate_components(selected, local_components)
+        return str(tmp_path)
+
+    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", snapshot_download)
+    pipeline = SimpleNamespace(
+        model_path="org/repo",
+        default_model_subfolder="Ref2VA",
+        server_args=SimpleNamespace(model_subfolder=None, revision="a" * 40),
+    )
+
+    loaded = ComposedPipelineBase._load_config(pipeline)
+
+    assert loaded == config
+    assert pipeline.model_path == str(selected)
+    assert [call.get("local_files_only", False) for call in calls] == (
+        [True] if cached == "complete" else [True, False]
+    )
+    assert all(call["allow_patterns"] == ["Ref2VA/**"] for call in calls)
+    assert all(call["revision"] == "a" * 40 for call in calls)
+    # modular indexes use local components; standard indexes can reference a repo
+    assert (selected / "text_encoder").exists() == (not external_text_encoder)
+    assert not (tmp_path / "transformer").exists()
+
+
+def test_incomplete_cached_subfolder_does_not_download_when_disabled(
+    recording_snapshot_download, tmp_path
+):
+    calls = recording_snapshot_download(tmp_path)
+
+    with pytest.raises(ValueError, match="missing requested files"):
+        maybe_download_model(
+            "org/repo",
+            allow_patterns=["Ref2VA/**"],
+            model_subfolder="Ref2VA",
+            download=False,
+        )
+
+    assert calls == ["probe"]
+
+
 def test_partially_populated_cached_snapshot_is_served_without_download(
     recording_snapshot_download, tmp_path
 ):

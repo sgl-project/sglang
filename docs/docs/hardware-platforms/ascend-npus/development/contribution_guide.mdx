@@ -64,6 +64,7 @@ See [`test_npu_sampling_backend.py`](https://github.com/sgl-project/sglang/tree/
 2. Extend `CustomTestCase` (from `sglang.test.test_utils`) for CI retry support.
 3. Launch server with `popen_launch_server()` in `setUpClass` and clean up with `kill_process_tree()` in `tearDownClass`.
 4. Register your test with `register_npu_ci()`:
+
    ```python
    from sglang.test.ci.ci_register import register_npu_ci
    register_npu_ci(est_time=400, suite="extra-b-test-1-npu-a3")
@@ -123,6 +124,7 @@ Also, do not rely on the "Latency/Output throughput" from this script, as it is 
 
 GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
 You can find additional accuracy eval examples in:
+
 - [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/manual/eval/test_eval_accuracy_large.py)
 
 ## Benchmark the speed
@@ -138,15 +140,14 @@ Then your PR can be merged.
 ## How to Trigger CI Tests
 
 We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
-Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
+Users with write access to the repository have every CI permission. Other users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json); maintainers prune entries whose user has had no commit on `main` for 90 days.
 
 **PR authors** can always use `/rerun-failed-ci` on their own PRs, even if they are not listed in `CI_PERMISSIONS.json`.
 
 For CI to run on a pull request, it must have the "run-ci" label and not be a draft; otherwise its CI workflows skip their tests. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
-- `/tag-run-ci-label [<hardware> ...]`: Adds the "run-ci" label, plus the opt-in label of each named hardware. NPU CI runs on a PR only with both "run-ci" and "run-ci-npu-extra", so use `/tag-run-ci-label npu` to opt a PR in. Only **future** commits trigger CI; the current commit is unaffected. The retired `extra` argument is rejected with migration guidance.
+- `/tag-and-rerun-ci [<hardware> ...]`: Adds the "run-ci" label, plus the opt-in label of each named hardware, then does what `/rerun-failed-ci` does, which includes rerunning the runs whose tests were skipped for a label it just added. NPU CI runs on a PR only with both "run-ci" and "run-ci-npu-extra", so use `/tag-and-rerun-ci npu` to opt a PR in. The retired `extra` argument is rejected with migration guidance. To add the labels and rerun only NPU CI, use `/run-ci npu`; several hardware may be named, as in `/run-ci nv npu`. See the [contribution guide](https://docs.sglang.io/docs/developer_guide/contribution_guide#how-to-trigger-ci-tests) for the full command list.
 - `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, flaky, skipped, cancelled, or timed out**. Runs whose tests were skipped because the PR was a draft or lacked a label are rerun in full once the PR is ready and has the label.
-- `/tag-and-rerun-ci [<hardware> ...]`: Adds the same labels, then does what `/rerun-failed-ci` does, which includes rerunning the runs whose tests were skipped for a label it just added. To add the labels and rerun only NPU CI, use `/run-ci npu`; several hardware may be named, as in `/run-ci nv npu`. See the [contribution guide](https://docs.sglang.io/docs/developer_guide/contribution_guide#how-to-trigger-ci-tests) for the full command list.
 - `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly, bypassing stage boundaries. Each `<test-spec>` is pytest-style `<file>::<TestClass>[.<test_method>]` (the `::TestClass` and `.<test_method>` parts are optional). The handler resolves each spec, groups specs by their registered runner-label, and dispatches one [Rerun Test workflow](https://github.com/sgl-project/sglang/actions/workflows/rerun-test.yml) per group. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py` (multiple at once).
 
 If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
@@ -211,6 +212,7 @@ Since SGLang and sgl-kernel-npu are separate Python packages, dependency updates
 If you want to contribute but don’t have a specific idea in mind, pick issues labeled ["good first issue" or "help wanted"](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase.
 
 Also check out the following materials as startup guide:
+
 - [Mini-SGLang](https://github.com/sgl-project/mini-sglang) for a quick overview on the structure of sglang.
 - [Code Walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang’s workflow.
 - [GTC-2026 Training Lab](https://drive.google.com/file/d/1mwOZEtipNLJzrflCTodj34KhuOZEoEw5/view?usp=drive_link) for hands-on practices of how to do optimization, benchmarking, or profiling on a launched SGLang instance.
