@@ -2543,6 +2543,9 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+    # MiniMax-M3.1 low-batch FFN (CuTe DSL routed + shared experts, from vLLM) in
+    # captured decode / verify graphs of 1-32 rows at TP4 or TP8; stock elsewhere.
+    SGLANG_MINIMAX_M3_LOW_BATCH_FFN = EnvBool(False)
 
     # MiniMax-M3 sparse-attention toggles for ROCm.
     # Share one index top-k across every N sparse layers; 1 (default) disables
