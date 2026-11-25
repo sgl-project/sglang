@@ -147,6 +147,11 @@ class NpuAsyncEPLBManager(EPLBManager):
                 "Online weight updates are unsupported with async EPLB: "
                 "the migration worker holds views of the original expert storage."
             )
+        if getattr(model, "_weight_export_error", None) is None:
+            model._weight_export_error = (
+                "Cannot export weights with async EPLB: physical expert slots can "
+                "move, and the weight export does not include their routing table."
+            )
 
     def reset_generator(self):
         if self._async_coordinator is not None:

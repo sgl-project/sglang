@@ -443,18 +443,16 @@ def _migration_gain(samples, live, target):
     after_peak = peak_tokens(samples, target)
     gain = (before_peak - after_peak).sum()
     # Require a saving of 1% of an ideally balanced rank's recorded tokens.
-    if gain <= 0.01 * samples.sum() / len(live):
+    totals = samples.sum(axis=1)
+    if gain <= 0.01 * totals.sum() / len(live):
         return 0.0
-    if live.size > num_experts:
-        totals = samples.sum(axis=1)
-        active = totals > 0
-        # A replica change can help large batches but overload small ones.
-        # Compare the nearest-rank P95 of each step's busiest rank share.
-        tail = int(np.ceil(0.95 * active.sum())) - 1
-        shares = np.stack([before_peak[active], after_peak[active]]) / totals[active]
-        before_p95, after_p95 = np.partition(shares, tail, axis=1)[:, tail]
-        if after_p95 > before_p95 + 1e-12:
-            return 0.0
+    # A move can help large batches but overload small ones, even without replicas.
+    active = totals > 0
+    tail = int(np.ceil(0.95 * active.sum())) - 1
+    shares = np.stack([before_peak[active], after_peak[active]]) / totals[active]
+    before_p95, after_p95 = np.partition(shares, tail, axis=1)[:, tail]
+    if after_p95 > before_p95 + 1e-12:
+        return 0.0
     return gain
 
 

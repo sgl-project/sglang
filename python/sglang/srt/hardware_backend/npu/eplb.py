@@ -414,6 +414,11 @@ def validate_async_eplb_args(cfg) -> None:
             "--eplb-async-rebalance requires --weight-cache-mode off because "
             "expert migration writes to model weights in place"
         )
+    if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
+        raise ValueError(
+            "An async EPLB worker cannot serve as a transfer-engine weight seed: "
+            "the registered weights can move to different expert slots"
+        )
     if (
         cfg.pp_size != 1
         or cfg.elastic_ep_backend is not None

@@ -343,9 +343,8 @@ class NpuEplbRuntime:
         world_size: int,
         ranks_per_node: int,
         plan_group: dist.ProcessGroup,
-        p2p_group: dist.ProcessGroup,
+        world_group: dist.ProcessGroup,
         *,
-        owns_p2p_group: bool = True,
         order_submissions: bool = False,
     ):
         # Peer batches must use the size checked across ranks at startup.
@@ -358,8 +357,8 @@ class NpuEplbRuntime:
         self.world_size = world_size
         self.ranks_per_node = ranks_per_node
         self.plan_group = plan_group
-        self.p2p_group = p2p_group
-        self._owns_p2p_group = owns_p2p_group
+        self._world_group = world_group
+        self.p2p_group = world_group
         self.log_metrics = get_bool_env_var(
             "SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS"
         )
@@ -582,7 +581,7 @@ class NpuEplbRuntime:
         self._routing_plan = None
 
     def close(self):
-        if self._owns_p2p_group:
+        if self.p2p_group is not self._world_group:
             dist.destroy_process_group(self.p2p_group)
 
 
@@ -612,18 +611,12 @@ def create_npu_async_eplb(model_config, weights, metadata):
     timeout = timedelta(seconds=90)
     control_group = dist.new_group(backend="gloo", timeout=timeout)
     plan_group = dist.new_group(backend="gloo", timeout=timeout)
-    p2p_options = eplb_hccl_options()
-    p2p_buffer_mib = p2p_options.hccl_config["hccl_buffer_size"]
-    borrow_world_group = eplb_reuses_world_group()
-    if borrow_world_group:
-        p2p_group = parallel.world_group.device_group
-    else:
-        p2p_group = dist.new_group(
-            backend="hccl", timeout=timeout, pg_options=p2p_options
-        )
     error = None
     signature = None
     try:
+        p2p_options = eplb_hccl_options()
+        p2p_buffer_mib = p2p_options.hccl_config["hccl_buffer_size"]
+        borrow_world_group = eplb_reuses_world_group()
         runtime = NpuEplbRuntime(
             weights,
             metadata,
@@ -632,8 +625,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             world_size,
             world_size // parallel.nnodes,
             plan_group,
-            p2p_group,
-            owns_p2p_group=not borrow_world_group,
+            parallel.world_group.device_group,
             order_submissions=order_submissions,
         )
         initial_layout = metadata.physical_to_logical_map_cpu.contiguous()
@@ -644,6 +636,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
         signature = (
             runtime.layer_ids,
             tuple(tuple(t.shape) for t in runtime.staging),
+            borrow_world_group,
             order_submissions,
             runtime._p2p_batch_size,
             p2p_buffer_mib,
@@ -659,7 +652,12 @@ def create_npu_async_eplb(model_config, weights, metadata):
         raise RuntimeError("Async EPLB setup failed on at least one rank") from error
     if any(s != signature for s in signatures):
         raise ValueError(
-            "Async EPLB ranks disagree on layout, weight geometry or batching"
+            "Async EPLB ranks disagree on transport, layout, weight geometry or batching"
+        )
+    # All ranks must agree before any enters a conditional HCCL group creation.
+    if not borrow_world_group:
+        runtime.p2p_group = dist.new_group(
+            backend="hccl", timeout=timeout, pg_options=p2p_options
         )
     # The recorder reduces int32 counts on TP. Initialize its HCCL collective
     # before KV sizing and before prewarm_eplb_communication releases the cache.
@@ -667,7 +665,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
         torch.zeros(1, dtype=torch.int32, device=runtime.device),
         group=get_eplb_group(),
     )
-    prewarm_eplb_communication(p2p_group)
+    prewarm_eplb_communication(runtime.p2p_group)
     weight_staging_bytes = sum(t.nbytes for t in runtime.staging)
     packed_fields = runtime._packed_fields
     if packed_fields is not None:
