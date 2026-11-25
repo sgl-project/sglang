@@ -587,17 +587,11 @@ class SchedulerMetricsReporter:
         # vs. bundled FFN labeling, see has_dedicated_ffn_layers below).
         layers_block_type = getattr(hf_text_config, "layers_block_type", None)
         _EXCLUSIVE_HYBRID_BLOCK_TYPES = {"mamba", "attention", "mlp", "moe"}
-        # Whether the dedicated-FFN layers (if any) are actually routed MoE,
-        # per the layer-type labels themselves -- not per hf_text_config's
-        # separate moe_intermediate_size/num_experts_per_tok fields, which a
-        # model's own HF config class may default to MoE-shaped values
-        # regardless of whether a specific checkpoint's layers_block_type
-        # ever emits "moe" (e.g. NemotronHConfig defaults num_experts_per_tok
-        # to 2 even for dense Nemotron-Nano-9B-v2-style checkpoints whose own
-        # config.json and real weights -- plain up_proj/down_proj per "mlp"
-        # layer, no expert tensors at all -- contain no MoE signal
-        # whatsoever). None means "unknown, defer to hf_text_config" (the
-        # prior behavior) for configs with no recognized layers_block_type.
+        # Whether the dedicated-FFN layers are actually routed MoE, per the
+        # layer-type labels -- not hf_text_config's moe fields, which a config
+        # class may default to MoE-shaped values regardless of a checkpoint's
+        # real layers_block_type (e.g. NemotronHConfig). None means unknown,
+        # defer to hf_text_config (prior behavior).
         layer_types_confirm_moe = None
         if (
             layers_block_type
@@ -642,6 +636,25 @@ class SchedulerMetricsReporter:
                 else num_layers
             )
             num_mlp_layers = num_layers
+
+        if layer_types_confirm_moe is None:
+            # Dense siblings of a shared MoE-defaulting config class (e.g.
+            # Qwen3.5-9B's Qwen3_5TextConfig extends Qwen3NextConfig, which
+            # hardcodes num_experts_per_tok=10/moe_intermediate_size=512/
+            # num_experts=512) can't be disambiguated via layers_block_type
+            # the way NemotronH is -- key off the architecture name instead.
+            _DENSE_ARCHITECTURES_WITH_UNRELIABLE_MOE_DEFAULTS = {
+                "Qwen3_5ForConditionalGeneration",
+            }
+            model_architectures = (
+                getattr(getattr(model_config, "hf_config", None), "architectures", None)
+                or []
+            )
+            if any(
+                arch in _DENSE_ARCHITECTURES_WITH_UNRELIABLE_MOE_DEFAULTS
+                for arch in model_architectures
+            ):
+                layer_types_confirm_moe = False
 
         # Pure Mamba/SSM stacks have no MLP sublayer; zero both rather than
         # fabricating FFN cost from intermediate_size (the SSM expand dim there).

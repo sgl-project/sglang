@@ -2023,6 +2023,57 @@ class TestEstimatedPerfConstants(CustomTestCase):
             attn_linear_flops * num_attn_layers + dense_mlp_flops * num_mlp_layers,
         )
 
+    def test_qwen3_5_style_dense_sibling_is_not_treated_as_moe(self):
+        # Regression for Qwen/Qwen3.5-9B: its Qwen3_5TextConfig extends
+        # Qwen3NextConfig, which hardcodes num_experts_per_tok=10,
+        # moe_intermediate_size=512, and num_experts=512 unconditionally.
+        # The real Qwen3.5-9B checkpoint's config.json sets none of these
+        # (unlike its genuine MoE sibling Qwen3.5-35B-A3B, whose own
+        # config.json explicitly sets num_experts_per_tok=8/num_experts=256
+        # and whose architecture is Qwen3_5MoeForConditionalGeneration, not
+        # Qwen3_5ForConditionalGeneration). layers_block_type can't help
+        # here -- Qwen3Next's "full_attention"/"linear_attention" vocabulary
+        # carries no mamba/mlp/moe-dedication signal at all -- so this must
+        # be keyed off the dense sibling's architecture name directly.
+        hidden, head_dim, heads, kv_heads = 4096, 256.0, 16, 4
+        layers_block_type = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+        full_attention_layer_ids = [3]
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=len(layers_block_type),
+                hf_config=types.SimpleNamespace(
+                    architectures=["Qwen3_5ForConditionalGeneration"]
+                ),
+                hf_text_config_overrides={
+                    "layers_block_type": layers_block_type,
+                    "full_attention_layer_ids": full_attention_layer_ids,
+                    "intermediate_size": 12288,
+                    # Stale class-level MoE defaults this checkpoint never set.
+                    "moe_intermediate_size": 512,
+                    "num_experts_per_tok": 10,
+                    "num_experts": 512,
+                },
+            )
+        )
+        num_attn_layers = 1.0  # one "full_attention" label
+        num_mlp_layers = 4.0  # every layer builds its own FFN (bundled convention)
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        # Qwen3_5ForConditionalGeneration is not in _NON_GATED_MLP_ARCHITECTURES
+        # (standard SiLU-gated FFN) -- dense gated 6x multiplier, not the MoE
+        # path's num_experts_per_tok-scaled formula.
+        dense_mlp_flops = 6.0 * hidden * 12288
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * num_attn_layers + dense_mlp_flops * num_mlp_layers,
+        )
+
     def test_falcon_h1_style_uniform_hybrid_label_counts_every_layer(self):
         # FalconH1Config.layers_block_type is a property that returns
         # ["hybrid"] * num_hidden_layers -- every layer, never "attention",
