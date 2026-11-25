@@ -99,12 +99,20 @@ runs:
             return;
           }
 
-          const jobs = await readWithQuotaReset(() => github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+          const listJobs = perPage => readWithQuotaReset(() => github.paginate(github.rest.actions.listJobsForWorkflowRun, {
             owner: context.repo.owner,
             repo: context.repo.repo,
             run_id: context.runId,
-            per_page: 100,
+            per_page: perPage,
           }));
+          let jobs;
+          try {
+            jobs = await listJobs(100);
+          } catch (error) {
+            if (![502, 504].includes(error.status)) throw error;
+            core.info('[health-check] Jobs listing hit a gateway error. Retrying with 30 jobs per page.');
+            jobs = await listJobs(30);
+          }
           core.info(`[health-check] Total jobs in run: ${jobs.length}`);
           const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
           core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);

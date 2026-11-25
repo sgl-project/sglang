@@ -16,7 +16,7 @@ async function check({
   snapshot = [], live = [], lint = 'success', event = 'pull_request',
   failedJobNames = ['model-test'], jobs, independentTestJobPrefix = '',
   lintErrors = [], jobErrors = [], quotaWait = () => assert.fail('unexpected quota wait'),
-  maxQuotaWaitMinutes = '2',
+  maxQuotaWaitMinutes = '2', pageSizes = [],
 } = {}) {
   const failures = [];
   let labelReads = 0;
@@ -41,7 +41,9 @@ async function check({
       } },
       actions: { listJobsForWorkflowRun: () => {} },
     },
-    paginate: async () => {
+    paginate: async (endpoint, params) => {
+      assert.equal(endpoint, github.rest.actions.listJobsForWorkflowRun);
+      pageSizes.push(params.per_page);
       jobReads++;
       if (jobErrors.length) throw jobErrors.shift();
       return jobs || failedJobNames.map(name => ({
@@ -221,6 +223,20 @@ test('a jobs read retries once and still blocks on a failed job', async () => {
   const result = await check({ jobErrors: [quotaError()], quotaWait: () => {} });
   assert.equal(result.jobReads, 2);
   assert.deepEqual(result.failures, ['Fail-fast: skipping — root cause job(s): model-test']);
+});
+
+test('a gateway error retries the full jobs listing with smaller pages', async () => {
+  const pageSizes = [];
+  const result = await check({ jobErrors: [{ status: 502 }], pageSizes });
+  assert.deepEqual(pageSizes, [100, 30]);
+  assert.deepEqual(result.failures, ['Fail-fast: skipping — root cause job(s): model-test']);
+});
+
+test('a second gateway error fails the check', async () => {
+  const error = Object.assign(new Error('Gateway timeout'), { status: 504 });
+  const pageSizes = [];
+  await assert.rejects(check({ jobErrors: [error, error], pageSizes }), err => err === error);
+  assert.deepEqual(pageSizes, [100, 30]);
 });
 
 test('diffusion can wait for a ten-minute reset and still enforces lint', async () => {
