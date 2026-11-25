@@ -71,10 +71,11 @@ def qsa_fast_topk(
         else:
             selected = torch.topk(scores, width, dim=-1).indices
         selected_relative = selected - starts.unsqueeze(1)
-        selected_valid = valid.gather(1, selected)
-        output[:, :width] = torch.where(
-            selected_valid, selected_relative, -1
-        ).to(torch.int32)
+        selected_valid = (selected_relative >= 0) & (
+            selected_relative < lengths.unsqueeze(1)
+        )
+        selected_relative = selected_relative.masked_fill(~selected_valid, -1)
+        output[:, :width] = selected_relative.to(torch.int32)
         return output
 
     if logits.is_cuda:
