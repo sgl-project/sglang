@@ -124,7 +124,7 @@ do
         --watchdog-timeout 9000 \
         --disaggregation-transfer-backend ascend \
         --disaggregation-bootstrap-port 8998 \
-        --mem-fraction-static 0.68 \
+        --mem-fraction-static 0.89 \
         --prefill-max-requests 6 \
         --max-prefill-tokens 80000 \
         --chunked-prefill-size 131072 \
@@ -138,7 +138,12 @@ do
         --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --disable-radix-cache \
         --load-balance-method round_robin \
-        --ep-dispatch-algorithm static
+        --ep-dispatch-algorithm static \
+        --speculative-algorithm DSPARK \
+        --speculative-draft-model-path "${MODEL_PATH}" \
+        --speculative-draft-model-quantization modelslim \
+        --speculative-draft-attention-backend ascend \
+        --speculative-num-draft-tokens 6
         break
     fi
 done
@@ -181,11 +186,12 @@ do
         --quantization modelslim \
         --enable-dp-lm-head \
         --kv-cache-dtype bfloat16 \
-        --cuda-graph-bs-decode 1 2 4 8 16 24 36 40 48 \
-        --speculative-algorithm EAGLE \
-        --speculative-num-steps 2 \
-        --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 3
+        --cuda-graph-bs-decode 1 2 4 8 \
+        --speculative-algorithm DSPARK \
+        --speculative-draft-model-path "${MODEL_PATH}" \
+        --speculative-draft-model-quantization modelslim \
+        --speculative-draft-attention-backend ascend \
+        --speculative-num-draft-tokens 6
         break
     fi
 done

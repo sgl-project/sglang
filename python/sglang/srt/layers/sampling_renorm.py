@@ -6,9 +6,11 @@ lands in that gap commits different tokens on different ranks and the ranks
 later wedge in a collective. The deterministic variants (flashinfer
 ``is_deterministic=True``: integer-histogram AIR top-p, fixed-point sum radix
 top-k) close that, at no measurable end-to-end cost. Policy: deterministic
-whenever the TP group has more than one rank, on every path (plain sampler and
-speculative verify alike), and under --enable-deterministic-inference; fast on
-a single rank, where there is nobody to agree with.
+whenever more than one rank samples the same batch, on every path (plain
+sampler and speculative verify alike), and under
+--enable-deterministic-inference; fast where each rank samples a batch of its
+own (a single rank, or attention DP with one attention TP and CP rank per DP
+group), since there is nobody to agree with.
 
 The fast kernels come from the per-platform table in
 ``sglang.kernels.ops.sampling.renorm``; this module keeps that table's
@@ -46,11 +48,20 @@ _FI_TOP_K_DETERMINISTIC = _flashinfer_has_deterministic("top_k_renorm_probs")
 
 
 def renorm_deterministic() -> bool:
-    # tp_size, not attn_tp_size: context-parallel ranks sample the same batch
-    # too, and attn_tp_size divides them out.
     if get_exec().deterministic.enable_deterministic_inference:
         return True
-    return get_parallel().tp_size > 1
+    parallel = get_parallel()
+    # Attention DP with one attention TP rank and no context parallel: every DP
+    # rank samples only its own requests, so no two ranks share a batch.
+    if (
+        parallel.attn_dp_enabled
+        and parallel.attn_tp_size == 1
+        and parallel.attn_cp_size == 1
+    ):
+        return False
+    # tp_size, not attn_tp_size: context-parallel ranks sample the same batch
+    # too, and attn_tp_size divides them out.
+    return parallel.tp_size > 1
 
 
 def _top_p_renorm_prob(
@@ -84,6 +95,13 @@ def _top_k_renorm_prob(
     return _platform.top_k_renorm_prob(probs, top_k)
 
 
+def min_p_renorm_prob(probs: torch.Tensor, min_ps: torch.Tensor) -> torch.Tensor:
+    """Zero each row's probabilities below ``min_ps`` times its largest one and
+    renormalize, in place: the sampler's min-p, applied after top-k and top-p."""
+    probs.masked_fill_(probs < probs.amax(dim=-1, keepdim=True) * min_ps[:, None], 0.0)
+    return probs.div_(probs.sum(dim=-1, keepdim=True))
+
+
 top_p_renorm_prob = (
     _top_p_renorm_prob if _platform.top_p_renorm_prob is not None else None
 )
@@ -92,6 +110,7 @@ top_k_renorm_prob = (
 )
 
 __all__ = [
+    "min_p_renorm_prob",
     "renorm_deterministic",
     "top_k_renorm_prob",
     "top_p_renorm_prob",

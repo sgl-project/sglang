@@ -13,6 +13,7 @@
 # ==============================================================================
 """Sampling parameters for text generation."""
 
+import copy
 import logging
 import math
 from typing import Any, Dict, List, Optional, Sequence, Set, Union
@@ -21,7 +22,7 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.sampling.stop_regex import validate_stop_regex
-from sglang.srt.sampling.watermarking.core import (
+from sglang.srt.sampling.watermarking.config import (
     WatermarkRequestConfig,
     normalize_watermark_request,
 )
@@ -43,6 +44,9 @@ CustomParamValue = Union[
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+# 2**64 / golden ratio: a request's samples get seeds far from each other and from
+# the small seeds clients pick by hand.
+_SAMPLE_SEED_STRIDE = 0x9E3779B97F4A7C15
 # The float32 bias is divided by a temperature of at least _SAMPLING_EPS; larger
 # values overflow to inf and NaN the softmax.
 LOGIT_BIAS_ABS_MAX = 1e30
@@ -415,6 +419,22 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.stop = None
         self.stop_regex = None
         self.is_normalized = True
+
+    def for_sample(self, sample_index: int) -> "SamplingParams":
+        """These params for sample `sample_index` of the request's n samples.
+
+        Sample 0 keeps the request's seed, so n=1 is unchanged; the others get seeds
+        of their own, or n samples sharing a seed and prompt would be n copies. The
+        Rust server's `SamplingParams::for_sample` derives the same seeds.
+        """
+        if self.sampling_seed is None or sample_index == 0:
+            return self
+        seed = (self.sampling_seed + sample_index * _SAMPLE_SEED_STRIDE) % (1 << 64)
+        if seed >= 1 << 63:
+            seed -= 1 << 64
+        params = copy.copy(self)
+        params.sampling_seed = seed
+        return params
 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need

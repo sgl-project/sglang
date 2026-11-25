@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_gfx95_supported
 from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
@@ -1116,6 +1117,19 @@ class MoriKVManager(CommonKVManager):
         logger.info(
             "MoriKVManager torn down (was role=%s)", self.disaggregation_mode.value
         )
+
+    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
+        relayout = super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
+        if (
+            relayout
+            and is_gfx95_supported()
+            and getattr(self.kv_args, "dsa_index_k_token_bytes", None)
+        ):
+            raise RuntimeError(
+                f"MoRI PD cannot relayout a DSA index-K from DCP-{self.dcp_size} "
+                f"to DCP-{dst_dcp_size}; use the same --dcp-size or Mooncake."
+            )
+        return relayout
 
     def _add_remote_peer(self, register_info: KVArgsRegisterInfo) -> None:
         engine_key = register_info.engine_key
