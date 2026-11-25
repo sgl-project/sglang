@@ -67,6 +67,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
 from sglang.srt.sampling.sampling_pipeline import VerifyStep
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
@@ -170,7 +171,6 @@ _is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
     from sglang.srt.speculative.dflash_mla_ctx import MlaContextKV
 
 logger = logging.getLogger(__name__)
