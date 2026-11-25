@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-
 from sglang.srt.eplb.eplb_algorithms import EplbAlgorithm
 from sglang.srt.hardware_backend.npu.eplb import coordinator, placement
 from sglang.srt.hardware_backend.npu.eplb.placement import (
@@ -158,8 +157,10 @@ class TestAsyncEplbSnapshot(unittest.TestCase):
                     [point.SNAPSHOT_PREPARE, point.SNAPSHOT_COMPLETE],
                 )
 
+
+class TestAsyncEplbPlanExchange(unittest.TestCase):
     def test_placement_preserves_holes_and_trims_only_changed_layers(self):
-        from sglang.srt.hardware_backend.npu.eplb import runtime
+        from sglang.srt.hardware_backend.npu.eplb import plan_exchange
 
         physical = torch.tensor([[0, 1, 0, 1], [0, 1, 0, 1]])
         logical = torch.tensor(
@@ -168,46 +169,46 @@ class TestAsyncEplbSnapshot(unittest.TestCase):
         plan = placement.MigrationPlacement((1,), physical[1:], logical[1:])
         messages = []
         with patch.multiple(
-            runtime.dist,
+            plan_exchange.dist,
             broadcast=Mock(
                 side_effect=lambda tensor, **_: messages.append(tensor.tolist())
             ),
             all_reduce=Mock(),
         ):
-            rows = runtime._broadcast_placement(
+            rows = plan_exchange.broadcast_placement(
                 plan,
                 None,
                 0,
                 None,
                 physical.shape,
                 2,
-                header=torch.empty(3, dtype=torch.int64),
+                header=plan_exchange.allocate_plan_header(),
             )
         self.assertEqual(messages[0], [1, 3, 0])
         torch.testing.assert_close(rows.logical_to_physical, logical[1:, :, :3])
 
     def test_placement_receive_failure_stops_the_payload_broadcast(self):
-        from sglang.srt.hardware_backend.npu.eplb import runtime
+        from sglang.srt.hardware_backend.npu.eplb import plan_exchange
 
         physical = torch.tensor([[0, 1]])
         plan = placement.MigrationPlacement((0,), physical, physical.unsqueeze(-1))
         broadcast = Mock()
         with (
             patch.multiple(
-                runtime.dist,
+                plan_exchange.dist,
                 broadcast=broadcast,
                 all_reduce=Mock(side_effect=lambda status, **_: status.fill_(1)),
             ),
             self.assertRaisesRegex(RuntimeError, "rank 1 could not allocate placement"),
         ):
-            runtime._broadcast_placement(
+            plan_exchange.broadcast_placement(
                 plan,
                 None,
                 0,
                 None,
                 physical.shape,
                 2,
-                header=torch.empty(3, dtype=torch.int64),
+                header=plan_exchange.allocate_plan_header(),
             )
         broadcast.assert_called_once()
 
@@ -266,7 +267,7 @@ class TestAsyncEplbStartup(unittest.TestCase):
             validate_async_eplb_args(cfg)
 
     def test_rank_setup_failure_or_disagreement_closes_control_group(self):
-        from sglang.srt.hardware_backend.npu.eplb import runtime
+        from sglang.srt.hardware_backend.npu.eplb import startup
 
         control_group = object()
         parallel = SimpleNamespace(
@@ -285,7 +286,7 @@ class TestAsyncEplbStartup(unittest.TestCase):
             layer_ids=(0,),
             weight_format_digest=b"test",
             use_prefill_admission=False,
-            _p2p_batch_size=1,
+            p2p_batch_size=1,
             narrowed_replica_layers=set(),
             staging=(torch.zeros(2),),
             device="cpu",
@@ -327,7 +328,7 @@ class TestAsyncEplbStartup(unittest.TestCase):
                 {"torch_npu": torch_npu, "sglang.srt.runtime_context": ctx},
             ),
             patch.multiple(
-                runtime,
+                startup,
                 _validate_migration_topology=Mock(),
                 _make_planning_spec=Mock(
                     return_value=PlanningSpec(
@@ -343,7 +344,7 @@ class TestAsyncEplbStartup(unittest.TestCase):
                 ),
             ),
             patch.multiple(
-                runtime.dist,
+                startup.dist,
                 get_world_size=Mock(return_value=2),
                 new_group=Mock(return_value=control_group),
                 destroy_process_group=Mock(),
@@ -358,8 +359,8 @@ class TestAsyncEplbStartup(unittest.TestCase):
                         RuntimeError(failure) if failed_rank == 0 else None
                     )
                     allocate.return_value = (None, None)
-                    runtime.dist.new_group.reset_mock()
-                    runtime.dist.destroy_process_group.reset_mock()
+                    startup.dist.new_group.reset_mock()
+                    startup.dist.destroy_process_group.reset_mock()
                     expected = (
                         (
                             ValueError,
@@ -369,15 +370,15 @@ class TestAsyncEplbStartup(unittest.TestCase):
                         else (RuntimeError, f"rank {failed_rank}:.*{failure}")
                     )
                     with self.assertRaisesRegex(*expected):
-                        runtime.create_npu_async_eplb(
+                        startup.create_npu_async_eplb(
                             None, model, startup_weight_load=None
                         )
                     allocate.assert_called_once_with(2)
-                    self.assertEqual(runtime.dist.new_group.call_count, 1)
+                    self.assertEqual(startup.dist.new_group.call_count, 1)
                     self.assertEqual(
-                        runtime.dist.new_group.call_args.kwargs["backend"], "gloo"
+                        startup.dist.new_group.call_args.kwargs["backend"], "gloo"
                     )
-                    runtime.dist.destroy_process_group.assert_called_once_with(
+                    startup.dist.destroy_process_group.assert_called_once_with(
                         control_group
                     )
                     transport.open_transport.assert_not_called()

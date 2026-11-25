@@ -22,7 +22,7 @@ from sglang.srt.hardware_backend.npu.eplb.coordinator import (
     UnsafeRebalanceFailure,
 )
 from sglang.srt.hardware_backend.npu.eplb.placement import PlanningSpec, RecordedWindow
-from sglang.srt.hardware_backend.npu.eplb.runtime import create_npu_async_eplb
+from sglang.srt.hardware_backend.npu.eplb.startup import create_npu_async_eplb
 from sglang.srt.runtime_context import get_exec
 from torch.profiler import record_function
 
