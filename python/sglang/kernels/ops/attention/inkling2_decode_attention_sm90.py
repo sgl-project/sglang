@@ -1,10 +1,11 @@
 """Paged decode attention with a compact relative bias for Hopper: the split-KV
 partials of paged_rel_bias_decode (unnormalized o, max, sum), reduced by
 combine_gate_sink, for one query per sequence or a causal block of queries per
-sequence (MTP verify). Each split takes an equal share of the sequence's own keys; on
-a global layer's verify of a block that pads to 64 rows, the keys at least the bias
-extent behind every query row run as larger unmasked tiles, and a split takes an equal
-share of the tiles."""
+sequence (MTP verify). Each split takes an equal share of the sequence's own keys. On
+a global layer's verify of a block that pads to 32 or 64 rows, each masked tile's bias
+is gathered a tile ahead; at 64 rows the keys at least the bias extent behind every
+query row also run as larger unmasked tiles, and a split takes an equal share of the
+tiles."""
 
 import torch
 import triton
@@ -116,6 +117,7 @@ def _decode_partials(
     WINDOW: tl.constexpr,
     BLOCK_N: tl.constexpr,
     INTERIOR: tl.constexpr,
+    PREFETCH_BIAS: tl.constexpr,
 ):
     tl.extra.cuda.gdc_wait()
     tl.extra.cuda.gdc_launch_dependents()
@@ -166,9 +168,10 @@ def _decode_partials(
     l = tl.zeros((ROWS,), tl.float32)
     acc = tl.zeros((ROWS, D), tl.float32)
     cols = tl.arange(0, BLOCK_N)
-    if INTERIOR > 0:
-        # Each masked tile's bias is gathered one tile ahead: gathered inside the tile,
-        # its latency made 64 to 1024 keys 1.09x to 1.4x slower on H200.
+    if PREFETCH_BIAS:
+        # A bias gathered one tile ahead overlaps the previous tile and keeps the scores
+        # in the MMA layout; gathered in-tile, 64-1024 keys ran 1.09-1.4x slower (H200).
+        tl.static_assert(WINDOW < 0)
         end = tl.minimum(seqlen, tile_hi * BLOCK_N)
         bias_next = _bias_tile(
             Bias, token, qh, head_mask, q_pos, tile_lo * BLOCK_N, end,
@@ -177,7 +180,7 @@ def _decode_partials(
     # Keep inline rather than share a helper with _interior_tile:
     # a helper changes the sliding-window verify SASS (1.7% slower at qlen 5 on H200).
     for tile in range(tile_lo, tile_hi):
-        if INTERIOR > 0:
+        if PREFETCH_BIAS:
             bias_now = bias_next
             bias_next = _bias_tile(
                 Bias, token, qh, head_mask, q_pos, (tile + 1) * BLOCK_N, end,
@@ -204,7 +207,7 @@ def _decode_partials(
         keep = valid[None, :] & (dist >= 0)
         if WINDOW >= 0:
             keep &= dist <= WINDOW
-        if INTERIOR > 0:
+        if PREFETCH_BIAS:
             bias = bias_now.to(tl.float32)
         else:
             bias = tl.load(
@@ -223,7 +226,7 @@ def _decode_partials(
         m = m_new
     if INTERIOR > 0:
         # After the masked loop, so its first loads issue as early as main's (up to 7%
-        # slower on short keys before it); unpipelined, so shared memory stays main's.
+        # slower on short keys before it); unpipelined to fit main's shared memory.
         for tile in tl.range(big_lo, big_hi, num_stages=1):
             m, l, acc = _interior_tile(
                 q, m, l, acc, tile * INTERIOR, b, hk, d, scale, K, V, PageTable,
@@ -266,7 +269,7 @@ def decode_partials(
     max_splits = max(1, min(2 * sms // max(1, batch * heads_k), MAX_SPLITS))
     block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32
     splits = min(triton.cdiv(span, block_n), max_splits)
-    interior = _interior_tile_keys(qlen, group, window_size_left)
+    interior, prefetch = _verify_path(qlen, group, window_size_left)
     o = torch.empty(
         (splits, tokens, 1, heads_q, head_dim), dtype=torch.float32, device=q.device
     )
@@ -302,21 +305,24 @@ def decode_partials(
         -1 if window_size_left is None else window_size_left,
         block_n,
         interior,
+        prefetch,
         num_warps=4,
-        num_stages=2 if qlen == 1 or interior else 3,
-        # main's register allocation: at 242 the chain ran 4% slower at 32 sequences
-        # of 64 keys though the kernel alone did not; the cap ran 1-3% faster (H200).
-        maxnreg=232 if interior else None,
+        num_stages=2 if qlen == 1 or prefetch else 3,
+        # Changes ptxas's schedule (205 registers, 197 without on TP8): against no cap,
+        # 8-token blocks of 64-1536 keys ran 0.9% slower to 2.9% faster on H200.
+        maxnreg=232 if prefetch else None,
         launch_pdl=True,
     )
     return o, m, l
 
 
-def _interior_tile_keys(qlen, group, window_size_left):
-    """Keys per unmasked interior tile of a global layer's verify, 0 for none.
-    Measured on H200 for blocks that pad to 64 rows (6 to 10 tokens x 6 heads); at
-    128 rows they spilled, and at 16 and 32 rows they ran up to 18% slower than main
-    on short keys."""
-    if qlen == 1 or window_size_left is not None or not 32 < qlen * group <= 64:
-        return 0
-    return 64
+def _verify_path(qlen, group, window_size_left):
+    """(keys per unmasked interior tile or 0, bias gathered a tile ahead) for a global
+    layer's verify; (0, False) keeps main's path. Measured on H200 at 6 heads per KV
+    head: interior tiles pay off at 64 rows (6 to 10 tokens) but ran up to 1.4% slower
+    than main at 32 rows (3 to 5 tokens) on 1536 keys, and 128-key ones spilled at 128
+    rows; at 16 rows (2 tokens) the bias prefetch alone ran up to 4% slower than
+    main."""
+    if qlen == 1 or window_size_left is not None or not 16 < qlen * group <= 64:
+        return 0, False
+    return (64 if qlen * group > 32 else 0), True

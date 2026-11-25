@@ -117,7 +117,8 @@ def _check_partials(partials, inputs, window):
     [
         (6, 1, 8, None, 128),  # verify on a global layer, TP8 rank
         (12, 2, 8, None, 48),  # page size that is no multiple of any tile
-        (6, 1, 2, None, 128),  # short verify block, 16 rows
+        (6, 1, 5, None, 128),  # 32 rows: main's split with the bias gathered ahead
+        (6, 1, 2, None, 128),  # short verify block, 16 rows: main's path
         (6, 1, 8, 1023, 128),  # verify on a sliding-window layer
         (12, 2, 1, None, 128),  # decode
     ],
@@ -162,11 +163,11 @@ def test_sequences_without_interior_tiles_keep_main_split(monkeypatch):
 
     inputs = _attention_inputs(6, 1, 8, None, 128)
     seqused = inputs[4]
-    tile = attn._interior_tile_keys(8, 6, None)
+    tile, _ = attn._verify_path(8, 6, None)
     has_interior = (seqused - 8 - EXTENT + 1) // tile > 0
     assert has_interior.any() and not has_interior.all()
     mixed = attn.decode_partials(*inputs, SCALE)
-    monkeypatch.setattr(attn, "_interior_tile_keys", lambda *args: 0)
+    monkeypatch.setattr(attn, "_verify_path", lambda *args: (0, False))
     plain = attn.decode_partials(*inputs, SCALE)
     rows = (~has_interior).repeat_interleave(8)
     (o, m, l), (o0, m0, l0) = ([x[:, rows] for x in out] for out in (mixed, plain))
