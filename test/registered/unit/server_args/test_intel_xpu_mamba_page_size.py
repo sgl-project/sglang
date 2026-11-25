@@ -94,6 +94,29 @@ class TestIntelXpuMambaPageSize(CustomTestCase):
             "no_buffer",
         )
 
+    def test_lfm2_vl_unchanged_off_xpu(self):
+        for platform in (
+            dict(is_xpu=False, is_cuda=True, is_hip=False),
+            dict(is_xpu=False, is_cuda=False, is_hip=False),
+        ):
+            with (
+                self.subTest(**platform),
+                override_platform(**platform),
+                patch.object(
+                    overrides_module,
+                    "model_config_of",
+                    return_value=_model("Lfm2VlForConditionalGeneration"),
+                ),
+            ):
+                self.assertEqual(
+                    _mamba_radix_cache_resolution(
+                        _view(
+                            attention_backend="triton", disable_overlap_schedule=False
+                        )
+                    ),
+                    {},
+                )
+
     def test_explicit_page_size_unchanged(self):
         self.assertEqual(
             self._strategy("Qwen3_5ForConditionalGeneration", page_size=1)[

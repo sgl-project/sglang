@@ -401,7 +401,6 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "JetVLMForConditionalGeneration",
         "Lfm2ForCausalLM",
         "Lfm2MoeForCausalLM",
-        "Lfm2VlForConditionalGeneration",
         "ZayaForCausalLM",
         "Glm5NextForConditionalGeneration",
     }
@@ -474,6 +473,8 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     model_arch = hf_config.architectures[0]
 
     in_branch = model_arch in _MAMBA_RADIX_CACHE_ARCHS
+    if model_arch == "Lfm2VlForConditionalGeneration":
+        in_branch = get_platform().is_xpu
     if model_arch == "GraniteMoeHybridForCausalLM":
         in_branch = any(
             layer_type == "mamba"
