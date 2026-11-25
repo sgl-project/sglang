@@ -84,6 +84,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     target_model_type,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.fly_config import resolve_fly_config
 from sglang.srt.speculative.online_acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
@@ -274,6 +275,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
+        self._fly = (
+            resolve_fly_config(
+                gamma=self.gamma,
+                window_size=get_spec().speculative_fly_window_size,
+                entropy_threshold=get_spec().speculative_fly_entropy_threshold,
+                entropy_top_k=get_spec().speculative_fly_entropy_top_k,
+            )
+            if is_hip() and get_spec().speculative_use_fly
+            else None
+        )
 
         parallel = get_parallel()
         self._tp_sync = SpecTpSync(get_dp_tp_group())
@@ -471,6 +482,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     static_epilogue_supported
                     and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
                 ),
+                fly=self._fly,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -540,6 +552,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulated_correct_len=self._simulated_correct_len,
             block_verification=get_spec().speculative_use_block_verification,
             rejection_noise=self._rejection_noise,
+            fly=self._fly,
         )
 
         self._need_mamba_verify_commit = False

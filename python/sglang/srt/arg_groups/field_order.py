@@ -588,5 +588,9 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_boundary_decay_start_chunks",
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
+    "speculative_use_fly",
+    "speculative_fly_window_size",
+    "speculative_fly_entropy_threshold",
+    "speculative_fly_entropy_top_k",
 )
 # fmt: on

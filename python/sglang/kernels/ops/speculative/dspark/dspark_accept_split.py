@@ -13,9 +13,14 @@ original kernel); the accept semantics and the residual fallbacks follow
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
+
+from sglang.kernels.ops.speculative.fly import _row_topk_entropy
+from sglang.srt.speculative.fly_config import FlyConfig
 
 SPLITS = 64  # vocabulary chunks a row: CTAs a row / request in the split launches
 
@@ -57,6 +62,77 @@ def _row_norm(stats_ptr, row, SPLITS: tl.constexpr):
     M = tl.max(ms, axis=0)
     Z = tl.sum(zs * tl.exp(ms - M), axis=0)
     return M, Z
+
+
+@triton.jit
+def _fly_prepass_kernel(
+    uni_ptr, cand_ptr, logits_ptr, temp_ptr, stats_ptr, draft_ptr, verify_lens_ptr,
+    stride_cand_b, stride_cand_s, stride_uni_b, stride_uni_s, logits_row_stride,
+    stride_dp_b, stride_dp_s, stride_dp_v, vocab, entropy_threshold,
+    NUM_SLOTS: tl.constexpr, SPLITS: tl.constexpr, WINDOW: tl.constexpr,
+    TOP_K: tl.constexpr, TOP_K_PAD: tl.constexpr, BLOCK_V: tl.constexpr,
+    HAS_VERIFY_LENS: tl.constexpr,
+):  # fmt: skip
+    """FLy (sglang.kernels.ops.speculative.fly) ahead of ``_accept_kernel``: the draw of
+    each slot FLy defers is set to 0, which the walk then accepts (p > 0)."""
+    pid = tl.program_id(0)
+    temp = tl.load(temp_ptr + pid).to(tl.float32)
+    if HAS_VERIFY_LENS:
+        num_drafts = tl.load(verify_lens_ptr + pid).to(tl.int32) - 1
+    else:
+        num_drafts = NUM_SLOTS - 1
+    # Bit step - 1: the walk accepts slot ``step``; slot ``step`` is a deferral candidate.
+    native_bits = tl.zeros((), tl.int32)
+    usable_bits = tl.zeros((), tl.int32)
+    for step in tl.static_range(1, NUM_SLOTS):
+        tok = tl.load(cand_ptr + pid * stride_cand_b + step * stride_cand_s)
+        valid = (tok >= 0) & (tok < vocab)
+        safe = tl.where(valid, tok, 0)
+        row = pid * NUM_SLOTS + step - 1
+        M, Z = _row_norm(stats_ptr, row, SPLITS)
+        x = (
+            tl.load(logits_ptr + row.to(tl.int64) * logits_row_stride + safe).to(
+                tl.float32
+            )
+            / temp
+        )
+        p = tl.exp(x - M) / Z
+        q = tl.load(
+            draft_ptr
+            + pid * stride_dp_b
+            + (step - 1) * stride_dp_s
+            + safe * stride_dp_v
+        )
+        coin = tl.load(uni_ptr + pid * stride_uni_b + (step - 1) * stride_uni_s)
+        q_is_prob = valid & (q > 0.0) & (q <= 1.0)
+        native_bits |= (q_is_prob & (coin * q < p)).to(tl.int32) << (step - 1)
+        usable_bits |= (q_is_prob & (p > 0.0)).to(tl.int32) << (step - 1)
+
+    window_mask = (1 << WINDOW) - 1
+    alive = tl.full((), 1, tl.int32)
+    for pos in tl.static_range(NUM_SLOTS - 1):
+        is_native = (native_bits >> pos) & 1
+        can_try = (
+            (((usable_bits >> pos) & 1) != 0)
+            & (((native_bits >> (pos + 1)) & window_mask) == window_mask)
+            & (pos + WINDOW < num_drafts)
+        )
+        if (alive != 0) & (is_native == 0):
+            deferred = tl.full((), 0, tl.int32)
+            if can_try:
+                row = pid * NUM_SLOTS + pos
+                entropy = _row_topk_entropy(
+                    logits_ptr + row.to(tl.int64) * logits_row_stride,
+                    vocab,
+                    1.0 / temp,
+                    TOP_K=TOP_K,
+                    TOP_K_PAD=TOP_K_PAD,
+                    BLOCK_V=BLOCK_V,
+                )
+                if entropy >= entropy_threshold:
+                    tl.store(uni_ptr + pid * stride_uni_b + pos * stride_uni_s, 0.0)
+                    deferred = tl.full((), 1, tl.int32)
+            alive = deferred
 
 
 @triton.jit
@@ -227,6 +303,8 @@ def chain_speculative_sampling_split(
     target_logits: torch.Tensor,
     temperatures: torch.Tensor,
     draft_probs: torch.Tensor,
+    fly: Optional[FlyConfig] = None,
+    verify_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """``chain_speculative_sampling_triton`` from the target logits and the
     requests' temperatures (the softmax folded in), the vocabulary split over
@@ -247,6 +325,19 @@ def chain_speculative_sampling_split(
         target_logits, temps, stats, vocab, num_slots, target_logits.stride(0),
         SPLITS=SPLITS, BLOCK=block, num_warps=4,
     )  # fmt: skip
+    if fly is not None:
+        uniform_samples = uniform_samples.clone()
+        top_k = min(fly.entropy_top_k, vocab)
+        _fly_prepass_kernel[(bs,)](
+            uniform_samples, candidates, target_logits, temps, stats, draft_probs,
+            verify_lens if verify_lens is not None else temps,
+            candidates.stride(0), candidates.stride(1), uniform_samples.stride(0), uniform_samples.stride(1),
+            target_logits.stride(0), draft_probs.stride(0), draft_probs.stride(1), draft_probs.stride(2),
+            vocab, float(fly.entropy_threshold),
+            NUM_SLOTS=num_slots, SPLITS=SPLITS, WINDOW=fly.window_size, TOP_K=top_k,
+            TOP_K_PAD=triton.next_power_of_2(top_k), BLOCK_V=2048,
+            HAS_VERIFY_LENS=verify_lens is not None, num_warps=4,
+        )  # fmt: skip
     _accept_kernel[(bs,)](
         predicts, accept_index, accept_token_num, sel_row, last_idx,
         candidates, retrive_index, uniform_samples, target_logits, temps, stats, draft_probs,
