@@ -1983,10 +1983,14 @@ class PrefillAdder:
         ):
             return AddReqResult.NO_TOKEN
 
-        # Once this pass prefills, holding the rest back saves no forward.
+        # Once this pass prefills, holding the rest back saves no forward, unless
+        # LoRA admission is rank-local and only the shared verdict keeps ranks equal.
         if (
             self.prefill_delayer_single_pass is not None
-            and not self.can_run_list
+            and (
+                not self.can_run_list
+                or self.prefill_delayer_single_pass.holds_requests_during_prefill
+            )
             and (
                 not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                     local_prefillable=True,
@@ -2145,10 +2149,14 @@ class PrefillAdder:
                 return admission
 
             # A rejected candidate must not report prefillable or queue H2D.
-            # Once this pass prefills, holding the rest back saves no forward.
+            # Once this pass prefills, holding the rest back saves no forward, unless
+            # LoRA admission is rank-local and only the shared verdict keeps ranks equal.
             if (
                 self.prefill_delayer_single_pass is not None
-                and not self.can_run_list
+                and (
+                    not self.can_run_list
+                    or self.prefill_delayer_single_pass.holds_requests_during_prefill
+                )
                 and (
                     not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                         local_prefillable=True,

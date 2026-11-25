@@ -114,6 +114,7 @@ class PrefillDelayer:
         rank_local_admission = bool(lora.enable_lora) and (
             bool(lora.enable_lora_overlap_loading) or lora.lora_drain_wait_threshold > 0
         )
+        self.rank_local_admission = rank_local_admission
         self._local_row_is_shared = not (self.attn_dp_enabled or rank_local_admission)
         dp_size_dim = self.num_dp_ranks if self.attn_dp_enabled else 1
 
@@ -407,6 +408,14 @@ class PrefillDelayerSinglePassExecutor:
     @property
     def _called(self) -> bool:
         return self._result is not None
+
+    @property
+    def holds_requests_during_prefill(self) -> bool:
+        # With rank-local LoRA admission, TP ranks can disagree on which queued
+        # requests are admissible. Only the shared delay verdict keeps their
+        # batches equal, so it must hold back new requests even when this pass
+        # already prefills a continuing chunk.
+        return self._prefill_delayer.rank_local_admission
 
     def finalize(self, *, actual_prefill_bs: int) -> int:
         if not self._called:

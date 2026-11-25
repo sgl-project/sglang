@@ -80,8 +80,9 @@ class _RecordingDelayer:
     the local_prefillable value of every negotiate call and returns a fixed
     verdict."""
 
-    def __init__(self, allow: bool):
+    def __init__(self, allow: bool, holds_requests_during_prefill: bool = False):
         self.allow = allow
+        self.holds_requests_during_prefill = holds_requests_during_prefill
         self.calls = []
 
     def negotiate_should_allow_prefill(self, local_prefillable, **kwargs):
@@ -2910,6 +2911,36 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertEqual(result, AddReqResult.CONTINUE)
                 self.assertEqual(adder.can_run_list, [chunk, req])
                 self.assertEqual(delayer.calls, [True])
+
+    def test_delay_verdict_holds_back_requests_with_rank_local_lora_admission(self):
+        """With rank-local LoRA admission, TP ranks can disagree on which queued
+        request is admissible, so a delay verdict must still hold back new
+        requests when a continuing chunk already prefills; otherwise rank 0 can
+        build [chunk, req] while rank 1 builds [chunk]."""
+        for ignore_eos in (False, True):
+            with self.subTest(ignore_eos=ignore_eos):
+                self.mock_tree_cache.disable = ignore_eos
+                delayer = _RecordingDelayer(
+                    allow=False, holds_requests_during_prefill=True
+                )
+                adder = self._create_delayer_adder(
+                    available_tokens=100_000, delayer=delayer, rem_chunk_tokens=500
+                )
+                chunk = self._create_delayer_req(200, rid="chunk")
+                self.assertIsNone(adder.add_chunked_req(chunk))
+                req = self._create_delayer_req(50, rid="short")
+                req.sampling_params.ignore_eos = ignore_eos
+                for r in (chunk, req):
+                    r.origin_input_ids = r.full_untruncated_fill_ids
+
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+
+                self.assertEqual(result, AddReqResult.OTHER)
+                self.assertEqual(adder.can_run_list, [chunk])
+                # The queued request asks for the verdict too, unlike the no-LoRA case.
+                self.assertEqual(delayer.calls, [True, True])
 
     def _create_delayer_adder(self, *, available_tokens, delayer, **kwargs):
         self.mock_token_allocator.available_size.return_value = available_tokens

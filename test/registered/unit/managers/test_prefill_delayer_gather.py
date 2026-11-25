@@ -10,7 +10,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.distributed.utils import all_gather_single
-from sglang.srt.managers.prefill_delayer import PrefillDelayer, _State
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
+    PrefillDelayerSinglePassExecutor,
+    _State,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
@@ -197,6 +201,9 @@ def _negotiate_with_diverging_readiness(rank, world_size, init_file, out_dir):
                         ]
                     )
                 traces[name] = trace
+                traces[f"{name}:holds"] = PrefillDelayerSinglePassExecutor(
+                    delayer, token_usage=0.9
+                ).holds_requests_during_prefill
     finally:
         torch.distributed.destroy_process_group()
     with open(os.path.join(out_dir, f"rank{rank}.json"), "w") as f:
@@ -233,6 +240,11 @@ class TestPrefillDelayerRankLocalAdmission(CustomTestCase):
         self.assertEqual(traces[0]["drain"], expected_lora)
         # Identical rows: the first verdict needs no gather.
         self.assertEqual(traces[0]["no_lora"][0], [False, False, False])
+        # Rank-local admission also keeps the delay verdict binding once a chunk
+        # prefills, so ranks cannot build different batches on a delay pass.
+        self.assertTrue(traces[0]["overlap_loading:holds"])
+        self.assertTrue(traces[0]["drain:holds"])
+        self.assertFalse(traces[0]["no_lora:holds"])
 
 
 if __name__ == "__main__":
