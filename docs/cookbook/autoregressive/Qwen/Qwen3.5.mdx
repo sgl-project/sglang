@@ -1218,3 +1218,21 @@ python3 -m sglang.benchmark.serving \
 ```text Output
 TODO
 ```
+
+### 5.4 Long text on two H200 GPUs with Qwen3.5-122B-A10B-FP8
+
+Use this recipe for text-only serving on two 141 GB H200 GPUs (TP2), with speculative decoding disabled. It was tested at 128 concurrent requests with 8192 input tokens before chat templating and 1024 output tokens per request. Set `MODEL_PATH` to your local checkpoint.
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path "$MODEL_PATH" --served-model-name Qwen/Qwen3.5-122B-A10B-FP8 --tp-size 2 \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder --tokenizer-worker-num 6 \
+  --flashinfer-allreduce-fusion-backend auto --attention-backend flashinfer \
+  --prefill-attention-backend fa3 --decode-attention-backend flashinfer \
+  --mamba-ssm-dtype float32 --linear-attn-prefill-backend triton \
+  --enable-mixed-chunk --chunked-prefill-size 6144 --cuda-graph-max-bs-prefill 8192 \
+  --mem-fraction-static 0.895 --max-total-tokens 1572864 \
+  --max-mamba-cache-size 640 --max-running-requests 128 --host 127.0.0.1 --port 31001
+```
+
+At matched cache capacity, the model answered 222 of 256 held-out GSM8K questions correctly with FP32 recurrent state and 205 with BF16. Switching to FP32 reduced output throughput by 4.7%, from 2786 to 2655 tokens/s.

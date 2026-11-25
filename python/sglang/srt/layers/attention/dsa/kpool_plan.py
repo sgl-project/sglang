@@ -16,9 +16,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     refresh_kpool_topk_v2_plan,
     update_kpool_write_plan_cuda_graph,
 )
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -80,14 +78,6 @@ class TailWriteRows:
 
 
 @dataclass(frozen=True)
-class KPoolCpInfo:
-    size: int
-    rank: int
-    owner_rank: torch.Tensor
-    local_write_mask: torch.Tensor
-
-
-@dataclass(frozen=True)
 class KPoolExtendPlan:
     writes: PoolWriteRows
     tails: TailWriteRows
@@ -101,7 +91,6 @@ class KPoolExtendPlan:
     ragged_k_scale: Optional[torch.Tensor] = None
     ragged_paged_page_table: Optional[torch.Tensor] = None
     ragged_paged_page_table_row_index: Optional[torch.Tensor] = None
-    cp: Optional[KPoolCpInfo] = None
 
 
 @dataclass(frozen=True)
@@ -559,34 +548,6 @@ def _kpool_plan_to_gpu(
         ragged_k_scale=ragged_k_scale,
         ragged_paged_page_table=ragged_paged_page_table,
         ragged_paged_page_table_row_index=ragged_paged_page_table_row_index,
-        cp=_kpool_cp_owner_rank(forward_batch, n_pool, device),
-    )
-
-
-def _kpool_cp_owner_rank(
-    forward_batch: ForwardBatch,
-    n_pool: int,
-    device: torch.device,
-) -> Optional[KPoolCpInfo]:
-    if not dsa_use_prefill_cp(forward_batch):
-        return None
-
-    cp_size = get_parallel().attn_cp_size
-    if cp_size <= 1:
-        return None
-
-    cp_rank = get_parallel().attn_cp_rank
-    if n_pool > 0:
-        owner = torch.arange(n_pool, dtype=torch.int32, device=device) % cp_size
-        local_write_mask = owner == cp_rank
-    else:
-        owner = torch.empty((0,), dtype=torch.int32, device=device)
-        local_write_mask = torch.empty((0,), dtype=torch.bool, device=device)
-    return KPoolCpInfo(
-        size=cp_size,
-        rank=cp_rank,
-        owner_rank=owner,
-        local_write_mask=local_write_mask,
     )
 
 
