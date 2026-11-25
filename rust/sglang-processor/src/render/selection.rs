@@ -2,9 +2,8 @@
 
 use dynamo_renderer::{kimi_k3_formatter_for, native_formatter_for};
 
-use super::legacy::infer_legacy_template_from_model_path;
 use super::{ChatFormatter, TemplateError, ThinkingTemplates, load_chat_formatter};
-use crate::model_files::{resolve_chat_template_file, resolve_model_file, resolve_tokenizer_file};
+use crate::model_files::{resolve_model_file, resolve_tokenizer_file};
 
 /// Model and template sources used to select a chat formatter.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -76,28 +75,11 @@ pub fn select_chat_formatter(
             );
         }
     }
-    // Python's `load_chat_template` guesses a legacy template from the model
-    // path before it reads the checkpoint's own template.
-    let legacy_model = || {
-        !config.model_path.is_empty()
-            && infer_legacy_template_from_model_path(
-                &config.model_path,
-                identity.model_type.as_deref(),
-            )
-            .is_some()
-    };
-    let discovered_template = (config.chat_template.is_none() && !legacy_model())
-        .then(|| resolve_chat_template_file(&config.tokenizer_path, config.revision.as_deref()))
-        .flatten();
-    let template_source = config
-        .chat_template
-        .as_deref()
-        .or(discovered_template.as_deref());
     let loaded = load_chat_formatter(
         tokenizer_config_file.as_deref(),
         (!config.model_path.is_empty()).then_some(config.model_path.as_str()),
         identity.model_type.as_deref(),
-        template_source,
+        config.chat_template.as_deref(),
     );
     // Python's `resolve_chat_encoding_spec`: a model's own encoder only when it
     // ships no template.
@@ -125,7 +107,7 @@ pub fn select_chat_formatter(
             }
             tracing::info!(
                 config = ?tokenizer_config_file.as_deref().unwrap_or("<built-in / inferred>"),
-                template = ?template_source,
+                template = ?config.chat_template,
                 "loaded OpenAI chat template"
             );
             (Some(formatter), None)

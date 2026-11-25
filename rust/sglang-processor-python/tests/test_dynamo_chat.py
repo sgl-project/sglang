@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from dynamo.llm.exceptions import InvalidArgument
 from sglang_processor import ChatProcessor
-from sglang_processor.dynamo import DynamoChat
+from sglang_processor.dynamo import DynamoChat, _load
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 
 
@@ -84,3 +84,153 @@ def test_kimi_public_usage_excludes_stub_on_worker_cache_hit(tmp_path):
     assert frame["usage"]["prompt_tokens_details"]["cached_tokens"] == prompt_len - 3
     assert frame["usage"]["total_tokens"] == prompt_len - 3
     assert frame["llm_metrics"]["input_tokens"] == prompt_len
+
+
+@pytest.fixture
+def turn_tokenizer(tmp_path):
+    # One turn-end spelling exists only in the base vocabulary. The other
+    # two are added tokens, one of which is intentionally marked ordinary.
+    words = ["[UNK]", "<|ifm|im_end|>", "prompt", "think", "response", "answer"]
+    tokenizer = Tokenizer(
+        models.WordLevel({w: i for i, w in enumerate(words)}, "[UNK]")
+    )
+    tokenizer.decoder = decoders.Fuse()
+    tokenizer.add_special_tokens(["<|open|>", "<|close|>", "<|sep|>", "<|eom_id|>"])
+    tokenizer.add_tokens(["<|content_model_end_sampling|>"])
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages[0].content }}"})
+    )
+    return tokenizer
+
+
+def run_generation(chat, eos, parser, batches, **options):
+    workers = []
+
+    async def generate(worker, context):
+        workers.append(worker)
+
+        async def frames():
+            for i, ids in enumerate(batches):
+                frame = {
+                    "token_ids": ids,
+                    "finish_reason": "length" if i == len(batches) - 1 else None,
+                }
+                yield SimpleNamespace(
+                    is_error=lambda: False, data=lambda frame=frame: frame
+                )
+
+        return frames()
+
+    async def run():
+        adapter = DynamoChat(
+            chat, SimpleNamespace(generate=generate), eos, reasoning_parser=parser
+        )
+        request = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "prompt"}],
+            **options,
+        }
+        return [chunk["choices"][0] async for chunk in adapter.generate(request)]
+
+    choices = asyncio.run(run())
+    return workers[0], choices
+
+
+def test_added_turn_end_tokens_stop_generation(tmp_path, turn_tokenizer):
+    chat, eos = _load(str(tmp_path), None)
+    token_id = turn_tokenizer.token_to_id
+    ids = [token_id(w) for w in ("answer", "<|eom_id|>", "response")]
+    worker, choices = run_generation(chat, eos, None, [ids])
+    assert worker["stop_conditions"]["stop_token_ids_hidden"] == sorted(
+        [token_id("<|eom_id|>"), token_id("<|content_model_end_sampling|>")]
+    )
+    assert choices[-1]["delta"]["content"] == "answer"
+    assert choices[-1]["finish_reason"] == "stop"
+    assert worker["require_reasoning"] is False
+    worker, choices = run_generation(chat, eos, None, [ids], ignore_eos=True)
+    assert "stop_token_ids_hidden" not in worker["stop_conditions"]
+    assert choices[-1]["delta"]["content"] == "answerresponse"
+    assert choices[-1]["finish_reason"] == "length"
+
+    # A checkpoint can declare a turn end in tokenizer_config.json alone.
+    config_file = tmp_path / "tokenizer_config.json"
+    config = json.loads(config_file.read_text())
+    config["added_tokens_decoder"] = {
+        str(token_id("<|ifm|im_end|>")): {
+            "content": "<|ifm|im_end|>",
+            "special": True,
+            "lstrip": False,
+            "rstrip": False,
+            "single_word": False,
+            "normalized": False,
+        }
+    }
+    config_file.write_text(json.dumps(config))
+    _, configured_eos = _load(str(tmp_path), None)
+    assert set(configured_eos) == {*eos, token_id("<|ifm|im_end|>")}
+
+
+@pytest.mark.parametrize("separate", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_worker_receives_thinking_mode(tmp_path, enabled, separate):
+    chat = processor(tmp_path, "{{ messages[0].content }}")
+    worker, choices = run_generation(
+        chat,
+        [],
+        "qwen3",
+        [[chat.token_id("x")]],
+        chat_template_args={"enable_thinking": enabled},
+        separate_reasoning=separate,
+    )
+    assert worker["require_reasoning"] is enabled
+    delta = choices[-1]["delta"]
+    assert delta.get("reasoning_content", "") == ("x" if separate and enabled else "")
+    assert delta["content"] == ("" if separate and enabled else "x")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_truncated_kimi_channel_name_stays_hidden(tmp_path, turn_tokenizer, stream):
+    chat, eos = _load(str(tmp_path), None)
+    # A literal "response" in the answer must survive; only the channel name
+    # after the final <|close|> belongs to the truncated framing.
+    output = [
+        "think",
+        "<|close|>",
+        "think",
+        "<|sep|>",
+        "<|open|>",
+        "response",
+        "<|sep|>",
+        "answer",
+        "response",
+        "<|close|>",
+        "response",
+    ]
+    batches = [[turn_tokenizer.token_to_id(token)] for token in output]
+    _, choices = run_generation(chat, eos, "kimi_k3", batches, stream=stream)
+    assert "".join(c["delta"].get("reasoning_content", "") for c in choices) == "think"
+    assert "".join(c["delta"]["content"] for c in choices) == "answerresponse"
+    assert choices[-1]["finish_reason"] == "length"
+
+
+def test_named_checkpoint_template_precedence(tmp_path):
+    processor(tmp_path, "embedded")
+    named = tmp_path / "additional_chat_templates"
+    named.mkdir()
+    (named / "rag.jinja").write_text(r"named\n{{ messages[0].content }}")
+    request = json.dumps(
+        {"model": "m", "messages": [{"role": "user", "content": "Hi"}]}
+    ).encode()
+    tokenizer = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
+
+    def render(template=None):
+        ids = ChatProcessor(str(tmp_path), template).encode_chat(request)
+        return tokenizer.decode(ids)
+
+    assert render() == r"named\nHi"
+    (tmp_path / "chat_template.jinja").write_text("root")
+    assert render() == "root"
+    (named / "default.jinja").write_text("named default")
+    assert render() == "named default"
+    assert render(str(named / "rag.jinja")) == "named\nHi"

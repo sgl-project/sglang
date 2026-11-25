@@ -55,11 +55,17 @@ pub fn load_chat_formatter(
     let config_text = read_to_string(config_path, "tokenizer config")?;
     let mut config = parse_json(&config_text, config_path, "tokenizer config")?;
 
-    let Some(argument) = chat_template_arg else {
+    let discovered = if chat_template_arg.is_none() {
+        config_path
+            .parent()
+            .and_then(crate::model_files::discover_chat_template_in_dir)
+    } else {
+        None
+    };
+    let Some(path) = chat_template_arg.map(Path::new).or(discovered.as_deref()) else {
         return ChatFormatter::from_tokenizer_config_with_type(&config, model_type);
     };
 
-    let path = Path::new(argument);
     if !path.exists() {
         return Err(TemplateError::NotFound {
             path: path.to_path_buf(),
@@ -73,10 +79,19 @@ pub fn load_chat_formatter(
 
     if path.extension().and_then(|extension| extension.to_str()) == Some("jinja") {
         let template = read_to_string(path, "chat template")?;
-        set_chat_template(
-            &mut config,
-            Value::String(template.trim_matches('\n').replace("\\n", "\n")),
-        )?;
+        // HF reads checkpoint templates verbatim. Keep SGLang's escape
+        // handling for explicit files and the legacy loose-file fallback.
+        let hf_template = discovered.is_some()
+            && (path
+                .file_name()
+                .is_some_and(|name| name == "chat_template.jinja")
+                || path.parent() != config_path.parent());
+        let template = if hf_template {
+            template
+        } else {
+            template.trim_matches('\n').replace("\\n", "\n")
+        };
+        set_chat_template(&mut config, Value::String(template))?;
         return ChatFormatter::from_tokenizer_config_with_type(&config, model_type);
     }
 

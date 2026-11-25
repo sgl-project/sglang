@@ -29,14 +29,6 @@ pub fn resolve_tokenizer_file(path: &str, revision: Option<&str>) -> Option<Stri
     discover_tokenizer_in_dir(&directory).map(|path| path.to_string_lossy().into_owned())
 }
 
-/// Resolve a dedicated Hugging Face chat-template file when the template is
-/// not embedded in `tokenizer_config.json`.
-#[cfg(feature = "render")]
-pub(crate) fn resolve_chat_template_file(path: &str, revision: Option<&str>) -> Option<String> {
-    let directory = model_directory(path, revision)?;
-    discover_chat_template_in_dir(&directory).map(|path| path.to_string_lossy().into_owned())
-}
-
 fn model_directory(path: &str, revision: Option<&str>) -> Option<PathBuf> {
     let input = Path::new(path);
     if input.is_dir() {
@@ -93,12 +85,28 @@ fn discover_tokenizer_in_dir(directory: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(feature = "render")]
-fn discover_chat_template_in_dir(directory: &Path) -> Option<PathBuf> {
+pub(crate) fn discover_chat_template_in_dir(directory: &Path) -> Option<PathBuf> {
     for name in ["chat_template.json", "chat_template.jinja"] {
         let candidate = directory.join(name);
         if candidate.is_file() {
+            // Transformers loads the root template as "default", then
+            // overlays named templates from additional_chat_templates.
+            let named_default = directory.join("additional_chat_templates/default.jinja");
+            if name == "chat_template.jinja" && named_default.is_file() {
+                return Some(named_default);
+            }
             return Some(candidate);
         }
+    }
+    // SGLang selects the first HF template. For local checkpoints,
+    // Transformers enumerates the directory in filesystem order.
+    if let Ok(mut entries) = std::fs::read_dir(directory.join("additional_chat_templates"))
+        && let Some(path) = entries.find_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()?.to_str()? == "jinja" && path.is_file()).then_some(path)
+        })
+    {
+        return Some(path);
     }
     sorted_directory_files(directory).find(|path| {
         path.file_name()
@@ -203,13 +211,8 @@ mod tests {
         );
         #[cfg(feature = "render")]
         assert_eq!(
-            resolve_chat_template_file(directory.to_str().unwrap(), None),
-            Some(
-                directory
-                    .join("chat_template.jinja")
-                    .to_string_lossy()
-                    .into_owned()
-            )
+            discover_chat_template_in_dir(&directory),
+            Some(directory.join("chat_template.jinja"))
         );
 
         std::fs::remove_dir_all(directory).unwrap();

@@ -19,6 +19,15 @@ from dynamo.llm.exceptions import InvalidArgument
 
 from . import ChatProcessor
 
+# Keep in sync with sglang.srt.hf_transformers.common._ADDITIONAL_STOP_TOKEN_TEXTS.
+_TURN_END_TOKENS = ("<|eom_id|>", "<|content_model_end_sampling|>", "<|ifm|im_end|>")
+
+
+class _TokenizerAddedTokens(msgspec.Struct):
+    # Decode only the added vocabulary, without materializing the base model.
+    added_tokens: list[dict] = msgspec.field(default_factory=list)
+
+
 _SAMPLING = {
     "temperature",
     "top_p",
@@ -256,7 +265,7 @@ class DynamoChat:
         if kwargs:
             request = dict(request, chat_template_kwargs=kwargs)
         body = msgspec.json.encode(request)
-        if self.reasoning_parser and request.get("separate_reasoning", True):
+        if self.reasoning_parser:
             return self.processor.encode_reasoning_chat(body, self.reasoning_parser)
         return self.processor.encode_chat(body), None
 
@@ -267,6 +276,11 @@ class DynamoChat:
         except ValueError as error:
             raise InvalidArgument(str(error)) from error
         worker = _worker_request(request, ids, self.eos, self.template_stops)
+        worker["require_reasoning"] = (
+            splitter is not None and splitter.require_reasoning
+        )
+        if not request.get("separate_reasoning", True):
+            splitter = None
         stops = worker["stop_conditions"]
         skip_special = worker["output_options"]["skip_special_tokens"]
         tail = ids[-5:]
@@ -380,16 +394,24 @@ class DynamoChat:
 
 def _load(model_dir, template):
     processor = ChatProcessor(model_dir, template)
+    model_dir = Path(model_dir)
     eos = set()
     for name in ("config.json", "generation_config.json"):
-        path = Path(model_dir) / name
+        path = model_dir / name
         if path.exists():
             value = json.loads(path.read_bytes()).get("eos_token_id")
             if value is not None:
                 eos.update(value if isinstance(value, list) else [value])
-    path = Path(model_dir) / "tokenizer_config.json"
+    path = model_dir / "tokenizer_config.json"
+    added = set()
     if path.exists():
-        token = json.loads(path.read_bytes()).get("eos_token")
+        config = json.loads(path.read_bytes())
+        added.update(
+            t.get("content")
+            for t in (config.get("added_tokens_decoder") or {}).values()
+            if isinstance(t, dict)
+        )
+        token = config.get("eos_token")
         if isinstance(token, dict):
             token = token.get("content")
         if (
@@ -397,6 +419,18 @@ def _load(model_dir, template):
             and (token_id := processor.token_id(token)) is not None
         ):
             eos.add(token_id)
+    candidates = {
+        text: token_id
+        for text in _TURN_END_TOKENS
+        if (token_id := processor.token_id(text)) is not None
+    }
+    # Some HF checkpoints store added tokens only in tokenizer.json. A
+    # matching spelling in the base vocabulary alone is not a turn boundary.
+    path = model_dir / "tokenizer.json"
+    if candidates.keys() - added and path.is_file():
+        metadata = msgspec.json.decode(path.read_bytes(), type=_TokenizerAddedTokens)
+        added.update(t["content"] for t in metadata.added_tokens)
+    eos.update(token_id for text, token_id in candidates.items() if text in added)
     return processor, sorted(eos)
 
 

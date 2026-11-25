@@ -76,7 +76,7 @@ impl ChatProcessor {
             .encode_segments(&[EncodeSegment::new(token, true)])
             .map_err(invalid)?;
         Ok(match ids.token_ids() {
-            &[id] => Some(id),
+            &[id] if tokenizer.decode(&[id], false).map_err(invalid)?.as_str() == token => Some(id),
             _ => None,
         })
     }
@@ -105,8 +105,16 @@ impl ChatProcessor {
                 let ids = encoded.token_ids();
                 let raw = tokenizer.decode(ids, false).ok()?;
                 let filtered = tokenizer.decode(ids, true).ok()?;
-                (raw.as_str() == marker && filtered.as_str() != marker)
-                    .then(|| (ids.to_vec(), marker))
+                (raw.as_str() == marker && filtered.as_str() != marker).then(|| FramingMarker {
+                    ids: ids.to_vec(),
+                    text: marker,
+                    // K3 channel names after a skipped control token are
+                    // framing even when generation stops before the separator.
+                    discard_partial: reasoning_parser == Some("kimi_k3")
+                        && tokenizer
+                            .decode(&ids[..1], true)
+                            .is_ok_and(|s| s.as_str().is_empty()),
+                })
             })
             .collect();
         Decoder {
@@ -133,6 +141,9 @@ impl ChatProcessor {
         py.detach(|| {
             let body: Value = serde_json::from_slice(request_json).map_err(invalid)?;
             let mut options = self.reasoning_options(name, &body);
+            // The worker receives the request's thinking mode. GLM's rendered
+            // suffix below only adjusts how the output parser splits text.
+            let require_reasoning = options.force_reasoning.unwrap_or(false);
             let check_glm_prompt = name == "glm45"
                 && body["continue_final_message"] != true
                 && body["add_generation_prompt"] != false;
@@ -143,7 +154,14 @@ impl ChatProcessor {
             }
             let parser = sglang_processor::ReasoningStream::new(name, &options)
                 .ok_or_else(|| invalid(format!("unsupported reasoning parser {name}")))?;
-            Ok((ids, ReasoningDecoder { parser, unary_text }))
+            Ok((
+                ids,
+                ReasoningDecoder {
+                    parser,
+                    unary_text,
+                    require_reasoning,
+                },
+            ))
         })
     }
 }
@@ -249,6 +267,8 @@ impl ChatProcessor {
 struct ReasoningDecoder {
     parser: sglang_processor::ReasoningStream,
     unary_text: Option<String>,
+    #[pyo3(get)]
+    require_reasoning: bool,
 }
 
 #[pymethods]
@@ -266,11 +286,17 @@ impl ReasoningDecoder {
     }
 }
 
+struct FramingMarker {
+    ids: Vec<u32>,
+    text: &'static str,
+    discard_partial: bool,
+}
+
 /// One incremental decoder per generation. Token boundaries can split UTF-8.
 #[pyclass(module = "sglang_processor._native")]
 struct Decoder {
     stream: DecodeStream,
-    framing: Vec<(Vec<u32>, &'static str)>,
+    framing: Vec<FramingMarker>,
     pending: VecDeque<u32>,
 }
 
@@ -303,25 +329,28 @@ impl Decoder {
     /// tokens. Decode every other token with the caller's normal skip setting.
     fn decode_pending(&mut self, finished: bool, text: &mut String) -> PyResult<()> {
         while let Some(&id) = self.pending.front() {
-            if let Some((ids, marker)) = self
+            if let Some(marker) = self
                 .framing
                 .iter()
-                .find(|(ids, _)| self.pending.iter().take(ids.len()).eq(ids))
+                .find(|m| self.pending.iter().take(m.ids.len()).eq(&m.ids))
             {
                 text.extend(self.stream.finish().map_err(invalid)?);
-                text.push_str(marker);
-                self.pending.drain(..ids.len());
-            } else if !finished
-                && self
-                    .framing
-                    .iter()
-                    .any(|(ids, _)| ids.iter().take(self.pending.len()).eq(self.pending.iter()))
-            {
-                break;
-            } else {
-                self.pending.pop_front();
-                text.extend(self.stream.step(id).map_err(invalid)?);
+                text.push_str(marker.text);
+                self.pending.drain(..marker.ids.len());
+                continue;
             }
+            let pending = self.pending.make_contiguous();
+            if let Some(marker) = self.framing.iter().find(|m| m.ids.starts_with(pending)) {
+                if !finished {
+                    break;
+                }
+                if marker.discard_partial {
+                    self.pending.clear();
+                    break;
+                }
+            }
+            self.pending.pop_front();
+            text.extend(self.stream.step(id).map_err(invalid)?);
         }
         Ok(())
     }
