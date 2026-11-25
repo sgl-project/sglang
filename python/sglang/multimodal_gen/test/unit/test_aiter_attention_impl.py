@@ -162,6 +162,39 @@ def test_tail_rows_with_split_keys_match_one_launch():
     assert torch.equal(out, again)
 
 
+@pytest.mark.parametrize("split_heads, full_rows", [(0, 32768), (7, 37376)])
+def test_head_group_calls_plan_the_tail_split_of_a_wider_call(split_heads, full_rows):
+    """SGLANG_DIFFUSION_AITER_TAIL_SPLIT_HEADS plans a 2-head call's split for 7
+    heads: MiniMax-H3's 7-head calls split at row 37376 on 256 CUs, 2-head
+    calls on their own at 32768."""
+    impl = _impl_cls()(
+        num_heads=2,
+        head_size=HEAD_SIZE,
+        softmax_scale=HEAD_SIZE**-0.5,
+        packed_trailing_padding=True,
+    )
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    used, total = 37757, 37760
+    q = torch.empty(total, 2, HEAD_SIZE, dtype=torch.bfloat16)
+    bounds = (0, used, total)
+    with (
+        patch.object(backend, "USE_AITER_GFX95", True),
+        patch.object(backend, "_TAIL_SPLIT_HEADS", split_heads),
+        patch.object(backend, "_num_cus", return_value=256),
+        patch.object(backend, "_tail_split_attention") as split,
+    ):
+        impl.forward_varlen(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor(bounds, dtype=torch.int32),
+            max_seqlen=used,
+            cu_seqlens_host=bounds,
+        )
+    assert split.call_args.args[-1] == full_rows
+
+
 class TestBF16AttentionUnderCompile(unittest.TestCase):
     """BF16 flash_attn_func must run outside Dynamo when tracing it would skip the DiT.
 
