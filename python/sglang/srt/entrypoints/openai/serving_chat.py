@@ -140,6 +140,7 @@ from sglang.srt.parser.response_template import (
 from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
+    set_request_reasoning_gated_ebnf,
     set_request_reasoning_in_grammar,
 )
 from sglang.srt.utils.json_response import model_json_response
@@ -1274,6 +1275,9 @@ class OpenAIServingChat(OpenAIServingBase):
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
+        set_request_reasoning_gated_ebnf(
+            sampling_params, processed_messages.reasoning_gated_ebnf
+        )
 
         # Handle single vs multiple requests
         if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
@@ -1772,6 +1776,7 @@ class OpenAIServingChat(OpenAIServingBase):
         xgrammar_reasoning = thinking_mode and (self.reasoning_parser is None)
         tool_call_constraint = None
         template_tool_parser = None
+        reasoning_gated_ebnf = None
 
         effective_tools = self._effective_tools(request)
         # A grammar reaching its terminal state ends generation regardless of
@@ -1784,16 +1789,8 @@ class OpenAIServingChat(OpenAIServingBase):
             and not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
-            enable_thinking = (request.chat_template_kwargs or {}).get(
-                "enable_thinking"
-            )
-            parser = FunctionCallParser(effective_tools, self.tool_call_parser)
-            tool_call_constraint = parser.get_structure_constraint(
-                request.tool_choice,
-                parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=(
-                    True if enable_thinking is None else bool(enable_thinking)
-                ),
+            tool_call_constraint, reasoning_gated_ebnf = self._glm47_tool_constraint(
+                request, effective_tools, thinking_mode=thinking_mode
             )
 
         # Apply chat template and its stop strings
@@ -1926,6 +1923,7 @@ class OpenAIServingChat(OpenAIServingBase):
             configure_response_template_request(request)
             result.uses_response_template = True
         result.tool_call_constraint = tool_call_constraint
+        result.reasoning_gated_ebnf = reasoning_gated_ebnf
         result.require_reasoning = thinking_mode
         if template_tool_parser is not None and result.uses_response_template:
             self._record_template_tool_call_grammar(
@@ -1958,6 +1956,48 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             result.reasoning_end_token_ids = list(token_ids)
         return result
+
+    def _glm47_tool_constraint(
+        self,
+        request: ChatCompletionRequest,
+        tools: List[Tool],
+        *,
+        thinking_mode: bool,
+    ) -> tuple[Optional[ToolCallConstraint], Optional[Callable[[], Optional[str]]]]:
+        """The glm47 whole-turn tool grammar, and a builder of its
+        post-reasoning variant.
+
+        The grammar matches the end of the reasoning as the text `</think>`,
+        which ordinary tokens can spell. A grammar backend that ends the
+        reasoning at the token ids applies the variant after them instead; it
+        is built only for a request that reaches the engine."""
+        enable_thinking = (request.chat_template_kwargs or {}).get("enable_thinking")
+        grammar_thinking = True if enable_thinking is None else bool(enable_thinking)
+        parser = FunctionCallParser(tools, self.tool_call_parser)
+        constraint = parser.get_structure_constraint(
+            request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
+            thinking_mode=grammar_thinking,
+        )
+        # Only a reasoning parser sets up the token-id gate, and only output
+        # that the grammar and require_reasoning both open in the reasoning
+        # reaches it; otherwise the grammar alone stays in charge.
+        if (
+            constraint is None
+            or self.reasoning_parser is None
+            or not (grammar_thinking and thinking_mode)
+        ):
+            return constraint, None
+
+        def reasoning_gated_ebnf() -> Optional[str]:
+            gated = parser.get_structure_constraint(
+                request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
+                thinking_mode=False,
+            )
+            return gated[1] if gated is not None else None
+
+        return constraint, reasoning_gated_ebnf
 
     def _apply_jinja_template(
         self,

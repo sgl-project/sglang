@@ -194,6 +194,9 @@ class InvalidGrammarObject(BaseGrammarObject):
 
 class BaseGrammarBackend:
     _enable_strict_thinking: bool = False
+    # Whether grammars start after the reasoning's end token ids rather than at
+    # the first output token.
+    gates_reasoning_by_token_ids: bool = False
 
     # Compiled grammars are kept in an LRU cache bounded by host memory. Each
     # compiled grammar holds per-vocabulary token tables, so an unbounded cache

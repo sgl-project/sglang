@@ -21,7 +21,7 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from xgrammar import TokenizerInfo
+from xgrammar import TokenizerInfo, VocabType
 
 from sglang.srt.constrained import reasoner_grammar_backend
 from sglang.srt.constrained.base_grammar_backend import (
@@ -36,6 +36,8 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
 )
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, Tool
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -49,7 +51,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
-from sglang.srt.parser.reasoning_parser import InklingDetector
+from sglang.srt.parser.reasoning_parser import InklingDetector, ReasoningParser
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_context,
@@ -59,7 +61,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
+    REQUEST_REASONING_GATED_EBNF_KEY,
     REQUEST_REASONING_IN_GRAMMAR_KEY,
+    SamplingParams,
+    set_request_reasoning_gated_ebnf,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -268,6 +273,33 @@ class TestProcessReqWithGrammar(unittest.TestCase):
                 result = mgr.process_req_with_grammar(req)
                 self.assertTrue(result)
                 self.assertEqual(req.grammar_key, (key_type, 'root ::= "hello"'))
+
+    def test_reasoning_gated_variant_needs_a_gating_backend(self):
+        """A whole-turn EBNF yields to its post-reasoning variant only on a
+        backend that ends the reasoning at the token ids, and only for output
+        that opens in the reasoning; anywhere else the grammar must keep
+        describing the reasoning itself."""
+        mgr = self._make_mgr()
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (Future(), False)
+        whole, gated = 'root ::= "whole"', 'root ::= "gated"'
+        for gates, reasoning, full_assistant, expected in (
+            (True, True, True, ("ebnf", gated)),
+            (False, True, True, ("full_assistant_ebnf", whole)),
+            (True, False, True, ("full_assistant_ebnf", whole)),
+            (True, True, False, ("ebnf", whole)),
+        ):
+            with self.subTest(
+                gates=gates, reasoning=reasoning, full_assistant=full_assistant
+            ):
+                mgr.grammar_backend.gates_reasoning_by_token_ids = gates
+                req = _make_req(
+                    ebnf=whole,
+                    custom_params={REQUEST_REASONING_GATED_EBNF_KEY: gated},
+                )
+                req.sampling_params.ebnf_full_assistant = full_assistant
+                req.require_reasoning = reasoning
+                mgr.process_req_with_grammar(req)
+                self.assertEqual(req.grammar_key, expected)
 
     def test_structural_tag_cache_miss(self):
         mgr = self._make_mgr()
@@ -1077,6 +1109,133 @@ class TestStrictReasoningPaths(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIsInstance(result[0].grammar, InvalidGrammarObject)
         req.set_finish_with_abort.assert_called_once()
+
+
+class TestGlm47ToolGrammarReasoningEnd(unittest.TestCase):
+    """The glm47 tool grammar must end the reasoning only at the `</think>` token.
+
+    Its whole-turn EBNF matched the end of thinking as text, and the reasoning
+    grammar backend passed that grammar through unwrapped. Reasoning that
+    spelled the tag with ordinary tokens then left the reasoning, and the real
+    token was rejected for the rest of the turn.
+    """
+
+    # Bytes plus single-token GLM markers, so a spelled tag is byte tokens.
+    MARKERS = ("<think>", "</think>", "<tool_call>", "</tool_call>")
+
+    def setUp(self):
+        scheduler = _make_scheduler()
+        self.addCleanup(reset_context)
+        enter_override(
+            self, get_context().override_server_args(skip_tokenizer_init=True)
+        )
+        self.mgr = GrammarManager(scheduler)
+        self.mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 0.01
+        self.ids = {marker: 256 + i for i, marker in enumerate(self.MARKERS)}
+        self.vocab = [bytes([i]) for i in range(256)] + [
+            marker.encode() for marker in self.MARKERS
+        ]
+        info = TokenizerInfo(self.vocab, vocab_type=VocabType.RAW)
+        self.tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: (
+                [self.ids[text]] if text in self.ids else list(text.encode())
+            ),
+            init_xgrammar=lambda: (info, None),
+        )
+
+    def _sampling_params(self):
+        # The serving layer's own steps: build the constraint, then the params.
+        tool = {
+            "type": "function",
+            "function": {"name": "alpha", "parameters": {"type": "object"}},
+        }
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Call alpha."}],
+            tools=[tool],
+        )
+        chat = OpenAIServingChat.__new__(OpenAIServingChat)
+        chat.tool_call_parser = "glm47"
+        chat.reasoning_parser = "glm45"
+        constraint, build_gated = chat._glm47_tool_constraint(
+            request, [Tool.model_validate(tool)], thinking_mode=True
+        )
+        params = request.to_sampling_params(
+            stop=[], model_generation_config={}, tool_call_constraint=constraint
+        )
+        set_request_reasoning_gated_ebnf(params, build_gated)
+        return params
+
+    def _grammar(self, backend):
+        self.mgr.grammar_backend = backend
+        req = _make_req()
+        params = self._sampling_params()
+        req.sampling_params = SamplingParams(**params)
+        req.require_reasoning = True
+        req.origin_input_ids = [1, 2, 3]
+        if self.mgr.process_req_with_grammar(req):
+            req.grammar.result(timeout=30)
+            # As the scheduler does, which moves the ready requests to waiting.
+            move(
+                self.mgr.get_ready_grammar_requests(),
+                IndexedReqList(ListKind.WAITING),
+            )
+        return req.grammar
+
+    def _allowed(self, grammar, token):
+        mask = grammar.allocate_vocab_mask(len(self.vocab), 1, "cpu")
+        grammar.fill_vocab_mask(mask, 0)
+        return bool((int(mask[0, token // 32]) >> (token % 32)) & 1)
+
+    def _walk(self, grammar, text_or_ids):
+        for token in text_or_ids:
+            self.assertTrue(self._allowed(grammar, token), self.vocab[token])
+            grammar.accept_token(token)
+
+    def _cases(self):
+        think_end = self.ids["</think>"]
+        call = (
+            [self.ids["<tool_call>"]]
+            + list(b"alpha")
+            + [self.ids["</tool_call>"], self.ids["<tool_call>"]]
+        )
+        return think_end, call
+
+    def test_reasoner_backend_ends_reasoning_at_the_token(self):
+        reasoner = ReasonerGrammarBackend(
+            XGrammarGrammarBackend(self.tokenizer, len(self.vocab)),
+            ReasoningParser("glm45", stream_reasoning=False),
+            self.tokenizer,
+        )
+        think_end, call = self._cases()
+        for name, tokens, closed in (
+            ("real tag", list(b"plan") + [think_end] + call, True),
+            (
+                "spelled, then real",
+                list(b"cite </think> so") + [think_end] + call,
+                True,
+            ),
+            ("spelled only", list(b"cite </think> then answer"), False),
+        ):
+            with self.subTest(name):
+                grammar = self._grammar(reasoner)
+                self._walk(grammar, tokens)
+                if closed:
+                    # The tool-call grammar is active: an undeclared tool is not.
+                    self.assertFalse(self._allowed(grammar, ord("b")))
+                else:
+                    # Still reasoning, so the real tag can still close it.
+                    self.assertTrue(self._allowed(grammar, think_end))
+
+    def test_unwrapped_backend_keeps_the_whole_turn_grammar(self):
+        """A backend that does not gate the reasoning by token ids (a custom
+        one, or none wrapped because the end marker does not encode) still
+        gets the grammar that describes the reasoning, as before."""
+        think_end, call = self._cases()
+        grammar = self._grammar(XGrammarGrammarBackend(self.tokenizer, len(self.vocab)))
+        self.assertNotIsInstance(grammar, ReasonerGrammarObject)
+        self._walk(grammar, list(b"plan</think>") + call)
+        self.assertFalse(self._allowed(grammar, ord("b")))
 
 
 if __name__ == "__main__":

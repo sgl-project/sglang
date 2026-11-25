@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
+    REQUEST_REASONING_GATED_EBNF_KEY,
     get_request_reasoning_in_grammar,
 )
 from sglang.srt.server_args import ServerArgs
@@ -741,6 +742,87 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
             [41, 42],
         )
         self.assertFalse(parser_cls.call_args.kwargs["force_reasoning"])
+
+    def test_create_responses_attaches_the_post_reasoning_grammar(self):
+        """/v1/responses forwards the post-reasoning variant of a whole-turn
+        tool grammar, as Chat does."""
+        serving = make_serving()
+        serving.default_chat_template_kwargs = None
+        built = []
+
+        def build_gated():
+            built.append(True)
+            return 'root ::= "after"'
+
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+            tool_call_constraint=("full_assistant_ebnf", 'root ::= "whole"'),
+            require_reasoning=True,
+            reasoning_gated_ebnf=build_gated,
+        )
+        captured = {}
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["sampling_params"] = adapted_request.sampling_params
+            context.append_output(
+                {
+                    "text": "done",
+                    "meta_info": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        serving._process_messages = Mock(return_value=rendered)
+        cases = (
+            ("whole-turn grammar", {}, 'root ::= "after"'),
+            # An explicit output format replaces the whole-turn grammar, so
+            # its variant is neither built nor sent.
+            ("json text.format", {"text": {"format": {"type": "json_object"}}}, None),
+        )
+        for name, extra, expected in cases:
+            with self.subTest(name):
+                built.clear()
+                request = ResponsesRequest(
+                    model="x",
+                    input="answer",
+                    request_id=f"resp_gated_{len(name)}",
+                    store=False,
+                    **extra,
+                )
+                with patch(
+                    "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+                ) as parser_cls:
+                    parser_cls.return_value.parse_non_stream.return_value = (
+                        None,
+                        "done",
+                    )
+                    asyncio.run(serving.create_responses(request))
+                params = captured["sampling_params"]
+                self.assertEqual(
+                    (params.get("custom_params") or {}).get(
+                        REQUEST_REASONING_GATED_EBNF_KEY
+                    ),
+                    expected,
+                )
+                self.assertEqual(bool(built), expected is not None)
 
 
 class SkipSpecialTokensForwardingTestCase(CustomTestCase):

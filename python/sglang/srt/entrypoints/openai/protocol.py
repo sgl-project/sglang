@@ -2573,6 +2573,9 @@ class MessageProcessingResult:
     skip_special_tokens: bool = True
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
+    # Builds the full_assistant_ebnf tool-call constraint without its
+    # reasoning, so that only a request that reaches the engine pays for it.
+    reasoning_gated_ebnf: Optional[Callable[[], Optional[str]]] = None
     # The tool-call constraint is the response template's own grammar.
     template_tool_call_grammar: bool = False
     # Derives the tool-call constraint for output that starts the assistant
