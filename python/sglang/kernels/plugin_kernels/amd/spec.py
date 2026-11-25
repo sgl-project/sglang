@@ -48,6 +48,10 @@ class StepMetadata(enum.Enum):
     """Per-step attention metadata a backend can skip building."""
 
     LOW_RATIO_DECODE_SCHEDULE = "the aiter decode schedule of each low-ratio indexer"
+    PAGED_KV_INDICES = "the paged attention's KV indices, indptrs and masks"
+    VERIFY_SIDE_TABLES = (
+        "the unified verify's query indptr, key lengths and SWA write slots"
+    )
 
 
 class DeviceLimits(msgspec.Struct, frozen=True):

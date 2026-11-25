@@ -31,6 +31,8 @@ from sglang.kernels.ops.attention.verify_reduce_norm_gate import (
 )
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import LAYOUT as TILED_GEMM_LAYOUT
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+    head_gemm,
+    head_gemm_applies,
     prepare_tiled_weight,
     rowmajor_gemm,
     rowmajor_gemm_applies,
@@ -159,17 +161,19 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
             if embedding_bias is not None:
                 logits = logits + embedding_bias
             return logits
-        logits = torch.mm(
-            hidden_states.to(lm_head.weight.dtype),
-            lm_head.weight.T,
-            out_dtype=output_dtype,
-        )
+        if _HEAD_GEMM and head_gemm_applies(x, lm_head.weight):
+            logits = head_gemm(x, lm_head.weight, output_dtype)
+        else:
+            logits = torch.mm(x, lm_head.weight.T, out_dtype=output_dtype)
         if embedding_bias is not None:
             logits = logits + embedding_bias
         return logits
 
 
 _FINALIZE_AR_PUSH = envs.SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH.get()
+# Vocab heads at up to 16 rows on the Triton row GEMV (bf16_tiled_small_m_gemm.head_gemm); gfx1250 keeps its
+# split-K head.
+_HEAD_GEMM = envs.SGLANG_ROCM_MUSE_HEAD_GEMM.get() and not mxfp4_moe._is_gfx1250()
 
 
 def _is_rocm() -> bool:

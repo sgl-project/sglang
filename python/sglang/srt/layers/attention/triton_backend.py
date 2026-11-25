@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
 )
 from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
+from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.configs.attention_execution import attention_dcp_size
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
@@ -26,6 +27,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd.binding import is_metadata_unread
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
 )
@@ -249,6 +251,7 @@ class TritonAttnBackend(AttentionBackend):
         # Parse args
         self.skip_prefill = skip_prefill
         max_bs = model_runner.req_to_token_pool.size
+        self.model_runner = model_runner
         self.sliding_window_size = model_runner.sliding_window_size
         self.is_gfx950_m31_draft = self.verify_reads_window_kv_only = False
         if _is_hip:
@@ -975,14 +978,19 @@ class TritonAttnBackend(AttentionBackend):
                 ),
             )
         else:
-            self._apply_cuda_graph_metadata(
-                plan=forward_batch.iteration_ids,
-                bs=bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                forward_mode=forward_mode,
-                spec_info=spec_info,
-            )
+            # A monokernel forward that reads the page tables on its own needs
+            # none of the paged KV indices, indptrs and masks rebuilt.
+            if not is_metadata_unread(
+                self.model_runner.model, forward_batch, StepMetadata.PAGED_KV_INDICES
+            ):
+                self._apply_cuda_graph_metadata(
+                    plan=forward_batch.iteration_ids,
+                    bs=bs,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    forward_mode=forward_mode,
+                    spec_info=spec_info,
+                )
             # Metadata view is reused from capture; the write loc is the
             # runner's slot, so only the window write ids need refilling.
             self._fill_cuda_graph_window_out_cache_locs(forward_batch)

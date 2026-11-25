@@ -53,6 +53,9 @@ ROW_MAJOR = {
     (8192, 1024, 32): (32, 256, 1, 8, 3),
     (8192, 1024, 64): (32, 256, 1, 4, 3),
     (8192, 1024, 128): (32, 128, 1, 4, 3),
+    # TP8 DFlash2 context projection, a rank's fc rows [1024, 40960] at 8 rows (11-09: 27.0 vs 36.5 us
+    # hipBLASLt, HBM-resident)
+    (1024, 40960, 16): (64, 256, 16, 4, 3),
     # TP4 DFlash draft (10-24, 1.5 GB of rotating weights per replay, vs aiter tgemm / hipBLASLt):
     # conv kernel projection [2048, 8192] (9.4 vs 12.8 at 16, 9.9 vs 12.8 at 32, 11.8 vs 18.3 at 64, 14.7 vs 20.5
     # at 128, with the sum),
@@ -438,3 +441,69 @@ def rowmajor_gemm_partials(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
         matrix_instr_nonkdim=16,
     )
     return p
+
+
+# Vocab heads at up to 16 rows (the TP8 lm_head shard [25256, 8192], 8 verify / 7 draft rows): 16 weight rows
+# a program over the whole K, no split. MI355X, HBM-resident weight: 83 vs 100 us for torch.mm / hipBLASLt.
+HEAD_MAX_M = 16
+_HEAD_BN, _HEAD_BK = 16, 256
+
+
+@triton.jit
+def _head_gemv(
+    X, W, Y, M, N, K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
+    m = tl.arange(0, BM)
+    kk = tl.arange(0, BK)
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
+    bp = W + n[None, :].to(tl.int64) * K + kk[:, None]
+    ap = X + m[:, None] * K + kk[None, :]
+    acc = tl.zeros((BM, BN), tl.float32)
+    for _ in range(K // BK):
+        a = tl.load(ap, mask=m[:, None] < M, other=0.0)
+        b = tl.load(bp, mask=n[None, :] < N, other=0.0, cache_modifier=".cg")
+        acc = tl.dot(a, b, acc)
+        ap += BK
+        bp += BK
+    tl.store(
+        Y + m[:, None] * N + n[None, :],
+        acc.to(Y.dtype.element_ty),
+        mask=(m[:, None] < M) & (n[None, :] < N),
+    )
+
+
+def head_gemm_applies(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Whether ``head_gemm(x, weight, ...)`` covers these operands."""
+    return (
+        x.dim() == 2
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and x.dtype == weight.dtype == torch.bfloat16
+        and 0 < x.shape[0] <= HEAD_MAX_M
+        and weight.shape[1] == x.shape[1]
+        and x.shape[1] % _HEAD_BK == 0
+    )
+
+
+def head_gemm(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """``x @ W.T`` with FP32 accumulation, in ``out_dtype``, reading the stored row-major ``W [n, k]``."""
+    m, k = x.shape
+    n = weight.shape[0]
+    y = torch.empty((m, n), device=x.device, dtype=out_dtype)
+    _head_gemv[(triton.cdiv(n, _HEAD_BN),)](
+        x,
+        weight,
+        y,
+        m,
+        n,
+        k,
+        HEAD_MAX_M,
+        _HEAD_BN,
+        _HEAD_BK,
+        num_warps=4,
+        num_stages=2,
+        matrix_instr_nonkdim=16,
+    )
+    return y

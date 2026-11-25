@@ -136,6 +136,7 @@ def _launcher(
     sc_th=SC_TH,
     sc_tgt=SC_TGT,
     ppb=1,
+    kv_s2=HD,
 ):
     # ppb: 16-row blocks per physical page (physical page = 16 ppb tokens; kv_s0 = physical page stride)
     # scheck: sum-checked lazy softmax (no per-tile max)
@@ -244,6 +245,9 @@ def _launcher(
 
         k_base = buf_base_i64(k)
         v_base = buf_base_i64(v)
+        if fx.const_expr(kv_s2 != HD):
+            k_base = k_base + fx.Int64(h) * fx.Int64(kv_s2)
+            v_base = v_base + fx.Int64(h) * fx.Int64(kv_s2)
 
         lds = fx.SharedAllocator().allocate(Lds).peek()
         lptr = lds.kv.ptr
@@ -267,7 +271,12 @@ def _launcher(
         # row 16 p + lane // 4, physical chunk lane % 4 holding logical chunk (lane % 4) ^ swz(row)
         swz_w = ((lane // 8) + 2 * (lane // 32)) % 4
         lc_w = fx.Int32(arith.xori(_to_raw(lane % 4), _to_raw(swz_w)))
-        voff_b = ((lane // 4) * s1w + h * (HD // 4) + lc_w * 4) * 4
+        # kv_s2: the head stride (HD: NHD pages; else a head-major pool, [head][row][dim]: the head's plane is
+        # folded into the page base below and a row is the head's HD bytes)
+        if fx.const_expr(kv_s2 == HD):
+            voff_b = ((lane // 4) * s1w + h * (HD // 4) + lc_w * 4) * 4
+        else:
+            voff_b = ((lane // 4) * s1w + lc_w * 4) * 4
 
         def pages(tile):
             # page ids of tile's two pages for this wave, clamped into the table row; vector loads with a uniform
@@ -827,11 +836,11 @@ def muse_extend_attention_fly(
         and out.stride(2) == 1
         and out.stride(1) == HD
     )
-    assert (
-        k_cache.stride() == v_cache.stride()
-        and k_cache.stride(3) == 1
-        and k_cache.stride(2) == HD
-    )
+    # NHD pages, or a head-major pool ([head][row][dim]: rows of HD bytes, the head a plane apart)
+    assert k_cache.stride() == v_cache.stride() and k_cache.stride(3) == 1
+    assert k_cache.stride(2) == HD or (
+        k_cache.stride(1) == HD and k_cache.stride(0) == k_cache.shape[1] * HD
+    ), k_cache.stride()
     if seq_lens.dtype != torch.int32:
         seq_lens = seq_lens.to(torch.int32)
     if block_table.dtype != torch.int32:
@@ -863,6 +872,7 @@ def muse_extend_attention_fly(
             sc_th,
             sc_tgt,
             k_cache.shape[1] // PAGE,
+            k_cache.stride(2),
         ),
         q.view(torch.uint8),
         k_cache.view(torch.uint8),

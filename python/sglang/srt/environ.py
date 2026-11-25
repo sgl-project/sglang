@@ -2488,6 +2488,16 @@ class Envs:
     # Greedy / simulated target verify keeps the logits vocab-sharded: each rank all-gathers its per-row
     # softcapped argmax ([rows, 2]), not the full logits.
     SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS = EnvBool(True)
+    # DFlash selector decode in the draft graph: the sampling params staged by one launch, the K x K lattice scored
+    # by one kernel and walked straight into the output buffers; =0 keeps the torch lattice and its copies.
+    SGLANG_ROCM_MUSE_DFLASH_FUSED_LATTICE = EnvBool(True)
+    # Vocab heads at up to 16 rows (the target LM head shard, the DFlash draft's head projection) on a Triton
+    # GEMV over the stored row-major weight; =0 keeps torch.mm / hipBLASLt.
+    SGLANG_ROCM_MUSE_HEAD_GEMM = EnvBool(True)
+    # Opt-in: the full and sliding-window KV pools stored head-major ([head][slot][dim]) behind the usual
+    # [slot][head][dim] tensor, for a decode monokernel that streams one KV head at a time. Off by default: the
+    # FlyDSL / Triton verify kernels that address NHD pages fall back to the unified attention on such a pool.
+    SGLANG_ROCM_MUSE_KV_HEAD_MAJOR = EnvBool(False)
     # DSpark sampling accept on ROCm: split the vocabulary over CTAs, with the softmax folded in.
     SGLANG_ROCM_DSPARK_SPLIT_ACCEPT = EnvBool(True)
     # ROCm Muse Spark model (sglang.srt.rocm_muse_spark): fused QKV projection /

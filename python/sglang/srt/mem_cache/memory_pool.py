@@ -41,6 +41,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
+    set_kv_buffer_prefix_valid_layers_fp8,
     set_kv_buffer_prefix_valid_tiled,
     set_kv_buffer_prefix_valid_tiled_fp8,
 )
@@ -2389,6 +2390,31 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             quant_method if quant_method is not None else UnquantizedKVCacheMethod()
         )
 
+        # Head-major storage (SGLANG_ROCM_MUSE_KV_HEAD_MAJOR=1): a hybrid model's full and
+        # sliding-window pools kept as [head][slot][dim] and exposed as the usual
+        # [slot][head][dim] tensor through its strides, so a decode kernel that streams
+        # one KV head reads whole cache lines. Stride-honouring readers and writers
+        # (indexing, the unified attention, reshape_and_cache_flash) see no difference;
+        # the kernels that address NHD rows directly check contiguity first.
+        self.full_head_major = (
+            envs.SGLANG_ROCM_MUSE_KV_HEAD_MAJOR.get()
+            and self.allocation_label in ("Full", "SWA")
+            and self.kv_cache_layout == "nhd"
+            and not self.use_hnd
+            and not self.is_quantized_kv_cache
+            and not self.post_capture_active
+            and self.head_num == 2
+            and self.head_dim == self.v_head_dim == 64
+            and self.store_dtype.itemsize == 1
+        )
+        if self.full_head_major:
+            # the tiled slot-row copy assumes NHD rows
+            self.use_native_move_kv_cache = True
+            logger.info(
+                "KV cache (%s): head-major [head][slot][dim] storage",
+                self.allocation_label,
+            )
+
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -2400,9 +2426,10 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             else None
         )
 
-        if enable_kv_cache_copy and not self.use_hnd:
+        if enable_kv_cache_copy and not self.use_hnd and not self.full_head_major:
             # The tiled byte copy assumes NHD slot-rows; HND uses a (page, off)
-            # gather in move_kv_cache instead, so skip the slot-row copy config.
+            # gather in move_kv_cache instead, so skip the slot-row copy config
+            # (a head-major pool moves natively too).
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
@@ -2733,7 +2760,19 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                     # k_cache and v_cache, and when they alias one allocation
                     # AOTAutograd functionalizes it through a synthetic base that
                     # clones the layer's whole KV allocation on every decode step.
-                    if (
+                    if getattr(self, "full_head_major", False):
+
+                        def _head_major(shape):
+                            rows, heads, dim = shape
+                            return _zeros((heads, rows, dim)).transpose(0, 1)
+
+                        self.k_buffer = [
+                            _head_major(k_shape) for _ in range(self.layer_num)
+                        ]
+                        self.v_buffer = [
+                            _head_major(v_shape) for _ in range(self.layer_num)
+                        ]
+                    elif (
                         k_shape == v_shape
                         and not _is_hip
                         and not get_flags().capture.enable_torch_compile
@@ -3130,6 +3169,16 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         # layouts that change buffer identity (e.g. PageMajorMHATokenToKVPool's
         # 4-D strided views). ``loc`` and the cache tensors are already dtype-cast
         # and viewed as ``store_dtype`` by ``set_kv_buffer``.
+        if getattr(self, "full_head_major", False):
+            # the row-store kernel assumes contiguous [slot] rows: index through the
+            # strided view (the same bytes land in the same logical places)
+            self.k_buffer[layer_idx][loc] = cache_k.view(
+                -1, self.head_num, self.head_dim
+            )
+            self.v_buffer[layer_idx][loc] = cache_v.view(
+                -1, self.head_num, self.v_head_dim
+            )
+            return
         if self.kv_cache_layout == "vectorized_5d":
             # Late-import to keep the NHD path import-clean.
             from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
@@ -3446,6 +3495,102 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             v_scale,
             layer_id_override,
         )
+
+    def set_kv_buffer_prefix_valid_layers(
+        self,
+        layer_ids: tuple[int, ...],
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> bool:
+        """``set_kv_buffer_prefix_valid`` without scales for the stacked
+        ``[len(layer_ids), rows, ...]`` K / V of several layers, in one launch.
+        Returns False, with nothing written, where only the per-layer path applies.
+
+        ROCm only: there the per-layer path writes a scale-free FP8 commit with the
+        fused kernel at scale 1.0, which this kernel repeats per layer."""
+        if not (
+            _is_hip
+            and type(self).set_kv_buffer_prefix_valid
+            is MHATokenToKVPool.set_kv_buffer_prefix_valid
+            and not getattr(self, "full_head_major", False)
+            and self.kv_cache_layout == "nhd"
+            and not self.use_hnd
+            and self.dtype == fp8_dtype
+            and self.store_dtype in (self.dtype, torch.uint8)
+            and self.v_row_dim == self.row_dim
+            and self.row_dim > 0
+            and cache_k.dtype == cache_v.dtype
+            and cache_k.dtype in (torch.bfloat16, torch.float16)
+            and cache_k.shape == cache_v.shape
+            and cache_k.shape[0] == len(layer_ids)
+            and cache_k.shape[1] == loc_2d.numel()
+            and loc_2d.ndim == 2
+            and loc_2d.numel() > 0
+            and loc_2d.dtype == torch.int64
+            and commit_lens.dtype == torch.int32
+            and commit_lens.shape[0] == loc_2d.shape[0]
+            and loc_2d.is_contiguous()
+            and commit_lens.is_contiguous()
+        ):
+            return False
+        k = cache_k.reshape(len(layer_ids), loc_2d.numel(), self.row_dim)
+        v = cache_v.reshape(len(layer_ids), loc_2d.numel(), self.row_dim)
+        if k.stride(-1) != 1 or v.stride() != k.stride():
+            return False
+        idx = [i - self.start_layer for i in layer_ids]
+        row_stride = int(self.k_buffer[idx[0]].stride(0))
+        if any(
+            int(buf[i].stride(0)) != row_stride
+            for buf in (self.k_buffer, self.v_buffer)
+            for i in idx
+        ):
+            return False
+        # the layers' buffer addresses as device tables, rebuilt when a buffer moves
+        addresses = tuple(
+            tuple(buf[i].data_ptr() for i in idx)
+            for buf in (self.k_buffer, self.v_buffer)
+        )
+        tables = self.__dict__.setdefault("_layer_ptr_tables", {})
+        if addresses not in tables:
+            tables.clear()
+            tables[addresses] = tuple(
+                torch.tensor(a, dtype=torch.int64, device=self.device)
+                for a in addresses
+            )
+        k_ptrs, v_ptrs = tables[addresses]
+        # the per-layer launcher's tiles (_set_kv_buffer_prefix_valid_impl_fp8)
+        if self.row_dim >= 4096:
+            elems_per_tile, num_warps = 256, 8
+        elif self.row_dim >= 2048:
+            elems_per_tile, num_warps = 128, 4
+        else:
+            elems_per_tile, num_warps = 64, 4
+        tiles = triton.cdiv(self.row_dim, elems_per_tile)
+        set_kv_buffer_prefix_valid_layers_fp8[
+            (int(loc_2d.shape[0]), int(loc_2d.shape[1]), tiles * len(layer_ids))
+        ](
+            k,
+            v,
+            k_ptrs,
+            v_ptrs,
+            loc_2d,
+            commit_lens,
+            1.0,
+            1.0,
+            int(k.stride(0)),
+            int(k.stride(1)),
+            row_stride,
+            int(loc_2d.shape[1]),
+            ROW_ELEMS=self.row_dim,
+            ELEMS_PER_TILE=elems_per_tile,
+            TILES=tiles,
+            FP8_MAX=torch.finfo(self.dtype).max,
+            num_warps=num_warps,
+            num_stages=2,
+        )
+        return True
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.

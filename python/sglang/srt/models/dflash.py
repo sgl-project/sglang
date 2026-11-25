@@ -16,6 +16,7 @@ from sglang.kernels.ops.communication import sp_collective
 from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.dflash import (
     dflash_grouped_conv,
+    selector_score_walk_triton,
     selector_walk_triton,
 )
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
@@ -104,6 +105,8 @@ def _gfx1250_try_gfx95():
 _muse_gfx95_like = _is_gfx95 or (is_hip() and _gfx1250_try_gfx95())
 if _muse_gfx95_like:
     from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+        head_gemm,
+        head_gemm_applies,
         rowmajor_gemm,
         rowmajor_gemm_applies,
         rowmajor_gemm_partials,
@@ -165,6 +168,10 @@ def _project_candidate_logits(
             w = weight[:num_org]
             if applies(h.contiguous(), w):
                 return lmhead_fp32(h.contiguous(), w, out_dtype=weight.dtype)
+        if _is_gfx95 and envs.SGLANG_ROCM_MUSE_HEAD_GEMM.get():
+            w = weight[:num_org]
+            if head_gemm_applies(h, w):
+                return head_gemm(h, w, weight.dtype)
         # Tuned bf16 dispatch (kernel chosen by GEMM shape); bf16 CUDA only.
         backend = get_bf16_gemm_backend()
         if (
@@ -1823,6 +1830,35 @@ class CandidateSelector(nn.Module):
             top_k=self.top_k,
         )
 
+    def score_walk(
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        uniforms: torch.Tensor,
+        temperatures: torch.Tensor,
+        greedy_mask: torch.Tensor,
+        tokens_out: torch.Tensor,
+        q_out: torch.Tensor,
+    ) -> None:
+        """``sample_path`` over ``build_lattice``'s scores (CUDA: one lattice kernel,
+        then the walk), into ``tokens_out`` / ``q_out``."""
+        selector_score_walk_triton(
+            candidate_ids=candidate_ids,
+            unary_logits=unary_logits,
+            hidden=self.hidden_projection(hidden_states),
+            anchor_token_ids=anchor_token_ids,
+            predecessor_table=self.predecessor_codebook,
+            successor_table=self.successor_codebook,
+            uniforms=uniforms,
+            temperatures=temperatures,
+            greedy_mask=greedy_mask,
+            tokens_out=tokens_out,
+            q_out=q_out,
+        )
+
     def sample_path(
         self,
         *,
@@ -1831,10 +1867,13 @@ class CandidateSelector(nn.Module):
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
+        tokens_out: Optional[torch.Tensor] = None,
+        q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Walk one path, with q over the K candidates for the verify. greedy_mask
         rows take the argmax, selected rather than branched, so one captured graph
-        serves greedy and sampling batches alike."""
+        serves greedy and sampling batches alike. On CUDA the walk writes into
+        ``tokens_out`` / ``q_out`` when given."""
         if scores.is_cuda:
             return selector_walk_triton(
                 candidate_ids=candidate_ids,
@@ -1842,6 +1881,8 @@ class CandidateSelector(nn.Module):
                 uniforms=uniforms,
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
+                tokens_out=tokens_out,
+                q_out=q_out,
             )
         top_k = self.top_k
         temps = temperatures.view(-1, 1)

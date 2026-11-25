@@ -433,7 +433,7 @@ def rebuild_compact_draft_req_to_token(
     draft_req_to_token,
     target_req_to_token,
     req_pool_indices,
-    suffix_start,
+    seq_lens,
     draft_prefix_lens,
     verify_out_cache_loc,
     verify_loc_stride,
@@ -441,22 +441,31 @@ def rebuild_compact_draft_req_to_token(
     draft_pool_len: tl.constexpr,
     target_pool_len: tl.constexpr,
     block_size: tl.constexpr,
+    window: tl.constexpr,
+    page_size: tl.constexpr,
     HAS_FULL_TO_SWA: tl.constexpr,
 ):
     """Rebuild one request's draft-local compact req->token row in a single pass.
 
-    Row layout written: [0, prefix_len) = the committed target suffix window
-    (target_req_to_token[req, suffix_start : suffix_start + prefix_len]) and
-    [prefix_len, prefix_len + block_size) = the verify block slots. Fixed grid,
-    per-row data-dependent loop bound; no host reads, so the caller never syncs.
-    With HAS_FULL_TO_SWA every id is mapped through ``full_to_swa`` (a draft pool
-    indexed by the target's sliding-window ids).
+    The compact prefix length is the committed length clamped to ``window``,
+    widened on the left to a ``page_size`` boundary of the full row (written to
+    ``draft_prefix_lens``). Row layout written: [0, prefix_len) = the committed
+    target suffix window (target_req_to_token[req, seq_len - prefix_len :
+    seq_len]) and [prefix_len, prefix_len + block_size) = the verify block slots.
+    Fixed grid, per-row data-dependent loop bound; no host reads, so the caller
+    never syncs. With HAS_FULL_TO_SWA every id is mapped through ``full_to_swa``
+    (a draft pool indexed by the target's sliding-window ids).
     """
     BLOCK: tl.constexpr = 256
     pid = tl.program_id(axis=0)
     req = tl.load(req_pool_indices + pid).to(tl.int64)
-    start = tl.load(suffix_start + pid).to(tl.int64)
-    prefix_len = tl.load(draft_prefix_lens + pid).to(tl.int64)
+    seq_len = tl.load(seq_lens + pid).to(tl.int64)
+    prefix_len = tl.minimum(seq_len, window)
+    if page_size > 1:
+        visible_start = seq_len - prefix_len
+        prefix_len = seq_len - (visible_start - visible_start % page_size)
+    tl.store(draft_prefix_lens + pid, prefix_len.to(tl.int32))
+    start = seq_len - prefix_len
     total = prefix_len + block_size
 
     src_row = target_req_to_token + req * target_pool_len
@@ -484,18 +493,23 @@ def rebuild_compact_draft_req_to_token_func(
     draft_req_to_token: torch.Tensor,
     target_req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    suffix_start: torch.Tensor,
-    draft_prefix_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
     verify_out_cache_loc_2d: torch.Tensor,
     batch_size: int,
     block_size: int,
+    window: int,
+    page_size: int,
     full_to_swa: Optional[torch.Tensor] = None,
-) -> None:
+) -> torch.Tensor:
+    """Rebuild the compact rows; returns the compact prefix lengths (int32)."""
+    draft_prefix_lens = torch.empty(
+        (batch_size,), dtype=torch.int32, device=seq_lens.device
+    )
     rebuild_compact_draft_req_to_token[(batch_size,)](
         draft_req_to_token,
         target_req_to_token,
         req_pool_indices,
-        suffix_start,
+        seq_lens,
         draft_prefix_lens,
         verify_out_cache_loc_2d,
         verify_out_cache_loc_2d.stride(0),
@@ -503,8 +517,11 @@ def rebuild_compact_draft_req_to_token_func(
         draft_req_to_token.shape[1],
         target_req_to_token.shape[1],
         block_size,
+        window,
+        page_size,
         full_to_swa is not None,
     )
+    return draft_prefix_lens
 
 
 @triton.jit

@@ -143,6 +143,63 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
 
 
 @triton.jit
+def set_kv_buffer_prefix_valid_layers_fp8(
+    src_k_ptr,
+    src_v_ptr,
+    dst_k_ptrs,
+    dst_v_ptrs,
+    loc_2d_ptr,
+    commit_len_ptr,
+    k_scale,
+    v_scale,
+    src_layer_stride,
+    src_row_stride,
+    dst_row_stride,
+    block_size,
+    ROW_ELEMS: tl.constexpr,
+    ELEMS_PER_TILE: tl.constexpr,
+    TILES: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """``set_kv_buffer_prefix_valid_tiled_fp8`` (host-scalar scales) for every layer of a
+    stacked ``[layers, rows, ROW_ELEMS]`` source in one launch: axis 2 is
+    ``layer * TILES + tile``, the layers' caches come from pointer tables."""
+    bid = tl.program_id(0)
+    row = tl.program_id(1)
+    layer = tl.program_id(2) // TILES
+    tid = tl.program_id(2) % TILES
+
+    commit_len = tl.load(commit_len_ptr + bid)
+    if row >= commit_len:
+        return
+
+    elem_off = tid * ELEMS_PER_TILE + tl.arange(0, ELEMS_PER_TILE)
+    mask_elem = elem_off < ROW_ELEMS
+
+    loc = tl.load(loc_2d_ptr + bid * block_size + row)
+    src_off = (
+        layer.to(tl.int64) * src_layer_stride
+        + (bid * block_size + row) * src_row_stride
+        + elem_off
+    )
+    dst_k_ptr = tl.cast(tl.load(dst_k_ptrs + layer), tl.pointer_type(tl.float8e4nv))
+    dst_v_ptr = tl.cast(tl.load(dst_v_ptrs + layer), tl.pointer_type(tl.float8e4nv))
+    dst_off = loc * dst_row_stride + elem_off
+
+    k_val = tl.load(src_k_ptr + src_off, mask=mask_elem, other=0).to(tl.float32)
+    k_val = k_val * tl.div_rn(1.0, k_scale)
+    k_val = k_val.to(src_k_ptr.dtype.element_ty)
+    k_val = _saturate_to_fp8_range(k_val, FP8_MAX, src_k_ptr.dtype.element_ty)
+    tl.store(dst_k_ptr + dst_off, k_val.to(tl.float8e4nv), mask=mask_elem)
+
+    v_val = tl.load(src_v_ptr + src_off, mask=mask_elem, other=0).to(tl.float32)
+    v_val = v_val * tl.div_rn(1.0, v_scale)
+    v_val = v_val.to(src_v_ptr.dtype.element_ty)
+    v_val = _saturate_to_fp8_range(v_val, FP8_MAX, src_v_ptr.dtype.element_ty)
+    tl.store(dst_v_ptr + dst_off, v_val.to(tl.float8e4nv), mask=mask_elem)
+
+
+@triton.jit
 def copy_all_layer_kv_cache_tiled(
     data_ptrs,
     strides,

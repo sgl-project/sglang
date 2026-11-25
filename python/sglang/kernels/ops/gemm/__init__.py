@@ -594,6 +594,11 @@ _MUSE_SPARK_GFX950_KERNELS = [
         "tiled_gemm",
         "BF16 17..64-row GEMM from a tile-contiguous weight copy",
     ),
+    (
+        "bf16_tiled_small_m_gemm",
+        "head_gemm",
+        "BF16 vocab-head GEMV at up to 16 rows over the stored row-major weight",
+    ),
     ("router_gemm_fp32", "router_gemv_fp32", "bf16 x fp32 router logits GEMV, M <= 64"),
     (
         "router_gemm_fp32",
