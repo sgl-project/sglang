@@ -15,7 +15,45 @@ import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, Parameter
 from torch.nn.utils.parametrizations import weight_norm
 
+from sglang.kernels.ops.diffusion import BitExactFusionGate, conv1d_fp64acc
 from sglang.multimodal_gen.runtime.models.vaes.alias_free import Activation1d
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+# MIOpen runs the dilated FP32 convs (dilation 3 and 5) on its FP64-accumulating
+# naive solver at 4-5 ms a call; the Triton replica of its order is verified per
+# shape. Undilated ones take a faster FP32 solver and stay on MIOpen.
+_MIOPEN_NAIVE_CONV1D = BitExactFusionGate(
+    "BigVGAN dilated conv1d in MIOpen naive order", per_signature=True
+)
+
+
+def _conv1d(conv: Conv1d, x: torch.Tensor) -> torch.Tensor:
+    if not (
+        current_platform.is_rocm()
+        and x.is_cuda
+        and x.dtype == torch.float32
+        and conv.dilation[0] > 1
+    ):
+        return conv(x)
+    sig = (tuple(x.shape), tuple(conv.weight.shape), conv.padding, conv.dilation)
+    if not _MIOPEN_NAIVE_CONV1D.can_attempt(sig):
+        return conv(x)
+
+    def fused():
+        out = conv1d_fp64acc(
+            x,
+            conv.weight,
+            stride=conv.stride[0],
+            padding=conv.padding[0],
+            dilation=conv.dilation[0],
+            groups=conv.groups,
+        )
+        return out if conv.bias is None else out + conv.bias[:, None]
+
+    return _MIOPEN_NAIVE_CONV1D.run(fused, lambda: conv(x), sig=sig, logger=logger)
 
 
 def get_padding(kernel_size, dilation=1):
@@ -147,9 +185,9 @@ class AMPBlock1(torch.nn.Module):
             a1 = next(activation_iter)
             a2 = next(activation_iter)
             xt = a1(x)
-            xt = c1(xt)
+            xt = _conv1d(c1, xt)
             xt = a2(xt)
-            xt = c2(xt)
+            xt = _conv1d(c2, xt)
             x = xt.add_(x)
 
         return x

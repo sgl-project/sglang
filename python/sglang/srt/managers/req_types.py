@@ -405,28 +405,6 @@ class MultimodalProcessorOutput(
     # have wrap_shm_features also move large model_specific_data tensors to SHM.
     shm_model_specific_data: ClassVar[bool] = False
 
-    @staticmethod
-    def from_dict(d: dict) -> MultimodalProcessorOutput:
-        return MultimodalProcessorOutput(
-            mm_items=d["mm_items"],
-            input_ids=d.get("input_ids"),
-            padded_input_ids=d.get("padded_input_ids"),
-            im_token_id=d.get("im_token_id"),
-            im_start_id=d.get("im_start_id"),
-            im_end_id=d.get("im_end_id"),
-            slice_start_id=d.get("slice_start_id"),
-            slice_end_id=d.get("slice_end_id"),
-            video_token_id=d.get("video_token_id"),
-            audio_token_id=d.get("audio_token_id"),
-            audio_start_id=d.get("audio_start_id"),
-            audio_end_id=d.get("audio_end_id"),
-            mrope_positions=d.get("mrope_positions"),
-            mrope_position_delta=d.get("mrope_position_delta"),
-            vision_position_ids=d.get("vision_position_ids"),
-            media_nums_per_sample=d.get("media_nums_per_sample"),
-            visible_frame_counts=d.get("visible_frame_counts"),
-        )
-
     def map_object_fields(
         self, transform: Callable[[list], list]
     ) -> MultimodalProcessorOutput:
@@ -555,14 +533,17 @@ class FINISHED_MATCHED_REGEX(BaseFinishReason):
 
 
 class FINISH_LENGTH(BaseFinishReason):
-    def __init__(self, length: int):
+    def __init__(self, length: int, ignored_stop_position: Optional[int] = None):
         super().__init__()
         self.length = length
+        self.ignored_stop_position = ignored_stop_position
 
     def to_json(self):
+        position = self.ignored_stop_position
         return {
             "type": "length",  # to match OpenAI API's return value
             "length": self.length,
+            "ignored_stop": None if position is None else {"position": position},
         }
 
 
@@ -580,6 +561,13 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TokenIdRows:
+    """A batch ``token_ids_logprobs`` entry with its own ids for each scored row."""
+
+    rows: List[List[int]]
 
 
 @dataclasses.dataclass

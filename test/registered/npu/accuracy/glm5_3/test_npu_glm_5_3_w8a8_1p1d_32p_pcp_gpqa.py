@@ -1,11 +1,20 @@
+import json
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    NIC_NAME,
+    get_mooncake_master_server_address,
+)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     GLM_5_3_W8A8_MODEL_PATH,
+)
+from sglang.test.ascend.test_ascend_utils import (
+    append_ld_library_path,
+    resolve_local_ip,
+    write_memfabric_tent_conf,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -37,6 +46,19 @@ GLM_5_3_PCP_PD_SEP_PREFILL_ENVS = {
     # "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
+    # The 32 prefill ranks finish Mooncake store setup minutes apart; the
+    # HiCache sync groups are built over a world HCCL domain right after, so
+    # the default 120s connect timeout would expire on the early ranks.
+    "HCCL_CONNECT_TIMEOUT": "1800",
+    "HCCL_EXEC_TIMEOUT": "1800",
+    # L3 store client: MemFabric TENT transport over the NPU device path.
+    # The store endpoint travels in the extra-config JSON and MC_TENT_CONF,
+    # both built in setUpClass.
+    "MC_USE_TENT": "1",
+    "MF_PROTOCOL": "device_sdma",
+    "MF_STORE_PROTOCOL": "device_sdma",
+    "MF_TRANSFER_TIMEOUT": "10000",
+    "SGLANG_HICACHE_MOONCAKE_REUSE_TE": "0",
 }
 
 GLM_5_3_PCP_PD_SEP_DECODE_ENVS = {
@@ -71,7 +93,6 @@ GLM_5_3_PCP_PD_SEP_PREFILL_ARGS = [
     "--enable-prefill-cp",
     "--cp-strategy",
     "interleave",
-    "--enable-dp-attention",
     "--mem-fraction-static",
     0.88,
     "--attention-backend",
@@ -102,7 +123,8 @@ GLM_5_3_PCP_PD_SEP_PREFILL_ARGS = [
     "--moe-ascend-ops-config",
     '{"prefill": "alltoallv", "decode": "low_latency"}',
     "--disable-shared-experts-fusion",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--dtype",
     "bfloat16",
     "--enable-dp-lm-head",
@@ -121,19 +143,36 @@ GLM_5_3_PCP_PD_SEP_PREFILL_ARGS = [
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
-    "--hicache-size",
-    80,
+    # Ratio-based sizing keeps the L2 host pool proportional to the device pool.
+    # A fixed --hicache-size 80 allocated ~88 GB per PP2 rank, which exhausted
+    # the host huge pages and made the Mooncake store's HalMemCreate fall back
+    # to 2MB pages (12+ minutes per rank, or a hard hang).
+    "--hicache-ratio",
+    1.2,
+    "--hicache-mem-layout",
+    "page_first",
+    "--hicache-write-policy",
+    "write_through",
+    "--hicache-storage-prefetch-policy",
+    "wait_complete",
+    "--hicache-storage-backend",
+    "mooncake",
     "--enable-cache-report",
-    # EPLB
-    "--enable-eplb",
-    "--expert-distribution-recorder-mode",
-    "stat",
-    "--ep-num-redundant-experts",
-    16,
-    "--eplb-rebalance-num-iterations",
-    100000,
-    "--expert-distribution-recorder-buffer-size",
-    50,
+    # Store setup blocks a scheduler for minutes; the 300s default would keep
+    # dumping thread stacks instead of letting startup finish.
+    "--watchdog-timeout",
+    9000,
+    # EPLB is disabled for now: the community build rejects EPLB when pp-size > 1,
+    # and the prefill side runs pp-size=4. Restore this block once that conflict is resolved.
+    # "--enable-eplb",
+    # "--expert-distribution-recorder-mode",
+    # "stat",
+    # "--ep-num-redundant-experts",
+    # 16,
+    # "--eplb-rebalance-num-iterations",
+    # 100000,
+    # "--expert-distribution-recorder-buffer-size",
+    # 50,
 ]
 
 GLM_5_3_PCP_PD_SEP_DECODE_ARGS = [
@@ -143,9 +182,8 @@ GLM_5_3_PCP_PD_SEP_DECODE_ARGS = [
     2,
     "--tp-size",
     32,
-    "--dp-size",
+    "--attn-dp-size",
     8,
-    "--enable-dp-attention",
     "--ep-size",
     32,
     "--mem-fraction-static",
@@ -193,43 +231,26 @@ GLM_5_3_PCP_PD_SEP_DECODE_ARGS = [
     "--speculative-num-draft-tokens",
     4,
     "--enable-cache-report",
-    # EPLB
-    "--enable-eplb",
-    "--expert-distribution-recorder-mode",
-    "stat",
-    "--ep-num-redundant-experts",
-    32,
-    "--eplb-rebalance-num-iterations",
-    100000,
-    "--expert-distribution-recorder-buffer-size",
-    1000,
+    # EPLB is disabled for now, matching the prefill side: the community build
+    # rejects EPLB when pp-size > 1. Restore this block once that conflict is resolved.
+    # "--enable-eplb",
+    # "--expert-distribution-recorder-mode",
+    # "stat",
+    # "--ep-num-redundant-experts",
+    # 32,
+    # "--eplb-rebalance-num-iterations",
+    # 100000,
+    # "--expert-distribution-recorder-buffer-size",
+    # 1000,
 ]
 
-GLM_5_3_PCP_PD_SEP_MODEL_CONFIG = {
-    "model_path": GLM_5_3_W8A8_MODEL_PATH,
-    "prefill_args": GLM_5_3_PCP_PD_SEP_PREFILL_ARGS,
-    "decode_args": GLM_5_3_PCP_PD_SEP_DECODE_ARGS,
-    "prefill_envs": GLM_5_3_PCP_PD_SEP_PREFILL_ENVS,
-    "decode_envs": GLM_5_3_PCP_PD_SEP_DECODE_ENVS,
-    "router_args": [
-        "--policy",
-        "round_robin",
-        "--request-timeout-secs",
-        7200,
-        "--disable-circuit-breaker",
-    ],
-    "router_envs": {},
-}
 
-
-# PCP variant with EPLB
 # 4-node PD separation, prefill tp8 + attn-cp8 (interleave) + pp4,
-# decode tp32/dp32/ep32, EPLB enabled on both P and D with GLM-5.3-w8a8
+# decode tp32/dp32/ep32, GLM-5.3-w8a8
 # MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
 class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
-    """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with PCP and EPLB on gpqa_diamond"""
+    """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with PCP on gpqa_diamond"""
 
-    model_config = GLM_5_3_PCP_PD_SEP_MODEL_CONFIG
     # Run evalscope only once (no retry on accuracy miss)
     max_retries = 1
     accuracy = 0.912
@@ -252,8 +273,51 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         "top_p": 0.95,
     }
 
+    @classmethod
+    def setUpClass(cls):
+        # Only the prefill node runs the L3 store client; the decode node has no
+        # storage backend. The Mooncake store config is one JSON passed through
+        # --hicache-storage-backend-extra-config (once it carries
+        # master_server_address the client ignores the MOONCAKE_* env vars).
+        # The master runs on the first prefill pod; each scheduler rank
+        # contributes global_segment_size to the pool.
+        l3_config = json.dumps(
+            {
+                "master_server_address": get_mooncake_master_server_address(),
+                "metadata_server": "P2PHANDSHAKE",
+                "protocol": "ascend",
+                "global_segment_size": "2gb",
+                "local_hostname": resolve_local_ip(),
+                "extra_backend_tag": "pd-1p1d-glm5.3-w8a8-pcp",
+            }
+        )
+        cls.model_config = {
+            "model_path": GLM_5_3_W8A8_MODEL_PATH,
+            "prefill_args": [
+                *GLM_5_3_PCP_PD_SEP_PREFILL_ARGS,
+                "--hicache-storage-backend-extra-config",
+                l3_config,
+            ],
+            "decode_args": list(GLM_5_3_PCP_PD_SEP_DECODE_ARGS),
+            "prefill_envs": {
+                **GLM_5_3_PCP_PD_SEP_PREFILL_ENVS,
+                "MC_TENT_CONF": write_memfabric_tent_conf(),
+                "LD_LIBRARY_PATH": append_ld_library_path(("memfabric_hybrid", "lib")),
+            },
+            "decode_envs": dict(GLM_5_3_PCP_PD_SEP_DECODE_ENVS),
+            "router_args": [
+                "--policy",
+                "round_robin",
+                "--request-timeout-secs",
+                7200,
+                "--disable-circuit-breaker",
+            ],
+            "router_envs": {},
+        }
+        super().setUpClass()
+
     def test_npu_glm_5_3_w8a8_1p1d_pcp_gpqa(self):
-        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with PCP and EPLB on gpqa_diamond"""
+        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with PCP on gpqa_diamond"""
         self.run_accuracy()
 
 
