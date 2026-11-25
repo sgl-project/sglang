@@ -793,18 +793,28 @@ class CommonKVManager(BaseKVManager):
     def check_status_pp_release(self, bootstrap_room: int) -> KVPoll:
         """PP0 only. Like check_status_pp_consensus, but a room concludes only
         once every stage has concluded and no stage holds Success for staging,
-        so no stage frees pages its own transfer still uses."""
+        so no stage frees pages its own transfer still uses. A failure after stage
+        0 committed the room waits too, since decode may recompute into it."""
         statuses = self.request_status.collect(bootstrap_room)
         if any(status is None for status in statuses):
             return KVPoll.Bootstrapping
         pending = [s for s in statuses if s not in (KVPoll.Success, KVPoll.Failed)]
         if pending:
             return min(pending)
-        if min(statuses) == KVPoll.Success and any(
-            self.request_status.collect(_pp_held_key(bootstrap_room))
-        ):
+        # prefill_complete sends each stage one last chunk, so a stage's held key
+        # clears when its worker ends the room's cleanup, or was never set.
+        if (
+            min(statuses) == KVPoll.Success or self._room_awaits_release(bootstrap_room)
+        ) and any(self.request_status.collect(_pp_held_key(bootstrap_room))):
             return KVPoll.Transferring
         return min(statuses)
+
+    def _room_awaits_release(self, bootstrap_room: int) -> bool:
+        # Decode recomputes into a room only after every stage's Success, and
+        # this stage commits its own before telling decode.
+        return self.deferred_bootstrap is not None and (
+            self.deferred_bootstrap.awaits_release(bootstrap_room)
+        )
 
     def staging_holds_success(self, bootstrap_room: int) -> bool:
         # With deferred allocation, also wait for worker cleanup (the zero
@@ -2680,6 +2690,18 @@ class CommonKVSender(BaseKVSender):
         return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
 
     def poll_pp_release(self) -> KVPoll:
+        if (
+            self.conclude_state == KVPoll.Failed
+            and self._owns_bootstrap_room
+            and self.kv_mgr._room_awaits_release(self.bootstrap_room)
+            and self.kv_mgr.check_status_pp_release(self.bootstrap_room)
+            not in (KVPoll.Success, KVPoll.Failed)
+        ):
+            # Stage 0's own abort after its commit cached Failed; the release
+            # still waits for every stage as an uncached one does. Each stage
+            # replicates its held key ahead of its Success, so a stale view
+            # reads as pending or held.
+            return KVPoll.Transferring
         return self._poll_with_status(self.kv_mgr.check_status_pp_release)
 
     def _poll_with_status(self, check_status) -> KVPoll:

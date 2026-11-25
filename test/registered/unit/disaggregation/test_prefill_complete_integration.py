@@ -19,11 +19,12 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     KVTransferError,
     PrefillServerInfo,
+    _PPStagingOutstanding,
 )
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -222,6 +223,7 @@ class TestAllocationIntegration(CustomTestCase):
         for pp_rank, mgr in enumerate(stages):
             mgr.request_status = PPConsensusStore(pp_size, pp_rank, group)
             self.addCleanup(mgr.request_status.close)
+            mgr._staging_outstanding = _PPStagingOutstanding(mgr)
             mgr._prefill_unique_rank = Mock(return_value=pp_rank)
             self.endpoints[(mgr.local_ip, mgr.rank_port)] = mgr
         return stages
@@ -1154,11 +1156,13 @@ class TestAllocationIntegration(CustomTestCase):
         self.flush()
         self.assertEqual(new_receiver.poll(), KVPoll.WaitingForInput)
 
-    def _run_last_chunk_through_worker(self, during_cleanup):
-        """Run room 1's last chunk through the Mooncake transfer worker, calling
-        during_cleanup() after its writes and Success, inside its room cleanup."""
-        mgr = self.prefill
-        mgr._staging_outstanding = defaultdict(int)
+    def _run_last_chunk_through_worker(self, during_cleanup, mgr=None):
+        """Run room 1's last chunk through mgr's (default: stage 0's) Mooncake
+        transfer worker, calling during_cleanup() after its writes and Success,
+        inside its room cleanup."""
+        mgr = mgr or self.prefill
+        if not isinstance(mgr._staging_outstanding, defaultdict):
+            mgr._staging_outstanding = defaultdict(int)
         mgr.session_lock = threading.Lock()
         mgr.failed_sessions = set()
         mgr.state_layout_rejections = {}
@@ -1244,6 +1248,92 @@ class TestAllocationIntegration(CustomTestCase):
             sender.failure_exception()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def pp_concluded_room(self, stage0_success=True):
+        """Room 1 on two PP stages, both bootstrapped and prefilled; stage 0's
+        worker has sent Success and cleaned up if ``stage0_success``."""
+        stages = self.pp_stages(2)
+        senders = [MooncakeKVSender(mgr, "prefill:8998", 1) for mgr in stages]
+        receiver = self.receiver(stages=stages)
+        self.flush()
+        for sender in senders:
+            sender.mark_prefill_complete()
+        self.flush()
+        if stage0_success:
+            stages[0].conclude_transfer(
+                bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
+            )
+        return stages, senders, receiver
+
+    def abort_on_every_stage(self, stages, senders):
+        for sender in senders:
+            sender.abort()
+        self.wait_until(lambda: stages[0].request_status.collect(1)[1] == KVPoll.Failed)
+
+    def test_pp_abort_after_success_waits_for_every_stage_worker_cleanup(self):
+        """An abort after stage 0's Success and cleanup leaves stage 0 Success but
+        fails a later stage still in its room cleanup; stage 0 releases the room
+        for every stage, so it waits for that cleanup."""
+        stages, senders, receiver = self.pp_concluded_room()
+
+        def during_cleanup():
+            self.abort_on_every_stage(stages, senders)
+            self.assertEqual(stages[0].request_status[1], KVPoll.Success)
+            self.assertEqual(senders[0].poll_pp_release(), KVPoll.Transferring)
+
+        self._run_last_chunk_through_worker(during_cleanup, stages[1])
+        self.wait_until(lambda: senders[0].poll_pp_release() == KVPoll.Failed)
+        for sender in senders:
+            with self.assertRaises(KVTransferError):
+                sender.failure_exception()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def test_pp_abort_during_stage0_cleanup_waits_for_a_stage_yet_to_conclude(self):
+        """Stage 0's abort during its own room cleanup caches Failed. Once that
+        cleanup ends, the release still waits for a later stage whose worker has
+        not taken its last chunk: it may commit Success before its own abort."""
+        stages, senders, _ = self.pp_concluded_room()
+        stages[0]._staging_outstanding[1] = 0
+        senders[0].abort()
+        self.assertEqual(senders[0].conclude_state, KVPoll.Failed)
+        stages[0]._staging_outstanding.pop(1)
+        self.assertNotIn(
+            stages[0].request_status.collect(1)[1], (KVPoll.Success, KVPoll.Failed)
+        )
+        self.assertEqual(senders[0].poll_pp_release(), KVPoll.Transferring)
+        senders[1].abort()
+        self.wait_until(lambda: stages[0].request_status.collect(1)[1] == KVPoll.Failed)
+        self.assertEqual(senders[0].poll_pp_release(), KVPoll.Failed)
+
+    def test_pp_abort_after_success_skips_a_stage_whose_last_chunk_was_dropped(self):
+        """A stage that failed before its worker took the last chunk holds
+        nothing, so the abort's release does not wait for it."""
+        stages, senders, _ = self.pp_concluded_room()
+        stage = stages[1]
+        stage.disaggregation_mode = DisaggregationMode.PREFILL
+        # A destination and a queue, so only the Failed status drops the chunk.
+        stage.transfer_infos[1] = {"decode:1234": Mock()}
+        stage.transfer_queues = [Mock()]
+        stage.record_failure(1, "decode session failed")
+        stage.update_status(1, KVPoll.Failed)
+        stage.add_transfer_request(1, [], slice(0, 0), True, aux_index=0)
+        stage.transfer_queues[0].put.assert_not_called()
+        self.abort_on_every_stage(stages, senders)
+        self.assertEqual(senders[0].poll_pp_release(), KVPoll.Failed)
+
+    def test_pp_abort_before_stage0_success_releases_at_once(self):
+        """Without stage 0's Success decode cannot recompute into the room, so
+        an abort releases it at once, even during a later stage's cleanup."""
+        stages, senders, receiver = self.pp_concluded_room(stage0_success=False)
+
+        def during_cleanup():
+            self.abort_on_every_stage(stages, senders)
+            self.assertEqual(senders[0].poll_pp_release(), KVPoll.Failed)
+
+        self._run_last_chunk_through_worker(during_cleanup, stages[1])
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
 
     def test_failure_racing_worker_success_is_decodes_only_notice(self):
         """An abort landing between the worker's Success decision and its commit
