@@ -337,6 +337,40 @@ Unsupported features are refused at startup. If startup fails with
 With P/D disaggregation, DCP on XPU skips the DCP pack fast path: the pack
 kernel runs only on CUDA, so KV is transferred per token instead.
 
+## XPU Monokernels for Qwen3.5 / Qwen3.6 MoE [Experimental]
+
+`--enable-xpu-monokernel` runs the decode and speculative-verify steps of
+Qwen3.5 / Qwen3.6 MoE (35B-A3B, block-FP8 checkpoint) at TP2 on two Intel Arc
+Pro B70 cards with one persistent kernel per decoder layer: the mixer, the MoE
+with the shared expert, and both TP all-reduces run in one kernel, which
+exchanges the all-reduce values with the peer card through P2P mailboxes.
+Other steps (prefill, unsupported batch sizes) use the standard forward.
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen3.6-35B-A3B-FP8 --device xpu \
+    --tp 2 --attention-backend intel_xpu --page-size 64 \
+    --cuda-graph-backend-decode full --enable-xpu-monokernel
+```
+
+Requirements:
+
+- **sgl-kernel-xpu built with the kernels.** They are not compiled by default:
+  build sgl-kernel-xpu with `USE_MONO_DECODE=ON` set in the environment.
+- **ptrace permission between the two ranks.** The mailboxes live in torch
+  symmetric memory, and mapping the peer card's buffer needs ptrace permission
+  over the peer process. With `kernel.yama.ptrace_scope` 1 (the Ubuntu default),
+  run the container with `--cap-add SYS_PTRACE` (or set `ptrace_scope` to 0 on
+  the host). Without it, the server stops at startup with an error that says so.
+- Two Xe2 GPUs with at least 32 Xe cores each, `--tp 2`, up to 8 requests a
+  decode step (set `--max-running-requests` and `--cuda-graph-max-bs-decode` to
+  the concurrency you serve). MTP speculative decoding: `--speculative-algorithm
+  EAGLE` with `--speculative-eagle-topk 1` and 2, 3, 4, 6 or 8 draft tokens.
+
+An unsupported configuration is refused at startup with the list of reasons.
+If a rank stops answering, the in-kernel waits give up after
+`SGLANG_XPU_MONO_DEADLINE_S` seconds (default 2), and the server stops with an
+error that names the likely cause instead of hanging.
+
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
 SGLang can temporarily release most of the GPU memory it holds — model weights

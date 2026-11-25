@@ -51,10 +51,10 @@ def _two_mono_gpus() -> bool:
     if not torch.xpu.is_available() or torch.xpu.device_count() < 2:
         return False
     try:
-        from sgl_kernel import mono_decode
+        from sgl_kernel import qwen35_decode
     except ImportError:
         return False
-    return all(mono_decode.supports(torch.device("xpu", i)) for i in range(2))
+    return all(qwen35_decode.is_supported(torch.device("xpu", i)) for i in range(2))
 
 
 def _generate(base_url: str) -> list:
