@@ -108,9 +108,10 @@ chat backend (`sglang-oai-chat`, `vllm-chat`, `lmdeploy-chat`). Each line's
 `messages` go out as written, so multi-turn and system prompts survive; its
 other fields (`tools`, `temperature`, ...) are merged over
 `--extra-request-body`, and `model`, `max_tokens` and `max_completion_tokens`
-are dropped. The output length is `--sharegpt-output-len`, else the line's
-`max_tokens`, else 256. Lines are read in file order up to `--num-prompts`;
-ones that are not JSON objects or carry no `messages` are skipped.
+are dropped. The output length is `--sharegpt-output-len` (1 measures
+prefill alone), else the line's `max_tokens`, else 256. Lines are read in
+file order up to `--num-prompts`; ones that are not JSON objects or carry no
+`messages` are skipped.
 
 One difference: the Python client counts each prompt with the tokenizer's
 chat template before sending. This client has no template engine, and some
