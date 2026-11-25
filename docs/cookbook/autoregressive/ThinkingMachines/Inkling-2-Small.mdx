@@ -1,8 +1,20 @@
 ---
 title: Inkling-2-Small
 description: "Deploy Inkling-2-Small with SGLang — verified launch commands, with and without DSpark speculative decoding, for Thinking Machines' NVFP4 / MXFP8 Mixture-of-Experts model on GB300, GB200, B300, B200, Vera Rubin, H200, AMD MI350X / MI355X, and TPU7x."
-tag: NEW
 ---
+
+<Callout icon="rocket" color="#d55816">
+SGLang supports Inkling-2-Small from day 0. See the launch blog post: [SGLang and Miles Add Day-0 Support for Inkling 2](https://www.sglang.io/blog/inkling-2-small-day0-support).
+</Callout>
+
+| Hardware | Supported | Docker image |
+| --- | --- | --- |
+| B300 / GB300 | Yes | `lmsysorg/sglang:dev-inkling-2-small` |
+| B200 / GB200 | Yes | `lmsysorg/sglang:dev-inkling-2-small` |
+| VR200 | Yes | `lmsysorg/sglang:dev-inkling-2-small-cu134` |
+| H200 | Yes | `lmsysorg/sglang:dev-inkling-2-small` |
+| MI350X / MI355X | Yes | `lmsysorg/sglang:dev-inkling-2-small-mi35x` |
+| TPU7x | Yes | `lmsysorg/sglang:dev-inkling-2-small-tpu` |
 
 ## Deployment
 
@@ -62,7 +74,11 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
 
-{/* §1 Model Introduction: to be added with the model card. */}
+## 1. Model Introduction
+
+**Inkling-2-Small** is a Mixture-of-Experts model from Thinking Machines with **594B total and 17B active parameters** per token and a **1M-token** context window. It takes text and image input. Its 48 layers use Block Attention Residuals, and each has 384 routed experts (top-8, no shared experts). A 5-layer DSpark draft head is bundled for speculative decoding. SGLang serves it from day 0 on NVIDIA, AMD and Google hardware.
+
+**Resources:** HuggingFace — [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) (NVFP4 + MXFP8) · [Inkling-2-Small-MXFP8](https://huggingface.co/thinkingmachines/Inkling-2-Small-MXFP8).
 
 ## 2. Configuration Tips
 
@@ -70,7 +86,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Parallelism.** Blackwell recipes run TP4 / EP4 (one GB200 / GB300 tray, or half of an 8-GPU B200 / B300 node), except the MXFP8 checkpoint on B200 and GB200, which runs TP8 / EP8 (the full B200 node, or two GB200 trays). H200 and AMD run TP8 / EP8. Keep EP equal to TP: the NVFP4 experts cannot be TP-sharded, because their activation scales must cover each expert's full input width.
 
-**MegaMoE (Blackwell).** `--moe-a2a-backend megamoe` runs the routed experts of every forward with at least 64 tokens through one fused DeepGEMM kernel (dispatch, both expert GEMMs, the capped SwiGLU, and the combine). The Blackwell and Vera Rubin recipes use it for Balanced and DSpark. Balanced decode below 64 concurrent requests stays on the routed kernels, so for Balanced the gain is mostly prefill: on GB300 it cut median time to first token by 19–29% with no decode slowdown. It needs a DeepGEMM build with Inkling-2-Small support; without one the server fails at load. AMD refuses MegaMoE at launch. Keep `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096`: it covers a 16384-token prefill chunk at EP4 and costs about 1.2% of the KV pool, against 6.2% at the global default of 8192. If the build is not available, pick **Routed experts** in the Playground's MoE card.
+**MegaMoE (Blackwell).** `--moe-a2a-backend megamoe` runs the routed experts of every forward with at least 64 tokens through one fused DeepGEMM kernel (dispatch, both expert GEMMs, the capped SwiGLU, and the combine). The Blackwell and Vera Rubin recipes use it for Balanced and DSpark. Balanced decode below 64 concurrent requests stays on the routed kernels, so for Balanced the gain is mostly prefill: on GB300 it cut median time to first token by 19–29% with no decode slowdown. On B200, B300, GB200, GB300 and Vera Rubin the NVFP4 and MXFP8 checkpoints turn MegaMoE on by themselves whenever the experts span two or more GPUs, so **Routed experts** in the Playground's MoE card applies only to Hopper and AMD. AMD refuses MegaMoE at launch. Keep `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096`: it covers a 16384-token prefill chunk at EP4 and costs about 1.2% of the KV pool, against 6.2% at the global default of 8192. A prefill chunk larger than that runs through MegaMoE in pieces.
 
 **Context length and batch size.** Both strategies serve the full 1,048,576-token window; the MTP draft head covers it as well. DSpark recipes raise `--max-running-requests` from the speculative-decoding default of 48. At TP4, B200 and GB200 (192 GB) hold about a third of GB300's KV pool, which limits concurrency at long context; for more KV capacity on B200, use TP8 on the full node.
 
@@ -80,11 +96,11 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Multimodal.** The recipes pass `--enable-multimodal` so the server accepts image inputs; drop it for text-only serving.
 
-**PD disaggregation.** The Playground's **PD Disaggregation** card turns the selected recipe into a prefill or decode role and prints the router command; on GB200 / GB300 it adds the Mooncake MNNVL environment. It was validated with the NVFP4 checkpoint as 1P1D on one 4-GPU GB300 tray, without MegaMoE: prefill at TP2 / EP2 on GPUs 0–1 and decode at TP2 / EP2 on GPUs 2–3. Set `--mem-fraction-static 0.86` on the decode server there; the automatic value (0.963) ran out of memory at startup. This split does not fit the MXFP8 checkpoint, whose weights take about 311 GB per GPU at TP2; keep each MXFP8 role at the TP of its recipe. See [PD disaggregation](../../../docs/advanced_features/pd_disaggregation) for the general setup.
+**PD disaggregation.** The Playground's **PD Disaggregation** card turns the selected recipe into a prefill or decode role and prints the router command; on GB200 / GB300 it adds the Mooncake MNNVL environment. It was validated with the NVFP4 checkpoint as 1P1D on one 4-GPU GB300 tray: prefill at TP2 / EP2 on GPUs 0–1 and decode at TP2 / EP2 on GPUs 2–3. With MegaMoE, the default there, set `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8192` on the prefill server so one MegaMoE call covers the 16384-token chunk at EP2; it cut prefill time to first token by 24–28% against the routed kernels. Set `--mem-fraction-static 0.86` on the decode server there; the automatic value (0.963) ran out of memory at startup. This split does not fit the MXFP8 checkpoint, whose weights take about 311 GB per GPU at TP2; keep each MXFP8 role at the TP of its recipe. See [PD disaggregation](../../../docs/advanced_features/pd_disaggregation) for the general setup.
 
 **AMD.** The ROCm image exports `ROCM_QUICK_REDUCE_QUANTIZATION=INT8`, a lossy all-reduce; the recipe sets it to `NONE`. Attention runs on the Triton backend. Inkling-2-Small on ROCm is validated on gfx950 (MI350X / MI355X) only; other ROCm GPUs refuse at launch.
 
-**Vera Rubin.** The recipes run on one 4-GPU VR200 tray with the GB300 flags (TP4 / EP4, FA4, MegaMoE). They need the `dev-inkling-2-small-cu134` image, which carries the DeepGEMM MegaMoE build for SM107. Both set `SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS=192`.
+**Vera Rubin.** The recipes run on one 4-GPU VR200 tray with the GB300 flags (TP4 / EP4, FA4, MegaMoE). The pinned sgl-deep-gemm 0.2.9 runs MegaMoE on SM107; with it, a launch without `--moe-a2a-backend` cut NVFP4 prefill time to first token by 35% against the routed kernels (8K and 32K prompts, TP4 / EP4). Both set `SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS=192`.
 
 **TPU7x.** One TPU7x host (4 chips, 8 TensorCores) runs TP8 / EP8 on sglang-torchtpu. The first start compiles the shapes listed in `--tpu-compile-bs` and `--tpu-compile-tokens`; later starts reuse the compilation cache.
 
@@ -106,7 +122,7 @@ Prefix caching, KV offloading and tool calls are supported for Inkling-2-Small o
 
 ### 4.1 Encoder disaggregation (EPD)
 
-Encoder disaggregation runs the vision tower in its own server. The encoder server (`--encoder-only`) loads only the vision tower; the language server (`--language-only`) skips it and receives the image embeddings from the encoder. The validated topology uses the NVFP4 checkpoint on one 4-GPU GB300 tray: an encoder at TP1 on GPU 1 and a language server at TP2 / EP2 on GPUs 2–3, without MegaMoE. The MXFP8 checkpoint does not fit a TP2 language server. Start the encoder first.
+Encoder disaggregation runs the vision tower in its own server. The encoder server (`--encoder-only`) loads only the vision tower; the language server (`--language-only`) skips it and receives the image embeddings from the encoder. The validated topology uses the NVFP4 checkpoint on one 4-GPU GB300 tray: an encoder at TP1 on GPU 1 and a language server at TP2 / EP2 on GPUs 2–3. It was validated before MegaMoE became the default on GB300 and has not been rerun with it. The MXFP8 checkpoint does not fit a TP2 language server. Start the encoder first.
 
 <Note>Encoder disaggregation for Inkling-2-Small is not in the `dev-inkling-2-small` images yet.</Note>
 

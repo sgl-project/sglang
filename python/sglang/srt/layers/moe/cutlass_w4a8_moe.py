@@ -104,7 +104,7 @@ def cutlass_w4a8_moe(
         applied directly on the inputs. This is only applicable when topk is 1.
 
     Returns:
-    - torch.Tensor: The fp8 output tensor after applying the MoE layer.
+    - torch.Tensor: The output tensor after applying the MoE layer, in the dtype of a.
     """
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.int8
@@ -319,11 +319,9 @@ def cutlass_w4a8_moe_deepep_normal(
     - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
         quantize the intermediate result between the gemms.
         Shape: scalar or [1, N]
-    - apply_router_weight_on_input (bool): When true, the topk weights are
-        applied directly on the inputs. This is only applicable when topk is 1.
 
     Returns:
-    - torch.Tensor: The fp8 output tensor after applying the MoE layer.
+    - torch.Tensor: The bf16 output tensor after applying the MoE layer.
     """
     assert topk_weights.shape == topk_ids_.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.int8
@@ -342,12 +340,6 @@ def cutlass_w4a8_moe_deepep_normal(
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1)
-
-    num_experts = w1_q.size(0)
-    m = a.size(0)
-    k = w1_q.size(2) * 2
-    n = w2_q.size(2) * 2
     topk = topk_ids_.size(1)
     device = a.device
 
@@ -488,7 +480,7 @@ def cutlass_w4a8_moe_deepep_ll(
     grouped gemm.
 
     Parameters:
-    - a (torch.Tensor): The input tensor to the MoE layer.
+    - a_states (torch.Tensor): The input tensor to the MoE layer.
         Shape: [num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, K]
     - w1_q (torch.Tensor): The first set of int4-quantized expert weights.
         Shape: [num_experts, N * 2,  K // 2]
@@ -500,7 +492,6 @@ def cutlass_w4a8_moe_deepep_ll(
         Shape: [num_experts, K // 512, N * 8]
     - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
         Shape: [num_experts, N // 512, K * 4]
-    - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
     - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
     - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
@@ -514,13 +505,11 @@ def cutlass_w4a8_moe_deepep_ll(
     - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
         quantize the intermediate result between the gemms.
         Shape: scalar or [1, N]
-    - apply_router_weight_on_input (bool): When true, the topk weights are
-        applied directly on the inputs. This is only applicable when topk is 1.
     - expected_m (Optional[int]): Dispatcher's expected rows per expert; a
         requant launch hint only, any value is correct.
 
     Returns:
-    - torch.Tensor: The fp8 output tensor after applying the MoE layer.
+    - torch.Tensor: The bf16 output tensor after applying the MoE layer.
     """
     assert w1_q.dtype == torch.int8
     assert w2_q.dtype == torch.int8

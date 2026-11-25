@@ -203,7 +203,12 @@ def create_unified_radix_cache(
     if ctx.is_hybrid_ssm and get_exec().mamba.decode_state_free_radix:
         tree_slots = keep_full_kv_only(params, tree_slots)
 
-    if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
+    # C128 pages are owned through the allocator's dedicated C128 sub-allocator,
+    # so the component only applies to models carrying ratio-128 layers (V4).
+    # V4.1 reuses the NPU req pool but has no C128 pool and runs on the generic
+    # SWA allocator, whose hooks would fail on the missing c128_attn_allocator.
+    has_c128_layers = 128 in (getattr(ctx.model_config, "compress_ratios", None) or ())
+    if has_c128_layers and hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
             C128SidecarComponent,
         )
@@ -253,6 +258,10 @@ def create_unified_radix_cache(
         kvcache.register_layer_transfer_counter(counter)
         if PoolName.MAMBA in linker.pools:
             kvcache.layer_router.load_parts_layer_wise()
+        if PoolName.DRAFT in linker.pools:
+            draft_counter = linker.draft_layer_counter()
+            for draft_pool in params.sidecar_draft_device_pools:
+                draft_pool.register_layer_transfer_counter(draft_counter)
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
 

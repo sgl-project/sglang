@@ -44,7 +44,7 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
     BH: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_tg, i_hg = tl.program_id(0), tl.program_id(1)
+    i_tg, i_hg = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
 
     if IS_VARLEN:
         i_n = 0
@@ -63,8 +63,8 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
         i_n = left
 
         bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int32),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
         )
         T = eos - bos
         i_t = i_tg - bos
