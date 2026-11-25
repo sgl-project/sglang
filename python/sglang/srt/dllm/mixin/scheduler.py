@@ -79,7 +79,7 @@ class SchedulerDllmMixin:
 
         # Record metrics and update state
         set_time_batch(can_run_list, "set_forward_entry_time")
-        self._update_state_for_batch(can_run_list, adder)
+        self._update_state_for_batch(adder)
 
         # Create and prepare batch
         new_batch = self._create_dllm_batch(
@@ -337,9 +337,7 @@ class SchedulerDllmMixin:
                 adder, incoming_reqs, running_batch=running_batch
             )
 
-    def _update_state_for_batch(
-        self: Scheduler, can_run_list: List[Req], adder: PrefillAdder
-    ) -> None:
+    def _update_state_for_batch(self: Scheduler, adder: PrefillAdder) -> None:
         """Update state for the batch."""
 
         if adder.preempt_list:
@@ -441,9 +439,6 @@ class DllmManager:
         abort: Callable[[Req], None],
     ):
         self.dllm_config = dllm_config
-        self.max_running_reqs = (
-            dllm_config.max_running_requests if dllm_config is not None else 1
-        )
         self.waiting_queue = IndexedReqList(ListKind.DLLM, abort=self._abort)
         self._abort_one = abort
 

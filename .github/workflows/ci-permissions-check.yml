@@ -1,0 +1,36 @@
+name: CI Permissions Check
+
+# Warns about CI_PERMISSIONS.json entries that update_ci_permission.py would drop.
+# Report only: continue-on-error keeps it from blocking a PR.
+
+on:
+  pull_request:
+    paths:
+      - ".github/CI_PERMISSIONS.json"
+      - ".github/update_ci_permission.py"
+  schedule:
+    - cron: "0 16 * * 1" # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Report entries the rules would change
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pip install requests
+          python .github/update_ci_permission.py --check
