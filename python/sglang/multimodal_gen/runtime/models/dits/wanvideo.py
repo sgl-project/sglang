@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -98,6 +99,23 @@ if _is_cuda:
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
+
+# SGLANG_ROCM_QK_NORM_ROPE=1 is set on the serve command line by whoever wants the
+# q/k RMSNorm + RoPE of Wan self-attention as one ROCm kernel. It is off by default
+# because a 40-step Wan2.2 run has not matched the default path yet.
+_use_rocm_qk_norm_rope = current_platform.is_rocm() and (
+    os.environ.get("SGLANG_ROCM_QK_NORM_ROPE", "0") == "1"
+)
+# SGLANG_ROCM_QK_NORM_ROPE_INPLACE=1 is set together with SGLANG_ROCM_QK_NORM_ROPE=1
+# to write q/k back into the packed QKV buffer instead of new tensors. It is off by
+# default because it has not been validated beyond the same Wan2.2 run.
+_rocm_qk_norm_rope_inplace = (
+    os.environ.get("SGLANG_ROCM_QK_NORM_ROPE_INPLACE", "0") == "1"
+)
+if _use_rocm_qk_norm_rope:
+    from sglang.kernels.ops.diffusion.norm.rocm_qk_norm_rope_triton import (
+        rocm_qk_norm_rope,
+    )
 
 
 class _WanGELUMLP(MLP):
@@ -1055,6 +1073,41 @@ class WanTransformerBlock(nn.Module):
             text_kv,
         )
 
+    def _rocm_qk_norm_rope(self, query, key, freqs_cis):
+        """q/k RMSNorm + RoPE in one ROCm kernel reading the packed QKV output;
+        None when this block's layout or config is not the supported one."""
+        if not (
+            _use_rocm_qk_norm_rope
+            and USE_AITER
+            and self.qk_norm == "rms_norm_across_heads"
+            and not self.tp_rmsnorm
+            and not self.use_offline_qk_rotation
+            and query.dim() == 3
+            and query.shape[0] == 1
+        ):
+            return None
+        cos, sin = freqs_cis
+        num_tokens, dim = query.shape[1], query.shape[2]
+        cos = cos.contiguous().view(num_tokens, -1)
+        sin = sin.contiguous().view(num_tokens, -1)
+        out = rocm_qk_norm_rope(
+            query[0],
+            key[0],
+            self.norm_q.weight,
+            self.norm_k.weight,
+            cos,
+            sin,
+            self.norm_q.variance_epsilon,
+            self.dim_head,
+            inplace=_rocm_qk_norm_rope_inplace,
+        )
+        if out is None:
+            return None
+        return tuple(
+            x.unflatten(1, (self.local_num_heads, self.dim_head)).unsqueeze(0)
+            for x in out
+        )
+
     def _self_attention(
         self,
         query: torch.Tensor,
@@ -1065,6 +1118,11 @@ class WanTransformerBlock(nn.Module):
         *,
         complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        fused_qk = self._rocm_qk_norm_rope(query, key, freqs_cis)
+        if fused_qk is not None:
+            return self.attn1(
+                *fused_qk, value.unflatten(2, (self.local_num_heads, self.dim_head))
+            )
         query, key, value, roped = self._norm_qk(
             query, key, value, self.local_num_heads, rope_cos_sin_cache
         )
