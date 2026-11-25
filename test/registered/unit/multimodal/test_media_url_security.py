@@ -196,6 +196,10 @@ class TestMediaURLSecurity(unittest.TestCase):
                 ):
                     _normalize_video_input(input_target)
 
+    def test_default_local_policy_retains_worker_config_shape(self):
+        configure_media_url_security(["example.com"], 7, 3.0, False)
+        self.assertEqual(media_url_security_config(), (["example.com"], 7, 3.0, False))
+
     def test_allowed_local_media_paths_permits_whitelisted_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             file_path = os.path.join(tmpdir, "sample.png")

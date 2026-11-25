@@ -34,6 +34,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
 import asyncio
 import contextlib
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -522,6 +523,7 @@ class TestTokenSpaceSGLangProcessor(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         self.addCleanup(configure_media_url_security, [], 64)
+        allowed_dir = str(Path(__file__).resolve().parent)
         server_args = ServerArgs(
             model_path="dummy",
             model_impl="sglang",
@@ -532,6 +534,7 @@ class TestTokenSpaceSGLangProcessor(CustomTestCase):
             media_url_max_file_size_mb=7,
             media_url_timeout=3.0,
             allow_local_media_files=False,
+            allowed_local_media_paths=[allowed_dir],
         )
         publish(server_args, role="test")
         configure_media_url_security([], 64)
@@ -540,7 +543,8 @@ class TestTokenSpaceSGLangProcessor(CustomTestCase):
         )(None, server_args, _bare_tokenizer(), None)
         self.addCleanup(processor.shutdown)
         self.assertEqual(
-            media_url_security_config(), (["media.example.com"], 7, 3.0, False)
+            media_url_security_config(),
+            (["media.example.com"], 7, 3.0, False, [allowed_dir]),
         )
 
     def test_serving_offsets_come_from_mm_spans(self):

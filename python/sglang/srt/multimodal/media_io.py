@@ -153,17 +153,15 @@ def configure_media_url_security(
 
 def media_url_security_config() -> tuple:
     """The configured policy, as ``configure_media_url_security`` arguments."""
-    return (
+    config = (
         sorted(_allowed_media_domains),
         _media_url_max_file_size_bytes // (1024 * 1024),
         _media_url_timeout,
         _allow_local_media_files,
-        (
-            None
-            if _allowed_local_media_paths is None
-            else sorted(_allowed_local_media_paths)
-        ),
     )
+    if _allowed_local_media_paths is None:
+        return config
+    return (*config, sorted(_allowed_local_media_paths))
 
 
 def _assert_media_url_allowed(url: str) -> None:
