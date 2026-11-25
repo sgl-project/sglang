@@ -1518,8 +1518,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mixed_qkv_to_track = mixed_qkv[
                     forward_metadata.track_conv_indices
                 ].transpose(1, 2)
+                # Conv states use SGLANG_MAMBA_CONV_DTYPE, which can differ from the
+                # activation dtype (e.g. --dtype float16), and index_put rejects a mismatch.
                 conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
+                    mixed_qkv_to_track.to(conv_states.dtype)
                 )
 
             mixed_qkv = self._convolve_prefill(
