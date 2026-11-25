@@ -3,9 +3,9 @@
 import logging
 import time
 
+import torch.distributed as dist
 from torch.profiler import record_function
 
-from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderReal,
@@ -47,6 +47,13 @@ class _AsyncStatAccumulator(_StatAccumulator):
         super().reset()
         self.window_samples = 0
         self._previous_layouts.clear()
+
+    def snapshot_physical_counts(self):
+        # A completed migration resets the window before the next epoch.
+        assert not self._previous_layouts
+        counts = self._global_physical_count_of_buffered_step.get_all().clone()
+        dist.all_reduce(counts, group=self._communication_group)
+        return counts, self._get_global_average_utilization_rate()
 
     def _logical_counts(self, physical_counts):
         logical = super()._logical_counts(physical_counts)
@@ -92,23 +99,28 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
         # NPU startup already warmed TP and emptied the allocator cache.
         self._accumulator._first_dump = False
 
-    def snapshot_for_rebalance(self):
+    def snapshot_for_rebalance(self, *, physical: bool):
         with record_function("npu_eplb.snapshot"):
-            return self.dump_record(output_mode="object")
+            if physical:
+                snapshot = self._accumulator.snapshot_physical_counts()
+                self._reset()
+                return snapshot
+            snapshot = self.dump_record(output_mode="object")
+            return snapshot["logical_count"], snapshot[
+                "average_utilization_rate_over_window"
+            ]
 
 
 def make_prefill_release_policy(scheduler):
     """Select early result processing for the first unified EPLB epoch."""
     fallback = scheduler.should_process_last_batch_early
     manager = scheduler.tp_worker.model_runner.eplb_manager
-    if manager is None:
+    coordinator = manager._async_coordinator if manager is not None else None
+    if coordinator is None or not coordinator.runtime.use_prefill_admission:
         return fallback
 
     def should_process(last_batch):
-        if (
-            last_batch is not None
-            and not envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
-        ):
+        if last_batch is not None:
             is_extend = (
                 last_batch.is_extend_in_batch
                 if scheduler.require_mlp_sync
@@ -209,15 +221,15 @@ class NpuAsyncEPLBManager(EPLBManager):
         if not ready:
             return
         start = time.perf_counter()
-        snapshot = recorder.snapshot_for_rebalance()
+        counts, utilization = recorder.snapshot_for_rebalance(
+            physical=coordinator.runtime.spec.use_physical_counts
+        )
         snapshot_seconds = time.perf_counter() - start
-        if not self._check_rebalance_needed(
-            snapshot["average_utilization_rate_over_window"]
-        ):
+        if not self._check_rebalance_needed(utilization):
             return
         coordinator.control.wait_seconds = 0.0
-        coordinator.start(coordinator.runtime.planner(snapshot["logical_count"]))
-        del snapshot
+        coordinator.start(coordinator.runtime.planner(counts))
+        del counts
         try:
             while True:
                 yield

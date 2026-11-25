@@ -319,9 +319,8 @@ class _PackedExpertFields:
             [staging[i] for i in direct] + [packed],
         )
 
-    def pack(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+    def pack(self, weights: list[torch.Tensor]) -> None:
         torch.cat([weights[i] for i in self.small], dim=1, out=self.send)
-        return [weights[i] for i in self.direct] + [self.send]
 
 
 @dataclass(frozen=True)
@@ -346,6 +345,7 @@ class NpuEplbRuntime:
         world_group: dist.ProcessGroup,
         *,
         order_submissions: bool = False,
+        use_prefill_admission: bool = False,
     ):
         # Peer batches must use the size checked across ranks at startup.
         self._p2p_batch_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
@@ -395,6 +395,7 @@ class NpuEplbRuntime:
         self._owner_stream = self.device_module.current_stream()
         self._owner_ready = self.device_module.Event()
         self._order_submissions = order_submissions
+        self.use_prefill_admission = use_prefill_admission
         self._routing_plan: _RoutingPlan | None = None
         self.stage_seconds = self.install_enqueue_seconds = 0.0
         self.interleaved_layers = 0
@@ -428,6 +429,13 @@ class NpuEplbRuntime:
                             self.spec,
                             self.ranks_per_node,
                             self.layer_ids,
+                            current_replicas=(
+                                self.metadata.logical_to_all_physical_map_cpu[
+                                    :, :, : self._replica_width
+                                ]
+                                if self.spec.use_physical_counts
+                                else None
+                            ),
                         )
                 except Exception as exc:
                     error = str(exc)
@@ -530,6 +538,12 @@ class NpuEplbRuntime:
 
         def stage_transfers(p2p_op_infos, rows):
             staged_rows.extend(rows)
+            if (
+                packed is not None
+                and not packed_for_local_copy
+                and any(op.op == dist.isend for _, ops in p2p_op_infos for op in ops)
+            ):
+                packed.pack(weights)
             _submit_hccl_batches(
                 p2p_op_infos, expert_order, self._p2p_batch_size, pending_work
             )
@@ -540,9 +554,23 @@ class NpuEplbRuntime:
                 row.copy_(routing.host_rows[name][layer], non_blocking=True)
             weights, staging = self.weights[layer], self.staging
             sends, receives = weights, staging
-            if self._packed_fields is not None:
-                sends = self._packed_fields.pack(weights)
-                receives = self._packed_fields.receive
+            packed = self._packed_fields
+            packed_for_local_copy = False
+            if packed is not None:
+                first = self.rank * self.spec.local_experts
+                local = slice(first, first + self.spec.local_experts)
+                resident = old_layout[local]
+                # The updater copies local moves before calling stage_transfers.
+                # Other sources only need packing if an isend was selected.
+                resident_experts = set(resident)
+                packed_for_local_copy = any(
+                    old != new and new in resident_experts
+                    for old, new in zip(resident, new_layout[local], strict=True)
+                )
+                if packed_for_local_copy:
+                    packed.pack(weights)
+                sends = [weights[i] for i in packed.direct] + [packed.send]
+                receives = packed.receive
             update_expert_weights_single_layer(
                 routed_experts_weights=sends,
                 temp_buffers=receives,
@@ -596,6 +624,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
         get_disagg,
         get_exec,
         get_parallel,
+        get_schedule,
         reports_expert_balancedness,
     )
 
@@ -616,6 +645,10 @@ def create_npu_async_eplb(model_config, weights, metadata):
         parallel.nnodes,
         algorithm,
         rank_fixed_dispatch=moe.ep_dispatch_algorithm == "static",
+        use_physical_counts=(
+            moe.moe_a2a_backend == "none"
+            and metadata.num_physical_experts > metadata.num_logical_experts
+        ),
     )
     # Fixed PP=1 TP=EP=WORLD: group construction order is identical on all ranks.
     timeout = timedelta(seconds=90)
@@ -637,6 +670,11 @@ def create_npu_async_eplb(model_config, weights, metadata):
             plan_group,
             parallel.world_group.device_group,
             order_submissions=order_submissions,
+            use_prefill_admission=(
+                borrow_world_group
+                and not get_schedule().disable_overlap_schedule
+                and not envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
+            ),
         )
         initial_layout = metadata.physical_to_logical_map_cpu.contiguous()
         if any(t.shape[0] != spec.local_experts for t in runtime.staging):
@@ -648,6 +686,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             runtime.weight_format_digest,
             borrow_world_group,
             order_submissions,
+            runtime.use_prefill_admission,
             runtime._p2p_batch_size,
             p2p_buffer_mib,
             moe.eplb_rebalance_num_iterations,
@@ -668,7 +707,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
     if any(s != signature for s in signatures):
         raise ValueError(
             "Async EPLB ranks disagree on transport, placement, expert weight format, "
-            "batching or recorder configuration"
+            "batching, scheduling or recorder configuration"
         )
     # All ranks must agree before any enters a conditional HCCL group creation.
     if not borrow_world_group:

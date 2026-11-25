@@ -37,6 +37,7 @@ class PlanningSpec:
     nodes: int
     algorithm: EplbAlgorithm
     rank_fixed_dispatch: bool = False
+    use_physical_counts: bool = False
 
     def compute(self, counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         from sglang.srt.eplb.eplb_algorithms import rebalance_experts
@@ -58,8 +59,21 @@ def plan_migration(
     spec: PlanningSpec,
     ranks_per_node: int,
     layer_ids: tuple[int, ...],
+    *,
+    current_replicas: torch.Tensor | None = None,
 ) -> MigrationPlacement | None:
-    """Build a CPU plan from [steps, layers, logical experts] on the root rank."""
+    """Plan on the root rank; row-index dispatch records physical slot counts."""
+    physical_counts = None
+    if spec.use_physical_counts:
+        from sglang.srt.eplb.expert_distribution import (
+            _convert_global_physical_count_to_logical_count,
+        )
+
+        assert current_replicas is not None
+        physical_counts = counts.numpy()
+        counts = _convert_global_physical_count_to_logical_count(
+            counts, current.size(0), current_replicas.size(1), current
+        )
     physical, logical = spec.compute(counts)
     if physical.shape != current.shape:
         raise ValueError("EPLB plan changed physical capacity")
@@ -80,18 +94,47 @@ def plan_migration(
         ranks_per_node,
         preserve_rank_assignment=replicated_static,
     )
-    cheaper_gains = {}
+    known_gains = {}
     if score_steps and not replicated:
-        physical, logical, cheaper_gains = _prefer_fewer_moves(
+        physical, logical, known_gains = _prefer_fewer_moves(
             current, physical, logical, counts, spec.local_experts
         )
     moved = (physical != current).any(dim=1).tolist()
     changed = tuple(layer for layer in layer_ids if moved[layer])
     # All ranks start with the same layout and commit layers together.
     # An unchanged plan only needs the completion message.
-    if score_steps and changed:
+    if physical_counts is not None:
+        # Search with logical totals, but admit against observed replica loads.
+        known_gains = {
+            layer: _row_dispatch_gain(
+                physical_counts[:, layer],
+                current_replicas[layer].numpy(),
+                logical[layer].numpy(),
+                spec.local_experts,
+            )
+            for layer in changed
+        }
+    if changed and (score_steps or physical_counts is not None):
         changed = _select_layers_for_migration(
-            changed, current, physical, counts, spec.local_experts, cheaper_gains
+            changed, current, physical, counts, spec.local_experts, known_gains
+        )
+    elif changed and not replicated:
+        # Hierarchical placement can trade compute for locality. If no expert
+        # changes node, require a load improvement just as on one node.
+        slots_per_node = ranks_per_node * spec.local_experts
+        before = current.numpy().reshape(-1, spec.nodes, slots_per_node)
+        after = physical.numpy().reshape(before.shape)
+        changed = tuple(
+            layer
+            for layer in changed
+            if not np.array_equal(
+                np.sort(before[layer], axis=1), np.sort(after[layer], axis=1)
+            )
+            or _migration_gain(
+                counts[:, layer].numpy(),
+                before[layer].reshape(-1, spec.local_experts),
+                after[layer].reshape(-1, spec.local_experts),
+            )
         )
     return MigrationPlacement(changed, physical, logical) if changed else None
 
@@ -435,6 +478,29 @@ def _prefer_fewer_moves(old, physical, logical, counts, local_experts):
     return physical, logical, cheaper_gains
 
 
+def _row_dispatch_gain(samples, live_replicas, target_replicas, local_experts):
+    """Bound rank peaks when a token row picks replica row % num_replicas."""
+    ranks = samples.shape[1] // local_experts
+    reachable = np.zeros((ranks, samples.shape[1]), dtype=bool)
+    # A row previously choosing column i can choose column j iff the two
+    # residues agree modulo gcd(old_count, new_count). Equal counts replay
+    # exactly. For splits, charge a slot to each rank that could receive it.
+    for old, new in zip(live_replicas, target_replicas, strict=True):
+        old = old[old >= 0]
+        new = new[new >= 0] // local_experts
+        if len(old) == len(new):
+            reachable[new, old] = True
+        else:
+            groups = np.gcd(len(old), len(new))
+            for residue in range(groups):
+                reachable[np.ix_(new[residue::groups], old[residue::groups])] = True
+    before = samples.reshape(len(samples), ranks, local_experts).sum(2).max(1)
+    upper = np.zeros_like(before)
+    for slots in reachable:
+        np.maximum(upper, samples[:, slots].sum(1), out=upper)
+    return _peak_gain(before, upper, samples.sum(1), ranks)
+
+
 def _migration_gain(samples, live, target):
     num_experts = samples.shape[-1]
 
@@ -451,10 +517,13 @@ def _migration_gain(samples, live, target):
 
     before_peak = peak_tokens(samples, live)
     after_peak = peak_tokens(samples, target)
+    return _peak_gain(before_peak, after_peak, samples.sum(axis=1), len(live))
+
+
+def _peak_gain(before_peak, after_peak, totals, ranks):
     gain = (before_peak - after_peak).sum()
     # Require a saving of 1% of an ideally balanced rank's recorded tokens.
-    totals = samples.sum(axis=1)
-    if gain <= 0.01 * totals.sum() / len(live):
+    if gain <= 0.01 * totals.sum() / ranks:
         return 0.0
     # A move can help large batches but overload small ones, even without replicas.
     active = totals > 0
@@ -467,7 +536,7 @@ def _migration_gain(samples, live, target):
 
 
 def _select_layers_for_migration(
-    changed, old, physical, counts, local_experts, cheaper_gains
+    changed, old, physical, counts, local_experts, known_gains
 ):
     """Skip marginal improvements and stage the most useful layers first."""
     load = counts.numpy()
@@ -477,7 +546,7 @@ def _select_layers_for_migration(
     for layer in changed:
         live = before[layer].reshape(-1, local_experts)
         target = after[layer].reshape(live.shape)
-        gain = cheaper_gains.get(layer)
+        gain = known_gains.get(layer)
         if gain is None:
             gain = _migration_gain(load[:, layer], live, target)
         if not gain:
