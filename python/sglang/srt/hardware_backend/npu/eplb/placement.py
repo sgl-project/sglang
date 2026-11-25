@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import numpy as np
 import torch
+from sglang.srt.hardware_backend.npu.eplb.placement_scoring import (
+    MIN_RANK_LOAD_SAVING,
+    estimate_migration_gain,
+    score_dispatch_migration,
+    window_p95_index,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.eplb_algorithms import EplbAlgorithm
@@ -16,8 +22,6 @@ _MAX_SCORING_STEPS = 64
 _EXCHANGE_BATCH_LAYERS = 16
 _LAYERS_PER_ALTERNATE_SEARCH = 8
 _MIN_COMPACTION_SKIP_FRACTION = 0.25
-_MIN_RANK_LOAD_SAVING = 0.01  # Fraction of an ideally balanced rank's load.
-_MAX_WINDOW_TAIL_REGRESSION_RISK = 0.05
 
 
 class MigrationPlacement(NamedTuple):
@@ -100,7 +104,7 @@ def _rank_peaks_and_eligible_layers(slot_counts, spec, layer_ids):
         total = rank_load.sum(axis=(0, 2))
         headroom = peaks.sum(axis=0) * rank_load.shape[2] - total
         layer_ids = tuple(
-            i for i in layer_ids if headroom[i] > _MIN_RANK_LOAD_SAVING * total[i]
+            i for i in layer_ids if headroom[i] > MIN_RANK_LOAD_SAVING * total[i]
         )
     return peaks, layer_ids
 
@@ -468,7 +472,7 @@ def _balance_recorded_steps(
         order[batch] = placement
 
     def score(peak, mass):
-        tail = int(np.ceil(0.95 * len(mass))) - 1
+        tail = window_p95_index(len(mass))
         return np.array([peak.sum(), np.partition(peak / mass, tail)[tail]])
 
     def evaluate(layer, placement):
@@ -504,10 +508,12 @@ def _balance_recorded_steps(
             live = current[layer].numpy().reshape(slots.shape)
             target = ids[layer, candidate]
             observed = None if observed_peaks is None else observed_peaks[:, layer]
-            if not _migration_gain(samples[:, layer], live, target, observed):
+            if not estimate_migration_gain(samples[:, layer], live, target, observed):
                 continue
             primary = ids[layer, order[layer]]
-            primary_gain = _migration_gain(samples[:, layer], live, primary, observed)
+            primary_gain = estimate_migration_gain(
+                samples[:, layer], live, primary, observed
+            )
             if primary_gain and improvement <= 1e-12:
                 continue
             extra = _min_remote_rows(live, target, logical.shape[1]) - _min_remote_rows(
@@ -574,7 +580,7 @@ def _prefer_fewer_moves(old, physical, logical, counts, local_experts, layer_ids
             np.count_nonzero(reference != source)
         ):
             # Keep the aligned plan unless the cheaper move also passes admission.
-            gain = _migration_gain(samples[:, layer], source, candidate)
+            gain = estimate_migration_gain(samples[:, layer], source, candidate)
             if gain:
                 result[layer] = candidate
                 cheaper_gains[layer] = gain
@@ -632,7 +638,7 @@ def _admit_dispatch_layers(
     def score(row, target, inverse):
         if row not in narrowed_rows and torch.equal(target, current[row]):
             return 0.0
-        return _a2a_migration_gain(
+        return score_dispatch_migration(
             logical_counts[:, row],
             physical_counts[:, row],
             observed_peaks[:, row],
@@ -640,8 +646,10 @@ def _admit_dispatch_layers(
             inverse.numpy(),
             spec.local_experts,
             ranks_per_node,
-            dispatch_by_rank[row] if dispatch_by_rank is not None else None,
-            source_counts[:, row] if source_counts is not None else None,
+            static_dispatch=dispatch_by_rank[row]
+            if dispatch_by_rank is not None
+            else None,
+            source_totals=source_counts[:, row] if source_counts is not None else None,
             score_locality=spec.score_locality,
             active_sources=(
                 active_source_counts[:, row]
@@ -670,219 +678,6 @@ def _admit_dispatch_layers(
     return gains, static_dispatch
 
 
-def _migration_gain(samples, live, target, before_peak=None):
-    num_experts = samples.shape[-1]
-
-    def peak_tokens(layer_load, rank_experts):
-        replicas = np.bincount(rank_experts.ravel(), minlength=num_experts)
-        # Keep each float64 gather near 512 KiB even for long recorder windows.
-        steps = max(1, (64 * 1024) // rank_experts.size)
-        peak = np.empty(len(layer_load))
-        for start in range(0, len(peak), steps):
-            block = slice(start, start + steps)
-            per_replica = layer_load[block] / replicas
-            peak[block] = per_replica[:, rank_experts].sum(axis=-1).max(axis=1)
-        return peak
-
-    if before_peak is None:
-        before_peak = peak_tokens(samples, live)
-    after_peak = peak_tokens(samples, target)
-    return _peak_gain(before_peak, after_peak, samples.sum(axis=1), len(live))
-
-
-def _static_rank_peak_bound(slots, destinations, sources, ranks):
-    # Bound each slot by its step count and by how many assignments its sources
-    # send to the destination over the whole window. Exact for a single step.
-    capacity = np.zeros((ranks, slots.shape[1]), dtype=np.int64)
-    np.add.at(capacity, (destinations, np.arange(slots.shape[1])), sources)
-    if len(slots) == 1:
-        return capacity.sum(1).max(keepdims=True)
-    slot_max = slots.max(0)
-    peak = np.zeros(len(slots), dtype=np.int64)
-    for per_slot in capacity:
-        active = per_slot > 0
-        loads = slots[:, active]
-        limits = per_slot[active]
-        if np.any(limits < slot_max[active]):
-            np.minimum(loads, limits, out=loads)
-        np.maximum(peak, loads.sum(1), out=peak)
-    return peak
-
-
-def _random_rank_peak_bound(samples, probability, before, totals, active_sources=None):
-    """Bound the mean busiest-rank load and reject unsafe window tails."""
-    # Accumulate moments and support bounds from the assignment marginals.
-    weights = np.concatenate(
-        (
-            probability,
-            probability * (1 - probability),
-            probability > 0,
-            (probability > 0) & (probability < 1),
-        ),
-        axis=1,
-    )
-    mean, variance_sum, reachable, random_counts = np.split(
-        samples @ weights, 4, axis=1
-    )
-    # Sources can share a generator state. With K active sources,
-    # Cauchy-Schwarz bounds the combined variance by K times their sum.
-    source_ranks = (
-        np.maximum(active_sources, 1)[:, None]
-        if active_sources is not None
-        else np.full((len(totals), 1), probability.shape[1])
-    )
-    if not _random_window_tail_is_safe(
-        before, totals, mean, variance_sum, reachable, random_counts, source_ranks
-    ):
-        return None
-    variance = source_ranks * variance_sum
-    # For any threshold c, max(X) <= c + sum((X_i - c)_+).
-    # Cauchy-Schwarz bounds each expected excess using its variance.
-    threshold = mean.max(1, keepdims=True)
-    gap = mean - threshold
-    excess = (np.sqrt(variance + gap * gap) + gap) / 2
-    peak = threshold[:, 0] + np.minimum(
-        excess, np.maximum(reachable - threshold, 0)
-    ).sum(1)
-    return np.minimum(peak, reachable.max(1))
-
-
-def _random_window_tail_is_safe(
-    before, totals, mean, variance_sum, reachable, random_counts, source_ranks
-):
-    active = totals > 0
-    tail = int(np.ceil(0.95 * active.sum())) - 1
-    if tail < 0:
-        return True
-    before_p95 = np.partition(before[active] / totals[active], tail)[tail]
-    # A step breaches the old P95 when any rank reaches this integer load.
-    first_breach = np.floor((before_p95 + 1e-12) * totals[active])[:, None] + 1
-    mean = mean[active]
-    random_counts = random_counts[active]
-    forced = ((random_counts == 0) & (mean >= first_breach)).any(axis=1)
-    # The nearest-rank P95 rises once one more step than the tail can hold
-    # breaches. Always count steps that already breach with probability one.
-    remaining = len(forced) - tail - int(forced.sum())
-    if remaining <= 0:
-        return False
-    possible = (
-        (reachable[active] >= first_breach) & (random_counts > 0) & ~forced[:, None]
-    )
-    gap = np.maximum(first_breach - mean, 0)[possible]
-    risk = np.zeros_like(mean)
-    # Apply Hölder to the K source moment-generating functions before using
-    # Bernstein and Hoeffding within each source. The exponents lose a factor
-    # of K, so sources may be arbitrarily correlated (including identical draws).
-    squared_gap = gap**2 / np.broadcast_to(source_ranks[active], mean.shape)[possible]
-    bernstein = squared_gap / (2 * (variance_sum[active][possible] + gap / 3))
-    hoeffding = 2 * squared_gap / random_counts[possible]
-    risk[possible] = np.exp(-np.maximum(bernstein, hoeffding))
-    # Union bound over destination ranks, then Markov over the window. Neither
-    # needs independence across destination ranks or across steps.
-    expected_breaches = np.minimum(risk.sum(axis=1), 1).sum()
-    return expected_breaches <= remaining * _MAX_WINDOW_TAIL_REGRESSION_RISK
-
-
-def _replica_rank_probabilities(inverse, ranks, local_experts):
-    """Probability of dispatching each logical expert to each destination rank."""
-    # Dynamic dispatch uses randint(0, 65536) modulo the number of copies.
-    # The first remainder columns therefore get one extra draw.
-    num_draws = 65536
-    expert, column = np.nonzero(inverse >= 0)
-    copies = (inverse >= 0).sum(1)[expert]
-    draws = num_draws // copies + (column < num_draws % copies)
-    destination = inverse[expert, column] // local_experts
-    probability = np.zeros((len(inverse), ranks))
-    np.add.at(probability, (expert, destination), draws / num_draws)
-    return probability
-
-
-def _a2a_migration_gain(
-    samples,
-    slots,
-    before,
-    live,
-    inverse,
-    local_experts,
-    ranks_per_node,
-    dispatch,
-    sources,
-    *,
-    score_locality=True,
-    active_sources=None,
-):
-    ranks = slots.shape[1] // local_experts
-    slot_ranks = np.arange(len(live)) // local_experts
-    totals = samples.sum(1)
-    remote_saved = 0
-    fixed_destinations = dispatch is not None or len(live) == len(inverse)
-    compare_nodes = score_locality and ranks > ranks_per_node
-    if fixed_destinations:
-        if dispatch is None:
-            # A single copy fixes the destination for every source node.
-            destinations = inverse[live, 0] // local_experts
-            peak = (
-                samples[:, np.argsort(inverse[:, 0])]
-                .reshape(len(samples), ranks, local_experts)
-                .sum(2)
-                .max(1)
-            )
-        else:
-            destinations = dispatch[live].T // local_experts
-            peak = _static_rank_peak_bound(slots, destinations, sources, ranks)
-        if compare_nodes:
-            source_nodes = np.arange(len(sources))
-            if dispatch is not None:
-                source_nodes //= ranks_per_node
-            remote_saved = (
-                sources[source_nodes[:, None] != slot_ranks // ranks_per_node].sum()
-                - sources[source_nodes[:, None] != destinations // ranks_per_node].sum()
-            )
-    else:
-        probability = _replica_rank_probabilities(inverse, ranks, local_experts)
-        peak = _random_rank_peak_bound(
-            samples, probability, before, totals, active_sources
-        )
-        if peak is None:
-            return 0.0
-        if compare_nodes:
-            nodes = ranks // ranks_per_node
-            local_probability = probability.reshape(
-                len(inverse), nodes, ranks_per_node
-            ).sum(2)
-            current_local = np.arange(nodes)[:, None] == slot_ranks // ranks_per_node
-            remote_saved = (sources * (local_probability[live].T - current_local)).sum()
-    if remote_saved < 0:
-        return 0.0
-    return _peak_gain(
-        before,
-        peak,
-        totals,
-        ranks,
-        check_tail=fixed_destinations,
-        remote_saved=remote_saved,
-    )
-
-
-def _peak_gain(
-    before_peak, after_peak, totals, ranks, *, check_tail=True, remote_saved=0
-):
-    gain = (before_peak - after_peak).sum()
-    min_saving = _MIN_RANK_LOAD_SAVING * totals.sum() / ranks
-    if gain < 0 or (gain <= min_saving and remote_saved <= 0):
-        return 0.0
-    # Compare the busiest rank's share of each step. With mixed batch sizes
-    # this percentile differs from the P95 of absolute assignment counts.
-    if check_tail:
-        active = totals > 0
-        tail = int(np.ceil(0.95 * active.sum())) - 1
-        shares = np.stack([before_peak[active], after_peak[active]]) / totals[active]
-        before_p95, after_p95 = np.partition(shares, tail, axis=1)[:, tail]
-        if after_p95 > before_p95 + 1e-12:
-            return 0.0
-    return gain if gain > 0 else remote_saved / ranks
-
-
 def _select_layers_for_migration(
     changed, old, physical, counts, local_experts, known_gains
 ):
@@ -896,7 +691,7 @@ def _select_layers_for_migration(
         target = after[layer].reshape(live.shape)
         gain = known_gains.get(layer)
         if gain is None:
-            gain = _migration_gain(load[:, layer], live, target)
+            gain = estimate_migration_gain(load[:, layer], live, target)
         if not gain:
             continue
         receives = max(
