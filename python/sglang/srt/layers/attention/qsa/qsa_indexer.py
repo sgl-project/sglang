@@ -445,8 +445,6 @@ class QSAIndexer(MultiPlatformOp):
         max_row_keys: Optional[int] = None,
         *,
         defer_expansion: bool = False,
-        row_offset: int = 0,
-        total_rows: Optional[int] = None,
     ) -> torch.Tensor:
         """Top-k token selection for packed prefill rows.
 
@@ -478,17 +476,13 @@ class QSAIndexer(MultiPlatformOp):
             and q.is_cuda
             and HAS_TILELANG
         )
-        reference_rows = rows if total_rows is None else total_rows
         row_chunk_size = _qsa_prefill_row_chunk_size(
-            reference_rows,
+            rows,
             max_row_keys if relative else compressed_keys.shape[0],
             q.shape[1],
         )
-        first_chunk = (row_offset // row_chunk_size) * row_chunk_size
-        for chunk_start in range(first_chunk, row_offset + rows, row_chunk_size):
-            chunk_end = min(chunk_start + row_chunk_size, reference_rows)
-            row_start = max(chunk_start - row_offset, 0)
-            row_end = min(chunk_end - row_offset, rows)
+        for row_start in range(0, rows, row_chunk_size):
+            row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
             if compressed_keys.shape[0] == 0:
                 block_indices = torch.full(
@@ -542,7 +536,6 @@ class QSAIndexer(MultiPlatformOp):
 
     def select_prefill_tokens_tp(self, q, logical_positions, metadata, layout):
         """Score one contiguous query shard against the replicated compressed K."""
-        rows = q.shape[0]
         shard_rows = layout.rows_per_rank
         local = layout.indexer_slice
         request_ids = metadata.get_token_to_batch_idx()
@@ -559,8 +552,6 @@ class QSAIndexer(MultiPlatformOp):
             local_positions,
             lengths.index_select(0, local_request_ids.long()),
             defer_expansion=True,
-            row_offset=local.start,
-            total_rows=rows,
         )
         if local_blocks.shape[0] != shard_rows:
             padded = local_blocks.new_full((shard_rows, self.block_topk), -1)
