@@ -554,7 +554,8 @@ class RMSNorm(BaseFusedOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
-        if self.variance_size_override is not None:
+        # A partial variance width, or FP32: the CUDA kernels take half precision
+        if self.variance_size_override is not None or x.dtype == torch.float32:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if residual is not None:

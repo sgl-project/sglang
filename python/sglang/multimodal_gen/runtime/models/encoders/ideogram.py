@@ -16,10 +16,13 @@ from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
     build_bitsandbytes_4bit_quant_states,
     is_bitsandbytes_4bit_state_name,
 )
-from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
-from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_text import (
+    Qwen3VLTextModel,
+    load_srt_text_weight,
+    srt_text_param_name,
+)
 
 
 class IdeogramQwen3VLTextEncoder(TextEncoder):
@@ -52,12 +55,11 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
         self.language_model = Qwen3VLTextModel(
             text_config,
             quant_config=quant_config,
-            use_weight_only_fp8=self._uses_weight_only_fp8,
-            # bitsandbytes 4-bit quant states can be sliced safely for output
-            # (column-parallel) shards, but not for the row-parallel input
-            # shards used by attention/MLP output projections. Replicate the
-            # relatively small NF4 text encoder while keeping DiT TP enabled.
-            use_tensor_parallel=not self._uses_bitsandbytes_4bit,
+            weight_only_fp8=self._uses_weight_only_fp8,
+            # bitsandbytes 4-bit quant states cannot be sliced for the
+            # row-parallel input shards of the output projections, nor at all
+            # when nested: keep each projection whole on every rank.
+            replicate_projections=self._uses_bitsandbytes_4bit,
         )
 
     @torch.no_grad()
@@ -136,15 +138,16 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
-            param = params_dict.get(name)
-            if param is None:
-                raise KeyError(
-                    f"Unexpected weight name while loading Ideogram text encoder: {name}"
-                )
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight.to(param.dtype))
-            loaded_params.add(name)
+            loaded_params.add(self._load_text_weight(params_dict, name, loaded_weight))
         return loaded_params
+
+    @staticmethod
+    def _load_text_weight(params_dict, name: str, loaded_weight: torch.Tensor) -> str:
+        if srt_text_param_name(params_dict, name)[0] not in params_dict:
+            raise KeyError(
+                f"Unexpected weight name while loading Ideogram text encoder: {name}"
+            )
+        return load_srt_text_weight(params_dict, name, loaded_weight)
 
     def _load_bitsandbytes_4bit_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]]
@@ -163,20 +166,18 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
-            param = params_dict.get(name)
-            if param is None:
-                raise KeyError(
-                    f"Unexpected weight name while loading Ideogram text encoder: {name}"
-                )
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight.to(param.dtype))
+            loaded_params.add(self._load_text_weight(params_dict, name, loaded_weight))
             normal_weight_names.append(name)
-            loaded_params.add(name)
 
         quant_states = build_bitsandbytes_4bit_quant_states(
             normal_weight_names,
             raw_quant_state,
             next(self.parameters()).device,
+            param_names_mapping=lambda name: (
+                srt_text_param_name(params_dict, name)[0],
+                None,
+                None,
+            ),
         )
         attach_bitsandbytes_4bit_quant_states(params_dict, quant_states)
         quantized_params_missing_state = [

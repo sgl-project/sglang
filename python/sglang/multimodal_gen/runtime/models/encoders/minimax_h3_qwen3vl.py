@@ -24,9 +24,6 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loa
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_text import (
-    Qwen3VLTextModel as SrtQwen3VLTextModel,
-)
-from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_text import (
     load_srt_text_weight,
 )
 from sglang.multimodal_gen.runtime.weights.source import (
@@ -285,17 +282,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 f"inconsistent: {selected_layer} vs {int(arch.num_hidden_layers)}"
             )
         self.model = Qwen3VLModel(
-            arch,
-            quant_config=config.quant_config,
-            use_tensor_parallel=True,
-            prefix="model",
+            arch, quant_config=config.quant_config, prefix="model"
         )
         # H3 and ClipProj consume an unnormalized intermediate residual stream.
-        language_model = self.model.language_model
-        if isinstance(language_model, SrtQwen3VLTextModel):
-            language_model.drop_final_norm()
-        else:
-            language_model.norm = nn.Identity()
+        self.model.language_model.drop_final_norm()
         self.image_token_id = int(arch.image_token_id)
         self.video_token_id = int(arch.video_token_id)
         self.selected_lm_layer = selected_layer
@@ -438,14 +428,11 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     ) -> set[str]:
         params = dict(self.named_parameters(remove_duplicate=False))
         loaded: set[str] = set()
-        srt_text = isinstance(
-            getattr(self.model, "language_model", None), SrtQwen3VLTextModel
-        )
         for name, loaded_weight in weights:
             name = _map_checkpoint_name(name)
             if not self.should_materialize_checkpoint_weight(name):
                 continue
-            if srt_text and name.startswith("model.language_model."):
+            if name.startswith("model.language_model."):
                 loaded.add(load_srt_text_weight(params, name, loaded_weight))
                 continue
             param_name = name

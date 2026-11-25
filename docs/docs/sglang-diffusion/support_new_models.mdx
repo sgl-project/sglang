@@ -162,6 +162,11 @@ lands once for both LLM serving and diffusion.
   encoders do.
 - **Weights:** map Hugging Face `q/k/v` and `gate/up` names to SRT's fused
   `qkv_proj` and `gate_up_proj` at load time.
+- **Quantized checkpoints:** diffusion formats (serialized and online FP8,
+  Comfy, GGUF, Quanto, bitsandbytes, weight-only FP8) mark and pack each
+  projection separately. Pass the diffusion config through the adapter's
+  `_ProjectionQuantConfig`: each fused SRT layer then holds one diffusion layer
+  per checkpoint projection, and the model code stays SRT's.
 - **Validation:** compare hidden states with the reference at TP 1 and TP 2
   (`lossless` bound), and time the encoder in its real regime (short prompts and
   long multimodal inputs).

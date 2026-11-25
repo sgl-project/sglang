@@ -11,7 +11,7 @@ from sglang.srt.runtime_context import get_parallel
 
 
 @pytest.fixture(params=[Qwen2_5_VLConfig, Qwen3VLConfig])
-def model(request):
+def model(request, srt_runtime):
     config = request.param(
         image_token_id=2,
         video_token_id=3,
@@ -19,7 +19,8 @@ def model(request):
             vocab_size=32,
             hidden_size=16,
             intermediate_size=24,
-            num_hidden_layers=0,
+            # srt's Qwen3-VL language model needs a layer
+            num_hidden_layers=1,
             num_attention_heads=2,
             num_key_value_heads=2,
             pad_token_id=0,
