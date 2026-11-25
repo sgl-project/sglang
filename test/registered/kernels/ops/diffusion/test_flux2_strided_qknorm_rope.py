@@ -70,12 +70,12 @@ def _documented_arithmetic(x, weight, cache, eps):
 
 
 def _packed_qk_fusion_supported() -> bool:
-    """The dispatch this test covers mounts on NVIDIA SM90 and newer."""
-    return (
-        torch.cuda.is_available()
-        and torch.version.hip is None
-        and current_arch().is_sm_at_least(9, 0)
-    )
+    """The dispatch this test covers mounts on the arches it was measured on:
+    SM90 (the original target) and SM120 (GeForce RTX 50, measured end to end)."""
+    if not (torch.cuda.is_available() and torch.version.hip is None):
+        return False
+    arch = current_arch()
+    return arch.is_sm(9, 0) or arch.is_sm(12, 0)
 
 
 @unittest.skipUnless(
@@ -166,6 +166,40 @@ class TestFlux2StridedQKNormRoPE(CustomTestCase):
                             q, k, qn.weight, kn.weight, cache
                         ),
                         f"head count {heads} must not be rejected",
+                    )
+
+    @torch.inference_mode()
+    def test_dispatch_is_widened_only_to_measured_arches(self):
+        """SM90 keeps the original allow-list entry, SM120 was added after it was
+        measured through the production entry point, and SM100 stays on the split
+        path until Blackwell-DC data exists."""
+
+        def _arch(major, minor):
+            class _A:
+                def is_sm(self, mj, mn=None):
+                    return (mj, mn) == (major, minor)
+
+                def is_sm_at_least(self, mj, mn=0):
+                    return (major, minor) >= (mj, mn)
+
+            return _A
+
+        _, q, k, qn, kn, cache = inputs(1, 64, heads=48)
+        target = (
+            "sglang.kernels.ops.diffusion.rope.flux2_qknorm_rope_triton.current_arch"
+        )
+        for arch, expected in (
+            ((9, 0), True),
+            ((12, 0), True),
+            ((10, 0), False),
+        ):
+            with self.subTest(sm=f"{arch[0]}.{arch[1]}"):
+                with patch(target, _arch(*arch)):
+                    self.assertEqual(
+                        can_use_flux2_strided_qknorm_rope(
+                            q, k, qn.weight, kn.weight, cache
+                        ),
+                        expected,
                     )
 
     @torch.inference_mode()
