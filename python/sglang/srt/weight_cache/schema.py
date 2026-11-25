@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Optional
+from typing import Any, Optional, Self
 
 import msgspec
 
 
-class WeightConfig(msgspec.Struct):
-    """Typed model, topology and environment fields used by the daemon and snapshots."""
+class WeightCacheConfig(msgspec.Struct):
+    """Fingerprint of one rank's weights, shared by the daemon and snapshot loaders."""
 
     model_path: str
     model_arch: str
@@ -44,8 +44,21 @@ class WeightConfig(msgspec.Struct):
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
 
+    def matches(self, other: WeightCacheConfig) -> bool:
+        """Compare all fields for an IPC weight-cache request."""
+        return self == other
 
-class LoadSpec(WeightConfig, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    def to_dict(self) -> dict[str, Any]:
+        return msgspec.structs.asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Self:
+        return cls(**d)
+
+
+class LoadSpec(
+    WeightCacheConfig, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
     """Inputs to the snapshot lookup key. Sources index snapshots by digest()."""
 
     checkpoint_id: str

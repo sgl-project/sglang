@@ -6,6 +6,6 @@
 # loader on that cheap protocol import, re-introducing the circular-import and
 # startup-cost problems the local-import refactor removed. Import the concrete
 # symbols from their submodules instead, e.g.
-#     from sglang.srt.weight_cache.protocol import CacheConfig
+#     from sglang.srt.weight_cache.schema import WeightCacheConfig
 #     from sglang.srt.weight_cache.daemon import launch_weight_cache_daemons
 #     from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader

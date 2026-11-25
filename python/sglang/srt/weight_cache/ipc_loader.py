@@ -26,11 +26,12 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 
-from .config import build_cache_config, resolve_cache_quantization
 from .protocol import (
+    build_cache_config,
     check_ipc_quant_support,
     get_socket_path,
     recv_msg,
+    resolve_cache_quantization,
     send_msg,
 )
 from .transport import (
@@ -101,7 +102,7 @@ class WeightCacheModelLoader(BaseModelLoader):
 
     - socket file missing            -> fall back to disk load
     - connection refused             -> raise (daemon crashed after binding)
-    - CacheConfig mismatch           -> raise (do NOT disk-load on a shared GPU
+    - WeightCacheConfig mismatch     -> raise (do NOT disk-load on a shared GPU
                                         holding a different config's weights;
                                         also surfaces fingerprint drift bugs)
     - any protocol / transfer error  -> raise

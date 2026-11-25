@@ -5,7 +5,7 @@ These cover the pure-Python logic that the GPU end-to-end test
 (test_weight_cache_daemon.py) cannot exercise cheaply:
 
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
-  - CacheConfig compatibility matching / (de)serialization
+  - WeightCacheConfig compatibility matching / (de)serialization
   - LoadSpec construction, shard identity and schema validation
   - quant-config hashing and method-name extraction
   - daemon spawn configuration and socket/ready path derivation
@@ -31,9 +31,9 @@ from transformers import PretrainedConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.weight_cache import protocol
 from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.protocol import (
-    CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
@@ -47,7 +47,7 @@ from sglang.srt.weight_cache.protocol import (
     recv_msg,
     send_msg,
 )
-from sglang.srt.weight_cache.schema import LoadSpec
+from sglang.srt.weight_cache.schema import LoadSpec, WeightCacheConfig
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
     TorchIpcTransportBackend,
@@ -59,7 +59,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _make_cache_config(**overrides) -> CacheConfig:
+def _cache_config_fields(**overrides):
     base = dict(
         model_path="/models/demo",
         model_arch="LlamaForCausalLM",
@@ -85,7 +85,11 @@ def _make_cache_config(**overrides) -> CacheConfig:
         torch_version="2.5.1",
     )
     base.update(overrides)
-    return CacheConfig(**base)
+    return base
+
+
+def _make_cache_config(**overrides) -> WeightCacheConfig:
+    return WeightCacheConfig(**_cache_config_fields(**overrides))
 
 
 def _make_load_spec(*, tp_size=2, hf_config=None, model_path="m", draft_model_idx=None):
@@ -195,7 +199,7 @@ class TestTransportBackend(CustomTestCase):
             b.close()
 
 
-class TestCacheConfig(CustomTestCase):
+class TestWeightCacheConfig(CustomTestCase):
     def test_identical_configs_match(self):
         self.assertTrue(_make_cache_config().matches(_make_cache_config()))
 
@@ -220,11 +224,12 @@ class TestCacheConfig(CustomTestCase):
                 msg=f"{field} difference should break match",
             )
 
-    def test_dict_round_trip(self):
-        cfg = _make_cache_config(quant_method="fp8", quant_config_hash="abc123")
-        restored = CacheConfig.from_dict(cfg.to_dict())
-        self.assertTrue(cfg.matches(restored))
-        self.assertEqual(cfg.to_dict(), restored.to_dict())
+    def test_legacy_protocol_round_trip(self):
+        self.assertIs(protocol.CacheConfig, WeightCacheConfig)
+        self.assertTrue(issubclass(LoadSpec, WeightCacheConfig))
+        wire = _cache_config_fields(quant_method="fp8", quant_config_hash="abc123")
+        restored = protocol.CacheConfig.from_dict(wire)
+        self.assertEqual(list(restored.to_dict().items()), list(wire.items()))
 
 
 class TestLoadSpec(CustomTestCase):

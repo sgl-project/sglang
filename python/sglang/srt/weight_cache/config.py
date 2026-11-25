@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build compatibility keys for weight-cache requests and snapshot lookups."""
+"""Build snapshot lookup keys from the resolved model and runtime configuration."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
 
+from sglang.srt.layers import dp_attention
+from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import use_cutedsl_moe_swap_ab
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
+from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+from sglang.srt.model_loader.loader import PreshardedModelLoader
 from sglang.srt.runtime_context import get_exec, get_parallel
 
-from .protocol import (
-    CacheConfig,
-    compute_env_stamp,
-    get_quant_method_name,
-    hash_quant_config,
-)
+from .protocol import build_cache_config, resolve_cache_quantization
 from .schema import LoadSpec
 
 if TYPE_CHECKING:
@@ -23,54 +25,6 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
-
-
-def resolve_cache_quantization(
-    model_config: ModelConfig, requested_method: Optional[str] = None
-) -> tuple[str, Any]:
-    """Resolve the method and config used by IPC checks and snapshot identity."""
-    config = getattr(model_config.hf_config, "quantization_config", None)
-    method = get_quant_method_name(requested_method or model_config.quantization)
-    return method or get_quant_method_name(config), config
-
-
-def build_cache_config(
-    model_config: ModelConfig,
-    *,
-    quant_method: str,
-    quant_config: Any,
-    model_path: str,
-    revision: Optional[str],
-    ep_size: int,
-) -> CacheConfig:
-    """Build the fingerprint before loading can mutate the quantization config."""
-    parallel = get_parallel()
-    architectures = model_config.hf_config.architectures
-    return CacheConfig(
-        model_path=model_path,
-        model_arch=architectures[0] if architectures else "",
-        tp_size=parallel.tp_size,
-        tp_rank=parallel.tp_rank,
-        pp_size=parallel.pp_size,
-        pp_rank=parallel.pp_rank,
-        dp_size=parallel.dp_size,
-        ep_size=ep_size,
-        # MoE-DP can alias a wider attention-CP communicator. Compare its
-        # configured width, as recorded in the daemon protocol.
-        moe_dp_size=parallel.moe_dp_size,
-        moe_dp_rank=parallel.moe_dp_rank,
-        moe_ep_rank=parallel.moe_ep_rank,
-        attn_dp_size=parallel.attn_dp_size,
-        enable_dp_lm_head=parallel.enable_dp_lm_head,
-        attn_cp_size=parallel.attn_cp_size,
-        moe_dense_tp_size=parallel.moe_dense_tp_size,
-        moe_a2a_backend=get_exec().moe.moe_a2a_backend,
-        quant_method=quant_method,
-        quant_config_hash=hash_quant_config(quant_config),
-        dtype=str(model_config.dtype),
-        revision=revision or "",
-        **compute_env_stamp(),
-    )
 
 
 def _hf_config_hash(hf_config: PretrainedConfig) -> str:
@@ -99,13 +53,6 @@ def build_load_spec(
     The caller identifies the checkpoint contents (e.g. a pinned Hub commit or
     a local checkpoint digest). Two checkpoints can have identical model configs.
     """
-    from sglang.srt.layers.dp_attention import get_moe_cp_size
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
-    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
-    from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
-    from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
-    from sglang.srt.model_loader.loader import PreshardedModelLoader
-
     quant_method, quant_config = resolve_cache_quantization(model_config)
     cache_config = build_cache_config(
         model_config,
@@ -122,10 +69,6 @@ def build_load_spec(
     if moe_runner.is_flashinfer_cutedsl() and (
         a2a_backend.is_none() or a2a_backend.is_flashinfer()
     ):
-        from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-            use_cutedsl_moe_swap_ab,
-        )
-
         swap_ab = use_cutedsl_moe_swap_ab(target_device)
 
     return LoadSpec(
@@ -137,7 +80,7 @@ def build_load_spec(
         fp4_gemm_runner_backend=get_fp4_gemm_runner_backend().value,
         fp8_gemm_runner_backend=get_fp8_gemm_runner_backend().value,
         bf16_gemm_backend=get_bf16_gemm_backend().value,
-        moe_cp_size=get_moe_cp_size(),
+        moe_cp_size=dp_attention.get_moe_cp_size(),
         enable_fp32_lm_head=execution.features.enable_fp32_lm_head,
         ep_num_redundant_experts=execution.moe.ep_num_redundant_experts,
         enable_eplb=execution.moe.enable_eplb,

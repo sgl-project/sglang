@@ -46,7 +46,8 @@ from torch.multiprocessing.reductions import StorageWeakRef
 from sglang.srt.utils import cuda_vmm_utils
 from sglang.srt.weight_cache import ipc_loader, transport
 from sglang.srt.weight_cache.daemon import WeightCacheDaemon
-from sglang.srt.weight_cache.protocol import CacheConfig, recv_msg, send_msg
+from sglang.srt.weight_cache.protocol import recv_msg, send_msg
+from sglang.srt.weight_cache.schema import WeightCacheConfig
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
     VMM_FD_BACKEND,
@@ -197,8 +198,8 @@ class _TinyModel(torch.nn.Module):
         )
 
 
-def _cache_config() -> CacheConfig:
-    return CacheConfig(
+def _cache_config() -> WeightCacheConfig:
+    return WeightCacheConfig(
         model_path="tiny",
         model_arch="TinyModel",
         tp_size=1,

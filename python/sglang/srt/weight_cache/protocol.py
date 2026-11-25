@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Protocol definitions for the weight cache daemon.
+"""Weight-cache daemon fingerprint construction and socket protocol helpers."""
 
-Defines CacheConfig for validation and socket message protocol helpers.
-"""
+from __future__ import annotations
 
 import hashlib
 import json
@@ -11,33 +10,21 @@ import os
 import pickle
 import signal
 import struct
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.serialization import safe_pickle_loads
 
-from .schema import WeightConfig
+from .schema import WeightCacheConfig
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+
+# Earlier daemon clients import this name from the protocol module.
+CacheConfig = WeightCacheConfig
 
 logger = logging.getLogger(__name__)
-
-
-class CacheConfig(WeightConfig):
-    """Fingerprint of the cached weights. Used to validate compatibility
-    between a daemon's cached state and a requesting engine process.
-
-    Any mismatch triggers a fallback to disk loading.
-    """
-
-    def matches(self, other: "CacheConfig") -> bool:
-        """Check if two configs are compatible for weight sharing."""
-        return self == other
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {f: getattr(self, f) for f in self.__struct_fields__}
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "CacheConfig":
-        return cls(**d)
 
 
 def hash_quant_config(quant_config: Any) -> str:
@@ -89,6 +76,54 @@ def get_quant_method_name(quant_config: Any) -> str:
     if hasattr(quant_config, "name"):
         return quant_config.name
     return type(quant_config).__name__
+
+
+def resolve_cache_quantization(
+    model_config: ModelConfig, requested_method: Optional[str] = None
+) -> tuple[str, Any]:
+    """Resolve the method and config used by IPC checks and snapshot identity."""
+    config = getattr(model_config.hf_config, "quantization_config", None)
+    method = get_quant_method_name(requested_method or model_config.quantization)
+    return method or get_quant_method_name(config), config
+
+
+def build_cache_config(
+    model_config: ModelConfig,
+    *,
+    quant_method: str,
+    quant_config: Any,
+    model_path: str,
+    revision: Optional[str],
+    ep_size: int,
+) -> WeightCacheConfig:
+    """Build the fingerprint before loading can mutate the quantization config."""
+    parallel = get_parallel()
+    architectures = model_config.hf_config.architectures
+    return WeightCacheConfig(
+        model_path=model_path,
+        model_arch=architectures[0] if architectures else "",
+        tp_size=parallel.tp_size,
+        tp_rank=parallel.tp_rank,
+        pp_size=parallel.pp_size,
+        pp_rank=parallel.pp_rank,
+        dp_size=parallel.dp_size,
+        ep_size=ep_size,
+        # MoE-DP can alias a wider attention-CP communicator. Compare its
+        # configured width, as recorded in the daemon protocol.
+        moe_dp_size=parallel.moe_dp_size,
+        moe_dp_rank=parallel.moe_dp_rank,
+        moe_ep_rank=parallel.moe_ep_rank,
+        attn_dp_size=parallel.attn_dp_size,
+        enable_dp_lm_head=parallel.enable_dp_lm_head,
+        attn_cp_size=parallel.attn_cp_size,
+        moe_dense_tp_size=parallel.moe_dense_tp_size,
+        moe_a2a_backend=get_exec().moe.moe_a2a_backend,
+        quant_method=quant_method,
+        quant_config_hash=hash_quant_config(quant_config),
+        dtype=str(model_config.dtype),
+        revision=revision or "",
+        **compute_env_stamp(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +253,7 @@ def compute_env_stamp() -> Dict[str, str]:
     Returns the device compute capability and torch version of the current
     process. A daemon and a connecting client that differ on either may have run
     different post-processing / kernel-selection branches, producing weights that
-    map cleanly over IPC yet serve garbage; stamping these into CacheConfig turns
+    map cleanly over IPC yet serve garbage; stamping these into WeightCacheConfig turns
     that into a clean mismatch. Imported lazily so protocol.py stays cheap to
     import and usable on CPU-only hosts (both fields degrade to "").
     """

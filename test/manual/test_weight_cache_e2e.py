@@ -20,6 +20,9 @@ import socket
 import sys
 import time
 
+from sglang.srt.weight_cache.protocol import recv_msg, send_msg
+from sglang.srt.weight_cache.schema import WeightCacheConfig
+
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -99,8 +102,6 @@ def run_single_daemon(
         flush=True,
     )
 
-    from sglang.srt.weight_cache.protocol import CacheConfig, recv_msg, send_msg
-
     if os.path.exists(socket_path):
         os.unlink(socket_path)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -119,7 +120,7 @@ def run_single_daemon(
                             conn, {"status": "ok", "config": daemon.config.to_dict()}
                         )
                     elif req.get("type") == "fetch_state":
-                        engine_config = CacheConfig.from_dict(req["config"])
+                        engine_config = WeightCacheConfig.from_dict(req["config"])
                         if daemon.config.matches(engine_config):
                             send_msg(
                                 conn,
@@ -283,7 +284,6 @@ def main():
 
     # Query config from daemon (pp_rank=0, tp_rank=0)
     from sglang.srt.utils import MultiprocessingSerializer
-    from sglang.srt.weight_cache.protocol import recv_msg, send_msg
 
     socket_path_0 = _temp_path(tp_size, 0, 0, ".sock")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
