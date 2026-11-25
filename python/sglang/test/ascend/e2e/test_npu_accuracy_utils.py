@@ -7,6 +7,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
+import uuid
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -62,6 +65,41 @@ DATASET_FLUCTUATION = {
 }
 
 MAX_RETRY_COUNT = 3
+
+# Datasets whose evalscope adapter shells out to Docker (agent environments).
+# NPU pods have no Docker daemon, so these run on a separate amd64 pod that
+# provides DinD, while the NPU pods keep serving the model. See
+# ``deepswe-eval-plan.md`` (方案 A).
+REMOTE_EVAL_DATASETS = frozenset({"deep_swe"})
+
+# DeepSWE eval pod: an amd64 node (kubernetes.io/arch=amd64) holding a
+# ``docker:dind`` sidecar plus a python container that drives evalscope.
+# Images/arch are overridable through the pod env when the cluster mirrors
+# them under a different registry; an empty value keeps the default.
+DEEPSWE_EVAL_IMAGE = os.environ.get("DEEPSWE_EVAL_IMAGE") or "python:3.12"
+DEEPSWE_DIND_IMAGE = os.environ.get("DEEPSWE_DIND_IMAGE") or "docker:dind"
+DEEPSWE_EVAL_NODE_ARCH = os.environ.get("DEEPSWE_EVAL_NODE_ARCH") or "amd64"
+# Time to get the pod scheduled and the eval container up (image pulls, node
+# availability) versus the wall-clock budget of the evaluation itself.
+DEEPSWE_EVAL_SCHEDULE_TIMEOUT = int(
+    os.environ.get("DEEPSWE_EVAL_SCHEDULE_TIMEOUT") or "1200"
+)
+DEEPSWE_EVAL_RUN_TIMEOUT = int(os.environ.get("DEEPSWE_EVAL_RUN_TIMEOUT") or "14400")
+# Kubernetes-side safety net: if the router pod (or the whole runner) dies
+# before its finally-block deletion runs, kubelet still terminates the eval
+# pod once this many seconds pass, instead of leaving a dind pod holding an
+# amd64 node and its emptyDir forever. Covers the schedule window plus the
+# run window plus slack.
+DEEPSWE_EVAL_ACTIVE_DEADLINE = int(
+    os.environ.get("DEEPSWE_EVAL_ACTIVE_DEADLINE")
+    or str(DEEPSWE_EVAL_SCHEDULE_TIMEOUT + DEEPSWE_EVAL_RUN_TIMEOUT + 900)
+)
+# The eval container prints its metrics as a single machine-readable line so
+# the router pod can forward them to the runner's pod-log monitor.
+DEEPSWE_EVAL_METRICS_MARKER = "[DEEPSWE_METRICS]"
+# Forwarded eval-pod log lines carry this prefix so they stay distinguishable
+# from the router/unittest output in the CI log.
+DEEPSWE_EVAL_LOG_PREFIX = "[deepswe-eval]"
 
 SERVER_INITIALIZATION_DELAY = 120
 
@@ -161,7 +199,9 @@ def extract_report_accuracy(report_data):
     metrics = report_data.get("metrics")
     if not isinstance(metrics, list):
         metrics = []
-    for name in (primary, "accuracy"):
+    # Agent-style datasets (e.g. deep_swe) report a binary metric named ``acc``
+    # rather than ``accuracy``; accept both.
+    for name in (primary, "accuracy", "acc"):
         if not name:
             continue
         for metric in metrics:
@@ -349,24 +389,458 @@ def run_evalscope(
         raise
 
 
+def requires_remote_eval(datasets):
+    """Whether ``datasets`` must be evaluated on the amd64 DinD pod."""
+    return bool(datasets) and datasets[0] in REMOTE_EVAL_DATASETS
+
+
+def _deepswe_eval_pod_name():
+    """Derive the eval pod name from this router pod's (Volcano) name.
+
+    Keeping the router job prefix in the name lets the workflow's
+    ``Post process`` step sweep the leftover eval pod together with the rest
+    of the run.
+    """
+    hostname = os.environ.get("HOSTNAME", "deepswe")
+    suffix = "-sgl-router-0"
+    job_name = hostname[: -len(suffix)] if hostname.endswith(suffix) else hostname
+    job_name = re.sub(r"[^a-z0-9-]", "-", job_name.lower()).strip("-")
+    # A per-call suffix keeps the name unique across retries in the same pod:
+    # the previous pod may still be terminating (Foreground delete is async),
+    # and recreating the same name would hit a 409 Conflict.
+    # Pod names are capped at 63 chars; reserve room for the trailing suffix.
+    unique = uuid.uuid4().hex[:6]
+    return f"{job_name[:42].strip('-')}-deepswe-eval-{unique}"
+
+
+def _resolve_share_volume(core_api, namespace):
+    """Copy this pod's ``share`` volume (PVC or hostPath) and repo subPath.
+
+    The CI env (``ci``) and the green env (``green``) back the shared disk with
+    different volume sources, so the eval pod reuses whatever the router pod
+    was given instead of hardcoding one of them.
+    """
+    pod_name = os.environ.get("HOSTNAME")
+    pod = core_api.read_namespaced_pod(name=pod_name, namespace=namespace)
+    share_volume = None
+    for volume in pod.spec.volumes or []:
+        if volume.name == "share":
+            share_volume = volume
+            break
+    if share_volume is None:
+        raise RuntimeError(
+            f"Pod {pod_name} has no 'share' volume; the DeepSWE eval pod cannot "
+            "mount the sglang source checkout"
+        )
+    sub_path = None
+    for container in pod.spec.containers or []:
+        for mount in container.volume_mounts or []:
+            if mount.mount_path == "/root/sglang":
+                sub_path = mount.sub_path
+    if not sub_path:
+        raise RuntimeError(
+            f"Pod {pod_name} does not mount /root/sglang from the share volume; "
+            "the DeepSWE eval pod cannot locate the sglang source"
+        )
+    return share_volume, sub_path
+
+
+def _build_deepswe_eval_env(
+    host, port, model, datasets, dataset_args, limit, timeout, api_key, metrics_dir
+):
+    env = {
+        "DOCKER_HOST": "tcp://127.0.0.1:2375",
+        # Base form (no /chat/completions): LiteLLM appends the route itself.
+        "DEEPSWE_API_URL": f"http://{host}:{port}/v1",
+        "DEEPSWE_MODEL": model,
+        "DEEPSWE_DATASETS": ",".join(datasets),
+        "DEEPSWE_LIMIT": str(limit),
+        "DEEPSWE_TIMEOUT": str(timeout),
+        "DEEPSWE_API_KEY": api_key,
+        "HF_ENDPOINT": os.environ.get("HF_ENDPOINT") or "https://hf-mirror.com",
+        "EVALSCOPE_PIP_MIRROR": os.environ.get("EVALSCOPE_PIP_MIRROR")
+        or "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple",
+    }
+    if dataset_args:
+        env["DEEPSWE_DATASET_ARGS"] = json.dumps(dataset_args, ensure_ascii=False)
+    if metrics_dir:
+        # Same path on the shared PVC, so the eval report lands next to the
+        # run's other artifacts.
+        env["METRICS_DATA_FILE"] = metrics_dir
+    if os.environ.get("SGLANG_USE_MODELSCOPE"):
+        env["SGLANG_USE_MODELSCOPE"] = os.environ["SGLANG_USE_MODELSCOPE"]
+    return env
+
+
+def _build_deepswe_eval_pod(pod_name, namespace, env_vars, share_volume, share_sub_path):
+    from kubernetes import client as k8s
+
+    dind_container = k8s.V1Container(
+        name="dind",
+        image=DEEPSWE_DIND_IMAGE,
+        security_context=k8s.V1SecurityContext(privileged=True),
+        # Empty TLS cert dir: serve plain HTTP on 2375 so the eval container can
+        # talk to it over the pod's shared network namespace.
+        env=[k8s.V1EnvVar(name="DOCKER_TLS_CERTDIR", value="")],
+        args=["--storage-driver=overlay2"],
+        volume_mounts=[
+            k8s.V1VolumeMount(name="dind-storage", mount_path="/var/lib/docker")
+        ],
+        resources=k8s.V1ResourceRequirements(
+            requests={"cpu": "1", "memory": "2Gi"}, limits={"cpu": "2", "memory": "4Gi"}
+        ),
+    )
+    eval_container = k8s.V1Container(
+        name="eval",
+        image=DEEPSWE_EVAL_IMAGE,
+        env=[k8s.V1EnvVar(name=key, value=value) for key, value in env_vars.items()],
+        command=["/bin/bash", "-c"],
+        args=["bash /root/sglang/python/sglang/test/ascend/e2e/run_deepswe_eval.sh"],
+        volume_mounts=[
+            k8s.V1VolumeMount(name="share", mount_path="/root/.cache"),
+            k8s.V1VolumeMount(
+                name="share", mount_path="/root/sglang", sub_path=share_sub_path
+            ),
+        ],
+        resources=k8s.V1ResourceRequirements(
+            requests={"cpu": "8", "memory": "16Gi"},
+            limits={"cpu": "16", "memory": "32Gi"},
+        ),
+    )
+    metadata = k8s.V1ObjectMeta(
+        name=pod_name,
+        namespace=namespace,
+        labels={"app": "sgl-deepswe-eval"},
+    )
+    spec = k8s.V1PodSpec(
+        restart_policy="Never",
+        node_selector={"kubernetes.io/arch": DEEPSWE_EVAL_NODE_ARCH},
+        # Hard cap enforced by kubelet even if this waiter never runs again.
+        active_deadline_seconds=DEEPSWE_EVAL_ACTIVE_DEADLINE,
+        containers=[dind_container, eval_container],
+        volumes=[
+            k8s.V1Volume(
+                name="dind-storage",
+                empty_dir=k8s.V1EmptyDirVolumeSource(size_limit="50Gi"),
+            ),
+            share_volume,
+        ],
+    )
+    return k8s.V1Pod(api_version="v1", kind="Pod", metadata=metadata, spec=spec)
+
+
+def _deepswe_eval_state(pod):
+    """Return ``(state, exit_code)`` for the eval container.
+
+    ``state`` is one of ``"running"``, ``"terminated"``, ``"waiting"`` or
+    ``None`` (not created yet). ``exit_code`` is set only when terminated.
+    """
+    for status in pod.status.container_statuses or []:
+        if status.name != "eval" or status.state is None:
+            continue
+        if status.state.terminated is not None:
+            return "terminated", status.state.terminated.exit_code
+        if status.state.running is not None:
+            return "running", None
+        if status.state.waiting is not None:
+            return "waiting", None
+    return None, None
+
+
+def _describe_pod_events(core_api, namespace, pod_name):
+    try:
+        events = core_api.list_namespaced_event(
+            namespace=namespace,
+            field_selector=f"involvedObject.name={pod_name}",
+        )
+        messages = [f"{event.reason}: {event.message}" for event in events.items]
+        return "; ".join(messages) if messages else "no events"
+    except Exception as e:
+        return f"<failed to read events: {e}>"
+
+
+def _stream_deepswe_eval_logs(core_api, namespace, pod_name, lines):
+    """Follow the eval container's log into ``lines`` (and stdout) until EOF."""
+    try:
+        response = core_api.read_namespaced_pod_log(
+            name=pod_name,
+            namespace=namespace,
+            container="eval",
+            follow=True,
+            _preload_content=False,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to stream DeepSWE eval logs: {e}")
+        return
+    buffer = ""
+    try:
+        for chunk in response.stream(amt=4096, decode_content=True):
+            buffer += chunk.decode("utf-8", "replace")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                print(f"{DEEPSWE_EVAL_LOG_PREFIX} {line}", flush=True)
+                lines.append(line)
+        if buffer:
+            print(f"{DEEPSWE_EVAL_LOG_PREFIX} {buffer}", flush=True)
+            lines.append(buffer)
+    except Exception as e:
+        logger.warning(f"DeepSWE eval log stream ended with an error: {e}")
+    finally:
+        try:
+            response.release_conn()
+        except Exception:
+            pass
+
+
+def _read_deepswe_eval_logs(core_api, namespace, pod_name):
+    """Read the eval container's full log once (no printing/append)."""
+    try:
+        text = core_api.read_namespaced_pod_log(
+            name=pod_name, namespace=namespace, container="eval"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to read DeepSWE eval logs: {e}")
+        return []
+    return text.splitlines()
+
+
+def _parse_deepswe_eval_metrics(lines):
+    metrics = {}
+    for line in lines:
+        if DEEPSWE_EVAL_METRICS_MARKER not in line:
+            continue
+        payload = line.split(DEEPSWE_EVAL_METRICS_MARKER, 1)[1].strip()
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            metrics.update(
+                {
+                    key: value
+                    for key, value in data.items()
+                    if isinstance(value, (int, float))
+                }
+            )
+    if "accuracy" not in metrics and "acc" in metrics:
+        metrics["accuracy"] = metrics.pop("acc")
+    return metrics
+
+
+def run_evalscope_on_x86_pod(
+    host,
+    port,
+    model,
+    datasets,
+    dataset_args=None,
+    limit=100000,
+    timeout=7200,
+    api_key="EMPTY",
+    metrics_dir=None,
+):
+    """Run evalscope on a dedicated amd64 pod that provides Docker (DinD).
+
+    Docker-backed datasets (``deep_swe``) cannot run on the ARM NPU pods: the
+    container images are amd64-only and the pods have no Docker daemon. This
+    creates a short-lived pod on an amd64 node (``kubernetes.io/arch=amd64``)
+    that runs the evaluation against the router while the NPU pods keep
+    serving, streams its logs back so they reach the CI log, and returns the
+    parsed metrics.
+
+    Args:
+        host (str): Router node IP (reachable from the eval pod).
+        port (int): Router HTTP port.
+        model (str): Model name passed to evalscope (ignored by SGLang).
+        datasets (list): Datasets to evaluate (first must be a Docker dataset).
+        dataset_args (dict): evalscope ``dataset_args`` (carries
+            ``pier_agent_kwargs`` for ``deep_swe``).
+        limit (int): Max number of tasks to evaluate.
+        timeout (int): Dataset-level timeout forwarded to evalscope (seconds).
+        api_key (str): API key sent to the router (``EMPTY`` for SGLang).
+        metrics_dir (str): Shared-PVC directory for the eval report.
+
+    Returns:
+        dict: ``{"accuracy": <float>}`` parsed from the eval container.
+
+    Raises:
+        RuntimeError: If the pod cannot be created/scheduled, the evaluation
+            fails, or it reports no accuracy.
+    """
+    from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+        NAMESPACE,
+        get_k8s_api,
+    )
+
+    namespace = NAMESPACE
+    if not namespace:
+        raise RuntimeError(
+            "DeepSWE evaluation requires the multi-node k8s environment "
+            "(NAMESPACE is unset); it cannot run inside a single NPU pod."
+        )
+
+    core_api = get_k8s_api()
+    pod_name = _deepswe_eval_pod_name()
+    share_volume, share_sub_path = _resolve_share_volume(core_api, namespace)
+    env_vars = _build_deepswe_eval_env(
+        host, port, model, datasets, dataset_args, limit, timeout, api_key, metrics_dir
+    )
+    pod = _build_deepswe_eval_pod(
+        pod_name, namespace, env_vars, share_volume, share_sub_path
+    )
+
+    logger.info(
+        f"Creating DeepSWE eval pod {pod_name} on "
+        f"kubernetes.io/arch={DEEPSWE_EVAL_NODE_ARCH}, "
+        f"image={DEEPSWE_EVAL_IMAGE}, dind={DEEPSWE_DIND_IMAGE}, "
+        f"datasets={datasets}, limit={limit}, timeout={timeout}s, "
+        f"api_url={env_vars['DEEPSWE_API_URL']}, metrics_dir={metrics_dir}"
+    )
+    try:
+        core_api.create_namespaced_pod(namespace=namespace, body=pod)
+    except Exception as e:
+        raise RuntimeError(f"Failed to create DeepSWE eval pod {pod_name}: {e}")
+    logger.info(f"DeepSWE eval pod {pod_name} created; waiting for scheduling ...")
+
+    lines = []
+    stream_thread = None
+    try:
+        start_time = time.time()
+        running_since = None
+        exit_code = None
+        next_report = start_time + 60
+        while True:
+            pod_status = core_api.read_namespaced_pod(
+                name=pod_name, namespace=namespace
+            )
+            phase = pod_status.status.phase
+            container_state, exit_code = _deepswe_eval_state(pod_status)
+            if exit_code is not None:
+                logger.info(
+                    f"DeepSWE eval container in {pod_name} terminated "
+                    f"(exit_code={exit_code}, elapsed={time.time() - start_time:.0f}s)"
+                )
+                break
+            if phase == "Failed":
+                raise RuntimeError(
+                    f"DeepSWE eval pod {pod_name} failed to run; events: "
+                    f"{_describe_pod_events(core_api, namespace, pod_name)}"
+                )
+            if phase == "Running":
+                if running_since is None:
+                    running_since = time.time()
+                    node_name = pod_status.spec.node_name if pod_status.spec else None
+                    logger.info(
+                        f"DeepSWE eval pod {pod_name} is running on node {node_name}; "
+                        "streaming eval logs ..."
+                    )
+                # Follow the log only once the eval container is actually
+                # running; an early call would 400 while it is still starting.
+                if stream_thread is None and container_state == "running":
+                    stream_thread = threading.Thread(
+                        target=_stream_deepswe_eval_logs,
+                        args=(core_api, namespace, pod_name, lines),
+                        daemon=True,
+                    )
+                    stream_thread.start()
+                    logger.info(f"Attached to eval container log of {pod_name}")
+                if time.time() - running_since > DEEPSWE_EVAL_RUN_TIMEOUT:
+                    raise RuntimeError(
+                        f"DeepSWE eval pod {pod_name} exceeded "
+                        f"{DEEPSWE_EVAL_RUN_TIMEOUT}s"
+                    )
+            else:
+                # Pending/Unknown: surface image-pull and scheduling reasons
+                # periodically instead of only at the final timeout.
+                if time.time() >= next_report:
+                    logger.info(
+                        f"DeepSWE eval pod {pod_name} is still {phase} "
+                        f"({time.time() - start_time:.0f}s); events: "
+                        f"{_describe_pod_events(core_api, namespace, pod_name)}"
+                    )
+                    next_report = time.time() + 60
+                if time.time() - start_time > DEEPSWE_EVAL_SCHEDULE_TIMEOUT:
+                    raise RuntimeError(
+                        f"DeepSWE eval pod {pod_name} is not running after "
+                        f"{DEEPSWE_EVAL_SCHEDULE_TIMEOUT}s (phase={phase}); events: "
+                        f"{_describe_pod_events(core_api, namespace, pod_name)}"
+                    )
+            time.sleep(5)
+
+        if stream_thread is not None:
+            stream_thread.join(timeout=30)
+        else:
+            # The container terminated before we caught the pod Running.
+            for line in _read_deepswe_eval_logs(core_api, namespace, pod_name):
+                print(f"{DEEPSWE_EVAL_LOG_PREFIX} {line}", flush=True)
+                lines.append(line)
+
+        if exit_code != 0:
+            tail = "\n".join(lines[-50:])
+            raise RuntimeError(
+                f"DeepSWE eval pod exited with code {exit_code}; log tail:\n{tail}"
+            )
+
+        metrics = _parse_deepswe_eval_metrics(lines)
+        if "accuracy" not in metrics:
+            # The follow stream can stop before the last buffered lines flush;
+            # re-read the full log once before giving up.
+            logger.info(
+                "Accuracy not in the streamed log, re-reading the full eval log ..."
+            )
+            lines.extend(_read_deepswe_eval_logs(core_api, namespace, pod_name))
+            metrics = _parse_deepswe_eval_metrics(lines)
+        if "accuracy" not in metrics:
+            raise RuntimeError(
+                "DeepSWE evaluation finished but reported no accuracy metric; "
+                "check the evalscope report in the eval pod log above"
+            )
+        logger.info(f"DeepSWE metrics: {metrics}")
+        return metrics
+    finally:
+        # Persist the forwarded eval log next to the run's artifacts so a
+        # post-mortem does not depend on the (large) router pod log.
+        if metrics_dir and lines:
+            try:
+                os.makedirs(metrics_dir, exist_ok=True)
+                eval_log_path = os.path.join(metrics_dir, "deepswe_eval.log")
+                with open(eval_log_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+                logger.info(f"Saved DeepSWE eval log to {eval_log_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save DeepSWE eval log: {e}")
+        try:
+            core_api.delete_namespaced_pod(
+                name=pod_name,
+                namespace=namespace,
+                grace_period_seconds=0,
+                propagation_policy="Foreground",
+            )
+            logger.info(f"Deleted DeepSWE eval pod {pod_name}")
+        except Exception as e:
+            logger.warning(f"Failed to delete DeepSWE eval pod {pod_name}: {e}")
+
+
 def assert_metrics(self, metrics):
     if not metrics:
         raise Exception("No metrics obtained from benchmark")
 
+    # Keep weekday gsm8k and weekend gpqa_diamond in separate series.
+    labels = {
+        "test_case": self.__class__.__name__,
+        "type": "accuracy",
+        "dataset": (self.datasets or ["unknown"])[0],
+    }
+    if metrics.get("accuracy") is not None:
+        dump_metric("accuracy", float(metrics["accuracy"]), labels=labels)
+    # Agent datasets (deep_swe) may ship without a calibrated baseline yet:
+    # record the measured value, but only assert once a baseline is set.
     if self.accuracy is not None:
         threshold = get_accuracy_threshold(self.datasets, self.accuracy)
-        # Keep weekday gsm8k and weekend gpqa_diamond in separate series.
-        labels = {
-            "test_case": self.__class__.__name__,
-            "type": "accuracy",
-            "dataset": (self.datasets or ["unknown"])[0],
-        }
-        dump_metric("accuracy", float(metrics["accuracy"]), labels=labels)
         dump_metric("accuracy_baseline", float(self.accuracy), labels=labels)
         self.assertGreaterEqual(
-            float(metrics["accuracy"]),
+            float(metrics.get("accuracy") or 0),
             threshold,
-            f"Accuracy check failed. Expected >= {threshold}, Got: {metrics['accuracy']}",
+            f"Accuracy check failed. Expected >= {threshold}, Got: {metrics.get('accuracy')}",
         )
 
 
@@ -379,40 +853,59 @@ def run_evalscope_with_retry(
     """Shared evalscope retry loop for all accuracy test bases.
 
     Retries up to ``max_retries`` (class attribute override, or
-    ``get_max_retries`` by dataset), keeping the best accuracy.
+    ``get_max_retries`` by dataset), keeping the best accuracy. Datasets that
+    need Docker (``REMOTE_EVAL_DATASETS``) are evaluated on the amd64 DinD pod
+    instead of the local NPU pod.
     """
     max_retries = (
         self.max_retries
         if self.max_retries is not None
         else get_max_retries(self.datasets)
     )
+    remote_eval = requires_remote_eval(self.datasets)
     logger.info(
         f"[retry-budget] {type(self).__name__}: max_retries={max_retries} "
         f"(class override: {self.max_retries is not None}), "
-        f"datasets={self.datasets}, threshold baseline={self.accuracy}"
+        f"datasets={self.datasets}, threshold baseline={self.accuracy}, "
+        f"remote_eval={remote_eval}"
     )
     best_metrics = None
     attempts_used = 0
     for attempt in range(max_retries):
         attempts_used = attempt + 1
-        metrics = run_evalscope(
-            host=host,
-            port=port,
-            model=model_name,
-            datasets=self.datasets,
-            dataset_args=self.dataset_args,
-            eval_batch_size=self.eval_batch_size,
-            limit=self.limit,
-            generation_config=self.generation_config,
-            dataset_dir=self.dataset_dir,
-            stream=self.stream,
-            timeout=self.timeout,
-            eval_type=self.eval_type,
-        )
+        if remote_eval:
+            metrics = run_evalscope_on_x86_pod(
+                host=host,
+                port=port,
+                model=model_name,
+                datasets=self.datasets,
+                dataset_args=self.dataset_args,
+                limit=self.limit,
+                timeout=self.timeout,
+                metrics_dir=os.environ.get("METRICS_DATA_FILE"),
+            )
+        else:
+            metrics = run_evalscope(
+                host=host,
+                port=port,
+                model=model_name,
+                datasets=self.datasets,
+                dataset_args=self.dataset_args,
+                eval_batch_size=self.eval_batch_size,
+                limit=self.limit,
+                generation_config=self.generation_config,
+                dataset_dir=self.dataset_dir,
+                stream=self.stream,
+                timeout=self.timeout,
+                eval_type=self.eval_type,
+            )
         if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
             best_metrics.get("accuracy", 0)
         ):
             best_metrics = metrics
+        # Without a calibrated baseline there is no threshold to retry against.
+        if self.accuracy is None:
+            break
         threshold = get_accuracy_threshold(self.datasets, self.accuracy)
         if float(best_metrics.get("accuracy", 0)) >= threshold:
             break
