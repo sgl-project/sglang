@@ -2210,6 +2210,7 @@ class PrefillAdder:
                                 best_match_node=req.best_match_node,
                                 host_hit_length=req.host_hit_length,
                                 req=req,
+                                cow_mamba_on_fallback=True,
                             )
                         )
                 if loaded is None:

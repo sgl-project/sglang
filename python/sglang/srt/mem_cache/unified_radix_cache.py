@@ -4552,7 +4552,8 @@ class UnifiedRadixCache(BasePrefixCache):
         params: InitLoadBackParams,
     ) -> Optional[tuple[int, NodeId]]:
         """None means admission retries without committing a load: buffer
-        mode, or a host-only anchor whose previous load-back is still in flight."""
+        mode, an in-flight host-only load-back, or a fallback prefix with no
+        device Mamba state to copy."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -4595,6 +4596,28 @@ class UnifiedRadixCache(BasePrefixCache):
                     best_match_node_id,
                 )
                 return len(new_indices), best_match_node_id
+
+            if (
+                params.cow_mamba_on_fallback
+                and (state_slot := self.slot_id(TREE_STATE)) is not None
+            ):
+                # The failed load_back has rolled back its temporary slot.
+                # Prefill still holds the device prefix lock and will take a
+                # request lock before releasing it. Use this prefix's state to
+                # initialize the active slot when the batch runs.
+                if req.prefix_len > 0:
+                    src = self.tree_core.get_component_device_value(
+                        last_best_match_device_node_id, state_slot
+                    )
+                    if src is None:
+                        return None
+                    req.kv.mamba_cow_src_index = src
+                    req.kv.mamba_needs_clear = False
+                else:
+                    # An earlier match may have staged a COW from the longer
+                    # anchor. A prefill from offset zero starts with zero state.
+                    req.kv.mamba_cow_src_index = None
+                    req.kv.mamba_needs_clear = req.kv.holds_mamba
 
         return 0, last_best_match_device_node_id
 
