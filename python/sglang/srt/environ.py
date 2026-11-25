@@ -2225,6 +2225,9 @@ class Envs:
     # gfx950 aiter MXFP8 dense route: keep the weight (16, 16)-preshuffled and run aiter's FlyDSL MXFP8
     # GEMM (needs aiter with ROCm/aiter#5896) instead of the Triton group32 GEMM on the plain weight.
     SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE = EnvBool(False)
+    # gfx950 DeepSeek-V4.1 decode / target-verify MoE calls of 257-2048 rows: route with aiter's fused
+    # top-k + sort + MXFP8 quant kernel (aiter.ops.flydsl.moe_route_sort_quant) instead of the unfused chain.
+    SGLANG_OPT_HIP_FUSED_MOE_ROUTING = EnvBool(False)
     # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
     # FP4 MQA logits kernel, a request's verify rows sharing each key load.
     SGLANG_HIP_FP4_INDEXER_ROWGROUP = EnvBool(_default_hip)
