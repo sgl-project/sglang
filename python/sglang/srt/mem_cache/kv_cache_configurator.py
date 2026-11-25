@@ -2462,7 +2462,6 @@ class KVCacheConfigurator:
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
             index_size=index_size,
-            index_page_size=get_schedule().page_size,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=(
                 calculate_mla_kv_cache_dim(
@@ -3442,7 +3441,7 @@ class KVCacheConfigurator:
         # Apply user-specified upper bound
         if user_limit is not None:
             if user_limit > token_capacity:
-                logging.warning(
+                logger.warning(
                     f"max_total_tokens={user_limit} is larger than the profiled value "
                     f"{token_capacity}. Use the profiled value instead."
                 )
@@ -3920,7 +3919,6 @@ def calculate_mla_kv_cache_dim(
     *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
-    kv_cache_dtype = kv_cache_dtype
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
