@@ -95,6 +95,28 @@ def npu_wrapper_rmsnorm_forward(func):
     return _rmsnorm_forward_oot
 
 
+_rmsnorm_bias_patched = False
+
+
+def _patch_rmsnorm_with_bias() -> None:
+    # The patch is process-wide and each call wraps the current method again,
+    # so apply it once however many norm biases or configs ask for it.
+    global _rmsnorm_bias_patched
+    if _rmsnorm_bias_patched:
+        return
+    apply_module_patch(
+        "sglang.srt.layers.layernorm.RMSNorm",
+        "__init__",
+        [npu_wrapper_rmsnorm_init],
+    )
+    apply_module_patch(
+        "sglang.srt.layers.layernorm.RMSNorm",
+        "forward_npu",
+        [npu_wrapper_rmsnorm_forward],
+    )
+    _rmsnorm_bias_patched = True
+
+
 def remap_dspark_weight_name_npu(
     name: str, *, for_quant_config: bool = False
 ) -> Optional[str]:
@@ -206,18 +228,8 @@ class ModelSlimConfig(QuantizationConfig):
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
 
-        for name in self.quant_description.keys():
-            if "norm.bias" in name:
-                apply_module_patch(
-                    "sglang.srt.layers.layernorm.RMSNorm",
-                    "__init__",
-                    [npu_wrapper_rmsnorm_init],
-                )
-                apply_module_patch(
-                    "sglang.srt.layers.layernorm.RMSNorm",
-                    "forward_npu",
-                    [npu_wrapper_rmsnorm_forward],
-                )
+        if any("norm.bias" in name for name in self.quant_description.keys()):
+            _patch_rmsnorm_with_bias()
         # Share DSpark path remapping while retaining config-specific suffixes,
         # checkpoint keys, and the precedence of explicitly configured aliases.
         dspark_quant_aliases = {}
@@ -516,9 +528,6 @@ class ModelSlimConfig(QuantizationConfig):
             if candidate + ".weight" in self.quant_description:
                 return candidate
         return prefix
-
-    def get_linear_method(self) -> ModelSlimLinearMethod:
-        return ModelSlimLinearMethod(self)
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
