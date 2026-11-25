@@ -310,11 +310,10 @@ def _broadcast_placement(
     if count == 0:
         return None
     slots = physical_shape[1]
-    physical_end = count + count * slots
-    logical_end = physical_end + count * num_logical * width
+    field_sizes = (count, count * slots, count * num_logical * width)
     if rank != 0:
         payload = torch.empty(
-            logical_end,
+            sum(field_sizes),
             dtype=torch.int64,
             device="cpu",
         )
@@ -325,10 +324,11 @@ def _broadcast_placement(
             (count, num_logical), dtype=torch.int64, device="cpu"
         )
         dist.scatter(local_dispatch, rank_tables, src=0, group=group)
+    layer_ids, physical, logical = payload.split(field_sizes)
     return _PlacementRows(
-        tuple(payload[:count].tolist()),
-        payload[count:physical_end].view(count, slots),
-        payload[physical_end:logical_end].view(count, num_logical, width),
+        tuple(layer_ids.tolist()),
+        physical.view(count, slots),
+        logical.view(count, num_logical, width),
         local_dispatch,
     )
 
@@ -482,14 +482,12 @@ class NpuEplbRuntime:
                     assert slot_counts is not None
                     if slot_counts.any().item():
                         placement = plan_migration(
-                            slot_counts,
+                            host_window,
                             self.metadata.physical_to_logical_map_cpu,
                             self.spec,
                             self.ranks_per_node,
                             self.layer_ids,
                             num_logical_experts=self.metadata.num_logical_experts,
-                            source_totals=host_window.source_totals,
-                            active_sources=host_window.active_sources,
                             narrowed_layers=self.narrowed_replica_layers,
                         )
                 except Exception as exc:

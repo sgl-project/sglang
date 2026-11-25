@@ -12,6 +12,7 @@ from sglang.srt.eplb.eplb_algorithms import EplbAlgorithm
 from sglang.srt.hardware_backend.npu.eplb import coordinator, placement
 from sglang.srt.hardware_backend.npu.eplb.placement import (
     PlanningSpec,
+    RecordedWindow,
     plan_migration,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -33,7 +34,7 @@ class TestAsyncEplbPlanning(unittest.TestCase):
             dtype=torch.int32,
         )
         return plan_migration(
-            counts,
+            RecordedWindow(slot_counts=counts),
             current,
             spec,
             2,
@@ -64,10 +65,16 @@ class TestAsyncEplbPlanning(unittest.TestCase):
         counts[:950, 0, 2] = 24
         counts[950:, 0, 1] = 128
         active_sources = torch.tensor([[2]] * 950 + [[16]] * 50)
-        args = (counts, current, spec, 16, (0,))
+        args = (current, spec, 16, (0,))
         kwargs = dict(num_logical_experts=31, narrowed_layers={0})
-        self.assertIsNone(plan_migration(*args, **kwargs))
-        plan = plan_migration(*args, **kwargs, active_sources=active_sources)
+        self.assertIsNone(
+            plan_migration(RecordedWindow(slot_counts=counts), *args, **kwargs)
+        )
+        plan = plan_migration(
+            RecordedWindow(slot_counts=counts, active_sources=active_sources),
+            *args,
+            **kwargs,
+        )
         self.assertIsNotNone(plan)
         self.assertEqual(plan.layers, (0,))
 
@@ -78,7 +85,14 @@ class TestAsyncEplbPlanning(unittest.TestCase):
         counts = torch.tensor([[[5, 3, 1, 7]]], dtype=torch.int32).repeat(16, 1, 1)
         with patch.object(PlanningSpec, "compute", autospec=True) as compute:
             self.assertIsNone(
-                plan_migration(counts, current, spec, 2, (0,), num_logical_experts=4)
+                plan_migration(
+                    RecordedWindow(slot_counts=counts),
+                    current,
+                    spec,
+                    2,
+                    (0,),
+                    num_logical_experts=4,
+                )
             )
         compute.assert_not_called()
 
@@ -95,7 +109,12 @@ class TestAsyncEplbPlanning(unittest.TestCase):
             ) as search,
         ):
             plan = plan_migration(
-                counts, current, spec, 2, (0, 1), num_logical_experts=4
+                RecordedWindow(slot_counts=counts),
+                current,
+                spec,
+                2,
+                (0, 1),
+                num_logical_experts=4,
             )
 
         self.assertIsNotNone(plan)
