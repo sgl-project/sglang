@@ -143,6 +143,18 @@ impl ChatFormatter {
         config: &Value,
         model_type: Option<&str>,
     ) -> Result<Self, TemplateError> {
+        // HF serializes named templates as [{name, template}, ...]. Python's
+        // TemplateManager selects the first entry before detecting its format.
+        // Dynamo expects [{default: source}, ...] instead, so resolve the HF
+        // selection before handing the config to it or wrapping the messages.
+        if let Some(entry) = config["chat_template"].as_array().and_then(|v| v.first())
+            && entry["name"].is_string()
+            && let Some(source) = entry["template"].as_str()
+        {
+            let mut config = config.clone();
+            config["chat_template"] = source.into();
+            return Self::from_tokenizer_config_with_type(&config, model_type);
+        }
         let source = config["chat_template"].as_str();
         let content_parts = || source.and_then(super::content_format::takes_content_parts);
         let glm53 = source.is_some_and(is_glm53);
@@ -357,6 +369,50 @@ mod tests {
             ]
         }))
         .unwrap()
+    }
+
+    /// Named HF templates must render like Python's selected first template,
+    /// including normalization of text parts before the template sees them.
+    #[test]
+    fn named_hf_templates_render_text_and_parts() {
+        use std::collections::HashMap;
+
+        use serde_json::json;
+
+        for (source, expected) in [
+            (
+                "{% for m in messages %}{{ m.content }}{% endfor %}",
+                "hi there",
+            ),
+            (
+                "{% for m in messages %}{% if m.content is string %}{{ m.content }}{% else %}{% for part in m.content %}{{ part.text }}{% endfor %}{% endif %}{% endfor %}",
+                "hithere",
+            ),
+        ] {
+            for name in ["default", "custom"] {
+                let formatter = ChatFormatter::from_tokenizer_config(&json!({
+                    "chat_template": [
+                        {"name": name, "template": source},
+                        {"name": if name == "default" { "tool_use" } else { "default" },
+                         "template": "WRONG TEMPLATE"}
+                    ]
+                }))
+                .unwrap();
+                for (content, expected) in [
+                    (json!("hi there"), "hi there"),
+                    (
+                        json!([{"type":"text","text":"hi"}, {"type":"text","text":"there"}]),
+                        expected,
+                    ),
+                ] {
+                    let body = json!({"messages": [{"role":"user", "content":content}]});
+                    let (prompt, prefix) =
+                        formatter.render_text_jinja(&body, &HashMap::new()).unwrap();
+                    assert_eq!(prompt.as_str(), expected, "{name}: {source}");
+                    assert!(prefix.is_empty());
+                }
+            }
+        }
     }
 
     /// A DeepSeek-V3.2 checkpoint's own template wins over the native encoder, as in Python.
