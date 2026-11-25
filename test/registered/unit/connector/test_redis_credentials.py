@@ -1,7 +1,8 @@
 """Unit tests for srt/connector/redis.py credential handling"""
 
+import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.connector.redis import RedisConnector
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -18,15 +19,17 @@ def _fake_base_init(self, url):
 
 
 def _make_connector(url):
-    """Build a RedisConnector with redis.Redis mocked out; returns
-    (connector, mock_client)."""
+    """Build a RedisConnector with a fake redis module injected into
+    sys.modules (redis is an optional dependency, so the tests must not
+    import it); returns (connector, mock Redis constructor)."""
+    fake_redis = MagicMock()
     with patch(
         "sglang.srt.connector.base_connector.BaseConnector.__init__",
         _fake_base_init,
     ):
-        with patch("redis.Redis") as mock_client:
+        with patch.dict(sys.modules, {"redis": fake_redis}):
             connector = RedisConnector(url)
-    return connector, mock_client
+    return connector, fake_redis.Redis
 
 
 class TestRedisCredentials(CustomTestCase):
@@ -49,8 +52,11 @@ class TestRedisCredentials(CustomTestCase):
         """urlparse does not decode credentials; special characters such
         as "@" or ":" must be percent-encoded in the URL and decoded
         before reaching the client, matching redis-py's from_url."""
-        _, client = _make_connector("redis://alice:p%40ss%3Aword@localhost:6379/model")
+        _, client = _make_connector(
+            "redis://%40lice:p%40ss%3Aword@localhost:6379/model"
+        )
 
+        self.assertEqual(client.call_args.kwargs["username"], "@lice")
         self.assertEqual(client.call_args.kwargs["password"], "p@ss:word")
 
     def test_urls_without_credentials_pass_none(self):
