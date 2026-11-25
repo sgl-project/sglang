@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     compute_logical_to_rank_dispatch_physical_map,
+    get_eplb_group,
 )
 from sglang.srt.eplb.expert_location_updater import update_expert_weights_single_layer
 from sglang.srt.hardware_backend.npu.eplb import (
@@ -70,6 +71,7 @@ class PlanningSpec:
     groups: int | None
     nodes: int
     algorithm: object
+    rank_fixed_dispatch: bool = False
 
     def compute(self, counts):
         from sglang.srt.eplb.eplb_algorithms import rebalance_experts
@@ -300,11 +302,8 @@ class NpuEplbRuntime:
         p2p_group,
         *,
         owns_p2p_group: bool = True,
-        layers_per_chunk: int = 1,
         order_submissions: bool = False,
     ):
-        if order_submissions and layers_per_chunk != 1:
-            raise ValueError("Ordering EPLB submissions requires single-layer staging")
         self.metadata = metadata
         self.spec = spec
         self.rank = rank
@@ -321,29 +320,24 @@ class NpuEplbRuntime:
         self.weights = {
             layer: adapter.make_weight_views(weights[layer]) for layer in self.layer_ids
         }
-        self.staging = tuple(
-            adapter.create_temp_buffers() for _ in range(layers_per_chunk)
-        )
+        self.staging = adapter.create_temp_buffers()
         self._packed_fields = (
-            _PackedExpertFields.create(self.staging[0])
+            _PackedExpertFields.create(self.staging)
             if order_submissions and world_size == ranks_per_node
             else None
         )
-        # Reserve the layer slots before KV sizing. One owner event fences reuse
-        # after all writes from the preceding chunk have been enqueued.
-        self._routing_buffers = tuple(
-            {
-                name: torch.empty_like(table[0], memory_format=torch.contiguous_format)
-                for name in _DEVICE_ROUTING_FIELDS
-                if (table := getattr(metadata, name)) is not None
-            }
-            for _ in range(layers_per_chunk)
-        )
+        # Reserve one layer before KV sizing. The owner event fences its reuse
+        # after writes from the preceding layer have been enqueued.
+        self._routing_buffers = {
+            name: torch.empty_like(table[0], memory_format=torch.contiguous_format)
+            for name in _DEVICE_ROUTING_FIELDS
+            if (table := getattr(metadata, name)) is not None
+        }
         # A loaded placement can have holes before the last populated slot.
         live = metadata.logical_to_all_physical_map_cpu
         occupied = (live != -1).any(dim=(0, 1)).nonzero()
         self._replica_width = int(occupied[-1, 0]) + 1 if occupied.numel() else 0
-        self.device = self.staging[0][0].device
+        self.device = self.staging[0].device
         self.device_module = torch.get_device_module(self.device)
         self._p2p_stream = self.device_module.Stream(device=self.device)
         self._owner_stream = self.device_module.current_stream()
@@ -411,14 +405,13 @@ class NpuEplbRuntime:
         # Include the previous populated columns so shrinking the active width
         # overwrites stale replicas. The graph still points to the full table.
         self._replica_width = max(self._replica_width, width)
-        self._routing_rows = tuple(
-            dict(
-                buffers,
-                logical_to_all_physical_map=buffers["logical_to_all_physical_map"]
-                .view(-1)[: logical.size(1) * self._replica_width]
-                .view(logical.size(1), self._replica_width),
-            )
-            for buffers in self._routing_buffers
+        self._routing_rows = dict(
+            self._routing_buffers,
+            logical_to_all_physical_map=self._routing_buffers[
+                "logical_to_all_physical_map"
+            ]
+            .view(-1)[: logical.size(1) * self._replica_width]
+            .view(logical.size(1), self._replica_width),
         )
         self._planned_rows = {
             "physical_to_logical_map": physical,
@@ -429,7 +422,7 @@ class NpuEplbRuntime:
             else logical,
             "logical_to_all_physical_map_num_valid": (logical != -1).sum(dim=-1),
         }
-        if "logical_to_rank_dispatch_physical_map" in self._routing_rows[0]:
+        if "logical_to_rank_dispatch_physical_map" in self._routing_rows:
             # Preserve the shared static algorithm's draws in full layer order.
             self._planned_rows["logical_to_rank_dispatch_physical_map"] = (
                 compute_logical_to_rank_dispatch_physical_map(
@@ -457,7 +450,7 @@ class NpuEplbRuntime:
             self._submitted = Future()
         return self._submitted
 
-    def stage(self, layer: int, slot: int = 0) -> WeightWriteback:
+    def stage(self, layer: int) -> WeightWriteback:
         """Run on the migration worker. The forward thread owns the writeback."""
         self.device_module.set_device(self.device)
         start = time.perf_counter()
@@ -485,9 +478,9 @@ class NpuEplbRuntime:
 
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
-            for name, row in self._routing_rows[slot].items():
+            for name, row in self._routing_rows.items():
                 row.copy_(self._planned_rows[name][layer], non_blocking=True)
-            weights, staging = self.weights[layer], self.staging[slot]
+            weights, staging = self.weights[layer], self.staging
             sends, receives = weights, staging
             if self._packed_fields is not None:
                 sends = self._packed_fields.pack(weights)
@@ -514,12 +507,12 @@ class NpuEplbRuntime:
         self.stage_seconds += time.perf_counter() - start
         return writeback
 
-    def install(self, layer: int, writeback: WeightWriteback, slot: int = 0) -> None:
+    def install(self, layer: int, writeback: WeightWriteback) -> None:
         self._check_stream()
         start = time.perf_counter()
         writeback()
         _install_routing_layer(
-            self.metadata, self._planned_rows, layer, self._routing_rows[slot]
+            self.metadata, self._planned_rows, layer, self._routing_rows
         )
         if layer == self._last_layer:
             self._planned_rows = None
@@ -551,7 +544,6 @@ def create_npu_async_eplb(model_config, weights, metadata):
     groups = common["model_config_for_expert_location"].num_groups
     moe = get_exec().moe
     algorithm = compute_algorithm(moe.eplb_algorithm, groups, parallel.nnodes)
-    layers_per_chunk = moe.eplb_rebalance_layers_per_chunk or 1
     order_submissions = get_disagg().disaggregation_mode == "decode"
     if algorithm.name.startswith("elasticity"):
         raise ValueError("Async EPLB requires a non-elastic CPU placement algorithm")
@@ -561,6 +553,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
         groups,
         parallel.nnodes,
         algorithm,
+        rank_fixed_dispatch=moe.ep_dispatch_algorithm == "static",
     )
     # Fixed PP=1 TP=EP=WORLD: group construction order is identical on all ranks.
     timeout = timedelta(seconds=90)
@@ -588,21 +581,19 @@ def create_npu_async_eplb(model_config, weights, metadata):
             plan_group,
             p2p_group,
             owns_p2p_group=not borrow_world_group,
-            layers_per_chunk=layers_per_chunk,
             order_submissions=order_submissions,
         )
         batch_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
         if batch_size <= 0:
             raise ValueError("Async EPLB requires a positive P2P batch chunk size")
         initial_layout = metadata.physical_to_logical_map_cpu.contiguous()
-        if any(t.shape[0] != spec.local_experts for t in runtime.staging[0]):
+        if any(t.shape[0] != spec.local_experts for t in runtime.staging):
             raise ValueError(
                 "Async EPLB weight rows do not match the local expert count"
             )
         signature = (
             runtime.layer_ids,
-            tuple(tuple(t.shape) for t in runtime.staging[0]),
-            layers_per_chunk,
+            tuple(tuple(t.shape) for t in runtime.staging),
             order_submissions,
             batch_size,
             p2p_buffer_mib,
@@ -620,21 +611,24 @@ def create_npu_async_eplb(model_config, weights, metadata):
         raise ValueError(
             "Async EPLB ranks disagree on layout, weight geometry or batching"
         )
+    # The recorder reduces int32 counts on TP. Initialize its HCCL collective
+    # before KV sizing and before prewarm_eplb_communication releases the cache.
+    dist.all_reduce(
+        torch.zeros(1, dtype=torch.int32, device=runtime.device),
+        group=get_eplb_group(),
+    )
     prewarm_eplb_communication(p2p_group)
-    weight_staging_bytes = sum(t.nbytes for slot in runtime.staging for t in slot)
+    weight_staging_bytes = sum(t.nbytes for t in runtime.staging)
     packed_fields = runtime._packed_fields
     if packed_fields is not None:
         weight_staging_bytes += packed_fields.send.nbytes
     logger.info(
         "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d "
-        "hccl_buffer_mib=%d reuse_world_group=%s layers_per_chunk=%d packed_fields=%d",
+        "hccl_buffer_mib=%d reuse_world_group=%s layers_per_chunk=1 packed_fields=%d",
         weight_staging_bytes,
-        sum(row.nbytes for slot in runtime._routing_buffers for row in slot.values()),
+        sum(row.nbytes for row in runtime._routing_buffers.values()),
         p2p_buffer_mib,
         borrow_world_group,
-        layers_per_chunk,
         len(packed_fields.small) if packed_fields is not None else 0,
     )
-    return AsyncEplbCoordinator(
-        EplbControl(control_group), runtime, layers_per_chunk=layers_per_chunk
-    )
+    return AsyncEplbCoordinator(EplbControl(control_group), runtime)

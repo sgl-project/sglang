@@ -9,14 +9,24 @@ def plan_migration(counts, current, spec, ranks_per_node, layer_ids):
     physical, logical = spec.compute(counts)
     if physical.shape != current.shape:
         raise ValueError("EPLB plan changed physical capacity")
-    if spec.nodes == 1 and physical.size(1) > logical.size(1):
+    replicated = physical.size(1) > logical.size(1)
+    # Aggregate counts cannot predict the load on replicas pinned to source
+    # ranks. Keep the base planner's rank assignments for static dispatch.
+    replicated_static = replicated and spec.rank_fixed_dispatch
+    score_steps = spec.nodes == 1 and not replicated_static
+    if score_steps and replicated:
         physical, logical = _balance_recorded_steps(
             physical, logical, counts, spec.local_experts, current, layer_ids
         )
     physical, logical = _align_placement(
-        current, physical, logical, spec.local_experts, ranks_per_node
+        current,
+        physical,
+        logical,
+        spec.local_experts,
+        ranks_per_node,
+        preserve_rank_assignment=replicated_static,
     )
-    if spec.nodes == 1 and physical.size(1) == logical.size(1):
+    if score_steps and not replicated:
         physical, logical = _prefer_fewer_moves(
             current, physical, logical, counts, spec.local_experts
         )
@@ -24,15 +34,23 @@ def plan_migration(counts, current, spec, ranks_per_node, layer_ids):
     changed = tuple(layer for layer in layer_ids if moved[layer])
     # All ranks start with the same layout and commit layers together.
     # An unchanged plan only needs the completion message.
-    if spec.nodes == 1 and changed:
+    if score_steps and changed:
         changed = _select_layers_for_migration(
             changed, current, physical, counts, spec.local_experts
         )
     return (changed, physical, logical) if changed else None
 
 
-def _align_placement(old, physical, logical, local_experts, ranks_per_node):
-    """Relabel target ranks within each node and keep resident expert rows in place."""
+def _align_placement(
+    old,
+    physical,
+    logical,
+    local_experts,
+    ranks_per_node,
+    *,
+    preserve_rank_assignment=False,
+):
+    """Keep resident expert rows in place, optionally reassigning ranks within a node."""
     if torch.equal(old, physical):
         return physical, logical
 
@@ -44,19 +62,24 @@ def _align_placement(old, physical, logical, local_experts, ranks_per_node):
     slots = np.arange(capacity).reshape(-1, local_experts)
     order = np.tile(slots, (layers, 1, 1))
     offsets = np.arange(local_experts)
+    alignment_width = len(slots) if preserve_rank_assignment else ranks_per_node
     for layer in range(layers):
-        for start in range(0, len(slots), ranks_per_node):
-            node = slice(start, start + ranks_per_node)
+        for start in range(0, len(slots), alignment_width):
+            node = slice(start, start + alignment_width)
             live, planned = live_rows[layer, node], planned_rows[layer, node]
             if np.array_equal(live, planned):
                 continue
-            # One receive supplies all local replicas of an expert. Count distinct
-            # resident experts, then maximize those hits across the entire node.
-            resident, wanted, receives = _receive_cost(live, planned, logical.shape[1])
-            endpoint = receives
-            if ranks_per_node == len(slots):
-                endpoint = np.maximum(receives, _send_upper_bound(resident, wanted))
-            sources = _assign_ranks(receives, endpoint)
+            if preserve_rank_assignment:
+                sources = np.arange(len(planned))
+            else:
+                # One receive supplies all local replicas of an expert.
+                resident, wanted, receives = _receive_cost(
+                    live, planned, logical.shape[1]
+                )
+                endpoint = receives
+                if ranks_per_node == len(slots):
+                    endpoint = np.maximum(receives, _send_upper_bound(resident, wanted))
+                sources = _assign_ranks(receives, endpoint)
             aligned = order[layer, node]
             aligned[:] = slots[start + sources]
             matches = live[:, :, None] == planned[sources, None, :]

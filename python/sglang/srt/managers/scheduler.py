@@ -7274,6 +7274,16 @@ def run_scheduler_process(
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
+        if (
+            scheduler.gracefully_exit
+            and _is_npu
+            and get_exec().moe.eplb_async_rebalance
+        ):
+            # Joining the EPLB worker is collective and must use live groups.
+            # An exception in the event loop skips this drain.
+            manager = scheduler.tp_worker.model_runner.eplb_manager
+            if manager is not None:
+                manager.close()
 
     except Exception:
         logger.error(f"Scheduler hit an exception: {traceback.format_exc()}")
@@ -7299,7 +7309,7 @@ def run_scheduler_process(
                 scheduler.async_d2h_worker = None
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
-            if scheduler.gracefully_exit:
+            if scheduler.gracefully_exit and not hit_exception:
                 scheduler.release_host_resources()
                 close_custom_all_reduce()
                 # Last: anything above may still need a working communicator.

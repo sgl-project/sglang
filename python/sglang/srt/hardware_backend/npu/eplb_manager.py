@@ -3,6 +3,8 @@
 import logging
 import time
 
+from torch.profiler import record_function
+
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderReal,
@@ -35,6 +37,15 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
         super()._reset()
         self.window_samples = 0
 
+    def snapshot_for_rebalance(self):
+        # Startup warms the statistics group and releases cached memory.
+        with record_function("npu_eplb.snapshot"):
+            snapshot = self._accumulator.dump(
+                output_mode="object", empty_cache_on_first_dump=False
+            )
+            self._reset()
+        return snapshot
+
 
 class NpuAsyncEPLBManager(EPLBManager):
     def __init__(self, **kwargs):
@@ -63,6 +74,17 @@ class NpuAsyncEPLBManager(EPLBManager):
             self._async_coordinator.reset()
             get_global_expert_distribution_recorder()._reset()
         super().reset_generator()
+
+    def close(self) -> None:
+        coordinator = self._async_coordinator
+        if coordinator is not None:
+            phase = coordinator.phase
+            coordinator.close()
+            logger.info(
+                "Async EPLB drained at shutdown: epoch=%d phase=%s",
+                coordinator.epoch,
+                phase.name,
+            )
 
     def should_release_first_prefill(self, *, has_pending_prefill: bool) -> bool:
         coordinator = self._async_coordinator
@@ -95,7 +117,7 @@ class NpuAsyncEPLBManager(EPLBManager):
         if not ready:
             return
         start = time.perf_counter()
-        snapshot = recorder.dump_record(output_mode="object")
+        snapshot = recorder.snapshot_for_rebalance()
         snapshot_seconds = time.perf_counter() - start
         if not self._check_rebalance_needed(
             snapshot["average_utilization_rate_over_window"]
@@ -111,14 +133,15 @@ class NpuAsyncEPLBManager(EPLBManager):
         except RebalanceAborted:
             self._rebalance_disabled_reason = "asynchronous planning failed"
             logger.exception("Async EPLB drained; disabling further rebalances")
-        # dump_record already started a fresh window. It is still valid if the
+        # The snapshot already started a fresh window. It is still valid if the
         # planner chose no migrations or failed before the first install.
         if coordinator.layers_installed:
             recorder._reset()
         runtime = coordinator.runtime
         logger.info(
             "Async EPLB epoch=%d layers=%d elapsed=%.3fs control_wait=%.6fs "
-            "stage=%.6fs install_enqueue=%.6fs snapshot=%.6fs interleaved_layers=%d",
+            "stage=%.6fs install_enqueue=%.6fs snapshot=%.6fs "
+            "interleaved_layers=%d submission_wait=%.6fs",
             coordinator.epoch,
             coordinator.layers_installed,
             time.perf_counter() - start,
@@ -127,4 +150,5 @@ class NpuAsyncEPLBManager(EPLBManager):
             runtime.install_enqueue_seconds,
             snapshot_seconds,
             runtime.interleaved_layers,
+            coordinator.submission_wait_seconds,
         )
