@@ -117,7 +117,7 @@ class WaveAttnBackend(AttentionBackend):
 
         self.forward_metadata: ForwardMetadata = None
 
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
 
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
