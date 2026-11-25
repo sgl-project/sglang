@@ -155,8 +155,9 @@ def test_interior_split_partition(monkeypatch, splits):
 @hopper
 def test_sequences_without_interior_tiles_keep_main_split(monkeypatch):
     """In a batch that mixes sequences with and without interior tiles, the ones
-    without get the same splits and partials, bit for bit, as on the launch with
-    no interior path, so short contexts run main's work layout."""
+    without get the same keys in each split as on the launch with no interior path,
+    so short contexts run main's work layout: the same row maxima bit for bit, and
+    outputs and row sums up to the order of their FP32 sums."""
     from sglang.kernels.ops.attention import inkling2_decode_attention_sm90 as attn
 
     inputs = _attention_inputs(6, 1, 8, None, 128)
@@ -168,8 +169,10 @@ def test_sequences_without_interior_tiles_keep_main_split(monkeypatch):
     monkeypatch.setattr(attn, "_interior_tile_keys", lambda *args: 0)
     plain = attn.decode_partials(*inputs, SCALE)
     rows = (~has_interior).repeat_interleave(8)
-    for got, want in zip(mixed, plain):
-        assert torch.equal(got[:, rows], want[:, rows])
+    (o, m, l), (o0, m0, l0) = ([x[:, rows] for x in out] for out in (mixed, plain))
+    assert torch.equal(m, m0)
+    torch.testing.assert_close(o, o0, rtol=1e-6, atol=0)
+    torch.testing.assert_close(l, l0, rtol=1e-6, atol=0)
 
 
 if __name__ == "__main__":
