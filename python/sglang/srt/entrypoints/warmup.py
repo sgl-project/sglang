@@ -254,9 +254,14 @@ async def _send_warmup_request(
     input_ids: List[int],
     sampling_params: Dict[str, Any],
     bootstrap_room: int = 0,
+    optional: bool = False,
     **kwargs: Any,
-) -> None:
-    """Send one warmup request, clamping length to stay within model context bounds."""
+) -> bool:
+    """Send one warmup request, clamping length to stay within model context bounds.
+
+    When `optional=True`, feature-rejection `ValueError`s (e.g. penalties or
+    grammar unsupported by a speculative backend) are logged and skipped.
+    """
     params = dict(sampling_params)
     max_new_tokens = max(1, int(params.get("max_new_tokens", 1) or 1))
     max_input = _max_warmup_input_len(tm, max_new_tokens)
@@ -265,11 +270,11 @@ async def _send_warmup_request(
         max_input = _max_warmup_input_len(tm, max_new_tokens=1)
     if max_input is not None:
         if max_input < 1:
-            return
+            return False
         input_ids = input_ids[:max_input]
 
     if not input_ids:
-        return
+        return False
     if kwargs.get("logprob_start_len", -1) >= len(input_ids):
         kwargs["logprob_start_len"] = max(0, len(input_ids) - 1)
 
@@ -277,8 +282,15 @@ async def _send_warmup_request(
     if disaggregation_mode != "null":
         req.bootstrap_room = bootstrap_room
         req.bootstrap_host = FAKE_BOOTSTRAP_HOST
-    async for _ in tm.generate_request(req, None):
-        pass
+    try:
+        async for _ in tm.generate_request(req, None):
+            pass
+        return True
+    except ValueError as exc:
+        if not optional:
+            raise
+        logger.info("Skipping unsupported warmup request: %s", exc)
+        return False
 
 
 async def _warm_tokenizer(tm: Any) -> None:
@@ -336,10 +348,13 @@ async def warmup_all(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         def rand_ids(length: int) -> List[int]:
             return [int(x) for x in rng.integers(0, max_token_id, size=length)]
 
+        server_args = getattr(tokenizer_manager, "server_args", None)
+
         def send(
             input_ids: List[int],
             sampling_params: Dict[str, Any],
             bootstrap_room: int = 0,
+            optional: bool = False,
             **kwargs: Any,
         ):
             return _send_warmup_request(
@@ -348,6 +363,7 @@ async def warmup_all(disaggregation_mode: str, tokenizer_manager: TokenizerManag
                 input_ids,
                 sampling_params,
                 bootstrap_room,
+                optional=optional,
                 **kwargs,
             )
 
@@ -373,8 +389,14 @@ async def warmup_all(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         }
 
         # 1. Sampling, decode batching (bs=2), and penalty paths.
-        for params in (greedy, sampled, min_p, penalty):
-            await send(rand_ids(_WARMUP_PROMPT_LEN), params)
+        await send(rand_ids(_WARMUP_PROMPT_LEN), greedy)
+        await send(rand_ids(_WARMUP_PROMPT_LEN), sampled)
+        # Speculative decoding does not support min_p sampling.
+        if getattr(server_args, "speculative_algorithm", None) is None:
+            await send(rand_ids(_WARMUP_PROMPT_LEN), min_p, optional=True)
+        penalty_supported = await send(
+            rand_ids(_WARMUP_PROMPT_LEN), penalty, optional=True
+        )
 
         max_input_len = _max_warmup_input_len(tokenizer_manager, max_new_tokens=1)
         if max_input_len is None or max_input_len >= _WARMUP_PROMPT_LEN:
@@ -382,46 +404,68 @@ async def warmup_all(disaggregation_mode: str, tokenizer_manager: TokenizerManag
                 send(rand_ids(_WARMUP_PROMPT_LEN), greedy, bootstrap_room=0),
                 send(rand_ids(_WARMUP_PROMPT_LEN), sampled, bootstrap_room=1),
             )
-            await asyncio.gather(
-                send(rand_ids(_WARMUP_PROMPT_LEN), penalty, bootstrap_room=0),
-                send(rand_ids(_WARMUP_PROMPT_LEN), penalty, bootstrap_room=1),
-            )
+            if penalty_supported:
+                await asyncio.gather(
+                    send(
+                        rand_ids(_WARMUP_PROMPT_LEN),
+                        penalty,
+                        bootstrap_room=0,
+                        optional=True,
+                    ),
+                    send(
+                        rand_ids(_WARMUP_PROMPT_LEN),
+                        penalty,
+                        bootstrap_room=1,
+                        optional=True,
+                    ),
+                )
 
         # 2. Output and prompt logprob paths.
         top_logprobs = min(5, vocab_size) if vocab_size is not None else 5
+        if disaggregation_mode != "null":
+            disagg_cap = _positive_int(
+                getattr(server_args, "disaggregation_max_top_logprobs_num", None)
+            )
+            if disagg_cap is not None:
+                top_logprobs = min(top_logprobs, disagg_cap)
         logprob_kwargs = {
             "return_logprob": True,
             "top_logprobs_num": top_logprobs,
             "return_text_in_logprobs": True,
             "log_metrics": False,
         }
-        await send(rand_ids(_WARMUP_PROMPT_LEN), greedy, **logprob_kwargs)
-        await send(rand_ids(_WARMUP_PROMPT_LEN), sampled, **logprob_kwargs)
-        if disaggregation_mode != "decode":
+        if await send(
+            rand_ids(_WARMUP_PROMPT_LEN), greedy, optional=True, **logprob_kwargs
+        ):
             await send(
-                rand_ids(_WARMUP_PROMPT_LEN),
-                {"max_new_tokens": 1, "temperature": 0.0},
-                logprob_start_len=0,
-                **logprob_kwargs,
+                rand_ids(_WARMUP_PROMPT_LEN), sampled, optional=True, **logprob_kwargs
             )
+            if disaggregation_mode != "decode":
+                await send(
+                    rand_ids(_WARMUP_PROMPT_LEN),
+                    {"max_new_tokens": 1, "temperature": 0.0},
+                    logprob_start_len=0,
+                    optional=True,
+                    **logprob_kwargs,
+                )
 
         # 3. Constrained decoding (JSON schema and regex FSMs).
-        grammar_backend = getattr(
-            getattr(tokenizer_manager, "server_args", None), "grammar_backend", None
-        )
+        grammar_backend = getattr(server_args, "grammar_backend", None)
         if (
             not getattr(tokenizer_manager, "skip_tokenizer_init", False)
             and grammar_backend != "none"
         ):
             schema = '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}'
-            await send(
+            if await send(
                 rand_ids(_WARMUP_PROMPT_LEN),
                 {"max_new_tokens": 8, "temperature": 0.0, "json_schema": schema},
-            )
-            await send(
-                rand_ids(_WARMUP_PROMPT_LEN),
-                {"max_new_tokens": 4, "temperature": 0.0, "regex": r"(yes|no)"},
-            )
+                optional=True,
+            ):
+                await send(
+                    rand_ids(_WARMUP_PROMPT_LEN),
+                    {"max_new_tokens": 4, "temperature": 0.0, "regex": r"(yes|no)"},
+                    optional=True,
+                )
 
         # 4. Radix prefix-cache extend and prefill shapes up to context limit.
         max_prefill_size = _resolve_max_prefill_size(max_input_len)

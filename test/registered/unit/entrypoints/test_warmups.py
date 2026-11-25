@@ -138,3 +138,26 @@ def test_warmup_all_respects_max_prefill_size_env(monkeypatch):
     tm = _FakeTokenizerManager(context_len=65536, max_req_input_len=40960)
     asyncio.run(warmup_mod.execute_warmups("null", ["all"], tm))
     assert max(len(r.input_ids) for r in tm.requests) == 256
+
+
+def test_warmup_all_skips_unsupported_speculative_features():
+    tm = _FakeTokenizerManager(context_len=512)
+    tm.server_args.speculative_algorithm = "DFLASH"
+    orig_generate = tm.generate_request
+
+    async def _dflash_generate(req, request=None):
+        params = req.sampling_params or {}
+        if params.get("min_p", 0) > 0:
+            raise AssertionError("min_p should be skipped under speculative decoding")
+        if params.get("repetition_penalty") is not None:
+            raise ValueError("DFLASH megakernel does not support sampling penalties")
+        if "json_schema" in params or "regex" in params:
+            raise ValueError("Grammar decoding not supported")
+        async for out in orig_generate(req, request):
+            yield out
+
+    tm.generate_request = _dflash_generate
+    asyncio.run(warmup_mod.execute_warmups("null", ["all"], tm))
+    assert len(tm.requests) > 0
+    assert tm.flush_count == 1
+    assert all((r.sampling_params or {}).get("min_p", 0) == 0 for r in tm.requests)
