@@ -99,6 +99,7 @@ __all__ = ["causal_conv1d_fwd", "causal_conv1d_update"]
 for _mod, _fn in [
     ("triton_ops.ssd_combined", "mamba_chunk_scan_combined"),
     ("triton_ops.mamba_ssm", "selective_state_update"),
+    ("triton_ops.mamba1_scan_prefill", "mamba1_scan_prefill"),
     ("mamba_state_scatter_triton", "fused_mamba_state_scatter_with_mask"),
 ]:
     register_kernel(
