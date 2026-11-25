@@ -3748,105 +3748,28 @@ class OpenAIServingChat(OpenAIServingBase):
 
         parser = parser_dict[index]
 
-        # Handle both FunctionCallParser and JsonArrayParser
+        # Handle both FunctionCallParser and JsonArrayParser. Each segment is
+        # sent text first, then calls; segments are in generation order.
         if isinstance(parser, JsonArrayParser):
-            result = parser.parse_streaming_increment(delta, effective_tools)
-            normal_text, calls = result.normal_text, result.calls
+            results = parser.parse_streaming_segments(delta, effective_tools)
             if flush:
-                end = parser.finish(effective_tools)
-                normal_text = (normal_text or "") + end.normal_text
-                calls = list(calls) + end.calls
+                results.append(parser.finish(effective_tools))
+            segments = [(result.normal_text, result.calls) for result in results]
         else:
-            normal_text, calls = parser.parse_stream_chunk(delta)
+            segments = parser.parse_stream_segments(delta)
             if flush:
-                end_text, end_calls = parser.parse_stream_end()
-                normal_text = (normal_text or "") + end_text
-                calls = list(calls) + end_calls
+                segments.append(parser.parse_stream_end())
 
-        # Yield normal text
-        if normal_text:
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=index,
-                delta=DeltaMessage(content=normal_text),
-                internal_content=wire.internal_content(
-                    index, normal_text, kind="content"
-                ),
-                finish_reason=None,
-            )
-            chunk = ChatCompletionStreamResponse(
-                id=wire.response_id(content["meta_info"]["id"]),
-                created=created,
-                choices=[choice_data],
-                model=request.model,
-            )
-
-            # Add usage stats if continuous_usage_stats is enabled
-            if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
-                completion_tokens = content["meta_info"].get("completion_tokens", 0)
-                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
-                chunk.usage = UsageProcessor.calculate_token_usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
-                )
-
-            yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
-
-        # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-        for call_item in calls:
-            # Mark that this choice has tool calls
-            has_tool_calls[index] = True
-
-            call_internal = wire.internal_content(
-                index, call_item.source_text, kind="tool"
-            )
-
-            # Tool call ID should be generated only once per tool call
-            if call_item.name:
-                # First chunk: include ID and function name
-                tool_call_id = self._process_tool_call_id(
-                    call_item, history_tool_calls_cnt
-                )
-                function_name = call_item.name
-            else:
-                # Subsequent chunks: null ID and name for argument deltas
-                tool_call_id = None
-                function_name = None
-
-            tool_call = ToolCall(
-                id=tool_call_id,
-                index=call_item.tool_index,
-                function=FunctionResponse(
-                    name=function_name,
-                    arguments=call_item.parameters,
-                ),
-            )
-            tool_call_deltas = [tool_call]
-            if wire.split_tool_call_opening and function_name is not None:
-                tool_call_deltas = [
-                    ToolCall(
-                        id=tool_call_id,
-                        index=call_item.tool_index,
-                        function=FunctionResponse(name=function_name, arguments=""),
-                    )
-                ]
-                if call_item.parameters:
-                    tool_call_deltas.append(
-                        ToolCall(
-                            index=call_item.tool_index,
-                            function=FunctionResponse(arguments=call_item.parameters),
-                        )
-                    )
-
-            for position, tool_call in enumerate(tool_call_deltas):
+        for normal_text, calls in segments:
+            # Yield normal text
+            if normal_text:
                 choice_data = ChatCompletionResponseStreamChoice(
                     index=index,
-                    delta=DeltaMessage(tool_calls=[tool_call]),
-                    # The tokens behind this call delta go out once.
-                    internal_content=call_internal if position == 0 else None,
+                    delta=DeltaMessage(content=normal_text),
+                    internal_content=wire.internal_content(
+                        index, normal_text, kind="content"
+                    ),
                     finish_reason=None,
                 )
                 chunk = ChatCompletionStreamResponse(
@@ -3869,6 +3792,91 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
 
                 yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
+
+            # Yield tool calls
+            for call_item in calls:
+                # Mark that this choice has tool calls
+                has_tool_calls[index] = True
+
+                call_internal = wire.internal_content(
+                    index, call_item.source_text, kind="tool"
+                )
+
+                # Tool call ID should be generated only once per tool call
+                if call_item.name:
+                    # First chunk: include ID and function name
+                    tool_call_id = self._process_tool_call_id(
+                        call_item, history_tool_calls_cnt
+                    )
+                    function_name = call_item.name
+                else:
+                    # Subsequent chunks: null ID and name for argument deltas
+                    tool_call_id = None
+                    function_name = None
+
+                tool_call = ToolCall(
+                    id=tool_call_id,
+                    index=call_item.tool_index,
+                    function=FunctionResponse(
+                        name=function_name,
+                        arguments=call_item.parameters,
+                    ),
+                )
+                tool_call_deltas = [tool_call]
+                if wire.split_tool_call_opening and function_name is not None:
+                    tool_call_deltas = [
+                        ToolCall(
+                            id=tool_call_id,
+                            index=call_item.tool_index,
+                            function=FunctionResponse(name=function_name, arguments=""),
+                        )
+                    ]
+                    if call_item.parameters:
+                        tool_call_deltas.append(
+                            ToolCall(
+                                index=call_item.tool_index,
+                                function=FunctionResponse(
+                                    arguments=call_item.parameters
+                                ),
+                            )
+                        )
+
+                for position, tool_call in enumerate(tool_call_deltas):
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(tool_calls=[tool_call]),
+                        # The tokens behind this call delta go out once.
+                        internal_content=call_internal if position == 0 else None,
+                        finish_reason=None,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=wire.response_id(content["meta_info"]["id"]),
+                        created=created,
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+
+                    # Add usage stats if continuous_usage_stats is enabled
+                    if continuous_usage_stats:
+                        prompt_tokens = self._reported_prompt_tokens(
+                            content["meta_info"]
+                        )
+                        completion_tokens = content["meta_info"].get(
+                            "completion_tokens", 0
+                        )
+                        reasoning_tokens = content["meta_info"].get(
+                            "reasoning_tokens", 0
+                        )
+                        chunk.usage = UsageProcessor.calculate_token_usage(
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            reasoning_tokens=reasoning_tokens,
+                            cached_tokens=self._continuous_usage_cached_details(
+                                content
+                            ),
+                        )
+
+                    yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
 
     def _check_for_unstreamed_tool_args(
         self,

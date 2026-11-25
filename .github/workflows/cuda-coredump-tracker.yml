@@ -28,6 +28,8 @@ jobs:
           # pull_requests is empty for a fork PR; pr-test.yml's run-name is "PR #<n> - <title>".
           RUN_TITLE: ${{ github.event.workflow_run.display_title }}
           WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+        # pipefail: a failed artifact listing (e.g. a rate limit) fails the step instead of posting.
+        shell: bash
         run: |
           count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" --paginate \
             --jq ".artifacts[] | select((.name | startswith(\"cuda-coredumps-\")) and .created_at >= \"${STARTED_AT}\") | .name" \
