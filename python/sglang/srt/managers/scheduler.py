@@ -7035,6 +7035,9 @@ class Scheduler(
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
+            if self.input_blocker is not None and self.input_blocker.has_pending():
+                time.sleep(0 if self.input_blocker.needs_polling() else 0.001)
+                return
             self.idle_sleeper.maybe_sleep()
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
