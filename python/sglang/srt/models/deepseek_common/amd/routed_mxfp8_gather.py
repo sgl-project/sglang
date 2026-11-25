@@ -307,8 +307,7 @@ def gather_routed_mxfp8_varlen(
         dynamic_per_group_scaled_quant(
             q[:n], x, s[:n].view(dtypes.fp8_e8m0), _GROUP, shuffle_scale=False
         )
-        meta[:n, :topk].copy_(ids)
-        meta[:n, topk:].copy_(weights.view(torch.int32))
+        torch.cat((ids, weights.view(torch.int32)), dim=1, out=meta[:n])
     if n < slot:
         q[n:].view(torch.uint8).zero_()
         s[n:].zero_()
@@ -316,8 +315,10 @@ def gather_routed_mxfp8_varlen(
     g_q, g_s, g_meta = get_parallel().tp_group.all_gatherv(
         [q.view(torch.uint8), s, meta], sizes=sizes
     )
-    g_ids = g_meta[:, :topk].contiguous()
-    g_weights = g_meta[:, topk:].contiguous().view(torch.float32)
+    # one copy splits the interleaved rows into contiguous ids and weights planes
+    planes = g_meta.view(-1, 2, topk).transpose(0, 1).contiguous()
+    g_ids = planes[0]
+    g_weights = planes[1].view(torch.float32)
     return RoutedMxfp8(
         g_q.view(dtypes.fp8),
         g_s.view(dtypes.fp8_e8m0),
