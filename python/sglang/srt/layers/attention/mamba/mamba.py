@@ -577,17 +577,19 @@ class MambaMixer2(torch.nn.Module):
             has_initial_states_p = mixed_metadata.has_initial_states
             prep_initial_states = mixed_metadata.prep_initial_states
             cache_indices = state_indices_tensor_p
-            # NOTE: for size-1 token slices, .contiguous() may keep a larger stride
-            # on dim0 (still considered contiguous by PyTorch), which turns into an
-            # invalid transposed stride for causal_conv1d_fwd_cpu after transpose.
-            # Repack to canonical contiguous layout only when needed.
-            if hidden_states_B_C_p.size(0) == 1 and hidden_states_B_C_p.stride(
-                0
-            ) != hidden_states_B_C_p.size(1):
-                hidden_states_B_C_p = torch.empty_like(
-                    hidden_states_B_C_p, memory_format=torch.contiguous_format
-                ).copy_(hidden_states_B_C_p)
-            x = hidden_states_B_C_p.contiguous().transpose(
+            if is_cpu():
+                # NOTE: for size-1 token slices, .contiguous() may keep a larger
+                # stride on dim0 (still considered contiguous by PyTorch), which
+                # turns into an invalid transposed stride for
+                # causal_conv1d_fwd_cpu after transpose. Repack only when needed.
+                if hidden_states_B_C_p.size(0) == 1 and hidden_states_B_C_p.stride(
+                    0
+                ) != hidden_states_B_C_p.size(1):
+                    hidden_states_B_C_p = torch.empty_like(
+                        hidden_states_B_C_p, memory_format=torch.contiguous_format
+                    ).copy_(hidden_states_B_C_p)
+                hidden_states_B_C_p = hidden_states_B_C_p.contiguous()
+            x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
             # Runs once per mamba layer
@@ -602,12 +604,15 @@ class MambaMixer2(torch.nn.Module):
                 if is_cpu() or not use_triton_causal_conv
                 else causal_conv1d_fn_triton
             )
-            if is_cpu():
-                self.conv1d.bias.data = self.conv1d.bias.data.to(dtype=x.dtype)
+            conv_bias = self.conv1d.bias
+            if is_cpu() and conv_bias is not None and conv_bias.dtype != x.dtype:
+                # CPU kernel needs bias dtype == input dtype; cast a local copy
+                # instead of mutating the parameter. Bias stays optional.
+                conv_bias = conv_bias.to(dtype=x.dtype)
             hidden_states_B_C_p = ccfn(
                 x,
                 conv_weights,
-                self.conv1d.bias,
+                conv_bias,
                 activation=self.activation,
                 conv_states=conv_state,
                 has_initial_state=has_initial_states_p,

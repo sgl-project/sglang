@@ -494,6 +494,13 @@ class NemotronHMoE(nn.Module):
             from sglang.srt.utils import use_intel_amx_backend
 
             if use_intel_amx_backend(self.gate):
+                # NOTE: weight_packed_linear accumulates in fp32 but writes the
+                # output in the input dtype (BF16), so the trailing .float()
+                # does NOT recover fp32 router precision. Logits whose fp32 gap
+                # is below one BF16 ulp may tie or swap order, which can change
+                # the selected top-k experts versus the fp32 GPU path. This is
+                # bounded by BF16 rounding of the logits and is covered by
+                # test/registered/cpu/test_router_logits_precision.py.
                 return torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.contiguous(), self.gate.weight, None, True
                 ).float()

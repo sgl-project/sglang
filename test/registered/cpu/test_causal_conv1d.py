@@ -244,6 +244,122 @@ class TestCausalConv1d(CustomTestCase):
         torch.testing.assert_close(final_states_ref, final_states, atol=atol, rtol=rtol)
 
     @parametrize(
+        dim=[96],
+        width=[4],
+        num_tokens=[1, 7],
+    )
+    def test_causal_conv1d_prefill_no_bias(
+        self, dim, width, num_tokens, dtype=torch.bfloat16
+    ):
+        # Regression: MambaMixer2 CPU prefill must accept use_conv_bias=False
+        # (conv1d.bias is None).
+        from sgl_kernel.mamba import causal_conv1d_fn_cpu
+
+        # Slice out of a wider projection (as torch.split does in
+        # MambaMixer2.forward), then repack contiguously like the CPU branch.
+        proj = torch.randn(num_tokens, dim + 32, dtype=dtype)
+        x = proj[:, :dim].contiguous().transpose(0, 1)
+
+        weight = torch.randn(dim, width, dtype=dtype)
+        conv_states = torch.zeros(2, dim, width - 1, dtype=dtype)
+        conv_states_ref = conv_states.clone()
+        query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32)
+        cache_indices = torch.tensor([1], dtype=torch.int32)
+        has_initial_state = torch.tensor([False])
+
+        out_ref, _ = causal_conv1d_ref(
+            x.unsqueeze(0),
+            weight,
+            None,
+            return_final_states=True,
+            final_states_out=conv_states_ref[1].unsqueeze(0),
+            activation=self.activation,
+        )
+        out = causal_conv1d_fn_cpu(
+            x,
+            causal_conv1d_weight_pack(weight),
+            None,
+            self.activation,
+            conv_states,
+            has_initial_state,
+            cache_indices,
+            query_start_loc,
+            None,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(out_ref[0], out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(conv_states_ref, conv_states, atol=atol, rtol=rtol)
+
+    @parametrize(
+        dim=[96],
+        width=[4],
+        has_bias=[True, False],
+        prepack=[False, True],
+    )
+    def test_causal_conv1d_varlen_mixed_initial_states(
+        self, dim, width, has_bias, prepack, dtype=torch.bfloat16
+    ):
+        # Mixed cache hits (has_initial_state=True) and misses (False), including
+        # one-token sequences on both sides, to exercise the cached-state branch
+        # of causal_conv1d_fwd_varlen_kernel_impl. Checks output and cache.
+        seqlens_list = [1, 5, 1, 2, 17, 3, 1, 40]
+        has_initial_list = [True, False, False, True, True, False, True, False]
+        batch = len(seqlens_list)
+        total_entries = batch + 3
+
+        seqlens = torch.tensor([0] + seqlens_list)
+        query_start_loc = torch.cumsum(seqlens, dim=0).to(torch.int32)
+        seqlen = query_start_loc[-1].item()
+
+        x = torch.randn(seqlen, dim, dtype=dtype).transpose_(-1, -2)
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype) if has_bias else None
+        packed_weight = causal_conv1d_weight_pack(weight) if prepack else weight
+
+        conv_states = torch.randn(total_entries, dim, width - 1, dtype=dtype)
+        conv_states_ref = conv_states.clone()
+        has_initial_states = torch.tensor(has_initial_list, dtype=torch.bool)
+        state_indices = torch.randperm(total_entries, dtype=torch.int32)[:batch]
+
+        out_ref_list = []
+        for i, x_s in enumerate(torch.split(x, seqlens_list, dim=1)):
+            idx = state_indices[i]
+            init = (
+                conv_states_ref[idx].unsqueeze(0).clone()
+                if has_initial_states[i]
+                else None
+            )
+            out_s, _ = causal_conv1d_ref(
+                x_s.unsqueeze(0),
+                weight,
+                bias,
+                initial_states=init,
+                return_final_states=True,
+                final_states_out=conv_states_ref[idx].unsqueeze(0),
+                activation=self.activation,
+            )
+            out_ref_list.append(out_s[0])
+        out_ref = torch.cat(out_ref_list, dim=-1)
+
+        out = causal_conv1d_fwd(
+            x,
+            packed_weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            state_indices,
+            has_initial_states,
+            self.activation in ["silu"],
+            PAD_SLOT_ID,
+            prepack,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(out_ref, out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(conv_states_ref, conv_states, atol=atol, rtol=rtol)
+
+    @parametrize(
         batch=[11],
         dim=[32, 64, 96],
         width=[4],
