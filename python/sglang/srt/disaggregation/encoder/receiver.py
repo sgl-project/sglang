@@ -2192,12 +2192,12 @@ class MMReceiverBase(ABC):
             self.registration_runner = _ReceiveRegistrationRunner(
                 f"encoder-receive-registration-{self.tp_rank}"
             )
-        if (
-            scheduler is not None
-            and self.encoder_transfer_backend == "nixl"
-            and self.tp_rank == 0
-            and get_disagg().disaggregation_mode != "decode"
-        ):
+        # In staged mode, only TP0 on P/PD receives and stages embeddings.
+        # Followers get the TP broadcast and decode rebuilds only the layout.
+        staged_receiver_rank = (
+            self.tp_rank == 0 and get_disagg().disaggregation_mode != "decode"
+        )
+        if self.encoder_transfer_backend == "nixl" and staged_receiver_rank:
             from sglang.srt.disaggregation.encoder.nixl import NixlReceiver
 
             self.nixl_receiver = NixlReceiver(
@@ -2264,7 +2264,15 @@ class MMReceiverBase(ABC):
             # Unlike mooncake, do NOT apply the default pool size: explicitly
             # set SGLANG_EMBEDDING_POOL_SIZE_MB=<MB> to bound received
             # embeddings on GPU; unset/0 keeps the unpooled CPU receive.
-            if envs.SGLANG_EMBEDDING_POOL_SIZE_MB.is_set() and scheduler is not None:
+            native_zmq = (
+                self.encoder_transfer_backend == "zmq_to_scheduler"
+                and not envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get()
+            )
+            if (
+                envs.SGLANG_EMBEDDING_POOL_SIZE_MB.is_set()
+                and scheduler is not None
+                and (staged_receiver_rank or native_zmq)
+            ):
                 pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
                 if pool_mb and pool_mb > 0:
                     try:
@@ -2663,6 +2671,7 @@ class MMReceiverBase(ABC):
                         )
                         transport_kwargs = {
                             **extra_kwargs,
+                            "embedding_pool": self.embedding_pool,
                             "staged_layout": mm,
                             "expected_identities": expected,
                         }

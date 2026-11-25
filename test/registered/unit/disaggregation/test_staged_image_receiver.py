@@ -79,8 +79,8 @@ def bridge(external=True):
     return rust
 
 
-def scheduler(context):
-    rx = receiver.MMReceiverHTTP.__new__(receiver.MMReceiverHTTP)
+def scheduler(context, cls=receiver.MMReceiverHTTP):
+    rx = cls.__new__(cls)
     rx.encoder_transfer_backend = "zmq_to_scheduler"
     rx.encode_urls = ["http://never-used"]
     rx.waiting_by_rid, rx.waiting_list = {}, []
@@ -194,6 +194,53 @@ async def staged_encoder(
 
 
 class TestStagedImageReceiver(unittest.TestCase):
+    def test_staged_device_pool_is_allocated_only_on_receiver_rank(self):
+        parallel = SimpleNamespace(tp_size=2, tp_rank=0, tp_group=None)
+        disagg = SimpleNamespace(encoder_transfer_backend="", disaggregation_mode="")
+        with (
+            patch.object(receiver, "get_parallel", return_value=parallel),
+            patch.object(receiver, "get_disagg", return_value=disagg),
+            patch.object(receiver, "get_serving", return_value=Mock(host="127.0.0.1")),
+            patch.object(
+                receiver, "get_device", return_value=Mock(device="cpu", gpu_id=0)
+            ),
+            patch.object(receiver, "get_local_ip_auto", return_value="127.0.0.1"),
+            patch.object(receiver, "_ReceiveRegistrationRunner"),
+            patch.object(
+                receiver, "get_zmq_socket_on_host", return_value=(12345, None)
+            ),
+            patch("sglang.srt.disaggregation.encoder.nixl.NixlReceiver"),
+            receiver.envs.SGLANG_EMBEDDING_POOL_SIZE_MB.override(8),
+        ):
+            for backend, staged in (
+                ("nixl", True),
+                ("zmq_to_scheduler", True),
+                ("zmq_to_scheduler", False),
+            ):
+                for role in ("null", "prefill", "decode"):
+                    for rank in range(parallel.tp_size):
+                        with (
+                            self.subTest(
+                                backend=backend, staged=staged, role=role, rank=rank
+                            ),
+                            receiver.envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(
+                                staged
+                            ),
+                        ):
+                            parallel.tp_rank = rank
+                            disagg.encoder_transfer_backend = backend
+                            disagg.disaggregation_mode = role
+                            rx = receiver.MMReceiverGrpc(
+                                Mock(), scheduler=Mock(), encode_urls=[]
+                            )
+                            pool = rx.embedding_pool
+                            if not staged or (role != "decode" and rank == 0):
+                                self.assertEqual(pool.buffer.nbytes, 8 * 1024 * 1024)
+                            else:
+                                self.assertIsNone(pool)
+                            rx.context.term()
+                            rx.scheduler_context.term()
+
     def test_public_handoff_authenticates_peer_instance_and_layout_before_admission(
         self,
     ):
@@ -731,7 +778,17 @@ class TestStagedImageReceiver(unittest.TestCase):
             prefill, decode = request("p-incarnation"), request("d-incarnation")
             with zmq.Context() as ctx, ctx.socket(zmq.PUSH) as sock:
                 sock.linger = 0
-                rx = scheduler(ctx)
+                # Exercise the optional device pool through the gRPC entry point.
+                # A CPU pool here preserves the production storage semantics.
+                use_pool = backend == "nixl-mock"
+                rx = scheduler(
+                    ctx,
+                    receiver.MMReceiverGrpc if use_pool else receiver.MMReceiverHTTP,
+                )
+                if use_pool:
+                    rx.embedding_pool = receiver.EmbeddingPool(
+                        device_type="cpu", gpu_id=0, size_bytes=4096
+                    )
                 if video_model:
                     rx.mm_processor.model_type = rx.model_type = video_model
                     rx.mm_processor._tokens_per_second = 4
@@ -867,6 +924,11 @@ class TestStagedImageReceiver(unittest.TestCase):
 
             self.assertEqual(prefill.input_ids, decode.input_ids)
             p, d = prefill.mm_inputs, decode.mm_inputs
+            if use_pool:
+                self.assertEqual(
+                    p.mm_items[0].precomputed_embeddings.untyped_storage().data_ptr(),
+                    rx.embedding_pool.base,
+                )
             torch.testing.assert_close(p.mrope_positions, d.mrope_positions)
             torch.testing.assert_close(p.mrope_position_delta, d.mrope_position_delta)
             self.assertEqual(
