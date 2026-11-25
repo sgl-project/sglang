@@ -48,6 +48,7 @@ def media_load_error(error_type, modality, data, error):
         (
             cls
             for cls in (
+                requests.exceptions.InvalidURL,
                 requests.HTTPError,
                 requests.ConnectionError,
                 requests.Timeout,
