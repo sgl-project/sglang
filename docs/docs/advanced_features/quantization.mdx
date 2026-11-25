@@ -845,6 +845,10 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
 
 For more detailed examples of quantization of models, as well as information about their support, see the [examples](https://gitcode.com/Ascend/msmodelslim/blob/master/example/README.md) section in ModelSLim repo.
 
+#### Using [AMD Quark](https://quark.docs.amd.com/) for Inkling-2-Mini
+
+Inkling-2-Mini checkpoints exported by AMD Quark with packed weights are served natively on MI355X; see the [Inkling-2-Mini cookbook](/cookbook/autoregressive/ThinkingMachines/Inkling-2-Mini#quark).
+
 ## Online Quantization
 
 To enable online quantization, you can simply specify `--quantization` in the command line. For example, you can launch the server with the following command to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`:
