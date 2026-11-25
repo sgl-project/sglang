@@ -4,6 +4,7 @@
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import PIL.Image
 import pytest
 import torch
@@ -79,6 +80,35 @@ class ImageVAE:
 
     def encode(self, image):
         return SimpleNamespace(sample=lambda generator=None: self.latent)
+
+
+@pytest.mark.parametrize("source_size", [(1920, 1080), (1080, 1920), (288, 192)])
+@pytest.mark.parametrize("tensor_input", [False, True], ids=["pil", "tensor"])
+def test_image_preprocessing_preserves_aspect_and_center_crops(
+    source_size, tensor_input
+):
+    src_w, src_h = source_size
+    height, width = 64, 96
+    pixels = np.full((src_h, src_w, 3), 128, dtype=np.uint8)
+    pixels[..., 0] = np.linspace(0, 255, src_w, dtype=np.uint8)[None, :]
+    pixels[..., 1] = np.linspace(0, 255, src_h, dtype=np.uint8)[:, None]
+    image = PIL.Image.fromarray(pixels)
+
+    # independent PIL oracle for the reference resize + center-crop geometry
+    scale = min(src_h / height, src_w / width)
+    new_h, new_w = int(src_h / scale), int(src_w / scale)
+    top, left = (new_h - height) // 2, (new_w - width) // 2
+    expected = image.resize((new_w, new_h), PIL.Image.Resampling.BILINEAR).crop(
+        (left, top, left + width, top + height)
+    )
+    expected = torch.from_numpy(np.array(expected)).permute(2, 0, 1).float() / 127.5 - 1
+    source = (
+        torch.from_numpy(pixels).permute(2, 0, 1).float() / 127.5 - 1
+        if tensor_input
+        else image
+    )
+    actual = Kandinsky6ImageEncodingStage._preprocess(source, height, width)
+    torch.testing.assert_close(actual, expected.unsqueeze(0), atol=2 / 255, rtol=0)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])

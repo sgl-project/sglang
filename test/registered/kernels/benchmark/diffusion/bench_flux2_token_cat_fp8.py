@@ -11,7 +11,7 @@ register_cuda_ci(
 
 
 @marker.parametrize("tokens", [512, 4096], [4096])
-@marker.benchmark("impl", ["cat_then_quant", "fused"], unit="us")
+@marker.benchmark("impl", ["cat_then_quant", "fused"], unit="us", gate=["fused"])
 def benchmark(tokens: int, impl: str):
     generator = torch.Generator(device="cuda")
     generator.manual_seed(20260831 + tokens)

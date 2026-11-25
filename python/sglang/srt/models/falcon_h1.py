@@ -31,6 +31,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -39,7 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -157,8 +159,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -167,8 +168,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.attn = RadixAttention(
@@ -351,6 +351,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 forward_batch=forward_batch,
                 mup_vector=self.mup_vector,
+                use_triton_causal_conv=forward_batch.forward_mode.is_target_verify(),
             )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 

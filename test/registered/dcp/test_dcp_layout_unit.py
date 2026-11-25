@@ -7,11 +7,15 @@ it is bit-identical to the legacy in-place formula that
 
     floor((len - rank - 1) / N) + 1   ==   len // N + (rank < len % N)   (len >= 0)
 
+Also pins the request-ordered prefix/extend rows that
+``all_gather_kv_cache_for_mha_extend`` returns after a simulated DCP all-gather.
+
 Usage:
     python -m pytest test_dcp_layout_unit.py -v
     python test_dcp_layout_unit.py
 """
 
+import itertools
 import math
 import unittest
 from types import SimpleNamespace
@@ -22,11 +26,14 @@ import torch
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
+from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp.layout import (
+    dsa_index_k_page_tokens,
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
-from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.linear import QKVParallelLinear, ReplicatedParallelGroup
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
@@ -43,11 +50,6 @@ STARTS = [0, 1, 2, 5, 7, 13, 31]
 def _owner_count(length: int, n: int, rank: int, start: int) -> int:
     """Ground truth: # of absolute positions p in [start, start+length) with p % n == rank."""
     return sum(1 for p in range(start, start + length) if p % n == rank)
-
-
-def _legacy_inplace_formula(length: int, n: int, rank: int) -> int:
-    """The pre-refactor update_local_kv_lens_for_dcp body (start == 0 case)."""
-    return (length - rank - 1) // n + 1
 
 
 class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
@@ -71,7 +73,7 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
     def _owner_rule(self, kv, dcp_size, dcp_rank):
         # Selection only: the filters leave ids WIDENED and the collapse now
-        # happens once, in KVIndexTranslator.translate_dcp_read_ids.
+        # happens once, in RunnerIds.translate_dcp_read_ids.
         return kv[kv % dcp_size == dcp_rank]
 
     def _run(self, starts, lens, dcp_size, dcp_rank, seed=0):
@@ -145,6 +147,118 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
             )
 
 
+def _expected_interleave(prefix_rows, extend_rows, prefix_lens, extend_lens):
+    """Request i's prefix rows, then its extend rows; padded extend rows dropped."""
+    out, p, e = [], 0, 0
+    for prefix_len, extend_len in zip(prefix_lens, extend_lens):
+        out += [prefix_rows[p : p + prefix_len], extend_rows[e : e + extend_len]]
+        p, e = p + prefix_len, e + extend_len
+    return torch.cat(out)
+
+
+class _GatherOnLastRankGroup:
+    """DCP group for ranks run in order 0..N-1; only the last rank's gather is complete."""
+
+    def __init__(self, world_size):
+        self.world_size = world_size
+        self.sent = []
+
+    def all_gather_into_tensor(self, out, inp):
+        self.sent.append(inp.clone())
+        if len(self.sent) == self.world_size:
+            out.copy_(torch.cat(self.sent))
+
+
+def _dcp_local_rows(prefix_lens, dcp_size, rank):
+    """Global prefix rows that `rank` stores: request positions p with p % dcp_size == rank."""
+    starts = itertools.accumulate(prefix_lens, initial=0)
+    rows = [
+        s + p for s, n in zip(starts, prefix_lens) for p in range(rank, n, dcp_size)
+    ]
+    return torch.tensor(rows, dtype=torch.int64)
+
+
+class TestAllGatherKvCacheForMhaExtend(CustomTestCase):
+    KV_LORA, ROPE = 4, 2
+
+    def test_rows_are_request_ordered_prefix_then_extend(self):
+        """After the DCP prefix all-gather, rows are request-ordered [prefix_i, extend_i];
+        trailing padded extend rows are dropped."""
+        cases = [
+            ([4, 0, 9], [2, 5, 1], 3),
+            ([0, 6, 0, 3], [1, 1, 4, 2], 0),
+        ]
+        for (prefix_lens, extend_lens, pad), dcp_size in itertools.product(
+            cases, (2, 4)
+        ):
+            num_prefix, num_extend = sum(prefix_lens), sum(extend_lens) + pad
+            # Distinct row values so any misplaced row shows up as a mismatch.
+            kv_buf = torch.arange(num_prefix * self.KV_LORA, dtype=torch.float32)
+            kv_buf = kv_buf.view(num_prefix, 1, self.KV_LORA)
+            pe_buf = -torch.arange(num_prefix * self.ROPE, dtype=torch.float32)
+            pe_buf = pe_buf.view(num_prefix, 1, self.ROPE) - 1
+            kv_a = 1000 + torch.arange(num_extend * self.KV_LORA, dtype=torch.float32)
+            kv_a = kv_a.view(num_extend, self.KV_LORA)
+            k_pe = -1000 - torch.arange(num_extend * self.ROPE, dtype=torch.float32)
+            k_pe = k_pe.view(num_extend, 1, self.ROPE)
+            layer_kv = SimpleNamespace(
+                read_mla=lambda _layer, loc, dst_dtype: (kv_buf[loc], pe_buf[loc])
+            )
+            pool = SimpleNamespace(
+                layer_router=SimpleNamespace(read=lambda _layer_id: layer_kv)
+            )
+            group = _GatherOnLastRankGroup(dcp_size)
+            for rank in range(dcp_size):
+                with rc.get_parallel().override(
+                    dcp_enabled=True,
+                    dcp_size=dcp_size,
+                    dcp_rank=rank,
+                    dcp_group=group,
+                ):
+                    got_kv_a, got_k_pe = all_gather_kv_cache_for_mha_extend(
+                        token_to_kv_pool=pool,
+                        attn_mqa=SimpleNamespace(layer_id=0),
+                        dcp_local_prefix_kv_indices=_dcp_local_rows(
+                            prefix_lens=prefix_lens, dcp_size=dcp_size, rank=rank
+                        ),
+                        extend_prefix_lens_cpu=prefix_lens,
+                        extend_seq_lens_cpu=extend_lens,
+                        kv_a=kv_a,
+                        k_pe=k_pe,
+                    )
+            # got_* now holds the last rank's output, the one built from the full gather.
+            want_kv_a = _expected_interleave(
+                prefix_rows=kv_buf.squeeze(1),
+                extend_rows=kv_a,
+                prefix_lens=prefix_lens,
+                extend_lens=extend_lens,
+            )
+            want_k_pe = _expected_interleave(
+                prefix_rows=pe_buf,
+                extend_rows=k_pe,
+                prefix_lens=prefix_lens,
+                extend_lens=extend_lens,
+            )
+            msg = f"{prefix_lens=} {extend_lens=} {pad=} {dcp_size=}"
+            self.assertTrue(torch.equal(got_kv_a, want_kv_a), msg)
+            self.assertTrue(torch.equal(got_k_pe, want_k_pe), msg)
+
+
+class TestDsaIndexKPageTokens(CustomTestCase):
+    def test_sharded_index_k_pages_span_the_dcp_group(self):
+        for dcp_size, shards_index_k, expected in (
+            (8, True, 512),
+            (8, False, 64),
+            (1, True, 64),
+        ):
+            with self.subTest(dcp_size=dcp_size, shards_index_k=shards_index_k):
+                with (
+                    patch.object(dcp_layout, "_dsa_shards_index_k", shards_index_k),
+                    rc.get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    self.assertEqual(dsa_index_k_page_tokens(64), expected)
+
+
 class TestGetDcpLens(CustomTestCase):
     def test_start_none_matches_owner_count(self):
         for n in DCP_SIZES:
@@ -157,21 +271,6 @@ class TestGetDcpLens(CustomTestCase):
                 self.assertTrue(
                     torch.equal(got.to(torch.int32), expected),
                     f"start=None mismatch at n={n}, rank={rank}: {got.tolist()} != {expected.tolist()}",
-                )
-
-    def test_start_none_matches_legacy_inplace_formula(self):
-        # The collapse claim: get_dcp_lens (start=None) == legacy floor((L-rank-1)/N)+1.
-        for n in DCP_SIZES:
-            for rank in range(n):
-                lens = torch.tensor(LENS, dtype=torch.int64)
-                got = get_dcp_lens(lens, n, rank)
-                legacy = torch.tensor(
-                    [_legacy_inplace_formula(L, n, rank) for L in LENS],
-                    dtype=torch.int64,
-                )
-                self.assertTrue(
-                    torch.equal(got.to(torch.int64), legacy),
-                    f"legacy-formula mismatch at n={n}, rank={rank}",
                 )
 
     def test_start_tensor_matches_owner_count(self):
@@ -218,9 +317,11 @@ class TestGetDcpLens(CustomTestCase):
             max_extend_len=1,
             qo_indptr=torch.tensor([0, 1], dtype=torch.int64),
         )
+        layer_kv = SimpleNamespace(
+            key=lambda: torch.empty(0), value=lambda: torch.empty(0)
+        )
         backend.token_to_kv_pool = SimpleNamespace(
-            get_key_buffer=lambda _layer_id: torch.empty(0),
-            get_value_buffer=lambda _layer_id: torch.empty(0),
+            layer_router=SimpleNamespace(read=lambda _layer_id: layer_kv)
         )
 
         kernel_q_shapes = []
@@ -272,8 +373,11 @@ class TestGetDcpLens(CustomTestCase):
         writes = []
         backend = TritonAttnBackend.__new__(TritonAttnBackend)
         backend.dcp_size, backend.dcp_rank = 2, 1
+        layer_kv = SimpleNamespace(
+            store=lambda *args, **kwargs: writes.append((args, kwargs))
+        )
         backend.token_to_kv_pool = SimpleNamespace(
-            set_kv_buffer=lambda *args, **kwargs: writes.append((args, kwargs))
+            layer_router=SimpleNamespace(layer=lambda _layer_id: layer_kv)
         )
         out_cache_loc = torch.tensor([8, 9, 10, 11, 12])
         forward_batch = SimpleNamespace(
@@ -284,7 +388,9 @@ class TestGetDcpLens(CustomTestCase):
         )
         k = torch.zeros(5, 1, 2)
 
-        backend._set_kv_buffer(forward_batch, SimpleNamespace(), None, k, k.clone())
+        backend._set_kv_buffer(
+            forward_batch, SimpleNamespace(layer_id=0), None, k, k.clone()
+        )
 
         ((args, kwargs),) = writes
         loc_info = args[1]
@@ -387,18 +493,39 @@ class TestGetDcpLens(CustomTestCase):
         v_weight = torch.arange(16, dtype=torch.float32).view(4, hidden_size) + 200
 
         for tp_rank in range(4):
-            layer = QKVParallelLinear(
-                hidden_size=hidden_size,
-                head_size=head_size,
-                total_num_heads=8,
-                total_num_kv_heads=2,
-                bias=False,
-                params_dtype=torch.float32,
-                tp_rank=tp_rank,
+            group = SimpleNamespace(rank_in_group=tp_rank, world_size=4)
+            with rc.get_parallel().override(
+                tp_group=group,
+                attn_tp_group=group,
                 tp_size=4,
-                kv_tp_rank=tp_rank // 2,
-                kv_tp_size=2,
-            )
+                tp_rank=tp_rank,
+                attn_tp_rank=tp_rank,
+                moe_tp_rank=tp_rank,
+                attn_dp_rank=0,
+                attn_cp_rank=0,
+                moe_dp_rank=0,
+                moe_ep_rank=0,
+                dcp_rank=tp_rank % 2,
+                **rc.derive_parallel_widths(
+                    tp_size=4,
+                    attn_cp_size=1,
+                    attn_dp_size=1,
+                    moe_ep_size=1,
+                    moe_dp_size=1,
+                    dcp_size=2,
+                    dcp_enabled=True,
+                ),
+            ):
+                layer = QKVParallelLinear(
+                    hidden_size=hidden_size,
+                    head_size=head_size,
+                    total_num_heads=8,
+                    total_num_kv_heads=2,
+                    bias=False,
+                    params_dtype=torch.float32,
+                    parallel_group="attn_tp",
+                    kv_parallel_group=ReplicatedParallelGroup("attn_tp", 2),
+                )
             layer.weight_loader(layer.weight, q_weight, "q")
             layer.weight_loader(layer.weight, k_weight, "k")
             layer.weight_loader(layer.weight, v_weight, "v")
@@ -442,6 +569,8 @@ class TestGetDcpLens(CustomTestCase):
                 kv_cache_dtype=torch.bfloat16,
                 device="cpu",
                 is_draft_worker=False,
+                kv_shard_size=1,
+                kv_shard_spec=None,
             )
             # The allocator widens from get_parallel(), not from the injected
             # server_args stand-in -- drive the cause, not the effect.
@@ -457,7 +586,7 @@ class TestGetDcpLens(CustomTestCase):
                         configurator,
                         sizes=sizes,
                         token_to_kv_pool=physical_kv_cache,
-                        is_dsv4_model=False,
+                        is_compressed_kv_model=False,
                         req_to_token_pool=object(),
                         token_to_kv_pool_allocator=None,
                     )

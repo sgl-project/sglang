@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -41,7 +42,7 @@ _CUDA_BLOCK_THREADS = 1024
 _HT_NON_REDUCTION_WARPS = 2
 _HT_REDUCTION_WARP_CHOICES = (1, 2, 4, 8)
 
-_SUPPORTED_TP_SIZES = (2, 4, 8, 16)
+SUPPORTED_TP_SIZES = (2, 4, 8, 16)
 
 
 def _ht_shard_split(
@@ -231,12 +232,27 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
             tp_size,
         )
 
+    ep_shape_tuning = (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        and (tp_size, hidden_size, top_k) == (8, 4096, 10)
+        and get_parallel().moe_ep_size > 1
+    )
+
+    def bt_preset(preset):
+        if not ep_shape_tuning:
+            return preset
+        return replace(preset, collective=replace(preset.collective, rms_threads=512))
+
     def routes(op):
         bounds, ll, bt, _ = shipped[op]
+        if op == "finalize" and ep_shape_tuning:
+            bounds = (*bounds[:2], 1024, *bounds[3:])
         return _routes(
             bounds,
             KernelTarget(protocol=ProtocolKind.LL, preset=ll),
-            tuple(KernelTarget(protocol=ProtocolKind.BT, preset=p) for p in bt),
+            tuple(
+                KernelTarget(protocol=ProtocolKind.BT, preset=bt_preset(p)) for p in bt
+            ),
             None
             if ht[op] is None
             else KernelTarget(protocol=ProtocolKind.HT, preset=ht[op]),
@@ -253,26 +269,35 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
     return MNNVLCuteDSLConfig(profiles=(profile,))
 
 
-def _config_for_shape(default_config, *, tp_size: int, hidden_size: int, top_k: int):
-    # MNNVLCuteDSLConfig.resolve matches (tp, hidden, top_k, dtype) exactly and
-    # DEFAULT_CONFIG ships GB300 H=8192/K=10 only, so other shapes need one.
-    for profile in default_config.profiles:
-        if profile.matches(
-            tp_size=tp_size,
-            hidden_size=hidden_size,
-            top_k=top_k,
-            dtype=torch.bfloat16,
-        ):
-            return default_config
+def _config_for_shape(
+    default_config,
+    *,
+    tp_size: int,
+    hidden_size: int,
+    top_k: int,
+    compute_capability: tuple[int, int],
+):
+    # The workspace resolves profiles by shape and device arch, so a profile
+    # FlashInfer ships only for another arch leaves this shape needing one.
+    profile = default_config.find(
+        tp_size=tp_size,
+        hidden_size=hidden_size,
+        top_k=top_k,
+        dtype=torch.bfloat16,
+        compute_capability=compute_capability,
+    )
+    if profile is not None:
+        return default_config
     logger.info(
-        "MNNVL CuTe DSL: no shipped profile for tp=%d hidden=%d top_k=%d; "
-        "re-targeting the GB300 presets at this shape. Their M crossovers were "
-        "measured at tp=8/16 hidden=8192 top_k=10, so benchmark against "
-        "--flashinfer-allreduce-fusion-backend mnnvl before deploying a shape "
-        "that matters.",
+        "MNNVL CuTe DSL: no shipped profile for tp=%d hidden=%d top_k=%d on "
+        "sm_%d%d; re-targeting the GB300 presets at this shape. Their M "
+        "crossovers were measured at tp=8/16 hidden=8192 top_k=10, so benchmark "
+        "against --flashinfer-allreduce-fusion-backend mnnvl before deploying a "
+        "shape that matters.",
         tp_size,
         hidden_size,
         top_k,
+        *compute_capability,
     )
     return _retargeted_config(tp_size, hidden_size, top_k)
 
@@ -320,6 +345,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         weight_bias: float,
         process_group: ProcessGroup,
         device: torch.device,
+        include_shared_expert: bool = True,
     ) -> None:
         if hidden_size <= 0 or top_k <= 0 or max_m <= 0:
             raise ValueError("hidden_size, top_k, and max_m must be positive")
@@ -334,9 +360,9 @@ class FlashInferMNNVLCuteDSLARFusion:
         self.process_group = process_group
         # Cached: supports() runs per layer and must not re-enter c10d.
         self.tp_size = dist.get_world_size(process_group)
-        if self.tp_size not in _SUPPORTED_TP_SIZES:
+        if self.tp_size not in SUPPORTED_TP_SIZES:
             raise ValueError(
-                f"MNNVL CuTe DSL fusion supports tp_size in {_SUPPORTED_TP_SIZES}, "
+                f"MNNVL CuTe DSL fusion supports tp_size in {SUPPORTED_TP_SIZES}, "
                 f"got {self.tp_size}"
             )
         self.device = torch.device(device)
@@ -372,10 +398,12 @@ class FlashInferMNNVLCuteDSLARFusion:
                 tp_size=self.tp_size,
                 hidden_size=self.hidden_size,
                 top_k=self.top_k,
+                compute_capability=torch.cuda.get_device_capability(self.device),
             )
-            if get_spec().speculative_algorithm is None:
+            self.workspace_config = shaped_config
+            if include_shared_expert and get_spec().speculative_algorithm is None:
                 self.workspace_config = _with_early_finalize_shared_load(shaped_config)
-            else:
+            elif include_shared_expert:
                 # Early shared load is safe only for a single looping decode graph;
                 # alternating draft/verify replays can read an unfinished buffer.
                 logger.info(
@@ -383,7 +411,6 @@ class FlashInferMNNVLCuteDSLARFusion:
                     "CuTe DSL finalize presets on the safe (non-early-load) "
                     "ordering."
                 )
-                self.workspace_config = shaped_config
             self.workspace = workspace_type(
                 tp_size=self.tp_size,
                 tp_rank=dist.get_rank(process_group),
@@ -395,7 +422,7 @@ class FlashInferMNNVLCuteDSLARFusion:
                 rms_eps=self.rms_epsilon,
                 routed_scaling_factor=1.0,
                 weight_bias=self.weight_bias,
-                include_shared_expert=True,
+                include_shared_expert=include_shared_expert,
                 add_residual=True,
                 write_residual_output=True,
                 config=self.workspace_config,
@@ -422,7 +449,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         routed_output: torch.Tensor,
         expert_weights: torch.Tensor,
         permuted_indices: torch.Tensor,
-        gated_shared_output: torch.Tensor,
+        gated_shared_output: torch.Tensor | None,
         residual: torch.Tensor,
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -491,6 +518,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     max_m: int,
     rms_epsilon: float,
     weight_bias: float,
+    include_shared_expert: bool = True,
 ) -> FlashInferMNNVLCuteDSLARFusion:
     """Build the process-local workspace. Must run before graph capture."""
     global _WORKSPACE
@@ -518,5 +546,6 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
         weight_bias=weight_bias,
         process_group=get_parallel().tp_group.device_group,
         device=torch.device("cuda", torch.cuda.current_device()),
+        include_shared_expert=include_shared_expert,
     )
     return _WORKSPACE

@@ -383,10 +383,6 @@ class SubBlockSparseAttentionBackend(AttentionBackend):
         return SubBlockSparseAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type[SubBlockSparseAttentionMetadata]:
-        return SubBlockSparseAttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type[SubBlockSparseAttentionMetadataBuilder]:
         return SubBlockSparseAttentionMetadataBuilder
 
@@ -397,14 +393,6 @@ class SubBlockSparseAttentionMetadata(AttentionMetadata):
 
 
 class SubBlockSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
-    # The base class declares __init__ abstract, so a builder that does not
-    # override it cannot be instantiated at all.
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(  # type: ignore[override]
         self, current_timestep: int, **kwargs: dict[str, Any]
     ) -> SubBlockSparseAttentionMetadata:

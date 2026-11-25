@@ -48,9 +48,7 @@ class RMSNorm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(dim, 1, 1, 1))
 
     def forward(self, x: Tensor) -> Tensor:
-        # Upcast to float32 around the normalize (matches the Diffusers reference's
-        # Kandinsky6SRLatentUpscalerRMSNorm): without it, bf16 activations drift from the
-        # reference across the many ResidualBlock/X2Branch calls that route through this norm.
+        # preserve the reference's fp32 reduction followed by bf16 scale/gain
         normalized = F.normalize(x.float(), dim=1).to(x.dtype)
         return normalized * self.scale * self.gamma
 
@@ -96,31 +94,8 @@ class ResidualBlock(nn.Module):
         return self.shortcut(x) + h
 
 
-def nearest_2x(x: Tensor) -> Tensor:
-    """Nearest-neighbour 2x resize of H and W of ``[B, C, T, H, W]`` (T folded into the batch)."""
-    b, c, t, h, w = x.shape
-    x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-    x = F.interpolate(x, scale_factor=2, mode="nearest")
-    return x.reshape(b, t, c, 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
-
-
-class PXSUpsample(nn.Module):
-    """2x spatial upsample ``linear(up + spatial_conv(up))`` with ``up = nearest_2x(x)``."""
-
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.spatial_conv = nn.Conv3d(
-            channels, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1)
-        )
-        self.linear = nn.Conv3d(channels, channels, kernel_size=1)
-
-    def forward(self, x: Tensor) -> Tensor:
-        up = nearest_2x(x)
-        return self.linear(up + self.spatial_conv(up))
-
-
 class X2Finisher(nn.Module):
-    """The ``PXSUpsample`` conv pair applied on the unchanged grid (no resize)."""
+    """Residual spatial convolution and channel projection, without resizing."""
 
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -133,17 +108,19 @@ class X2Finisher(nn.Module):
         return self.linear(x + self.spatial_conv(x))
 
 
+class PXSUpsample(X2Finisher):
+    """Apply the same projection after nearest-neighbor 2x spatial resizing."""
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, c, t, h, w = x.shape
+        x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
+        x = x.reshape(b, t, c, 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
+        return super().forward(x)
+
+
 def _stem(in_channels: int, out_channels: int) -> nn.Sequential:
     return nn.Sequential(ReplicateTimeConv3d(in_channels, out_channels, kernel_size=3))
-
-
-def _mid_output_head(channels: int, out_channels: int) -> nn.Sequential:
-    """Unused training head whose checkpoint layout remains positional."""
-    return nn.Sequential(
-        RMSNorm(channels),
-        nn.SiLU(),
-        ReplicateTimeConv3d(channels, out_channels, kernel_size=3),
-    )
 
 
 class Kandinsky6SRLatentUpscalerOutputHead(nn.Module):
@@ -182,18 +159,6 @@ def _run_blocks(blocks: nn.Sequential, x: Tensor, zq: Tensor) -> Tensor:
     return x
 
 
-def _second_stage(
-    upsample: nn.Module,
-    blocks: nn.Sequential,
-    head: Kandinsky6SRLatentUpscalerOutputHead,
-    x: Tensor,
-    zq: Tensor,
-) -> Tensor:
-    """``upsample -> blocks -> head``, with the head's first (norm) layer conditioned on ``zq``."""
-    x = _run_blocks(blocks, upsample(x), zq)
-    return head(x, zq)
-
-
 class X2Branch(nn.Module):
     """Weights exclusive to the x2 path."""
 
@@ -213,7 +178,8 @@ class X2Branch(nn.Module):
         x = _run_blocks(self.adapter, x, zq)
         x = self.finisher(x)
         x = _run_blocks(self.mid_blocks, x, zq)
-        return _second_stage(self.upsample, self.blocks, self.output_proj, x, zq)
+        x = _run_blocks(self.blocks, self.upsample(x), zq)
+        return self.output_proj(x, zq)
 
 
 class Kandinsky6SRLatentUpscaler(nn.Module):
@@ -227,7 +193,9 @@ class Kandinsky6SRLatentUpscaler(nn.Module):
         er = config.expand_ratio
         self.input_proj = _stem(c, w1)
         # The 2x deep-supervision head of training: part of the checkpoint, never run at inference.
-        self.mid_output_head = _mid_output_head(w2, c)
+        self.mid_output_head = nn.Sequential(
+            RMSNorm(w2), nn.SiLU(), ReplicateTimeConv3d(w2, c, kernel_size=3)
+        )
         self.output_proj = Kandinsky6SRLatentUpscalerOutputHead(w3, c, zq_dim=c)
         self.upsample_1 = PXSUpsample(w1)
         self.upsample_2 = PXSUpsample(w2)
@@ -254,7 +222,8 @@ class Kandinsky6SRLatentUpscaler(nn.Module):
             )
         x = _run_blocks(self.pre_blocks, self.input_proj(z), zq)
         x = _run_blocks(self.mid_blocks, self.upsample_1(x), zq)
-        return _second_stage(self.upsample_2, self.post_blocks, self.output_proj, x, zq)
+        x = _run_blocks(self.post_blocks, self.upsample_2(x), zq)
+        return self.output_proj(x, zq)
 
 
 class Kandinsky6SRLatentUpscalerBank(nn.Module, LayerwiseOffloadableModuleMixin):

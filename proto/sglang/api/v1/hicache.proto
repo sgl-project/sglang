@@ -1,0 +1,42 @@
+// HiCache storage management APIs shared by HTTP JSON and gRPC.
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/json/v1/options.proto";
+
+message GetHiCacheStorageRequest {}
+
+message AttachHiCacheStorageRequest {
+  // Required and non-null in the Python HTTP API; handlers validate presence.
+  // An empty string is passed through for scheduler-side backend validation.
+  optional string hicache_storage_backend = 1;
+  optional string hicache_storage_backend_extra_config_json = 2;
+  optional string hicache_storage_prefetch_policy = 3;
+  optional string hicache_write_policy = 4;
+}
+
+message DetachHiCacheStorageRequest {}
+
+message ClearHiCacheStorageRequest {}
+
+message HiCacheStatus {
+  optional string hicache_storage_backend = 1 [
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+  optional string hicache_storage_backend_extra_config = 2 [
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+  optional string hicache_storage_prefetch_policy = 3 [
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+  optional string hicache_write_policy = 4 [
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+}
+
+// Result shared by the HTTP and gRPC management APIs.
+message HiCacheStorageResponse {
+  bool success = 1;
+  string message = 2;
+}

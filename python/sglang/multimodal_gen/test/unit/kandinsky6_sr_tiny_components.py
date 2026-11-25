@@ -3,6 +3,7 @@
 
 import copy
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,6 +22,7 @@ from sglang.multimodal_gen.configs.sample.kandinsky6_sr import (
     Kandinsky6SRSamplingParams,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.kandinsky6_sr import (
     Kandinsky6SRTransformer3DModel,
 )
@@ -37,29 +39,30 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.sampling import (
     DitSpec,
     SamplingSpec,
+    denoise_chunks,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled import (
     LatentUpscaleFn,
     decode_chunks,
-    denoise_chunks,
+    encode_pixel_tile,
     encode_video_to_lr_latent,
     plan_tiles,
-    prepare_lu_tile_latents,
-    prepare_pixel_tile_latents,
+    prepare_tile_latents,
     stitch_tiles,
+    upscale_lr_latent_tile,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiling import (
     RESOLUTIONS,
     VAE_SPATIAL_FACTOR,
 )
 
-# Flat (legacy) transformer config with a pi-Flow DX head: 3 grids of 4 channels.
+# official transformer layout: total output width, scheduler configured separately
 TINY_DIT = dict(
     in_visual_dim=4,
     in_text_dim=8,
     in_text_dim2=8,
     time_dim=16,
-    out_visual_dim=4,
+    out_visual_dim=12,
     patch_size=[1, 2, 2],
     model_dim=32,
     ff_dim=64,
@@ -69,15 +72,16 @@ TINY_DIT = dict(
     visual_cond=False,
     instruct_type="noise",
     use_text=False,
+    attribute_overrides=None,
+    sr_params=dict(visual_size=[512], scale_factor={"512": [1.0, 1.0, 1.0]}),
+)
+TINY_PIFLOW = dict(
     n_grid=3,
-    piflow_nfe=2,
-    piflow_num_policy_substeps=8,
-    piflow_final_step_size_scale=0.5,
-    piflow_shift=5.0,
-    piflow_eps=1e-6,
-    attribute_overrides={"instruct_type": "noise"},
-    sr_visual_size=[512],
-    sr_scale_factor={"512": [1.0, 1.0, 1.0]},
+    nfe=2,
+    num_policy_substeps=8,
+    final_step_size_scale=0.5,
+    shift=5.0,
+    eps=1e-6,
 )
 TINY_KVAE = dict(
     ch=8,
@@ -211,9 +215,7 @@ def super_resolve(
 ) -> torch.Tensor:
     """Tiled SR of a ``[T, C, H, W]`` uint8 video -> uint8 ``[3, T, H*s, W*s]``.
 
-    ``upscale_fn`` selects the LU path; without it the pixel path runs. ``scheduler`` is the
-    already-resolved effective scheduler (``run_spec.effective_scheduler``) -- a real loaded
-    component, or one synthesized from ``spec.piflow`` / ``spec.scheduler_scale`` when none fits.
+    ``upscale_fn`` selects the LU path; without it the pixel path runs.
     """
     device = torch.device(device)
     common = dict(
@@ -230,30 +232,43 @@ def super_resolve(
             lr_latent.shape[-1] * spatial_factor,
         )
         plan = plan_tiles(frame_hw=frame_hw, **common)
-        chunks = prepare_lu_tile_latents(
-            lr_latent,
-            plan,
+        source = lr_latent
+        tile_encoder = partial(
+            upscale_lr_latent_tile,
             upscale_fn=upscale_fn,
             lu_dtype=lu_dtype,
             scaling_factor=scaling_factor,
-            dit_spec=dit_spec,
-            spec=spec,
             device=device,
-            spatial_factor=spatial_factor,
         )
     else:
         plan = plan_tiles(frame_hw=tuple(video.shape[-2:]), **common)
-        chunks = prepare_pixel_tile_latents(
-            video,
-            plan,
+        source = video
+        tile_encoder = partial(
+            encode_pixel_tile,
             vae=vae,
             scaling_factor=scaling_factor,
-            dit_spec=dit_spec,
-            spec=spec,
             device=device,
         )
+    chunks = prepare_tile_latents(
+        source,
+        plan,
+        tile_encoder=tile_encoder,
+        latent_path=upscale_fn is not None,
+        dit_spec=dit_spec,
+        spec=spec,
+        device=device,
+        spatial_factor=spatial_factor,
+    )
     denoised = denoise_chunks(
-        chunks, dit, scheduler, dit_spec=dit_spec, spec=spec, device=device
+        chunks,
+        dit,
+        scheduler,
+        dit_spec=dit_spec,
+        spec=spec,
+        device=device,
+        step_context=lambda step: set_forward_context(
+            current_timestep=step, attn_metadata=None
+        ),
     )
     tiles = decode_chunks(denoised, vae, scaling_factor=scaling_factor, device=device)
     return stitch_tiles(tiles, plan)

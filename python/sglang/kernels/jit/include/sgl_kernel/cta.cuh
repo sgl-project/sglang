@@ -11,6 +11,33 @@ namespace sglang {
 namespace device::cta {
 
 /**
+ * \brief Compute the sum of `value` across all threads in a fixed-size CTA.
+ *
+ * Uses a two-level reduction: first within each warp via `warp::reduce_sum`,
+ * then one warp-wide reduction over the per-warp partials. The result is
+ * returned by every thread without a trailing `__syncthreads()`.
+ *
+ * \tparam kNumThreads Threads in the CTA; must be a multiple of the warp size.
+ * \tparam T Numeric type supported by `warp::reduce_sum`.
+ * \param value Per-thread input value.
+ * \param smem Shared-memory buffer with at least `kNumThreads / 32` elements.
+ */
+template <int kNumThreads, typename T>
+SGL_DEVICE T reduce_sum(T value, T* smem) {
+  static_assert(kNumThreads % kWarpThreads == 0);
+  constexpr auto kNumWarps = kNumThreads / kWarpThreads;
+  value = warp::reduce_sum(value);
+  if constexpr (kNumWarps == 1) {
+    return value;
+  } else {
+    const auto lane = threadIdx.x % kWarpThreads;
+    if (lane == 0) smem[threadIdx.x / kWarpThreads] = value;
+    __syncthreads();
+    return warp::reduce_sum(lane < kNumWarps ? smem[lane] : T{0});
+  }
+}
+
+/**
  * \brief Compute the maximum of `value` across all threads in the CTA.
  *
  * Uses a two-level reduction: first within each warp via `warp::reduce_max`,

@@ -55,11 +55,12 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.ops.diffusion.common.numerics import (
+from sglang.kernels.numerics import (
     mul_rn_f32,
     round_bf16_to_fp32,
     rsqrt_approx_f32,
 )
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -164,6 +165,32 @@ def _is_row_broadcast(t: torch.Tensor, shape: tuple, device: torch.device) -> bo
     )
 
 
+def can_use_fused_rmsnorm_modulation(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+) -> bool:
+    """Whether this kernel can serve ``x`` with this ``scale``/``shift``.
+
+    The launcher raises on everything it cannot serve, which is the right
+    answer for a caller that has already committed. A request-gated caller has
+    not: a fast path that meets an input it cannot handle has to fall back,
+    not fail the request. So it asks here first, and this mirrors exactly what
+    :func:`_validate_rmsnorm_modulate` checks about ``x`` and the modulation
+    rows -- a dtype-and-width check alone leaves the layout of ``scale`` and
+    ``shift`` to chance.
+    """
+    if not (
+        can_use_fused_rmsnorm_scale_shift(x.dtype, x.shape[-1])
+        and x.is_cuda
+        and x.ndim == 3
+        and x.is_contiguous()
+    ):
+        return False
+    row_shape = (x.shape[0], 1, x.shape[-1])
+    return _is_row_broadcast(scale, row_shape, x.device) and _is_row_broadcast(
+        shift, row_shape, x.device
+    )
+
+
 def can_use_fused_rmsnorm_scale_shift(dtype: torch.dtype, hidden: int) -> bool:
     """Select the BF16 FlashInfer reduction replicated by this kernel."""
     return (
@@ -223,6 +250,7 @@ def _fake_norm_scale_shift(
     mutates_args=[],
     fake_impl=_fake_norm_scale_shift,
 )
+@replay_launches
 def fused_rmsnorm_scale_shift_bitexact(
     x: torch.Tensor,
     weight: torch.Tensor,

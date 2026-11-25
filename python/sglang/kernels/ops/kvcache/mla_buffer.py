@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.kvcache.paged_rows import paged_layout, paged_row_offset
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -26,6 +27,9 @@ def set_mla_kv_buffer_kernel(
     DCP_RANK: tl.constexpr,
     DCP_WORLD_SIZE: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    # A paged buffer (`paged_layout`): buffer_stride is then its row stride.
+    PAGE_SIZE: tl.constexpr = 1,
+    PAGE_STRIDE: tl.constexpr = 0,
 ):
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
@@ -42,7 +46,11 @@ def set_mla_kv_buffer_kernel(
     is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
     safe_loc = tl.where(is_valid, loc, 0)
     safe_loc = safe_loc // DCP_WORLD_SIZE
-    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
+    dst_ptr = (
+        kv_buffer_ptr
+        + paged_row_offset(safe_loc, PAGE_STRIDE, buffer_stride, PAGE_SIZE)
+        + offs
+    )
 
     # Three-way branch to handle boundary correctly while preserving fast path
     if base + BLOCK <= nope_dim:
@@ -88,11 +96,14 @@ def set_mla_kv_buffer_kernel_norope(
     kv_buffer_ptr,
     cache_k_nope_ptr,
     loc_ptr,
+    reserved_skip_index,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    PAGE_SIZE: tl.constexpr = 1,
+    PAGE_STRIDE: tl.constexpr = 0,
 ):
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
@@ -105,16 +116,74 @@ def set_mla_kv_buffer_kernel_norope(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    is_valid = loc != reserved_skip_index
+    safe_loc = tl.where(is_valid, loc, 0)
+    dst_ptr = (
+        kv_buffer_ptr
+        + paged_row_offset(safe_loc, PAGE_STRIDE, buffer_stride, PAGE_SIZE)
+        + offs
+    )
 
     src = tl.load(
         cache_k_nope_ptr + pid_loc * nope_stride + offs,
         mask=mask,
     )
-    tl.store(dst_ptr, src, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
+
+
+def set_mla_kv_buffer_naive(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: Optional[torch.Tensor],
+    *,
+    reserved_skip_index: int,
+    dcp_world_size: int,
+    dcp_rank: int,
+) -> None:
+    """Torch-native scatter for platforms that cannot launch Triton.
+
+    Mirrors ``set_mla_kv_buffer_kernel``: rows land at
+    ``kv_buffer[loc // dcp_world_size]`` as nope then rope, a loc equal to
+    ``reserved_skip_index`` is dropped, and under DCP a rank keeps only the
+    locs it owns. Duplicate locs race here exactly as they do in the kernel.
+    """
+    # view, not reshape: the destination must alias kv_buffer, and a layout
+    # reshape would have to copy is one this write cannot serve. The sources
+    # are read-only, so a copy there is harmless.
+    paged = paged_layout(kv_buffer)
+    page_size = 1 if paged is None else paged[0]
+    if paged is None:
+        rows = kv_buffer.view(kv_buffer.shape[0], -1)
+    else:
+        assert dcp_world_size == 1, "a paged buffer holds rank-local rows"
+        rows = kv_buffer[:, :, 0, :]
+    nope = cache_k_nope.reshape(cache_k_nope.shape[0], -1)
+    nope_dim = nope.shape[-1]
+    has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
+
+    loc = loc.to(torch.int64)
+    is_valid = loc != reserved_skip_index
+    if dcp_world_size > 1:
+        is_valid &= loc % dcp_world_size == dcp_rank
+    dst = loc[is_valid] // dcp_world_size
+    at = dst if page_size == 1 else (dst // page_size, dst % page_size)
+
+    nope_rows = nope[is_valid]
+    if page_size == 1:
+        rows[dst, :nope_dim] = nope_rows
+    else:
+        rows[at[0], at[1], :nope_dim] = nope_rows
+    if has_rope:
+        rope = cache_k_rope.reshape(cache_k_rope.shape[0], -1)[is_valid]
+        span = slice(nope_dim, nope_dim + rope.shape[-1])
+        if page_size == 1:
+            rows[dst, span] = rope
+        else:
+            rows[at[0], at[1], span] = rope
 
 
 def _set_mla_kv_buffer_impl(
@@ -139,6 +208,8 @@ def _set_mla_kv_buffer_impl(
     - Otherwise: Triton kernel with ``BLOCK = next_pow2(nope_dim + rope_dim)``,
       i.e. one CTA per loc covering the entire row in one tile. This is the
       path for SM<90 and for shapes that violate the TMA 16-byte alignment.
+    - Platforms declaring ``capabilities.supports_triton=False``: the
+      torch-native scatter, which no device-specific kernel backs.
 
     Speedup vs the legacy BLOCK=128 Triton kernel on GB300 (BF16, nope=512,
     rope=64): ~1.05x at bs=8, ~1.5x at bs=128, 3.5x at bs=512, **11.7x at
@@ -153,9 +224,33 @@ def _set_mla_kv_buffer_impl(
     Shared body of the two entry points below; the owner rule reaches it as
     ``1, 0`` (nothing to select) or as the live topology.
     """
+    # Imported here, not at module scope: `current_platform` is a lazy module
+    # attribute, so a top-level `from ... import` resolves the platform during
+    # this module's import.
+    from sglang.srt.platforms import current_platform
+
+    if not current_platform.capabilities.supports_triton:
+        set_mla_kv_buffer_naive(
+            kv_buffer,
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            reserved_skip_index=reserved_skip_index,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+        )
+        return
+
     has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
     n_loc = loc.numel()
     nope_dim = cache_k_nope.shape[-1]
+    paged = paged_layout(kv_buffer)
+    if paged is None:
+        page_size, page_stride, row_stride = 1, 0, kv_buffer.stride(0)
+    else:
+        assert dcp_world_size == 1, "a paged buffer holds rank-local rows"
+        page_size, page_stride, row_stride = paged
+    page_kwargs = {"PAGE_SIZE": page_size, "PAGE_STRIDE": page_stride}
 
     if not has_rope:
         BLOCK = triton.next_power_of_2(nope_dim)
@@ -167,10 +262,12 @@ def _set_mla_kv_buffer_impl(
             kv_buffer,
             cache_k_nope,
             loc,
-            kv_buffer.stride(0),
+            reserved_skip_index,
+            row_stride,
             cache_k_nope.stride(0),
             nope_dim,
             BLOCK=BLOCK,
+            **page_kwargs,
             **pdl_kwargs,
         )
         return
@@ -214,7 +311,7 @@ def _set_mla_kv_buffer_impl(
         cache_k_rope,
         loc,
         reserved_skip_index,
-        kv_buffer.stride(0),
+        row_stride,
         cache_k_nope.stride(0),
         cache_k_rope.stride(0),
         nope_dim,
@@ -222,6 +319,7 @@ def _set_mla_kv_buffer_impl(
         BLOCK=BLOCK,
         DCP_RANK=dcp_rank,
         DCP_WORLD_SIZE=dcp_world_size,
+        **page_kwargs,
         **pdl_kwargs,
     )
 
@@ -268,6 +366,38 @@ def set_mla_kv_buffer_dcp_sharded_triton(
     )
 
 
+def set_mla_kv_buffer_cast_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    dcp_world_size: int,
+    dcp_rank: int,
+    reserved_skip_index: int = 0,
+):
+    """Scatter bf16 rows into a lower-precision buffer (raw fp8), casting on
+    store: one kernel instead of a cast per input plus the copy."""
+    nope_dim, rope_dim = cache_k_nope.shape[-1], cache_k_rope.shape[-1]
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    set_mla_kv_buffer_kernel[(loc.numel(), 1)](
+        kv_buffer,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        reserved_skip_index,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+        BLOCK=triton.next_power_of_2(nope_dim + rope_dim),
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
+        **pdl_kwargs,
+    )
+
+
 @triton.jit
 def set_mla_kv_buffer_fp8_quant_kernel(
     kv_buffer_fp8_ptr,
@@ -281,6 +411,8 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    DCP_RANK: tl.constexpr = 0,
+    DCP_WORLD_SIZE: tl.constexpr = 1,
     USE_GDC: tl.constexpr = False,
 ):
     """Fuse BF16/FP16->FP8 cast with paged KV write."""
@@ -296,8 +428,9 @@ def set_mla_kv_buffer_fp8_quant_kernel(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    is_valid = loc != reserved_skip_index
+    is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
     safe_loc = tl.where(is_valid, loc, 0)
+    safe_loc = safe_loc // DCP_WORLD_SIZE
     dst_ptr = kv_buffer_fp8_ptr + safe_loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
@@ -342,10 +475,14 @@ def set_mla_kv_buffer_triton_fp8_quant(
     fp8_dtype: torch.dtype,
     *,
     reserved_skip_index: int = 0,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
 ):
     """Fuse BF16/FP16 MLA K quantization with paged KV write.
 
     Writes targeting ``reserved_skip_index`` are skipped. Pass -1 to disable.
+    With ``dcp_world_size > 1`` the locs are DCP-widened: only this rank's slots
+    are written, at row ``loc // dcp_world_size``.
     """
     kv_buffer_fp8 = kv_buffer.view(fp8_dtype)
 
@@ -370,6 +507,8 @@ def set_mla_kv_buffer_triton_fp8_quant(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
         **pdl_kwargs,
     )
 

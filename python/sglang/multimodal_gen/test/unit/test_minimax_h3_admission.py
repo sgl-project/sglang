@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,7 +14,10 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+    MiniMaxH3SamplingParams,
+    PikaH3FlexSamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
@@ -27,6 +31,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     RESIDENT,
 )
+from sglang.multimodal_gen.runtime.pipelines import minimax_h3_pipeline
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
@@ -34,6 +39,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+    prequeue,
+    reference_encoding,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -248,7 +257,7 @@ def test_hybrid_override_loads_ref_config_and_admits_all_native_tasks(weights):
     stage = MiniMaxH3PartitionAdmissionStage(pipeline.release_metadata)
     for task in ("t2va", "fl2va", "ref2va"):
         batch = SimpleNamespace(
-            sampling_params=SimpleNamespace(task=task, quality="lossless"),
+            sampling_params=SimpleNamespace(task=task, quality="exact"),
             num_inference_steps=50,
         )
         assert (
@@ -257,6 +266,220 @@ def test_hybrid_override_loads_ref_config_and_admits_all_native_tasks(weights):
         )
     with pytest.raises(ValueError):
         pipeline.release_metadata.canonical_task("unknown")
+
+
+def _write_partition(root, subfolder, partition, tasks, **contract):
+    os.makedirs(os.path.join(root, subfolder, "pika"))
+    os.makedirs(os.path.join(root, subfolder, "transformer"))
+    open(os.path.join(root, subfolder, "pika", "adapter.safetensors"), "w").close()
+    model_index = {
+        "_class_name": "PikaH3FlexPipeline",
+        "_diffusers_version": "0.32.2",
+        "transformer": ["diffusers", "MiniMaxH3DiTModel"],
+        "_minimax_h3": {
+            "schema_version": 1,
+            "partition": partition,
+            "tasks": tasks,
+            "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            "dmd_denoising_steps": [1000, 750, 500, 250, 100, 40],
+            "stochastic_sampling": True,
+            "lora_adapter": "pika/adapter.safetensors",
+            **contract,
+        },
+    }
+    with open(os.path.join(root, subfolder, "model_index.json"), "w") as f:
+        json.dump(model_index, f)
+    return model_index
+
+
+def _dual_pipeline(root):
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    pipeline.server_args = SimpleNamespace(
+        model_variant="fl2va+ref2va",
+        model_subfolder=None,
+        component_weights_paths={},
+        transformer_weights_path=None,
+        component_paths={},
+        lora_path=None,
+        model_path=root,
+        revision=None,
+    )
+    pipeline.model_path = os.path.join(root, "FL2VA")
+    pipeline._required_config_modules = ["text_encoder", "transformer"]
+    pipeline.dual_variant_lora_adapters = []
+    return pipeline
+
+
+def test_dual_variant_loads_the_ref2va_transformer_and_admits_both(tmp_path):
+    root = str(tmp_path)
+    model_index = _write_partition(root, "FL2VA", "fl2va", ["t2va", "fl2va"])
+    _write_partition(root, "Ref2VA", "ref2va", ["ref2va"])
+    pipeline = _dual_pipeline(root)
+    with (
+        patch.object(ComposedPipelineBase, "_load_config", return_value=model_index),
+        patch.object(minimax_h3_pipeline, "maybe_download_model") as download,
+    ):
+        pipeline._load_config()
+
+    # both partitions are on disk: nothing is downloaded
+    download.assert_not_called()
+    # the shared components come from FL2VA, the second transformer from Ref2VA
+    assert pipeline.server_args.model_subfolder == "FL2VA"
+    assert pipeline.required_config_modules == [
+        "text_encoder",
+        "transformer",
+        "transformer_2",
+    ]
+    assert model_index["transformer_2"] == model_index["transformer"]
+    assert pipeline.server_args.component_paths == {
+        "transformer_2": os.path.join(root, "Ref2VA", "transformer")
+    }
+    # each transformer merges its own adapter; none applies to both
+    assert pipeline.server_args.lora_path is None
+    assert pipeline.dual_variant_lora_adapters == [
+        ("fl2va", "transformer", os.path.join(root, "FL2VA/pika/adapter.safetensors")),
+        (
+            "ref2va",
+            "transformer_2",
+            os.path.join(root, "Ref2VA/pika/adapter.safetensors"),
+        ),
+    ]
+    stage = MiniMaxH3PartitionAdmissionStage(pipeline.release_metadata)
+    for task in ("t2va", "fl2va", "ref2va"):
+        batch = SimpleNamespace(
+            sampling_params=SimpleNamespace(task=task, quality="exact"),
+            num_inference_steps=6,
+        )
+        assert (
+            stage.forward(batch, SimpleNamespace(minimax_h3_adaln_online=False))
+            is batch
+        )
+    with pytest.raises(ValueError):
+        pipeline.release_metadata.canonical_task("t2i")
+
+
+def test_dual_variant_downloads_the_ref2va_partition_from_the_hub(tmp_path):
+    root = str(tmp_path)
+    model_index = _write_partition(root, "FL2VA", "fl2va", ["t2va", "fl2va"])
+    pipeline = _dual_pipeline(root)
+    # the base loader fetched FL2VA/** of the Hub repository into root
+    pipeline.server_args.model_path = "MiniMaxAI/MiniMax-H3"
+    pipeline.server_args.revision = "main"
+
+    def download(model_id, **kwargs):
+        _write_partition(root, "Ref2VA", "ref2va", ["ref2va"])
+        return root
+
+    with (
+        patch.object(ComposedPipelineBase, "_load_config", return_value=model_index),
+        patch.object(
+            minimax_h3_pipeline, "maybe_download_model", side_effect=download
+        ) as fetch,
+    ):
+        pipeline._load_config()
+
+    fetch.assert_called_once_with(
+        "MiniMaxAI/MiniMax-H3",
+        allow_patterns=["Ref2VA/**"],
+        revision="main",
+        model_subfolder="Ref2VA",
+    )
+    assert pipeline.server_args.component_paths == {
+        "transformer_2": os.path.join(root, "Ref2VA", "transformer")
+    }
+    assert pipeline.dual_variant_lora_adapters[1] == (
+        "ref2va",
+        "transformer_2",
+        os.path.join(root, "Ref2VA/pika/adapter.safetensors"),
+    )
+    assert pipeline.release_metadata.tasks == ("t2va", "fl2va", "ref2va")
+
+
+def test_dual_variant_needs_one_sampling_contract(tmp_path):
+    root = str(tmp_path)
+    model_index = _write_partition(root, "FL2VA", "fl2va", ["t2va", "fl2va"])
+    _write_partition(
+        root,
+        "Ref2VA",
+        "ref2va",
+        ["ref2va"],
+        sigma_shift_scales={"video": 5.0, "audio": 3.0},
+    )
+    pipeline = _dual_pipeline(root)
+    with patch.object(ComposedPipelineBase, "_load_config", return_value=model_index):
+        with pytest.raises(ValueError, match="sampling contract"):
+            pipeline._load_config()
+
+
+@pytest.mark.parametrize("dual", [False, True])
+def test_dual_variant_releases_the_idle_dit_before_placing_the_other(dual):
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.transformer = torch.nn.Linear(1, 1)
+    stage.transformer_2 = torch.nn.Linear(1, 1) if dual else None
+    calls = []
+    stage.finish_unused_declared_component = lambda *, component_name, module: (
+        calls.append(("release", component_name, module))
+    )
+    stage._manage_dit_use_site = lambda module, name, batch: calls.append(
+        ("use", name, module)
+    )
+    stage._declared_component_use = lambda *, component_name: component_name
+
+    stage._component_residency_manager = None
+    assert stage._begin_dit_use(True, None) is (
+        stage.transformer_2 or stage.transformer
+    )
+    assert calls == []
+
+    stage._component_residency_manager = SimpleNamespace(
+        begin_use=lambda use, module: calls.append(("use", use, module))
+    )
+    ref2va = stage._begin_dit_use(True, None)
+    t2va = stage._begin_dit_use(False, None)
+    assert t2va is stage.transformer
+    if not dual:
+        assert ref2va is stage.transformer
+        assert calls == [
+            ("use", "transformer", stage.transformer),
+            ("use", "transformer", stage.transformer),
+        ]
+        return
+    # the DiT kept ready after the previous request leaves before the other is placed
+    assert ref2va is stage.transformer_2
+    assert calls == [
+        ("release", "transformer", stage.transformer),
+        ("use", "transformer_2", stage.transformer_2),
+        ("release", "transformer_2", stage.transformer_2),
+        ("use", "transformer", stage.transformer),
+    ]
+
+
+@pytest.mark.parametrize("performance_mode", ["auto", "speed"])
+@pytest.mark.parametrize("explicit_mode", [None, "component-offload"])
+def test_dual_variant_dit_uses_keep_the_last_dit_ready(performance_mode, explicit_mode):
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.vae = None
+    stage.pipeline = None
+    stage._registered_stage_name = "denoising"
+    stage.transformer = torch.nn.Linear(1, 1)
+    stage.transformer_2 = torch.nn.Linear(1, 1)
+    server_args = SimpleNamespace(
+        performance_mode=performance_mode,
+        explicit_residency_mode=lambda name: explicit_mode,
+    )
+    uses = stage.component_uses(server_args)
+    assert [use.component_name for use in uses] == ["transformer", "transformer_2"]
+    for use in uses:
+        # a request alone says which DiT it runs: never prefetch the first one
+        assert not use.allow_prefetch and use.memory_intensive
+        # the automatic placement keeps the DiT that ran last on the GPU
+        assert use.keep_ready_after_request == (
+            performance_mode == "auto" and explicit_mode is None
+        )
+
+    stage.transformer_2 = None
+    (single,) = stage.component_uses(server_args)
+    assert single.allow_prefetch and not single.keep_ready_after_request
 
 
 def test_synthetic_warmup_target_honors_warmup_flags():
@@ -272,7 +495,11 @@ def test_synthetic_warmup_target_honors_warmup_flags():
     assert target() == TARGET
     assert target(num_frames=345) == {**TARGET, "duration_seconds": 345 / 24.0}
     assert target(resolution="768x1344") == {**TARGET, "aspect_ratio": "9:16"}
-    assert target(resolution="832x464") == TARGET
+    assert target(resolution="1344x768") == TARGET
+    # The short edge follows the flag as well as the aspect.
+    assert target(resolution="832x464") == {**TARGET, "short_edge": 464}
+    assert target(resolution="864x480") == {**TARGET, "short_edge": 480}
+    assert target(resolution="960x544") == {**TARGET, "short_edge": 544}
 
 
 def test_duration_admission_accepts_released_4_to_15_second_range():
@@ -337,6 +564,148 @@ def test_video_adapter_lowers_only_native_fields_and_rejects_cfg():
         )
 
 
+def test_reference_resize_mode_is_declared_as_video_request_extra():
+    assert (
+        "reference_resize_mode" in MiniMaxH3SamplingParams.video_request_extra_fields()
+    )
+
+
+def test_video_adapter_lowers_reference_resize_mode():
+    request = VideoGenerationsRequest(
+        prompt="contract",
+        task="ref2va",
+        conditions=[
+            {
+                "type": "image",
+                "uri": "file:///reference.png",
+                "role": "reference",
+            }
+        ],
+        target=TARGET,
+        reference_resize_mode="match",
+    )
+    lowered = MiniMaxH3SamplingParams.lower_video_request_kwargs(
+        request,
+        {"prompt": request.prompt, "seed": request.seed},
+    )
+
+    assert lowered["reference_resize_mode"] == "match"
+
+
+def test_video_adapter_does_not_override_default_reference_resize_mode():
+    request = VideoGenerationsRequest(
+        prompt="contract",
+        task="ref2va",
+        conditions=[
+            {
+                "type": "image",
+                "uri": "file:///reference.png",
+                "role": "reference",
+            }
+        ],
+        target=TARGET,
+    )
+    lowered = MiniMaxH3SamplingParams.lower_video_request_kwargs(
+        request,
+        {"prompt": request.prompt, "seed": request.seed},
+    )
+
+    assert "reference_resize_mode" not in lowered
+
+
+def test_pika_h3_flex_defaults_to_pika_reference_resize():
+    assert MiniMaxH3SamplingParams().reference_resize_mode == "max"
+    assert PikaH3FlexSamplingParams().reference_resize_mode == "diffusers"
+    assert (
+        PikaH3FlexSamplingParams(reference_resize_mode="max").reference_resize_mode
+        == "max"
+    )
+
+
+def test_sampling_params_normalizes_reference_resize_mode():
+    assert (
+        MiniMaxH3SamplingParams(reference_resize_mode=" MATCH ").reference_resize_mode
+        == "match"
+    )
+    assert (
+        MiniMaxH3SamplingParams(
+            reference_resize_mode=" DIFFUSERS "
+        ).reference_resize_mode
+        == "diffusers"
+    )
+
+
+@pytest.mark.parametrize("bad_mode", ["unknown", "", None, 1])
+def test_sampling_params_rejects_invalid_reference_resize_mode(bad_mode):
+    with pytest.raises(ValueError, match="reference_resize_mode"):
+        MiniMaxH3SamplingParams(reference_resize_mode=bad_mode)
+
+
+@pytest.mark.parametrize(
+    ("sampling_params", "expected_mode"),
+    [
+        (SimpleNamespace(reference_resize_mode="match"), "match"),
+        (SimpleNamespace(reference_resize_mode="diffusers"), "diffusers"),
+        (SimpleNamespace(), "max"),
+    ],
+)
+def test_prequeue_forwards_reference_resize_mode_and_target_canvas(
+    sampling_params, expected_mode
+):
+    material = SimpleNamespace(
+        condition_index=0,
+        condition_type="image",
+        material_chain="image.reference_preserve",
+        start_time_seconds=0.0,
+        uri="file:///reference.png",
+    )
+    plan = SimpleNamespace(
+        materials=(material,),
+        shape={
+            "geometry": "resolved_v2",
+            "width": 960,
+            "height": 544,
+            "fps": 24,
+            "frame_count": 124,
+        },
+        task="ref2va",
+    )
+    batch = SimpleNamespace(extra={}, sampling_params=sampling_params)
+    resolved_reference_shape = {
+        "geometry": "reference_image_resolved",
+        "width": 960,
+        "height": 544,
+    }
+
+    with (
+        patch.object(prequeue, "minimax_h3_plan_from_batch", return_value=plan),
+        patch.object(
+            prequeue,
+            "minimax_h3_probe_material",
+            return_value={"display_width": 1920, "display_height": 1080},
+        ),
+        patch.object(prequeue, "_replace_plan_shape", return_value=plan),
+        patch.object(
+            reference_encoding,
+            "minimax_h3_resolve_reference_image_shape",
+            return_value=resolved_reference_shape,
+        ) as resolve_reference_shape,
+    ):
+        assert prequeue.minimax_h3_prepare_for_queue(batch) is plan
+
+    resolve_reference_shape.assert_called_once_with(
+        width=1920.0,
+        height=1080.0,
+        canvas_width=960,
+        canvas_height=544,
+        mode=expected_mode,
+    )
+    assert batch.extra[prequeue.MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY][0] == {
+        **resolved_reference_shape,
+        "condition_index": 0,
+    }
+
+
 @pytest.mark.parametrize("bad_quality", ["ultra", "draft", "", 1])
 def test_video_adapter_rejects_invalid_quality(bad_quality):
     request = VideoGenerationsRequest(
@@ -367,6 +736,7 @@ def _quality_server_args():
         enable_breakable_cuda_graph=False,
         enable_torch_compile=False,
         is_dit_layerwise_offload_selected=False,
+        lora_path=None,
         minimax_h3_adaln_online=False,
         performance_mode="speed",
         quantization=None,
@@ -440,7 +810,7 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
     server_args = _quality_server_args()
     server_args.minimax_h3_adaln_online = True
     batch = SimpleNamespace(
-        sampling_params=SimpleNamespace(task="t2va", quality="lossless"),
+        sampling_params=SimpleNamespace(task="t2va", quality="exact"),
         num_inference_steps=50,
         is_warmup=False,
     )
@@ -451,18 +821,33 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
             stage.forward(batch, server_args)
 
         batch.num_inference_steps = 9
+        with pytest.raises(ValueError, match="9 AdaLN plans.*slab holds 8"):
+            stage.forward(batch, server_args)
+
+        batch.num_inference_steps = 8
+        assert stage.forward(batch, server_args) is batch
+
+        batch.num_inference_steps = 1
+        assert stage.forward(batch, server_args) is batch
+
+        batch.num_inference_steps = 0
+        with pytest.raises(ValueError, match="num_inference_steps >= 1"):
+            stage.forward(batch, server_args)
+
+        server_args.minimax_h3_adaln_online = False
+        batch.num_inference_steps = 50
         assert stage.forward(batch, server_args) is batch
 
 
-def test_extra_high_quality_does_not_enable_h3_cache_dit():
+def test_lossless_quality_does_not_enable_h3_cache_dit():
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
     stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
     stage._cache_dit_enabled = False
     stage._minimax_h3_cache_mode = None
-    stage._minimax_h3_quality = "lossless"
+    stage._minimax_h3_quality = "exact"
     batch = SimpleNamespace(
         sampling_params=SimpleNamespace(
-            quality="extra-high",
+            quality="lossless",
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
@@ -475,9 +860,23 @@ def test_extra_high_quality_does_not_enable_h3_cache_dit():
     with patch.object(DenoisingStage, "_cache_dit_requested", return_value=True):
         stage._maybe_enable_cache_dit(50, batch)
 
-    assert stage._minimax_h3_quality == "extra-high"
+    assert stage._minimax_h3_quality == "lossless"
     assert stage._minimax_h3_cache_mode is None
     assert not stage._cache_dit_enabled
+
+
+def test_high_quality_cache_schedule_is_the_audited_static_mask():
+    """quality="high" runs exactly the step schedule the 4xH200 audit measured;
+    reusing the stack before step 15 changes the layout of the sample."""
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage._minimax_h3_quality = "high"
+
+    _, policy, mask, _ = stage._cache_dit_scm_masks(50)
+
+    assert policy == "static"
+    assert "".join(map(str, mask)) == (
+        "11111111111111101010101010000000100000001000000011"
+    )
 
 
 def test_quality_admission_fails_closed_outside_validated_request():
@@ -534,7 +933,7 @@ def test_quality_admission_fails_closed_outside_validated_request():
     server_args.attention_backend = "sage_attn"
     assert stage.forward(batch, server_args) is batch
 
-    batch.sampling_params.quality = "extra-high"
+    batch.sampling_params.quality = "lossless"
     assert stage.forward(batch, server_args) is batch
 
     batch.sampling_params.quality = "ultra"
@@ -543,12 +942,39 @@ def test_quality_admission_fails_closed_outside_validated_request():
         stage.forward(batch, server_args)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lora_path", "larryvrh/MiniMax-H3-Turbo-Lora"),
+        ("transformer_weights_path", "/weights/dit.safetensors"),
+    ],
+)
+def test_quality_admission_rejects_substituted_dit_weights(field, value):
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_HopperCapability(),
+        ),
+    ):
+        config.validate_quality_deployment(server_args)
+        setattr(server_args, field, value)
+        with pytest.raises(ValueError, match=field):
+            config.validate_quality_deployment(server_args)
+
+
 def test_validate_server_args_requires_packed_varlen_backend():
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(
         component_attention_backends={},
         attention_backend="sage_attn",
         ring_degree=1,
+        performance_mode="speed",
         resolve_component_attention_backend=lambda *_names: (None, None),
     )
     with patch(
@@ -578,6 +1004,22 @@ def test_validate_server_args_requires_packed_varlen_backend():
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 
+@pytest.mark.parametrize("backend", ["fa", "aiter"])
+def test_validate_server_args_accepts_ring_on_lse_backends(backend):
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend=backend,
+        ring_degree=2,
+        performance_mode="speed",
+        resolve_component_attention_backend=lambda *_names: (None, None),
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+    ):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
 def test_validate_server_args_accepts_transformer_backend_override():
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(
@@ -585,6 +1027,7 @@ def test_validate_server_args_accepts_transformer_backend_override():
         attention_backend="fa",
         attention_backend_config={},
         ring_degree=1,
+        performance_mode="speed",
         resolve_component_attention_backend=lambda *_names: (
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
             "transformer",
@@ -647,6 +1090,7 @@ def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
         attention_backend=None,
         enable_torch_compile=False,
         ring_degree=1,
+        performance_mode="speed",
         residency_mode=modes.get,
         resolve_component_attention_backend=lambda *_names: (None, None),
     )

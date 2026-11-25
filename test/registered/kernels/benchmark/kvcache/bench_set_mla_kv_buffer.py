@@ -16,9 +16,13 @@ from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DTYPE,
 )
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_kernel as sglang_triton_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_triton as sglang_wrapper,
+)
 from sglang.kernels.ops.kvcache.set_mla_kv_buffer import set_mla_kv_buffer as jit_set
-from sglang.srt.mem_cache.utils import set_mla_kv_buffer_kernel as sglang_triton_kernel
-from sglang.srt.mem_cache.utils import set_mla_kv_buffer_triton as sglang_wrapper
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -59,7 +63,9 @@ ROPE_DIM = 64
 
 
 @marker.parametrize("batch_size", marker.range(15, pattern="pow2"), [1, 128, 8192])
-@marker.benchmark("provider", ["wrapper", "jit_tma", "triton"])
+@marker.benchmark(
+    "provider", ["wrapper", "jit_tma", "triton"], gate=["wrapper", "jit_tma"]
+)
 def benchmark(batch_size: int, provider: str):
     cache_k_nope = torch.randn(
         (batch_size, 1, NOPE_DIM),

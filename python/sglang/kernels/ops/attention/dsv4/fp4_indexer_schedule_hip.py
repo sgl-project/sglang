@@ -198,21 +198,24 @@ def pad_page_table(
     page_table: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     page_table_bucket: int = 4,
+    columns: Optional[int] = None,
 ) -> Tuple[torch.Tensor, int]:
     """Pad a page table for 256-token scheduling in a single dispatch.
 
     Replaces the ``new_zeros`` + masked ``copy_`` pair: the kernel writes every
-    output element, so the destination never needs pre-zeroing.
+    output element, so the destination never needs pre-zeroing. ``columns`` widens
+    the destination to at least that many columns; the returned logits width stays
+    the table's own.
     """
     page_table = _as_int32_2d(page_table)
     rows, logical_width, padded_width = padded_page_table_shape(
         page_table, page_table_bucket
     )
+    w_dst = max(padded_width + 4, columns or 0)
     if out is None:
-        out = page_table.new_empty((rows, padded_width + 4))
+        out = page_table.new_empty((rows, w_dst))
     else:
-        assert out.shape == (rows, padded_width + 4), f"{out.shape=} {rows=}"
-    w_dst = padded_width + 4
+        assert out.shape == (rows, w_dst), f"{out.shape=} {rows=}"
     if rows:
         _pad_page_table_kernel[(rows, triton.cdiv(w_dst, _PT_BLOCK))](
             page_table,

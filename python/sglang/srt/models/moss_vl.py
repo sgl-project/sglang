@@ -43,17 +43,17 @@ from sglang.srt.layers.rotary_embedding import (
 )
 from sglang.srt.layers.rotary_embedding.mrope import apply_interleaved_rope
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionRotaryEmbedding
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -898,7 +898,6 @@ class MossVLSelfAttention(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -928,8 +927,7 @@ class MossVLSelfAttention(nn.Module):
             self.total_num_kv_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -937,8 +935,7 @@ class MossVLSelfAttention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )

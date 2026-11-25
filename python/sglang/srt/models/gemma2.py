@@ -35,6 +35,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
@@ -42,7 +44,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu, make_layers
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
@@ -402,57 +404,6 @@ class Gemma2ForCausalLM(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-
-            # Normalize
-            normalizer = torch.tensor(
-                self.model.config.hidden_size**0.5, dtype=torch.float16
-            )
-            forward_batch.hidden_states *= normalizer
-
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            forward_batch.hidden_states, forward_batch.residual = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-                forward_batch.residual,
-            )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
-            )
-
-            # logits process
-            result = self.logits_processor(
-                input_ids,
-                forward_batch.hidden_states,
-                self.model.embed_tokens,
-                forward_batch,
-            )
-        else:
-            result = None
-
-        return result
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
