@@ -328,11 +328,9 @@ class Glm47MoeDetector(BaseFormatDetector):
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
             re.DOTALL,
         )
-        self._last_arguments = ""
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
-        self._tool_call_completed = False  # Track if tool call has been completed
         self._sent_empty_object = (
             False  # Track if empty object has been sent for no-arg functions
         )
@@ -351,7 +349,6 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
         )
-        self._tool_call_completed = False  # Reset tool call completion status
         self._sent_empty_object = False  # Reset empty object sent status
         self._buffer_arguments = None
 
@@ -365,7 +362,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         :param text: The complete text to parse.
         :param tools: List of available tools.
-        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        :return: StreamingParseResult with normal text and parsed tool calls.
         """
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
@@ -677,7 +674,6 @@ class Glm47MoeDetector(BaseFormatDetector):
         if not json_increment:
             return None
 
-        self._last_arguments += json_increment
         self.streamed_args_for_tool[self.current_tool_id] += json_increment
 
         return ToolCallItem(
@@ -718,7 +714,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                     tool_index=self.current_tool_id, name=None, parameters=serialized
                 )
             )
-            self._last_arguments += serialized
             self.streamed_args_for_tool[self.current_tool_id] += serialized
             self._sent_empty_object = True
 
@@ -732,7 +727,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                     parameters=suffix,
                 )
             )
-            self._last_arguments += suffix
             self.streamed_args_for_tool[self.current_tool_id] += suffix
             self._sent_empty_object = True
 
@@ -750,9 +744,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._buffer = current_text[match_end_pos:]
 
         # Reset state for next tool call
-        self._tool_call_completed = True
         self.current_tool_id += 1
-        self._last_arguments = ""
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
         self._reset_streaming_state()
@@ -804,9 +796,6 @@ class Glm47MoeDetector(BaseFormatDetector):
             # Update buffer to only include from the bot token onwards
             self._buffer = current_text
 
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
@@ -826,14 +815,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                 self._streamed_raw_length = 0
                 self.current_tool_name_sent = False  # Reset for new tool call
                 self._reset_streaming_state()
-            # Check if this is a continuation of an existing tool call or a new one
-            elif not self.current_tool_name_sent:
-                # Only increment tool_id if we're truly starting a NEW tool call
-                # Don't increment if this is just the first time we're processing
-                # a tool call that was received in the buffer
-                # The key insight: only increment when we've COMPLETED a previous tool call
-                # and now see another bot_token in new_text
-                pass  # Remove the problematic auto-increment logic
 
             # Ensure tracking arrays are large enough (keeping existing logic)
             while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -861,7 +842,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     calls.append(arg_item)
 
                 # Finalize tool call if end token is encountered
-                if is_tool_end == self.eot_token and not self._tool_call_completed:
+                if is_tool_end == self.eot_token:
                     finalize_calls = self._finalize_tool_call(
                         func_name,
                         func_args_raw,
