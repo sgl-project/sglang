@@ -12,7 +12,6 @@ import functools
 import logging
 from dataclasses import dataclass
 from http import HTTPStatus
-from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -177,12 +176,9 @@ class EncoderPreprocessor:
             else {"backend": image_processor_backend}
         )
         try:
-            if self.model_type == "dots3_note":
-                from sglang.srt.models.dots3_common.dots_omni_towers import (
-                    DotsNoteOmniImagePreprocessor,
-                )
-
-                self.image_processor = DotsNoteOmniImagePreprocessor(
+            factory = self.encoder_media_processor_config.image_processor_factory
+            if factory is not None:
+                self.image_processor = factory(
                     self.model_config.hf_config._name_or_path
                 )
             else:
@@ -206,21 +202,11 @@ class EncoderPreprocessor:
             logger.warning(f"Failed to load video processor: {e}")
             self.video_processor = None
 
-        try:
-            if self.model_type == "dots3_note":
-                from sglang.srt.models.dots3_common.dots_omni_audio import (
-                    OmniAudioConfig,
-                )
-                from sglang.srt.models.dots3_common.dots_omni_towers import (
-                    load_omni_component_config,
-                )
+        if self.encoder_media_processor_config.audio_processor is not None:
+            self.audio_processor = self.encoder_media_processor_config.audio_processor
+            return
 
-                self.audio_processor = OmniAudioConfig(
-                    **load_omni_component_config(
-                        Path(self.model_config.hf_config._name_or_path), "audio"
-                    )
-                )
-                return
+        try:
             from sglang.srt.multimodal.customized_mm_processor_utils import (
                 _CUSTOMIZED_MM_PROCESSOR,
             )
@@ -311,8 +297,9 @@ class EncoderPreprocessor:
         if sr:
             return int(sr)
 
-        if self.model_type == "dots3_note" and self.audio_processor is not None:
-            return self.audio_processor.sampling_rate
+        sr = _read(self.encoder_media_processor_config.audio_processor, "sampling_rate")
+        if sr:
+            return int(sr)
         hf_cfg = self.model_config.hf_config
         thinker_cfg = _read(hf_cfg, "thinker_config")
         pc = _read(thinker_cfg, "processor_config") or _read(hf_cfg, "processor_config")
@@ -893,43 +880,6 @@ class EncoderPreprocessor:
 
         if not self.audio_processor:
             raise ValueError("No audio processor available")
-        if self.model_type == "dots3_note":
-            from sglang.srt.managers.req_types import MultimodalDataItem
-            from sglang.srt.models.dots3_common.dots_omni_audio import (
-                compute_audio_token_length,
-            )
-            from sglang.srt.multimodal.processors.dots_note_omni import (
-                DotsNoteOmniProcessor,
-            )
-
-            config = self.audio_processor
-            features = [
-                DotsNoteOmniProcessor._normalize_audio(audio) for audio in audios
-            ]
-            rows = [
-                compute_audio_token_length(
-                    waveform.numel(),
-                    chunk_seconds=config.chunk_seconds,
-                    conv_temporal_stride=config.conv_temporal_stride,
-                    merge_factor=config.merge_factor,
-                )
-                for waveform in features
-            ]
-            return EncoderPreprocessOutput(
-                {
-                    "input_features": features,
-                    "audio_feature_lens_raw": torch.tensor(rows, dtype=torch.long),
-                },
-                mm_items=[
-                    MultimodalDataItem(
-                        modality=Modality.AUDIO,
-                        feature=waveform,
-                        offsets=[(0, count - 1)],
-                    )
-                    for waveform, count in zip(features, rows)
-                ],
-            )
-
         audio_config = {
             "return_tensors": "pt",
             "sampling_rate": self.model_audio_sr,

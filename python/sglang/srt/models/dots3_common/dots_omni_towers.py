@@ -62,6 +62,7 @@ class DotsNoteOmniAudioEncoder(OmniAudioModel):
         model_dir = Path(model_dir)
         config = OmniAudioConfig(**load_omni_component_config(model_dir, "audio"))
         super().__init__(config)
+        self.config = config
         self.to(torch.bfloat16)
 
     @property
@@ -233,13 +234,32 @@ class DotsNoteOmniImagePreprocessor:
         return pixel_values, grids, token_strings
 
 
-def get_audio_token_string(num_samples: int, config: OmniAudioConfig) -> str:
-    count = compute_audio_token_length(
+def normalize_audio(audio) -> torch.Tensor:
+    if isinstance(audio, torch.Tensor):
+        waveform = audio
+    elif isinstance(audio, np.ndarray):
+        waveform = torch.from_numpy(audio)
+    else:
+        waveform = torch.as_tensor(audio)
+    waveform = waveform.float().squeeze()
+    if waveform.ndim != 1:
+        raise ValueError(
+            f"Dots omni audio must be mono, got shape={tuple(waveform.shape)}"
+        )
+    return waveform.contiguous()
+
+
+def get_audio_token_count(num_samples: int, config: OmniAudioConfig) -> int:
+    return compute_audio_token_length(
         num_samples,
         chunk_seconds=config.chunk_seconds,
         conv_temporal_stride=config.conv_temporal_stride,
         merge_factor=config.merge_factor,
     )
+
+
+def get_audio_token_string(num_samples: int, config: OmniAudioConfig) -> str:
+    count = get_audio_token_count(num_samples, config)
     return (
         config.audio_comp_start + config.audio_comp_span * count + config.audio_comp_end
     )

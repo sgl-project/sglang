@@ -22,6 +22,9 @@ class EncoderMediaProcessorConfig:
     # encoder already loaded in its IO executor.
     preprocess_off_event_loop: bool = False
     audio_sample_rate: int | None = None
+    image_processor_factory: Callable[[str], Any] | None = None
+    # Native audio processor or configuration used by the model hook.
+    audio_processor: Any | None = None
 
 
 @runtime_checkable

@@ -115,6 +115,10 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
 from sglang.srt.models.utils import bind_or_assign
+from sglang.srt.multimodal.encoder_preprocessing import (
+    EncoderMediaProcessorConfig,
+    EncoderPreprocessOutput,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_device,
@@ -2354,11 +2358,13 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         model_dir = Path(config._name_or_path)
-        self.language_model = Dots3LanguageModelForCausalLM(
-            config,
-            quant_config=quant_config,
-            prefix=add_prefix("language_model", prefix),
-        )
+        self.language_model = None
+        if not getattr(config, "encoder_only", False):
+            self.language_model = Dots3LanguageModelForCausalLM(
+                config,
+                quant_config=quant_config,
+                prefix=add_prefix("language_model", prefix),
+            )
         # Load multimodal towers only where embeddings are produced.
         if self.pp_group.is_first_rank and not config.language_only:
             self.audio_tower = DotsNoteOmniAudioEncoder(str(model_dir))
@@ -2499,9 +2505,23 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
             prefix=add_prefix("thinker", prefix),
         )
         language_model = self.thinker.language_model
-        self.pp_group = language_model.pp_group
-        self.quant_config = language_model.quant_config
-        self.num_fused_shared_experts = language_model.num_fused_shared_experts
+        self.pp_group = self.thinker.pp_group
+        self.quant_config = (
+            language_model.quant_config if language_model is not None else quant_config
+        )
+        self.num_fused_shared_experts = (
+            language_model.num_fused_shared_experts if language_model is not None else 0
+        )
+        if language_model is None:
+            from sglang.srt.models.dots3_common.dots_omni_towers import (
+                DotsNoteOmniImagePreprocessor,
+            )
+
+            self.encoder_media_processor_config = EncoderMediaProcessorConfig(
+                image_processor_factory=DotsNoteOmniImagePreprocessor,
+                audio_processor=self.thinker.audio_tower.config,
+                preprocess_off_event_loop=True,
+            )
         self.forward = self.thinker.forward
         self.pad_input_ids = self.thinker.pad_input_ids
 
@@ -2532,6 +2552,35 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.thinker.get_input_embeddings()
 
+    def preprocess_mm_for_encoder(
+        self, mm_data, modality, config, *, image_processor=None
+    ):
+        if modality == Modality.IMAGE:
+            return image_processor(images=mm_data, **config.get("image", {}))
+        if modality != Modality.AUDIO:
+            raise ValueError(f"Unsupported Dots encoder modality: {modality}")
+
+        from sglang.srt.models.dots3_common.dots_omni_towers import (
+            get_audio_token_count,
+            normalize_audio,
+        )
+
+        waveforms = [normalize_audio(audio) for audio in mm_data]
+        audio_config = self.thinker.audio_tower.config
+        rows = [get_audio_token_count(wave.numel(), audio_config) for wave in waveforms]
+        return EncoderPreprocessOutput(
+            {
+                "input_features": waveforms,
+                "audio_feature_lens_raw": torch.tensor(rows, dtype=torch.long),
+            },
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.AUDIO, feature=wave, offsets=[(0, count - 1)]
+                )
+                for wave, count in zip(waveforms, rows, strict=True)
+            ],
+        )
+
     def load_weights(self, weights, *args, **kwargs):
         # Partition the flat checkpoint in one pass. This avoids reading the
         # large tower tensors once through the model loader and again through
@@ -2552,13 +2601,21 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
                     continue
                 yield name, weight
 
-        self.thinker.language_model.load_weights(language_weights(), *args, **kwargs)
+        if self.thinker.language_model is not None:
+            self.thinker.language_model.load_weights(
+                language_weights(), *args, **kwargs
+            )
+        else:
+            # Drain the checkpoint iterator to collect the two tower states.
+            for _ in language_weights():
+                pass
         if load_towers:
             self.thinker.visual.load_converted_state(vision_state)
             self.thinker.audio_tower.load_converted_state(audio_state)
 
     def post_load_weights(self, *args, **kwargs):
-        return self.thinker.language_model.post_load_weights(*args, **kwargs)
+        if self.thinker.language_model is not None:
+            return self.thinker.language_model.post_load_weights(*args, **kwargs)
 
     def get_embed_and_head(self):
         return self.thinker.language_model.get_embed_and_head()

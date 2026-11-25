@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar
 
-import numpy as np
 import torch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -19,6 +18,7 @@ from sglang.srt.models.dots3_common.dots_omni_towers import (
     DotsNoteOmniImagePreprocessor,
     get_audio_token_string,
     load_omni_component_config,
+    normalize_audio,
 )
 from sglang.srt.multimodal.media_io import VideoData, get_video_bytes
 from sglang.srt.multimodal.modality import Modality
@@ -279,21 +279,6 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
             )
         return token_ids[0]
 
-    @staticmethod
-    def _normalize_audio(audio) -> torch.Tensor:
-        if isinstance(audio, torch.Tensor):
-            waveform = audio
-        elif isinstance(audio, np.ndarray):
-            waveform = torch.from_numpy(audio)
-        else:
-            waveform = torch.as_tensor(audio)
-        waveform = waveform.float().squeeze()
-        if waveform.ndim != 1:
-            raise ValueError(
-                f"Dots omni audio must be mono, got shape={tuple(waveform.shape)}"
-            )
-        return waveform.contiguous()
-
     def _render_video_content(
         self,
         input_text: str,
@@ -545,7 +530,7 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
             if base_output.images
             else ([], [], [])
         )
-        audio_features = [self._normalize_audio(audio) for audio in base_output.audios]
+        audio_features = [normalize_audio(audio) for audio in base_output.audios]
         audio_token_strings = [
             get_audio_token_string(waveform.numel(), self.audio_processor_config)
             for waveform in audio_features

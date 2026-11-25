@@ -205,6 +205,7 @@ class TestEncodeRequestInputEdges(CustomTestCase):
         self.assertEqual(items[1].audio_feature_lens.tolist(), [7, 3])
 
     def test_dots_audio_encoder_preserves_native_waveforms_and_offsets(self):
+        from sglang.srt.models.dots3 import Dots3NoteForCausalLM
         from sglang.srt.models.dots3_common.dots_omni_audio import OmniAudioConfig
         from sglang.srt.models.dots3_common.dots_omni_towers import (
             get_audio_token_string,
@@ -213,8 +214,14 @@ class TestEncodeRequestInputEdges(CustomTestCase):
         config = OmniAudioConfig()
         p = EncoderPreprocessor.__new__(EncoderPreprocessor)
         p.model_type = "dots3_note"
-        p.audio_processor = config
-        p._model_preprocessor = None
+        model = Dots3NoteForCausalLM.__new__(Dots3NoteForCausalLM)
+        model.thinker = SimpleNamespace(audio_tower=SimpleNamespace(config=config))
+        p._model_preprocessor = model.preprocess_mm_for_encoder
+        p.encoder_media_processor_config = EncoderMediaProcessorConfig(
+            preprocess_off_event_loop=True
+        )
+        p.preproc_executor = None
+        p.vision_config = {}
         waves = [np.ones(16000, np.float32), np.zeros(24000, np.float32)]
         p._flatten_and_load_audios = AsyncMock(return_value=waves)
         prepared = asyncio.run(p.process_mm_items(["a", "b"], Modality.AUDIO))
