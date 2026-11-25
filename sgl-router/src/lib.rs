@@ -14,6 +14,7 @@ pub mod policies;
 pub mod policies_reorg;
 pub(crate) mod protocol;
 pub mod proxy;
+pub(crate) mod routing;
 pub mod server;
 pub mod state;
 pub mod tokenizer;

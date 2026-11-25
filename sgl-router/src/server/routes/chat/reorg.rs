@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::forward::SelectedWorkers;
-use super::preparation::PreparedRequest;
 use super::{
     nonempty_header, parse_optional_positive_f64_header, parse_optional_positive_u64_header,
     record_prefill_route, X_SGL_TPS_SLO, X_SGL_TTFT_SLO_MS,
@@ -10,8 +8,10 @@ use super::{
 use crate::buckets_reorg::{BucketRequest, BucketResolver, SloPreference};
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{PickError, Stage};
+use crate::routing::dispatch::SelectedWorkers;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
+use crate::server::routes::chat::preparation::PreparedRequest;
 use axum::http::HeaderMap;
 
 /// Bucket-first selection used when `AppContext::chat_routing` is reorg.
