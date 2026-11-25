@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -98,6 +99,16 @@ if _is_cuda:
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
+
+# SGLANG_ROCM_CHAIN_FFN_RESIDUAL=1 is set together with
+# SGLANG_ROCM_TRITON_NORM_SCALE_SHIFT=true on the serve command line, to run the FFN
+# residual and the next norm1 as one ROCm kernel. It is off by default because it
+# needs the Triton norm, and a 40-step Wan2.2 run has not matched the default path yet.
+_use_rocm_chain_ffn_residual = (
+    current_platform.is_rocm()
+    and os.environ.get("SGLANG_ROCM_TRITON_NORM_SCALE_SHIFT", "false") == "true"
+    and os.environ.get("SGLANG_ROCM_CHAIN_FFN_RESIDUAL", "0") == "1"
+)
 
 
 class _WanGELUMLP(MLP):
@@ -973,6 +984,13 @@ class WanTransformerBlock(nn.Module):
     def chains_ffn_residual(self) -> bool:
         """Whether the FFN residual (MulAdd) and the next norm1 run as one kernel with
         the same bits: both sides on their CUDA kernels"""
+        if _use_rocm_chain_ffn_residual:
+            # the ROCm Triton norm adds residual + x * gate in FP32 and rounds once,
+            # like MulAdd followed by the cast to the activation dtype
+            return all(
+                op._forward_method == op.forward_hip
+                for op in (self.norm1, self.ffn_residual_norm1)
+            )
         return all(
             op._forward_method == op.forward_cuda
             for op in (self.mlp_residual, self.norm1, self.ffn_residual_norm1)
