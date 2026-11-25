@@ -128,6 +128,12 @@ def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
 class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
+        if self.quant_config.group_size != 128:
+            raise ValueError(
+                "W4AFp8MoEMethod requires group_size=128 "
+                f"(cutlass_w4a8_moe chunk_size); got {self.quant_config.group_size}. "
+                "Requantize with group_size=128."
+            )
 
     def create_weights(
         self,
@@ -334,6 +340,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
+            group_size=self.quant_config.group_size,
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -379,6 +386,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
             expected_m=expected_m,
+            group_size=self.quant_config.group_size,
         )
 
         return output
@@ -429,6 +437,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes2,
                 layer.w13_input_scale,
                 layer.w2_input_scale,
+                group_size=self.quant_config.group_size,
             )
         else:
             return hidden_states
