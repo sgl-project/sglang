@@ -947,9 +947,6 @@ class Envs:
     # Remove a path's superseded Mamba states from storage (HiCache L3 and the
     # external linker) once a newer state on the path persists.
     SGLANG_ENABLE_HICACHE_MAMBA_TAIL_ONLY_STORAGE = EnvBool(True)
-    # Seconds before retrying a superseded state refused while leased; set it
-    # above the Mooncake master's --default_kv_lease_ttl.
-    SGLANG_HICACHE_MAMBA_TAIL_ONLY_STORAGE_RETRY_DELAY_S = EnvFloat(65.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

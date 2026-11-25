@@ -9,7 +9,6 @@ import time
 from collections import Counter, OrderedDict, deque
 from typing import TYPE_CHECKING
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName
 
 if TYPE_CHECKING:
@@ -27,6 +26,8 @@ _REMOVE_OUTCOMES = {
     -706: "mamba_remove_leased",
 }
 _RETRIABLE = (-703, -706)
+# Above the Mooncake master's --default_kv_lease_ttl (10 s; 60 s in common PD setups).
+RETRY_DELAY_S = 65.0
 
 
 class MambaStorageRetention:
@@ -79,21 +80,17 @@ class MambaStateRemover:
     """Removes superseded Mamba states on its own thread, counting each object.
 
     A state refused while leased is retried once after ``retry_delay_s``, which
-    should exceed the master's lease TTL: the rank's own lookup of the next turn
+    must exceed the master's lease TTL: the rank's own lookup of the next turn
     leases the state that turn supersedes. Then it is left to storage eviction.
     """
 
     def __init__(
         self,
         stats: Counter[str] | dict[str, int],
-        retry_delay_s: float | None = None,
+        retry_delay_s: float = RETRY_DELAY_S,
     ):
         self.stats = stats
-        self.retry_delay_s = (
-            envs.SGLANG_HICACHE_MAMBA_TAIL_ONLY_STORAGE_RETRY_DELAY_S.get()
-            if retry_delay_s is None
-            else retry_delay_s
-        )
+        self.retry_delay_s = retry_delay_s
         self._tasks: queue.Queue[tuple[HiCacheStorage, list[str]]] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._unsupported_logged = False
