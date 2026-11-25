@@ -46,7 +46,6 @@ RUN source $HOME/.local/bin/env && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install .
 
-ENV SGLANG_USE_CPU_ENGINE=1
 RUN echo 'source /opt/.venv/bin/activate' >> /root/.bashrc
 
 WORKDIR /sgl-workspace/sglang

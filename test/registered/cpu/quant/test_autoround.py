@@ -1,7 +1,6 @@
 """CPU accuracy test for AutoRound INT4 checkpoints in both packing formats
 (auto_round:auto_gptq / auto_round:auto_awq)."""
 
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -102,5 +101,4 @@ class TestAutoRoundCPU(CustomTestCase):
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("SGLANG_USE_CPU_ENGINE", "1")
     unittest.main()

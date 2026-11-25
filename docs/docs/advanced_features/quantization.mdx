@@ -466,10 +466,10 @@ Several limitations currently affect offline quantized model loading in sglang, 
 
 - CPU serving
 
-    AutoRound INT4 checkpoints (both `auto_round:auto_gptq` and `auto_round:auto_awq` packing formats) can be served on Intel CPUs with AMX support:
+    With [SGLang installed for CPU](../hardware-platforms/cpu_server#installation), AutoRound INT4 checkpoints (both `auto_round:auto_gptq` and `auto_round:auto_awq` packing formats) can be served on Intel CPUs with AMX support:
 
     ```bash
-    SGLANG_USE_CPU_ENGINE=1 python3 -m sglang.launch_server \
+    python3 -m sglang.launch_server \
         --model-path OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc \
         --quantization auto-round \
         --device cpu --trust-remote-code
