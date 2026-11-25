@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -1076,11 +1077,20 @@ class CPUGraphRunner:
     prefill_dynamic_graph: Optional[Callable] = None
     prefill_dynamic_graph_bs1: Optional[Callable] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    use_mla: bool = False
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
+        self.use_mla = bool(
+            getattr(model_runner, "use_mla_backend", False)
+            or (
+                hasattr(model_runner, "model_config")
+                and getattr(model_runner.model_config, "attention_arch", None)
+                == AttentionArch.MLA
+            )
+        )
         # Decode steps (and hence decode graphs) only exist for generation
         # models -- embedding/reward/classification models only ever run
         # EXTEND. Gate the decode-only setup below on this instead of
@@ -2352,7 +2362,38 @@ class CPUGraphRunner:
             self._rewarm_decode_dynamic_graphs()
         self._reset_mamba_cache_if_needed()
 
+    def _warmup_prefill_eager(self) -> None:
+        if not (
+            hasattr(self, "model_runner")
+            and self.model_runner is not None
+            and hasattr(self, "device")
+            and self.capture_num_tokens
+        ):
+            return
+
+        warmup_num_tokens = self.capture_num_tokens[0]
+        warmup_fb = self._build_prefill_dummy_forward_batch(warmup_num_tokens, 1)
+        warmup_kwargs = {} if self.is_generation else {"get_embedding": True}
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend),
+            forward_batch=warmup_fb,
+        ):
+            self.model_runner.attn_backend.init_forward_metadata(warmup_fb)
+            with _disable_cpu_graph_custom_op_aliasing_check(), torch.no_grad():
+                get_parallel().tp_group.barrier()
+                self.model_runner.model.forward(
+                    warmup_fb.input_ids,
+                    warmup_fb.positions,
+                    warmup_fb,
+                    **warmup_kwargs,
+                )
+
     def capture_prefill(self) -> None:
+        # Warm up eager model once for prefill (EXTEND) mode before compiling,
+        # so any lazy-initialized modules (e.g. BaseFusedOp._forward_method)
+        # are resolved in eager mode rather than during Dynamo tracing.
+        self._warmup_prefill_eager()
+
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_num_tokens)))
             if get_parallel().tp_rank == 0
@@ -2401,6 +2442,18 @@ class CPUGraphRunner:
             return False
         if forward_batch.batch_size > self.prefill_max_bs:
             return False
+        if self.use_mla:
+            # MLA models on CPU compile prefill graphs using the MHA companion
+            # path, which assumes pure prefill (no cached prefix). A prefix cache
+            # hit (extend_prefix_lens > 0) requires absorbed MLA over the latent
+            # KV pool, which cannot run via the compiled MHA prefill graph.
+            # Reject here to safely fall back to eager MLA.
+            if forward_batch.extend_prefix_lens_cpu is not None:
+                if any(forward_batch.extend_prefix_lens_cpu):
+                    return False
+            elif forward_batch.extend_prefix_lens is not None:
+                if bool((forward_batch.extend_prefix_lens > 0).any()):
+                    return False
 
         raw_num_tokens = forward_batch.input_ids.shape[0]
         if forward_batch.contains_mm_inputs():
