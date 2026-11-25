@@ -295,7 +295,9 @@ def throughput_test_once(
             backend.stop_profile()
         except RuntimeError:
             pass
-        monitor_trace_file(known_files, dir)
+        # CUDA-only capture writes an external Nsight report, not a Torch trace.
+        if set(profile_activities or ()) != {"CUDA_PROFILER"}:
+            monitor_trace_file(known_files, dir)
 
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
