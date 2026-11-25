@@ -612,6 +612,10 @@ class _GenerationStreamAccumulator:
                 should_output = (
                     len(req.output_ids) % self.default_force_stream_interval == 0
                 )
+                if should_output:
+                    # Same hold as the stream branch: text sent here can no
+                    # longer be trimmed when the stop string completes.
+                    should_output &= not req.check_match_stop_str_prefix()
 
         if not should_output:
             return

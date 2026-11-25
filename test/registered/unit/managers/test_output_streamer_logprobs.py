@@ -86,6 +86,9 @@ class _FakeReq(FakeReq):
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
 
+    def check_match_stop_str_prefix(self):
+        return False
+
 
 def _make_accumulator(
     *, output_sink: OutputSink = OutputSink.DETOKENIZER
