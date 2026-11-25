@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.attention.dsa.ssmax_triton import ssmax_scale_query
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -113,8 +114,10 @@ class MistralLarge4AttentionMLA(DeepseekV2AttentionMLA):
             self.ssmax_scaling_s = self._sharded_head_param()
             self.ssmax_scaling_b = self._sharded_head_param()
         if self.indexer is not None:
+            # The checkpoint stores this norm in bf16; bf16 parameters let ROCm use
+            # aiter's fused layer_norm instead of a cast, an fp32 norm and a cast back.
             self.indexer.q_input_norm = LayerNorm(
-                self.hidden_size, eps=config.indexer_norm_eps
+                self.hidden_size, eps=config.indexer_norm_eps, dtype=torch.bfloat16
             )
 
     def _build_nope_projections(
@@ -158,6 +161,12 @@ class MistralLarge4AttentionMLA(DeepseekV2AttentionMLA):
     def _apply_ssmax(self, q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         if self.ssmax_scaling_s is None:
             return q
+        if q.is_cuda:
+            out = ssmax_scale_query(
+                q, positions, self.ssmax_scaling_s, self.ssmax_scaling_b
+            )
+            if out is not None:
+                return out
         factor = (
             torch.log1p(positions.to(torch.float32)).unsqueeze(-1)
             * self.ssmax_scaling_s

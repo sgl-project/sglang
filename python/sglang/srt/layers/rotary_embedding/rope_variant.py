@@ -375,8 +375,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
-        if _is_hip:
-            self._forward_method = self.forward_native
 
     def set_lerope_alpha(self, lerope_alpha: torch.Tensor) -> None:
         """Update in place so existing cache references see the LeRoPE frequencies."""

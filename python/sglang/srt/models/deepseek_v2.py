@@ -831,6 +831,15 @@ class DeepseekV2MoE(nn.Module):
                         else self.experts.should_fuse_routed_scaling_factor_in_topk
                     ),
                 )
+            # With a single expert group the grouped top-k picks the same experts as a
+            # plain top-k; the ungrouped softmax route is one fused kernel on ROCm.
+            if (
+                not is_deepseek_v4
+                and config.n_group == 1
+                and config.topk_group == 1
+                and self.gate.e_score_correction_bias is None
+            ):
+                topk_kwargs["use_grouped_topk"] = False
             self.topk = TopK(**topk_kwargs)
             self.topk.bind_runner_backend(
                 self.experts.runner_backend,
@@ -1283,7 +1292,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_musa
             and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
+        ) and self.routed_scaling_factor != 1.0:
             final_hidden_states *= self.routed_scaling_factor
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
@@ -1481,7 +1490,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_xpu
             and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
+        ) and self.routed_scaling_factor != 1.0:
             final_hidden_states *= self.routed_scaling_factor
 
         if (
