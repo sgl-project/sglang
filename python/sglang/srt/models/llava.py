@@ -117,7 +117,6 @@ class LlavaBaseForCausalLM(nn.Module):
                     )
                     if matched_anyres_max_num_patches:
                         max_num_patches = int(matched_anyres_max_num_patches.group(1))
-                    # times = math.sqrt(h * w / (max_num_patches * unit**2))
                     times = math.sqrt(
                         new_h * new_w / (max_num_patches * self.image_feature_len)
                     )
@@ -165,7 +164,7 @@ class LlavaBaseForCausalLM(nn.Module):
         if self.vision_feature_select_strategy in ["default", "patch"]:
             selected_image_feature = selected_image_feature[:, 1:]
         elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
+            pass
         else:
             raise ValueError(
                 f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
@@ -237,7 +236,6 @@ class LlavaBaseForCausalLM(nn.Module):
 
                 if pixel_values[0].ndim == 4:
                     # llava-hd: BS, num_patch, C=3, H=336, W=336, num_patch obtained from process_images
-                    np.concatenate(pixel_values, axis=0)
                     # ndim=4
                     concat_images = torch.tensor(
                         np.concatenate(pixel_values, axis=0),
@@ -301,19 +299,6 @@ class LlavaBaseForCausalLM(nn.Module):
                                 image_feature = image_feature.view(
                                     2, 2, height, width, -1
                                 )
-
-                            # (
-                            #     num_patch_width,
-                            #     num_patch_height,
-                            # ) = get_anyres_image_grid_shape(
-                            #     image_sizes[image_idx][0],
-                            #     self.image_grid_pinpoints,
-                            #     self.vision_tower.config.image_size,
-                            # )
-
-                            # image_feature = image_feature.view(
-                            #     num_patch_height, num_patch_width, height, width, -1
-                            # )
 
                             if "unpad" in self.mm_patch_merge_type:
                                 unit = image_feature.shape[2]
@@ -752,8 +737,6 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         if not hasattr(self.config, "image_aspect_ratio"):
             self.config.image_aspect_ratio = "anyres"
         if not hasattr(self.config, "image_grid_pinpoints"):
-            # from transformers.models.llava_onevision.configuration_llava_onevision import LlavaOnevisionConfig
-            # self.config.image_grid_pinpoints = LlavaOnevisionConfig().image_grid_pinpoints
             self.config.image_grid_pinpoints = [
                 [96, 96],
                 [224, 224],
@@ -839,7 +822,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             if self.vision_feature_select_strategy in ["default", "patch"]:
                 selected_image_feature = selected_image_feature[:, 1:]
             elif self.vision_feature_select_strategy == "full":
-                selected_image_feature = selected_image_feature
+                pass
             else:
                 raise ValueError(
                     f"Unexpected select feature: {self.vision_feature_select_strategy}"
