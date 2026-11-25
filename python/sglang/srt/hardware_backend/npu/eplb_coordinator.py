@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from enum import IntEnum
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, NoReturn, Protocol
 
 
 class Phase(IntEnum):
@@ -18,6 +18,14 @@ class Phase(IntEnum):
     STAGING = 2
     DISABLED = 3
     FAILED = 4
+
+
+class ControlPoint(IntEnum):
+    """Vote identifiers outside the nonnegative MoE layer IDs."""
+
+    NO_LAYER = -1
+    RECORDER_WINDOW = -2
+    PREFILL_ADMISSION = -3
 
 
 class RebalanceAborted(RuntimeError):
@@ -29,6 +37,7 @@ class UnsafeRebalanceFailure(RuntimeError):
 
 
 class Control(Protocol):
+    # layer is a nonnegative layer ID or one of the reserved ControlPoint values.
     def vote(
         self, epoch: int, phase: int, layer: int, ready: bool, error: bool
     ) -> tuple[bool, bool]: ...
@@ -42,7 +51,7 @@ class Runtime(Protocol):
 
     def record_source_ready(self) -> Future[None] | None: ...
 
-    def stage(self, layer: int) -> WeightWriteback: ...
+    def stage(self, layer: int, submitted: Future[None] | None) -> WeightWriteback: ...
 
     def install(self, layer: int, writeback: WeightWriteback) -> None: ...
 
@@ -52,7 +61,7 @@ class Runtime(Protocol):
 
 
 # Keep the runtime and its tensors alive until the failed process exits.
-_FAILED_OWNERS: list[Any] = []
+_FAILED_OWNERS: list[AsyncEplbCoordinator] = []
 
 
 class AsyncEplbCoordinator:
@@ -74,7 +83,7 @@ class AsyncEplbCoordinator:
         self._layers: tuple[int, ...] = ()
         self.layers_installed = 0
         self.submission_wait_seconds = 0.0
-        self._future: Future | None = None
+        self._future: Future[tuple[int, ...]] | Future[WeightWriteback] | None = None
         self._error: BaseException | None = None
         self._deadline = 0.0
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eplb")
@@ -140,16 +149,20 @@ class AsyncEplbCoordinator:
         if not self.active:
             return self.phase == Phase.IDLE
         layer = (
-            self._layers[self.layers_installed] if self.phase == Phase.STAGING else -1
+            self._layers[self.layers_installed]
+            if self.phase == Phase.STAGING
+            else ControlPoint.NO_LAYER
         )
         if not self._all_ranks_ready(layer):
             return False
 
+        future = self._future
+        assert future is not None
         if self.phase == Phase.PLANNING:
-            self._layers = self._future.result()
+            self._layers = future.result()
         else:
             try:
-                self.runtime.install(layer, self._future.result())
+                self.runtime.install(layer, future.result())
                 self.layers_installed += 1
             except Exception as error:
                 self._fatal("EPLB install failed; layout integrity unknown", error)
@@ -159,35 +172,42 @@ class AsyncEplbCoordinator:
             self.phase = Phase.IDLE
             return True
 
+        self._start_stage(self._layers[self.layers_installed])
+        return False
+
+    def _start_stage(self, layer: int) -> None:
         self.phase = Phase.STAGING
         self._deadline = time.monotonic() + self.timeout
         try:
             submitted = self.runtime.record_source_ready()
-            next_layer = self._layers[self.layers_installed]
-            self._future = self._executor.submit(self.runtime.stage, next_layer)
+            staged = self._executor.submit(self.runtime.stage, layer, submitted)
         except Exception as error:
             self._error = error
-            self._future = None
-            return False
+            return
+        self._future = staged
         if submitted is not None:
-            # Decode can queue its next forward once this rank has submitted P2P.
-            # Device completion still runs on the worker and gates publication.
-            start = time.perf_counter()
-            try:
-                done, _ = wait(
-                    (submitted, self._future),
-                    timeout=max(0.0, self._deadline - time.monotonic()),
-                    return_when=FIRST_COMPLETED,
-                )
-                if self._future in done:
-                    self._future.result()
-                if submitted not in done:
-                    raise TimeoutError("EPLB did not submit the layer transfers")
-            except Exception as error:
-                self._fatal("EPLB could not order P2P before decode", error)
-            finally:
-                self.submission_wait_seconds += time.perf_counter() - start
-        return False
+            self._wait_for_submission(submitted, staged)
+
+    def _wait_for_submission(
+        self, submitted: Future[None], staged: Future[WeightWriteback]
+    ) -> None:
+        # Decode can continue after local P2P submission. Publication still
+        # waits for device completion and agreement across ranks.
+        start = time.perf_counter()
+        try:
+            done, _ = wait(
+                (submitted, staged),
+                timeout=max(0.0, self._deadline - time.monotonic()),
+                return_when=FIRST_COMPLETED,
+            )
+            if staged in done:
+                staged.result()
+            if submitted not in done:
+                raise TimeoutError("EPLB did not submit the layer transfers")
+        except Exception as error:
+            self._fatal("EPLB could not order P2P before decode", error)
+        finally:
+            self.submission_wait_seconds += time.perf_counter() - start
 
     def cancel(self) -> None:
         """Collective: no rank may restart or free storage until all are drained."""
@@ -218,7 +238,11 @@ class AsyncEplbCoordinator:
             # Keep the same collective as a forward vote. If a peer is still
             # polling, the phase mismatch is reported on both ranks.
             drained, _ = self.control.vote(
-                self.epoch, Phase.DISABLED, -1, local_error is None, False
+                self.epoch,
+                Phase.DISABLED,
+                ControlPoint.NO_LAYER,
+                local_error is None,
+                False,
             )
         except Exception as error:
             self._fatal("EPLB drain agreement failed", error)
@@ -243,7 +267,7 @@ class AsyncEplbCoordinator:
         self._error = None
         self.phase = Phase.IDLE
 
-    def _fatal(self, message: str, cause: BaseException | None) -> None:
+    def _fatal(self, message: str, cause: BaseException | None) -> NoReturn:
         self.phase = Phase.FAILED
         _FAILED_OWNERS.append(self)
         raise UnsafeRebalanceFailure(message) from cause

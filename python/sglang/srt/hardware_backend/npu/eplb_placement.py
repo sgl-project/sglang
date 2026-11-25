@@ -1,10 +1,64 @@
 """CPU placement and migration selection for asynchronous Ascend EPLB."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, NamedTuple
+
 import numpy as np
 import torch
 
+if TYPE_CHECKING:
+    from sglang.srt.eplb.eplb_algorithms import EplbAlgorithm
 
-def plan_migration(counts, current, spec, ranks_per_node, layer_ids):
+_LOAD_PROFILE_BUCKETS = 8
+_MAX_SCORING_STEPS = 64
+_EXCHANGE_BATCH_LAYERS = 16
+_LAYERS_PER_ALTERNATE_SEARCH = 8
+
+
+class MigrationPlacement(NamedTuple):
+    """Ordered layers to migrate and the full CPU routing tables.
+
+    The first table is indexed by layer and physical slot. The inverse is
+    indexed by layer, logical expert and replica, with -1 padding.
+    """
+
+    layers: tuple[int, ...]
+    physical_to_logical: torch.Tensor
+    logical_to_physical: torch.Tensor
+
+
+@dataclass(frozen=True)
+class PlanningSpec:
+    physical_experts: int
+    local_experts: int
+    groups: int | None
+    nodes: int
+    algorithm: EplbAlgorithm
+    rank_fixed_dispatch: bool = False
+
+    def compute(self, counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.eplb.eplb_algorithms import rebalance_experts
+
+        physical, logical, _ = rebalance_experts(
+            tokens_per_expert=counts,
+            num_physical_experts=self.physical_experts,
+            num_local_physical_experts=self.local_experts,
+            num_groups=self.groups,
+            num_nodes=self.nodes,
+            algorithm=self.algorithm,
+        )
+        return physical, logical
+
+
+def plan_migration(
+    counts: torch.Tensor,
+    current: torch.Tensor,
+    spec: PlanningSpec,
+    ranks_per_node: int,
+    layer_ids: tuple[int, ...],
+) -> MigrationPlacement | None:
     """Build a CPU plan from [steps, layers, logical experts] on the root rank."""
     physical, logical = spec.compute(counts)
     if physical.shape != current.shape:
@@ -38,7 +92,7 @@ def plan_migration(counts, current, spec, ranks_per_node, layer_ids):
         changed = _select_layers_for_migration(
             changed, current, physical, counts, spec.local_experts
         )
-    return (changed, physical, logical) if changed else None
+    return MigrationPlacement(changed, physical, logical) if changed else None
 
 
 def _align_placement(
@@ -204,6 +258,32 @@ def _exchange_slots(expert_ids, features, slots, offers):
     return order
 
 
+def _build_step_profiles(samples, totals, replicas, eligible_layers):
+    """Group active steps by token count and normalize loads per replica."""
+    layers, experts = replicas.shape
+    features = np.zeros((layers, experts, _LOAD_PROFILE_BUCKETS))
+    scoring_steps = {}
+    for layer in eligible_layers:
+        active = np.flatnonzero(totals[:, layer])
+        by_size = active[np.argsort(totals[active, layer], kind="stable")]
+        # The search uses a bounded sample. Migration admission still checks
+        # the full window.
+        scoring_steps[layer] = (
+            by_size[np.linspace(0, len(active) - 1, _MAX_SCORING_STEPS, dtype=np.intp)]
+            if len(active) > _MAX_SCORING_STEPS
+            else active
+        )
+        groups = np.array_split(by_size, min(_LOAD_PROFILE_BUCKETS, len(active)))
+        profiles = [
+            samples[group, layer].sum(axis=0) / totals[group, layer].sum()
+            for group in groups
+        ]
+        features[layer, :, : len(groups)] = (
+            np.stack(profiles, axis=1) / replicas[layer, :, None]
+        )
+    return features, scoring_steps
+
+
 def _balance_recorded_steps(
     physical, logical, counts, local_experts, current, layer_ids
 ):
@@ -222,30 +302,12 @@ def _balance_recorded_steps(
     if not len(eligible):
         return physical, logical
     replicas = np.stack([np.bincount(row, minlength=logical.shape[1]) for row in ids])
-    features = np.zeros((layers, logical.shape[1], 8))
-    scoring_steps = {}
-    for layer in eligible:
-        active = np.flatnonzero(totals[:, layer])
-        by_size = active[np.argsort(totals[active, layer], kind="stable")]
-        # Only the optional search uses this sample. The migration admission
-        # check below the planner still evaluates the complete recorded window.
-        scoring_steps[layer] = (
-            by_size[np.linspace(0, len(active) - 1, 64, dtype=np.intp)]
-            if len(active) > 64
-            else active
-        )
-        groups = np.array_split(by_size, min(8, len(active)))
-        profiles = [
-            samples[g, layer].sum(axis=0) / totals[g, layer].sum() for g in groups
-        ]
-        features[layer, :, : len(groups)] = (
-            np.stack(profiles, axis=1) / replicas[layer, :, None]
-        )
+    features, scoring_steps = _build_step_profiles(samples, totals, replicas, eligible)
 
     def exchange(layer_ids, schedules):
         # Bound temporary [layers, ranks, ranks] assignment matrices.
-        for start in range(0, len(layer_ids), 16):
-            batch = layer_ids[start : start + 16]
+        for start in range(0, len(layer_ids), _EXCHANGE_BATCH_LAYERS):
+            batch = layer_ids[start : start + _EXCHANGE_BATCH_LAYERS]
             yield batch, _exchange_slots(ids[batch], features[batch], slots, schedules)
 
     for batch, placement in exchange(eligible, offers):
@@ -271,7 +333,9 @@ def _balance_recorded_steps(
         headroom[layer] = (1 - lower / baseline[layer]).sum()
 
     # Limit extra solver work to one alternate per eight eligible layers.
-    budget = (len(headroom) + 7) // 8
+    budget = (
+        len(headroom) + _LAYERS_PER_ALTERNATE_SEARCH - 1
+    ) // _LAYERS_PER_ALTERNATE_SEARCH
     shortlist = sorted(headroom, key=headroom.get, reverse=True)[:budget]
     shortlist = np.array([i for i in shortlist if headroom[i] > 1e-12], dtype=np.intp)
     # A fixed permutation gives a different exchange neighborhood on each

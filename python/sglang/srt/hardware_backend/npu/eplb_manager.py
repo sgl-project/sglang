@@ -13,7 +13,11 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.hardware_backend.npu.eplb_async import create_npu_async_eplb
-from sglang.srt.hardware_backend.npu.eplb_coordinator import Phase, RebalanceAborted
+from sglang.srt.hardware_backend.npu.eplb_coordinator import (
+    ControlPoint,
+    Phase,
+    RebalanceAborted,
+)
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
@@ -122,7 +126,11 @@ class NpuAsyncEPLBManager(EPLBManager):
         # Called at the same extend boundary on every rank. Keep scheduling
         # prefill before processing results while any rank has prompts pending.
         all_finished, _ = coordinator.control.vote(
-            coordinator.epoch, coordinator.phase, -3, not has_pending_prefill, False
+            coordinator.epoch,
+            coordinator.phase,
+            ControlPoint.PREFILL_ADMISSION,
+            not has_pending_prefill,
+            False,
         )
         return all_finished
 
@@ -141,7 +149,11 @@ class NpuAsyncEPLBManager(EPLBManager):
             >= get_exec().moe.expert_distribution_recorder_buffer_size
         )
         ready, _ = coordinator.control.vote(
-            coordinator.epoch, Phase.IDLE, -2, enough_samples, False
+            coordinator.epoch,
+            Phase.IDLE,
+            ControlPoint.RECORDER_WINDOW,
+            enough_samples,
+            False,
         )
         if not ready:
             return
