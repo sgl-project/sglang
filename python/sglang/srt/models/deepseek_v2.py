@@ -666,6 +666,29 @@ def _scale_routed_and_add_shared(
     return routed
 
 
+def _check_router_row_ids(input_ids_global, router_rows):
+    """Fail loudly when the vision_topk ids do not describe the router rows.
+
+    `moe_fused_gate` indexes the per-token bias by `input_ids`, so a stale row
+    view here does not raise on its own: it either trips a fused-gate shape
+    assert or silently selects experts from the wrong bias. The MoE transport
+    aligns ids for every CP path it owns (`_align_cp_router_ids`), so a mismatch
+    reaching this point means a caller bypassed the transport (issue #52215).
+    """
+    if input_ids_global is None:
+        # Next-token layers are not hash-routed and carry no token ids.
+        return
+    # Keep the diagnostic dependent on the arguments alone: reading runtime
+    # config here (e.g. `get_parallel().attn_cp_size`) raises before the assert
+    # message is built whenever the `parallel` namespace is not published, which
+    # replaces this AssertionError with a ValueError and hides the real signal.
+    assert input_ids_global.shape[0] == router_rows, (
+        "vision_topk ids do not describe the router rows: "
+        f"ids={tuple(input_ids_global.shape)} rows={router_rows}. "
+        "A caller bypassed the transport alignment (_align_cp_router_ids)."
+    )
+
+
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -1240,6 +1263,7 @@ class DeepseekV2MoE(nn.Module):
             if router_logits_partials is not None:
                 topk_kwargs["router_logits_partials"] = router_logits_partials
             if use_vision_topk:
+                _check_router_row_ids(input_ids_global, hidden_states.shape[0])
                 topk_output = vision_topk(
                     self,
                     router_logits,
@@ -1429,6 +1453,7 @@ class DeepseekV2MoE(nn.Module):
             if router_logits_partials is not None:
                 topk_kwargs["router_logits_partials"] = router_logits_partials
             if use_vision_topk:
+                _check_router_row_ids(input_ids_global, hidden_states.shape[0])
                 topk_output = vision_topk(
                     self,
                     router_logits,
