@@ -2194,6 +2194,9 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    # Hy4-Flash iHC post + pre + RMSNorm through the SM90 single-pass kernels
+    # (out-norm folded at every token count); False keeps the generic kernels.
+    SGLANG_OPT_HY4_FLASH_IHC_SINGLE_PASS = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Shard the ratio-1/2 index sources' dense prefill scores across the
     # attention-TP group and all-gather the selections, instead of every rank

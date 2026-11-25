@@ -31,12 +31,17 @@ from sglang.kernels.ops.layernorm.hy4_ihc import (
     hy4_ihc_post_pre_norm,
     ihc_fuses_out_norm,
 )
+from sglang.kernels.ops.layernorm.hy4_ihc_single_pass import (
+    hy4_ihc_single_pass_supported,
+    prepare_hy4_ihc_single_pass,
+)
 from sglang.srt.configs.hy_v4_flash import (
     SLIDING_ATTENTION,
     HYV4FlashConfig,
     HYV4FlashTextConfig,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -1152,10 +1157,18 @@ class HYV4FlashMoE(nn.Module):
 
 class HYV4FlashDecoderLayer(nn.Module):
     def __init__(
-        self, config, layer_id, quant_config, prefix, alt_stream, rope_store=None
+        self,
+        config,
+        layer_id,
+        quant_config,
+        prefix,
+        alt_stream,
+        rope_store=None,
+        ihc_single_pass=False,
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.ihc_single_pass = ihc_single_pass
         self.self_attn = HYV4FlashAttention(
             config,
             layer_id,
@@ -1175,7 +1188,15 @@ class HYV4FlashDecoderLayer(nn.Module):
         self.engram_layer: Optional[FlashEngram] = None
 
     @staticmethod
-    def _ihc_pre(hc_layer, norm, residual, output=None, post=None, out_norm=None):
+    def _ihc_pre(
+        hc_layer,
+        norm,
+        residual,
+        output=None,
+        post=None,
+        out_norm=None,
+        single_pass=False,
+    ):
         """iHC pre and the block's input RMSNorm, with the previous block's
         output RMSNorm (`out_norm`) and iHC post folded in when given."""
         p = hc_layer.hc_pre
@@ -1193,6 +1214,7 @@ class HYV4FlashDecoderLayer(nn.Module):
             norm.variance_epsilon,
             out_norm.weight if out_norm is not None else None,
             out_norm.variance_epsilon if out_norm is not None else 0.0,
+            single_pass=single_pass,
         )
 
     @staticmethod
@@ -1213,7 +1235,9 @@ class HYV4FlashDecoderLayer(nn.Module):
     ):
         """`pending` is the previous layer's (mlp output, post gates, deferred out
         norm); its iHC post is fused into this layer's iHC pre when possible."""
-        defer_norm = ihc_fuses_out_norm(hidden_states.shape[0])
+        defer_norm = ihc_fuses_out_norm(
+            hidden_states.shape[0], single_pass=self.ihc_single_pass
+        )
         if pending is not None and self.engram_layer is not None:
             hidden_states = self._finish_post(hidden_states, pending)
             pending = None
@@ -1222,11 +1246,18 @@ class HYV4FlashDecoderLayer(nn.Module):
             if self.engram_layer is not None:
                 residual = self.engram_layer(residual, engram_hashes)
             residual, x, post = self._ihc_pre(
-                self.hc_attn_layer, self.input_layernorm, residual
+                self.hc_attn_layer,
+                self.input_layernorm,
+                residual,
+                single_pass=self.ihc_single_pass,
             )
         else:
             residual, x, post = self._ihc_pre(
-                self.hc_attn_layer, self.input_layernorm, hidden_states, *pending
+                self.hc_attn_layer,
+                self.input_layernorm,
+                hidden_states,
+                *pending,
+                single_pass=self.ihc_single_pass,
             )
         context = get_attn_tp_context()
         context.set_attn_inputs(
@@ -1249,6 +1280,7 @@ class HYV4FlashDecoderLayer(nn.Module):
             x,
             post,
             self.self_attn.out_norm if defer_norm else None,
+            single_pass=self.ihc_single_pass,
         )
         x = self.mlp(x, forward_batch, apply_out_norm=not defer_norm)
         return residual, (x, post, self.mlp.out_norm if defer_norm else None)
@@ -1275,6 +1307,16 @@ class HYV4FlashModel(nn.Module):
             **get_embedding_tp_kwargs(),
         )
         self.alt_stream = None
+        device = torch.device("cuda", torch.cuda.current_device())
+        ihc_single_pass = (
+            envs.SGLANG_OPT_HY4_FLASH_IHC_SINGLE_PASS.get()
+            and hy4_ihc_single_pass_supported(
+                hc_mult=config.hc_mult,
+                hidden_size=config.hidden_size,
+                dtype=self.embed_tokens.weight.dtype,
+                device=device,
+            )
+        )
         self.rope_store = (
             _MRopePositionStore(config.mrope_section)
             if visual_token_ids is not None
@@ -1288,9 +1330,17 @@ class HYV4FlashModel(nn.Module):
                 f"{prefix}.layers.{i}",
                 self.alt_stream,
                 rope_store=self.rope_store,
+                ihc_single_pass=ihc_single_pass,
             )
             for i in range(config.num_hidden_layers)
         )
+        if ihc_single_pass:
+            out_norms = [layer.self_attn.out_norm for layer in self.layers]
+            out_norms += [layer.mlp.out_norm for layer in self.layers]
+            prepare_hy4_ihc_single_pass(
+                device=device,
+                out_norm_variants=tuple({n is not None for n in out_norms}),
+            )
         self.engram_hasher = None
         self.engram_index = {}
         if config.engram_layer_ids:

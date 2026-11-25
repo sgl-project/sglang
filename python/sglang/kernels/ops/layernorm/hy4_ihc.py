@@ -7,6 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.layernorm.hy4_ihc_single_pass import hy4_ihc_single_pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -738,10 +740,10 @@ _IHC_DOT_BLOCK_K = 128
 _IHC_DOT_POST_CONFIG = (64, 256, 8)  # (BLOCK_T, BLOCK_K, num_warps)
 
 
-def ihc_fuses_out_norm(num_tokens: int) -> bool:
+def ihc_fuses_out_norm(num_tokens: int, single_pass: bool = False) -> bool:
     """Whether `hy4_ihc_post_pre_norm` can take the output RMSNorm for this many
-    tokens."""
-    return num_tokens < _IHC_TOKEN_BLOCKED_MIN_T
+    tokens; the single-pass kernel takes it at every token count."""
+    return single_pass or num_tokens < _IHC_TOKEN_BLOCKED_MIN_T
 
 
 def hy4_ihc_post_pre_norm(
@@ -758,14 +760,35 @@ def hy4_ihc_post_pre_norm(
     rms_eps: float,
     out_norm_weight: torch.Tensor | None = None,
     out_norm_eps: float = 0.0,
+    single_pass: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """iHC post (when `output` is given) + iHC pre + RMSNorm in two launches.
+    """iHC post (when `output` is given) + iHC pre + RMSNorm.
 
     Returns (new residual, normalized block input, new post gates). Without
     `output` the residual is used as is and returned unchanged.
     `out_norm_weight` applies the previous block's output RMSNorm to `output`
     first; only for token counts where `ihc_fuses_out_norm` holds.
+    `single_pass` selects the SM90 kernels of `hy4_ihc_single_pass`; set it only
+    where `hy4_ihc_single_pass_supported` holds.
     """
+    if single_pass:
+        # H200-tuned, hidden 3072 only (one launch at decode sizes); the kernels
+        # below serve every other architecture and shape.
+        return hy4_ihc_single_pass(
+            output,
+            residual,
+            post,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            magnitude,
+            norm_eps,
+            hc_eps,
+            rms_weight,
+            rms_eps,
+            out_norm_weight,
+            out_norm_eps,
+        )
     residual = residual.contiguous()
     hc_fn = hc_fn.contiguous()
     T, hc_mult, hidden_size = residual.shape
