@@ -148,30 +148,56 @@ class TestLIMState(CustomTestCase):
                 **self.options(prefill_workspace_tokens=129)
             )
             configurator = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
-            configurator._sparse_budget = plan
-            configurator._pd_sparse_decode = False
-            configurator._kvc = SimpleNamespace(sparse_kv_budget_plan=None)
+            configurator._fused_sparse_kv = True
+            configurator._page_shard_scratch_bytes = 256
+            configurator._is_fused_sparse_offload_pd_decode_worker = False
+            configurator._kvc = SimpleNamespace(
+                sparse_kv_budget_plan=None,
+                model_config=None,
+                kv_cache_dtype=None,
+                attn_dp_size=1,
+            )
             configurator._cell_size = 8
-            configurator._fixed_overhead_bytes = plan.managed_hbm_bytes
-            required = plan.managed_hbm_bytes + 256 * 8
-            with patch(
-                "sglang.srt.model_executor.pool_configurator.get_schedule",
-                return_value=SimpleNamespace(max_total_tokens=129),
+            configurator._num_layers = 1
+            required = (
+                configurator._page_shard_scratch_bytes
+                + plan.managed_hbm_bytes
+                + 256 * 8
+            )
+            with (
+                patch(
+                    "sglang.srt.model_executor.pool_configurator.get_schedule",
+                    return_value=SimpleNamespace(max_total_tokens=129),
+                ),
+                patch(
+                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.build_sparse_kv_budget_options",
+                    return_value={},
+                ),
+                patch(
+                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparse_kv_budget",
+                    return_value=plan,
+                ),
             ):
+                with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
+                    configurator.calculate_pool_sizes(0, 128)
+                self.assertIsNone(configurator._kvc.sparse_kv_budget_plan)
                 result = configurator.calculate_pool_sizes(
                     required - int(not fits), 128
                 )
             selected = configurator._kvc.sparse_kv_budget_plan
             self.assertEqual(plan.prefill_workspace_tokens, 129)
             self.assertEqual(selected.prefill_workspace_tokens, 129 if fits else 0)
-            self.assertGreaterEqual(result.max_total_num_tokens, 256)
+            if fits:
+                self.assertEqual(result.max_total_num_tokens, 256)
+            else:
+                self.assertGreater(result.max_total_num_tokens, 256)
             # A later configurator uses the shared finalized decision.
             later = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
             later._kvc = configurator._kvc
-            later._sparse_budget = selected
-            later._pd_sparse_decode = False
+            later._fused_sparse_kv = True
+            later._page_shard_scratch_bytes = configurator._page_shard_scratch_bytes
+            later._is_fused_sparse_offload_pd_decode_worker = False
             later._cell_size = 8
-            later._fixed_overhead_bytes = selected.managed_hbm_bytes
             with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
                 later.calculate_pool_sizes(0, 128)
             self.assertIs(later._kvc.sparse_kv_budget_plan, selected)

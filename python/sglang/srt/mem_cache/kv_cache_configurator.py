@@ -282,6 +282,7 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
         BudgetPlan,
+        SparseKVHBMSizing,
     )
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv.storage import KVStorage
@@ -609,13 +610,16 @@ class KVCacheConfigurator:
             if reason is not None:
                 raise ValueError(reason)
 
+        sparse_kv_hbm_sizing = None
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert self.memory_pool_config is not None, (
                 "Draft worker requires memory_pool_config"
             )
             config = self.memory_pool_config
         else:
-            config = self._resolve_memory_pool_config(pre_model_load_memory)
+            config, sparse_kv_hbm_sizing = self._resolve_memory_pool_config(
+                pre_model_load_memory
+            )
 
         sizes = self._derive_pool_sizes(config=config)
 
@@ -623,6 +627,7 @@ class KVCacheConfigurator:
             sizes=sizes,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            sparse_kv_hbm_sizing=sparse_kv_hbm_sizing,
         )
         state = pools.state
         if state is not None:
@@ -762,6 +767,7 @@ class KVCacheConfigurator:
         sizes: _PoolSizes,
         req_to_token_pool: Optional[ReqToTokenPool],
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
+        sparse_kv_hbm_sizing: Optional[SparseKVHBMSizing] = None,
     ) -> _InitializedPools:
         """Initialize the memory pools."""
         token_to_kv_pool = None
@@ -951,15 +957,29 @@ class KVCacheConfigurator:
         if budget is not None and not self.is_draft_worker:
             budget.bind_native_pool(token_to_kv_pool)
             token_to_kv_pool.sparse_kv_budget_plan = budget
-            logger.info(
-                "Fused sparse KV pool allocated (per attention DP rank): "
-                "bs=%d, token_capacity=%d, C=%d, context_len=%d (model_context_len=%d)",
-                sizes.max_running_requests,
-                sizes.max_total_num_tokens,
-                budget.cache_tokens,
-                budget.context_len,
-                self.model_config.context_len,
-            )
+            if sparse_kv_hbm_sizing is not None:
+                logger.info(
+                    "Fused sparse KV pool allocated (per attention DP rank): "
+                    "available_hbm_bytes=%d, planned_hbm_bytes=%d, remaining_hbm_bytes=%d, "
+                    "bs=%d, resident_bs=%d, native_kv_bytes=%d, resident_kv_bytes=%d, "
+                    "indexer_k_tokens=%d, indexer_k_physical_tokens=%d, indexer_k_hbm=%.3f GiB, "
+                    "C=%d, context_len=%d, model_context_len=%d, full_context_bytes_per_request=%d",
+                    sparse_kv_hbm_sizing.available_bytes,
+                    sparse_kv_hbm_sizing.planned_bytes,
+                    sparse_kv_hbm_sizing.available_bytes
+                    - sparse_kv_hbm_sizing.planned_bytes,
+                    sizes.max_running_requests,
+                    budget.resident_rows - 1,
+                    sparse_kv_hbm_sizing.native_kv_bytes,
+                    budget.device_kv_bytes,
+                    sizes.max_total_num_tokens,
+                    budget.host_token_capacity,
+                    token_to_kv_pool.mem_usage,
+                    budget.cache_tokens,
+                    budget.context_len,
+                    self.model_config.context_len,
+                    budget.full_context_bytes_per_request,
+                )
 
         if self.kv_shard_rank is not None:
             # Hybrid pools stripe their inner full-attention pool.
@@ -3518,9 +3538,10 @@ class KVCacheConfigurator:
 
     def _resolve_memory_pool_config(
         self, pre_model_load_memory: int
-    ) -> MemoryPoolConfig:
-        """Profile GPU memory and resolve all pool parameters into a config."""
+    ) -> tuple[MemoryPoolConfig, Optional[SparseKVHBMSizing]]:
+        """Resolve the pool configuration and the fused sparse allocation budget."""
         from sglang.srt.model_executor.pool_configurator import (
+            DefaultPoolConfigurator,
             create_memory_pool_configurator,
         )
 
@@ -3528,13 +3549,13 @@ class KVCacheConfigurator:
         # the free-memory profile the pool sizes come from differs between the two.
         replayed = get_foundry_adapter().replay_saved_memory_pool_config()
         if replayed is not None:
-            return replayed
+            return replayed, None
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
         if get_memory().enable_unified_memory and not self.is_draft_worker:
             config.mem_fraction_static = get_schedule().mem_fraction_static
             get_foundry_adapter().record_memory_pool_config(config)
-            return config
+            return config, None
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
@@ -3549,10 +3570,15 @@ class KVCacheConfigurator:
             )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
+        sparse_kv_hbm_sizing = None
+        if isinstance(configurator, DefaultPoolConfigurator):
+            sparse_kv_hbm_sizing = configurator.get_sparse_kv_hbm_sizing(
+                available_bytes, config.max_total_num_tokens
+            )
         config.mem_fraction_static = get_schedule().mem_fraction_static
         # Foundry SAVE records the resolved config for LOAD.
         get_foundry_adapter().record_memory_pool_config(config)
-        return config
+        return config, sparse_kv_hbm_sizing
 
     def config_from_budget(
         self, budget_bytes: int, *, cap_tokens: Optional[int] = None

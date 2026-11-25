@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import msgspec
 import torch
 
-from sglang.srt.utils.common import ceil_align, ceil_div
+from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -35,6 +35,14 @@ class BufferSpec(msgspec.Struct, frozen=True):
         if fill_value is not None:
             return torch.full(self.shape, fill_value, dtype=self.dtype, device=device)
         return torch.empty(self.shape, dtype=self.dtype, device=device)
+
+
+class SparseKVHBMSizing(msgspec.Struct, frozen=True, kw_only=True):
+    """Final HBM sizing for the startup allocation log."""
+
+    available_bytes: int
+    planned_bytes: int
+    native_kv_bytes: int
 
 
 class BudgetPlan:
@@ -167,6 +175,15 @@ class BudgetPlan:
         )
 
     @property
+    def full_context_bytes_per_request(self) -> int:
+        return get_sparse_kv_full_context_bytes_per_request(
+            self.cache_tokens,
+            self.context_len,
+            self.num_layers,
+            self.kv_cache_dim * self.kv_dtype.itemsize,
+        )
+
+    @property
     def host_kv_bytes(self) -> int:
         """Report the physical Host allocation only after native pool binding."""
         if self.host_kv_spec is None:
@@ -245,9 +262,16 @@ def resolve_sparse_kv_budget(
         or kv_bytes_per_token != (kv_lora_rank + qk_rope_head_dim) * kv_dtype.itemsize
     ):
         raise ValueError("Native LIM requires BF16 MLA KV storage.")
-    capacity = resolve_sparse_kv_cache_tokens(
-        cache_tokens, max_query_width, top_k, page_size
-    )
+    if not cache_tokens:
+        cache_tokens = get_sparse_kv_cache_tokens(cache_tokens, max_query_width, top_k)
+    if (
+        cache_tokens < max_query_width * top_k
+        or cache_tokens + page_size > MISS_CAPACITY
+        or cache_tokens % page_size
+    ):
+        raise ValueError(
+            f"Native LIM cache capacity must cover query width * TopK, be <= {MISS_CAPACITY - page_size} and aligned to {page_size}."
+        )
     resident_rows = request_rows if resident_rows is None else resident_rows
     return BudgetPlan(
         request_rows=request_rows,
@@ -259,7 +283,7 @@ def resolve_sparse_kv_budget(
         copy_sfa_query_heads=copy_sfa_query_heads,
         max_query_width=max_query_width,
         batch_capacity=max(resident_rows, graph_batch_capacity),
-        cache_tokens=capacity,
+        cache_tokens=cache_tokens,
         page_size=page_size,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
@@ -268,49 +292,34 @@ def resolve_sparse_kv_budget(
     )
 
 
-def resolve_sparse_kv_cache_tokens(
-    cache_tokens: int, max_query_width: int, top_k: int, page_size: int
+def get_sparse_kv_cache_tokens(
+    configured_cache_tokens: int, max_query_width: int, top_k: int
 ) -> int:
-    capacity = cache_tokens or max_query_width * top_k
-    if (
-        capacity < max_query_width * top_k
-        or capacity + page_size > MISS_CAPACITY
-        or capacity % page_size
-    ):
-        raise ValueError(
-            f"Native LIM cache capacity must cover query width * TopK, be <= {MISS_CAPACITY - page_size} and aligned to {page_size}."
-        )
-    return capacity
+    """Return the configured resident capacity or the default query union size."""
+    return configured_cache_tokens or max_query_width * top_k
+
+
+def get_sparse_kv_full_context_bytes_per_request(
+    cache_tokens: int, context_len: int, num_layers: int, kv_bytes_per_token: int
+) -> int:
+    """Charge the resident window and the full context at the MLA KV rate."""
+    return (cache_tokens + context_len) * num_layers * kv_bytes_per_token
 
 
 def fit_pd_sparse_running_requests(
     requested_rows: int,
     available_bytes: int,
-    page_size: int,
     *,
     cache_tokens: int,
     context_len: int,
     num_layers: int,
     kv_bytes_per_token: int,
-    token_limit: int | None,
-    num_reserved_decode_tokens: int,
 ) -> int:
     """Return the P/D Decode concurrency that fits the full-context budget."""
-    max_rows = requested_rows
-    if token_limit is not None:
-        aligned_limit = token_limit // page_size * page_size
-        min_tokens = ceil_align(page_size + num_reserved_decode_tokens, page_size)
-        if aligned_limit < min_tokens:
-            raise RuntimeError(
-                f"max_total_tokens={token_limit} provides {aligned_limit} page-aligned "
-                f"native tokens, below the P/D Decode minimum of {min_tokens}."
-            )
-        # The native scheduler caps requests at half the usable token capacity.
-        max_rows = min(max_rows, aligned_limit // 2)
-
-    # Charge the resident window and the full context at the MLA KV rate.
-    bytes_per_request = (cache_tokens + context_len) * num_layers * kv_bytes_per_token
-    fitting_rows = min(max_rows, available_bytes // bytes_per_request)
+    bytes_per_request = get_sparse_kv_full_context_bytes_per_request(
+        cache_tokens, context_len, num_layers, kv_bytes_per_token
+    )
+    fitting_rows = min(requested_rows, available_bytes // bytes_per_request)
     if fitting_rows < 1:
         raise RuntimeError(
             "Cannot fit one sparse KV resident row: "

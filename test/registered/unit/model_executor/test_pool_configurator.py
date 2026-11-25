@@ -423,7 +423,7 @@ class TestDefaultConfigurator(CustomTestCase):
                 ),
                 kv_cache_dtype=torch.bfloat16,
                 server_args=SimpleNamespace(
-                    enable_hisparse=False, indexer_kv_cache_dtype="auto"
+                    enable_hisparse=False, indexer_kv_cache_dtype=None
                 ),
                 is_draft_worker=is_draft_worker,
                 mambaish_config=None,
@@ -533,22 +533,26 @@ class TestDefaultConfigurator(CustomTestCase):
         ):
             cfg = DefaultPoolConfigurator(mr)
             self.assertIsNone(mr.sparse_kv_budget_plan)
-            cfg.calculate_pool_sizes(
-                cfg._fixed_overhead_bytes + cfg._cell_size * 1_000_000, 128
-            )
-            selected_plan = mr.sparse_kv_budget_plan
             second_cfg = DefaultPoolConfigurator(mr)
-            self.assertIs(second_cfg._sparse_budget, selected_plan)
+            mock_sparse_budget.assert_not_called()
+            available = cfg._cell_size * 1_000_000
+            sizes = cfg.calculate_pool_sizes(available, 128)
+            selected_plan = mr.sparse_kv_budget_plan
+            self.assertEqual(second_cfg.calculate_pool_sizes(available, 128), sizes)
+            self.assertIs(mr.sparse_kv_budget_plan, selected_plan)
 
         # The compact target indexer and the draft's full native CKV/KPE
         # plus indexer remain in HBM; native BF16 LIM needs no scale buffer.
         self.assertEqual(len(owner_ids), 21)
         self.assertEqual(cfg._cell_size, (21 + 1) * 128 * 2 + 576 * 2)
         self.assertEqual(
-            cfg._fixed_overhead_bytes,
-            mr.sparse_kv_budget_plan.managed_hbm_bytes,
+            cfg.get_sparse_kv_hbm_sizing(
+                available, sizes.max_total_num_tokens
+            ).planned_bytes,
+            cfg._page_shard_scratch_bytes
+            + selected_plan.managed_hbm_bytes
+            + sizes.max_total_num_tokens * cfg._cell_size,
         )
-        self.assertEqual(second_cfg._fixed_overhead_bytes, cfg._fixed_overhead_bytes)
         self.assertEqual(mock_sparse_budget.call_count, 1)
 
     def test_legacy_offload_does_not_reserve_fused_buffers(self):
@@ -573,9 +577,11 @@ class TestDefaultConfigurator(CustomTestCase):
             ),
         ):
             cfg = DefaultPoolConfigurator(mr)
+            sizes = cfg.calculate_pool_sizes(1 << 20, 128)
 
+        self.assertEqual(sizes.max_total_num_tokens, 2048)
         self.assertEqual(cfg._cell_size, 2 * 128 * 2)
-        self.assertEqual(cfg._fixed_overhead_bytes, 0)
+        self.assertEqual(cfg._page_shard_scratch_bytes, 0)
         self.assertIsNone(mr.sparse_kv_budget_plan)
 
     def test_fused_draft_entry_overrides_the_layer_ratio(self):
@@ -1195,24 +1201,26 @@ class TestEagleConfigurator(CustomTestCase):
             # Five BF16 index-K layers and the draft's full KV. Only the
             # target owns bounded residency; BF16 index keys have no scales.
             cell_size = 5 * 128 * 2 + 576 * 2
-            fixed = manager_bytes
             self.assertEqual(cfg._cell_size, cell_size)
-            self.assertEqual(cfg._fixed_overhead_bytes, fixed)
-            available = fixed + 10_000_000
+            available = manager_bytes + unpadded.context_len * cell_size
             sizes = cfg.calculate_pool_sizes(available, 128)
-            used = sizes.max_total_num_tokens * cell_size + cfg._fixed_overhead_bytes
-            self.assertLessEqual(used, available)
+            self.assertEqual(sizes.max_total_num_tokens, unpadded.context_len)
+            self.assertEqual(mr.sparse_kv_budget_plan.managed_hbm_bytes, manager_bytes)
+            self.assertEqual(
+                cfg.get_sparse_kv_hbm_sizing(
+                    available, sizes.max_total_num_tokens
+                ).planned_bytes,
+                available,
+            )
 
             # With automatic C, charge the plan for query width times TopK.
             with envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0):
                 mr.sparse_kv_budget_plan = None
                 automatic = DefaultPoolConfigurator(mr)
-                plan = automatic._sparse_budget
+                automatic.calculate_pool_sizes(available, 128)
+                plan = mr.sparse_kv_budget_plan
                 self.assertEqual(plan.cache_tokens, 3 * 2048)
-                self.assertEqual(
-                    automatic._fixed_overhead_bytes,
-                    plan.managed_hbm_bytes,
-                )
+                self.assertEqual(plan.device_kv_bytes, 3 * 4 * (3 * 2048) * 1152)
 
             # Eager MLP-sync can pad a one-row target to attention TP=8 even
             # when graphs are disabled. Admission reserves the padded LIM metadata.
@@ -1237,6 +1245,9 @@ class TestEagleConfigurator(CustomTestCase):
     def test_sparse_mtp_budget_rows_follow_attention_dp_worker_capacity(self):
         """Budget the target manager per attention-DP worker, including PD slots."""
         from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            get_sparse_kv_budget,
+        )
         from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 
         mr = _make_model_runner(
@@ -1295,12 +1306,7 @@ class TestEagleConfigurator(CustomTestCase):
             ),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparse_kv_budget",
-                side_effect=lambda **kwargs: SimpleNamespace(
-                    managed_hbm_bytes=123,
-                    scale_element_size=torch.float32.itemsize,
-                    context_len=kwargs["context_len"],
-                    request_rows=kwargs["request_rows"],
-                ),
+                wraps=get_sparse_kv_budget,
             ) as mock_sparse_budget,
             mock_cpu_env(tp_size=16),
         ):
@@ -1335,27 +1341,15 @@ class TestEagleConfigurator(CustomTestCase):
                         mr.attn_dp_size = attn_dp
                         mr.sparse_kv_budget_plan = None
                         configurator = DefaultPoolConfigurator(mr)
-                        if extra:
-                            self.assertIsNone(mr.sparse_kv_budget_plan)
-                            self.assertEqual(
-                                configurator._pd_sparse_budget_options["request_rows"],
-                                expected_rows,
-                            )
+                        self.assertIsNone(mr.sparse_kv_budget_plan)
+                        mock_sparse_budget.assert_not_called()
+                        configurator.calculate_pool_sizes(1 << 30, 128)
+                        plan = mr.sparse_kv_budget_plan
+                        self.assertEqual(plan.request_rows, expected_rows)
+                        self.assertEqual(plan.resident_rows, expected_rows - extra)
+                        self.assertEqual(plan.num_layers, 4)
 
-                    calls = mock_sparse_budget.call_args_list
-                    if extra:
-                        self.assertEqual(len(calls), 0)
-                        continue
-                    self.assertEqual(len(calls), 1)
-                    self.assertEqual([call.kwargs["num_layers"] for call in calls], [4])
-                    self.assertEqual(
-                        [call.kwargs["request_rows"] for call in calls],
-                        [expected_rows],
-                        msg=(
-                            f"{requested=}, {attn_dp=}, {dp=}, {extra=}: "
-                            "target residency must use the attention-DP local row count"
-                        ),
-                    )
+                    mock_sparse_budget.assert_called_once()
 
     def test_pd_sparse_best_effort_sets_the_running_limit(self):
         from sglang.srt.environ import envs
@@ -1463,41 +1457,61 @@ class TestEagleConfigurator(CustomTestCase):
             self.assertGreaterEqual(one_request_tokens, min_tokens)
             self.assertLess(one_request_tokens, aligned_context_len)
 
-            for available, cap, rows, tokens in (
-                (request_bytes, None, 1, one_request_tokens),
-                (2 * request_bytes - 1, None, 1, aligned_context_len),
-                (2 * request_bytes, None, 2, 2 * aligned_context_len),
-                (3 * request_bytes, token_limit, 3, token_limit),
-                (5 * request_bytes, None, 4, 4 * aligned_context_len),
+            # The native token cap still bounds admission, but HBM sizes C.
+            native_bs_limit = min_tokens // 2
+            for available, cap, resident_bs, bs, tokens in (
+                (request_bytes, None, 1, 1, one_request_tokens),
+                (2 * request_bytes - 1, None, 1, 1, aligned_context_len),
+                (2 * request_bytes, None, 2, 2, 2 * aligned_context_len),
+                (3 * request_bytes, token_limit, 3, 3, token_limit),
+                (5 * request_bytes, None, 4, 4, 4 * aligned_context_len),
+                (
+                    (native_bs_limit + 1) * request_bytes,
+                    min_tokens,
+                    native_bs_limit + 1,
+                    native_bs_limit,
+                    min_tokens,
+                ),
             ):
                 with self.subTest(available=available, cap=cap):
                     mr.sparse_kv_budget_plan = None
                     mr._profile_available_bytes.return_value = available
                     with (
-                        get_context().override_server_args(
-                            **server_args, max_total_tokens=cap
+                        get_schedule().override(
+                            max_total_tokens=cap,
+                            max_running_requests=max(
+                                max_running_requests, resident_bs * attn_dp_size
+                            ),
                         ),
                         patch(
                             "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.resolve_sparse_kv_budget",
                             wraps=resolve_sparse_kv_budget,
                         ) as resolve_plan,
                     ):
-                        sizes = KVCacheConfigurator._resolve_memory_pool_config(
+                        sizes, sizing = KVCacheConfigurator._resolve_memory_pool_config(
                             mr, pre_model_load_memory=0
                         )
                     self.assertEqual(resolve_plan.call_count, 1)
-                    self.assertEqual(sizes.max_running_requests, rows)
+                    self.assertEqual(sizes.max_running_requests, bs)
                     self.assertEqual(sizes.max_total_num_tokens, tokens)
                     plan = mr.sparse_kv_budget_plan
-                    self.assertEqual(plan.resident_rows, rows + 1)
-                    self.assertEqual(plan.request_rows, rows + extra_rows + 1)
+                    native_bytes = tokens * native_bytes_per_token
+                    planned_bytes = plan.managed_hbm_bytes + native_bytes
+                    self.assertEqual(sizing.available_bytes, available)
+                    self.assertEqual(sizing.planned_bytes, planned_bytes)
+                    self.assertEqual(sizing.native_kv_bytes, native_bytes)
+                    self.assertEqual(plan.resident_rows, resident_bs + 1)
+                    self.assertEqual(plan.request_rows, resident_bs + extra_rows + 1)
                     for name in ("device_k_buffer", "device_v_buffer"):
-                        self.assertEqual(plan.manager_buffers[name].shape[0], rows + 1)
+                        self.assertEqual(
+                            plan.manager_buffers[name].shape[0], resident_bs + 1
+                        )
                     self.assertEqual(
-                        plan.manager_buffers["device_slot_map"].shape[0], rows + 2
+                        plan.manager_buffers["device_slot_map"].shape[0],
+                        resident_bs + 2,
                     )
                     self.assertEqual(
-                        plan.adapter_buffers["last_prefix"].shape[0], rows + 2
+                        plan.adapter_buffers["last_prefix"].shape[0], resident_bs + 2
                     )
 
             mr.sparse_kv_budget_plan = None
@@ -1533,7 +1547,7 @@ class TestEagleConfigurator(CustomTestCase):
                 )
             self.assertIsNone(mr.sparse_kv_budget_plan)
             with get_disagg().override(num_reserved_decode_tokens=decode_reserve):
-                sizes = KVCacheConfigurator._resolve_memory_pool_config(
+                sizes, sizing = KVCacheConfigurator._resolve_memory_pool_config(
                     mr, pre_model_load_memory=0
                 )
             self.assertEqual(sizes.max_running_requests, 1)

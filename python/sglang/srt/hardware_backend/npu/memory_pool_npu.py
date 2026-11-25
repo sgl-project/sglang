@@ -782,16 +782,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
-            and not (
-                envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
-                and (is_draft_worker or get_disagg().disaggregation_mode == "prefill")
-            )
         )
+        disaggregation_mode = None
         if (
             self.enable_sparsity_driven_kv_offload
             and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
-            and get_disagg().disaggregation_mode == "decode"
         ):
+            if is_draft_worker:
+                self.enable_sparsity_driven_kv_offload = False
+            else:
+                disaggregation_mode = get_disagg().disaggregation_mode
+                self.enable_sparsity_driven_kv_offload = (
+                    disaggregation_mode != "prefill"
+                )
+        if disaggregation_mode == "decode":
             if modelslim_cache_layout is not None or self.use_fia_nz:
                 raise ValueError("Ascend PD split KV requires row-major MLA caches.")
             from sgl_kernel_npu.operators.attention.fused_scatter_copy_sparse_flash_attention_split import (

@@ -16,8 +16,8 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     BudgetPlan,
     fit_pd_sparse_running_requests,
+    get_sparse_kv_cache_tokens,
     resolve_sparse_kv_budget,
-    resolve_sparse_kv_cache_tokens,
 )
 from sglang.srt.layers.dp_attention import (
     get_cuda_graph_max_batch_size,
@@ -208,7 +208,7 @@ def get_sparsity_driven_kv_offload_cell_size(
         )
     else:
         num_indexer_layers = num_layers
-    return index_head_dim * element_size * num_indexer_layers
+    return index_head_dim * num_indexer_layers * element_size
 
 
 def build_sparse_kv_budget_options(
@@ -217,13 +217,13 @@ def build_sparse_kv_budget_options(
     kv_dtype: torch.dtype,
     num_layers: int,
     attn_dp_size: int,
-    pd_sparse_decode: bool,
+    is_pd_decode_worker: bool,
 ) -> dict[str, Any]:
     """Resolve the initial sparse budget inputs for this worker."""
     disagg = get_disagg()
     extra_rows = (
         disagg.disaggregation_decode_extra_slots or 0
-        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch
+        if is_pd_decode_worker or disagg.enable_pd_role_switch
         else 0
     )
     running_rows = max(1, get_schedule().max_running_requests // attn_dp_size)
@@ -231,7 +231,7 @@ def build_sparse_kv_budget_options(
     return dict(
         model_config=model_config,
         request_rows=request_rows,
-        resident_rows=running_rows + 1 if pd_sparse_decode else request_rows,
+        resident_rows=running_rows + 1 if is_pd_decode_worker else request_rows,
         context_len=model_config.context_len + get_req_to_token_extra_context_len(),
         top_k=get_sparsity_driven_kv_offload_sparse_context_len(
             model_config=model_config
@@ -262,34 +262,32 @@ def get_sparse_kv_budget(
     page_size = schedule.page_size
     aligned_context = ceil_div(context_len, page_size) * page_size
     max_query_width = get_sparse_kv_max_query_width()
-    cache_tokens = envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get()
+    cache_tokens = get_sparse_kv_cache_tokens(
+        envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
+        max_query_width,
+        top_k,
+    )
+    prefill_rows = 0
     if pd_available_bytes is not None:
-        cache_tokens = resolve_sparse_kv_cache_tokens(
-            cache_tokens, max_query_width, top_k, page_size
-        )
         running_rows = fit_pd_sparse_running_requests(
             resident_rows - 1,
             pd_available_bytes,
-            page_size,
             cache_tokens=cache_tokens,
             context_len=aligned_context,
             num_layers=num_layers,
             kv_bytes_per_token=kv_bytes_per_token,
-            token_limit=schedule.max_total_tokens,
-            num_reserved_decode_tokens=disagg.num_reserved_decode_tokens,
         )
         extra_rows = request_rows - resident_rows
         resident_rows = running_rows + 1
         request_rows = resident_rows + extra_rows
+    elif disagg.disaggregation_mode != "decode":
+        prefill_rows = request_rows - 1
+        if schedule.prefill_max_requests is not None:
+            prefill_rows = min(prefill_rows, schedule.prefill_max_requests)
 
     query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
     # Native SFA accepts 1..64 or 128 query heads per KV head.
     copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
-    prefill_rows = request_rows - 1
-    if disagg.disaggregation_mode == "decode":
-        prefill_rows = 0
-    elif schedule.prefill_max_requests is not None:
-        prefill_rows = min(prefill_rows, schedule.prefill_max_requests)
     if graph_batch_capacity is None:
         # Reserve before admission determines the final request-pool size.
         # Capture buckets may round that size up for attention parallelism.
