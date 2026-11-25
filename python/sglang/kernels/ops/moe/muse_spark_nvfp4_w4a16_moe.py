@@ -20,7 +20,7 @@ BIG_MIN = 2049
 DG_MIN = 769
 SP_MIN = 65  # SP instances exist for NT >= 8 only (batches above 64)
 BIG_TOKENS = 8192
-# init_runtime raises it to the prefill chunk, assumed a multiple of lcm(128, tp)
+# Most tokens of one SP call; init_runtime raises it to the prefill chunk, rounded up to 128
 _BIG_MAXT = 16384
 _BIG_SLOTS = 8 * BIG_TOKENS + 1152
 DYNAMIC_GUESTS = 2
@@ -259,7 +259,8 @@ def _big_workspace(device_index: int) -> dict:
         "h": torch.empty((_BIG_SLOTS, _INTER), dtype=torch.bfloat16, device=dev),
         # per expert a list of up to 8 routes per token (ids may repeat in a token), then ranks
         "rev": torch.empty((_BIG_NE + 1) * _TOP_K * _BIG_MAXT, **i32),
-        "ucnt": torch.empty(_BIG_MAXT // 128 * 64, **i32),
+        # count_unit writes 64 words for every started 128-token unit
+        "ucnt": torch.empty(-(-_BIG_MAXT // 128) * 64, **i32),
         "ctr": torch.zeros(_BIG_CTR, **i32),
     }
     p = _BigParams()
@@ -284,6 +285,8 @@ def _big_workspace(device_index: int) -> dict:
 
 def init_runtime(device: torch.device, max_tokens: int) -> None:
     global _BIG_MAXT
+    # SP pads a chunk to tp * ceil(chunk / tp) tokens: a multiple of 128 covers tp 1, 2, 4, 8
+    max_tokens = -(-max_tokens // 128) * 128
     if max_tokens > _BIG_MAXT:
         _BIG_MAXT = max_tokens
         _big_workspace.cache_clear()  # rev / ucnt are sized by _BIG_MAXT

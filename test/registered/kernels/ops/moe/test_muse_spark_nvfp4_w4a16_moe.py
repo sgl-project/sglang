@@ -258,6 +258,18 @@ def test_kernels_complete_on_sm_partition():
     assert res.returncode == 0, res.stderr[-4000:]
 
 
+@sm90
+def test_big_workspace_holds_padded_chunk():
+    """A prefill chunk that is not a multiple of 128 or of tp: SP pads it to tp * ceil(chunk / tp)
+    tokens, and the large-M kernel writes 64 counters for every started 128-token unit."""
+    chunk = 2 * m._BIG_MAXT + 1
+    m.init_runtime(torch.device(G, 0), chunk)
+    ucnt = m._big_workspace(0)["ucnt"]
+    for tp in (1, 2, 4, 8):
+        M = tp * -(-chunk // tp)
+        assert M <= m._BIG_MAXT and ucnt.numel() >= -(-M // 128) * 64
+
+
 def test_wide_ids_stay_skipped():
     """int64 ids are narrowed to int32 for the kernels; one that would wrap into a
     valid local id (2**32 + e -> e) must stay outside [0, 32 + guests)."""
