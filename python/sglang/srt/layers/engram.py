@@ -1307,9 +1307,12 @@ class EngramEmbedding(nn.Module):
         column_bounds: tuple[int, ...],
         *,
         mxfp4: bool = False,
+        storage_spec: Optional[dict] = None,
     ):
         super().__init__()
         self.dim = dim
+        self.npu_host_table = None
+        self.int8_sym = storage_spec is not None
         self.mxfp4 = mxfp4
         self.row_bytes = _table_row_bytes(dim, mxfp4)
         self.tp_size = get_parallel().tp_size
@@ -1325,7 +1328,60 @@ class EngramEmbedding(nn.Module):
         config = resolve_engram_config(len(column_bounds) - 1)
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
-        if config.replication == EngramReplication.GROUP_SHARDS:
+        if self.int8_sym:
+            expected = {
+                "format": "int8_sym",
+                "weight_dtype": "I8",
+                "layout": "row_major",
+                "group_size": FP8_BLOCK_SIZE,
+                "axis": 1,
+                "scale_dtype": "F8_E8M0",
+            }
+            for key, value in expected.items():
+                if storage_spec.get(key) != value:
+                    raise ValueError(
+                        f"Unsupported Engram storage {key}: {storage_spec.get(key)}"
+                    )
+            if storage_spec.get("weight_shape") != [
+                num_embeddings,
+                dim,
+            ] or storage_spec.get("scale_shape") != [
+                num_embeddings,
+                dim // FP8_BLOCK_SIZE,
+            ]:
+                raise ValueError(
+                    "Engram storage shapes disagree with model configuration"
+                )
+            if not (
+                is_npu()
+                and torch.npu.get_device_name()
+                .replace(" ", "")
+                .startswith("Ascend910B")
+                and not mxfp4
+                and config.placement == EngramPlacement.CPU
+                and config.replication == EngramReplication.NONE
+                and config.lookup == EngramLookup.ALL_REDUCE
+            ):
+                raise ValueError(
+                    "INT8/E8M0 Engram requires per-rank CPU placement and all_reduce on Ascend 910B"
+                )
+            if self.rows:
+                from sglang.srt.hardware_backend.npu.dsv4.engram_host_uva import (
+                    NpuHostInt8Engram,
+                )
+
+                self.npu_host_table = NpuHostInt8Engram(
+                    self.rows, dim, torch.device("npu", torch.npu.current_device())
+                )
+                weight, scale = self.npu_host_table.weight, self.npu_host_table.scale
+            else:
+                weight = torch.empty(0, dim, dtype=torch.int8, device="cpu")
+                scale = torch.empty(
+                    0, dim // FP8_BLOCK_SIZE, dtype=torch.uint8, device="cpu"
+                )
+            self.weight = nn.Parameter(weight, requires_grad=False)
+            self.scale = nn.Parameter(scale, requires_grad=False)
+        elif config.replication == EngramReplication.GROUP_SHARDS:
             self.peer = _GroupShards(
                 num_embeddings,
                 dim,
@@ -1413,6 +1469,14 @@ class EngramEmbedding(nn.Module):
         rows = slice(self.row_start, self.row_start + self.rows)
         dst = param.data[rows] if self._shared else param.data
         src = loaded_weight[rows]
+        if self.int8_sym:
+            expected = torch.int8 if param is self.weight else torch.float8_e8m0fnu
+            if src.dtype != expected or src.shape != dst.shape:
+                raise ValueError(
+                    f"Expected {expected} Engram shard of shape {tuple(dst.shape)}"
+                )
+            dst.copy_(src if param is self.weight else src.view(torch.uint8))
+            return
         # uint8 on either side is an MXFP4 table.
         src_mxfp4, dst_mxfp4 = src.dtype == torch.uint8, dst.dtype == torch.uint8
         assert src.shape == dst.shape and src_mxfp4 == dst_mxfp4, (
@@ -1532,6 +1596,8 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self.new_rows(indices).zero_()
+        if self.npu_host_table is not None:
+            return self.npu_host_table.lookup(indices, self.row_start)
         if self.host_table is None and not _cuda_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
@@ -1764,12 +1830,25 @@ class Engram(nn.Module):
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
+        description = getattr(quant_config, "quant_description", {}) or {}
+        modules = (
+            description.get("optional", {})
+            .get("embedding_storage", {})
+            .get("modules", {})
+        )
+        storage_spec = modules.get(f"layers.{layer_id}.engram.embed")
+        if storage_spec is None and any(
+            k.endswith(f"layers.{layer_id}.engram.embed.quant_type") and v == "INT8_SYM"
+            for k, v in description.items()
+        ):
+            raise ValueError("INT8 Engram declaration is missing storage metadata")
         self.embed = EngramEmbedding(
             layout.num_embeddings[self.layer_hash_index],
             layout.head_dim,
             layer_id,
             column_bounds=layout.column_bounds(self.layer_hash_index),
             mxfp4=_engram_table_is_mxfp4(config),
+            storage_spec=storage_spec,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
