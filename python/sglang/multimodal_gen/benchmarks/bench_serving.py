@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.test.test_utils import print_divider, print_value_formatted
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -140,7 +141,7 @@ def _populate_slo_ms_from_warmups(
     if base_time_ms is None:
         return requests_list
 
-    slo_scale = float(getattr(args, "slo_scale", 3.0))
+    slo_scale = float(args.slo_scale)
     if slo_scale <= 0:
         raise ValueError(f"slo_scale must be positive, got {slo_scale}.")
 
@@ -210,7 +211,6 @@ async def async_request_image_sglang(
             async with session.post(input.api_url, data=data) as response:
                 if response.status == 200:
                     resp_json = await response.json()
-                    output.response_body = resp_json
                     output.success = True
                     output.output_count = _get_response_output_count(resp_json)
                     if "peak_memory_mb" in resp_json:
@@ -242,7 +242,6 @@ async def async_request_image_sglang(
             async with session.post(input.api_url, json=payload) as response:
                 if response.status == 200:
                     resp_json = await response.json()
-                    output.response_body = resp_json
                     output.success = True
                     output.output_count = _get_response_output_count(resp_json)
                     if "peak_memory_mb" in resp_json:
@@ -294,6 +293,8 @@ async def async_request_video_sglang(
         # Explicitly add fps/num_frames if they are not in extra_body (bench_serving logic overrides)
         if input.num_frames:
             data.add_field("num_frames", str(input.num_frames))
+        if input.num_inference_steps is not None:
+            data.add_field("num_inference_steps", str(input.num_inference_steps))
         if input.fps:
             data.add_field("fps", str(input.fps))
 
@@ -393,7 +394,6 @@ async def async_request_video_sglang(
                     status = status_data.get("status")
                     if status == "completed":
                         output.success = True
-                        output.response_body = status_data
                         output.output_count = _get_response_output_count(status_data)
                         if "peak_memory_mb" in status_data:
                             output.peak_memory_mb = status_data["peak_memory_mb"]
@@ -486,7 +486,7 @@ def calculate_metrics(
             {
                 "slo_attainment_rate": slo_attain_all,
                 "slo_met_success": slo_met_success,
-                "slo_scale": getattr(args, "slo_scale", 3.0),
+                "slo_scale": args.slo_scale,
             }
         )
 
@@ -525,6 +525,7 @@ class ProfileReqOutput:
 
 async def async_request_profile(
     api_url: str,
+    admin_api_key: Optional[str] = None,
     session: Optional[aiohttp.ClientSession] = None,
 ) -> ProfileReqOutput:
     """Send a profile start/stop request to the server."""
@@ -536,7 +537,9 @@ async def async_request_profile(
         close_session = True
 
     try:
-        async with session.post(api_url) as response:
+        async with session.post(
+            api_url, headers=admin_auth_headers(admin_api_key)
+        ) as response:
             response_text = await response.text()
             if response.status == 200:
                 output.success = True
@@ -696,7 +699,8 @@ async def benchmark(args):
         # Start profiler if --profile is enabled (after warmup)
         if args.profile:
             profile_output = await async_request_profile(
-                api_url=f"{args.base_url}/start_profile"
+                api_url=f"{args.base_url}/start_profile",
+                admin_api_key=args.admin_api_key,
             )
             if profile_output.success:
                 logger.info(f"Profiler started: {profile_output.message}")
@@ -725,7 +729,8 @@ async def benchmark(args):
     if args.profile:
         logger.info("Stopping profiler and saving traces...")
         profile_output = await async_request_profile(
-            api_url=f"{args.base_url}/stop_profile"
+            api_url=f"{args.base_url}/stop_profile",
+            admin_api_key=args.admin_api_key,
         )
         if profile_output.success:
             logger.info(f"Profiler stopped: {profile_output.message}")
@@ -908,6 +913,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable full pipeline profiling. "
         "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR.",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --profile requires "
+        "(default: SGLANG_ADMIN_API_KEY).",
     )
     parser.add_argument(
         "--log-level",

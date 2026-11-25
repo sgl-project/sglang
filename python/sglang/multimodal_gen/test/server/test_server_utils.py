@@ -59,6 +59,7 @@ from sglang.multimodal_gen.test.test_utils import (
     validate_openai_video,
     validate_video_file,
 )
+from sglang.test.test_utils import ADMIN_LAUNCH_ARGS_FOR_TEST
 
 logger = init_logger(__name__)
 
@@ -406,6 +407,8 @@ class ServerManager:
             "--port",
             str(self.port),
             "--log-level=debug",
+            # The admin routes (weights, LoRA, profiling) refuse a server without one.
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
         if self.extra_args.strip():
             command.extend(shlex.split(self.extra_args))
