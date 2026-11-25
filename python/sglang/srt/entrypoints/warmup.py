@@ -186,13 +186,14 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
 
     # Effective running-request slots of one DP rank (the smallest).
     max_running_requests: int
-    # DP dispatch spreads a round evenly, so each rank gets its own share.
+    # Rounds are sized per DP rank and rely on an even dispatch.
     dp_ranks: int = 1
+    even_dp_dispatch: bool = True
     # Per scheduler; None is unlimited or not applied.
     max_queued_requests: Optional[int]
     # Every tokenizer worker runs this warmup at the same time.
     tokenizer_workers: int = 1
-    # None or <= 0: chunked prefill is off.
+    # The scheduler's own chunk size; None when chunked prefill is off.
     chunked_prefill_size: Optional[int]
     context_len: int
     max_req_input_len: int
@@ -200,8 +201,6 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
     num_reserved_tokens: int
     # Smallest full-attention KV pool over DP ranks, in tokens.
     kv_pool_tokens: int
-    # Smallest sliding-window pool over DP ranks, in tokens; None without one.
-    window_pool_tokens: Optional[int] = None
     page_size: int
     serves_input_logprobs: bool
 
@@ -209,6 +208,8 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
 class ConcurrentPrefillPlan(msgspec.Struct, frozen=True, kw_only=True):
     rounds: List[List[int]]
     logprob_sizes: List[int]
+    # Set when the warmup cannot be shown to be safe; nothing is sent then.
+    skip_reason: Optional[str] = None
 
 
 def concurrent_prefill_limits(
@@ -222,37 +223,28 @@ def concurrent_prefill_limits(
     (one dict per DP rank)."""
     state = internal_states[0]
     spec_algorithm = SpeculativeAlgorithm.from_string(state["speculative_algorithm"])
+    pd_prefill = state.get("disaggregation_mode") == "prefill"
+    load_balance = state["load_balance_method"]
     return ConcurrentPrefillLimits(
         max_running_requests=min(
             s["effective_max_running_requests_per_dp"] for s in internal_states
         ),
         dp_ranks=len(internal_states),
+        # Round robin gives each rank an equal share of a round, and so do the
+        # consecutive bootstrap rooms this warmup sends to a PD prefill server.
+        even_dp_dispatch=len(internal_states) == 1
+        or load_balance == "round_robin"
+        or (pd_prefill and load_balance == "follow_bootstrap_room"),
         # Only the regular scheduler applies the queue limit; a PD prefill
         # server queues requests for bootstrap instead.
-        max_queued_requests=(
-            None
-            if state.get("disaggregation_mode") == "prefill"
-            else state["max_queued_requests"]
-        ),
+        max_queued_requests=None if pd_prefill else state["max_queued_requests"],
         tokenizer_workers=state["tokenizer_worker_num"],
-        chunked_prefill_size=state["chunked_prefill_size"],
+        chunked_prefill_size=state["effective_chunked_prefill_size"],
         context_len=context_len,
         max_req_input_len=max_req_input_len,
         num_reserved_tokens=num_reserved_tokens,
         kv_pool_tokens=min(
             s["memory_usage"]["token_capacity"] for s in internal_states
-        ),
-        window_pool_tokens=min(
-            (
-                tokens
-                for s in internal_states
-                for tokens in (
-                    s["memory_usage"]["token_capacity_swa"],
-                    *s["memory_usage"]["token_capacity_window"].values(),
-                )
-                if tokens is not None
-            ),
-            default=None,
         ),
         page_size=state["page_size"] or 1,
         # UNO refuses logprob requests; the MLX sampling path refuses prompt logprobs.
@@ -266,6 +258,9 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     """Prompt lengths of each concurrent round (1, about 1/8 and all of the
     running slots of every DP rank) and of the input-logprob probes.
 
+    The plan only covers configs where it can show that every request is
+    admitted; for any other config it sends nothing and says why.
+
     Each DP rank gets at least one round budget (two prefill chunks, at least
     `_CONCURRENT_PREFILL_TOKENS`) per round and less than two: each prompt gets
     an equal share plus an offset below that share, stepped by 37 so extends do
@@ -274,35 +269,41 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     page = limits.page_size
     new_tokens = _CONCURRENT_PREFILL_NEW_TOKENS
     chunk = limits.chunked_prefill_size
-    chunked = chunk is not None and chunk > 0
-
-    def pool_bound(pool_tokens: int) -> int:
-        # Admission rounds the prompt up to whole pages and reserves one more page.
-        reserved = limits.num_reserved_tokens + new_tokens
-        return (pool_tokens - reserved) // page * page - 2 * page
-
+    queue = limits.max_queued_requests
     max_prompt = min(
         # The scheduler aborts a prompt of max_req_input_len tokens or more.
         limits.max_req_input_len - 1,
         # The tokenizer counts the reserved slots and the new tokens in the context.
         limits.context_len - limits.num_reserved_tokens - new_tokens - 1,
-        pool_bound(limits.kv_pool_tokens),
+        # Admission rounds the prompt up to whole pages and reserves one more page.
+        (limits.kv_pool_tokens - limits.num_reserved_tokens - new_tokens) // page * page
+        - 2 * page,
     )
-    if not chunked and limits.window_pool_tokens is not None:
-        # Admission shrinks a chunk to fit the sliding-window pool; without
-        # chunking the whole prompt must fit, or it waits forever.
-        max_prompt = min(max_prompt, pool_bound(limits.window_pool_tokens))
-    slots = limits.max_running_requests
-    if limits.max_queued_requests is not None:
-        # A rank's share of a round can arrive in one scheduler poll, so the
-        # shares of all tokenizer workers must fit in that rank's waiting queue.
-        slots = min(slots, limits.max_queued_requests // limits.tokenizer_workers)
-    if max_prompt < 1 or slots < 1:
-        return ConcurrentPrefillPlan(rounds=[], logprob_sizes=[])
+    skip_reason = None
+    if chunk is None:
+        # Without chunking a prompt must fit every pool (sliding-window ones
+        # too) in one piece.
+        skip_reason = "chunked prefill is off"
+    elif not limits.even_dp_dispatch:
+        skip_reason = "DP dispatch is load based, so a rank's share is unknown"
+    elif queue is not None and limits.tokenizer_workers > 1:
+        # The workers' requests interleave, so no worker can bound what one
+        # rank's waiting queue receives.
+        skip_reason = "several tokenizer workers share a request queue limit"
+    elif queue is not None and queue < 1:
+        skip_reason = "the request queue limit is 0"
+    elif max_prompt < 1:
+        skip_reason = "the context or the KV pool is too small"
+    if skip_reason is not None:
+        return ConcurrentPrefillPlan(
+            rounds=[], logprob_sizes=[], skip_reason=skip_reason
+        )
 
-    budget = _CONCURRENT_PREFILL_TOKENS
-    if chunked:
-        budget = max(budget, 2 * chunk)
+    slots = limits.max_running_requests
+    if queue is not None:
+        # A rank's share of a round can arrive in one scheduler poll.
+        slots = min(slots, queue)
+    budget = max(_CONCURRENT_PREFILL_TOKENS, 2 * chunk)
     rounds = []
     for n in sorted({1, slots // 8 or 1, slots}):
         share = max(1, budget // n)
@@ -359,6 +360,9 @@ async def concurrent_prefill(
             num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
         )
         plan = concurrent_prefill_plan(limits)
+        if plan.skip_reason is not None:
+            logger.info(f"Skipping concurrent_prefill: {plan.skip_reason}")
+            return
         logger.info(
             f"concurrent_prefill: {limits=}, round sizes {[len(r) for r in plan.rounds]}"
         )

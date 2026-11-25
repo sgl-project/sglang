@@ -12,7 +12,6 @@ from sglang.srt.entrypoints.warmup import (
     concurrent_prefill_limits,
     concurrent_prefill_plan,
 )
-from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,6 +40,8 @@ def _internal_state(**overrides):
         "effective_max_running_requests_per_dp": 32,
         "max_queued_requests": None,
         "chunked_prefill_size": 16384,
+        "effective_chunked_prefill_size": 16384,
+        "load_balance_method": "round_robin",
         "page_size": 1,
         "memory_usage": {
             "token_capacity": 1888043,
@@ -67,11 +68,14 @@ class _RecordingTokenizerManager:
     num_reserved_tokens = 0
     model_config = _FakeModelConfig()
 
-    def __init__(self):
+    def __init__(self, **state_overrides):
         self.requests = []
+        self.state = _internal_state(
+            effective_max_running_requests_per_dp=8, **state_overrides
+        )
 
     async def get_internal_state(self):
-        return [_internal_state(effective_max_running_requests_per_dp=8)]
+        return [self.state]
 
     def generate_request(self, req, request):
         self.requests.append(req)
@@ -87,7 +91,14 @@ class TestConcurrentPrefillPlan(CustomTestCase):
         """The plan the cold-start TTFT gain was measured with: rounds of 1, 4
         and 32 prompts (40K tokens per share, lengths stepped by 37), then the
         two input-logprob probes."""
-        plan = concurrent_prefill_plan(_limits())
+        limits = concurrent_prefill_limits(
+            [_internal_state()],
+            context_len=131072,
+            max_req_input_len=131066,
+            num_reserved_tokens=0,
+        )
+        self.assertEqual(limits, _limits())
+        plan = concurrent_prefill_plan(limits)
         self.assertEqual(
             plan.rounds,
             [
@@ -135,24 +146,47 @@ class TestConcurrentPrefillPlan(CustomTestCase):
             concurrent_prefill_plan(_limits(max_queued_requests=0)).rounds, []
         )
 
-    def test_tokenizer_workers_share_the_waiting_queue(self):
-        """Each tokenizer worker runs this warmup at the same time, so their
-        requests together (rounds and the one-at-a-time logprob probes) must
-        fit in the waiting queue."""
-        limits = concurrent_prefill_limits(
-            [_internal_state(max_queued_requests=2, tokenizer_worker_num=2)],
-            context_len=131072,
-            max_req_input_len=131066,
-            num_reserved_tokens=0,
-        )
-        plan = concurrent_prefill_plan(limits)
-        self.assertNotEqual(plan.rounds, [])
-        self.assertLessEqual(2 * max(len(r) for r in plan.rounds), 2)
-        self.assertEqual(plan.logprob_sizes, [513, 512])
+    def test_tokenizer_workers_with_a_queue_limit_send_nothing(self):
+        """Every tokenizer worker runs this warmup at the same time and their
+        requests interleave in DP dispatch, so no worker can bound what one
+        rank's waiting queue receives: with a queue limit, the warmup skips."""
         plan = concurrent_prefill_plan(
-            _limits(max_queued_requests=1, tokenizer_workers=2)
+            _limits(max_queued_requests=64, tokenizer_workers=2)
         )
         self.assertEqual((plan.rounds, plan.logprob_sizes), ([], []))
+        # Without a queue limit the workers only wait in the queue.
+        plan = concurrent_prefill_plan(_limits(tokenizer_workers=2))
+        self.assertEqual([len(r) for r in plan.rounds], [1, 4, 32])
+
+    def test_load_based_dp_dispatch_sends_nothing(self):
+        """Rounds are sized per DP rank, but total_tokens dispatch balances
+        tokens, not requests: a 128-prompt round of uneven lengths over four
+        32-slot ranks can put 33 prompts on one rank, over a queue limit of 32."""
+
+        def round_sizes(method, mode="null"):
+            states = [
+                _internal_state(
+                    max_queued_requests=32,
+                    load_balance_method=method,
+                    disaggregation_mode=mode,
+                )
+                for _ in range(4)
+            ]
+            limits = concurrent_prefill_limits(
+                states,
+                context_len=131072,
+                max_req_input_len=131066,
+                num_reserved_tokens=0,
+            )
+            return [len(r) for r in concurrent_prefill_plan(limits).rounds]
+
+        for method in ("total_tokens", "total_requests"):
+            self.assertEqual(round_sizes(method), [], method)
+        self.assertEqual(round_sizes("round_robin"), [4, 16, 128])
+        # Consecutive bootstrap rooms spread evenly on a PD prefill server.
+        self.assertEqual(
+            round_sizes("follow_bootstrap_room", mode="prefill"), [4, 16, 128]
+        )
 
     def test_pd_prefill_ignores_the_queue_limit(self):
         """A PD prefill scheduler never applies --max-queued-requests, so the
@@ -204,35 +238,6 @@ class TestConcurrentPrefillPlan(CustomTestCase):
         charged = -(-longest // page) * page + page + 8
         self.assertLessEqual(charged, 32768)
 
-    def test_prompt_fits_the_window_pool_without_chunking(self):
-        """A 4,096-token sliding-window pool with chunked prefill off: the whole
-        prompt is charged to the window pool at once, and admission needs it
-        to fit below the pool (strictly), so a longer prompt waits forever."""
-        for window in (1024, 8192):
-            state = _internal_state(
-                chunked_prefill_size=-1,
-                memory_usage={
-                    "token_capacity": 1888043,
-                    "token_capacity_swa": 4096,
-                    "token_capacity_window": {"swa": 4096},
-                },
-            )
-            limits = concurrent_prefill_limits(
-                [state],
-                context_len=131072,
-                max_req_input_len=131066,
-                num_reserved_tokens=0,
-            )
-            plan = concurrent_prefill_plan(limits)
-            longest = max(max(r) for r in plan.rounds)
-            charged = estimate_swa_kv_tokens(
-                longest, 8, sliding_window_size=window, page_size=1
-            )
-            self.assertLess(charged, 4096, window)
-        # Chunked prefill shrinks the chunk to the window pool instead.
-        plan = concurrent_prefill_plan(_limits(window_pool_tokens=4096))
-        self.assertEqual(plan.rounds[0], [40001])
-
     def test_skips_logprob_probes_the_server_refuses(self):
         for overrides in (
             {"speculative_algorithm": "UNO"},
@@ -270,6 +275,22 @@ class TestConcurrentPrefillRequests(CustomTestCase):
             asyncio.run(concurrent_prefill("prefill", tm))
         rooms = [{r.bootstrap_room for r in tm.requests} for tm in workers]
         self.assertEqual(rooms[0] & rooms[1], set())
+
+    def test_scheduler_without_chunking_gets_nothing(self):
+        """A multimodal Transformers model keeps --chunked-prefill-size 16384 in
+        the server args, but its scheduler turns chunking off, so a 40,001-token
+        prompt must fit a 4,096-token sliding-window pool in one piece and
+        waits forever."""
+        tm = _RecordingTokenizerManager(
+            effective_chunked_prefill_size=None,
+            memory_usage={
+                "token_capacity": 1888043,
+                "token_capacity_swa": 4096,
+                "token_capacity_window": {"swa": 4096},
+            },
+        )
+        asyncio.run(concurrent_prefill("null", tm))
+        self.assertEqual(tm.requests, [])
 
     def test_decode_server_sends_nothing(self):
         tm = _RecordingTokenizerManager()
