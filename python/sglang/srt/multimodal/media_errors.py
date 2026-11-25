@@ -5,8 +5,9 @@ import errno
 import os
 
 import requests
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
+from sglang.srt.multimodal.audio_from_video import AudioContainerDecodeError
 from sglang.srt.multimodal.media_io import ImageData, ImageDecodeError, VideoData
 
 
@@ -41,8 +42,12 @@ def media_load_error(error_type, modality, data, error):
         detail = "Invalid base64 media"
     elif isinstance(error, Image.DecompressionBombError):
         detail = "Image exceeds the decompression bomb limit"
+    elif isinstance(error, AudioContainerDecodeError):
+        detail = str(AudioContainerDecodeError())
     elif isinstance(error, ImageDecodeError):
         detail = "Could not decode image"
+        if isinstance(error.__cause__, UnidentifiedImageError):
+            detail += ": cannot identify image file"
 
     cause_type = next(
         (

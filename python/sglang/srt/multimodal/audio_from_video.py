@@ -20,9 +20,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_INVALID_AUDIO_CONTAINER_MESSAGE = (
-    "Invalid input_audio: no decodable audio stream was found in the media container."
-)
 _AUDIO_CONTAINER_SIGNATURES = (
     ((4, b"ftyp"),),
     ((0, b"RIFF"), (8, b"AVI ")),
@@ -33,8 +30,13 @@ _AUDIO_CONTAINER_SIGNATURES = (
 )
 
 
-class _AudioContainerDecodeError(ValueError):
-    pass
+class AudioContainerDecodeError(ValueError):
+    """A public diagnostic that never contains codec output or media contents."""
+
+    def __init__(self):
+        super().__init__(
+            "Invalid input_audio: no decodable audio stream was found in the media container."
+        )
 
 
 def is_audio_container(data: bytes) -> bool:
@@ -64,9 +66,9 @@ def decode_audio_container(
 ) -> np.ndarray:
     """Strictly decode the first audio stream from a supported container."""
     if not isinstance(target_sr, int) or target_sr <= 0:
-        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+        raise AudioContainerDecodeError()
     if isinstance(source, bytes) and not source:
-        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+        raise AudioContainerDecodeError()
 
     try:
         import av
@@ -74,7 +76,7 @@ def decode_audio_container(
         input_source = io.BytesIO(source) if isinstance(source, bytes) else source
         with av.open(input_source) as container:
             if not container.streams.audio:
-                raise _AudioContainerDecodeError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+                raise AudioContainerDecodeError()
 
             audio_stream = container.streams.audio[0]
             if mono:
@@ -115,20 +117,20 @@ def decode_audio_container(
                     len(chunks),
                     first_decode_error,
                 )
-    except _AudioContainerDecodeError:
+    except AudioContainerDecodeError:
         raise
     except Exception as error:
-        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE) from error
+        raise AudioContainerDecodeError() from error
 
     if not chunks:
         if first_decode_error is not None:
-            raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE) from first_decode_error
-        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+            raise AudioContainerDecodeError() from first_decode_error
+        raise AudioContainerDecodeError()
 
     waveform = np.concatenate(chunks, axis=0)
     expected_ndim = 1 if mono else 2
     if waveform.ndim != expected_ndim or waveform.size == 0:
-        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+        raise AudioContainerDecodeError()
     return np.ascontiguousarray(waveform, dtype=np.float32)
 
 
