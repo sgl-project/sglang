@@ -22,18 +22,15 @@ The format of `CI_PERMISSIONS.json` is as follows:
 
 Permissions are assigned according to the following rules:
 
-1. Add the top 50 contributors from the last 120 days with full permissions, no cooldown, and the reason "top contributor".
-2. Load all users from the existing `CI_PERMISSIONS.json` file and update their entries as follows:
-   - If a user is already covered by rule 1, skip that user.
-   - If the old reason of a user is "top contributor" but they are not in the current top contributors list, change their configuration to:
-       {
-           "can_tag_run_ci_label": true,
-           "can_rerun_failed_ci": true,
-           "cooldown_interval_minutes": 60,
-           "reason": "custom override"
-       }
-    - For all other cases, preserve the original configuration unchanged.
-3. All other users receive no permissions and a 120-minute cooldown (they are omitted from the file).
+1. Users with write, maintain, or admin access are never listed: write access
+   grants every CI permission (see slash_command_handler.py).
+2. Nobody is added automatically; maintainers add entries by hand.
+3. Existing entries:
+   - If the reason is anything other than "top contributor" or "custom override",
+     the entry is a manual exception: keep it unchanged.
+   - Otherwise, if the user has no commit on main in the last 90 days, drop it.
+   - Otherwise keep it unchanged.
+4. All other users receive no permissions and a 120-minute cooldown (they are omitted from the file).
 
 `cooldown_interval_minutes` is not only a rate limit: 0 also authorizes
 `/rerun-test` and `/rerun-group`, which never pass through `pr-gate.yml`.
@@ -44,12 +41,14 @@ Usage:
 
     # Sort-only mode (no network calls, no GH_TOKEN required)
     python3 update_ci_permission.py --sort-only
+
+    # Report what the rules would change, without writing
+    python3 update_ci_permission.py --check
 """
 
 import argparse
 import json
 import os
-from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -62,10 +61,15 @@ REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
 FILE_NAME = os.path.join(os.path.dirname(__file__), "CI_PERMISSIONS.json")
 HEADERS = {}
+WINDOW_DAYS = 90
+WRITE_PERMISSIONS = ("admin", "maintain", "write")
+# Reasons the old automatic rules wrote; an entry with any other reason is a manual
+# exception and is kept as is.
+GENERATED_REASONS = ("top contributor", "custom override")
 
 
-def github_api_get(endpoint, params=None):
-    """Helper to make paginated GitHub API requests."""
+def github_api_get(endpoint, params=None, allow_missing=False):
+    """Helper to make paginated GitHub API requests; None on 404 if allow_missing."""
     if requests is None:
         raise RuntimeError(
             "The requests package is required. Install it or use --sort-only."
@@ -80,10 +84,11 @@ def github_api_get(endpoint, params=None):
 
     while url:
         response = requests.get(url, headers=HEADERS, params=params)
+        if response.status_code == 404 and allow_missing:
+            return None
         if response.status_code != 200:
-            print(f"Error fetching {url}: {response.status_code} {response.text}")
-            # If we fail to fetch, strictly return what we have or empty to avoid crashing logic
-            break
+            # A partial commit list would mark active users inactive; fail instead.
+            raise RuntimeError(f"GET {url}: {response.status_code} {response.text}")
 
         data = response.json()
         if isinstance(data, list):
@@ -103,40 +108,25 @@ def github_api_get(endpoint, params=None):
     return results
 
 
-def get_write_access_users():
-    """Fetches users with push (write) or admin access."""
-    print("Fetching collaborators with write access...")
-    # Note: This endpoint usually requires admin rights on the token.
-    collaborators = github_api_get("collaborators", params={"per_page": 100})
-
-    writers = set()
-    for col in collaborators:
-        perms = col.get("permissions", {})
-        # Check for admin, maintain, or push rights
-        if perms.get("admin") or perms.get("maintain") or perms.get("push"):
-            writers.add(col["login"])
-
-    print(f"Found {len(writers)} users with write access.")
-    return writers
+def has_write_access(user):
+    """Whether the user has write, maintain, or admin access to the repo."""
+    data = github_api_get(f"collaborators/{user}/permission", allow_missing=True)
+    return isinstance(data, dict) and data.get("permission") in WRITE_PERMISSIONS
 
 
-def get_top_contributors(days, limit):
-    """Fetches top contributors based on commit count in the last N days."""
-    print(f"Fetching commits from the last {days} days...")
-    since_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-
-    # Fetch commits
+def get_active_authors():
+    """Lowercased logins of commit authors on the default branch in the last WINDOW_DAYS days."""
+    print(f"Fetching commits from the last {WINDOW_DAYS} days...")
+    since_date = (datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)).isoformat()
     commits = github_api_get("commits", params={"since": since_date, "per_page": 100})
-
-    author_counts = Counter()
-    for commit in commits:
-        # commit['author'] contains the GitHub user object (can be None if not linked)
-        if commit.get("author") and "login" in commit["author"]:
-            author_counts[commit["author"]["login"]] += 1
-
-    top_users = [user for user, _ in author_counts.most_common(limit)]
-    print(f"Found {len(top_users)} top contributors in the last {days} days.")
-    return set(top_users)
+    # commit['author'] is the GitHub user object (None if not linked)
+    authors = {
+        commit["author"]["login"].lower()
+        for commit in commits
+        if commit.get("author") and "login" in commit["author"]
+    }
+    print(f"Found {len(authors)} commit authors in the last {WINDOW_DAYS} days.")
+    return authors
 
 
 def load_existing_permissions():
@@ -149,28 +139,61 @@ def load_existing_permissions():
     return {}
 
 
+def save_permissions(permissions):
+    with open(FILE_NAME, "w") as f:
+        json.dump(dict(sorted(permissions.items())), f, indent=4)
+        f.write("\n")
+
+
 def sort_permissions_file():
     """Sort the existing CI permissions file alphabetically and exit."""
     if not os.path.exists(FILE_NAME):
         print(f"{FILE_NAME} not found. Nothing to sort.")
         return
+    permissions = load_existing_permissions()
+    save_permissions(permissions)
+    print(f"Sorted {FILE_NAME}. Total users: {len(permissions)}")
 
-    old_permissions = load_existing_permissions()
-    sorted_permissions = dict(sorted(old_permissions.items()))
 
-    with open(FILE_NAME, "w") as f:
-        json.dump(sorted_permissions, f, indent=4)
-        f.write("\n")
+def compute_permissions(old_permissions):
+    """Apply the rules in the module docstring.
 
-    print(f"Sorted {FILE_NAME}. Total users: {len(sorted_permissions)}")
+    Returns the new permissions and one note per dropped entry.
+    """
+    active = get_active_authors()
+    new_permissions = {}
+    notes = []
+
+    for user, config in old_permissions.items():
+        reason = config.get("reason", "")
+        if has_write_access(user):
+            notes.append(
+                (user, "dropped: has write access, which grants every CI permission")
+            )
+        elif reason not in GENERATED_REASONS:
+            new_permissions[user] = config
+        elif user.lower() not in active:
+            notes.append(
+                (user, f"dropped: no commit on main in the last {WINDOW_DAYS} days")
+            )
+        else:
+            new_permissions[user] = config
+
+    return new_permissions, notes
 
 
 def main():
     parser = argparse.ArgumentParser(description="Update or sort CI permissions.")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--sort-only",
         action="store_true",
         help="Only sort CI_PERMISSIONS.json alphabetically without fetching data.",
+    )
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help="Print a warning for each entry the rules would change; never writes.",
     )
     args = parser.parse_args()
 
@@ -189,56 +212,18 @@ def main():
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    # Gather Data
-    try:
-        write_access_users = get_write_access_users()
-    except Exception as e:
-        print(f"Warning: Could not fetch collaborators (check token scope). Error: {e}")
-        write_access_users = set()
+    new_permissions, notes = compute_permissions(load_existing_permissions())
 
-    top_contributors = get_top_contributors(days=120, limit=50)
-    old_permissions = load_existing_permissions()
+    if args.check:
+        for user, note in notes:
+            print(f"::warning file={os.path.relpath(FILE_NAME)}::{user}: {note}")
+        print(f"{len(notes)} entries would change; run this script to apply.")
+        return
 
-    new_permissions = {}
-
-    # Rule 1: Add Top 50 Contributors
-    for user in top_contributors:
-        new_permissions[user] = {
-            "can_tag_run_ci_label": True,
-            "can_rerun_failed_ci": True,
-            "cooldown_interval_minutes": 0,
-            "reason": "top contributor",
-        }
-
-    # Rule 2: Process Existing Users (Merge Logic)
-    for user, config in old_permissions.items():
-        if user in new_permissions:
-            # Already handled by Rule 1 or 2
-            continue
-
-        old_reason = config.get("reason", "")
-
-        # If they fell off the top contributor list
-        if old_reason in ["top contributor"]:
-            new_permissions[user] = {
-                "can_tag_run_ci_label": True,
-                "can_rerun_failed_ci": True,
-                "cooldown_interval_minutes": 60,
-                "reason": "custom override",
-            }
-        else:
-            # Preserve custom overrides
-            new_permissions[user] = config
-
-    # Save and Sort
-    # Sorting keys for cleaner diffs
-    sorted_permissions = dict(sorted(new_permissions.items()))
-
-    with open(FILE_NAME, "w") as f:
-        json.dump(sorted_permissions, f, indent=4)
-        f.write("\n")  # Add trailing newline
-
-    print(f"Successfully updated {FILE_NAME}. Total users: {len(sorted_permissions)}")
+    for user, note in notes:
+        print(f"{user}: {note}")
+    save_permissions(new_permissions)
+    print(f"Successfully updated {FILE_NAME}. Total users: {len(new_permissions)}")
 
 
 if __name__ == "__main__":
