@@ -458,11 +458,13 @@ class QSAIndexer(MultiPlatformOp):
         top-k reads only each row's own section and returns indices relative to
         the row's start either way."""
         rows = q.shape[0]
-        width = self.token_topk + self.compress_ratio - 1
-        if defer_expansion:
-            width = self.block_topk
         output = torch.empty(
-            (rows, width),
+            (
+                rows,
+                self.block_topk
+                if defer_expansion
+                else self.token_topk + self.compress_ratio - 1,
+            ),
             dtype=torch.int32,
             device=q.device,
         )
