@@ -213,6 +213,7 @@ from sglang.srt.utils import (
     freeze_gc,
     get_bool_env_var,
     is_mps,
+    kill_itself_when_parent_died,
     kill_process_tree,
 )
 from sglang.srt.utils.auth import add_api_key_middleware
@@ -260,11 +261,21 @@ async def init_multi_tokenizer() -> ServerArgs:
     Initialization function for multi-process tokenizer mode.
     It read args information from shm and inits tokenizer manager for current process.
     """
+    main_pid = get_main_process_id()
+    kill_itself_when_parent_died()
+    # The launcher may have exited before the parent-death signal was armed.
+    if os.getppid() != main_pid:
+        logger.error(
+            "HTTP tokenizer worker %s lost launcher %s during startup.",
+            os.getpid(),
+            main_pid,
+        )
+        os._exit(1)
+
     # Workers do not re-run the launcher module, which applies these filters.
     suppress_noisy_warnings()
 
     # Read configuration from shared memory
-    main_pid = get_main_process_id()
     port_args, server_args, scheduler_info = read_from_shared_memory(
         f"multi_tokenizer_args_{main_pid}"
     )
