@@ -28,6 +28,7 @@ from .scoring import (
     _DEEP_GEMM_SCORE_BUDGET_BYTES,
     DeepGEMMPrefillData,
     PagedDecodeScores,
+    _prefill_score_budget_bytes,
     decode_scores,
     dense_prefill_topk,
     get_deep_gemm_prefill_data,
@@ -66,13 +67,17 @@ class _Sm90PagedKCache(msgspec.Struct, frozen=True):
 
 
 class _Sm90PagedCandidateMap(msgspec.Struct, frozen=True):
+    request_page_starts: torch.Tensor
     context_lens: torch.Tensor
     block_table: torch.Tensor
     schedules: List[Tuple[slice, torch.Tensor]]
     max_context_len: int
-    score_columns: torch.Tensor
-    positions: torch.Tensor
-    lens: torch.Tensor
+    # Single-tile batches cache gathered columns once; multi-tile batches store
+    # compact block ordinals and expand per tile to stay within the score budget.
+    ordinals: Optional[torch.Tensor] = None
+    score_columns: Optional[torch.Tensor] = None
+    positions: Optional[torch.Tensor] = None
+    lens: Optional[torch.Tensor] = None
 
 
 class BlockIds(CandidateMetadata, msgspec.Struct):
@@ -345,7 +350,11 @@ class DenseBlocksBackend:
             caches[cache_key] = k_cache
 
         page_map = published.sm90_page_map
-        if page_map is None or page_map.context_lens.shape[0] != data.num_rows:
+        if (
+            page_map is None
+            or page_map.request_page_starts is not k_cache.request_page_starts
+            or page_map.context_lens.shape[0] != data.num_rows
+        ):
             page_map = self._sm90_paged_candidate_map(
                 inputs, data, blocks, k_cache.request_page_starts
             )
@@ -364,11 +373,25 @@ class DenseBlocksBackend:
                 page_map.max_context_len,
                 clean_logits=False,
             )
-            scores = logits.gather(1, page_map.score_columns[rows])
+            if page_map.score_columns is not None:
+                positions = page_map.positions[rows]
+                lens = page_map.lens[rows]
+                scores = logits.gather(1, page_map.score_columns[rows])
+            else:
+                positions, lens = _pack_candidate_positions(
+                    blocks[rows], data.compress_lens[rows], self.block_size
+                )
+                score_columns = (
+                    page_map.ordinals[rows].repeat_interleave(self.block_size, dim=1)
+                    * _SM90_INDEX_K_PAGE_SIZE
+                    + positions.remainder(_SM90_INDEX_K_PAGE_SIZE)
+                ).long()
+                scores = logits.gather(1, score_columns)
+                del score_columns
             _select_candidate_positions(
                 scores,
-                page_map.positions[rows],
-                page_map.lens[rows],
+                positions,
+                lens,
                 data.request_starts[rows],
                 selected[rows],
             )
@@ -382,7 +405,6 @@ class DenseBlocksBackend:
         source_layer: int,
     ) -> _Sm90PagedKCache:
         page_size = _SM90_INDEX_K_PAGE_SIZE
-        blocks_per_page = page_size // self.block_size
         # Pad each request separately so its local positions map to whole pages.
         page_starts = []
         padded_slots = []
@@ -421,6 +443,7 @@ class DenseBlocksBackend:
     ) -> _Sm90PagedCandidateMap:
         import deep_gemm
 
+        assert self.block_size == CANDIDATE_BLOCK_SIZE
         page_size = _SM90_INDEX_K_PAGE_SIZE
         blocks_per_page = page_size // self.block_size
         row_page_starts = torch.repeat_interleave(
@@ -435,23 +458,24 @@ class DenseBlocksBackend:
         new_page = valid.clone()
         new_page[:, 1:] &= page_ids[:, 1:] != page_ids[:, :-1]
         ordinals = new_page.cumsum(dim=1, dtype=torch.int32) - 1
-        sink = blocks.shape[1]
-        block_table = blocks.new_zeros((data.num_rows, sink + 1))
+        max_pages = min(
+            blocks.shape[1],
+            (max(data.lens_per_request) + page_size - 1) // page_size,
+        )
+        max_context_len = ((max_pages * page_size + 255) // 256) * 256
+        sink = max_pages
+        block_table_cols = max(sink + 1, max_context_len // page_size)
+        block_table = blocks.new_zeros((data.num_rows, block_table_cols))
         block_table.scatter_(
             1,
             ordinals.masked_fill(~valid, sink).long(),
             (page_ids + row_page_starts[:, None]).masked_fill(~valid, 0),
         )
         context_lens = (ordinals[:, -1:] + 1) * page_size
-        positions, lens = _pack_candidate_positions(
-            blocks, data.compress_lens, self.block_size
-        )
-        score_columns = (
-            ordinals.clamp_min(0).repeat_interleave(self.block_size, dim=1) * page_size
-            + positions.remainder(page_size)
-        ).long()
-        max_context_len = ((sink * page_size + 255) // 256) * 256
-        rows_per_tile = max(1, _DEEP_GEMM_SCORE_BUDGET_BYTES // (4 * max_context_len))
+        candidate_width = blocks.shape[1] * self.block_size
+        row_bytes = 4 * max_context_len + 16 * candidate_width
+        budget_bytes = _prefill_score_budget_bytes(_DEEP_GEMM_SCORE_BUDGET_BYTES)
+        rows_per_tile = max(1, budget_bytes // row_bytes)
         schedules = []
         num_sms = deep_gemm.get_num_sms()
         for start in range(0, data.num_rows, rows_per_tile):
@@ -464,14 +488,32 @@ class DenseBlocksBackend:
                     ),
                 )
             )
+        clamped_ordinals = ordinals.clamp_min(0)
+        if len(schedules) == 1:
+            positions, lens = _pack_candidate_positions(
+                blocks, data.compress_lens, self.block_size
+            )
+            score_columns = (
+                clamped_ordinals.repeat_interleave(self.block_size, dim=1) * page_size
+                + positions.remainder(page_size)
+            ).long()
+            return _Sm90PagedCandidateMap(
+                request_page_starts=request_page_starts,
+                context_lens=context_lens,
+                block_table=block_table,
+                schedules=schedules,
+                max_context_len=max_context_len,
+                score_columns=score_columns,
+                positions=positions,
+                lens=lens,
+            )
         return _Sm90PagedCandidateMap(
-            context_lens,
-            block_table,
-            schedules,
-            max_context_len,
-            score_columns,
-            positions,
-            lens,
+            request_page_starts=request_page_starts,
+            context_lens=context_lens,
+            block_table=block_table,
+            schedules=schedules,
+            max_context_len=max_context_len,
+            ordinals=clamped_ordinals,
         )
 
     # ---------- torch: per-request scores ----------

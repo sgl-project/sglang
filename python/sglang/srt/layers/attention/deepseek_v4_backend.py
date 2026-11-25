@@ -1236,9 +1236,12 @@ class DSV4Metadata:
         )
         self.low_ratio_k_slots = static_metadata.low_ratio_k_slots
         self.low_ratio_index_plans = static_metadata.low_ratio_index_plans
-        # K slots are refreshed in place for graph replay; discard FP8 pages
-        # from the preceding replay before any candidate consumer can reuse them.
-        self.low_ratio_paged_index_k_caches = {}
+        # Share the refreshed forward's FP8 K-page cache (fresh on the full
+        # metadata, aliased from it on the late-layer tail) instead of keeping
+        # stale pages from the preceding replay.
+        self.low_ratio_paged_index_k_caches = (
+            static_metadata.low_ratio_paged_index_k_caches
+        )
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
         )
