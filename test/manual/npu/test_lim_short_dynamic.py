@@ -159,7 +159,7 @@ def test_prefill_attention_and_short_residency():
                     tp_q_head_num=heads,
                     scaling=576**-0.5,
                 )
-                manager.resident_end[layer_id][1:3] = 1
+                manager.short_resident_end[layer_id][1:3] = 1
                 output = forward_fused_sparse_kv_offload(
                     backend,
                     query,
@@ -195,7 +195,10 @@ def test_prefill_attention_and_short_residency():
                         rtol=0,
                         atol=0,
                     )
-                assert manager.resident_end[layer_id][1:3].cpu().tolist() == [-1, -1]
+                assert manager.short_resident_end[layer_id][1:3].cpu().tolist() == [
+                    -1,
+                    -1,
+                ]
         finally:
             if manager is not None:
                 torch.npu.synchronize()
@@ -531,7 +534,7 @@ def test_short_sparse_graph_lifecycle(
                             rtol=0,
                             atol=0,
                         )
-                    assert manager.resident_end[layer_id, 1:3].cpu().tolist() == [
+                    assert manager.short_resident_end[layer_id, 1:3].cpu().tolist() == [
                         -1,
                         -1,
                     ]

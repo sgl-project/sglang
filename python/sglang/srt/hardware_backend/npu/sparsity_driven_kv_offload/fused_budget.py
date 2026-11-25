@@ -93,7 +93,9 @@ class BudgetPlan:
             "device_slot_map": BufferSpec(
                 (resident_rows + 1, context_len), metadata_dtype, num_layers
             ),
-            "resident_end": BufferSpec((num_layers, request_rows), metadata_dtype),
+            "short_resident_end": BufferSpec(
+                (num_layers, request_rows), metadata_dtype
+            ),
             "planner_hbm_block_table": BufferSpec(
                 (batch_capacity, cache_tokens // page_size), metadata_dtype
             ),
@@ -137,7 +139,7 @@ class BudgetPlan:
             "_pre_states",
             "_pre_next_prefix",
             "_pre_cache_sizes",
-            "_copy_lengths",
+            "actual_seq_lengths_kv",
         ):
             self.adapter_buffers[name] = BufferSpec((batch_capacity,), metadata_dtype)
         for name in ("_pre_sparse", "_pre_valid"):

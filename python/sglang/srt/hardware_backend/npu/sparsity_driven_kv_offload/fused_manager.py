@@ -69,7 +69,7 @@ class FusedSparseKVCacheManager:
         try:
             for name, spec in self.budget.manager_buffers.items():
                 fill_value = None
-                if name in ("device_slot_map", "resident_end"):
+                if name in ("device_slot_map", "short_resident_end"):
                     fill_value = -1
                 elif name == "request_to_resident":
                     fill_value = 0
@@ -161,7 +161,7 @@ class FusedSparseKVCacheManager:
                 self.device, non_blocking=True
             )
         )
-        self.resident_end.index_fill_(1, req_indices, -1)
+        self.short_resident_end.index_fill_(1, req_indices, -1)
         for slot_map in self.device_slot_map:
             slot_map.index_fill_(0, resident_indices, -1)
         self.lim_adapter.reset_requests(resident_indices)
@@ -212,7 +212,7 @@ class FusedSparseKVCacheManager:
             sparse_rows=plan.sparse_rows,
             request_slots=plan.resident_safe_slots,
             seq_lens=adapter._pre_lengths[:batch],
-            actual_seq_lengths_kv=adapter._copy_lengths[:batch],
+            actual_seq_lengths_kv=adapter.actual_seq_lengths_kv[:batch],
             hbm_block_table=self.planner_hbm_block_table[:batch],
             capacity=adapter.capacity,
             query_width=plan.query_width,
@@ -254,7 +254,7 @@ class FusedSparseKVCacheManager:
             hbm_ckv=cache,
             hbm_rope=rope_cache,
             actual_seq_lengths_query=adapter.query_ends[plan.query_width - 1, :batch],
-            actual_seq_lengths_kv=adapter._copy_lengths[:batch],
+            actual_seq_lengths_kv=adapter.actual_seq_lengths_kv[:batch],
             num_cache_tokens=adapter._pre_cache_sizes[:batch],
             topk_src_ids=plan.source_ids,
             topk_dst_slots=plan.device_slots,
@@ -275,7 +275,7 @@ class FusedSparseKVCacheManager:
             valid=valid,
             request_slots=plan.request_safe_slots,
             req_to_token=self.req_to_token_pool.req_to_token,
-            resident_end=self.resident_end[layer_idx, : self.actual_request_rows],
+            resident_end=self.short_resident_end[layer_idx, : self.actual_request_rows],
             host_token_capacity=self.host_token_capacity,
             dram_rope_dev_ptr=self.rope_dev_ptr_list[layer_idx],
         )
@@ -364,7 +364,7 @@ class FusedSparseKVCacheManager:
             # A prefill can rewrite an existing request's host prefix.
             # Invalidate only this layer's resident extent.
             requests = forward_batch.req_pool_indices.to(torch.long)
-            self.resident_end[layer_idx].index_fill_(0, requests, -1)
+            self.short_resident_end[layer_idx].index_fill_(0, requests, -1)
 
         return current, positions, valid
 

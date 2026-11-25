@@ -99,7 +99,7 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(plan.manager_buffers["device_k_buffer"].shape[0], 3)
         self.assertEqual(plan.manager_buffers["device_v_buffer"].shape[0], 3)
         self.assertEqual(plan.manager_buffers["device_slot_map"].shape[0], 4)
-        self.assertEqual(plan.manager_buffers["resident_end"].shape, (2, 103))
+        self.assertEqual(plan.manager_buffers["short_resident_end"].shape, (2, 103))
         self.assertEqual(plan.manager_buffers["request_to_resident"].shape, (103,))
         self.assertEqual(plan.adapter_buffers["last_prefix"].shape, (4,))
         self.assertEqual(plan.adapter_buffers["resident_safe_slots"].shape, (4,))
@@ -486,7 +486,7 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(
             selection.device_slots.data_ptr(), adapter.device_slots.data_ptr()
         )
-        expected_copy_lengths = torch.tensor(
+        expected_kv_lens = torch.tensor(
             [manager.cache_capacity + manager.max_query_width - 1, 100],
             dtype=torch.int32,
         )
@@ -503,8 +503,10 @@ class TestLIMState(CustomTestCase):
                 adapter.query_ends[manager.max_query_width - 1].data_ptr(),
             )
             self.assertEqual(tensors[6].data_ptr(), adapter._pre_cache_sizes.data_ptr())
-            self.assertEqual(tensors[5].data_ptr(), adapter._copy_lengths.data_ptr())
-            torch.testing.assert_close(tensors[5], expected_copy_lengths)
+            self.assertEqual(
+                tensors[5].data_ptr(), adapter.actual_seq_lengths_kv.data_ptr()
+            )
+            torch.testing.assert_close(tensors[5], expected_kv_lens)
             torch.testing.assert_close(
                 tensors[6], torch.tensor([8192, 0], dtype=torch.int32)
             )
@@ -532,13 +534,13 @@ class TestLIMState(CustomTestCase):
             )
             self.assertEqual(
                 kwargs["actual_seq_lengths_kv"].data_ptr(),
-                adapter._copy_lengths.data_ptr(),
+                adapter.actual_seq_lengths_kv.data_ptr(),
             )
             torch.testing.assert_close(
                 kwargs["seq_lens"],
                 torch.tensor([9000, 100], dtype=torch.int32),
             )
-            kwargs["actual_seq_lengths_kv"].copy_(expected_copy_lengths)
+            kwargs["actual_seq_lengths_kv"].copy_(expected_kv_lens)
 
         post.prepare_copy_sfa_metadata.side_effect = prepare_metadata
         adapter._pre_lengths[:2].copy_(torch.tensor([9000, 100], dtype=torch.int32))
@@ -566,7 +568,7 @@ class TestLIMState(CustomTestCase):
         if compact_pd:
             manager.device_slot_map[0][1].fill_(7)
             adapter.last_prefix[1].fill_(12)
-            manager.resident_end[:, 3].fill_(11)
+            manager.short_resident_end[:, 3].fill_(11)
             req_pool.release_sparse_resident_row(
                 1
             )  # Transfer aborted before admission.
@@ -578,7 +580,7 @@ class TestLIMState(CustomTestCase):
             self.assertEqual(manager.request_to_resident.tolist(), [0, 0, 0, 1, 2, 0])
             self.assertTrue(manager.device_slot_map[0][1].eq(-1).all())
             self.assertTrue(adapter.last_prefix[1].eq(-1).all())
-            self.assertTrue(manager.resident_end[:, 3].eq(-1).all())
+            self.assertTrue(manager.short_resident_end[:, 3].eq(-1).all())
         # Use the allocated index pages, including their dummy page, rather
         # than reconstructing the physical capacity from a logical size.
         pool.size = 3968
