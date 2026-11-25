@@ -115,6 +115,10 @@ class RequestFuncOutput:
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
+    finish_reason: Optional[str] = None
+    has_server_output_len: bool = False
+    requested_output_len: int = 0
+    check_short_output: bool = False
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -723,6 +727,22 @@ async def async_request_sglang_generate(
             headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
+        eff_sp = payload.get("sampling_params")
+        if isinstance(eff_sp, dict):
+            eff_max_new_tokens = eff_sp.get("max_new_tokens")
+            eff_ignore_eos = bool(eff_sp.get("ignore_eos", False))
+            has_extra_stop = bool(
+                eff_sp.get("stop")
+                or eff_sp.get("stop_token_ids")
+                or eff_sp.get("stop_regex")
+            )
+            if (
+                isinstance(eff_max_new_tokens, int)
+                and not isinstance(eff_max_new_tokens, bool)
+                and eff_max_new_tokens > 0
+            ):
+                output.requested_output_len = eff_max_new_tokens
+                output.check_short_output = eff_ignore_eos and not has_extra_stop
 
         generated_text = ""
         output_len = request_func_input.output_len
@@ -759,6 +779,19 @@ async def async_request_sglang_generate(
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
                                 ]
+                            _completion_tokens = _meta_info.get("completion_tokens")
+                            if isinstance(_completion_tokens, int) and not isinstance(
+                                _completion_tokens, bool
+                            ):
+                                output_len = _completion_tokens
+                                output.has_server_output_len = True
+                            _raw_finish_reason = _meta_info.get("finish_reason")
+                            if isinstance(_raw_finish_reason, dict):
+                                _fr_type = _raw_finish_reason.get("type")
+                                if isinstance(_fr_type, str):
+                                    output.finish_reason = _fr_type
+                            elif isinstance(_raw_finish_reason, str):
+                                output.finish_reason = _raw_finish_reason
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -1197,6 +1230,30 @@ def calculate_metrics(
         warnings.warn(
             "All requests failed. This is likely due to a misconfiguration "
             "on the benchmark arguments.",
+            stacklevel=2,
+        )
+
+    truncated_count = 0
+    truncated_actual_tokens = 0
+    truncated_expected_tokens = 0
+    for output in outputs:
+        if (
+            output.success
+            and output.check_short_output
+            and output.has_server_output_len
+            and output.finish_reason == "length"
+            and output.output_len < output.requested_output_len
+        ):
+            truncated_count += 1
+            truncated_actual_tokens += output.output_len
+            truncated_expected_tokens += output.requested_output_len
+    if truncated_count > 0:
+        warnings.warn(
+            f"{truncated_count} fixed-length benchmark request(s) finished early "
+            f"with finish_reason='length' ({truncated_actual_tokens}/"
+            f"{truncated_expected_tokens} expected output tokens). "
+            f"Check whether the server KV cache or context limit is clamping "
+            f"max_new_tokens.",
             stacklevel=2,
         )
 
