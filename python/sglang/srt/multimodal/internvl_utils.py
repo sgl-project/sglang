@@ -261,15 +261,18 @@ def get_video_target_size_and_feature_size(
     ds = int(1 / downsample_ratio)
 
     if target_num_patches > 0 and maintain_aspect_ratio:
+        # Same rounding as the checkpoints' _compute_target_patches_video.
         aspect = orig_w / max(orig_h, 1)
-        ph = math.sqrt(target_num_patches / max(aspect, 1e-6))
-        pw = ph * aspect
-        target_pw = max(ds, int(round(pw / ds)) * ds)
-        target_ph = max(ds, int(round(ph / ds)) * ds)
+        ph = max(round(math.sqrt(target_num_patches / aspect)), 1)
+        pw = max(round(math.sqrt(target_num_patches * aspect)), 1)
+        ph_up, pw_up = -(-ph // ds) * ds, -(-pw // ds) * ds
+        if ph_up * pw_up <= target_num_patches:
+            target_ph, target_pw = ph_up, pw_up
+        else:
+            target_ph, target_pw = max(ds, ph - ph % ds), max(ds, pw - pw % ds)
     elif target_num_patches > 0:
         side = int(math.sqrt(target_num_patches))
-        target_pw = max(ds, int(round(side / ds)) * ds)
-        target_ph = target_pw
+        target_pw = target_ph = max(ds, side // ds * ds)
     else:
         target_pw = max(ds, round(orig_w / patch_size / ds) * ds)
         target_ph = max(ds, round(orig_h / patch_size / ds) * ds)

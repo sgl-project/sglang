@@ -7,14 +7,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import torch
+from transformers import ProcessorMixin
 
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 from sglang.srt.multimodal.evs import EVSConfig, EVSProcessor
+from sglang.srt.multimodal.internvl_utils import get_video_target_size_and_feature_size
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.nano_nemotron_vl import (
     NanoNemotronVLImageProcessor,
     _create_visual_items,
+    _resolve_video_sizing,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -176,6 +179,78 @@ class TestNanoNemotronVLProcessor(CustomTestCase):
                     list(padded), expected + [30, 1_000_002, 1_000_002, 31]
                 )
                 self.assertEqual(mm.data_offsets, [start - 1, len(text)])
+
+    def test_video_size_falls_back_to_preprocessor_config(self):
+        """A video patch target set only in preprocessor_config.json must be used."""
+        hf_processor = Mock(spec=ProcessorMixin, image_processor=Mock())
+        hf_processor.image_processor.to_dict.return_value = {
+            "video_target_num_patches": 1024,
+            "video_maintain_aspect_ratio": True,
+        }
+        tokenizer = Mock()
+        for config_target, processor, expected in (
+            (0, hf_processor, (1024, True)),
+            (512, hf_processor, (512, False)),
+            (0, tokenizer, (0, False)),
+        ):
+            with self.subTest(config_target=config_target, processor=processor):
+                hf_config = SimpleNamespace(
+                    video_target_num_patches=config_target,
+                    video_maintain_aspect_ratio=False,
+                )
+                self.assertEqual(
+                    _resolve_video_sizing(hf_config=hf_config, hf_processor=processor),
+                    expected,
+                )
+
+    def test_video_frame_size_matches_checkpoint_processor(self):
+        """Frame sizes from the checkpoints' processors; none exceeds the patch target."""
+        for (width, height, target, keep_aspect), expected in (
+            ((720, 480, 1024, True), (608, 416, 247)),
+            ((4096, 2160, 1024, True), (704, 352, 242)),
+            ((640, 360, 1000, False), (480, 480, 225)),
+        ):
+            with self.subTest(size=(width, height), target=target):
+                self.assertEqual(
+                    get_video_target_size_and_feature_size(
+                        orig_w=width,
+                        orig_h=height,
+                        target_num_patches=target,
+                        maintain_aspect_ratio=keep_aspect,
+                        patch_size=16,
+                        downsample_ratio=0.5,
+                    ),
+                    expected,
+                )
+
+    def test_videos_with_different_frame_sizes_are_rejected(self):
+        """Two videos that resize to different frame sizes must fail as a bad request."""
+        processor = self._tokenized_processor()
+        processor.__dict__.update(
+            video_temporal_patch_size=2,
+            video_target_num_patches=1024,
+            video_maintain_aspect_ratio=True,
+        )
+        processor.mm_tokens.video_token_id = 21
+        processor.tokenizer.convert_ids_to_tokens.side_effect = {
+            18: "<image>",
+            21: "<video>",
+        }.get
+        processor.load_mm_data.return_value = SimpleNamespace(
+            images=[], videos=[object(), object()], audios=[]
+        )
+        processor.parse_video = Mock(
+            side_effect=[
+                (torch.zeros(2, 360, 640, 3, dtype=torch.uint8).numpy(), [0.0, 0.5]),
+                (torch.zeros(2, 480, 720, 3, dtype=torch.uint8).numpy(), [0.0, 0.5]),
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "same frame size"):
+            asyncio.run(
+                processor.process_mm_data_async(
+                    [], [], [21, 21], SimpleNamespace(video_data=[object(), object()])
+                )
+            )
 
     def test_tubelet_label_matches_hf_reference(self):
         """Multi-frame tubelet labels must match the HF processor's prompt format."""
