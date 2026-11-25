@@ -21,7 +21,6 @@ from sglang.srt.layers.quantization.utils import (
     resolve_dynamic_fused_shards,
 )
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
     GPTQAscendLinearScheme,
@@ -895,12 +894,3 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         return layer.scheme.apply_weights(layer, dispatch_output)
-
-
-# Register fake implementations for torch.compile support. The decorator is a
-# no-op when the custom op is unavailable on the current platform.
-@register_fake_if_exists("sgl_kernel::gptq_marlin_repack")
-def _(b_q_weight, perm, size_k, size_n, num_bits):
-    return b_q_weight.new_empty(
-        (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
-    )

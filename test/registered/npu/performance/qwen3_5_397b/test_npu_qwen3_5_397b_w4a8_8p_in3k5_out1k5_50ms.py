@@ -8,7 +8,11 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=3600, suite="extra-c-perf-test-16-npu-a3")
+register_npu_ci(
+    est_time=3600,
+    suite="extra-c-perf-test-16-npu-a3",
+    disabled="zbal missing from the CANN 9.2.0 image; re-enable later",
+)
 register_npu_ci(est_time=3600, suite="nightly-perf-test-16-npu-a3", nightly=True)
 
 QWEN3_5_397B_A17B_ENVS = {
