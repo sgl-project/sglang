@@ -189,5 +189,101 @@ def test_probe_dpx_pairs_survives_a_raising_probe(monkeypatch):
     assert gathered_local == [None]
 
 
+def _drm_card(sysfs_root: Path, card: str, bus_id: str, partition=None) -> None:
+    device = sysfs_root / "devices" / bus_id
+    device.mkdir(parents=True)
+    if partition is not None:
+        (device / "current_compute_partition").write_text(partition, encoding="utf-8")
+    (sysfs_root / card).mkdir()
+    (sysfs_root / card / "device").symlink_to(device, target_is_directory=True)
+
+
+def test_read_compute_partition(tmp_path: Path):
+    _drm_card(tmp_path, "card1", "0001:01:00.0", "SPX\n")
+    _drm_card(tmp_path, "card9", "0002:01:00.0", "dpx")
+    _drm_card(tmp_path, "card17", "0003:01:00.0")
+
+    read = gfx1250_fabric.read_compute_partition
+    assert read("0001:01:00.0", tmp_path) == "SPX"
+    assert read("0002:01:00.0", tmp_path) == "DPX"
+    assert read("0003:01:00.0", tmp_path) is None  # no attribute
+    assert read("0004:01:00.0", tmp_path) is None  # no card
+    assert read(None, tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    ("local", "peer", "expected"),
+    [("SPX", "SPX", True), ("SPX", "DPX", False), ("SPX", None, False)],
+)
+def test_probe_spx_needs_every_rank(monkeypatch, local, peer, expected):
+    monkeypatch.setattr(gfx1250_fabric.torch.cuda, "get_device_properties", Mock())
+    monkeypatch.setattr(
+        gfx1250_fabric, "pci_function0_bus_id", lambda p: "0001:01:00.0"
+    )
+    monkeypatch.setattr(gfx1250_fabric, "read_compute_partition", lambda bus_id: local)
+    monkeypatch.setattr(gfx1250_fabric.dist, "get_world_size", lambda group: 2)
+
+    def all_gather_object(gathered, local, group):
+        gathered[:] = [local, peer]
+
+    monkeypatch.setattr(gfx1250_fabric.dist, "all_gather_object", all_gather_object)
+    assert gfx1250_fabric.probe_spx(object(), Mock(index=0)) is expected
+
+
+def test_probe_spx_survives_a_raising_probe(monkeypatch):
+    def boom(index):
+        raise RuntimeError("no device")
+
+    monkeypatch.setattr(gfx1250_fabric.torch.cuda, "get_device_properties", boom)
+    monkeypatch.setattr(gfx1250_fabric.dist, "get_world_size", lambda group: 2)
+    gathered_local = []
+
+    def all_gather_object(gathered, local, group):
+        gathered_local.append(local)
+        gathered[:] = [local, "SPX"]
+
+    monkeypatch.setattr(gfx1250_fabric.dist, "all_gather_object", all_gather_object)
+    assert gfx1250_fabric.probe_spx(object(), Mock(index=0)) is False
+    assert gathered_local == [None]
+
+
+# The rows follow the CU count the device reports, whatever it is.
+@pytest.mark.parametrize("num_sm", [96, 128, 256])
+def test_gfx1250_spx_rows(num_sm):
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    MB = cfg.MB
+    base = cfg._rocm_gfx1250_configs(num_sm, True)
+    spx = cfg._rocm_gfx1250_configs(num_sm, True, True)
+    # SPX rows exist only with HIP_FORCE_DEV_KERNARG=1, where they were tuned
+    assert cfg._rocm_gfx1250_configs(num_sm, False, True) == cfg._rocm_gfx1250_configs(
+        num_sm, False
+    )
+    for ws in (3, 5, 6, 7, 8, 16):
+        assert spx[ws] == base[ws]
+    assert base[2].default_max_size == base[4].default_max_size == 0
+    assert base[2].ring_simple_buffer_size == base[4].ring_simple_buffer_size == 0
+
+    for ws, one_shot, two_shot, slot in (
+        (2, 6 * MB, 96 * MB, 96 * MB),
+        (4, 2 * MB, 160 * MB, 80 * MB),
+    ):
+        row = spx[ws]
+        assert row.graph == row.eager
+        assert row.num_push_blocks == num_sm
+        assert row.graph.one_shot_push_threshold == one_shot
+        assert row.graph.two_shot_push_threshold == two_shot
+        assert row.graph.ring_simple.min_bytes == two_shot + 16
+        assert row.graph.hier_2shot_push == row.graph.hier_ring_simple == (0, 0)
+        assert row.default_max_size == slot
+        assert row.ring_simple_buffer_size == 2 * MB
+        # the default cap keeps 2shot_push up to its threshold
+        clipped = row.clip(max_push_bytes=slot, max_pull_bytes=0, world_size=ws)
+        assert clipped.graph.two_shot_push_threshold == two_shot
+        assert row.max_push_bytes(ws) == slot
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
