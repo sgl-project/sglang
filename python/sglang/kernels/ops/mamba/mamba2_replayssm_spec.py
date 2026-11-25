@@ -93,7 +93,10 @@ def record_mamba2_replayssm_spec(
         return
     num_rows, ring_t, HV, V = x_ring.shape
     G, K = b_ring.shape[-2:]
-    assert x.stride(-1) == 1 and B.stride(-1) == 1
+    assert x.stride(-1) == 1 and B.stride(-1) == 1 and dt.stride(-1) == 1
+    assert x.dtype == x_ring.dtype and B.dtype == b_ring.dtype
+    assert dt_bias.shape == (HV,) and A.shape == (HV,)
+    assert dt_bias.is_contiguous() and A.is_contiguous()
     assert 0 < num_steps <= ring_t and num_tokens % num_steps == 0
     assert num_tokens // num_steps <= num_rows
     for ring in (x_ring, b_ring, dt_ring, decay_ring):

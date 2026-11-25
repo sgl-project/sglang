@@ -820,6 +820,11 @@ class MambaPool:
             replayssm_decay = None
             if self.replayssm_is_mamba2:
                 assert speculative_num_draft_tokens is not None
+                if speculative_eagle_topk not in (None, 1):
+                    raise ValueError(
+                        "--enable-linear-replayssm-spec for Mamba2 requires a "
+                        f"linear draft chain, got topk={speculative_eagle_topk}."
+                    )
                 replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_decay = (
                     self._allocate_mamba2_replay_ring(
                         cache_params=cache_params,

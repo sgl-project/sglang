@@ -1520,7 +1520,6 @@ class KVCacheConfigurator:
         )
 
     def _replayssm_spec_model(self) -> bool:
-        """--enable-linear-replayssm-spec applies to this model's state pool."""
         if not get_exec().mamba.enable_linear_replayssm_spec:
             return False
         return (

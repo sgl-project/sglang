@@ -696,7 +696,7 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             hidden_states_d, B_d, C_d = split_hidden_states_B_C_fn(hidden_states_B_C_d)
-            replay_ring = is_target_verify and layer_cache.intermediate_ssm is None
+            replay_ring = is_target_verify and layer_cache.replayssm_decay is not None
             if replay_ring:
                 record_mamba2_replayssm_spec(
                     x=hidden_states_d,

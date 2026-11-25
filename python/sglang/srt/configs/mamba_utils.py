@@ -165,7 +165,6 @@ class BaseLinearStateParams(ABC):
 
     @property
     def mamba2_local_groups(self) -> int:
-        """B/C groups per attn-TP rank, including head-shard extension groups."""
         hv, v_dim, k_dim = self.shape.temporal
         return (self.shape.conv[0][0] - hv * v_dim) // (2 * k_dim)
 
