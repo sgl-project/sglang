@@ -18,11 +18,9 @@ import math
 import os
 import re
 import struct
-import subprocess
 import sys
 import tempfile
 import threading
-import time
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -1249,9 +1247,6 @@ def _node_local_peers(ranks: Iterable[int]) -> Tuple[int, int]:
 
 
 _LUSTRE_SUPER_MAGIC = 0x0BD00BD0
-_LUSTRE_DEFAULT_LRU_MAX_AGE_S = 3900.0  # Used when the client's value is unreadable.
-# Prefetch a file at most this fraction of the lock age ahead of the loader.
-_PREFETCH_PACE_LEAD_FRACTION = 0.3
 
 
 def _statfs_type(path: str) -> Optional[int]:
@@ -1268,87 +1263,38 @@ def _statfs_type(path: str) -> Optional[int]:
         return None
 
 
-def _parse_lru_max_age_s(value: str) -> Optional[float]:
-    """Parse an ``lru_max_age`` value: milliseconds since Lustre 2.11, seconds before."""
-    value = value.strip()
-    try:
-        if value.endswith("ms"):
-            return float(value[:-2]) / 1000
-        if value.endswith("s"):
-            return float(value[:-1])
-        number = float(value)
-    except ValueError:
-        return None
-    # A bare number of 10,000 or more is milliseconds (an age of 10 s or more).
-    return number / 1000 if number >= 10_000 else number
-
-
-def _lustre_lru_max_age_s() -> Optional[float]:
-    """Return the shortest ``lru_max_age`` of this client's OSC lock namespaces."""
-    values = []
-    for path in glob.glob("/sys/fs/lustre/ldlm/namespaces/*-osc-*/lru_max_age"):
-        try:
-            with open(path) as f:
-                values.append(f.read())
-        except OSError:
-            pass
-    if not values:
-        try:
-            values = subprocess.run(
-                ["lctl", "get_param", "-n", "ldlm.namespaces.*-osc-*.lru_max_age"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            ).stdout.split()
-        except (OSError, subprocess.SubprocessError):
-            pass
-    ages = [a for a in map(_parse_lru_max_age_s, values) if a]
-    return min(ages) if ages else None
-
-
 class _PrefetchPacer:
-    """Keeps background checkpoint prefetch a bounded time ahead of the loader.
+    """Keeps background checkpoint prefetch a bounded number of bytes ahead of
+    the loader.
 
     A Lustre client caches a file's pages under the extent locks it holds on
-    the file's objects, and drops the pages when it cancels a lock. Every few
-    seconds it cancels unused locks from the head of each OSC namespace's LRU:
-    if the oldest is older than ``lru_max_age``, it cancels that lock and the
-    next ``lru_cancel_batch - 1`` regardless of their age. Page-cache hits do
-    not refresh a lock's age. Prefetching the whole checkpoint up front can
-    therefore lose the part the loader has not reached within ``lru_max_age``
-    (sooner when older locks are on the node), and the loader reads it again.
+    the file's objects, and drops the pages when it cancels a lock, which it
+    does to unused locks older than ``lru_max_age``. Page-cache hits do not
+    refresh a lock's age. Prefetching the whole checkpoint up front can
+    therefore lose the part the loader has not reached yet, and the loader reads
+    it again. Prefetch reads several times faster than the loader consumes, so a
+    fixed window ahead of the loader keeps it fed and the cached pages young.
 
-    File ``i`` may be prefetched once the bytes the node prefetches from the
-    loader's current file through file ``i`` are within ``min_lead_bytes``, or
-    within ``lead_s`` seconds at the loader's measured rate. Bytes count what
-    the node's plan reads of each file, not the file size.
+    File ``i`` may be prefetched once the files from the loader's current file
+    through file ``i`` total at most ``window_bytes``, or ``i`` is among the
+    next ``min_files`` files. Files the loader has passed are skipped.
     """
 
     def __init__(
-        self,
-        files: List[str],
-        planned_bytes: List[int],
-        lead_s: float,
-        min_lead_bytes: int,
+        self, files: List[str], sizes: List[int], window_bytes: int, min_files: int
     ) -> None:
         self.index = {path: i for i, path in enumerate(files)}
-        self.cum = list(itertools.accumulate(planned_bytes, initial=0))
-        self.lead_s = lead_s
-        self.min_lead_bytes = min_lead_bytes
+        self.cum = list(itertools.accumulate(sizes, initial=0))
+        self.window_bytes = window_bytes
+        self.min_files = min_files
         self.pos = 0
-        self.t_start: Optional[float] = None
         self.finished = False
         self.cv = threading.Condition()
 
     def advance(self, path: str) -> None:
         """Record that the loader has started on ``path``."""
-        i = self.index.get(path)
-        if i is None:
-            return
         with self.cv:
-            if self.t_start is None:
-                self.t_start = time.monotonic()
-            self.pos = max(self.pos, i)
+            self.pos = max(self.pos, self.index.get(path, 0))
             self.cv.notify_all()
 
     def finish(self) -> None:
@@ -1358,60 +1304,19 @@ class _PrefetchPacer:
             self.cv.notify_all()
 
     def _allowed(self, i: int) -> bool:
-        if self.finished or i <= self.pos:
-            return True
-        ahead = self.cum[i + 1] - self.cum[self.pos]
-        if ahead <= self.min_lead_bytes:
-            return True
-        if self.t_start is None:
-            return False
-        # Measure the loader's rate over at least a tenth of the lead.
-        elapsed = time.monotonic() - self.t_start
-        if elapsed < self.lead_s / 10:
-            return False
-        return ahead <= self.cum[self.pos] / elapsed * self.lead_s
+        return (
+            self.finished
+            or i < self.pos + self.min_files
+            or self.cum[i + 1] - self.cum[self.pos] <= self.window_bytes
+        )
 
     def wait(self, path: str, cancel_event: threading.Event) -> bool:
         """Block until ``path`` may be prefetched; False if it is no longer needed."""
-        i = self.index.get(path)
-        if i is None:
-            return True
+        i = self.index[path]
         with self.cv:
             while not self._allowed(i) and not cancel_event.is_set():
                 self.cv.wait(timeout=1.0)
             return not self.finished and i >= self.pos
-
-
-def _prefetch_lead_s(path: str) -> Optional[Tuple[float, str]]:
-    """Return how many seconds prefetch may run ahead of the loader, and why;
-    None to not pace it."""
-    from sglang.srt.environ import envs
-
-    lead_s = envs.SGLANG_PREFETCH_PACE_LEAD_S.get()
-    if lead_s is not None:
-        return (lead_s, "SGLANG_PREFETCH_PACE_LEAD_S") if lead_s > 0 else None
-    # Only Lustre is known to drop cached pages of unused files on a timer.
-    if _statfs_type(path) != _LUSTRE_SUPER_MAGIC:
-        return None
-    max_age_s = _lustre_lru_max_age_s()
-    source = "the Lustre client's lock lru_max_age"
-    if max_age_s is None:
-        max_age_s, source = (
-            _LUSTRE_DEFAULT_LRU_MAX_AGE_S,
-            "the Lustre default lru_max_age",
-        )
-    lead_s = _PREFETCH_PACE_LEAD_FRACTION * max_age_s
-    return lead_s, f"{_PREFETCH_PACE_LEAD_FRACTION:g} x {source} of {max_age_s:.0f} s"
-
-
-def _planned_prefetch_bytes(
-    path: str, select: Optional[Callable[[str, int], bool]]
-) -> int:
-    if select is None:
-        return os.path.getsize(path)
-    return sum(
-        e - b for k, (b, e) in _safetensors_offsets(path).items() if select(k, e - b)
-    )
 
 
 def _paced_prefetch_checkpoint_file(
@@ -1504,6 +1409,8 @@ def _prefetch_all_checkpoints(
     timer (Lustre), each rank prefetches a file only when its loader nears it;
     the loader reports its position through ``CheckpointFilePrefetchHandle.advance``.
     """
+    import time
+
     if num_threads < 1:
         raise ValueError("weight loader prefetch num_threads must be >= 1")
 
@@ -1529,16 +1436,13 @@ def _prefetch_all_checkpoints(
         fits = torch.tensor(int(size <= 0.9 * psutil.virtual_memory().available))
         group = get_parallel().moe_ep_group.cpu_group
         torch.distributed.all_reduce(fits, torch.distributed.ReduceOp.MIN, group)
-    node_select = None  # What the node prefetches of a file; None for all of it.
     if readers is None or fits:
         my_files = [(path, None) for path in sorted_files[local_rank::local_world_size]]
     elif (node_reads := readers.node_reads) is not None:
         # Each rank reads all that the node reads of its share of the files.
         files = sorted_files[local_rank::local_world_size]
         my_files = [(path, node_reads) for path in files]
-        node_select = node_reads
     else:  # Prefetch only what the node reads, split by file among its readers.
-        node_select = lambda name, n: readers.rank_of(name, n) is not None
         my_files = [
             (
                 path,
@@ -1549,31 +1453,26 @@ def _prefetch_all_checkpoints(
             for i, path in enumerate(sorted_files)
         ]
     pacer = None
-    lead = _prefetch_lead_s(sorted_files[0]) if pace and my_files else None
-    if lead is not None:
-        lead_s, lead_source = lead
-        planned = [_planned_prefetch_bytes(path, node_select) for path in sorted_files]
-        from sglang.srt.environ import envs
-
-        min_lead_gb = envs.SGLANG_PREFETCH_PACE_MIN_LEAD_GB.get()
-        if min_lead_gb is not None:
-            min_lead_bytes = round(min_lead_gb * (1 << 30))
-        else:  # Until the loader's rate is known: a file per prefetch thread on the node.
-            files_in_flight = num_threads * local_world_size
-            min_lead_bytes = max(
-                max(planned), sum(planned) * files_in_flight // len(planned)
-            )
-        pacer = _PrefetchPacer(sorted_files, planned, lead_s, min_lead_bytes)
+    window_gb = envs.SGLANG_PREFETCH_PACE_LEAD_GB.get()
+    # Only Lustre is known to drop cached pages of unused files on a timer.
+    if (
+        pace
+        and my_files
+        and window_gb > 0
+        and _statfs_type(sorted_files[0]) == _LUSTRE_SUPER_MAGIC
+    ):
+        pacer = _PrefetchPacer(
+            sorted_files,
+            [os.path.getsize(path) for path in sorted_files],
+            round(window_gb * (1 << 30)),
+            # Always allow a file per prefetch thread on the node.
+            min_files=num_threads * local_world_size,
+        )
         if local_rank == 0:
             logger.info(
-                "Pacing checkpoint prefetch: a file is read when the loader is "
-                "within %.0f s of it at its measured rate, or within %.1f GiB "
-                "(lead from %s; SGLANG_PREFETCH_PACE_LEAD_S=0 disables pacing). "
-                "The node prefetches %.1f GiB.",
-                lead_s,
-                min_lead_bytes / (1 << 30),
-                lead_source,
-                sum(planned) / (1 << 30),
+                "Pacing checkpoint prefetch on Lustre to %g GiB ahead of the "
+                "loader (SGLANG_PREFETCH_PACE_LEAD_GB=0 disables pacing).",
+                window_gb,
             )
     total_for_rank = len(my_files)
     cancel_event = threading.Event()

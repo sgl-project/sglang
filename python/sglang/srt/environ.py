@@ -327,11 +327,8 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
-    # Checkpoint prefetch pacing on Lustre: seconds ahead of the loader (unset:
-    # 0.3 x the client's lock lru_max_age; 0 disables), and the window before the
-    # loader's rate is known (unset: a file per prefetch thread on the node).
-    SGLANG_PREFETCH_PACE_LEAD_S = EnvFloat(None)
-    SGLANG_PREFETCH_PACE_MIN_LEAD_GB = EnvFloat(None)
+    # GiB that checkpoint prefetch on Lustre may read ahead of the loader (0: unpaced).
+    SGLANG_PREFETCH_PACE_LEAD_GB = EnvFloat(64.0)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
