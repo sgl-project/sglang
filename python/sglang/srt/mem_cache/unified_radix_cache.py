@@ -4018,6 +4018,15 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
 
         def _drain_backup():
+            if n_backup is not None:
+                # Sync pending backup token count across TP ranks so all ranks
+                # see the same high-water mark and make consistent admit/skip
+                # decisions in write_backup_storage (issue #52891).
+                pending = torch.tensor(
+                    [cc.backup_tokens_occupied], dtype=torch.int64
+                )
+                self._all_reduce_storage_drain_max(pending)
+                cc.backup_tokens_occupied = int(pending[0])
             acked = list(_drain_queue(cc.ack_backup_queue, n_backup))
             if not acked:
                 return 0
@@ -4108,6 +4117,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MIN)
         else:
             self._all_reduce(data, torch.distributed.ReduceOp.MIN)
+
+    def _all_reduce_storage_drain_max(self, data: torch.Tensor) -> None:
+        """MAX-reduce a per-drain tensor over the same rank group as
+        _all_reduce_storage_drain, so admission decisions use the highest
+        pending count across ranks and all ranks agree on whether to throttle."""
+        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+            self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MAX)
+        else:
+            self._all_reduce(data, torch.distributed.ReduceOp.MAX)
 
     def _backup_requested_tokens_of(self, operation_id: int) -> Optional[int]:
         """Requested KV tokens of an acked storage write; None for a write no
