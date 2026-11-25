@@ -88,6 +88,21 @@ def set_global_trace_level(level: int):
     get_resources().trace_level = level
 
 
+def get_request_trace_level(external_trace_header: Optional[Dict[str, str]]) -> int:
+    """One request's level: the caller's `tracestate: sglang=<level>`, else the global.
+
+    The value travels in the request's W3C trace context, so every server that
+    handles the request (prefill and decode in PD mode) uses the same level.
+    """
+    level = None
+    if external_trace_header:
+        caller = trace.get_current_span(
+            _trace_context_propagator.extract(external_trace_header)
+        ).get_span_context()
+        level = caller.trace_state.get("sglang")
+    return int(level) if level is not None else get_global_trace_level()
+
+
 @dataclass
 class TraceThreadInfo:
     host_id: str
@@ -358,7 +373,9 @@ class TraceReqContext:
     ):
         self.rid: str = str(rid)
         self.trace_level = (
-            trace_level if trace_level is not None else get_global_trace_level()
+            trace_level
+            if trace_level is not None
+            else get_request_trace_level(external_trace_header)
         )
         self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0
 

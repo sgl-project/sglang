@@ -18,6 +18,7 @@ from sglang.srt.observability.trace import (
     TraceThreadInfo,
     extract_trace_headers,
     get_global_trace_level,
+    get_request_trace_level,
     process_tracing_init,
     set_global_trace_level,
     trace_set_thread_info,
@@ -87,6 +88,26 @@ class TestGetOtlpSpanExporter(unittest.TestCase):
         with patch.dict(os.environ, {"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "invalid"}):
             with self.assertRaises(ValueError):
                 get_otlp_span_exporter("localhost:4317")
+
+
+@unittest.skipUnless(_has_otel, "opentelemetry not installed")
+class TestRequestTraceLevel(unittest.TestCase):
+    def test_caller_tracestate_sets_the_level_else_the_global(self):
+        from sglang.srt.runtime_context import get_resources
+
+        traceparent = f"00-{'1' * 32}-{'1' * 16}-01"
+        self.addCleanup(
+            setattr, get_resources(), "trace_level", get_resources().trace_level
+        )
+        set_global_trace_level(1)
+        self.assertEqual(
+            get_request_trace_level(
+                {"traceparent": traceparent, "tracestate": "sglang=3"}
+            ),
+            3,
+        )
+        self.assertEqual(get_request_trace_level({"traceparent": traceparent}), 1)
+        self.assertEqual(get_request_trace_level(None), 1)
 
 
 class TestProcessTracingInit(unittest.TestCase):
