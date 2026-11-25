@@ -10,6 +10,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
+from sglang.test.kits.sampling_penalty_kit import PenalizedEOSMixin
 from sglang.test.kits.spec_server_kits import SpecGrammarKit, SpecLogprobKit
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
@@ -29,6 +30,7 @@ class TestDFlashServerBase(
     MatchedStopMixin,
     GSM8KMixin,
     JSONConstrainedMixin,
+    PenalizedEOSMixin,
     SpecGrammarKit,
     SpecLogprobKit,
 ):

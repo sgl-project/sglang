@@ -11,7 +11,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=1800, suite="full-test-2-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="extra-b-test-2-npu-a3")
+register_npu_ci(est_time=400, suite="full-test-2-npu-a3", nightly=True)
 
 COMPILE_ARGS = [
     "--trust-remote-code",
@@ -35,6 +36,11 @@ COMPILE_ARGS = [
 # Same as the TorchAir compile test: without it the ascend backend runs paged
 # attention through ATB, which has been observed to fail graph capture on A3.
 os.environ["ASCEND_USE_FIA"] = "true"
+
+# torch>=2.13 validates custom-op aliasing and raises when CI=true. The NPU
+# fused-infer-attention .out op returns tensors aliasing its inputs, so let
+# the check warn instead of failing this compile lane.
+os.environ.setdefault("TORCHINDUCTOR_ERROR_ON_CUSTOM_OP_ALIASING", "0")
 
 
 class TestNpuCompileGraphTp2Bf16(CustomTestCase, NPUGSM8KMixin):

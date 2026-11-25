@@ -53,8 +53,14 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_device, get_schedule
+from sglang.srt.runtime_context import (
+    get_device,
+    get_memory,
+    get_platform,
+    get_schedule,
+)
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.aiter import pin_aiter_hip_runtime
 from sglang.srt.utils.common import run_with_deadline
 
 try:
@@ -375,6 +381,8 @@ class KVArgsRegisterInfo:
     staging_total_size: int = 0
     dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_aux_item_lens: Optional[List[int]] = None
+    dst_unified_layout: Optional[dict] = None
+    unified_layout_error: Optional[str] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -443,6 +451,9 @@ class KVArgsRegisterInfo:
                 int(msg[23].decode("ascii")) if len(msg) > 23 and msg[23] != b"" else 0
             ),
             dst_draft_rows_dcp_collapsed=(len(msg) > 25 and msg[25] == b"1"),
+            dst_unified_layout=(
+                json.loads(msg[26]) if len(msg) > 26 and msg[26] else None
+            ),
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
@@ -528,6 +539,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     # Newer NIXL prepares compressed (addr, len, dev_id, stride, count) runs
     # directly; cleared on the first TypeError to expand per block instead.
     _use_strided_descs: bool = True
+    enable_unified_memory: bool = False
 
     def __init__(
         self,
@@ -537,6 +549,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.enable_unified_memory = get_memory().enable_unified_memory
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
             getattr(self.kv_args, "kv_data_mem_kinds", None),
             len(self.kv_args.kv_data_ptrs),
@@ -557,6 +570,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             ) from e
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
+        if self.enable_unified_memory and (
+            not get_platform().is_cuda or backend != "UCX"
+        ):
+            raise ValueError("NIXL unified-memory PD currently requires CUDA and UCX")
         num_threads = 8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
         backend_params = json.loads(
             envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get()
@@ -607,6 +624,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             num_threads=num_threads,
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
         )
+        pin_aiter_hip_runtime()
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
@@ -1086,13 +1104,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         threading.Thread(target=decode_listener_thread, daemon=True).start()
 
-    def _prefetch_staging_reqs(self, room: int):
-        """Send STAGING_REQ for all chunks before the prefill forward starts.
-
-        Idempotent per room: the first call for a given room does the full
-        fan-out (one STAGING_REQ per chunk per peer); subsequent calls return
-        immediately, so the caller can invoke this on every chunk.
-        """
+    def _prefetch_staging_reqs(self, room: int, upto_tokens: Optional[int] = None):
+        """Reserve staging for chunks up to the prefill bound, or the whole room."""
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
         if room in self._staging_ctx.prefetched_rooms:
@@ -1122,8 +1135,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            upto_tokens=upto_tokens,
         )
-        self._staging_ctx.prefetched_rooms.add(room)
+        if upto_tokens is None:
+            self._staging_ctx.prefetched_rooms.add(room)
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
@@ -1523,7 +1538,55 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         return indices
 
+    def _unified_wire_layout(self) -> Optional[dict]:
+        if not self.enable_unified_memory:
+            return None
+        return {
+            "version": 1,
+            "page_size": self.kv_args.page_size,
+            "state_types": list(self.kv_args.state_types or []),
+            "state_wire_keys": list(self.kv_args.state_wire_keys or []),
+        }
+
+    def _validate_unified_peer(self, peer_info: KVArgsRegisterInfo) -> None:
+        """Validate a peer's whole-entry geometry at registration.
+
+        Arena capacity may differ, but page/slot layouts and TP must match.
+        The explicit wire marker also rejects a legacy or non-unified peer
+        whose single-layer buffer happens to have the same entry size.
+        """
+        layout = self._unified_wire_layout()
+        remote_layout = peer_info.dst_unified_layout
+        if layout is None and remote_layout is None:
+            return
+        if layout != remote_layout:
+            raise ValueError(
+                "NIXL unified-memory PD layout mismatch: both peers must enable "
+                "unified memory with the same page size and state components "
+                f"(prefill={layout}, decode={remote_layout})"
+            )
+        if self.attn_tp_size != peer_info.decode_tp_size:
+            raise ValueError(
+                "NIXL unified-memory PD requires equal prefill/decode attention "
+                "TP sizes; whole-entry state cannot be TP-resliced"
+            )
+        if (
+            len(self.kv_args.kv_data_ptrs) != 1
+            or len(peer_info.dst_kv_ptrs) != 1
+            or self.kv_args.kv_item_lens != peer_info.dst_kv_item_lens
+            or self.kv_args.kv_data_mem_kinds != peer_info.dst_kv_mem_kinds
+            or self.kv_args.state_item_lens != peer_info.dst_state_item_lens
+            or [len(ptrs) for ptrs in self.kv_args.state_data_ptrs]
+            != [len(ptrs) for ptrs in peer_info.dst_state_data_ptrs]
+        ):
+            raise ValueError(
+                "NIXL unified-memory PD entry geometry mismatch: KV pages and "
+                "all state slots must have matching byte strides and regions"
+            )
+
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
+        if peer_info.unified_layout_error:
+            raise ValueError(peer_info.unified_layout_error)
         # If prefill does not run speculative decoding (the usual case),
         # decode with speculative decoding will have more kv items.
         # Prefill having more kv items is impossible.
@@ -1665,6 +1728,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         "Skipping chunk for room %s because it has been cleared",
                         room,
                     )
+                    self.note_send_finished(room, kv_chunk.send_record)
                     self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
                         # clear() keeps the target while a chunk is counted.
@@ -1691,12 +1755,27 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         kv_chunk.wait_event.synchronize()
                     kv_chunk.wait_event = None
 
+                if (
+                    kv_chunk.indices_event is not None
+                    and self.check_status(room) != KVPoll.Failed
+                ):
+                    if not device_bound:
+                        torch.get_device_module(get_device().device).set_device(
+                            self.kv_args.gpu_id
+                        )
+                        device_bound = True
+                    kv_chunk.indices_event.synchronize()
+                    kv_chunk.indices_event = None
                 if self.check_status(room) == KVPoll.Failed:
+                    self.note_send_finished(room, kv_chunk.send_record)
                     self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(room)
                     continue
+
+                if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
+                    kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
 
                 room_transfer_infos = self.transfer_infos.get(room)
                 if room_transfer_infos is None:
@@ -1705,6 +1784,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         "has been cleared",
                         room,
                     )
+                    self.note_send_finished(room, kv_chunk.send_record)
                     self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(room)
@@ -1746,6 +1826,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self.validate_aux_buffers(
                         dst_info.dst_aux_ptrs, dst_info.dst_aux_item_lens
                     )
+                    if dst_info.unified_layout_error:
+                        raise ValueError(dst_info.unified_layout_error)
                     decode_tp_size = dst_info.decode_tp_size
                     if self.kv_shard_state_peer_only:
                         # Every prefill rank checks, not only the state peer:
@@ -1987,6 +2069,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 # Clear with the decrement: the failure path below reads this
                 # flag, so a raise after this point must not uncount twice.
+                self.note_send_finished(room, kv_chunk.send_record)
                 kv_chunk.staging_counted = False
                 self._staging_outstanding[room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -2066,12 +2149,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
+        seen = set()
         kv_addrs_by_mem_kind = {"VRAM": [], "DRAM": []}
         for kv_data_ptr, kv_data_len, kv_mem_kind in zip(
             self.kv_args.kv_data_ptrs,
             self.kv_args.kv_data_lens,
             self.kv_args.kv_data_mem_kinds,
         ):
+            region = (kv_mem_kind, kv_data_ptr, kv_data_len)
+            if kv_data_len == 0 or region in seen:
+                continue
+            seen.add(region)
             kv_addrs_by_mem_kind[kv_mem_kind].append(
                 (
                     kv_data_ptr,
@@ -2111,6 +2199,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             for state_data_ptr, state_data_len in zip(comp_ptrs, comp_lens):
                 if state_data_ptr == 0 or state_data_len == 0:
                     continue
+                region = ("VRAM", state_data_ptr, state_data_len)
+                if region in seen:
+                    continue
+                seen.add(region)
                 state_addrs.append(
                     (state_data_ptr, state_data_len, self.kv_args.gpu_id, "")
                 )
@@ -2132,7 +2224,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if decode_kv_args.requires_dcp_relayout:
             self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
+        decode_kv_args.unified_layout_error = None
+        try:
+            self._validate_unified_peer(decode_kv_args)
+        except ValueError as exc:
+            decode_kv_args.unified_layout_error = str(exc)
+        # Publish the validation result with the peer, including rejected peers
+        # whose requests must fail before any KV, state, or aux writes.
         self.decode_kv_args_table[agent_name] = decode_kv_args
+        if decode_kv_args.unified_layout_error:
+            logger.error(
+                "Rejected NIXL peer %s: %s",
+                agent_name,
+                decode_kv_args.unified_layout_error,
+            )
+            return
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.check_peer_aux_buffer_count(
@@ -2146,7 +2252,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # restores it; reload it from the registration we already hold.
         for agent_name in list(room_transfer_infos):
             peer_info = self.decode_kv_args_table.get(agent_name)
-            if peer_info is None:
+            if peer_info is None or peer_info.unified_layout_error:
                 continue
             try:
                 if self.agent.check_remote_metadata(agent_name):
@@ -2256,7 +2362,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         logger.debug(f"sending kvcache to {peer_name}")
         # Make descs
-        if self.is_mla_backend or force_flat:
+        if self.is_mla_backend or force_flat or self.enable_unified_memory:
             if src_layer_ids or dst_layer_ids:
                 pairs = build_transfer_entry_pairs(
                     src_layer_ids or [],
@@ -3461,16 +3567,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
+        if (
+            bootstrap_room not in self.transfer_infos
+            or self.request_status.get(bootstrap_room, KVPoll.Failed) == KVPoll.Failed
+        ):
+            # Dummy rank, failed, or already cleared; nothing to enqueue.
+            return None
+
         # Prefetch STAGING_REQ to decode before enqueueing so decode has
         # already allocated staging by the time the worker picks up the
         # chunk. Internally a no-op when staging is disabled or no peer
         # in this room needs heterogeneous-TP staging.
-        if self.enable_staging:
-            self._prefetch_staging_reqs(bootstrap_room)
-
-        if bootstrap_room not in self.transfer_infos:
-            # Dummy rank or already cleared; nothing to enqueue.
-            return None
+        if self.enable_staging and self.kv_buffer_tensors is not None:
+            upto_tokens = None
+            if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+                upto_tokens = index_slice.stop * self.kv_buffer_tensors["page_size"]
+            self._prefetch_staging_reqs(bootstrap_room, upto_tokens=upto_tokens)
 
         # Shard by destination (mirror mooncake): same dst endpoint(s) -> same
         # worker, keeping a room's chunks on one private staging buffer.
@@ -3478,6 +3590,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             info.dst_port for info in self.transfer_infos[bootstrap_room].values()
         )
         shard_idx = session_port_sum % len(self.transfer_queues)
+        self.note_send_enqueued(bootstrap_room)
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -3488,6 +3601,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 wait_event=wait_event,
+                indices_event=indices_event,
+                send_record=self.send_record(bootstrap_room),
             )
         )
         return None
@@ -3651,7 +3766,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_kv_item_len = 0
             dst_num_slots = 0
 
-        return [
+        message = [
             GUARD,
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
@@ -3687,6 +3802,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             packed_state_data_lens,
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
         ]
+        if self.enable_unified_memory:
+            message.append(json.dumps(self._unified_wire_layout()).encode("ascii"))
+        return message
 
     def build_receiver_metadata_message(
         self,
@@ -3723,7 +3841,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
 
 class NixlKVSender(CommonKVSender):
-    pass
+    @property
+    def supports_host_tensor_indices(self) -> bool:
+        # Enable only for the whole-entry path; other layouts may inspect or
+        # filter host indices on the scheduler before their copy has finished.
+        return self.kv_mgr.enable_unified_memory
 
 
 class NixlKVReceiver(CommonKVReceiver):
