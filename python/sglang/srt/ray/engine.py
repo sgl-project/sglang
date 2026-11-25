@@ -396,14 +396,15 @@ class RayEngine(Engine):
                     )
                     scheduler_actors.append(actor)
 
-            cpu_share.close()
             try:
+                cpu_share.close()
                 ray.get([actor.start.remote() for actor in scheduler_actors])
                 scheduler_infos = ray.get(
                     [actor.get_info.remote() for actor in scheduler_actors]
                 )
                 merge_scheduler_info_layouts(scheduler_infos)
-            except ray.exceptions.RayActorError as e:
+            except ray.exceptions.RayError as e:
+                # an actor that died or a start() that raised: stop them all
                 for actor in scheduler_actors:
                     try:
                         ray.kill(actor)

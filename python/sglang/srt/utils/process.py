@@ -363,6 +363,14 @@ def gpu_proc_affinity_env(plan: dict[int, list[int]], gpu_id: int):
         yield
 
 
+def gpu_proc_affinity_requested() -> bool:
+    """Whether this scheduler binds its CPUs: ``SGLANG_SET_CPU_AFFINITY`` here, or CPUs
+    its launcher planned under its own ``SGLANG_SET_CPU_AFFINITY``."""
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_SET_CPU_AFFINITY.get() or bool(envs.SGLANG_GPU_PROC_CPUS.get())
+
+
 def set_gpu_proc_affinity(gpu_id: int, server_args=None):
     from sglang.srt.environ import envs
 

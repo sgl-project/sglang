@@ -229,6 +229,13 @@ class TestCpuShareBoard(CustomTestCase):
 
 
 class TestSetGpuProcAffinity(CustomTestCase):
+    def test_binds_the_cpus_a_launcher_planned_without_the_local_flag(self):
+        """Affinity set on the driver only: the planned CPUs still decide the bind."""
+        with envs.SGLANG_SET_CPU_AFFINITY.override(False):
+            self.assertFalse(process.gpu_proc_affinity_requested())
+            with process.gpu_proc_affinity_env({0: [4, 5]}, 0):
+                self.assertTrue(process.gpu_proc_affinity_requested())
+
     def test_binds_the_cpus_the_launcher_planned(self):
         bound = _bind(
             1,

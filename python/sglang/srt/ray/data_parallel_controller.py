@@ -109,7 +109,7 @@ class RayDataParallelController(DataParallelController):
             self._launch_ray_tp_group(
                 server_args, dp_port_args_list[dp_rank], dp_rank, cpu_share=cpu_share
             )
-        cpu_share.close()
+        self._close_cpu_share(cpu_share)
         # Then load one DP group at a time, so one replica's weights sit in host memory
         # at once.
         for first, stop in zip(firsts, firsts[1:] + [None]):
@@ -142,7 +142,7 @@ class RayDataParallelController(DataParallelController):
             worker_ports=worker_ports,
             cpu_share=cpu_share,
         )
-        cpu_share.close()
+        self._close_cpu_share(cpu_share)
         self._await_ray_actors(first)
 
     def _launch_ray_tp_group(
@@ -282,6 +282,20 @@ class RayDataParallelController(DataParallelController):
                 )
                 self.scheduler_actors.append(actor)
 
+    def _kill_scheduler_actors(self):
+        for actor in self.scheduler_actors:
+            try:
+                ray.kill(actor)
+            except Exception:
+                logger.error(f"Failed to kill Ray scheduler actor: {actor}")
+
+    def _close_cpu_share(self, cpu_share: CpuShareLaunch):
+        try:
+            cpu_share.close()
+        except ray.exceptions.RayError as e:
+            self._kill_scheduler_actors()
+            raise RuntimeError(f"Scheduler actors' CPU split failed: {e}")
+
     def _await_ray_actors(self, first: int, stop: Optional[int] = None):
         """Start the actors at ``scheduler_actors[first:stop]``, wait for them to
         initialize, then start their event loops."""
@@ -291,12 +305,10 @@ class RayDataParallelController(DataParallelController):
             scheduler_infos = ray.get(
                 [actor.get_info.remote() for actor in batch_actors]
             )
-        except ray.exceptions.RayActorError as e:
-            for actor in self.scheduler_actors:
-                try:
-                    ray.kill(actor)
-                except Exception:
-                    logger.error(f"Failed to kill Ray scheduler actor: {actor}")
+        except ray.exceptions.RayError as e:
+            # an actor that died or a start() that raised (e.g. out of memory loading
+            # weights): stop every actor, the groups already running included
+            self._kill_scheduler_actors()
             raise RuntimeError(f"Scheduler actor failed to initialize: {e}")
 
         # Store init info from the first actor (same across all actors)
