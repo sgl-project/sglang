@@ -14,6 +14,8 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
 )
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.layers.attention.mamba import mamba
+from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -290,6 +292,144 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     self.assertTrue(torch.all(ssm_states[[6, 2, 5]] == 5))
                     expected = DOUBLE_ROUND_PROBE if snapshot else 2.0
                     self.assertTrue(torch.all(ssm_states[4] == expected))
+
+
+class TestTrackConvStateDtype(CustomTestCase):
+    """Prefill tracking writes activations into a conv pool whose dtype
+    (SGLANG_MAMBA_CONV_DTYPE) can differ from the model dtype; the tracked rows
+    must receive the activations cast to the pool dtype."""
+
+    CONV_DTYPE = torch.bfloat16
+
+    def test_gdn_prefill_tracks_cast_activations(self):
+        layer = SimpleNamespace(
+            layer_id=0,
+            q_dim=2,
+            k_dim=2,
+            v_dim=2,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=1,
+            head_q_dim=2,
+            head_k_dim=2,
+            head_v_dim=2,
+            A_log=torch.zeros(1),
+            dt_bias=torch.zeros(1),
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_prefix_lens=torch.tensor([0, 64]),
+        )
+        torch.manual_seed(0)
+        qkv = torch.randn(4, 6, dtype=torch.float16)
+        empty = torch.empty(0, dtype=torch.long)
+        backend = object.__new__(GDNAttnBackend)
+        backend.forward_metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 2, 4]),
+            mamba_cache_indices=torch.tensor([6, 2]),
+            has_mamba_track_mask=True,
+            conv_states_mask_indices=torch.tensor([4, 5]),
+            track_conv_indices=torch.tensor([[0, 1], [2, 3]]),
+            track_ssm_h_src=empty,
+            track_ssm_h_dst=empty,
+            track_ssm_h_batch_src=empty,
+            track_ssm_final_src=empty,
+            track_ssm_final_dst=empty,
+        )
+        backend.mis_metadata = None
+        backend.requires_contiguous_prefill_state = False
+        conv_states = torch.zeros(8, 6, 2, dtype=self.CONV_DTYPE)
+        cache = SimpleNamespace(conv=[conv_states], temporal=torch.zeros(8, 1, 2, 2))
+        backend.state_layer_cache = lambda _: cache
+        backend._convolve_prefill = Mock(side_effect=lambda _l, _b, x, _s, _i: x)
+        backend._prefill_gates = Mock(return_value=(None, None))
+        backend.kernel_dispatcher = object.__new__(GDNKernelDispatcher)
+        backend.kernel_dispatcher.extend_kernel = SimpleNamespace(
+            supports_track_state_snapshot=False,
+            defers_prefill_gates=False,
+            extend=lambda q, k, v, g, beta, **kwargs: (v, None, None),
+        )
+        with (
+            patch.object(gdn_backend, "is_cuda", return_value=False),
+            patch.object(gdn_backend, "is_hip", return_value=False),
+            patch.object(gdn_backend, "is_xpu", return_value=False),
+            patch.object(gdn_backend, "is_npu", return_value=False),
+        ):
+            backend.forward_extend(layer, batch, qkv, None, None)
+        expected = qkv.view(2, 2, 6).transpose(1, 2).to(self.CONV_DTYPE)
+        self.assertTrue(torch.equal(conv_states[[4, 5]], expected))
+        untouched = torch.ones(8, dtype=torch.bool)
+        untouched[[4, 5]] = False
+        self.assertTrue(torch.all(conv_states[untouched] == 0))
+
+    def test_mamba2_prefill_tracks_cast_activations(self):
+        # intermediate 4 = 2 heads x head_dim 2; conv_dim = 4 + 2 x (1 group x state 2).
+        mixer = SimpleNamespace(
+            tp_size=1,
+            intermediate_size=4,
+            conv_dim=8,
+            num_heads=2,
+            head_dim=2,
+            n_groups=1,
+            groups_ssm_state_size=2,
+            activation="silu",
+            conv1d=SimpleNamespace(weight=torch.zeros(8, 1, 4), bias=None),
+            A=torch.zeros(2),
+            D=torch.zeros(2),
+            dt_bias=torch.zeros(2),
+            # in_proj output is [gate 4 | B_C 8 | dt 2]; pass it through.
+            in_proj=lambda hidden_states: (hidden_states, None),
+            norm=lambda hidden_states, gate: hidden_states,
+            out_proj=lambda hidden_states: (hidden_states, None),
+        )
+        torch.manual_seed(0)
+        hidden_states = torch.randn(4, 14, dtype=torch.float16)
+        conv_state = torch.zeros(8, 8, 3, dtype=self.CONV_DTYPE)
+        metadata = SimpleNamespace(
+            mamba_cache_indices=torch.tensor([6]),
+            query_start_loc=torch.tensor([0, 4]),
+            num_prefills=1,
+            num_decodes=0,
+            num_prefill_tokens=4,
+            is_target_verify=False,
+            draft_token_num=None,
+            mixed_metadata=SimpleNamespace(
+                has_initial_states=None,
+                prep_initial_states=False,
+                extend_seq_lens_cpu=[4],
+                chunk_size=4,
+                seq_idx=None,
+                chunk_indices=None,
+                chunk_offsets=None,
+            ),
+            has_mamba_track_mask=True,
+            track_conv_indices=torch.tensor([[0, 1, 2], [1, 2, 3]]),
+            conv_states_mask_indices=torch.tensor([5, 2]),
+            track_ssm_seq_idx=None,
+            track_ssm_end_locs=None,
+        )
+        with (
+            patch.object(
+                mamba, "causal_conv1d_fn", side_effect=lambda x, *a, **k: x, create=True
+            ),
+            patch.object(
+                mamba, "mamba_chunk_scan_combined", return_value=(None, None, None)
+            ),
+        ):
+            MambaMixer2.forward(
+                mixer,
+                hidden_states=hidden_states,
+                layer_cache=SimpleNamespace(
+                    conv=[conv_state], temporal=torch.zeros(8, 2, 2, 2)
+                ),
+                metadata=metadata,
+            )
+        x = hidden_states[:, 4:12]
+        expected = x[metadata.track_conv_indices].transpose(1, 2).to(self.CONV_DTYPE)
+        self.assertTrue(torch.equal(conv_state[[5, 2]], expected))
+        untouched = torch.ones(8, dtype=torch.bool)
+        untouched[[5, 2]] = False
+        self.assertTrue(torch.all(conv_state[untouched] == 0))
 
 
 class TestKdaCutedslVerifyStateDtypeGate(CustomTestCase):
