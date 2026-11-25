@@ -7,6 +7,7 @@ mod preparation;
 mod reorg;
 
 pub(super) use preparation::enforce_minimax_m31_thinking;
+pub use preparation::Preprocessor;
 
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
@@ -29,9 +30,10 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
-    forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
-    CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
+    parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
+    COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
+use sglang_processor::openai::OpenAiSettings;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
@@ -230,7 +232,7 @@ pub async fn route_typed<R: TypedRpc>(
         if path != GENERATE_PATH {
             require_plain_workers(ctx, &model, path)?;
         }
-        let prepared = PreparedRequest::typed(ctx, path, model, &request.view())?;
+        let prepared = ctx.preprocessor.typed(path, model, &request.view())?;
         Ok::<_, ApiError>((prepared, routing))
     };
     match prepared.await {
@@ -245,7 +247,9 @@ pub async fn route_typed<R: TypedRpc>(
 /// when it keeps the text, as under `--disable-input-ids-forwarding`.
 pub fn prompt_ids(ctx: &AppContext, endpoint: Endpoint, text: &str) -> Option<Vec<i32>> {
     let model = ModelId(ctx.config.model.id.clone());
-    let ids = forwarded_prompt_ids(ctx, &model, endpoint.path(), text)?;
+    let ids = ctx
+        .preprocessor
+        .forwarded_prompt_ids(&model, endpoint.path(), text)?;
     ids.into_iter().map(|id| i32::try_from(id).ok()).collect()
 }
 
@@ -296,28 +300,39 @@ fn prepare_now<'a>(
             let sent =
                 ModelId(sent.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
             let (_, body) = canonicalize_model_alias(ctx, sent, body)?;
-            let needs_tokens = routing.needs_request_tokens(ctx);
+            let needs_tokens =
+                routing.needs_request_tokens(ctx) || ctx.bucket_selector.is_enabled();
             let path = if matches!(endpoint, Endpoint::Chat) {
                 CHAT_PATH
             } else {
                 COMPLETIONS_PATH
             };
             if grpc && matches!(endpoint, Endpoint::Completions) {
-                PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
+                ctx.preprocessor
+                    .completion(model, fields, body, needs_tokens)?
             } else if grpc {
-                PreparedRequest::openai_grpc(ctx, path, model, fields, headers, body, needs_tokens)?
+                ctx.preprocessor
+                    .openai_grpc(path, model, fields, headers, body, needs_tokens)?
             } else {
-                PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?
+                ctx.preprocessor.openai(
+                    model_openai_settings(ctx, &model).as_deref(),
+                    path,
+                    model,
+                    fields,
+                    headers,
+                    body,
+                    needs_tokens,
+                )?
             }
         }
-        Endpoint::Generate => PreparedRequest::generate(ctx, model, body)?,
+        Endpoint::Generate => ctx.preprocessor.generate(model, body)?,
         Endpoint::Embeddings | Endpoint::Classify => {
             let path = endpoint.path();
             let (sent, mut value) = parse_embedding_request(&body)?;
             let (sent, body) = canonicalize_model_alias(ctx, sent, body)?;
             value["model"] = sent.0.into();
             require_plain_workers(ctx, &model, path)?;
-            PreparedRequest::embeddings(ctx, path, model, body, value)?
+            ctx.preprocessor.embeddings(path, model, body, value)?
         }
         Endpoint::Rerank => {
             require_plain_workers(ctx, &model, RERANK_PATH)?;
@@ -820,6 +835,19 @@ fn parse_optional_positive_f64_header(
     Ok(Some(parsed))
 }
 
+/// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.
+fn model_openai_settings(ctx: &AppContext, model: &ModelId) -> Option<Arc<OpenAiSettings>> {
+    let workers = ctx.registry.workers_for(model);
+    let first = Arc::clone(workers.first()?.openai_settings()?);
+    let agree = workers.iter().all(|w| w.openai_settings() == Some(&first));
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !agree && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(model = %model.0, "workers report different OpenAI server args; \
+            serving OpenAI requests through the engines' own routes");
+    }
+    agree.then_some(first)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,7 +986,11 @@ mod tests {
         ctx.config.model.tokenizer_path = Some(dir.join("tokenizer.json").to_str().unwrap().into());
         // A token-aware route, so `prepare` renders and tokenizes the chat.
         ctx.config.model.dp_aware = true;
-        ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+        ctx.preprocessor = Preprocessor::new(
+            &ctx.config.model,
+            Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap()),
+            Arc::clone(&ctx.metrics),
+        );
         ctx.policies.insert(
             ModelId("stub-model".into()),
             Arc::new(crate::policies::round_robin::RoundRobinPolicy::new()),
@@ -973,7 +1005,13 @@ mod tests {
         let dir = slow_template_dir();
         let ctx = Arc::new(slow_render_ctx(dir.path()));
         let body = slow_chat_body(
-            |b| assert!(ctx.tokenizers.encode_chat("stub-model", b).is_some()),
+            |b| {
+                assert!(ctx
+                    .preprocessor
+                    .tokenizers()
+                    .encode_chat("stub-model", b)
+                    .is_some())
+            },
             Duration::from_millis(400),
         );
         let body = Bytes::from(body.to_string());
