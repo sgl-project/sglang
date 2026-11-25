@@ -230,15 +230,24 @@ jobs:
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-          while true; do
-            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
-              echo "Found exist sglang job, sleeping for 30 seconds..."
-              sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
-            else
-              echo "No sglang job exist, start test case..."
+          # The DeepSWE eval pod is a standalone Pod (not part of the volcano
+          # job YAML), so the `-f` delete above does not remove it. Always list
+          # and delete in $NAMESPACE: a bare `kubectl get pods` uses the
+          # kubeconfig's default namespace and can silently delete nothing,
+          # which would spin this loop forever.
+          for attempt in $(seq 1 40); do
+            leftover_pods="$(kubectl get pods -n "$NAMESPACE" --no-headers \
+              -o custom-columns=:metadata.name 2>/dev/null \
+              | grep "^${pod_name_prefix}" || true)"
+            if [ -z "${leftover_pods}" ]; then
+              echo "No sglang pod left."
               break
             fi
+            echo "Attempt ${attempt}: deleting leftover pods:"
+            echo "${leftover_pods}"
+            echo "${leftover_pods}" \
+              | xargs -r kubectl delete pod -n "$NAMESPACE" --grace-period=0 --force || true
+            sleep 15
           done
 
       - name: Run test
@@ -440,15 +449,24 @@ jobs:
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-          while true; do
-            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
-              echo "Found exist sglang job, sleeping for 30 seconds..."
-              sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
-            else
-              echo "No sglang job exist, start test case..."
+          # The DeepSWE eval pod is a standalone Pod (not part of the volcano
+          # job YAML), so the `-f` delete above does not remove it. Always list
+          # and delete in $NAMESPACE: a bare `kubectl get pods` uses the
+          # kubeconfig's default namespace and can silently delete nothing,
+          # which would spin this loop forever.
+          for attempt in $(seq 1 40); do
+            leftover_pods="$(kubectl get pods -n "$NAMESPACE" --no-headers \
+              -o custom-columns=:metadata.name 2>/dev/null \
+              | grep "^${pod_name_prefix}" || true)"
+            if [ -z "${leftover_pods}" ]; then
+              echo "No sglang pod left."
               break
             fi
+            echo "Attempt ${attempt}: deleting leftover pods:"
+            echo "${leftover_pods}"
+            echo "${leftover_pods}" \
+              | xargs -r kubectl delete pod -n "$NAMESPACE" --grace-period=0 --force || true
+            sleep 15
           done
           # Cleanup the run-scoped source code directory on the shared PVC.
           rm -rf /root/.cache/tests/sglang-${{ github.run_id }} || true
