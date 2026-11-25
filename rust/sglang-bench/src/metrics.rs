@@ -135,6 +135,63 @@ pub struct BenchmarkMetrics {
     pub max_concurrent_requests: usize,
     /// Per-request output lengths in request order, 0 for a failure.
     pub output_lens: Vec<usize>,
+    pub cache: CacheReport,
+}
+
+/// The `--cache-report` totals over the successful requests, as the Python
+/// client sums them. The prompt total is the server-reported length.
+#[derive(Debug, Default)]
+pub struct CacheReport {
+    pub total_prompt_tokens: usize,
+    pub total_cached_tokens: usize,
+    pub device: u64,
+    pub host: u64,
+    pub storage: u64,
+    pub storage_backend: Option<String>,
+    /// Whether any request carried a split by cache tier.
+    pub has_details: bool,
+}
+
+impl CacheReport {
+    fn add(&mut self, output: &RequestOutput) {
+        self.total_prompt_tokens += output.prompt_len;
+        self.total_cached_tokens += output.cached_tokens;
+        let Some(details) = &output.cached_tokens_details else {
+            return;
+        };
+        self.has_details = true;
+        let tier = |name: &str| {
+            details
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        self.device += tier("device");
+        self.host += tier("host");
+        let storage = tier("storage");
+        if storage > 0 {
+            self.storage += storage;
+            self.storage_backend = details
+                .get("storage_backend")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+        }
+    }
+
+    pub fn hit_rate_pct(&self) -> f64 {
+        if self.total_prompt_tokens == 0 {
+            0.0
+        } else {
+            self.total_cached_tokens as f64 / self.total_prompt_tokens as f64 * 100.0
+        }
+    }
+
+    fn storage_label(&self) -> String {
+        match &self.storage_backend {
+            Some(name) => format!("  Storage ({name}):"),
+            None => "  Storage:".to_owned(),
+        }
+    }
 }
 
 /// Fold the per-request outputs into the reported metrics. `retokenized_lens`
@@ -152,6 +209,7 @@ pub fn calculate(
     let mut tpots: Vec<f64> = Vec::new();
     let mut ttfts: Vec<f64> = Vec::new();
     let mut e2e_latencies: Vec<f64> = Vec::new();
+    let mut cache = CacheReport::default();
 
     for output in outputs {
         if !output.success {
@@ -159,6 +217,7 @@ pub fn calculate(
             continue;
         }
         output_lens.push(output.output_len);
+        cache.add(output);
         total_input += output.dataset_prompt_len;
         total_input_text += output.dataset_text_prompt_len;
         total_input_vision += output.dataset_vision_prompt_len;
@@ -195,6 +254,7 @@ pub fn calculate(
         max_output_tokens_per_s,
         max_concurrent_requests,
         output_lens,
+        cache,
     }
 }
 
@@ -325,7 +385,52 @@ pub fn print_report(
     println!("{:<40} {:<10.2}", "P95 ITL (ms):", metrics.itl.p95);
     println!("{:<40} {:<10.2}", "P99 ITL (ms):", metrics.itl.p99);
     println!("{:<40} {:<10.2}", "Max ITL (ms):", metrics.max_itl_ms);
+    if args.cache_report {
+        print_cache_report(&metrics.cache);
+    }
     println!("{}", "=".repeat(50));
+}
+
+/// The `Cache Hit Details` block the Python client prints for `--cache-report`.
+fn print_cache_report(cache: &CacheReport) {
+    let tiers = cache.has_details && cache.total_cached_tokens > 0;
+    let cached = cache.total_cached_tokens as f64;
+    println!("{:-^50}", "Cache Hit Details");
+    println!(
+        "{:<40} {:<10}",
+        "Total prompt tokens:", cache.total_prompt_tokens
+    );
+    println!(
+        "{:<40} {:<10}",
+        "Total cached tokens:", cache.total_cached_tokens
+    );
+    if tiers {
+        println!("{:<40} {:<10}", "  Device:", cache.device);
+        println!("{:<40} {:<10}", "  Host:", cache.host);
+        if cache.storage > 0 {
+            println!("{:<40} {:<10}", cache.storage_label(), cache.storage);
+        }
+    }
+    println!("{:<40} {:.1}%", "Cache hit rate:", cache.hit_rate_pct());
+    if tiers {
+        println!(
+            "{:<40} {:.1}%",
+            "  Device:",
+            cache.device as f64 / cached * 100.0
+        );
+        println!(
+            "{:<40} {:.1}%",
+            "  Host:",
+            cache.host as f64 / cached * 100.0
+        );
+        if cache.storage > 0 {
+            println!(
+                "{:<40} {:.1}%",
+                cache.storage_label(),
+                cache.storage as f64 / cached * 100.0
+            );
+        }
+    }
 }
 
 fn print_family(heading: &str, label: &str, summary: &Summary) {
@@ -485,11 +590,26 @@ pub fn result_json(
             "max_concurrent_requests",
             serde_json::json!(metrics.max_concurrent_requests),
         );
+        if args.cache_report {
+            let cache = &metrics.cache;
+            put(
+                "cache_report",
+                serde_json::json!({
+                    "total_prompt_tokens": cache.total_prompt_tokens,
+                    "total_cached_tokens": cache.total_cached_tokens,
+                    "cache_hit_rate_pct": (cache.hit_rate_pct() * 100.0).round() / 100.0,
+                    "device_cached_tokens": cache.has_details.then_some(cache.device),
+                    "host_cached_tokens": cache.has_details.then_some(cache.host),
+                    "storage_cached_tokens": (cache.storage > 0).then_some(cache.storage),
+                    "storage_backend": cache.storage_backend,
+                }),
+            );
+        }
     }
     let mut result = serde_json::Value::Object(object);
 
     if args.output_details {
-        let details = serde_json::json!({
+        let mut details = serde_json::json!({
             "input_lens": outputs.iter().map(|o| o.prompt_len).collect::<Vec<_>>(),
             "output_lens": metrics.output_lens,
             "ttfts": outputs.iter().map(|o| o.ttft).collect::<Vec<_>>(),
@@ -497,6 +617,16 @@ pub fn result_json(
             "generated_texts": outputs.iter().map(|o| o.generated_text.clone()).collect::<Vec<_>>(),
             "errors": outputs.iter().map(|o| o.error.clone()).collect::<Vec<_>>(),
         });
+        if args.cache_report {
+            details["cached_tokens"] =
+                serde_json::json!(outputs.iter().map(|o| o.cached_tokens).collect::<Vec<_>>());
+            details["cached_tokens_details"] = serde_json::json!(
+                outputs
+                    .iter()
+                    .map(|o| o.cached_tokens_details.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
         let (Some(result), Some(details)) = (result.as_object_mut(), details.as_object()) else {
             unreachable!("both are JSON objects");
         };
@@ -651,6 +781,34 @@ mod tests {
         // Second 0 holds 3 tokens from the first request plus 1 from the second.
         assert_eq!(peak_tokens, 4.0);
         assert_eq!(peak_requests, 2);
+    }
+
+    /// The cache totals cover successful requests only, divide by the
+    /// server-reported prompt lengths, and sum the tiers that were reported.
+    #[test]
+    fn cache_report_folds_successful_requests() {
+        let mut hit = output(0.1, vec![], 0.1, 1);
+        hit.cached_tokens = 6;
+        hit.cached_tokens_details = Some(serde_json::json!({
+            "device": 4, "host": 1, "storage": 1, "storage_backend": "file"
+        }));
+        let mut miss = output(0.1, vec![], 0.1, 1);
+        miss.prompt_len = 30;
+        let failed = RequestOutput {
+            success: false,
+            prompt_len: 100,
+            cached_tokens: 100,
+            ..Default::default()
+        };
+        let cache = calculate(&[hit, miss, failed], &[0, 0, 0], 1.0).cache;
+
+        assert_eq!(cache.total_prompt_tokens, 40);
+        assert_eq!(cache.total_cached_tokens, 6);
+        assert_eq!((cache.device, cache.host, cache.storage), (4, 1, 1));
+        assert_eq!(cache.storage_backend.as_deref(), Some("file"));
+        assert!(cache.has_details);
+        assert!((cache.hit_rate_pct() - 15.0).abs() < 1e-9);
+        assert_eq!(CacheReport::default().hit_rate_pct(), 0.0);
     }
 
     #[test]

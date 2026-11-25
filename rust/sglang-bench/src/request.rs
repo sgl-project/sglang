@@ -53,6 +53,10 @@ pub struct RequestOutput {
     pub dataset_prompt_len: usize,
     pub dataset_text_prompt_len: usize,
     pub dataset_vision_prompt_len: usize,
+    /// Prompt tokens the server served from its prefix cache, and their
+    /// split by cache tier where the server reported one.
+    pub cached_tokens: usize,
+    pub cached_tokens_details: Option<Value>,
 }
 
 /// Everything about a request body that does not vary per prompt.
@@ -379,6 +383,7 @@ impl StreamState {
     fn feed_value(&mut self, data: &Value, start: Instant, output: &mut RequestOutput) {
         self.latency = Some(start.elapsed().as_secs_f64());
         record_server_prompt_len(data, output);
+        record_cached_tokens(data, output);
         match self.api {
             Api::SglangGenerate => self.feed_generate(data, start, output),
             Api::OpenaiCompletions => self.feed_completions(data, start, output),
@@ -523,6 +528,7 @@ impl StreamState {
 /// arriving as `delta` frames. TTFT is the whole latency, as in Python.
 fn finish_non_streaming_chat(data: &Value, latency: f64, output: &mut RequestOutput) {
     record_server_prompt_len(data, output);
+    record_cached_tokens(data, output);
     let message = data
         .get("choices")
         .and_then(|choices| choices.get(0))
@@ -576,6 +582,36 @@ fn record_server_prompt_len(data: &Value, output: &mut RequestOutput) {
     if tokens > 0 {
         output.prompt_len = tokens as usize;
     }
+}
+
+/// Take the prefix-cache hits where the Python `--cache-report` reads them:
+/// `meta_info.cached_tokens` and its tier split on the native route, and on
+/// the OpenAI routes the tier split under `sglext`, summed. A frame carrying
+/// neither leaves the earlier frame's values.
+fn record_cached_tokens(data: &Value, output: &mut RequestOutput) {
+    if let Some(meta) = data.get("meta_info") {
+        output.cached_tokens = meta
+            .get("cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        output.cached_tokens_details = meta
+            .get("cached_tokens_details")
+            .filter(|details| !details.is_null())
+            .cloned();
+        return;
+    }
+    let Some(details) = data
+        .get("sglext")
+        .and_then(|sglext| sglext.get("cached_tokens_details"))
+        .filter(|details| details.as_object().is_some_and(|tiers| !tiers.is_empty()))
+    else {
+        return;
+    };
+    output.cached_tokens = ["device", "host", "storage"]
+        .iter()
+        .filter_map(|tier| details.get(tier).and_then(Value::as_u64))
+        .sum::<u64>() as usize;
+    output.cached_tokens_details = Some(details.clone());
 }
 
 fn trim(line: &[u8]) -> &[u8] {
@@ -719,6 +755,44 @@ mod tests {
         );
         assert_eq!(output.itl.len(), 1);
         assert_eq!(output.output_len, 2);
+    }
+
+    /// Cache hits come from `meta_info` on the native route and from the
+    /// `sglext` tier split, summed, on the OpenAI routes; the last frame that
+    /// carries them wins, as in the Python client.
+    #[test]
+    fn cached_tokens_are_read_from_either_route() {
+        let native = feed_all(
+            Api::SglangGenerate,
+            &[
+                r#"data: {"text":"a","meta_info":{"completion_tokens":1,"cached_tokens":64}}"#,
+                r#"data: {"text":"ab","meta_info":{"completion_tokens":2,"cached_tokens":64,"cached_tokens_details":{"device":48,"host":16}}}"#,
+            ],
+        );
+        assert_eq!(native.cached_tokens, 64);
+        assert_eq!(native.cached_tokens_details.unwrap()["host"], 16);
+
+        let chat = feed_all(
+            Api::OpenaiChat,
+            &[
+                r#"data: {"choices":[{"delta":{"content":"a"}}]}"#,
+                r#"data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":1},"sglext":{"cached_tokens_details":{"device":3,"host":2,"storage":1,"storage_backend":"file"}}}"#,
+                "data: [DONE]",
+            ],
+        );
+        assert_eq!(chat.cached_tokens, 6);
+        assert_eq!(
+            chat.cached_tokens_details.unwrap()["storage_backend"],
+            "file"
+        );
+
+        // No cache fields at all: nothing recorded.
+        let plain = feed_all(
+            Api::OpenaiCompletions,
+            &[r#"data: {"choices":[{"text":"a"}]}"#],
+        );
+        assert_eq!(plain.cached_tokens, 0);
+        assert!(plain.cached_tokens_details.is_none());
     }
 
     /// The OpenAI routes send deltas, so the text concatenates and each frame

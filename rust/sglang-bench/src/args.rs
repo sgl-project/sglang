@@ -205,6 +205,11 @@ pub struct Args {
     #[arg(long)]
     pub disable_retokenize: bool,
 
+    /// Report how many prompt tokens the server served from its prefix
+    /// cache. Supported with the sglang backends (native, oai, oai-chat).
+    #[arg(long)]
+    pub cache_report: bool,
+
     /// POST `/flush_cache` after the warmup.
     #[arg(long)]
     pub flush_cache: bool,
