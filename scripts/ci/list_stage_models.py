@@ -172,8 +172,10 @@ def extract_models_from_source(
     source: str,
     const_table: Dict[str, Set[str]],
     deny: Optional[Set[str]] = None,
+    tree: Optional[ast.AST] = None,
 ) -> Set[str]:
     """All model ids reachable from ``source``: inline literals + name refs.
+    ``tree`` is ``source`` already parsed, when the caller has it.
 
     ``const_table`` is the merged (global + local) constant lookup. Name
     references resolve against it, so an imported ``DEFAULT_*`` constant is
@@ -181,7 +183,8 @@ def extract_models_from_source(
     inside f-strings are skipped -- they are partial/dynamic and would yield
     truncated, non-existent ids (e.g. ``f"org/model-{ver}"``).
     """
-    tree = ast.parse(source)
+    if tree is None:
+        tree = ast.parse(source)
     fstring_fragments = {
         id(part)
         for node in ast.walk(tree)
@@ -319,12 +322,15 @@ def collect_suite_files(
 
 def load_overrides(path: Optional[str]) -> Dict[str, object]:
     """Read the overrides JSON: ``by_file``, ``by_suite``, ``deny``,
-    ``suite_labels`` (all optional).
+    ``suite_labels``, ``prefetch``, ``unused_by_file`` (all optional).
 
     ``suite_labels`` maps a legacy ``suite=`` registration (which carries no
     runner_config) to the GH runner label(s) its dispatching workflow
     hardcodes in ``runs-on`` -- a LIST, since one suite can run on several
-    labels. A present-but-null key is treated as its default, so a hand-edit
+    labels. ``prefetch`` maps a repo id to how utils/prefetch_hf_models.py
+    downloads it, when not every file at main; ``unused_by_file`` lists the
+    ids a test file names but never loads on CUDA, which that script leaves
+    out. A present-but-null key is treated as its default, so a hand-edit
     like ``"deny": null`` does not blow up downstream iteration.
     """
     overrides: Dict[str, object] = {
@@ -332,6 +338,8 @@ def load_overrides(path: Optional[str]) -> Dict[str, object]:
         "by_suite": {},
         "deny": [],
         "suite_labels": {},
+        "prefetch": {},
+        "unused_by_file": {},
     }
     if not path:
         return overrides
@@ -339,7 +347,7 @@ def load_overrides(path: Optional[str]) -> Dict[str, object]:
         raise FileNotFoundError(f"overrides file not found: {path}")
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    for key in ("by_file", "by_suite", "deny", "suite_labels"):
+    for key in overrides:
         if data.get(key) is not None:
             overrides[key] = data[key]
     return overrides

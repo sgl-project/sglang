@@ -183,7 +183,15 @@ class Overrides(unittest.TestCase):
     def test_load_defaults_when_missing(self):
         ov = lsm.load_overrides(None)
         self.assertEqual(
-            ov, {"by_file": {}, "by_suite": {}, "deny": [], "suite_labels": {}}
+            ov,
+            {
+                "by_file": {},
+                "by_suite": {},
+                "deny": [],
+                "suite_labels": {},
+                "prefetch": {},
+                "unused_by_file": {},
+            },
         )
 
     def test_null_values_fall_back_to_defaults(self):
@@ -193,7 +201,15 @@ class Overrides(unittest.TestCase):
                 f.write('{"deny": null, "by_file": null}')
             ov = lsm.load_overrides(path)
             self.assertEqual(
-                ov, {"by_file": {}, "by_suite": {}, "deny": [], "suite_labels": {}}
+                ov,
+                {
+                    "by_file": {},
+                    "by_suite": {},
+                    "deny": [],
+                    "suite_labels": {},
+                    "prefetch": {},
+                    "unused_by_file": {},
+                },
             )
 
 

@@ -143,6 +143,65 @@ jobs:
           # commit first and the checkout keeps no credentials (persist-credentials: false).
           allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
+      - name: Fetch live partition model
+        if: fromJson(inputs.check_changes).partition_model_sha != ''
+        run: |
+          # SHA resolved by check-changes -> require fetch (curl --retry)
+          # so all shards stay on the same snapshot.
+          rm -f "$RUNNER_TEMP/partition-model.json"
+          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ fromJson(inputs.check_changes).partition_model_sha }}/model.json"
+          curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
+            "$URL" -o "$RUNNER_TEMP/partition-model.json"
+
+      # HF_TOKEN reaches only the prefetch step, which runs the workflow's own
+      # commit before any step runs PR code: the tests themselves hold no token.
+      - name: Check out the prefetch scripts
+        id: prefetch_scripts
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .ci-prefetch
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci
+            python/sglang/test/ci
+
+      - name: Install prefetch dependencies
+        id: prefetch_deps
+        if: steps.prefetch_scripts.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 10
+        # No HF_TOKEN here: pip runs without user-site, pip config, or PIP_*
+        # left on the persistent runner, and installs only hash-pinned wheels.
+        run: |
+          lib="$RUNNER_TEMP/hf-prefetch"
+          rm -rf "$lib"
+          python3 -s -m pip install --isolated --disable-pip-version-check --quiet \
+            --no-cache-dir --only-binary=:all: --index-url https://pypi.org/simple \
+            --target "$lib" -r .ci-prefetch/scripts/ci/utils/prefetch_requirements.txt
+
+      - name: Prefetch Hugging Face models
+        if: steps.prefetch_deps.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 60
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SUITE: ${{ inputs.self_name }}
+          PARTITION_ID: ${{ matrix.partition }}
+          PARTITION_SIZE: ${{ fromJson(inputs.partitions)[inputs.self_name].size }}
+        run: |
+          lib="$RUNNER_TEMP/hf-prefetch"
+          PYTHONPATH="$lib" python3 -s .ci-prefetch/scripts/ci/utils/prefetch_hf_models.py \
+            --repo-root . --suite "$SUITE" \
+            --auto-partition-id "$PARTITION_ID" --auto-partition-size "$PARTITION_SIZE" \
+            --partition-model-file "$RUNNER_TEMP/partition-model.json"
+
+      - name: Remove the prefetch scripts and libraries
+        if: always()
+        continue-on-error: true
+        run: rm -rf .ci-prefetch "$RUNNER_TEMP/hf-prefetch"
+
       - name: Resolve runner_config
         id: rc
         env:
@@ -217,16 +276,6 @@ jobs:
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py ${{ inputs.warmup_server_models }}
 
-      - name: Fetch live partition model
-        if: fromJson(inputs.check_changes).partition_model_sha != ''
-        run: |
-          # SHA resolved by check-changes -> require fetch (curl --retry)
-          # so all shards stay on the same snapshot.
-          rm -f /tmp/partition-model.json
-          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ fromJson(inputs.check_changes).partition_model_sha }}/model.json"
-          curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
-            "$URL" -o /tmp/partition-model.json
-
       # Only test_nightly_precision_regression.py reads these; the others are
       # inert wherever it does not run.
       - name: Export precision baseline env
@@ -259,7 +308,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} \
-            --partition-model-file /tmp/partition-model.json \
+            --partition-model-file "$RUNNER_TEMP/partition-model.json" \
             ${{ inputs.scheduled && '--timeout-from-est-time' || '' }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $CONTINUE_ON_ERROR_FLAG

@@ -1,10 +1,9 @@
 import argparse
 import glob
-import json
 import math
 import os
 import sys
-from typing import Dict, List, Optional
+from typing import List
 
 import tabulate
 
@@ -13,6 +12,7 @@ from sglang.test.ci.ci_register import (
     HWBackend,
     auto_partition,
     collect_tests,
+    load_live_est,
 )
 from sglang.test.ci.ci_utils import run_unittest_files
 
@@ -351,34 +351,6 @@ def pretty_print_tests(
             msg += f"  - {t.filename} (est_time={t.est_time})\n"
 
     print(msg, flush=True)
-
-
-def load_live_est(
-    partition_model_file: Optional[str], suites: List[str], repo_root: str
-) -> Optional[Dict[str, float]]:
-    """`CIRegistry.filename -> est seconds` from `model.json est[suite]`,
-    merged across all requested `suites`; None if no suite yielded any entry
-    (caller then falls back to in-source `est_time`)."""
-    if not partition_model_file or not os.path.exists(partition_model_file):
-        return None
-    try:
-        with open(partition_model_file) as f:
-            partition_model = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(partition_model, dict):
-        return None
-    est_by_suite = partition_model.get("est", {})
-    if not isinstance(est_by_suite, dict):
-        return None
-    merged: Dict[str, float] = {}
-    for suite in suites:
-        suite_est = est_by_suite.get(suite)
-        if not isinstance(suite_est, dict):
-            continue
-        for relpath, elapsed in suite_est.items():
-            merged[os.path.join(repo_root, relpath)] = float(elapsed)
-    return merged or None
 
 
 def load_only_file_list(list_path: str, repo_root: str) -> set:
