@@ -464,10 +464,29 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         key = (id(self), branch)
         entry = cache.get(key)
         if entry is None or entry[0] is not source or entry[1] != context.dtype:
-            kvs = [
-                block.attn2.project_context_kv(context)
+            tokens = math.prod(context.shape[:-1])
+            if (
+                req.do_classifier_free_guidance
+                and get_classifier_free_guidance_world_size() == 1
+            ):
+                tokens = sum(
+                    math.prod(embeds[0].shape[:-1])
+                    for embeds in (req.prompt_embeds, req.negative_prompt_embeds)
+                    if embeds
+                )
+            local_features = sum(
+                block.attn2.heads * block.attn2.head_dim
                 for block in self.transformer_blocks
-            ]
+            )
+            cache_bytes = 2 * tokens * local_features * context.element_size()
+            free_bytes, _ = torch.cuda.mem_get_info(context.device)
+            # Leave at least three quarters of free memory for denoising.
+            kvs = None
+            if cache_bytes <= free_bytes // 4:
+                kvs = [
+                    block.attn2.project_context_kv(context)
+                    for block in self.transformer_blocks
+                ]
             cache[key] = (source, context.dtype, kvs)
             return kvs
         return entry[2]
