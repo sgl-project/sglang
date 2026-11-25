@@ -1,4 +1,4 @@
-"""Muse Spark SM90 fused attention vs fp32 torch: pfa (extend / mixed batches) and attn_srv (chain / tree verify)."""
+"""Muse Spark SM90 fused attention vs fp32 torch: extend (extend / mixed batches) and verify (chain / tree)."""
 
 import sys
 
@@ -58,9 +58,10 @@ def _ref(x, reqs, pt, loc, kc, vc, window, scale, cs):
 
 
 def _run(past, new, tails, window, tree, sink=False, x=None):
-    """pfa over the extend requests, attn_srv over the last `tails` 8-token verify requests (glue.py's mixed
+    """extend over the extend requests, verify over the last `tails` 8-token verify requests (glue.py's mixed
     layout), vs fp32; also checks the cache writes, untouched rows, determinism and CUDA graph replay."""
-    from sglang.srt.layers.muse_spark.fused import attn_srv, pfa
+    from sglang.kernels.ops.attention import muse_spark_extend_sm90 as extend_sm90
+    from sglang.kernels.ops.attention import muse_spark_verify_sm90 as verify_sm90
 
     torch.manual_seed(0)
     B, T, R = len(past), sum(new), len(past) - tails
@@ -107,10 +108,10 @@ def _run(past, new, tails, window, tree, sink=False, x=None):
         if n:
             cu = torch.tensor([0] + new[:R]).cumsum(0).int()
             kvb = sum(min(k, e + window + 128) if window else k for e, k in zip(new, seq[:R]))  # fmt: skip
-            pfa.forward(qkv[:n], loc[:n], kc, vc, pt[:R], sl[:R], cu, kvb, 0.125, qsf, 1e-5, out[:n], window, cs if window else None, pos[:n] if window else None)  # fmt: skip
+            extend_sm90.extend_attention(qkv[:n], loc[:n], kc, vc, pt[:R], sl[:R], cu, kvb, 0.125, qsf, 1e-5, out[:n], window, cs if window else None, pos[:n] if window else None)  # fmt: skip
         if tails:
             o = out[n:T].view(tails, 8, -1)
-            attn_srv.kernel_fn(qkv[n:].view(tails, 8, -1), sl[R:], loc[n:], kc, vc, pt[R:], cfg, tr, o)  # fmt: skip
+            verify_sm90.verify_attention(qkv[n:].view(tails, 8, -1), sl[R:], loc[n:], kc, vc, pt[R:], cfg, tr, o)  # fmt: skip
         return out
 
     out = go()

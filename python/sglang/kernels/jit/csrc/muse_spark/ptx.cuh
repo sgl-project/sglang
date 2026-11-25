@@ -1,5 +1,5 @@
 // Inline-PTX helpers pasted at #include "ptx.cuh" into the Muse Spark NVRTC sources: moe_w4a16*.cuh,
-// fused/attn_srv.py, pfa.py, muse_spark_sp_experts.py, dflash_tree.py.
+// verify_attention.cuh, extend_attention.cuh, dflash_tree.cuh and muse_spark_sp_experts.py.
 typedef unsigned char u8;
 typedef unsigned int u32;
 typedef unsigned short u16;

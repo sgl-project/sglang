@@ -588,6 +588,8 @@ def _module_defines(module: str, attr: str) -> bool:
     "op, backends",
     [
         ("attention.muse_spark_qk_norm_rope_store", {"torch", "triton", "helion"}),
+        ("attention.muse_spark_verify_attention_sm90", {"jit"}),
+        ("attention.muse_spark_extend_attention_sm90", {"jit"}),
         ("communication.muse_spark_all_gather", {"jit"}),
         ("communication.muse_spark_all_gather_norm_residual", {"jit"}),
         (
@@ -603,6 +605,8 @@ def _module_defines(module: str, attr: str) -> bool:
         ("layernorm.muse_spark_rmsnorm_nvfp4_quant", {"torch", "jit", "helion"}),
         ("moe.muse_spark_routing", {"torch", "jit", "triton"}),
         ("moe.muse_spark_post_expert_finalize", {"triton"}),
+        ("speculative.dflash_tree_build", {"jit"}),
+        ("speculative.dflash_tree_accept", {"jit"}),
     ],
 )
 def test_muse_spark_kernels_are_inventoried_by_operator(op, backends):

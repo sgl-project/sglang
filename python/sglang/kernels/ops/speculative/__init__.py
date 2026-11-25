@@ -99,4 +99,16 @@ register_kernel(
     )
 )
 
+# DFlash tree verify (NVRTC, built for the current CUDA device).
+for _fn in ("dflash_tree_build", "dflash_tree_accept"):
+    register_kernel(
+        KernelSpec(
+            op=f"speculative.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.speculative.dflash_tree:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn
+
 __all__ = []

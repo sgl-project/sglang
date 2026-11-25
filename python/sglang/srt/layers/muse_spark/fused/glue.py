@@ -1,14 +1,15 @@
 """Hopper-only Muse Spark paths: the gate shared by every one of them, the fused attention
-(attn_srv verify, pfa extend / mixed, the SP o_proj push) and TP row-split pooler projections."""
+(chain / tree verify, extend / mixed, the SP o_proj push) and TP row-split pooler projections."""
 
 import functools
 from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention import muse_spark_extend_sm90 as extend_sm90
+from sglang.kernels.ops.attention import muse_spark_verify_sm90 as verify_sm90
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import is_cp_active
-from sglang.srt.layers.muse_spark.fused import attn_srv, pfa
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     get_breakable_capture_recorder,
@@ -23,7 +24,7 @@ _HOPPER = (9, 0)
 SLICED_PROJECTION_CAPS = ((10, 3), _HOPPER)
 # prefill sizes split pooler / unpooler rows over TP (GEMM cost > all-gather)
 PREFILL_SLICE_MIN_TOKENS = 1024
-# pfa packs each key read; below this kv-weighted mean extend (measured break-even) FA3 wins
+# the extend kernel packs each key read; below this kv-weighted mean extend (measured break-even) FA3 wins
 PREFILL_MIN_MEAN_EXTEND = 32
 
 
@@ -155,7 +156,7 @@ def _fa3_ok(module, backend) -> bool:
 
 
 def verify_max_batch(module, backend) -> int:
-    return attn_srv.MAX_BATCH if _fa3_ok(module, backend) else 0
+    return verify_sm90.MAX_BATCH if _fa3_ok(module, backend) else 0
 
 
 def run_attention(
@@ -190,7 +191,7 @@ def run_attention(
 def _tree_uncovered():
     # stock attention has no tree mask; trees only reach batches tree_verify_max_batch() admits
     raise RuntimeError(
-        "fused tree verify: this layer / batch is not covered by attn_srv"
+        "fused tree verify: this layer / batch is not covered by the verify kernel"
     )
 
 
@@ -229,13 +230,13 @@ def _run_verify_attention(module, qkv, forward_batch, tree) -> Optional[torch.Te
         return None
     batch = md.cache_seqlens_int32.shape[0]
     tokens = qkv.shape[0]
-    if tokens != 8 * batch or not 0 < batch <= attn_srv.MAX_BATCH:
+    if tokens != 8 * batch or not 0 < batch <= verify_sm90.MAX_BATCH:
         return None
     kv = _paged_kv(module, backend, md, forward_batch)
     if kv is None:
         return None
     page_table, cache_loc, k_cache, v_cache = kv
-    out = attn_srv.kernel_fn(
+    out = verify_sm90.verify_attention(
         qkv.view(batch, 8, -1),
         md.cache_seqlens_int32,
         cache_loc[:tokens],
@@ -288,7 +289,7 @@ def _run_pfa(module, qkv, positions, out, a, push=None, last_only=False) -> None
     page_table, cache_loc, k_cache, v_cache, cache_seqlens, cu_seqlens_q, ext, seq = a
     n, window = sum(ext), module._fused_cfg["window"]
     if n > 0:
-        pfa.forward(
+        extend_sm90.extend_attention(
             qkv[:n],
             cache_loc[:n],
             k_cache,
@@ -319,7 +320,7 @@ def _run_mixed_verify(
     page_table, cache_loc, k_cache, v_cache, cache_seqlens, cu_seqlens_q, ext, seq = a
     tails, tree = forward_batch.mixed_verify_rows or 0, forward_batch.mixed_verify_tree
     rows = len(ext) - tails
-    if rows < 0 or tails > attn_srv.MAX_BATCH or any(e != 8 for e in ext[rows:]):
+    if rows < 0 or tails > verify_sm90.MAX_BATCH or any(e != 8 for e in ext[rows:]):
         if tree is not None:
             _tree_uncovered()
         return False
@@ -346,7 +347,7 @@ def _run_mixed_verify(
         )
     elif push:
         module.o_proj._sp_a2a_push.push_rows(push, t, push[5] - t)
-    attn_srv.kernel_fn(
+    verify_sm90.verify_attention(
         qkv[n : n + t].view(tails, 8, -1),
         cache_seqlens[rows:],
         cache_loc[n : n + t],
@@ -399,7 +400,7 @@ def run_prefill_attention(
     """With ``push`` (sp_o_proj_push_plan) a non-None result means the rows went to their owners."""
     from sglang.srt.model_executor.forward_mode import ForwardMode
 
-    # a full prefill graph would freeze the host lengths pfa sizes its launch from
+    # a full prefill graph would freeze the host lengths the extend kernel sizes its launch from
     if (
         not module._fused_attn
         or forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)

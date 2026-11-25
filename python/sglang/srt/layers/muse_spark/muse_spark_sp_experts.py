@@ -112,7 +112,7 @@ class SPExpertBuffers:
         return self.recv.view(-1)[: rows * kf].view(rows, kf)
 
     def o_proj_push_plan(self, num_tokens: int, k: int) -> Optional[tuple]:
-        """Where pfa writes o_proj input so recv holds push_all_to_all's result."""
+        """Where the extend kernel writes o_proj input so recv holds push_all_to_all's result."""
         rows, kf = -(-num_tokens // self.tp), k * self.tp
         if not self._push_ok or rows * kf > self.recv.numel() or k % 8:
             return None
