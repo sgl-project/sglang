@@ -138,6 +138,7 @@ from sglang.srt.managers.mm_utils import (
     pad_mm_tokens,
 )
 from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE, MultimodalInputs
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -219,6 +220,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_spec,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -1203,9 +1205,16 @@ class MqaAttentionBase(nn.Module):
                 else 0
             )
         )
+        rope_seqlen = config.max_position_embeddings
+        if get_spec().speculative_algorithm == "DSPARK":
+            # Verify runs at full width even on the final step. With overlap,
+            # the next window can also launch before the previous step retires
+            # the request. Cover both windows, as the spec decode KV allocator
+            # does. Request admission still uses the configured context length.
+            rope_seqlen += get_alloc_reserve_per_decode()
         self.rope_kwargs = dict(
             dim=self.qk_rope_head_dim,
-            seqlen=config.max_position_embeddings,
+            seqlen=rope_seqlen,
             original_seq_len=original_seq_len,
             base=self.rope_base,
             factor=scaling.get("factor", 1.0),
