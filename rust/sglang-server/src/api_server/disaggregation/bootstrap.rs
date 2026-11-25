@@ -53,6 +53,9 @@ struct PrefillServerInfo {
     /// Each stage's state entries, by stage, when the stages differ.
     #[serde(skip_serializing_if = "Option::is_none")]
     state_wires: Option<Vec<Option<serde_json::Value>>>,
+    /// Non-checksum metadata buffer item sizes when prefill exchanges them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aux_item_lens: Option<Vec<i64>>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
     stores_to_linker: bool,
@@ -126,6 +129,7 @@ struct Topology {
     /// Each pipeline stage's PD state entries (`state_wire`), as its ranks
     /// registered them; every rank of a stage registers the same ones.
     state_wire_by_stage: BTreeMap<i64, Option<serde_json::Value>>,
+    aux_item_lens: Option<Vec<i64>>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
     stores_to_linker: Option<bool>,
@@ -235,6 +239,8 @@ struct Route {
     /// a rank that registers none.
     #[serde(default)]
     state_wire: Option<serde_json::Value>,
+    #[serde(default)]
+    aux_item_lens: Option<Vec<i64>>,
 }
 
 async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) -> Response {
@@ -255,6 +261,7 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
     let mut layout_mismatch = false;
     let mut spec_mismatch = false;
     let mut state_wire_mismatch = false;
+    let mut aux_item_lens_mismatch = false;
     state.topology.rcu(|current| {
         let mut topo = (**current).clone();
         layout_mismatch =
@@ -266,7 +273,9 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
             .state_wire_by_stage
             .get(&body.pp_rank)
             .is_some_and(|wire| *wire != body.state_wire);
-        if layout_mismatch || spec_mismatch || state_wire_mismatch {
+        aux_item_lens_mismatch =
+            topo.registered_count > 0 && topo.aux_item_lens != body.aux_item_lens;
+        if layout_mismatch || spec_mismatch || state_wire_mismatch || aux_item_lens_mismatch {
             return topo;
         }
         topo.dsv41_spec_layout = body.dsv41_spec_layout.clone();
@@ -275,6 +284,7 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         }
         topo.state_wire_by_stage
             .insert(body.pp_rank, body.state_wire.clone());
+        topo.aux_item_lens = body.aux_item_lens.clone();
         topo.attn_tp_size.get_or_insert(body.attn_tp_size);
         topo.attn_cp_size.get_or_insert(body.attn_cp_size);
         topo.dp_size.get_or_insert(dp_size);
@@ -326,6 +336,12 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         return json_error(
             StatusCode::BAD_REQUEST,
             "PD state entries differ across the ranks of one pipeline stage",
+        );
+    }
+    if aux_item_lens_mismatch {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Disaggregation metadata buffer layout differs across prefill ranks",
         );
     }
 
@@ -390,6 +406,7 @@ async fn route_get(
             // them answers, so an older decode reads a dense prefill's answer.
             state_wire: topo.state_wire().filter(truthy),
             state_wires: topo.state_wires().filter(|wires| !wires.is_empty()),
+            aux_item_lens: topo.aux_item_lens.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
             stores_to_linker: topo.stores_to_linker.unwrap_or(false),
@@ -679,6 +696,19 @@ mod tests {
         let (_, body) = request(addr, "GET", SENTINEL, None);
         let info: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(info["dsv41_spec_layout"], layout);
+    }
+
+    #[test]
+    fn aux_item_lens_round_trip_and_rank_mismatch() {
+        let (_rt, addr) = start_on_free_port();
+        let lens = serde_json::json!([8, 64, 128]);
+        let body = put_route(serde_json::json!({"aux_item_lens": lens}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        assert_eq!(sentinel_info(addr)["aux_item_lens"], lens);
+
+        let incompatible = put_route(serde_json::json!({"aux_item_lens": [8, 64]}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&incompatible)).0, 400);
+        assert_eq!(sentinel_info(addr)["aux_item_lens"], lens);
     }
 
     #[test]

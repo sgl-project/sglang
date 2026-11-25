@@ -4,9 +4,12 @@ The bootstrap thread records the ACK target while a transfer is outstanding.
 Only the transfer worker can send that ACK after its write has drained.
 """
 
+import ctypes
+import struct
 import threading
 import unittest
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -239,6 +242,41 @@ class TestMooncakeAbortNotification(
 
                 manager.send_aux.assert_called_once()
                 self.assertEqual(manager._sent, [])
+
+
+class TestMooncakeAuxLayout(CustomTestCase):
+    def test_decode_fails_the_room_of_a_dropped_aux_item(self):
+        rows = (ctypes.c_ubyte * 16)()
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=[ctypes.addressof(rows)], aux_item_lens=[8]
+        )
+        succeeded = ROOM + 1
+        manager.request_status = {
+            ROOM: KVPoll.WaitingForInput,
+            succeeded: KVPoll.Success,
+        }
+        manager.failure_records = {}
+        manager.failure_lock = threading.Lock()
+        data = b"\x01" * 16
+
+        for room in (ROOM, succeeded):
+            manager._handle_aux_data(
+                [
+                    MooncakeKVManager.AUX_DATA_HEADER,
+                    str(room).encode("ascii"),
+                    b"0",
+                    b"0",
+                    struct.pack(">I", len(data)),
+                    data,
+                ]
+            )
+        manager.update_status(ROOM, KVPoll.Success)
+
+        self.assertEqual(bytes(rows), bytes(16))
+        for room in (ROOM, succeeded):
+            self.assertEqual(manager.request_status[room], KVPoll.Failed)
+            self.assertIn("AUX_DATA rejected", manager.failure_records[room])
 
 
 if __name__ == "__main__":

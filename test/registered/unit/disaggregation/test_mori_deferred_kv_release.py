@@ -4,6 +4,7 @@ import threading
 import unittest
 from collections import defaultdict
 from queue import Queue
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -23,11 +24,13 @@ from test_deferred_decode_kv_release import (
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AbortNotification, AckTarget
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mori.conn import (
     MoriKVManager,
     _MoriTransferSubmissionError,
     _SubmissionLocal,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -317,6 +320,83 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
         self.assertEqual(manager._drain_transfer_statuses.call_count, 2)
         log.assert_called_once()
+
+
+class TestMoriAuxLayout(CustomTestCase):
+    def test_prefill_refuses_a_decode_with_another_aux_layout(self):
+        item_lens = [8] * 15 + [64]
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.transfer_lock = threading.Lock()
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=[0] * 16, aux_item_lens=item_lens
+        )
+        manager.customized_info_enabled = False
+        manager.exchange_aux_item_lens = True
+        manager.pp_group = SimpleNamespace(is_last_rank=True)
+        manager.state_mem_descs = []
+        manager.update_status = MagicMock()
+        info = SimpleNamespace(
+            engine_key="decode",
+            is_dummy=False,
+            dst_kv_indices=np.arange(4, dtype=np.int32),
+            dst_aux_index=0,
+        )
+        manager.transfer_infos = {11: {"decode": info}}
+
+        def submit(dst_aux_item_lens):
+            manager.request_status = {11: KVPoll.WaitingForInput}
+            manager.decode_kv_args_table = {
+                "decode": SimpleNamespace(
+                    dst_aux_mem_descs=[object()] * 16,
+                    dst_aux_item_lens=dst_aux_item_lens,
+                    requires_dcp_relayout=False,
+                )
+            }
+            manager.send_kvcache = MagicMock(return_value=[])
+            manager.send_aux = MagicMock(return_value=[])
+            manager._submit_kv_transfer(
+                11, np.arange(4, dtype=np.int32), slice(0, 4), True, aux_index=0
+            )
+
+        with get_context().override_server_args(
+            disaggregation_enable_kv_checksum=False
+        ):
+            with self.assertRaisesRegex(ValueError, "layout mismatch"):
+                submit(None)
+            manager.send_kvcache.assert_not_called()
+            manager.send_aux.assert_not_called()
+
+            submit(item_lens)
+            manager.send_aux.assert_called_once()
+
+    def test_rdma_aux_write_lands_on_the_decode_row(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.aux_mem_descs = ["src0", "src1"]
+        manager.kv_args = SimpleNamespace(aux_item_lens=[8, 16])
+        manager.engine = MagicMock()
+        manager.engine.batch_write.return_value = []
+        manager._record_submitted_statuses = MagicMock()
+
+        def remote_offsets_and_sizes(dst_aux_item_lens):
+            manager.engine.batch_write.reset_mock()
+            manager.send_aux_rdma(
+                SimpleNamespace(
+                    dst_aux_mem_descs=["dst0", "dst1"],
+                    dst_aux_item_lens=dst_aux_item_lens,
+                ),
+                prefill_aux_index=2,
+                dst_aux_index=3,
+                room=11,
+            )
+            args = manager.engine.batch_write.call_args.args
+            self.assertEqual(args[1], [[16], [32]])
+            return args[3], args[4]
+
+        self.assertEqual(
+            remote_offsets_and_sizes([8, 40]), ([[24], [120]], [[8], [16]])
+        )
+        self.assertEqual(remote_offsets_and_sizes(None), ([[24], [48]], [[8], [16]]))
 
 
 if __name__ == "__main__":
