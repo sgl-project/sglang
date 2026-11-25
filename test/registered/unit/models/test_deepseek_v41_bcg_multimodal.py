@@ -13,6 +13,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -140,7 +141,9 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
 
                 def outer_forward(ids, positions, batch):
                     model = SimpleNamespace(
-                        vision=object(), config=SimpleNamespace(image_token_id=image_id)
+                        vision=object(),
+                        supports_visual_inputs=True,
+                        config=SimpleNamespace(image_token_id=image_id),
                     )
                     mapped, _ = (
                         dsv4.DeepseekV4ForCausalLM.prepare_language_model_inputs(
@@ -226,6 +229,68 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                     model, torch.arange(3), hidden, batch, ids, ids, False, []
                 )
             torch.testing.assert_close(actual, expected)
+
+
+class TestDsv41WeightSkip(CustomTestCase):
+    """A language-only server still routes image tokens, so it needs the vision bias."""
+
+    BIAS = "model.layers.0.mlp.gate.e_score_correction_bias_vl"
+
+    def test_vision_bias_loads_without_a_local_tower(self):
+        self.assertIsNone(
+            dsv4._dsv41_skip_group(
+                name=self.BIAS,
+                has_local_vision=False,
+                params_dict={self.BIAS: object()},
+            )
+        )
+
+    def test_vision_bias_is_skipped_when_the_gate_has_no_parameter(self):
+        self.assertEqual(
+            dsv4._dsv41_skip_group(
+                name=self.BIAS, has_local_vision=False, params_dict={}
+            ),
+            "gate.bias_vl",
+        )
+
+    def test_vision_weights_are_skipped_without_a_local_tower(self):
+        self.assertEqual(
+            dsv4._dsv41_skip_group(
+                name="vision.blocks.0.norm1.weight",
+                has_local_vision=False,
+                params_dict={},
+            ),
+            "vision",
+        )
+
+    def test_everything_loads_with_a_local_tower(self):
+        self.assertIsNone(
+            dsv4._dsv41_skip_group(
+                name="vision.blocks.0.norm1.weight",
+                has_local_vision=True,
+                params_dict={},
+            )
+        )
+
+
+class TestDeepseekV41EncoderNumTokens(CustomTestCase):
+    """EPD token span of one image: start, (width + newline) per row, end."""
+
+    @staticmethod
+    def _model():
+        return object.__new__(dsv4.DeepseekV4ForCausalLM)
+
+    def test_image_span_length(self):
+        self.assertEqual(
+            self._model().encoder_num_tokens([1, 11, 16], Modality.IMAGE), 189
+        )
+        self.assertEqual(
+            self._model().encoder_num_tokens(torch.tensor([1, 2, 3]), Modality.IMAGE),
+            10,
+        )
+
+    def test_non_image_modality_declares_nothing(self):
+        self.assertIsNone(self._model().encoder_num_tokens([1, 2, 3], Modality.AUDIO))
 
 
 if __name__ == "__main__":

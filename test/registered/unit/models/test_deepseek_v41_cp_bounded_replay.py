@@ -330,6 +330,10 @@ class TestEagerCpOutputHook(CustomTestCase):
                 model = deepseek_v4_nextn.DeepseekV4ForCausalLMNextN(
                     SimpleNamespace(vocab_size=16, hidden_size=3)
                 )
+                # The draft mirrors the EPD flags the inherited loader reads.
+                self.assertFalse(model.encoder_only)
+                self.assertFalse(model.language_only)
+                self.assertFalse(model.supports_visual_inputs)
                 runner = SimpleNamespace(model_runner=SimpleNamespace(model=model))
                 batch = make_batch()
                 batch.positions = torch.arange(512)

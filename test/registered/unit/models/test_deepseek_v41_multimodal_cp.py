@@ -105,7 +105,10 @@ def simulated_collective(strategy, batch, global_tensor):
 
 
 class _PreparedModel(NS, LanguageModelInputPreparation):
-    pass
+    def __init__(self, **kwargs):
+        # These fixtures model a colocated vision tower.
+        kwargs.setdefault("supports_visual_inputs", True)
+        super().__init__(**kwargs)
 
 
 class TestDSV41MultimodalCP(CustomTestCase):
@@ -390,6 +393,7 @@ class TestDSV41MultimodalCP(CustomTestCase):
                 ids = torch.tensor([4, 5, 6])
                 model = NS(
                     vision=object(),
+                    supports_visual_inputs=True,
                     config=NS(image_token_id=IMAGE_ID),
                     _prepare_mm_embeddings=Mock(),
                 )
@@ -407,6 +411,7 @@ class TestDSV41MultimodalCP(CustomTestCase):
                 ids = torch.tensor([4, IMAGE_ID, 6])
                 model = NS(
                     vision=object(),
+                    supports_visual_inputs=True,
                     config=NS(image_token_id=IMAGE_ID),
                     _prepare_mm_embeddings=Mock(),
                 )
@@ -474,6 +479,7 @@ class TestDSV41MultimodalInputs(CustomTestCase):
 
     def test_text_only_model_keeps_existing_embeddings(self):
         self.model.vision = None
+        self.model.supports_visual_inputs = False
         ids, embeds = DeepseekV4ForCausalLM.prepare_language_model_inputs(
             self.model, self.ids, self.batch, self.embeds
         )
@@ -483,6 +489,7 @@ class TestDSV41MultimodalInputs(CustomTestCase):
 
     def test_text_subclass_without_vision_module(self):
         del self.model.vision
+        self.model.supports_visual_inputs = False
         ids, embeds = DeepseekV4ForCausalLM.prepare_language_model_inputs(
             self.model, self.ids, self.batch, self.embeds
         )
