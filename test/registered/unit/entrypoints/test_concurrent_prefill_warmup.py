@@ -44,6 +44,7 @@ def _internal_state(**overrides):
         "memory_usage": {"token_capacity": 1888043},
         "speculative_algorithm": None,
         "mlx_enable_sampling": False,
+        "disaggregation_mode": "null",
     }
     state.update(overrides)
     return state
@@ -112,6 +113,22 @@ class TestConcurrentPrefillPlan(CustomTestCase):
         self.assertEqual(
             concurrent_prefill_plan(_limits(max_queued_requests=0)).rounds, []
         )
+
+    def test_pd_prefill_ignores_the_queue_limit(self):
+        """A PD prefill scheduler never applies --max-queued-requests, so the
+        limit must not shrink or skip the warmup there."""
+
+        def round_sizes(mode):
+            limits = concurrent_prefill_limits(
+                [_internal_state(max_queued_requests=0, disaggregation_mode=mode)],
+                context_len=131072,
+                max_req_input_len=131066,
+                num_reserved_tokens=0,
+            )
+            return [len(r) for r in concurrent_prefill_plan(limits).rounds]
+
+        self.assertEqual(round_sizes("null"), [])
+        self.assertEqual(round_sizes("prefill"), [1, 4, 32])
 
     def test_round_budget_follows_chunk_size(self):
         """Each round spans a chunk boundary even with a large chunk, and the

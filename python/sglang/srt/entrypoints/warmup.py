@@ -185,7 +185,7 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
 
     # Effective running-request slots, summed over DP ranks.
     max_running_requests: int
-    # Per scheduler; None is unlimited.
+    # Per scheduler; None is unlimited or not applied.
     max_queued_requests: Optional[int]
     # None or <= 0: chunked prefill is off.
     chunked_prefill_size: Optional[int]
@@ -219,7 +219,13 @@ def concurrent_prefill_limits(
         max_running_requests=sum(
             s["effective_max_running_requests_per_dp"] for s in internal_states
         ),
-        max_queued_requests=state["max_queued_requests"],
+        # Only the regular scheduler applies the queue limit; a PD prefill
+        # server queues requests for bootstrap instead.
+        max_queued_requests=(
+            None
+            if state.get("disaggregation_mode") == "prefill"
+            else state["max_queued_requests"]
+        ),
         chunked_prefill_size=state["chunked_prefill_size"],
         context_len=context_len,
         max_req_input_len=max_req_input_len,
