@@ -16,8 +16,25 @@ logger = logging.getLogger(__name__)
 
 # The compressed-KV pool's page; its C128 sub-pool hardcodes 256-token pages.
 DSV4_PAGE_SIZE = 256
+# NPU uses a 128-token compressed-KV page geometry.
+DSV4_NPU_PAGE_SIZE = 128
 # Used when --swa-full-tokens-ratio is at its default and cap mode is unusable.
 DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
+
+_DSV4_ATTENTION_BACKEND = "dsv4"
+_DSV4_ATTENTION_BACKEND_FLAGS = (
+    ("attention_backend", "--attention-backend"),
+    ("prefill_attention_backend", "--prefill-attention-backend"),
+    ("decode_attention_backend", "--decode-attention-backend"),
+)
+
+
+def _raw_input_of(server_args: Any, field: str) -> Any:
+    """Return the caller-supplied raw value for ``field``, ignoring prior defaults."""
+    raw = getattr(server_args, "_raw_input", None)
+    if raw is not None and field in raw:
+        return raw[field]
+    return getattr(server_args, field, None)
 
 
 @_register_for("DeepseekV4ForCausalLM")
@@ -26,7 +43,27 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
 
     model_arch = hf_config.architectures[0]
-    overrides: Dict[str, Any] = {"attention_backend": "dsv4"}
+
+    # Inspect raw caller inputs rather than resolving_view(server_args): on NPU,
+    # set_default_server_args() declares "ascend" for all three attention
+    # backend fields and page_size=128 before model overrides run.
+    for field, flag in _DSV4_ATTENTION_BACKEND_FLAGS:
+        explicit_backend = _raw_input_of(server_args, field)
+        if explicit_backend is not None and explicit_backend != _DSV4_ATTENTION_BACKEND:
+            raise ValueError(
+                f"DeepSeek-V4 only supports {flag} {_DSV4_ATTENTION_BACKEND!r}, "
+                f"got {explicit_backend!r}."
+            )
+
+    page_size = DSV4_NPU_PAGE_SIZE if cfg.device == "npu" else DSV4_PAGE_SIZE
+    explicit_page_size = _raw_input_of(server_args, "page_size")
+    if explicit_page_size is not None and explicit_page_size != page_size:
+        raise ValueError(
+            f"DeepSeek-V4 only supports --page-size {page_size} on {cfg.device}, "
+            f"got {explicit_page_size}."
+        )
+
+    overrides: Dict[str, Any] = {"attention_backend": _DSV4_ATTENTION_BACKEND}
 
     # MXFP8 serves this checkpoint's 32-wide ue8m0 blocks on SM100/SM103;
     # explicit backend choices, including Triton, take precedence.
@@ -56,16 +93,14 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             f"{DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO} for {model_arch}."
         )
 
-    page_size = DSV4_PAGE_SIZE
     if cfg.device == "npu":
         # NPU keeps the device-aware "dsv4" backend (the registry routes it to
         # the Ascend V4 subclass); only the pool geometry / dtype differ.
         # set_default_server_args() pins all three backends to "ascend" for
         # generic NPU models; override that here so V4 stays consistently on
         # dsv4.
-        page_size = 128
-        overrides["prefill_attention_backend"] = "dsv4"
-        overrides["decode_attention_backend"] = "dsv4"
+        overrides["prefill_attention_backend"] = _DSV4_ATTENTION_BACKEND
+        overrides["decode_attention_backend"] = _DSV4_ATTENTION_BACKEND
     overrides["page_size"] = page_size
     logger.info(
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."
