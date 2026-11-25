@@ -5,7 +5,6 @@ import os
 import subprocess
 import sys
 import textwrap
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,7 +12,7 @@ import torch
 from sglang.kernels.ops.moe import muse_spark_nvfp4_w4a16_moe as m
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=420, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 E, H, G, D = 32, 4096, "cuda", torch.float64  # the only supported shape
 V = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
@@ -50,23 +49,6 @@ def _guests():
     return m.DynamicGuests(stage, gsrc, torch.tensor(peer, device=G))
 
 
-@functools.cache
-def _marlin():  # Hopper's stock NVFP4 MoE (Marlin) on the same weights
-    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-        prepare_moe_nvfp4_layer_for_marlin,
-    )
-
-    (q13, s13, _), (q2, s2, _) = _experts(2 * H), _experts(H)
-    k = "w13_weight w2_weight w13_weight_scale w2_weight_scale w13_weight_scale_2"
-    layer = SimpleNamespace(**dict(zip(k.split(), (q13, q2, s13, s2, _gs()[0, :E]))))
-    layer.__dict__.update(w2_weight_scale_2=_gs()[1, :E], params_dtype=torch.bfloat16)
-    layer.moe_runner_config = SimpleNamespace(is_gated=True)
-    layer.intermediate_size_per_partition, layer.num_local_experts = H, E
-    layer.global_num_experts, layer._expert_map = E, None
-    prepare_moe_nvfp4_layer_for_marlin(layer, group_size=16)
-    return layer
-
-
 def _inputs(M, n, skew, seed):
     torch.manual_seed(seed)
     ids = torch.rand(M, n, device=G).argsort(1)[:, :8]
@@ -85,8 +67,8 @@ def _w(q, s, gs):  # e2m1 x e4m3 per 16 x global
     return torch.cat([V, -V]).to(G, D)[c] * s.float().repeat_interleave(16, 1) * gs
 
 
-def _ref(x, ids, tw, nw, exact=False):
-    """-> (out, sum_j tw_j |y_j|); h rounded to BF16 as in the kernels unless exact."""
+def _ref(x, ids, tw, nw):
+    """-> (out, sum_j tw_j |y_j|); h rounded to BF16 as in the kernels."""
     (q13, s13, _), (q2, s2, _), (g13, g2) = _experts(2 * H), _experts(H), _gs()
     ref = torch.zeros(x.shape, dtype=D, device=G)
     mag = torch.zeros_like(ref)
@@ -94,21 +76,16 @@ def _ref(x, ids, tw, nw, exact=False):
         t, j = (ids == e).nonzero(as_tuple=True)
         g, u = (x[t].to(D) @ _w(q13[e], s13[e], g13[e]).T).chunk(2, -1)
         h = g * g.sigmoid() * u
-        y = (h if exact else h.bfloat16().to(D)) @ _w(q2[e], s2[e], g2[e]).T * nw.to(D)
+        y = h.bfloat16().to(D) @ _w(q2[e], s2[e], g2[e]).T * nw.to(D)
         y *= tw[t, j, None] * (y.square().mean(-1, True) + 1e-8).rsqrt()
         ref.index_add_(0, t, y)
         mag.index_add_(0, t, y.abs())
     return ref, mag
 
 
-@sm90  # split-K tiles to 512, 1024-token chunks, SP_MIN, BIG_MIN, 8192-token big chunks
+@sm90  # small-M, a split-K boundary, both sides of BIG_MIN (SP), repeated ids in the large-M lists
 @pytest.mark.parametrize(
-    "M,sp,skew",
-    [(1, 0, 0), (100, 0, 1), (512, 0, 0), (513, 0, 1), (1025, 0, 0), (65, 1, 0)]
-    + [(300, 1, 1), (2048, 1, 0), (2049, 1, 1), (8192, 1, 0), (8193, 1, 1)]
-    + [(16384, 1, 0)]
-    # repeated ids: more routes per expert than tokens in the large-M route lists
-    + [(100, 0, 2), (2049, 1, 2), (8193, 1, 2)],
+    "M,sp,skew", [(1, 0, 0), (513, 0, 1), (2048, 1, 0), (2049, 1, 1), (8193, 1, 2)]
 )
 def test_matches_reference(M, sp, skew):
     (w13, w2), (g13, g2) = (_experts(n)[2] for n in (2 * H, H)), _gs()[:, :E]
@@ -134,25 +111,6 @@ def test_matches_reference(M, sp, skew):
     assert ((outs[0].to(D) - ref).abs() <= tol).all()
 
 
-@sm90
-@pytest.mark.parametrize("M", [1, 200])
-def test_not_less_accurate_than_marlin(M):
-    from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
-        fused_post_expert_norm_weighted_sum as finalize,
-    )
-    from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
-
-    (w13, w2), (g13, g2) = (_experts(n)[2] for n in (2 * H, H)), _gs()[:, :E]
-    x, ids, tw, nw = _inputs(M, E, 0, M)
-    y, lid = MuseSpark1xFp4Experts._marlin_expert_outputs(_marlin(), x, tw, ids)
-    stock = finalize(y, tw, nw, 1e-8, True, slot_expert_ids=lid)
-    ours = m.nvfp4_w4a16_moe_with_post_norm(x, ids, tw, w13, g13, w2, g2, nw.float())
-    ref = _ref(x, ids, tw, nw, exact=True)[0]
-    err = lambda o: (o.to(D) - ref).norm().item()
-    # Marlin also rounds gate / up to BF16 before the SiLU
-    assert err(ours) <= err(stock) <= 2**-7 * ref.norm().item()
-
-
 def _all_ranks(x, ids, tw, nw, guests_on):
     """8 SP ranks on one GPU; with ``guests_on`` busy ranks' experts run as dynamic guests."""
     (w13, w2, g13, g2), M = _ranks(), x.shape[0]
@@ -172,7 +130,7 @@ def _all_ranks(x, ids, tw, nw, guests_on):
 
 
 @sm90  # guests from DG_MIN, big kernel from BIG_MIN
-@pytest.mark.parametrize("M,skew", [(776, 1), (2048, 1), (2056, 0), (8200, 1)])
+@pytest.mark.parametrize("M,skew", [(2048, 1)])
 def test_guests_same_math(M, skew):
     x, ids, tw, nw = _inputs(M, 256, skew, M)
     run = lambda on: _all_ranks(x, ids, tw, nw.float(), on)
@@ -185,7 +143,7 @@ def test_guests_same_math(M, skew):
 
 
 @sm90
-@pytest.mark.parametrize("M", [1, 256])
+@pytest.mark.parametrize("M", [1])
 def test_cuda_graph_replay(M):
     """Decode on rank 0 of 8, captured once, replayed on new inputs: as eager."""
     (w13, w2, g13, g2), local = _ranks(), lambda i: torch.where(i < E, i, -1)

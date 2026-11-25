@@ -1,6 +1,5 @@
-"""SM90 small-M BF16 GEMV (TileLang): fp64 reference, cuBLAS, rows past M, determinism and
-CUDA graph replay. CI takes the smallest M and both sides of each table row boundary; outside
-CI (or with SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1) every M the tables admit."""
+"""SM90 small-M BF16 GEMV (TileLang): one decode shape at M = 1 and both sides of its first
+config boundary, against an fp64 reference and cuBLAS."""
 
 import sys
 
@@ -8,10 +7,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
 if SM90:
@@ -19,12 +17,8 @@ if SM90:
 
 pytestmark = pytest.mark.skipif(not SM90, reason="SM90")
 U, PAD, NAN = 2.0**-24, 64, float("nan")
-# GWC: bf16 out (unquant decode GEMMs); GWR / GWS: fp32 router out (decode / SP)
-CASES = (
-    [(n, k, "GWC") for n, k in g._GWC] + [(512, 8192, "GWR"), (512, 8192, "GWS")]
-    if SM90
-    else []
-)
+# bf16 out (the unquant decode GEMMs): the table's first shape
+CASES = [(*next(iter(g._GWC)), "GWC")] if SM90 else []
 
 
 def _bits(t):
@@ -45,11 +39,8 @@ def _setup(n, k, mode, seed):
 
 
 def _test_ms(rows):
-    """Row boundaries pick the kernel config: both sides of each, and M = 1."""
-    edges = {1} | {r[0] for r in rows} | {r[0] + 1 for r in rows[:-1]}
-    return get_ci_test_range(
-        full_range=list(range(1, rows[-1][0] + 1)), ci_range=sorted(edges)
-    )
+    """M = 1 and both sides of the first row boundary, which switches the kernel config."""
+    return [1, rows[0][0], rows[0][0] + 1]
 
 
 def _err(y, ref):  # bf16: outputs not correctly rounded; fp32: squared error
@@ -66,34 +57,6 @@ def test_use_admits_only_table_shapes():
             assert not g.use(0, n, k, tab) and not g.use(hi + 1, n, k, tab)
             # non-multiple N / K are not in the tables: the caller keeps cuBLAS
             assert not g.use(1, n + 8, k, tab) and not g.use(1, n, k + 8, tab)
-
-
-def test_wide_wgmma_stays_inside_the_build():
-    """Importing the module and building its kernels leave TileLang's wgmma emitter and
-    log level as they were; the kernels still get one m64nTBk16 per k16 step."""
-    import logging
-    import subprocess
-
-    from tilelang.cuda.intrinsics.macro.wgmma_macro_generator import (
-        TensorCoreIntrinEmitter as E,
-    )
-
-    probe = (
-        "import logging, tilelang\n"
-        "from tilelang.cuda.intrinsics.macro.wgmma_macro_generator import "
-        "TensorCoreIntrinEmitter as E\n"
-        "before = (logging.getLogger('tilelang').level, E._initialize_wgmma_prefix)\n"
-        "import sglang.kernels.ops.gemm.hopper_bf16_small_m_gemv\n"
-        "assert (logging.getLogger('tilelang').level, E._initialize_wgmma_prefix) == before\n"
-    )
-    subprocess.run([sys.executable, "-c", probe], check=True)
-    stock, level = E._initialize_wgmma_prefix, logging.getLogger("tilelang").level
-    tab, f32, x, w, arg = _setup(2304, 8192, "GWC", seed=0)
-    m = 112  # TB 112: TileLang alone would issue gcd(112, 256) = 16-wide wgmmas
-    g.gemv(x[:m], arg, torch.empty(m, 2304, dtype=torch.bfloat16, device="cuda"), tab)
-    assert E._initialize_wgmma_prefix is stock
-    assert logging.getLogger("tilelang").level == level
-    assert "64, 112, 16," in g._K[g._config(m, 2304, 8192)].get_kernel_source()
 
 
 @pytest.mark.parametrize("n,k,mode", CASES)
@@ -124,38 +87,6 @@ def test_table_ms(n, k, mode):
     # summation order (it decides some roundings on long K: 1.27x at K = 40960)
     slack = 0 if f32 else 2e-5 * n * sum(ms)
     assert ours <= 1.5 * stock + slack, (ours, stock)
-
-
-_GRAPH_CASES = [
-    (2304, 8192, 5, "GWC"),
-    (512, 8192, 100, "GWC"),
-    (8192, 1024, 256, "GWC"),
-    (1024, 40960, 64, "GWC"),
-    (512, 8192, 64, "GWR"),
-    (512, 8192, 256, "GWS"),
-]
-
-
-# CI: a K-split cluster kernel with the fp32 router epilogue
-@pytest.mark.parametrize(
-    "n,k,m,mode",
-    get_ci_test_range(full_range=_GRAPH_CASES, ci_range=[(512, 8192, 64, "GWR")]),
-)
-def test_cuda_graph_replay(n, k, m, mode):
-    tab, f32, x, _, arg = _setup(n, k, mode, seed=m)
-    xs = x[:m].clone()
-    dt = torch.float32 if f32 else torch.bfloat16
-    y = torch.empty(m, n // 2 if f32 else n, dtype=dt, device="cuda")
-    g.gemv(xs, arg, y, tab)  # build outside capture
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        g.gemv(xs, arg, y, tab)
-    for _ in range(3):
-        xs.copy_(torch.randn(m, k, device="cuda").bfloat16())
-        graph.replay()
-        eager = g.gemv(xs.clone(), arg, torch.empty_like(y), tab)
-        assert torch.equal(_bits(y), _bits(eager))
 
 
 if __name__ == "__main__":

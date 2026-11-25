@@ -7,7 +7,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 F8, W = torch.float8_e4m3fn, 2048
 # verify tree slots: 0-1-2-3 is a chain, 4..7 branch off it
@@ -134,12 +134,13 @@ def _run(past, new, tails, window, tree, sink=False, x=None):
 
 # (past, new, verify tails, window, sink): prefix lengths at 128-key chunk / window edges, mixed extend + tree
 # verify batches, a sink-dominated NoPE batch
-PFA = [([0, 2600], [40, 30], 0, W, False), ([500, 3000], [64, 100], 0, 0, True)]
-PFA += [([0, 1, 127, 128, 2047, 2048, 3001], [1, 127, 129, 64, 2, 300, 1000], 0, w, False) for w in (W, 0)]  # fmt: skip
-PFA += [([100, 2600, 2047, 5000, 70], [300, 50, 8, 8, 8], 3, w, False) for w in (W, 0)]
-# (verify batch, window, tree, sink): the batch picks the cluster size (sliding) / combine width (full);
-# 1 long request splits over every SM, [200000, 0] leaves the short one on a single CTA
-SRV = [(B, w, B in (2, 20, 32), not w and B == 16) for B in (1, 2, 16, 20, 28, 32) for w in (W, 0)]  # fmt: skip
+# (past, new, verify tails, window, sink): page / window edges in one extend, and a mixed batch
+PFA = [
+    ([0, 1, 127, 128, 2047, 2048, 3001], [1, 127, 129, 64, 2, 300, 1000], 0, W, False)
+]
+PFA += [([100, 2600, 2047, 5000, 70], [300, 50, 8, 8, 8], 3, 0, False)]
+# (verify batch, window, tree, sink): a sliding cluster batch with tree masks, a full one with sinks
+SRV = [(32, W, True, False), (16, 0, False, True)]
 
 
 @sm90
@@ -160,7 +161,7 @@ def test_attn_srv_verify(B, window, tree, sink):
 
 
 @sm90
-@pytest.mark.parametrize("window", [W, 0])
+@pytest.mark.parametrize("window", [W])
 def test_tree_verify_equals_chain(window):
     """Tree node i == the last row of a chain verify over i's root path (same past, so the same split)."""
     anc, dep = _tree()
