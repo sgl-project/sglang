@@ -162,6 +162,8 @@ class TestPullFilesFromDb(CustomTestCase):
             self._pulled(local_dir),
             {"config.json": "{}", "tokenizer.json": "[2]"},
         )
+
+    def test_no_patterns_downloads_everything(self):
         """Without patterns the behavior is unchanged (backwards compat)."""
         store, local_dir = self._store(
             {
