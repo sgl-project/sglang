@@ -57,12 +57,13 @@ def _static_rank_peak_bound(slots, destinations, sources, ranks):
 def _random_rank_peak_bound(samples, probability, before, totals, active_sources=None):
     """Bound the mean busiest-rank load and reject unsafe window tails."""
     # Accumulate moments and support bounds from the assignment marginals.
+    can_reach_rank = probability > 0
     weights = np.concatenate(
         (
             probability,
             probability * (1 - probability),
-            probability > 0,
-            (probability > 0) & (probability < 1),
+            can_reach_rank,
+            can_reach_rank & (probability < 1),
         ),
         axis=1,
     )
@@ -164,8 +165,9 @@ def _replica_rank_probabilities(inverse, ranks, local_experts):
     # Dynamic dispatch uses randint(0, 65536) modulo the number of copies.
     # The first remainder columns therefore get one extra draw.
     num_draws = 65536
-    expert, column = np.nonzero(inverse >= 0)
-    copies = (inverse >= 0).sum(1)[expert]
+    valid_slots = inverse >= 0
+    expert, column = np.nonzero(valid_slots)
+    copies = valid_slots.sum(1)[expert]
     draws = num_draws // copies + (column < num_draws % copies)
     destination = inverse[expert, column] // local_experts
     probability = np.zeros((len(inverse), ranks))

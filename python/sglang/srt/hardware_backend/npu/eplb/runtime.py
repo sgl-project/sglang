@@ -193,15 +193,16 @@ def _hccl_expert_order(old_layout, new_layout, num_logical, world_size, batch_si
     sends = owners * (quotient + (owners.cumsum(axis=0) <= remainder))
     endpoint_rows = np.concatenate((sends, receivers), axis=0)
     contiguous = endpoint_rows.reshape(-1, num_batches, batch_size).sum(axis=2)
+    contiguous_cost = contiguous.max(axis=0).sum()
+    if contiguous_cost == 0:
+        return None
     interleaved = endpoint_rows.reshape(
         -1, batch_size // block_size, num_batches, block_size
     ).sum(axis=(1, 3))
 
     # Require a substantial drop in busiest-endpoint rows to offset extra
     # submissions on lightly loaded ranks.
-    if interleaved.max(axis=0).sum() * 3 > contiguous.max(axis=0).sum() * 2:
-        return None
-    if not contiguous.any():
+    if interleaved.max(axis=0).sum() * 3 > contiguous_cost * 2:
         return None
     return (
         np.arange(padded)

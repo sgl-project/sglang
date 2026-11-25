@@ -497,20 +497,21 @@ def _balance_recorded_steps(
         tail = window_p95_index(len(mass))
         return np.array([peak.sum(), np.partition(peak / mass, tail)[tail]])
 
-    def evaluate(layer, placement):
+    def sampled_rank_load(layer, placement):
         steps = scoring_steps[layer]
         mass = totals[steps, layer]
         per_copy = samples[steps, layer] / replicas[layer]
         peak = per_copy[:, ids[layer, placement]].sum(axis=2).max(axis=1)
-        # No layout can beat the average rank or the busiest single replica.
-        lower = np.maximum(mass / len(ranks), per_copy.max(axis=1))
-        return score(peak, mass), score(lower, mass)
+        return peak, mass, per_copy
 
     baseline = {}
     headroom = {}
     for layer in eligible:
-        baseline[layer], lower = evaluate(layer, order[layer])
-        headroom[layer] = (1 - lower / baseline[layer]).sum()
+        peak, mass, per_copy = sampled_rank_load(layer, order[layer])
+        baseline[layer] = score(peak, mass)
+        # No layout can beat the average rank or the busiest single replica.
+        lower = np.maximum(mass / len(ranks), per_copy.max(axis=1))
+        headroom[layer] = (1 - score(lower, mass) / baseline[layer]).sum()
 
     # Limit extra solver work to one alternate per eight eligible layers.
     budget = (
@@ -525,9 +526,6 @@ def _balance_recorded_steps(
     alternatives = []
     for batch, candidates in exchange(shortlist, alternate):
         for layer, candidate in zip(batch, candidates, strict=True):
-            candidate_score, _ = evaluate(layer, candidate)
-            improvement = 1 - (candidate_score / baseline[layer]).mean()
-            live = current[layer].numpy().reshape(slots.shape)
             target = ids[layer, candidate]
             before_peak = observed_peaks[:, layer]
             layer_counts = samples[:, layer]
@@ -539,8 +537,13 @@ def _balance_recorded_steps(
             primary_gain = estimate_migration_gain(
                 layer_counts, primary, before_peak=before_peak
             )
-            if primary_gain and improvement <= 1e-12:
-                continue
+            if primary_gain:
+                # Only an alternative to an admissible primary spends the shared budget.
+                peak, mass, _ = sampled_rank_load(layer, candidate)
+                improvement = 1 - (score(peak, mass) / baseline[layer]).mean()
+                if improvement <= 1e-12:
+                    continue
+            live = current[layer].numpy().reshape(slots.shape)
             extra = _min_remote_rows(live, target, logical.shape[1]) - _min_remote_rows(
                 live, primary, logical.shape[1]
             )
