@@ -35,36 +35,6 @@ from sglang.srt.models.siglip import SiglipVisionModel
 logger = logging.getLogger(__name__)
 
 
-def _load_with_shard_id(
-    weight_loader, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id
-) -> None:
-    """Try the checkpoint shard id before its equivalent string or integer form."""
-    try:
-        weight_loader(param, loaded_weight, shard_id)
-        return
-    except (AssertionError, TypeError):
-        pass
-
-    if isinstance(shard_id, str):
-        mapping = {"q": 0, "k": 1, "v": 2}
-        if shard_id in mapping:
-            weight_loader(param, loaded_weight, mapping[shard_id])
-            return
-        if shard_id.isdigit():
-            weight_loader(param, loaded_weight, int(shard_id))
-            return
-    elif isinstance(shard_id, int):
-        mapping = {0: "q", 1: "k", 2: "v"}
-        if shard_id in mapping:
-            weight_loader(param, loaded_weight, mapping[shard_id])
-            return
-
-    raise TypeError(
-        f"Unsupported shard_id={shard_id!r} for weight_loader={weight_loader} "
-        f"(param={param.name})."
-    )
-
-
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
@@ -471,21 +441,6 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = residual_mlp + hidden_states
 
         return hidden_states, None
-
-
-class Gemma3TextScaledWordEmbedding(nn.Embedding):
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: int,
-        embed_scale: Optional[float] = 1.0,
-    ):
-        super().__init__(num_embeddings, embedding_dim, padding_idx)
-        self.embed_scale = embed_scale
-
-    def forward(self, input_ids: torch.Tensor):
-        return super().forward(input_ids) * self.embed_scale
 
 
 class Gemma3MultiModalProjector(nn.Module):

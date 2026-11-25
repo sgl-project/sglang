@@ -262,8 +262,8 @@ class TestKimiK3BfaOverlap(CustomTestCase):
 
     def test_bfa_weight_reload_preserves_buffers(self):
         """Rebuilding dense or dequantized BFA weights must not strand a graph."""
-        for block_fp8 in (False, True):
-            with self.subTest(block_fp8=block_fp8):
+        for block_fp8, mxfp8 in ((False, False), (True, False), (False, True)):
+            with self.subTest(block_fp8=block_fp8, mxfp8=mxfp8):
 
                 def module(rows):
                     return SimpleNamespace(
@@ -273,6 +273,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                 owner = SimpleNamespace(
                     use_full_rank_gate=True,
                     _bfa_uses_block_fp8=block_fp8,
+                    _bfa_uses_mxfp8=mxfp8,
                     f_a_proj=module(4),
                     b_proj=module(2),
                     f_b_proj=module(8),
@@ -309,6 +310,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
 
         owner = SimpleNamespace(
             _may_fuse_kda_inproj=lambda: True,
+            _kda_dwdp=None,
             _qkvgbfa_layer=None,
             fused_qkvg_proj=module(8),
             f_a_proj=module(4),
@@ -389,7 +391,10 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         owner = SimpleNamespace(
             config=SimpleNamespace(full_attention_layer_ids=[]),
             model=SimpleNamespace(
-                layers=[], output_attn_res_proj=proj, output_attn_res_norm=norm
+                layers=[],
+                output_attn_res_proj=proj,
+                output_attn_res_norm=norm,
+                kda_dwdp=None,
             ),
         )
 
@@ -427,7 +432,8 @@ class TestKimiK3BfaOverlap(CustomTestCase):
             model=SimpleNamespace(
                 layers=[
                     SimpleNamespace(self_attn=attn, use_attn_residuals=False, mlp=None)
-                ]
+                ],
+                kda_dwdp=None,
             ),
         )
         post_load = KimiK3LinearForCausalLM.post_load_weights
@@ -487,6 +493,34 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         torch.testing.assert_close(
             weight[[0, 0, 128, 128], [0, 128, 0, 128]].float(),
             torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda"),
+        )
+
+    def test_mxfp8_weight_is_dequantized_for_tiny_gemm(self):
+        """MXFP8 scale bytes are UE8M0 exponents, not multipliers; the dense
+        tiny-GEMM weight must apply 2**(byte - 127) per row and 32-wide group."""
+        # Two rows x two 32-wide groups; UE8M0 exponents 127 / 128 / 129 / 126
+        # are scales 1 / 2 / 4 / 0.5.
+        module = SimpleNamespace(
+            weight=torch.nn.Parameter(
+                torch.ones((2, 64), device="cuda", dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+            weight_scale_inv=torch.nn.Parameter(
+                torch.tensor(
+                    [[127, 128], [129, 126]], device="cuda", dtype=torch.uint8
+                ),
+                requires_grad=False,
+            ),
+            quant_method=SimpleNamespace(weight_block_size=[1, 32]),
+            params_dtype=torch.bfloat16,
+        )
+
+        weight = _get_k3_dense_weight(module)
+
+        self.assertEqual(weight.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            weight[[0, 0, 1, 1], [0, 32, 31, 63]].float(),
+            torch.tensor([1.0, 2.0, 4.0, 0.5], device="cuda"),
         )
 
     def test_per_tensor_fp8_weight_is_not_block_dequantized(self):

@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.kv_events import (
     kv_event_namespace_seed,
     namespaced_block_hash,
 )
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
@@ -118,10 +119,6 @@ class KvEventLoraNames(LoRANameTable):
         return self._names.get(extra_key) or self._adapter_names.get(
             extra_key[-_LORA_ID_LEN:]
         )
-
-
-# Matches the multimodal pad-value offset in req_types.MM_PAD_SHIFT_VALUE.
-_MM_PAD_SHIFT_VALUE = 1_000_000
 
 
 class MmRoutingLabels:
@@ -231,7 +228,7 @@ def mm_routing_spans(token_ids, block_size: int, num_blocks: int):
     # Text holds no value at or above the pad shift, and max() runs in C, so
     # text skips the per-token loop: whole events here, blocks of mixed
     # events below.
-    if max(token_ids) < _MM_PAD_SHIFT_VALUE:
+    if max(token_ids) < MM_PAD_SHIFT_VALUE:
         return None
     per_block = []
     any_span = False
@@ -239,12 +236,12 @@ def mm_routing_spans(token_ids, block_size: int, num_blocks: int):
         block = token_ids[block_index * block_size : (block_index + 1) * block_size]
         spans = []
         per_block.append(spans)
-        if not block or max(block) < _MM_PAD_SHIFT_VALUE:
+        if not block or max(block) < MM_PAD_SHIFT_VALUE:
             continue
         run_start, run_label = 0, None
         for position, token in enumerate(block):
             label = (
-                MM_ROUTING_LABELS.get(token) if token >= _MM_PAD_SHIFT_VALUE else None
+                MM_ROUTING_LABELS.get(token) if token >= MM_PAD_SHIFT_VALUE else None
             )
             if label != run_label:
                 if run_label is not None:

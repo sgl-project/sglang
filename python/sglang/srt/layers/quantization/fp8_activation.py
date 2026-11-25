@@ -277,7 +277,7 @@ class DenseSiluAndMulQuant:
         ):
             return act_fn(x)
 
-        from sglang.kernels.ops.quantization.silu_mul_fp8_group_quant import (
+        from sglang.kernels.ops.activation.silu_mul_fp8_group_quant import (
             silu_mul_fp8_group_quant,
         )
 

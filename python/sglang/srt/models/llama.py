@@ -66,6 +66,11 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.utils import (
+    can_run_silu_fp4_quant_fusion,
+    maybe_enable_silu_fp4_quant_fusion,
+    silu_and_mul_fp4_quant,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, is_xpu
@@ -117,6 +122,10 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
         self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
+        # Off unless the decoder layer enables the fused SiLU+mul+NVFP4 quant path.
+        self._enable_silu_fp4_quant_fusion = False
+        self._masked_m_cache: dict = {}
+        self._down_input_scale_inv_1d = None
 
     def forward(
         self,
@@ -127,7 +136,9 @@ class LlamaMLP(nn.Module):
             x = self.dual_gemm(x, self.gate_up_proj)
         else:
             gate_up, _ = self.gate_up_proj(x)
-            if forward_batch is not None and forward_batch.forward_mode.is_decode():
+            if can_run_silu_fp4_quant_fusion(self, gate_up):
+                x = silu_and_mul_fp4_quant(self, gate_up)
+            elif forward_batch is not None and forward_batch.forward_mode.is_decode():
                 x = self.activation_quant.forward_decode(
                     gate_up, self.act_fn, self.down_proj
                 )
@@ -360,6 +371,7 @@ class LlamaDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             reduce_results=not stage_boundaries,
         )
+        maybe_enable_silu_fp4_quant_fusion(self.mlp)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps

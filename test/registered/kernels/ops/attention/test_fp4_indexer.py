@@ -586,12 +586,16 @@ def test_hopper_indexer_backends_replay(ratio):
         paged_metadata=metadata,
         is_verify=True,
     )
-    kwargs = dict(
-        token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False
+    kwargs = dict(token_to_kv_pool=pool, req_to_token=req_table)
+    full = FullTopKIndexer(
+        **kwargs, use_deep_gemm_prefill=False, use_deep_gemm_decode=False
     )
-    full = FullTopKIndexer(**kwargs, use_deep_gemm_decode=False)
     candidates = DenseBlocksBackend(
-        **kwargs, candidate_topk_blocks=4, candidate_block_size=8
+        **kwargs,
+        candidate_topk_blocks=4,
+        candidate_block_size=8,
+        use_deep_gemm_publish=False,
+        use_deep_gemm_consume=False,
     )
     # DeepSelect fills a full top-k buffer of exactly live rows by topk, as at
     # runtime; the candidate paths also clear padded rows and columns.

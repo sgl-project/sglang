@@ -139,6 +139,10 @@ def init_parallel_runtime(
             get_parallel().tp_rank,
         )
         raise
+    if current_platform.is_rocm():
+        from sglang.srt.distributed.bootstrap_rocm import reserve_runtime_memory
+
+        reserve_runtime_memory(device=device, gpu_id=get_device().gpu_id)
     maybe_init_shared_mooncake_transfer_engine(gpu_id=get_device().gpu_id)
 
     parallel = get_parallel()
@@ -173,7 +177,7 @@ def init_parallel_runtime(
     ):
         _prewarm_tp_lm_head_all_to_all()
 
-    # EPLB uses the default process group, not the TP/EP coordinators.
+    # CUDA EPLB uses the default process group, not the TP/EP coordinators.
     # Limit warmup to static full-EP layouts for now.
     if (
         device == "cuda"
@@ -184,6 +188,16 @@ def init_parallel_runtime(
         and parallel.moe_ep_size == parallel.tp_size > 1
     ):
         _prewarm_eplb_p2p()
+
+    # Account for NPU EPLB's TP transports before sizing the KV cache.
+    if (
+        device == "npu"
+        and get_exec().moe.enable_eplb
+        and get_exec().moe.elastic_ep_backend is None
+    ):
+        from sglang.srt.hardware_backend.npu.eplb import prewarm_eplb_communication
+
+        prewarm_eplb_communication()
 
     logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
 

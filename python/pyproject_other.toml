@@ -34,6 +34,9 @@ runtime_base = [
   "einops",
   "fastapi",
   "gguf",
+  "grpcio>=1.81.1",
+  "grpcio-health-checking>=1.81.1",
+  "grpcio-reflection>=1.81.1",
   "interegular",
   "IPython",
   "llguidance>=1.7.6,<2.0.0",
@@ -50,6 +53,7 @@ runtime_base = [
   # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
   "pillow<13",
   "prometheus-client>=0.20.0",
+  "protobuf>=6.33.5",
   "psutil",
   "py-spy",
   "pybase64",
@@ -61,7 +65,6 @@ runtime_base = [
   "scipy",
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
-  "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
   "tqdm",
@@ -118,7 +121,7 @@ fastokens = [
 
 # Monokernels for gfx950 (--enable-amd-monokernel); the ROCm image checks out this pin too.
 monokernels_hip = [
-  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@7113024f8b2e4612b891d330a525a9a7d57de371",
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@a04ceab159d9d8bb43403f96485337f35fbb59c3",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -207,7 +210,7 @@ srt_musa = [
   "torch==2.11.0.post1+musa5.2.0",
   "torch-c-dlpack-ext==0.1.5",
   "torch_musa==2.11.0.post1+musa5.2.0",
-  "torchada>=0.1.90",
+  "torchada>=0.1.112",
   "torchaudio==2.11.0+musa5.2.0",
   "torchvision==0.26.0.post1+musa5.2.0",
   "triton==3.2.0",

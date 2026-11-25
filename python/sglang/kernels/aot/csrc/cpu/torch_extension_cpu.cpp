@@ -336,6 +336,12 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
+std::tuple<at::Tensor, at::Tensor>
+sgl_per_token_group_quant_8bit_cpu(const at::Tensor& input, int64_t group_size, double eps);
+std::tuple<at::Tensor, at::Tensor> sgl_per_token_quant_fp8_cpu(const at::Tensor& input);
+std::tuple<at::Tensor, at::Tensor>
+sgl_per_tensor_quant_fp8_cpu(const at::Tensor& input, const std::optional<at::Tensor>& scale);
+std::tuple<at::Tensor, at::Tensor> mxfp8_group_quantize_cpu(const at::Tensor& input);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -861,6 +867,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
+  m.def("sgl_per_token_group_quant_8bit_cpu(Tensor input, int group_size, float eps) -> (Tensor, Tensor)");
+  m.impl("sgl_per_token_group_quant_8bit_cpu", torch::kCPU, &sgl_per_token_group_quant_8bit_cpu);
+  m.def("sgl_per_token_quant_fp8_cpu(Tensor input) -> (Tensor, Tensor)");
+  m.impl("sgl_per_token_quant_fp8_cpu", torch::kCPU, &sgl_per_token_quant_fp8_cpu);
+  m.def("sgl_per_tensor_quant_fp8_cpu(Tensor input, Tensor? scale) -> (Tensor, Tensor)");
+  m.impl("sgl_per_tensor_quant_fp8_cpu", torch::kCPU, &sgl_per_tensor_quant_fp8_cpu);
+  m.def("mxfp8_group_quantize_cpu(Tensor input) -> (Tensor, Tensor)");
+  m.impl("mxfp8_group_quantize_cpu", torch::kCPU, &mxfp8_group_quantize_cpu);
 
   // igemm
   m.def(

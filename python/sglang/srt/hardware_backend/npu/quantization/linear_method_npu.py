@@ -516,7 +516,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     backend, NOT this matmul (verified by stage-sync bisection — qkv's matmul
     syncs clean, the fault surfaces at the entry-sync of the next layer, i.e. the
     decode attention between qkv and o_proj). Run with the NPU decode graph (do
-    NOT pass ``--disable-cuda-graph``); graph mode is the NPU default. This
+    NOT pass ``--disable-decode-cuda-graph --disable-prefill-cuda-graph``); graph mode is the NPU default. This
     attention issue is model-agnostic and out of scope for W4A8.
 
     This is a true W4(weight) A8(activation) single-level matmul. The *online*

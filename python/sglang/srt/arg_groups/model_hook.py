@@ -10,6 +10,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
+    decode_state_free_radix_of,
     mamba_extra_buffer_of,
     model_config_of,
     resolved_view,
@@ -36,7 +37,6 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
-from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -77,7 +77,7 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
 
 
 def _rocm_fp8_wo_a_supported() -> bool:
-    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 + aiter)."""
+    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950/gfx1250 + aiter)."""
     try:
         from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
             is_wo_a_fp8_mxscale_supported,
@@ -254,6 +254,10 @@ def handle_model_specific_adjustments(server_args: Any):
 
         apply_kimi_k3_linear_attn_defaults(server_args)
         apply_kimi_k3_spec_backend_defaults(server_args)
+        if model_arch == "KimiK31ForConditionalGeneration" and get_platform().is_gfx95:
+            from sglang.srt.models.kimi_k3_amd import env_defaults
+
+            env_defaults.apply_kimi_k31_rocm_env_defaults()
 
     if model_arch == "Glm5NextForConditionalGeneration":
         from sglang.srt.arg_groups.glm5_next_hook import (
@@ -561,29 +565,6 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-        quant_method = get_quantization_config(hf_config)
-        is_mxfp4_quant_format = quant_method == "mxfp4"
-        if (
-            not attn_dp_enabled_of(resolved_view(server_args))
-            and cfg.nnodes == 1
-            and get_platform().is_hip
-        ):
-            # TODO (Hubert): Put this back later
-            # server_args.enable_aiter_allreduce_fusion = True
-            # logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
-            pass
-
-        quantization_config = getattr(hf_config, "quantization_config", None)
-        is_mxfp4_quant_format = (
-            quantization_config is not None
-            and quantization_config.get("quant_method") == "mxfp4"
-        )
-        # The mxfp4 dtype override moved to the override registry
-        # (arg_groups/overrides.py: _gpt_oss_overrides).
-
-        # The moe_runner_backend selection moved to the override registry
-        # (arg_groups/overrides.py: _gpt_oss_overrides).
-
     elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
             expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(hf_config)
@@ -814,7 +795,7 @@ def handle_model_capability_adjustments(server_args: Any):
         logger.warning(
             "HRM-Text (prefix_lm) detected: forcing --attention-backend "
             "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
-            "--disable-cuda-graph for correctness of the bidirectional "
+            "--disable-decode-cuda-graph --disable-prefill-cuda-graph for correctness of the bidirectional "
             "prompt attention."
         )
 
@@ -1092,7 +1073,8 @@ def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
             hf_config,
             mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
-    else:
+    elif not decode_state_free_radix_of(view):
+        # A state-free decode tree caches no state, so no_buffer's limits do not apply.
         validate_mamba_no_buffer(view, hf_config.architectures[0])
 
 

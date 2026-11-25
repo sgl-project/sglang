@@ -1640,12 +1640,6 @@ non-default speculative acceptance thresholds or deterministic inference.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Special for GPU</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-flashinfer-allreduce-fusion`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag<br/> (set to enable)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Special for GPU</td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--deepep-mode`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`auto`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`normal`, <br/>`low_latency`,<br/> `auto`</td>
@@ -1886,6 +1880,17 @@ If the value is int8, you must also set the environment variable:DEEP_NORMAL_MOD
   </tbody>
 </table>
 
+### ModelSlim KV caches in local CPU memory (L2)
+
+On Ascend 950, use a checkpoint that declares the attention format in `quant_model_description.json`. Add `--quantization modelslim --kv-cache-dtype fp8_e4m3 --enable-hierarchical-cache --hicache-io-backend kernel_ascend` to your launch command. Leave `--hicache-storage-backend` unset for local L2 caching. GQA MXFP8 uses Quant Flash Attention on CANN 9.2.0. [Quant Flash Attention requirements](https://github.com/sgl-project/sgl-kernel-npu/blob/2026.11.0.post3/docs/api/en/operators/attention/quant_flash_attn.md#hardware-support)
+
+| Model and checkpoint attention format | Default host layout and memory | What L2 restores |
+| --- | --- | --- |
+| DeepSeek-V3.1 MLA FP8 (`Q_FP8_DYNAMIC_KV_FP8`) | `page_first_kv_split` in ACL-registered CPU memory. Leave `SGLANG_HICACHE_HOST_MEM_BACKEND` unset so MLA selects `acl`. | The FP8 compressed KV latent and the BF16 RoPE key, in separate buffers. |
+| Qwen3.6 GQA MXFP8 (`QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL`) | `page_first_direct` in pinned CPU memory. | The MXFP8 K/V pages and their dynamic K scales. The static per-channel V scales come from the checkpoint and stay on the NPU. |
+
+To verify an L2 hit, start the server with `--enable-cache-report`. After a prefix has been backed up to L2 and evicted from NPU memory (L1), send another `/generate` request with the same prefix. A positive `meta_info.cached_tokens_details.host` counts the tokens restored from CPU memory.
+
 ## LMCache
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -1955,7 +1960,7 @@ If the value is int8, you must also set the environment variable:DEEP_NORMAL_MOD
   </tbody>
 </table>
 
-## Offloading (must be used with `--disable-cuda-graph`)
+## Offloading (must be used with `--disable-decode-cuda-graph --disable-prefill-cuda-graph`)
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -2089,12 +2094,6 @@ If the value is int8, you must also set the environment variable:DEEP_NORMAL_MOD
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3, 950PR/DT Series</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-cuda-graph`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag<br/> (set to enable)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3, 950PR/DT Series</td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-cuda-graph-padding`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag<br/> (set to enable)</td>
@@ -2179,12 +2178,6 @@ If the value is int8, you must also set the environment variable:DEEP_NORMAL_MOD
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3, 950PR/DT Series</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-dp-attention`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag<br/> (set to enable)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3, 950PR/DT Series</td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-dp-attention-local-control-broadcast`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag<br/> (set to enable)</td>
@@ -2216,12 +2209,6 @@ If the value is int8, you must also set the environment variable:DEEP_NORMAL_MOD
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-p2p-check`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag<br/> (set to enable)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Special for GPU</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--triton-attention-reduce-in-fp32`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag<br/> (set to enable)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Special for GPU</td>
@@ -2296,12 +2283,6 @@ If the value is int8, you must also set the environment variable:DEEP_NORMAL_MOD
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--image-processor-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`auto`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`, `torchvision`, `pil`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3, 950PR/DT Series</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-fast-image-processor`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag<br/> (set to enable)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3, 950PR/DT Series</td>
     </tr>
     <tr>

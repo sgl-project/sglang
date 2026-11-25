@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import sgl_kernel_npu  # noqa: F401  Registers torch.ops.sgl_kernel_npu.
+import sgl_kernel_npu  # noqa: F401  Registers torch.ops.npu sparse attention ops.
 import torch
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -23,6 +25,7 @@ def forward_dcp_sparse_attention(
     forward_batch: ForwardBatch,
     speculative_num_draft_tokens: int | None,
     scaling: float,
+    fp8_attention: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute one rank's sparse partial attention and natural-log LSE."""
 
@@ -60,25 +63,36 @@ def forward_dcp_sparse_attention(
         actual_seq_lengths_query = actual_seq_lengths_query.to(
             device=q_nope.device, dtype=torch.int32
         )
-    attn_out, softmax_max, softmax_sum = torch.ops.npu.sgl_sparse_flash_attention(
-        query=q_nope,
-        key=k_nope,
-        value=k_nope,
-        query_rope=q_rope,
-        key_rope=k_rope,
+    kwargs = dict(
         sparse_indices=topk_indices,
         scale_value=scaling,
         actual_seq_lengths_query=actual_seq_lengths_query,
         actual_seq_lengths_kv=local_lens,
         block_table=block_tables,
-        sparse_block_size=1,
-        layout_query="TND",
-        layout_kv="PA_BSND",
-        # Global top-k already enforces causal visibility. Local indices no
-        # longer carry enough information for the kernel's causal sparse mode.
-        sparse_mode=0,
-        attention_mode=2,
-        return_softmax_lse=True,
     )
+    if fp8_attention is None:
+        attn_out, softmax_max, softmax_sum = torch.ops.npu.sgl_sparse_flash_attention(
+            query=q_nope,
+            key=k_nope,
+            value=k_nope,
+            query_rope=q_rope,
+            key_rope=k_rope,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            # Global top-k already enforces causal visibility. Local indices no
+            # longer carry enough information for the kernel's causal sparse mode.
+            sparse_mode=0,
+            attention_mode=2,
+            return_softmax_lse=True,
+            **kwargs,
+        )
+    else:
+        attn_out, softmax_max, softmax_sum = fp8_attention(
+            query=q_nope,
+            query_rope=q_rope,
+            packed_kv=k_nope.view(torch.uint8),
+            **kwargs,
+        )
     lse = softmax_max.float() + torch.log(softmax_sum.float())
     return attn_out, lse.permute(1, 0, 2).reshape(lse.shape[1], -1)

@@ -600,7 +600,9 @@ async fn register_one(
     // so logging unconditionally would repeat the same line for the life of the
     // process. Logging only a new or changed resolution keeps the reconcile
     // path quiet, matching why its own progress message stays at `debug!`.
-    let previous_protocol = registry.get(&spec.id).map(|w| w.protocol());
+    let previous = registry.get(&spec.id);
+    let previous_protocol = previous.as_ref().map(|w| w.protocol());
+    let previous_inline_system = previous.map(|w| w.supports_inline_system());
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
     // The profile rides beside the spec rather than on it: `WorkerSpec` is the
     // serde wire type for `DiscoveryEvent`, and no discovery backend can know it.
@@ -609,6 +611,7 @@ async fn register_one(
         dp_ranks: info.dp_ranks,
         openai: info.openai.map(Arc::new),
         grpc_port: info.grpc_port,
+        supports_inline_system: info.supports_inline_system,
     };
     if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
@@ -626,6 +629,14 @@ async fn register_one(
     }
     // After the insert, so the log describes a worker that is actually taking
     // traffic — a spec refused above never reaches the wire at all.
+    if previous_inline_system != Some(info.supports_inline_system) {
+        tracing::info!(
+            worker_url = %worker_url,
+            supports_inline_system = info.supports_inline_system,
+            "/v1/messages keeps inline system turns in place only while every \
+             worker of the model reports supports_inline_system",
+        );
+    }
     if previous_protocol != Some(protocol) {
         log_protocol_resolution(&worker_url, info.enable_http2, cleartext);
         if info.grpc_port.is_none() && cfg.is_some_and(|c| c.server.grpc_port.is_some()) {

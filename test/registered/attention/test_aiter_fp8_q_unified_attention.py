@@ -12,7 +12,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=120, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 _RUNNABLE = is_hip()
 if _RUNNABLE:
@@ -64,7 +64,6 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
         backend.use_mla = branch == "mla"
         backend.kv_cache_is_vectorized_5d = branch == "vectorized"
         backend.use_triton_unified_attention = branch != "legacy"
-        backend.use_muse_flydsl_decode = False
         backend.dcp_world_size = 1
         backend.kv_cache_dtype = kv_cache_dtype
         backend.input_dtype = torch.bfloat16

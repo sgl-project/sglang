@@ -428,6 +428,7 @@ class MockDSV4ModelRunner:
             page_size=case.page_size,
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
         self.runner_ids = RunnerIds(
             req_to_token=self.req_to_token_pool.req_to_token,

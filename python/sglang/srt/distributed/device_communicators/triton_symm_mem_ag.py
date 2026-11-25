@@ -21,6 +21,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.utils import is_cuda, is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -466,7 +467,8 @@ class MultimemAllGatherer:
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
         # None => always NCCL; _UNINIT => build on first eager call.
-        self._state = self._UNINIT if enabled else None
+        # gfx950 has no multicast; the build's symm-mem rendezvous hung MI355X start.
+        self._state = self._UNINIT if enabled and not is_gfx95_supported() else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
@@ -488,11 +490,12 @@ class MultimemAllGatherer:
                 tp_group.world_size > 1
                 and get_parallel().nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
-                and not is_one_nvlink_clique(
+            ):
+                if is_cuda() and is_one_nvlink_clique(
                     tp_group.cpu_group,
                     torch.device("cuda", torch.cuda.current_device()),
-                )
-            ):
+                ):
+                    return
                 logger.warning(
                     "multimem all-gather disabled because the TP group spans "
                     "nodes outside one NVLink clique."

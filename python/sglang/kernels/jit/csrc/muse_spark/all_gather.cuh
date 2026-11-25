@@ -26,6 +26,7 @@ using device::distributed::EpochCounter;
 
 constexpr uint32_t kBlock = 128;
 constexpr uint32_t kVec = 16 / sizeof(bf16_t);  // 8 bf16 (16B) per thread
+using Lamport = device::distributed::LamportTrait<bf16_t, kVec, /*kAtom=*/4>;
 
 template <uint32_t kWorld>
 struct Params {
@@ -58,13 +59,7 @@ __global__ __launch_bounds__(kBlock) void all_gather_kernel(const __grid_constan
   const uint32_t stride = gridDim.x * kBlock * kVec;
   for (uint32_t local_elem = tid * kVec; local_elem < params.num_rows * kNLocal; local_elem += stride) {
     uint4 raw = *reinterpret_cast<const uint4*>(params.local + local_elem);
-    // +0.0 is the "not arrived" marker; -0.0 is numerically identical
-    uint32_t* w = reinterpret_cast<uint32_t*>(&raw);
-#pragma unroll
-    for (uint32_t j = 0; j < 4; ++j) {
-      if ((w[j] & 0xffffu) == 0) w[j] |= 0x8000u;
-      if ((w[j] >> 16) == 0) w[j] |= 0x80000000u;
-    }
+    Lamport::clear_pos_zero(&raw);
     const uint32_t byte_off = half_off + (params.rank * params.num_rows * kNLocal + local_elem) * sizeof(bf16_t);
     ptx::st_multimem_16B(raw, params.ws_mc + byte_off, 0);
   }
@@ -82,8 +77,7 @@ __global__ __launch_bounds__(kBlock) void all_gather_kernel(const __grid_constan
     uint4 raw;
     do {
       ptx::ld_relaxed_16B(raw, src, 0);
-    } while ((raw.x & 0xffffu) == 0 || (raw.x >> 16) == 0 || (raw.y & 0xffffu) == 0 || (raw.y >> 16) == 0 ||
-             (raw.z & 0xffffu) == 0 || (raw.z >> 16) == 0 || (raw.w & 0xffffu) == 0 || (raw.w >> 16) == 0);
+    } while (Lamport::has_pos_zero(&raw));
     const auto& gathered = *reinterpret_cast<const vec_t*>(&raw);
     vec_t out_vec;
 #pragma unroll

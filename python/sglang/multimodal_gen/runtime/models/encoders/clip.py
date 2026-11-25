@@ -416,8 +416,4 @@ class CLIPVisionModel(ImageEncoder):
         return loaded_params
 
 
-class BertModel(CLIPTextModel):
-    pass
-
-
 EntryClass = [CLIPTextModel, CLIPTextModelWithProjection, CLIPVisionModel]

@@ -37,6 +37,7 @@ _TRITON_KERNELS = [
     ("lilicorr", "lilicorr_topk_lse"),
     ("lilicorr", "lilicorr_sample_path"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
+    ("target_only_sampling", "tree_speculative_sampling_target_only_triton"),
     ("acceptance_estimator", "predict_acceptance"),
     ("acceptance_estimator", "accumulate_acceptance_counts"),
     ("acceptance_estimator", "refit_acceptance"),
@@ -58,6 +59,14 @@ register_kernel(
         op="speculative.simulated_accept",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.simulated_accept:simulated_accept",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="speculative.dflash_simulated_accept",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.speculative.dflash_simulated_accept:dflash_simulated_accept",
         capabilities=CUDA_ONLY,
     )
 )

@@ -366,17 +366,22 @@ TMS_PLATFORM=xpu uv pip install --no-build-isolation \
 
 **Use it** by launching with `--enable-memory-saver` (the XPU backend is
 selected automatically); optionally add `--enable-weights-cpu-backup` to keep
-weights in host RAM across a release:
+weights in host RAM across a release. The release/resume endpoints are admin
+endpoints, so the server also needs `SGLANG_ADMIN_API_KEY` (or `--admin-api-key`)
+and the calls must carry that key (exported as `SGLANG_ADMIN_API_KEY` below):
 
 ```bash
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B \
     --trust-remote-code --device xpu --enable-memory-saver
 ```
 
 ```bash
 # Release GPU memory while idle, then reclaim it (server must be idle).
-curl -X POST http://127.0.0.1:30000/release_memory_occupation
-curl -X POST http://127.0.0.1:30000/resume_memory_occupation
+curl -X POST http://127.0.0.1:30000/release_memory_occupation \
+    -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
+curl -X POST http://127.0.0.1:30000/resume_memory_occupation \
+    -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 The Python engine API (`engine.release_memory_occupation(tags=...)` /
@@ -406,7 +411,7 @@ SGLang supports prefill-decode disaggregation on Intel XPU with the [Mooncake](h
 
 Mooncake supports Intel XPU through its TENT engine. The PyPI `mooncake-transfer-engine` wheel does not include it, so either use the XPU Docker image, which builds Mooncake from a pinned upstream commit (see `docker/xpu.Dockerfile`), or build Mooncake from source with icpx and `-DUSE_XPU=ON -DUSE_TENT=ON`. The image builds Mooncake without its store (`-DWITH_STORE=OFF`), so the Mooncake store HiCache L3 backend (`--hicache-storage-backend mooncake`) is not available on XPU.
 
-**Prerequisites:** Mooncake with XPU support (above) and `uv pip install sglang-router`.
+**Prerequisites:** Mooncake with XPU support (above) and the `sgl-router` binary, which the XPU Docker image installs at `/usr/local/bin/sgl-router` (outside the image, install it with `pip install sgl-router` or see [installing sgl-router](../advanced_features/dp_dpa_router_guide#quick-start-for-sgl-router)).
 
 Set `MC_USE_TENT=1` on both the prefill and decode servers, and leave `MOONCAKE_PROTOCOL` at its default. On one node, the TENT engine then copies KV card to card through Level Zero IPC, so no RDMA NIC is needed.
 
@@ -438,7 +443,7 @@ Start the router and send a request as shown for NIXL below, using `Qwen/Qwen2.5
 
 ### NIXL backend
 
-**Prerequisites:** NIXL on a UCX built with the Level Zero transport (`--with-ze`), and `uv pip install sglang-router`. The PyPI `nixl` wheel bundles a UCX without it, so either use the XPU Docker image, which builds UCX, Abseil, and NIXL from pinned upstream commits (see `docker/xpu.Dockerfile`), or build them from source the same way.
+**Prerequisites:** NIXL on a UCX built with the Level Zero transport (`--with-ze`), and the `sgl-router` binary (see the Mooncake prerequisites above). The PyPI `nixl` wheel bundles a UCX without it, so either use the XPU Docker image, which builds UCX, Abseil, and NIXL from pinned upstream commits (see `docker/xpu.Dockerfile`), or build them from source the same way.
 
 Inside a container, run with `--cap-add SYS_PTRACE`, or `--privileged` as in the Docker example above: UCX's ze_ipc transport maps the peer's device memory through `pidfd_getfd()`, which Docker blocks by default, and the first transfer fails with `Operation not permitted`.
 
@@ -463,10 +468,10 @@ ZE_AFFINITY_MASK=1 python -m sglang.launch_server \
 **Start the router:**
 
 ```bash
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://127.0.0.1:30000 \
-    --decode  http://127.0.0.1:30001 \
+sgl-router \
+    --model-id Qwen/Qwen3-0.6B \
+    --no-tokenizer \
+    --worker-urls http://127.0.0.1:30000 http://127.0.0.1:30001 \
     --host 0.0.0.0 --port 8000
 ```
 

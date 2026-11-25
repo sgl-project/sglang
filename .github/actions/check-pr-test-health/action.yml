@@ -7,6 +7,11 @@ inputs:
     required: false
     default: ${{ github.token }}
 
+  independent-test-job-prefix:
+    description: 'Run independent test lanes under this job-name prefix even if a peer test failed; setup and lint failures still stop them.'
+    required: false
+    default: ''
+
 runs:
   using: composite
   steps:
@@ -14,6 +19,7 @@ runs:
       uses: actions/github-script@v8
       env:
         SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
+        INDEPENDENT_TEST_JOB_PREFIX: ${{ inputs.independent-test-job-prefix }}
       with:
         github-token: ${{ inputs.github-token }}
         retries: 3
@@ -73,6 +79,8 @@ runs:
           const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
           core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);
 
+          const independentTestJobPrefix = process.env.INDEPENDENT_TEST_JOB_PREFIX || '';
+
           // Find jobs that failed from a real error, not from fail-fast cascade
           const rootCauseFailures = jobs.filter(j => {
             if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
@@ -95,13 +103,37 @@ runs:
               core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
               return false;
             }
+            // a base-b wait can fail solely because health checks stopped its producers
+            if (baseName === 'wait-for-base-b') {
+              const failedProducers = failedJobs.filter(job => job.name.startsWith('base-b-test-'));
+              if (failedProducers.length > 0 && failedProducers.every(job => {
+                const failedStep = (job.steps || []).find(s => s.conclusion === 'failure');
+                return failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'));
+              })) {
+                core.info(`[health-check] Filtered out cascade wait summary: ${j.name}`);
+                return false;
+              }
+            }
             // coverage is a downstream summary; its prior failure must not block producer retries
             if (j.name.split(' / ').pop() === 'diffusion-coverage-check') {
               core.info(`[health-check] Filtered out coverage summary: ${j.name}`);
               return false;
             }
-            // If the failing step is the health check, it's a cascade -- skip it
+            // finish only aggregates producer results; it cannot be a producer prerequisite
+            if (baseName === 'pr-test-finish') {
+              core.info(`[health-check] Filtered out finish summary: ${j.name}`);
+              return false;
+            }
             const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
+            if (
+              independentTestJobPrefix && j.name.startsWith(independentTestJobPrefix) &&
+              // pre-suite commands also run architecture-specific numerical tests
+              ['Run diffusion suite', 'Run pre-suite commands', 'Run test'].includes(failedStep?.name)
+            ) {
+              core.info(`[health-check] Collecting independent test failure: ${j.name}`);
+              return false;
+            }
+            // If the failing step is the health check, it's a cascade -- skip it
             if (failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'))) {
               core.info(`[health-check] Filtered out cascade failure: ${j.name} (failed step: ${failedStep.name})`);
               return false;

@@ -4,8 +4,12 @@
 import json
 import os
 import shlex
+import subprocess
 import sys
+import tempfile
 from importlib import resources
+from pathlib import Path
+from typing import NoReturn
 
 from sglang.srt.utils.device import get_device_count, get_device_name, is_hip
 
@@ -23,8 +27,10 @@ NO_MATCH_MESSAGE = (
     "launching it with the default flags. To pick fewer GPUs, set {devices_env}."
 )
 EDIT_PROMPT = (
-    'Change a flag ("--port 8000"), remove one ("!--port"), or press Enter to launch: '
+    'Change a flag ("--port 8000"), remove one ("!--port"), '
+    'edit the whole command in your editor ("e"), or press Enter to launch: '
 )
+EDITOR_HEADER = "# Edit, save and quit; lines starting with # are ignored.\n"
 
 # Cookbook hardware ids by device name, most specific first;
 _HARDWARE = (
@@ -84,7 +90,7 @@ def run_guide(model: str, recipes: list[dict], dry_run: bool) -> None:
         print(recipe["command"])
         return
     if interactive:
-        argv = _ask_flag_edits(env=env, argv=argv, command=recipe["command"])
+        env, argv = _ask_edits(env=env, argv=argv, command=recipe["command"])
     else:
         print(recipe["command"])
     yours = [key for key in env if os.environ.get(key, env[key]) != env[key]]
@@ -106,10 +112,7 @@ def run_guide(model: str, recipes: list[dict], dry_run: bool) -> None:
 
 def command_argv(command: str) -> list[str]:
     """Arguments after `sglang serve` in a Cookbook command."""
-    lines = [line.rstrip(" \\") for line in command.strip().splitlines()]
-    lines = [line for line in lines if line and not line.startswith("#")]
-    start = next(i for i, line in enumerate(lines) if line.startswith("sglang serve"))
-    return shlex.split(" ".join(lines[start:]))[2:]
+    return _split_command(command)[1]
 
 
 def format_command(env: dict[str, str], argv: list[str]) -> str:
@@ -148,6 +151,30 @@ def edit_flags(argv: list[str], edits: str) -> list[str]:
     return [token for group in groups for token in group]
 
 
+def _split_command(command: str) -> tuple[list[str], list[str]]:
+    """Shell words before `sglang serve`, and the arguments after it."""
+    lines = [line.rstrip(" \\") for line in command.strip().splitlines()]
+    words = shlex.split(
+        " ".join(line for line in lines if not line.lstrip().startswith("#"))
+    )
+    for i in range(len(words) - 1):
+        if words[i : i + 2] == ["sglang", "serve"]:
+            return words[:i], words[i + 2 :]
+    raise ValueError('No "sglang serve" in the command')
+
+
+def _parse_command(command: str) -> tuple[dict[str, str], list[str]]:
+    """Env and arguments of a `KEY=VALUE ... sglang serve ...` command."""
+    words, argv = _split_command(command)
+    env = {}
+    for word in words:
+        key, sep, value = word.partition("=")
+        if not (sep and key.isidentifier()):
+            raise ValueError(f'Expected KEY=VALUE before "sglang serve", got {word!r}')
+        env[key] = value
+    return env, argv
+
+
 def _flag_groups(argv: list[str]) -> list[list[str]]:
     groups = []
     for token in argv:
@@ -183,26 +210,54 @@ def _pick_mode(recipes: list[dict], interactive: bool) -> dict:
         _log(f"Pick 1-{len(modes)} or a mode name.")
 
 
-def _ask_flag_edits(env: dict[str, str], argv: list[str], command: str) -> list[str]:
+def _ask_edits(
+    env: dict[str, str], argv: list[str], command: str
+) -> tuple[dict[str, str], list[str]]:
     print(command)
     while True:
-        edits = _ask(EDIT_PROMPT)
-        if not edits.strip():
-            return argv
+        answer = _ask(EDIT_PROMPT).strip()
+        if not answer:
+            return env, argv
         try:
-            argv = edit_flags(argv=argv, edits=edits)
+            if answer == "e":
+                env, argv = _edit_in_editor(env=env, argv=argv)
+            else:
+                argv = edit_flags(argv=argv, edits=answer)
         except ValueError as e:
             _log(str(e))
             continue
         print(format_command(env=env, argv=argv))
 
 
+def _edit_in_editor(
+    env: dict[str, str], argv: list[str]
+) -> tuple[dict[str, str], list[str]]:
+    """Open the command in $VISUAL or $EDITOR, then parse what the user saved."""
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "command.sh"
+        path.write_text(EDITOR_HEADER + format_command(env=env, argv=argv) + "\n")
+        try:
+            code = subprocess.call([*shlex.split(editor), str(path)])
+            if code:
+                raise ValueError(f"{editor} exited with code {code}")
+            return _parse_command(path.read_text())
+        except (OSError, ValueError) as e:
+            raise ValueError(f"{e}; the command is unchanged.")
+        except KeyboardInterrupt:
+            _cancel()
+
+
 def _ask(prompt: str) -> str:
     try:
         return input(prompt)
     except (EOFError, KeyboardInterrupt):
-        _log("\nCancelled; nothing launched.")
-        raise SystemExit(130)
+        _cancel()
+
+
+def _cancel() -> NoReturn:
+    _log("\nCancelled; nothing launched.")
+    raise SystemExit(130)
 
 
 def _is_terminal() -> bool:

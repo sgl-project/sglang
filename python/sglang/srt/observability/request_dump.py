@@ -65,7 +65,10 @@ def build_request_dump(
     time)`` tuples."""
     data = {
         "server_args": _redacted_config(server_args),
-        "config_updates": redact_watermark_secrets(get_context().overrides_log()),
+        "config_updates": [
+            (source, redact_server_args_secrets(fields))
+            for source, fields in get_context().overrides_log()
+        ],
         "resolved_config": _redacted_config(resolved_config),
         "requests": redact_watermark_secrets(requests),
     }

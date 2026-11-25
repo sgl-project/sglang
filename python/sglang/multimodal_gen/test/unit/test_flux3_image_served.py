@@ -634,6 +634,97 @@ class TestFlux3RequestControls(unittest.TestCase):
         self.assertEqual(_mode(explicit, config), "t2i")
 
 
+class TestFlux3RequestSizeAlignment(unittest.TestCase):
+    """Requested sizes reach the latent grid as multiples of 16."""
+
+    @staticmethod
+    def _server_args():
+        return SimpleNamespace(
+            model_path=_MODEL,
+            model_id=None,
+            backend="sglang",
+            performance_mode="manual",
+            pipeline_class_name=None,
+            pipeline_config=Flux3ImagePipelineConfig(),
+            output_path=None,
+            comfyui_mode=True,
+            enable_cfg_parallel=False,
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+            enable_trace=False,
+            attention_backend_config={},
+            num_gpus=1,
+            warmup_steps=1,
+            warmup_num_frames=None,
+        )
+
+    def _build(self, server_args, fields):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.configs.task_type import DataType
+        from sglang.multimodal_gen.runtime.entrypoints.openai import (
+            utils as openai_utils,
+        )
+
+        with (
+            mock.patch.object(
+                openai_utils, "get_global_server_args", return_value=server_args
+            ),
+            mock.patch.object(
+                SamplingParams,
+                "from_pretrained",
+                return_value=Flux3ImageSamplingParams(),
+            ),
+        ):
+            return openai_utils.build_sampling_params(
+                "size", prompt="a fox", request_data_type=DataType.IMAGE, **fields
+            )
+
+    def test_http_size_aligns_to_the_latent_grid(self):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_image import (
+            latent_shape,
+        )
+
+        server_args = self._server_args()
+        for fields, expected in (
+            ({"size": "1920x1080"}, (1920, 1072)),
+            ({"size": "854x480"}, (848, 480)),
+            ({"size": "1000x1000"}, (992, 992)),
+            ({"size": "1000x1000", "image_path": ["reference.png"]}, (992, 992)),
+            ({"size": "1280x720"}, (1280, 720)),
+            ({"size": "1024x1024"}, (1024, 1024)),
+        ):
+            with self.subTest(fields=fields):
+                sampling = self._build(server_args, fields)
+                self.assertEqual((sampling.width, sampling.height), expected)
+                latent_shape(sampling.height, sampling.width)
+
+    def test_warmup_resolution_aligns_to_the_latent_grid(self):
+        from sglang.multimodal_gen.runtime.warmup_request_builder import (
+            build_warmup_reqs,
+        )
+
+        server_args = self._server_args()
+        server_args.pipeline_config.flux3_package = SimpleNamespace(
+            config=SimpleNamespace(
+                dit=SimpleNamespace(flow_map=True),
+                sampler=SimpleNamespace(steps=4),
+            )
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=Flux3ImageSamplingParams(),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["1920x1080"],
+                warmup_input_path="warmup.png",
+                server_based_warmup=True,
+            )
+        self.assertEqual([(r.width, r.height) for r in reqs], [(1920, 1072)])
+
+
 class TestFlux3Lora(unittest.TestCase):
     _SUPPORTS_LORA = (
         "sglang.multimodal_gen.runtime.pipelines.flux3_image."
