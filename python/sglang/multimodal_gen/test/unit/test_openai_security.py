@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import errno
+import gzip
 import http.server
 import io
 import ipaddress
@@ -155,8 +156,10 @@ def image_source(request, monkeypatch):
 
     client_cls = httpx.AsyncClient
     transport = httpx.MockTransport(
-        lambda req: httpx.Response(
-            200, headers={"content-type": "image/png"}, content=b"image"
+        _streamed(
+            lambda req: httpx.Response(
+                200, headers={"content-type": "image/png"}, content=b"image"
+            )
         )
     )
     monkeypatch.setattr(
@@ -175,6 +178,22 @@ def test_save_image_sources_within_uploads_root(tmp_path, image_source):
     )
     assert Path(saved) == root / f"input{suffix}"
     assert Path(saved).read_bytes() == b"image"
+
+
+def _streamed(handler):
+    """Serve a handler's body as an unread stream, as a real socket would."""
+
+    def respond(request):
+        response = handler(request)
+        if response.is_stream_consumed:
+            return httpx.Response(
+                response.status_code,
+                headers=response.headers,
+                stream=httpx.ByteStream(response.content),
+            )
+        return response
+
+    return respond
 
 
 def _reason(error: BaseException) -> str:
@@ -627,7 +646,9 @@ def _patch_download(monkeypatch, tmp_path, handler):
     monkeypatch.setattr(
         utils.httpx,
         "AsyncClient",
-        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+        lambda **kw: real_client(
+            transport=httpx.MockTransport(_streamed(handler)), **kw
+        ),
     )
     return part_dir
 
@@ -665,6 +686,31 @@ def test_image_download_over_size_limit_is_rejected(monkeypatch, tmp_path, handl
     assert not target.exists()
     assert not any(part_dir.iterdir())
     assert not list(target.parent.iterdir())
+
+
+def test_image_download_requests_identity_and_rejects_compressed_body(
+    monkeypatch, tmp_path
+):
+    """The size cap counts written bytes, so the body is never decompressed here."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["accept-encoding"])
+        return httpx.Response(
+            200,
+            content=gzip.compress(b"x" * 4096),
+            headers={"content-type": "image/png", "content-encoding": "gzip"},
+        )
+
+    part_dir = _patch_download(monkeypatch, tmp_path, handler)
+    target = tmp_path / "in" / "img.png"
+    with pytest.raises(Exception) as caught:
+        asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert "Content-Encoding" in _reason(caught.value)
+    assert str(caught.value) == "Failed to download image from URL"
+    assert seen and set(seen) == {"identity"}
+    assert not target.exists()
+    assert not any(part_dir.iterdir())
 
 
 def test_image_download_has_one_deadline(monkeypatch, tmp_path):

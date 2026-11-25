@@ -13,6 +13,7 @@ from unittest.mock import patch
 import requests
 
 from sglang.srt.multimodal.media_io import (
+    _body_decoder,
     _normalize_video_input,
     configure_media_url_security,
     download_remote_media,
@@ -88,6 +89,14 @@ class _MediaHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Encoding", "gzip")
             self.end_headers()
             self.wfile.write(gzip.compress(b"gzip-media" * 200000))
+            return
+
+        if self.path == "/gzip-truncated":
+            full = gzip.compress(os.urandom(200000))
+            self.send_response(200)
+            self.send_header("Content-Encoding", "gzip")
+            self.end_headers()
+            self.wfile.write(full[: len(full) // 2])
             return
 
         if self.path == "/gzip-drip":
@@ -280,6 +289,35 @@ class TestMediaURLSecurity(unittest.TestCase):
         configure_media_url_security(["127.0.0.1"], max_file_size_mb=1)
         with self.assertRaisesRegex(ValueError, "download limit"):
             download_remote_media(self._url("/gzip"), timeout=5)
+
+    def test_truncated_gzip_body_is_rejected(self):
+        configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
+        with self.assertRaises(requests.exceptions.ContentDecodingError):
+            download_remote_media(self._url("/gzip-truncated"), timeout=5)
+
+    def test_truncated_deflate_body_is_rejected(self):
+        payload = os.urandom(5000)
+        decode = _body_decoder("deflate")
+        with self.assertRaises(requests.exceptions.ContentDecodingError):
+            b"".join(decode(zlib.compress(payload)[:-10]))
+            b"".join(decode.finish())
+
+    def test_zlib_deflate_body_fed_one_byte_at_a_time(self):
+        payload = b"deflate-media" * 1000
+        body = zlib.compress(payload)
+        decode = _body_decoder("deflate")
+        out = b"".join(b"".join(decode(body[i : i + 1])) for i in range(len(body)))
+        out += b"".join(decode.finish())
+        self.assertEqual(out, payload)
+
+    def test_raw_deflate_body_fed_one_byte_at_a_time(self):
+        payload = b"deflate-media" * 1000
+        compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        body = compressor.compress(payload) + compressor.flush()
+        decode = _body_decoder("deflate")
+        out = b"".join(b"".join(decode(body[i : i + 1])) for i in range(len(body)))
+        out += b"".join(decode.finish())
+        self.assertEqual(out, payload)
 
     def test_unsupported_content_encoding_is_rejected(self):
         configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)

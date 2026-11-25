@@ -545,11 +545,15 @@ async def _download_capped_to_temp_file(
     declared = response.headers.get("content-length")
     if max_bytes and declared and declared.isdigit() and int(declared) > max_bytes:
         raise ValueError(too_large)
+    encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if encoding not in ("", "identity"):
+        # Bytes are counted as received, so a compressed body is not decoded here.
+        raise ValueError(f"Unsupported Content-Encoding for image: {encoding}")
     fd, part_path = tempfile.mkstemp(dir=directory)
     try:
         with os.fdopen(fd, "wb") as f:
             total = 0
-            async for chunk in response.aiter_bytes():
+            async for chunk in response.aiter_raw():
                 total += len(chunk)
                 if max_bytes and total > max_bytes:
                     raise ValueError(too_large)
@@ -573,7 +577,10 @@ async def _open_image_response(client: httpx.AsyncClient, url: str, timeout: flo
             "GET",
             origin.copy_with(host=str(address)),
             timeout=timeout,
-            headers={"Host": origin.netloc.decode("ascii")},
+            headers={
+                "Host": origin.netloc.decode("ascii"),
+                "Accept-Encoding": "identity",
+            },
             extensions={"sni_hostname": origin.raw_host.decode("ascii")},
         )
         # Each numeric URL represents one virtual host for this hop only.

@@ -447,7 +447,12 @@ def _body_decoder(content_encoding: Optional[str]):
     """
     encoding = (content_encoding or "identity").strip().lower()
     if encoding in ("", "identity"):
-        return lambda data: iter((data,)) if data else iter(())
+
+        def decode_identity(data):
+            return iter((data,)) if data else iter(())
+
+        decode_identity.finish = lambda: iter(())
+        return decode_identity
     if encoding not in ("gzip", "x-gzip", "deflate"):
         raise requests.exceptions.ContentDecodingError(
             f"Unsupported Content-Encoding for media: {content_encoding}"
@@ -458,10 +463,16 @@ def _body_decoder(content_encoding: Optional[str]):
         decompressors = [zlib.decompressobj(), zlib.decompressobj(-zlib.MAX_WBITS)]
     else:
         decompressors = [zlib.decompressobj(16 + zlib.MAX_WBITS)]
-    state = {"first": True}
+    state = {"first": True, "held": b""}
 
-    def decode(data):
+    def decode(data, final=False):
         if state["first"] and data:
+            data = state["held"] + data
+            if len(decompressors) == 2 and len(data) < 2 and not final:
+                # too short to tell zlib from raw deflate; wait for more bytes
+                state["held"] = data
+                return
+            state["held"] = b""
             state["first"] = False
             if len(decompressors) == 2:
                 # a zlib header is (CMF * 256 + FLG) % 31 == 0 with CM == 8
@@ -486,6 +497,17 @@ def _body_decoder(content_encoding: Optional[str]):
         except zlib.error as e:
             raise requests.exceptions.ContentDecodingError(e) from e
 
+    def finish():
+        """Called once the raw stream ends; a truncated body is an error."""
+        if state["held"]:
+            held, state["held"] = state["held"], b""
+            yield from decode(held, final=True)
+        if not decompressors[0].eof:
+            raise requests.exceptions.ContentDecodingError(
+                "Truncated compressed media body"
+            )
+
+    decode.finish = finish
     return decode
 
 
@@ -511,6 +533,7 @@ def _read_body_until(response: requests.Response, deadline: float):
                 sock.settimeout(remaining)
             data = raw.read1(_MEDIA_READ_CHUNK_BYTES, decode_content=False)
             if not data:
+                yield from decode.finish()
                 return
             yield from decode(data)
     except urllib3.exceptions.ReadTimeoutError as e:
