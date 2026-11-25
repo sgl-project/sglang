@@ -20,6 +20,7 @@ from sglang.srt.models.llava import (
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
+from sglang.srt.multimodal.media_budget import decoding_admitted_media
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     ImageData,
@@ -133,14 +134,17 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         url = image_data.url if isinstance(image_data, ImageData) else image_data
         image_hash = hash(url) if isinstance(url, (str, bytes)) else None
 
-        # Only remote URLs hit the network, and that fetch is what used to sit
-        # inside the cpu-preprocess timeout budget. Pull it into the io pool so a
-        # slow fetch can't starve cpu workers or trip the CPU timeout. Local and
-        # inline inputs (file://, data:, base64, bytes) decode instantly in the
-        # worker, so pass them through unchanged.
+        # Resolve and account for encoded inputs under the parent request's
+        # shared budget before handing them to independent CPU processes.
         image_input = url
         if isinstance(url, str) and url.startswith(("http://", "https://")):
             image_input = await self._fetch_remote_image_bytes(url)
+        elif self.cpu_executor is not None and isinstance(url, bytes):
+            image_input = get_image_bytes(url)
+        elif self.cpu_executor is not None and isinstance(url, str):
+            image_input = await asyncio.get_running_loop().run_in_executor(
+                self.io_executor, get_image_bytes, url
+            )
 
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
@@ -171,13 +175,16 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 self._replace_broken_cpu_executor(executor)
                 raise
         else:
-            return LlavaImageProcessor._preprocess_image_task(
-                image_input,
-                image_hash,
-                aspect_ratio,
-                grid_pinpoints,
-                self._processor,
-            )
+            with decoding_admitted_media(
+                image_input if image_input is not url else None
+            ):
+                return LlavaImageProcessor._preprocess_image_task(
+                    image_input,
+                    image_hash,
+                    aspect_ratio,
+                    grid_pinpoints,
+                    self._processor,
+                )
 
     def _process_precomputed_image_data(self, image_data: List[Dict]) -> Dict:
         mm_items = []

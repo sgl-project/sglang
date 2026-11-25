@@ -21,6 +21,7 @@ from sglang.srt.multimodal.cache import (
     snapshot_media,
 )
 from sglang.srt.multimodal.cache.digest import media_identity
+from sglang.srt.multimodal.media_budget import decoding_admitted_media
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 
 _CALLER_IDENTITY_KEYS = ("hash", "pad_value", "pad_values", "identity")
@@ -88,7 +89,8 @@ class KimiGridMMDataMixin:
             return super()._load_single_item(data, modality, *args, **kwargs)
         # hash the bytes already on the host, before nvJPEG creates a GPU tensor
         snapshot = snapshot_media(data)
-        image = super()._load_single_item(snapshot.data, modality, *args, **kwargs)
+        with decoding_admitted_media(snapshot.data):
+            image = super()._load_single_item(snapshot.data, modality, *args, **kwargs)
         return KimiLoadedImage(image, snapshot.content_digest)
 
     def process_mm_data(self, input_text, images=None, **kwargs):

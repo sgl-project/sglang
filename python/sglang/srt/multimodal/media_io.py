@@ -43,6 +43,11 @@ from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
+from sglang.srt.multimodal.media_budget import (
+    charge_base64,
+    charge_media_buffer,
+    charge_media_bytes,
+)
 from sglang.srt.utils.device import is_cuda, is_npu
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
@@ -398,6 +403,7 @@ def open_remote_media(url: str, timeout: float):
                         raise ValueError(
                             f"Remote media exceeds the {max_bytes} byte download limit"
                         )
+                    charge_media_bytes(len(chunk))
                     yield chunk
 
             yield response.headers, chunks()
@@ -485,7 +491,8 @@ def _open_local_media_file(path: str) -> BinaryIO:
 
 def check_local_media_file(path: str) -> str:
     """Raise ValueError unless ``path`` is an allowed, in-cap regular file."""
-    _open_local_media_file(path).close()
+    with _open_local_media_file(path) as f:
+        charge_media_bytes(os.fstat(f.fileno()).st_size)
     return path
 
 
@@ -493,12 +500,13 @@ def read_local_media_file(path: str) -> bytes:
     max_bytes = _media_url_max_file_size_bytes
     with _open_local_media_file(path) as f:
         # Bounded even when st_size understates the content (e.g. /proc files).
-        data = f.read(max_bytes + 1) if max_bytes else f.read()
-    if max_bytes and len(data) > max_bytes:
-        raise ValueError(
-            f"Media file exceeds the {max_bytes} byte limit: {shorten_media_source(path)}"
-        )
-    return data
+        blocks = bytearray()
+        while chunk := f.read(64 * 1024):
+            if max_bytes and len(blocks) + len(chunk) > max_bytes:
+                raise ValueError("Local media exceeds the byte limit")
+            charge_media_bytes(len(chunk))
+            blocks.extend(chunk)
+        return bytes(blocks)
 
 
 def is_local_media_path(value: str) -> bool:
@@ -509,6 +517,7 @@ def is_local_media_path(value: str) -> bool:
 
 def _decode_bare_base64(value: str) -> bytes:
     try:
+        charge_base64(value)
         return pybase64.b64decode(value, validate=True)
     except ValueError as e:
         if not value.startswith("/"):
@@ -532,9 +541,10 @@ def load_audio(
 
     # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
+        charge_media_buffer(audio_file)
         source = audio_file
     elif isinstance(audio_file, str) and audio_file.startswith("data:"):
-        source = pybase64.b64decode(audio_file.split(",")[1], validate=True)
+        source = _decode_bare_base64(audio_file.split(",", 1)[1])
     elif isinstance(audio_file, str) and (
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
@@ -799,6 +809,7 @@ def load_image(
         image = _fully_load_pil_image(image_file)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
+        charge_media_buffer(image_file)
         image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
@@ -827,6 +838,7 @@ def load_image(
 def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
+        charge_media_buffer(image_file)
         return image_file
     if image_file.startswith(("http://", "https://")):
         timeout = media_url_timeout(3)
@@ -839,7 +851,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         return read_local_media_file(image_file)
     if isinstance(image_file, str) and image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
-        return pybase64.b64decode(encoded, validate=True)
+        return _decode_bare_base64(encoded)
     if isinstance(image_file, str):
         return _decode_bare_base64(image_file)
     raise NotImplementedError(f"Invalid image: {image_file}")
@@ -855,6 +867,7 @@ def _normalize_video_input(
     torchcodec and VideoDecoderWrapper accept bytes natively).
     """
     if isinstance(video_file, bytes):
+        charge_media_buffer(video_file)
         return video_file
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
@@ -862,11 +875,11 @@ def _normalize_video_input(
             return download_remote_media(video_file, timeout=timeout)
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
-            return pybase64.b64decode(encoded, validate=True)
+            return _decode_bare_base64(encoded)
         elif video_file.startswith("file://"):
-            return check_local_media_file(unquote(urlparse(video_file).path))
+            return unquote(urlparse(video_file).path)
         elif is_local_media_path(video_file):
-            return check_local_media_file(video_file)
+            return video_file
         else:
             return _decode_bare_base64(video_file)
     else:
@@ -898,6 +911,8 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if source is None:
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
+    if isinstance(source, str):
+        check_local_media_file(source)
     device = "cuda" if use_gpu else "cpu"
     try:
         return VideoDecoderWrapper(source, device=device)

@@ -11,6 +11,7 @@ import torch
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torchvision import transforms
 
+from sglang.srt.multimodal.media_budget import charge_media_bytes
 from sglang.srt.multimodal.media_io import (
     media_url_timeout,
     open_remote_media,
@@ -118,6 +119,7 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
             f"{field_name}_{hashlib.sha256(url.encode()).hexdigest()[:16]}{ext}",
         )
         if os.path.exists(target_path):
+            charge_media_bytes(os.stat(target_path).st_size)
             return target_path
         # Renamed in only when complete, so a failed download never leaves a truncated
         # file for the cache check above to return.

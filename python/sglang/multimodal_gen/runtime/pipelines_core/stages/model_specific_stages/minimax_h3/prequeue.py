@@ -10,7 +10,6 @@ the scheduler.
 from __future__ import annotations
 
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
@@ -37,6 +36,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_audio_latent_t,
     minimax_h3_video_latent_t,
 )
+from sglang.srt.multimodal.media_budget import MediaThreadPool, ensure_media_budget
 
 MINIMAX_H3_PROBE_FACTS_EXTRA_KEY = "minimax_h3_probe_facts_by_condition"
 MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY = "minimax_h3_resolved_material_shapes"
@@ -286,7 +286,7 @@ def _probe_materials(batch: Any, plan: Any) -> list[dict[str, Any]]:
     for material in materials:
         first_by_uri.setdefault(material.uri, material)
     workers = min(_PROBE_MAX_THREADS, len(first_by_uri))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    with MediaThreadPool(max_workers=workers) as pool:
         futures = {uri: pool.submit(probe, m) for uri, m in first_by_uri.items()}
     return [
         futures[m.uri].result() if first_by_uri[m.uri] is m else probe(m)
@@ -294,6 +294,7 @@ def _probe_materials(batch: Any, plan: Any) -> list[dict[str, Any]]:
     ]
 
 
+@ensure_media_budget()
 def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
     """Freeze MiniMax H3 media/shape facts before queue admission."""
 

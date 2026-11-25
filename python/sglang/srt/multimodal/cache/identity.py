@@ -132,6 +132,9 @@ def _snapshot_ndarray(array: np.ndarray) -> MediaSnapshot:
 
 def _read_media_bytes(media: str | bytes) -> bytes:
     if isinstance(media, bytes):
+        from sglang.srt.multimodal.media_budget import charge_media_buffer
+
+        charge_media_buffer(media)
         return bytes(media)
 
     from sglang.srt.multimodal.media_io import (

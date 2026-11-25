@@ -20,6 +20,7 @@ from packaging import version
 
 from sglang.kernels import get_kernel
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.media_budget import charge_media_bytes
 from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
 from sglang.srt.multimodal.media_io import (
     get_mm_http_session,
@@ -191,6 +192,7 @@ def load_image(
     """
     if isinstance(image, (str, bytes)):
         if isinstance(image, str) and os.path.isfile(image):
+            charge_media_bytes(os.stat(image).st_size)
             image = PIL.Image.open(image)
         else:
             # in-memory loading path
@@ -263,6 +265,7 @@ def download_video_to_stream(video: str, output: BinaryIO) -> None:
             for chunk in response.iter_content(chunk_size=8192):
                 if not chunk:
                     continue
+                charge_media_bytes(len(chunk))
                 total_bytes += len(chunk)
                 if total_bytes > _VIDEO_DOWNLOAD_MAX_BYTES:
                     raise ValueError(
@@ -320,6 +323,7 @@ def _read_video_source(video: str, max_frames: int | None) -> list[PIL.Image.Ima
             with open(video_path, "wb") as output:
                 download_video_to_stream(video, output)
             return _read_video_frames(video_path, max_frames)
+    charge_media_bytes(os.stat(video).st_size)
     return _read_video_frames(video, max_frames)
 
 

@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
+from sglang.srt.multimodal.media_budget import MAX_REQUEST_BYTES
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
@@ -84,6 +85,7 @@ class Req:
 
     sampling_params: SamplingParams | None = None
     runtime_lora_scale: float = 1.0
+    media_bytes_remaining: int = MAX_REQUEST_BYTES
 
     generator: torch.Generator | list[torch.Generator] | None = None
 

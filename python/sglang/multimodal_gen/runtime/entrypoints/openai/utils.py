@@ -14,9 +14,10 @@ from typing import Any, Generator, List, Literal, Optional, Union
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException
 from pydantic import BaseModel
 from requests.utils import get_environ_proxies, select_proxy
+from starlette.datastructures import UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
@@ -39,6 +40,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_generation_timer,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
+from sglang.srt.multimodal.media_budget import charge_media_bytes
 from sglang.srt.multimodal.media_io import (
     approved_media_addresses,
     validate_remote_media_url,
@@ -469,6 +471,12 @@ async def save_first_input_image(
 async def _save_upload_to_path(
     upload: Union[UploadFile, bytes], target_path: str
 ) -> str:
+    if isinstance(upload, UploadFile):
+        content = bytearray()
+        while chunk := await upload.read(64 * 1024):
+            charge_media_bytes(len(chunk))
+            content.extend(chunk)
+        return save_image_bytes_to_path(content, target_path)
     if isinstance(upload, bytes):
         content = upload
     elif isinstance(upload, (bytearray, memoryview)):
@@ -486,6 +494,7 @@ async def _save_upload_to_path(
             raise TypeError(
                 f"Image upload read() returned {type(content).__name__}, expected bytes"
             )
+    charge_media_bytes(len(content))
     return save_image_bytes_to_path(content, target_path)
 
 
@@ -535,6 +544,7 @@ async def _download_capped_to_temp_file(
         with os.fdopen(fd, "wb") as f:
             total = 0
             async for chunk in response.aiter_bytes():
+                charge_media_bytes(len(chunk))
                 total += len(chunk)
                 if total > _MAX_IMAGE_DOWNLOAD_BYTES:
                     raise ValueError(too_large)

@@ -26,6 +26,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderPreprocessOutput,
     invoke_encoder_preprocessor,
 )
+from sglang.srt.multimodal.media_budget import decoding_admitted_media
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     load_audio,
@@ -331,7 +332,10 @@ class EncoderPreprocessor:
                     if self.use_image_processor_gpu
                     else False
                 )
-                img, _ = load_image(data, gpu_image_decode)
+                with decoding_admitted_media(
+                    data if content_hash is not None else None
+                ):
+                    img, _ = load_image(data, gpu_image_decode)
                 if (
                     discard_alpha_channel
                     and not isinstance(img, torch.Tensor)
