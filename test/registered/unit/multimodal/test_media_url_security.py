@@ -8,12 +8,12 @@ from unittest.mock import patch
 import requests
 
 from sglang.srt.multimodal.media_io import (
-    _assert_media_url_allowed,
     _normalize_video_input,
     configure_media_url_security,
     download_remote_media,
     get_image_bytes,
     load_audio,
+    validate_remote_media_url,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -137,17 +137,17 @@ class TestMediaURLSecurity(unittest.TestCase):
         ):
             with self.subTest(url=url):
                 with self.assertRaisesRegex(ValueError, "non-public IP"):
-                    _assert_media_url_allowed(url)
+                    validate_remote_media_url(url)
 
     def test_noncanonical_private_ip_spellings_are_blocked(self):
         for host in ("0x7f.0.0.1", "2130706433", "0177.0.0.1"):
             with self.subTest(host=host):
                 with self.assertRaisesRegex(ValueError, "non-public IP"):
-                    _assert_media_url_allowed(f"http://{host}/media")
+                    validate_remote_media_url(f"http://{host}/media")
 
     def test_public_literal_ip_is_allowed(self):
         # A literal public IP needs no DNS lookup, so this needs no network.
-        _assert_media_url_allowed("http://93.184.216.34/media")
+        validate_remote_media_url("http://93.184.216.34/media")
 
     def test_exact_domain_allowlist(self):
         configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)

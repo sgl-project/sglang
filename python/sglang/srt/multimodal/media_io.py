@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import errno
 import ipaddress
+import json
 import logging
 import math
 import os
@@ -24,9 +25,11 @@ import socket
 import stat
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
+from pathlib import Path
 from typing import BinaryIO, Dict, Optional, Sequence, Union
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -36,6 +39,9 @@ import requests
 import torch
 from PIL import Image, ImageOps, UnidentifiedImageError
 from typing_extensions import Literal
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 from sglang.srt.utils.device import is_cuda, is_npu
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
@@ -154,6 +160,16 @@ def configure_media_url_security(
     return normalized_domains
 
 
+def configure_worker_media_policy(config):
+    return configure_media_url_security(
+        config.allowed_media_domains,
+        config.media_url_max_file_size_mb,
+        config.media_url_timeout,
+        config.allow_local_media_files,
+        config.allow_private_media_hosts,
+    )
+
+
 def media_url_security_config() -> tuple:
     """The configured policy, as ``configure_media_url_security`` arguments."""
     return (
@@ -197,49 +213,99 @@ def _resolve_host_ips(
     return ips
 
 
-def _ip_is_public(
-    ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address],
-) -> bool:
-    """True only for globally routable unicast addresses.
+# One versioned address policy for native and Python loaders on every Python version.
+# IPv4-mapped IPv6 uses the IPv4 rules. Named origins may be explicitly trusted.
+with Path(__file__).with_name("media_networks.json").open() as _policy_file:
+    _MEDIA_NETWORKS = {
+        name: tuple(map(ipaddress.ip_network, ranges))
+        for name, ranges in json.load(_policy_file).items()
+    }
 
-    ``is_global`` alone is not enough: multicast addresses report
-    ``is_global == True`` on some Python versions, so check explicitly.
-    IPv4-mapped IPv6 addresses (``::ffff:127.0.0.1``) are unwrapped first.
-    """
+
+def _ip_is_public(ip):
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
-    return bool(
-        ip.is_global
-        and not ip.is_multicast
-        and not ip.is_reserved
-        and not ip.is_unspecified
+    if any(ip in net for net in _MEDIA_NETWORKS["exceptions"]):
+        return True
+    return any(ip in net for net in _MEDIA_NETWORKS["unicast"]) and not any(
+        ip in net for net in _MEDIA_NETWORKS["excluded"]
     )
 
 
-def _assert_media_host_is_public(hostname: str) -> None:
-    for ip in _resolve_host_ips(hostname):
-        if not _ip_is_public(ip):
+def approved_media_addresses(hostname: str):
+    hostname = _normalize_media_domain(hostname)
+    if _allowed_media_domains and hostname not in _allowed_media_domains:
+        raise ValueError(f"Media URL domain is not allowed: {hostname}")
+    addresses = _resolve_host_ips(hostname)
+    if not (_allow_private_media_hosts or hostname in _allowed_media_domains):
+        if any(not _ip_is_public(address) for address in addresses):
             raise ValueError("Media URL host resolves to a non-public IP address")
+    return addresses
 
 
-def _assert_media_url_allowed(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-        raise ValueError(f"Invalid media URL: {url!r}")
+class _MediaConnection:
+    def _new_conn(self):
+        # only the socket dial uses a numeric address; TLS and Host retain the origin
+        origin = self.host
+        addresses = approved_media_addresses(origin)
+        try:
+            for index, address in enumerate(addresses):
+                self.host = str(address)
+                try:
+                    return super()._new_conn()
+                except (ConnectTimeoutError, NewConnectionError):
+                    if index + 1 == len(addresses):
+                        raise
+        finally:
+            self.host = origin
 
-    hostname = _normalize_media_domain(parsed.hostname)
-    if _allowed_media_domains:
-        if hostname not in _allowed_media_domains:
-            raise ValueError(
-                "Media URL domain is not allowed. "
-                f"Allowed domains: {sorted(_allowed_media_domains)}; "
-                f"input domain: {hostname}"
-            )
-        # An explicit allowlist entry is an operator opt-in to that host,
-        # including a private one (e.g. an internal media server).
-        return
-    if not _allow_private_media_hosts:
-        _assert_media_host_is_public(hostname)
+
+class _MediaHTTPConnection(_MediaConnection, HTTPConnection):
+    pass
+
+
+class _MediaHTTPSConnection(_MediaConnection, HTTPSConnection):
+    pass
+
+
+class _MediaPool:
+    def _get_conn(self, timeout=None):
+        connection = super()._get_conn(timeout)
+        if connection.sock is not None:
+            # Reuse only while this peer is still an approved address for this origin.
+            try:
+                peer = ipaddress.ip_address(connection.sock.getpeername()[0])
+                if peer not in approved_media_addresses(self.host):
+                    connection.close()
+            except OSError:
+                connection.close()
+            except BaseException:
+                connection.close()
+                self._put_conn(None)
+                raise
+        return connection
+
+
+class _MediaHTTPPool(_MediaPool, HTTPConnectionPool):
+    ConnectionCls = _MediaHTTPConnection
+
+
+class _MediaHTTPSPool(_MediaPool, HTTPSConnectionPool):
+    ConnectionCls = _MediaHTTPSConnection
+
+
+class _MediaAdapter(requests.adapters.HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": _MediaHTTPPool,
+            "https": _MediaHTTPSPool,
+        }
+
+    def proxy_manager_for(self, proxy, **kwargs):
+        raise ValueError(
+            "Pinned media connections require a direct route; configure NO_PROXY for the media origin"
+        )
 
 
 def validate_remote_media_url(url: str) -> str:
@@ -257,7 +323,10 @@ def validate_remote_media_url(url: str) -> str:
         raise ValueError(f"Invalid media URL: {url!r}") from e
     if prepared_url is None:
         raise ValueError(f"Invalid media URL: {url!r}")
-    _assert_media_url_allowed(prepared_url)
+    parsed = urlparse(prepared_url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError("Expected an HTTP(S) media URL")
+    approved_media_addresses(parsed.hostname)
     return prepared_url
 
 
@@ -267,15 +336,9 @@ def media_url_timeout(default: float) -> float:
     return float(os.getenv("REQUEST_TIMEOUT", default))
 
 
-def download_remote_media(url: str, timeout: float) -> bytes:
-    """Download one HTTP(S) media object under the configured URL policy.
-
-    Redirects are followed manually so every destination is validated before
-    a connection is made. The response is streamed to enforce both the total
-    request deadline and the configured byte limit without first buffering an
-    attacker-controlled body in memory.
-    """
-
+@contextmanager
+def open_remote_media(url: str, timeout: float):
+    """Yield response headers and a size- and deadline-bounded body iterator."""
     if timeout <= 0:
         raise ValueError("media URL timeout must be positive")
 
@@ -323,22 +386,27 @@ def download_remote_media(url: str, timeout: float) -> bytes:
                         f"Remote media exceeds the {max_bytes} byte download limit"
                     )
 
-            content = bytearray()
-            for chunk in response.iter_content(chunk_size=64 * 1024):
-                if not chunk:
-                    continue
-                if time.monotonic() > deadline:
-                    raise requests.exceptions.Timeout(
-                        f"Timed out while downloading media URL: {url}"
-                    )
-                if max_bytes and len(content) + len(chunk) > max_bytes:
-                    raise ValueError(
-                        f"Remote media exceeds the {max_bytes} byte download limit"
-                    )
-                content.extend(chunk)
-            return bytes(content)
+            def chunks():
+                total = 0
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    if time.monotonic() > deadline:
+                        raise requests.exceptions.Timeout("Media download timed out")
+                    total += len(chunk)
+                    if max_bytes and total > max_bytes:
+                        raise ValueError(
+                            f"Remote media exceeds the {max_bytes} byte download limit"
+                        )
+                    yield chunk
 
-    raise AssertionError("unreachable")
+            yield response.headers, chunks()
+            return
+
+
+def download_remote_media(url: str, timeout: float) -> bytes:
+    with open_remote_media(url, timeout) as (_, chunks):
+        return b"".join(chunks)
 
 
 def get_mm_http_session() -> requests.Session:
@@ -349,6 +417,9 @@ def get_mm_http_session() -> requests.Session:
     session = getattr(_mm_http_session, "session", None)
     if session is None or getattr(_mm_http_session, "pid", None) != pid:
         session = requests.Session()
+        adapter = _MediaAdapter()
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
         _mm_http_session.session = session
         _mm_http_session.pid = pid
     return session

@@ -56,7 +56,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e4m3` or `--kv-cache-dtype fp8_e5m2`.
 - To enable deterministic inference and batch invariant operations, add `--enable-deterministic-inference`. More details can be found in [deterministic inference document](./deterministic_inference).
-- If a multimodal server accepts requests from untrusted clients, restrict remote image, video, and audio URLs with `--allowed-media-domains`. SGLang checks the initial URL and every redirect destination against the exact-hostname allowlist. Remote media downloads are limited to 64 MiB by default; adjust `--media-url-max-file-size-mb` when larger trusted media is required. Local media files named by a request are held to the same size limit; pass `--no-allow-local-media-files` to reject them.
+- If a multimodal server accepts requests from untrusted clients, restrict remote image, video, and audio URLs with `--allowed-media-domains`. SGLang checks the initial URL and every redirect destination against the exact-hostname allowlist. Remote media downloads are limited to 64 MiB by default; adjust `--media-url-max-file-size-mb` when larger trusted media is required. Local media files named by a request are held to the same size limit; pass `--no-allow-local-media-files` to reject them. Media downloads connect directly to the approved origin address. If the server environment uses an HTTP proxy, include trusted media origins in `NO_PROXY`.
 
   ```bash Command
   python -m sglang.launch_server \

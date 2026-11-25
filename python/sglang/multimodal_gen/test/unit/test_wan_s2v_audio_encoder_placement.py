@@ -187,7 +187,7 @@ class _Response:
         self._body = body
 
     def __enter__(self):
-        return self
+        return {}, iter([self.read()])
 
     def __exit__(self, *exc):
         return False
@@ -207,7 +207,10 @@ def test_retry_after_failed_download_gets_the_whole_file(tmp_path):
     )
     with (
         patch.object(stage_module.tempfile, "gettempdir", return_value=str(tmp_path)),
-        patch.object(stage_module, "urlopen", lambda *a, **kw: next(responses)),
+        patch.object(stage_module, "validate_remote_media_url", lambda url: url),
+        patch.object(
+            stage_module, "open_remote_media", lambda *a, **kw: next(responses)
+        ),
     ):
         with pytest.raises(TimeoutError):
             stage._download_remote_input("https://example.com/talk.wav", "audio_path")

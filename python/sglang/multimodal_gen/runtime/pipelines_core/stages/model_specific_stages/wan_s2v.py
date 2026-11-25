@@ -5,12 +5,17 @@ import hashlib
 import os
 import tempfile
 from urllib.parse import urlparse
-from urllib.request import urlopen
 
 import PIL.Image
 import torch
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torchvision import transforms
+
+from sglang.srt.multimodal.media_io import (
+    media_url_timeout,
+    open_remote_media,
+    validate_remote_media_url,
+)
 
 try:
     import soundfile as sf
@@ -101,6 +106,7 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         return value
 
     def _download_remote_input(self, url: str, field_name: str) -> str:
+        url = validate_remote_media_url(url)
         parsed = urlparse(url)
         ext = os.path.splitext(parsed.path)[1] or (
             ".wav" if field_name == "audio_path" else ".jpg"
@@ -115,13 +121,19 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
             return target_path
         # Renamed in only when complete, so a failed download never leaves a truncated
         # file for the cache check above to return.
-        partial_path = f"{target_path}.partial"
-        with (
-            urlopen(url, timeout=_REMOTE_INPUT_TIMEOUT_S) as response,
-            open(partial_path, "wb") as fout,
-        ):
-            fout.write(response.read())
-        os.replace(partial_path, target_path)
+        with tempfile.NamedTemporaryFile(dir=cache_dir, delete=False) as fout:
+            partial_path = fout.name
+            try:
+                with open_remote_media(
+                    url, media_url_timeout(_REMOTE_INPUT_TIMEOUT_S)
+                ) as (_, chunks):
+                    for chunk in chunks:
+                        fout.write(chunk)
+                fout.close()
+                os.replace(partial_path, target_path)
+            finally:
+                if os.path.exists(partial_path):
+                    os.unlink(partial_path)
         return target_path
 
     def _generate_seed_and_generator(self, batch: Req) -> None:

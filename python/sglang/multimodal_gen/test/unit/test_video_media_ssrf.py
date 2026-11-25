@@ -133,7 +133,7 @@ class _FakeResponse:
 
 class TestLoadVideoDownload:
     def test_private_url_is_rejected_without_fetching(self):
-        with mock.patch.object(vision.requests, "get") as fake_get:
+        with mock.patch.object(vision.get_mm_http_session(), "get") as fake_get:
             with pytest.raises(ValueError, match="non-public IP"):
                 vision.load_video(PRIVATE_URL)
         fake_get.assert_not_called()
@@ -144,7 +144,7 @@ class TestLoadVideoDownload:
             headers={"Location": PRIVATE_URL},
         )
         with mock.patch.object(
-            vision.requests, "get", return_value=redirect
+            vision.get_mm_http_session(), "get", return_value=redirect
         ) as fake_get:
             with pytest.raises(ValueError, match="non-public IP"):
                 vision.load_video(PUBLIC_VIDEO_URL)
@@ -158,21 +158,27 @@ class TestLoadVideoDownload:
             status_code=302,
             headers={"Location": PUBLIC_VIDEO_URL},
         )
-        with mock.patch.object(vision.requests, "get", return_value=redirect):
+        with mock.patch.object(
+            vision.get_mm_http_session(), "get", return_value=redirect
+        ):
             with pytest.raises(requests.exceptions.TooManyRedirects):
                 vision.load_video(PUBLIC_VIDEO_URL)
 
     def test_oversized_download_is_rejected(self, monkeypatch):
         monkeypatch.setattr(vision, "_VIDEO_DOWNLOAD_MAX_BYTES", 10)
         response = _FakeResponse(chunks=[b"x" * 11])
-        with mock.patch.object(vision.requests, "get", return_value=response):
+        with mock.patch.object(
+            vision.get_mm_http_session(), "get", return_value=response
+        ):
             with pytest.raises(ValueError, match="download limit"):
                 vision.load_video(PUBLIC_VIDEO_URL)
 
     def test_public_url_still_downloads(self):
         response = _FakeResponse(chunks=[b"fake-mp4"])
         with (
-            mock.patch.object(vision.requests, "get", return_value=response),
+            mock.patch.object(
+                vision.get_mm_http_session(), "get", return_value=response
+            ),
             mock.patch.object(
                 vision, "_read_video_frames", return_value=["frame"]
             ) as read_frames,
@@ -233,7 +239,7 @@ class TestAvOpenGuard:
         with (
             mock.patch.dict("sys.modules", {"av": fake_av}),
             mock.patch.object(
-                vision.requests, "get", side_effect=requests.Timeout(url)
+                vision.get_mm_http_session(), "get", side_effect=requests.Timeout(url)
             ),
             pytest.raises(
                 ValueError, match=r"^Could not open video source \(Timeout\)\.$"
@@ -254,7 +260,7 @@ class TestAvOpenGuard:
         fake_av = self._fake_av()
         with (
             mock.patch.dict("sys.modules", {"av": fake_av}),
-            mock.patch.object(vision.requests, "get") as get,
+            mock.patch.object(vision.get_mm_http_session(), "get") as get,
             pytest.raises(ValueError, match="Could not open video source") as exc,
         ):
             list(_iter_video_frames_pyav(PUBLIC_VIDEO_URL, 1))
@@ -292,7 +298,7 @@ class TestAvOpenGuard:
                 vision, "validate_remote_media_url", return_value=PUBLIC_VIDEO_URL
             ) as policy,
             mock.patch.object(
-                vision.requests,
+                vision.get_mm_http_session(),
                 "get",
                 return_value=_FakeResponse(chunks=[b"fixture clip"]),
             ) as download,

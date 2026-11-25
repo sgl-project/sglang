@@ -21,7 +21,10 @@ from packaging import version
 from sglang.kernels import get_kernel
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
-from sglang.srt.multimodal.media_io import validate_remote_media_url
+from sglang.srt.multimodal.media_io import (
+    get_mm_http_session,
+    validate_remote_media_url,
+)
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -154,9 +157,11 @@ def _read_media_source(read: Callable, *args, invalid_input: str | None = None):
                 )
                 if isinstance(exc, cls)
             ),
-            requests.exceptions.InvalidURL
-            if isinstance(exc, ValueError)
-            else requests.RequestException,
+            (
+                requests.exceptions.InvalidURL
+                if isinstance(exc, ValueError)
+                else requests.RequestException
+            ),
         )
         status = exc.response.status_code if exc.response is not None else None
         detail = f" (HTTP {status})" if type(status) is int else ""
@@ -235,7 +240,7 @@ def download_video_to_stream(video: str, output: BinaryIO) -> None:
     for redirect_count in range(_VIDEO_DOWNLOAD_MAX_REDIRECTS + 1):
         prepared_url = validate_remote_media_url(current_url)
         with closing(
-            requests.get(
+            get_mm_http_session().get(
                 prepared_url,
                 stream=True,
                 allow_redirects=False,

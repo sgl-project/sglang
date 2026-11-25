@@ -26,8 +26,8 @@ def _gif_bytes() -> bytes:
     "loader, dependency, category",
     [
         (vision.load_image, "srt_get_image_bytes", requests.HTTPError),
-        (vision.load_video, "requests.get", requests.Timeout),
-        (vision.load_video, "requests.get", requests.TooManyRedirects),
+        (vision.load_video, "get", requests.Timeout),
+        (vision.load_video, "get", requests.TooManyRedirects),
     ],
 )
 def test_media_download_errors_keep_category_not_request(loader, dependency, category):
@@ -40,7 +40,11 @@ def test_media_download_errors_keep_category_not_request(loader, dependency, cat
         response.status_code = 403
     original = category(url, request=request, response=response)
     original.__cause__ = OSError(marker)
-    with patch(f"{vision.__name__}.{dependency}", side_effect=original):
+    with patch.object(
+        vision if dependency != "get" else vision.get_mm_http_session(),
+        dependency,
+        side_effect=original,
+    ):
         with pytest.raises(category) as caught:
             loader(url)
     error = caught.value
@@ -84,7 +88,9 @@ def test_load_video_removes_downloaded_temp_file(
         iter_content=lambda chunk_size: iter([payload]),
         close=lambda: closed.append(True),
     )
-    monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        vision.get_mm_http_session(), "get", lambda *args, **kwargs: response
+    )
 
     if error is None:
         frames = vision.load_video(_GIF_URL)

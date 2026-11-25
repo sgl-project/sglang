@@ -8,7 +8,7 @@ import re
 import shutil
 import tempfile
 import time
-from contextlib import contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from functools import cache
 from typing import Any, Generator, List, Literal, Optional, Union
 from urllib.parse import urljoin, urlparse
@@ -16,6 +16,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from fastapi import HTTPException, UploadFile
 from pydantic import BaseModel
+from requests.utils import get_environ_proxies, select_proxy
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
@@ -38,7 +39,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_generation_timer,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
-from sglang.srt.multimodal.media_io import validate_remote_media_url
+from sglang.srt.multimodal.media_io import (
+    approved_media_addresses,
+    validate_remote_media_url,
+)
 
 logger = init_logger(__name__)
 
@@ -554,6 +558,36 @@ async def _download_capped_to_temp_file(
     return part_path
 
 
+@asynccontextmanager
+async def _open_image_response(client: httpx.AsyncClient, url: str):
+    origin = httpx.URL(url)
+    if select_proxy(url, get_environ_proxies(url)):
+        raise ValueError(
+            "Pinned media connections require a direct route; configure NO_PROXY for the media origin"
+        )
+    addresses = await asyncio.to_thread(approved_media_addresses, origin.host)
+    for index, address in enumerate(addresses):
+        request = client.build_request(
+            "GET",
+            origin.copy_with(host=str(address)),
+            timeout=10.0,
+            headers={"Host": origin.netloc.decode("ascii")},
+            extensions={"sni_hostname": origin.raw_host.decode("ascii")},
+        )
+        # Each numeric URL represents one virtual host for this hop only.
+        request.headers.pop("cookie", None)
+        try:
+            response = await client.send(request, stream=True)
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            if index + 1 == len(addresses):
+                raise
+    try:
+        yield response
+    finally:
+        await response.aclose()
+
+
 async def _save_url_image_to_path(
     image_url: str, target_path: str, *, uploads_root: str | None = None
 ) -> str:
@@ -584,15 +618,22 @@ async def _save_url_image_to_path(
     backoff_seconds = 0.2
 
     try:
-        async with httpx.AsyncClient(follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+            verify=httpx.create_ssl_context(),
+            limits=httpx.Limits(max_keepalive_connections=0),
+        ) as client:
             for attempt in range(1, max_attempts + 1):
                 part_path = None
                 try:
-                    current_url = validate_remote_media_url(image_url)
+                    current_url = await asyncio.to_thread(
+                        validate_remote_media_url, image_url
+                    )
                     downloaded = False
                     for redirect_count in range(_MAX_IMAGE_DOWNLOAD_REDIRECTS + 1):
-                        async with client.stream(
-                            "GET", current_url, timeout=10.0
+                        async with _open_image_response(
+                            client, current_url
                         ) as response:
                             location = response.headers.get("Location")
                             if (
@@ -605,8 +646,9 @@ async def _save_url_image_to_path(
                                         f"{_MAX_IMAGE_DOWNLOAD_REDIRECTS} "
                                         f"redirects: {image_url}"
                                     )
-                                current_url = validate_remote_media_url(
-                                    urljoin(str(response.url), location)
+                                current_url = await asyncio.to_thread(
+                                    validate_remote_media_url,
+                                    urljoin(current_url, location),
                                 )
                                 continue
                             response.raise_for_status()

@@ -3,6 +3,7 @@
 import asyncio
 import errno
 import io
+import ipaddress
 import os
 import threading
 from collections import OrderedDict
@@ -582,6 +583,11 @@ def _patch_download(monkeypatch, tmp_path, handler):
     monkeypatch.setattr(
         "sglang.srt.multimodal.media_io._allowed_media_domains", frozenset({"x.test"})
     )
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.media_io._resolve_host_ips",
+        lambda _: [ipaddress.ip_address("127.0.0.1")],
+    )
+    monkeypatch.setenv("no_proxy", "*")
     part_dir = tmp_path / "parts"
     part_dir.mkdir()
     monkeypatch.setattr(utils.tempfile, "tempdir", str(part_dir))

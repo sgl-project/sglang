@@ -119,7 +119,14 @@ class _Origin:
 @pytest.fixture
 def origin(monkeypatch, media) -> _Origin:
     origin = _Origin(media)
-    monkeypatch.setattr(urllib.request, "urlopen", origin.urlopen)
+    from contextlib import contextmanager
+
+    @contextmanager
+    def open_material(uri, timeout):
+        with origin.urlopen(uri, timeout) as response:
+            yield {}, iter(lambda: response.read(65536), b"")
+
+    monkeypatch.setattr(material_io, "open_remote_media", open_material)
     monkeypatch.setattr(
         material_io, "_ffprobe_media", lambda path: json.loads(Path(path).read_bytes())
     )
