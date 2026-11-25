@@ -1,6 +1,5 @@
 {
-  "_comment": "Manual overrides for hf_repo_scan.py, which list_stage_models.py and check-changes' prefetch lists both use. by_file/by_suite ADD models the static scan cannot see (models built dynamically, read from configs, passed via CLI args). unused_by_file REMOVES ids a test file names but never loads on CUDA. deny lists strings the heuristic mistakes for repo ids; datasets lists Hub dataset ids tests read, which are not models. Keys in by_file and unused_by_file are repo-relative test paths (e.g. test/registered/foo/test_bar.py). suite_labels maps legacy suite= registrations (no runner_config) to the GH runner label(s) their dispatching workflow hardcodes in runs-on -- a list, because one suite can run on several labels. $b200_runner is the dynamic-b200 placeholder from runner_configs.yml. Suites registered with stage=/runner_config= need no entry: their label resolves through runner_configs.yml. Anything unmappable stays visible in unmapped_suites.",
-  "by_file": {},
+  "_comment": "Manual overrides for hf_repo_scan.py, which list_stage_models.py and check-changes' prefetch lists both use. by_suite ADDS models the static scan cannot see to a whole suite. A test file corrects its own models with declare_models(models=..., skip_models=...) next to its register_cuda_ci call, not here. deny lists strings the heuristic mistakes for repo ids; datasets lists Hub dataset ids tests read, which are not models. suite_labels maps legacy suite= registrations (no runner_config) to the GH runner label(s) their dispatching workflow hardcodes in runs-on -- a list, because one suite can run on several labels. $b200_runner is the dynamic-b200 placeholder from runner_configs.yml. Suites registered with stage=/runner_config= need no entry: their label resolves through runner_configs.yml. Anything unmappable stays visible in unmapped_suites.",
   "by_suite": {},
   "suite_labels": {
     "stress": ["8-gpu-h200"]
@@ -24,9 +23,5 @@
     "THUDM/LongBench-v2",
     "xai-org/RealworldQA",
     "anon8231489123/ShareGPT_Vicuna_unfiltered"
-  ],
-  "unused_by_file": {
-    "test/registered/reasoning/test_reasoning.py": ["Qwen/Qwen3-30B-A3B"],
-    "test/registered/unit/models/test_qwen4_exp_ple_table.py": ["RadixArk/Qwen3.8-Flash-Next-NVFP4"]
-  }
+  ]
 }

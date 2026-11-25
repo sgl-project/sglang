@@ -18,9 +18,10 @@ How `file -> models` is resolved (best effort, recall-favoring)
     file's literals and the names it defines or imports from test-support
     modules. A file it finds no model in is reported per suite as
     `unresolved_files`, and any file it cannot parse is reported in
-    `parse_failures`, so recall gaps are visible rather than silent. A
-    `--overrides` JSON file supplies models for dynamic cases and trims false
-    positives.
+    `parse_failures`, so recall gaps are visible rather than silent. A test
+    file's `declare_models(...)` call adds models for dynamic cases and drops
+    ones it names but does not load; the `--overrides` JSON file adds models
+    per suite and trims false positives.
 
 How `runner label -> models` is aggregated
     Registration/prewarm decisions are made per GH runner *label* (a runner's

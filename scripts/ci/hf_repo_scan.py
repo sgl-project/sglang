@@ -7,10 +7,12 @@ like a repo id, plus the ids behind the names it uses: names it defines, and
 names it imports from test-support modules of the checkout, followed through
 their own imports. A name resolves through its import, never by a bare-name
 match across modules: one module's `MODEL` is not another's.
-stage_models_overrides.json corrects the scan: `by_file` / `by_suite` add ids
-it cannot see, `unused_by_file` drops ids a file names but never loads on
-CUDA, `deny` lists strings that are not repo ids, and `datasets` lists Hub
-dataset ids, which tests read but which are not models.
+A test file corrects its own ids with a top-level `declare_models(models=...,
+skip_models=...)` call (ci_register.py): `models` adds ids the scan cannot
+see, `skip_models` drops ids the file names but never loads on CUDA.
+stage_models_overrides.json corrects the rest: `by_suite` adds ids per suite,
+`deny` lists strings that are not repo ids, and `datasets` lists Hub dataset
+ids, which tests read but which are not models.
 
 As a script, it prints for $GITHUB_OUTPUT the repos each partition of each
 CUDA suite in check-changes' `partitions` needs, with the files
@@ -116,9 +118,7 @@ def load_overrides(path: Optional[str]) -> Dict[str, object]:
     default, so a hand-edit like ``"deny": null`` does not blow up downstream
     iteration."""
     overrides: Dict[str, object] = {
-        "by_file": {},
         "by_suite": {},
-        "unused_by_file": {},
         "deny": [],
         "datasets": [],
         "suite_labels": {},
@@ -149,9 +149,7 @@ def load_ci_register(repo_root: str):
 class RepoIdScanner:
     def __init__(self, repo_root: str, overrides: Dict[str, object]):
         self.repo_root = repo_root
-        self.by_file: Dict[str, List[str]] = overrides["by_file"]
         self.by_suite: Dict[str, List[str]] = overrides["by_suite"]
-        self.unused_by_file: Dict[str, List[str]] = overrides["unused_by_file"]
         self.not_models = set(overrides["deny"]) | set(overrides["datasets"])
         # `{path: {name: repo ids}}` per scanned module.
         self.modules: Dict[str, Dict[str, Set[str]]] = {}
@@ -169,17 +167,55 @@ class RepoIdScanner:
     def file_repo_ids(self, rel: str) -> Set[str]:
         """Repo ids the test file ``rel`` (repo-relative) needs."""
         path = os.path.join(self.repo_root, rel)
-        ids = set(self.by_file.get(rel, []))
         tree = self._parse(path)
-        if tree is not None:
-            table = dict(self.module_repo_ids(path, tree))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom):
-                    table.update(self._imported_repo_ids(path, node))
-            ids |= self.node_repo_ids(tree, table)
-        ids -= set(self.unused_by_file.get(rel, []))
+        if tree is None:
+            return set()
+        table = dict(self.module_repo_ids(path, tree))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                table.update(self._imported_repo_ids(path, node))
+        declared = self._declared_repo_ids(rel, tree, table)
+        ids = self.node_repo_ids(tree, table) | declared["models"]
+        ids -= declared["skip_models"]
         # An id-shaped path of the checkout is a local directory, not a repo.
         return {i for i in ids if not os.path.exists(os.path.join(self.repo_root, i))}
+
+    def _declared_repo_ids(
+        self, rel: str, tree: ast.Module, table: Dict[str, Set[str]]
+    ) -> Dict[str, Set[str]]:
+        """`{"models": ids, "skip_models": ids}` from the top-level
+        `declare_models(...)` calls of the test file ``rel``. An item that
+        resolves to no repo id is an error, so a typo fails the scan instead
+        of silently declaring nothing."""
+        declared: Dict[str, Set[str]] = {"models": set(), "skip_models": set()}
+        for stmt in tree.body:
+            call = stmt.value if isinstance(stmt, ast.Expr) else None
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "declare_models"
+            ):
+                continue
+            if call.args:
+                raise ValueError(f"{rel}: declare_models() takes keywords only")
+            for kw in call.keywords:
+                key, value = kw.arg, kw.value
+                if key not in declared:
+                    raise ValueError(
+                        f"{rel}: unknown argument {key!r} in declare_models()"
+                    )
+                items = (
+                    value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
+                )
+                for item in items:
+                    ids = self.node_repo_ids(item, table)
+                    if not ids:
+                        raise ValueError(
+                            f"{rel}: declare_models({key}=...) item "
+                            f"{ast.unparse(item)} names no repo id"
+                        )
+                    declared[key] |= ids
+        return declared
 
     def module_repo_ids(
         self, path: str, tree: Optional[ast.Module] = None

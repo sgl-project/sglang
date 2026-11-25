@@ -200,15 +200,35 @@ class ExtractModels(unittest.TestCase):
         self.assertEqual(_scan("x = M\n", 'M = "org/other-model"\n'), set())
 
 
+class DeclareModels(unittest.TestCase):
+    def test_skip_models_by_literal_and_constant(self):
+        source = (
+            "from sglang.test.helper import M\n"
+            'declare_models(skip_models=[M, "org/unused-model"])\n'
+            'x = (M, "org/unused-model", "org/kept-model")\n'
+        )
+        self.assertEqual(
+            _scan(source, 'M = "org/constant-model"\n'), {"org/kept-model"}
+        )
+
+    def test_bad_declaration_is_loud(self):
+        for call in (
+            'declare_models(skip_models=["not-a-repo-id"])',
+            "declare_models(skip_models=[UNKNOWN])",
+            'declare_models(model=["org/some-model"])',
+            'declare_models(["org/some-model"])',
+        ):
+            with self.subTest(call=call), self.assertRaises(ValueError):
+                _scan(call + "\n")
+
+
 class Overrides(unittest.TestCase):
     def test_load_defaults_when_missing(self):
         ov = scan.load_overrides(None)
         self.assertEqual(
             ov,
             {
-                "by_file": {},
                 "by_suite": {},
-                "unused_by_file": {},
                 "deny": [],
                 "datasets": [],
                 "suite_labels": {},
@@ -219,14 +239,12 @@ class Overrides(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "ov.json")
             with open(path, "w", encoding="utf-8") as f:
-                f.write('{"deny": null, "by_file": null}')
+                f.write('{"deny": null, "by_suite": null}')
             ov = scan.load_overrides(path)
             self.assertEqual(
                 ov,
                 {
-                    "by_file": {},
                     "by_suite": {},
-                    "unused_by_file": {},
                     "deny": [],
                     "datasets": [],
                     "suite_labels": {},
@@ -353,15 +371,25 @@ class BuildInventory(unittest.TestCase):
             self.assertEqual(inv["model_count"], 1)
             self.assertEqual(inv["parse_failures"], {})
 
-    def test_by_file_override_adds_and_clears_unresolved(self):
+    def test_declare_models_adds_and_clears_unresolved(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._repo(tmp)
-            overrides = scan.load_overrides(None)
-            overrides["by_file"] = {"test/registered/b/test_b.py": ["org/extra-model"]}
-            inv = lsm.build_inventory(tmp, "cuda", overrides, "sha")
+            _write(
+                tmp,
+                "test/registered/b/test_b.py",
+                "import unittest\n"
+                "from sglang.test.ci.ci_register import "
+                "declare_models, register_cuda_ci\n"
+                'register_cuda_ci(est_time=1, stage="base-x", '
+                'runner_config="1-gpu")\n'
+                'declare_models(models=["org/extra-model"])\n'
+                'if __name__ == "__main__":\n    unittest.main()\n',
+            )
+            inv = lsm.build_inventory(tmp, "cuda", scan.load_overrides(None), "sha")
             suite = inv["suites"]["base-x-test-1-gpu"]
             self.assertIn("org/extra-model", suite["models"])
-            # by_file supplied a model for test_b -> no longer unresolved.
+            # The registry parse ignores the call: test_b stays in its suite.
+            self.assertEqual(suite["test_file_count"], 2)
             self.assertEqual(suite["unresolved_files"], [])
 
     def test_by_suite_override_adds_model(self):

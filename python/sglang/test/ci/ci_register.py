@@ -5,7 +5,7 @@ import os
 import warnings
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
     "HWBackend",
@@ -25,6 +25,7 @@ __all__ = [
     "register_mps_ci",
     "register_ppu_ci",
     "register_mlu_ci",
+    "declare_models",
     "ut_parse_one_file",
 ]
 
@@ -197,6 +198,20 @@ def register_mlu_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for MLU CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def declare_models(
+    *, models: Sequence[str] = (), skip_models: Sequence[str] = ()
+) -> None:
+    """Correct the Hugging Face repos CI prefetches for this test file (parsed
+    via AST by scripts/ci/hf_repo_scan.py; runtime no-op).
+
+    ``models`` are repos the file loads that the scan cannot see, such as an
+    id built at runtime; ``skip_models`` are repos the file names but does not
+    load on CUDA. Each item is a repo id literal or a module-level name bound
+    to one, such as an imported ``DEFAULT_*`` model constant.
+    """
     return None
 
 
