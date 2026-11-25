@@ -672,11 +672,13 @@ class NpuEplbRuntime:
         self._owner_stream.synchronize()
         self._routing_plan = None
 
-    def open_transport(self, timeout, p2p_options, tp_probe, warmup_buffers) -> None:
-        self.plan_group = dist.new_group(backend="gloo", timeout=timeout)
+    def open_transport(
+        self, cpu_timeout, hccl_timeout, p2p_options, tp_probe, warmup_buffers
+    ) -> None:
+        self.plan_group = dist.new_group(backend="gloo", timeout=cpu_timeout)
         # Background P2P and foreground TP can be submitted in different orders.
         self.p2p_group = dist.new_group(
-            backend="hccl", timeout=timeout, pg_options=p2p_options
+            backend="hccl", timeout=hccl_timeout, pg_options=p2p_options
         )
         # Warm the recorder's TP reduction before KV sizing.
         dist.all_reduce(tp_probe, group=get_eplb_group())
@@ -750,8 +752,8 @@ def create_npu_async_eplb(model_config, model, *, startup_weight_load):
     )
 
     world_size = dist.get_world_size()
-    timeout = timedelta(seconds=90)
-    control = EplbControl(dist.new_group(backend="gloo", timeout=timeout))
+    cpu_timeout = timedelta(seconds=90)
+    control = EplbControl(dist.new_group(backend="gloo", timeout=cpu_timeout))
     error = None
     try:
         import torch_npu
@@ -762,6 +764,12 @@ def create_npu_async_eplb(model_config, model, *, startup_weight_load):
                 "Async EPLB requires completed weight loading before migration setup"
             )
         parallel = get_parallel()
+        # Let TorchNPU derive its watchdog timeout from CANN by default.
+        hccl_timeout = (
+            timedelta(seconds=parallel.dist_timeout)
+            if parallel.dist_timeout is not None
+            else None
+        )
         moe = get_exec().moe
         serving_mode = get_disagg().disaggregation_mode
         decode_worker = serving_mode == "decode"
@@ -815,6 +823,7 @@ def create_npu_async_eplb(model_config, model, *, startup_weight_load):
             runtime.use_prefill_admission,
             runtime._p2p_batch_size,
             p2p_buffer_mib,
+            hccl_timeout,
             moe.eplb_rebalance_num_iterations,
             moe.expert_distribution_recorder_buffer_size,
             moe.eplb_min_rebalancing_utilization_threshold
@@ -845,7 +854,9 @@ def create_npu_async_eplb(model_config, model, *, startup_weight_load):
         )
     for _, narrowed_layers in peers:
         runtime.narrowed_replica_layers.update(narrowed_layers)
-    runtime.open_transport(timeout, p2p_options, tp_probe, warmup_buffers)
+    runtime.open_transport(
+        cpu_timeout, hccl_timeout, p2p_options, tp_probe, warmup_buffers
+    )
     del tp_probe, warmup_buffers
     torch.npu.empty_cache()
     if decode_worker and blocking_wait:

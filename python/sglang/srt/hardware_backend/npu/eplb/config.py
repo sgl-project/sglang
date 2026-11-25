@@ -6,6 +6,11 @@ def validate_async_eplb_args(cfg) -> None:
         raise ValueError(
             "--eplb-async-rebalance requires --enable-eplb and --device npu"
         )
+    if cfg.ep_size != cfg.tp_size or cfg.tp_size <= 1:
+        raise ValueError(
+            "Async NPU EPLB requires resolved EP size = TP size > 1 "
+            f"(got EP={cfg.ep_size}, TP={cfg.tp_size})"
+        )
     if cfg.ep_dispatch_algorithm not in (None, "static", "dynamic"):
         raise ValueError("Async NPU EPLB supports static or dynamic dispatch")
     if cfg.weight_cache_mode != "off":

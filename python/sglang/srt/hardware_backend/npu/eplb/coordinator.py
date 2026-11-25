@@ -78,8 +78,11 @@ class AsyncEplbCoordinator:
         control: Control,
         runtime: Runtime,
         timeout: float = 60,
+        *,
+        planning_drain_timeout: float = 5,
     ):
         self.control, self.runtime, self.timeout = control, runtime, timeout
+        self._planning_drain_timeout = planning_drain_timeout
         self.phase = Phase.IDLE
         self.epoch = 0
         self._layers: tuple[int, ...] = ()
@@ -223,6 +226,10 @@ class AsyncEplbCoordinator:
                 # Distinguish an unfinished Future from a worker that finished
                 # by raising TimeoutError (for example, a failed CPU plan).
                 remaining = max(0.0, self._deadline - time.monotonic())
+                if self.phase == Phase.PLANNING:
+                    # The planner may finish shortly after the work deadline.
+                    # Give it a bounded grace period before failing the worker.
+                    remaining = max(remaining, self._planning_drain_timeout)
                 if not wait((self._future,), timeout=remaining).done:
                     raise TimeoutError("EPLB worker did not drain")
                 try:

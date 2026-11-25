@@ -16,6 +16,7 @@ _MAX_SCORING_STEPS = 64
 _EXCHANGE_BATCH_LAYERS = 16
 _LAYERS_PER_ALTERNATE_SEARCH = 8
 _MIN_RANK_LOAD_SAVING = 0.01  # Fraction of an ideally balanced rank's load.
+_MAX_WINDOW_TAIL_REGRESSION_RISK = 0.05
 
 
 class MigrationPlacement(NamedTuple):
@@ -117,6 +118,15 @@ def plan_migration(
         counts = _convert_global_physical_count_to_logical_count(
             counts, current.size(0), current_replicas.size(1), current
         )
+    elif spec.nodes == 1:
+        # With one slot per expert, logical counts give the exact live slot load.
+        live_counts = np.take_along_axis(
+            counts.numpy(), current.numpy()[None, :, :], axis=2
+        )
+        _, layer_ids = _rank_peaks_and_eligible_layers(live_counts, spec, layer_ids)
+        del live_counts
+        if not layer_ids:
+            return None
     physical, logical = spec.compute(counts)
     if physical.shape != current.shape:
         raise ValueError("EPLB plan changed physical capacity")
@@ -150,6 +160,7 @@ def plan_migration(
         spec.local_experts,
         ranks_per_node,
         preserve_rank_assignment=replicated_static,
+        layer_ids=layer_ids,
     )
     known_gains = {}
     static_dispatch = None
@@ -226,6 +237,7 @@ def _align_placement(
     ranks_per_node,
     *,
     preserve_rank_assignment=False,
+    layer_ids=None,
 ):
     """Keep resident expert rows in place, optionally reassigning ranks within a node."""
     if torch.equal(old, physical):
@@ -240,7 +252,7 @@ def _align_placement(
     order = np.tile(slots, (layers, 1, 1))
     offsets = np.arange(local_experts)
     alignment_width = len(slots) if preserve_rank_assignment else ranks_per_node
-    for layer in range(layers):
+    for layer in range(layers) if layer_ids is None else layer_ids:
         for start in range(0, len(slots), alignment_width):
             node = slice(start, start + alignment_width)
             live, planned = live_rows[layer, node], planned_rows[layer, node]
@@ -665,19 +677,15 @@ def _static_rank_peak_bound(slots, destinations, sources, ranks):
     return peak
 
 
-def _random_rank_peak_bounds(samples, probability):
-    """Upper bounds for the expected busiest rank and its 95th percentile."""
+def _random_rank_peak_bound(samples, probability, before, totals):
+    """Bound the mean busiest-rank load and reject unsafe window tails."""
     # Accumulate mean, variance and the reachable count in one pass.
     weights = np.concatenate(
         (probability, probability * (1 - probability), probability > 0), axis=1
     )
     mean, variance, reachable = np.split(samples @ weights, 3, axis=1)
-    # Bernstein's bound plus a union bound over destination ranks. Cap at
-    # the number of assignments that can reach each rank; fixed routes
-    # have zero variance and need no margin.
-    t = np.log(probability.shape[1] / 0.05) / 3
-    margin = np.where(variance > 0, t + np.sqrt(t * t + 6 * t * variance), 0)
-    tail_peak = np.minimum(np.floor(mean + margin), reachable).max(1)
+    if not _random_window_tail_is_safe(before, totals, mean, variance, reachable):
+        return None
     # For any threshold c, max(X) <= c + sum((X_i - c)_+).
     # Cauchy-Schwarz bounds each expected excess using its variance.
     threshold = mean.max(1, keepdims=True)
@@ -686,7 +694,32 @@ def _random_rank_peak_bounds(samples, probability):
     peak = threshold[:, 0] + np.minimum(
         excess, np.maximum(reachable - threshold, 0)
     ).sum(1)
-    return np.minimum(peak, reachable.max(1)), tail_peak
+    return np.minimum(peak, reachable.max(1))
+
+
+def _random_window_tail_is_safe(before, totals, mean, variance, reachable):
+    active = totals > 0
+    tail = int(np.ceil(0.95 * active.sum())) - 1
+    if tail < 0:
+        return True
+    before_p95 = np.partition(before[active] / totals[active], tail)[tail]
+    # A step breaches the old P95 when any rank reaches this integer load.
+    first_breach = np.floor((before_p95 + 1e-12) * totals[active])[:, None] + 1
+    mean, variance, reachable = mean[active], variance[active], reachable[active]
+    forced = ((variance == 0) & (mean >= first_breach)).any(axis=1)
+    # The nearest-rank P95 rises once one more step than the tail can hold
+    # breaches. Always count steps that already breach with probability one.
+    remaining = len(forced) - tail - int(forced.sum())
+    if remaining <= 0:
+        return False
+    possible = (reachable >= first_breach) & (variance > 0) & ~forced[:, None]
+    gap = np.maximum(first_breach - mean, 0)[possible]
+    risk = np.zeros_like(mean)
+    risk[possible] = np.exp(-(gap**2) / (2 * (variance[possible] + gap / 3)))
+    # Bernstein bounds each rank, a union bound gives each step's risk, and
+    # Markov bounds the number of breaches without assuming independent steps.
+    expected_breaches = np.minimum(risk.sum(axis=1), 1).sum()
+    return expected_breaches <= remaining * _MAX_WINDOW_TAIL_REGRESSION_RISK
 
 
 def _replica_rank_probabilities(inverse, ranks, local_experts):
@@ -718,6 +751,7 @@ def _a2a_migration_gain(
 ):
     ranks = slots.shape[1] // local_experts
     slot_ranks = np.arange(len(live)) // local_experts
+    totals = samples.sum(1)
     remote_saved = 0
     fixed_destinations = dispatch is not None or len(live) == len(inverse)
     compare_nodes = score_locality and ranks > ranks_per_node
@@ -734,7 +768,6 @@ def _a2a_migration_gain(
         else:
             destinations = dispatch[live].T // local_experts
             peak = _static_rank_peak_bound(slots, destinations, sources, ranks)
-        tail_peak = peak
         if compare_nodes:
             source_nodes = np.arange(len(sources))
             if dispatch is not None:
@@ -745,7 +778,9 @@ def _a2a_migration_gain(
             )
     else:
         probability = _replica_rank_probabilities(inverse, ranks, local_experts)
-        peak, tail_peak = _random_rank_peak_bounds(samples, probability)
+        peak = _random_rank_peak_bound(samples, probability, before, totals)
+        if peak is None:
+            return 0.0
         if compare_nodes:
             nodes = ranks // ranks_per_node
             local_probability = probability.reshape(
@@ -758,15 +793,15 @@ def _a2a_migration_gain(
     return _peak_gain(
         before,
         peak,
-        samples.sum(1),
+        totals,
         ranks,
-        tail_peak=tail_peak,
+        check_tail=fixed_destinations,
         remote_saved=remote_saved,
     )
 
 
 def _peak_gain(
-    before_peak, after_peak, totals, ranks, *, tail_peak=None, remote_saved=0
+    before_peak, after_peak, totals, ranks, *, check_tail=True, remote_saved=0
 ):
     gain = (before_peak - after_peak).sum()
     min_saving = _MIN_RANK_LOAD_SAVING * totals.sum() / ranks
@@ -774,14 +809,13 @@ def _peak_gain(
         return 0.0
     # Compare the busiest rank's share of each step. With mixed batch sizes
     # this percentile differs from the P95 of absolute assignment counts.
-    active = totals > 0
-    tail = int(np.ceil(0.95 * active.sum())) - 1
-    if tail_peak is None:
-        tail_peak = after_peak
-    shares = np.stack([before_peak[active], tail_peak[active]]) / totals[active]
-    before_p95, after_p95 = np.partition(shares, tail, axis=1)[:, tail]
-    if after_p95 > before_p95 + 1e-12:
-        return 0.0
+    if check_tail:
+        active = totals > 0
+        tail = int(np.ceil(0.95 * active.sum())) - 1
+        shares = np.stack([before_peak[active], after_peak[active]]) / totals[active]
+        before_p95, after_p95 = np.partition(shares, tail, axis=1)[:, tail]
+        if after_p95 > before_p95 + 1e-12:
+            return 0.0
     return gain if gain > 0 else remote_saved / ranks
 
 
