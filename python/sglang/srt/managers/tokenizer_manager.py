@@ -4044,7 +4044,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             _add_sampling_mask_to_meta_info(meta_info, state, None, finished=True)
 
         output_ids = state.output_ids
-        text = state.get_text()
+        incremental = is_stream and self.incremental_streaming_output
+        # Incremental chunks carry deltas, and each one was queued as it
+        # arrived; an abort adds no output, so nothing is left to send.
+        text = "" if incremental else state.get_text()
         if drop_output:
             output_ids, text = [], ""
             meta_info["routed_experts"] = ""
@@ -4073,8 +4076,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else:
                     meta_info["output_token_sampling_mask_length"] = 0
         meta_info["completion_tokens"] = len(output_ids)
-        if is_stream and self.incremental_streaming_output:
+        if incremental:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
+            _slice_streaming_output_meta_info(
+                meta_info,
+                state.last_output_offset,
+                state.customized_info_accumulated.keys(),
+            )
         out = {
             "text": text,
             "output_ids": output_ids,
