@@ -315,12 +315,14 @@ def _broadcast_placement(
     group: dist.ProcessGroup,
     physical_shape: torch.Size,
     num_logical: int,
+    *,
+    header: torch.Tensor,
 ) -> _PlacementRows | None:
     """Broadcast changed rows; scatter only the static picks each rank uses."""
     # Header: [changed layers (-1 on failure), replica width, static dispatch flag].
-    header = torch.zeros(3, dtype=torch.int64, device="cpu")
     rank_tables = None
     if rank == 0:
+        header.zero_()
         if error is None and placement is not None:
             try:
                 num_ranks = (
@@ -348,18 +350,32 @@ def _broadcast_placement(
         return None
     slots = physical_shape[1]
     field_sizes = (count, count * slots, count * num_logical * width)
-    if rank != 0:
-        payload = torch.empty(
-            sum(field_sizes),
-            dtype=torch.int64,
-            device="cpu",
-        )
-    dist.broadcast(payload, src=0, group=group)
     local_dispatch = None
+    receive_error = None
+    try:
+        if rank != 0:
+            payload = torch.empty(sum(field_sizes), dtype=torch.int64, device="cpu")
+        if has_static_dispatch:
+            local_dispatch = torch.empty(
+                (count, num_logical), dtype=torch.int64, device="cpu"
+            )
+    except Exception as exc:
+        receive_error = exc
+
+    # The header was decoded above. Reuse its storage to agree on both
+    # allocations before any rank enters the payload broadcast or scatter.
+    failed_rank = header[:1]
+    failed_rank.fill_(rank if receive_error is not None else -1)
+    dist.all_reduce(failed_rank, op=dist.ReduceOp.MAX, group=group)
+    failed = int(failed_rank.item())
+    if failed >= 0:
+        raise RuntimeError(
+            f"Async EPLB rank {failed} could not allocate placement receive buffers"
+        ) from receive_error
+
+    dist.broadcast(payload, src=0, group=group)
     if has_static_dispatch:
-        local_dispatch = torch.empty(
-            (count, num_logical), dtype=torch.int64, device="cpu"
-        )
+        assert local_dispatch is not None
         dist.scatter(local_dispatch, rank_tables, src=0, group=group)
     layer_ids, physical, logical = payload.split(field_sizes)
     return _PlacementRows(
@@ -440,6 +456,8 @@ class NpuEplbRuntime:
         # Opened together after all ranks agree on the startup configuration.
         self.plan_group: dist.ProcessGroup
         self.p2p_group: dist.ProcessGroup
+        # Reused only by the single planner worker. Allocate it before the startup vote.
+        self._plan_header = torch.empty(3, dtype=torch.int64, device="cpu")
         self.log_metrics = get_bool_env_var(
             "SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS"
         )
@@ -527,6 +545,7 @@ class NpuEplbRuntime:
                 self.plan_group,
                 self.metadata.physical_to_logical_map_cpu.shape,
                 self.metadata.num_logical_experts,
+                header=self._plan_header,
             )
 
         return compute

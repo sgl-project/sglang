@@ -166,10 +166,50 @@ class TestAsyncEplbSnapshot(unittest.TestCase):
             [[[0, -1, -1, 2], [1, 3, -1, -1]], [[0, -1, 2, -1], [1, 3, -1, -1]]]
         )
         plan = placement.MigrationPlacement((1,), physical[1:], logical[1:])
-        with patch.object(runtime.dist, "broadcast") as broadcast:
-            rows = runtime._broadcast_placement(plan, None, 0, None, physical.shape, 2)
-        self.assertEqual(broadcast.call_args_list[0].args[0].tolist(), [1, 3, 0])
+        messages = []
+        with patch.multiple(
+            runtime.dist,
+            broadcast=Mock(
+                side_effect=lambda tensor, **_: messages.append(tensor.tolist())
+            ),
+            all_reduce=Mock(),
+        ):
+            rows = runtime._broadcast_placement(
+                plan,
+                None,
+                0,
+                None,
+                physical.shape,
+                2,
+                header=torch.empty(3, dtype=torch.int64),
+            )
+        self.assertEqual(messages[0], [1, 3, 0])
         torch.testing.assert_close(rows.logical_to_physical, logical[1:, :, :3])
+
+    def test_placement_receive_failure_stops_the_payload_broadcast(self):
+        from sglang.srt.hardware_backend.npu.eplb import runtime
+
+        physical = torch.tensor([[0, 1]])
+        plan = placement.MigrationPlacement((0,), physical, physical.unsqueeze(-1))
+        broadcast = Mock()
+        with (
+            patch.multiple(
+                runtime.dist,
+                broadcast=broadcast,
+                all_reduce=Mock(side_effect=lambda status, **_: status.fill_(1)),
+            ),
+            self.assertRaisesRegex(RuntimeError, "rank 1 could not allocate placement"),
+        ):
+            runtime._broadcast_placement(
+                plan,
+                None,
+                0,
+                None,
+                physical.shape,
+                2,
+                header=torch.empty(3, dtype=torch.int64),
+            )
+        broadcast.assert_called_once()
 
 
 class TestAsyncEplbCoordinator(unittest.TestCase):
