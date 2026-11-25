@@ -1790,12 +1790,16 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def _forward_extend_tp(self, q, layer, topk_indices, metadata, layout):
         """Transpose query rows and heads inside one replicated KV-head group."""
+        from sgl_kernel_npu.operators.attention import (
+            qsa_sparse_attention as npu_sparse_attention,
+        )
+
         num_rows = metadata.token_to_batch_idx.numel()
-        q = q[:num_rows].contiguous()
+        q = q[:num_rows]
         padded_rows = sum(layout.attention_splits)
         if num_rows != padded_rows:
             q = F.pad(q, (0, 0, 0, 0, 0, padded_rows - num_rows))
-        received = qsa_all_to_all(q, layout.attention_splits)
+        received = qsa_all_to_all(q.contiguous(), layout.attention_splits)
         local_rows = layout.num_kv_groups * layout.rows_per_rank
         slots = self._logical_to_physical(topk_indices, metadata, layout.attention_slice)
         if slots.shape[0] != local_rows:
@@ -1803,12 +1807,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             padded[: slots.shape[0]].copy_(slots)
             slots = padded
         kv = self.token_to_kv_pool.layer_router.read(layer.layer_id)
-        k, v = kv.key(), kv.value()
+        k = _flatten_qsa_kv_cache(kv.key(), "k_cache")
+        v = _flatten_qsa_kv_cache(kv.value(), "v_cache")
         # Each fragment keeps the original per-rank Q head shape and shares
         # the physical slot mapping for this query shard.
         fragments = received.view(-1, local_rows, *q.shape[1:]).unbind(0)
         output = torch.cat(
-            [_npu_sparse_attention(x, k, v, slots, layer.scaling) for x in fragments]
+            [npu_sparse_attention(x, k, v, slots, layer.scaling) for x in fragments]
         )
         return qsa_all_to_all(output, layout.attention_splits)[:num_rows]
 
