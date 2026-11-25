@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from collections import defaultdict
 from concurrent.futures import Future
@@ -21,10 +22,6 @@ from sglang.srt.eplb.expert_location import (
     get_eplb_group,
 )
 from sglang.srt.eplb.expert_location_updater import update_expert_weights_single_layer
-from sglang.srt.hardware_backend.npu.distributed import (
-    eplb_hccl_options,
-    eplb_reuses_world_group,
-)
 from sglang.srt.hardware_backend.npu.eplb.coordinator import (
     AsyncEplbCoordinator,
     WeightWriteback,
@@ -374,7 +371,6 @@ class NpuEplbRuntime:
         world_size: int,
         ranks_per_node: int,
         plan_group: dist.ProcessGroup,
-        world_group: dist.ProcessGroup,
         *,
         order_submissions: bool = False,
         use_prefill_admission: bool = False,
@@ -389,8 +385,8 @@ class NpuEplbRuntime:
         self.world_size = world_size
         self.ranks_per_node = ranks_per_node
         self.plan_group = plan_group
-        self._world_group = world_group
-        self.p2p_group = world_group
+        # Assigned after all ranks validate the startup configuration.
+        self.p2p_group: dist.ProcessGroup
         self.log_metrics = get_bool_env_var(
             "SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS"
         )
@@ -676,8 +672,7 @@ class NpuEplbRuntime:
         self._routing_plan = None
 
     def close(self):
-        if self.p2p_group is not self._world_group:
-            dist.destroy_process_group(self.p2p_group)
+        dist.destroy_process_group(self.p2p_group)
 
 
 def _make_planning_spec(model_config, metadata, moe, nodes, *, decode_worker):
@@ -728,7 +723,8 @@ def create_npu_async_eplb(model_config, weights, metadata):
     world_size = dist.get_world_size()
     _validate_migration_topology(world_size)
     moe = get_exec().moe
-    decode_worker = get_disagg().disaggregation_mode == "decode"
+    serving_mode = get_disagg().disaggregation_mode
+    decode_worker = serving_mode == "decode"
     spec = _make_planning_spec(
         model_config, metadata, moe, parallel.nnodes, decode_worker=decode_worker
     )
@@ -739,9 +735,13 @@ def create_npu_async_eplb(model_config, weights, metadata):
     error = None
     setup = None
     try:
-        p2p_options = eplb_hccl_options()
-        p2p_buffer_mib = p2p_options.hccl_config["hccl_buffer_size"]
-        borrow_world_group = eplb_reuses_world_group()
+        import torch_npu
+
+        p2p_buffer_mib = int(os.environ.get("HCCL_BUFFSIZE") or 64)
+        if p2p_buffer_mib < 1:
+            raise ValueError("HCCL_BUFFSIZE must be positive")
+        p2p_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+        p2p_options.hccl_config = {"hccl_buffer_size": p2p_buffer_mib}
         runtime = NpuEplbRuntime(
             weights,
             metadata,
@@ -750,10 +750,9 @@ def create_npu_async_eplb(model_config, weights, metadata):
             world_size,
             world_size // parallel.nnodes,
             plan_group,
-            parallel.world_group.device_group,
             order_submissions=decode_worker,
             use_prefill_admission=(
-                borrow_world_group
+                serving_mode == "null"
                 and not get_schedule().disable_overlap_schedule
                 and not envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
             ),
@@ -766,8 +765,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
         signature = (
             runtime.layer_ids,
             runtime.weight_format_digest,
-            borrow_world_group,
-            decode_worker,
+            serving_mode,
             runtime.use_prefill_admission,
             runtime._p2p_batch_size,
             p2p_buffer_mib,
@@ -795,11 +793,11 @@ def create_npu_async_eplb(model_config, weights, metadata):
         )
     for _, narrowed_layers in peers:
         runtime.narrowed_replica_layers.update(narrowed_layers)
-    # All ranks must agree before any enters a conditional HCCL group creation.
-    if not borrow_world_group:
-        runtime.p2p_group = dist.new_group(
-            backend="hccl", timeout=timeout, pg_options=p2p_options
-        )
+    # Background P2P and foreground TP collectives can be submitted in different
+    # orders across ranks. Give migrations their own communicator for all layers.
+    runtime.p2p_group = dist.new_group(
+        backend="hccl", timeout=timeout, pg_options=p2p_options
+    )
     # The recorder reduces int32 counts on TP. Initialize its HCCL collective
     # before KV sizing and before prewarm_eplb_communication releases the cache.
     dist.all_reduce(
@@ -813,11 +811,10 @@ def create_npu_async_eplb(model_config, weights, metadata):
         weight_staging_bytes += packed_fields.send.nbytes
     logger.info(
         "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d "
-        "hccl_buffer_mib=%d reuse_world_group=%s layers_per_chunk=1 packed_fields=%d",
+        "hccl_buffer_mib=%d layers_per_chunk=1 packed_fields=%d",
         weight_staging_bytes,
         sum(row.nbytes for row in runtime._routing_buffers.values()),
         p2p_buffer_mib,
-        borrow_world_group,
         len(packed_fields.small) if packed_fields is not None else 0,
     )
     return AsyncEplbCoordinator(EplbControl(control_group), runtime)
