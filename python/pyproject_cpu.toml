@@ -74,6 +74,7 @@ dependencies = [
   "tqdm",
   "transformers==5.19.0",
   "triton==3.8.0",
+  "urllib3>=2.3",
   "uvicorn",
   "uvloop",
   "xxhash",

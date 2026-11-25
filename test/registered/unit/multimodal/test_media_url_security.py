@@ -1,11 +1,13 @@
 """Security tests for client-supplied remote multimodal media URLs."""
 
+import gzip
 import http.server
 import os
 import socket
 import threading
 import time
 import unittest
+import zlib
 from unittest.mock import patch
 
 import requests
@@ -79,6 +81,39 @@ class _MediaHandler(http.server.BaseHTTPRequestHandler):
                     time.sleep(0.3)
             except OSError:
                 pass
+            return
+
+        if self.path == "/gzip":
+            self.send_response(200)
+            self.send_header("Content-Encoding", "gzip")
+            self.end_headers()
+            self.wfile.write(gzip.compress(b"gzip-media" * 200000))
+            return
+
+        if self.path == "/gzip-drip":
+            # Stored deflate blocks that decode to nothing: no decoded byte ever
+            # reaches the client, but the socket keeps seeing data.
+            self.send_response(200)
+            self.send_header("Content-Encoding", "gzip")
+            self.end_headers()
+            compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
+            try:
+                self.wfile.write(
+                    compressor.compress(b"") + compressor.flush(zlib.Z_SYNC_FLUSH)
+                )
+                for _ in range(200):
+                    self.wfile.write(b"\x00\x00\x00\xff\xff")
+                    self.wfile.flush()
+                    time.sleep(0.2)
+            except OSError:
+                pass
+            return
+
+        if self.path == "/br":
+            self.send_response(200)
+            self.send_header("Content-Encoding", "br")
+            self.end_headers()
+            self.wfile.write(b"not-brotli")
             return
 
         if self.path == "/redirect-loop":
@@ -234,6 +269,28 @@ class TestMediaURLSecurity(unittest.TestCase):
         start = time.monotonic()
         with self.assertRaises(requests.exceptions.Timeout):
             download_remote_media(self._url("/slow-drip"), timeout=1.0)
+        self.assertLess(time.monotonic() - start, 1.5)
+
+    def test_gzip_body_is_decoded(self):
+        configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
+        body = download_remote_media(self._url("/gzip"), timeout=5)
+        self.assertEqual(body, b"gzip-media" * 200000)
+
+    def test_decoded_gzip_body_is_capped(self):
+        configure_media_url_security(["127.0.0.1"], max_file_size_mb=1)
+        with self.assertRaisesRegex(ValueError, "download limit"):
+            download_remote_media(self._url("/gzip"), timeout=5)
+
+    def test_unsupported_content_encoding_is_rejected(self):
+        configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
+        with self.assertRaises(requests.exceptions.ContentDecodingError):
+            download_remote_media(self._url("/br"), timeout=5)
+
+    def test_gzip_body_with_empty_blocks_stops_at_the_total_deadline(self):
+        configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
+        start = time.monotonic()
+        with self.assertRaises(requests.exceptions.Timeout):
+            download_remote_media(self._url("/gzip-drip"), timeout=1.0)
         self.assertLess(time.monotonic() - start, 1.5)
 
     def test_invalid_allowlist_entries_are_rejected(self):

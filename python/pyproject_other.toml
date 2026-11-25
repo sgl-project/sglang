@@ -14,7 +14,7 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
 ]
 # Please keep dependency lists in this file sorted alphabetically by package name.
-dependencies = ["aiohttp", "IPython", "numpy", "requests", "setproctitle", "tqdm"]
+dependencies = ["aiohttp", "IPython", "numpy", "requests", "setproctitle", "tqdm", "urllib3>=2.3"]
 
 [project.optional-dependencies]
 # runtime_base: torch-free subset of runtime_common.
@@ -69,6 +69,7 @@ runtime_base = [
   "tiktoken",
   "tqdm",
   "transformers==5.19.0",
+  "urllib3>=2.3",
   "uvicorn",
   "uvloop",
   "xxhash",

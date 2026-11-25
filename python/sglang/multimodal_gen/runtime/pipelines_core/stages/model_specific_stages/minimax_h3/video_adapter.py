@@ -370,6 +370,8 @@ def _ffprobe_output_media(path: str) -> dict[str, Any]:
         probe = subprocess.run(
             [
                 "ffprobe",
+                "-protocol_whitelist",
+                "file",
                 "-v",
                 "error",
                 "-show_entries",

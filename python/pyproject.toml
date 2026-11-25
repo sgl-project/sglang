@@ -99,6 +99,7 @@ dependencies = [
   "torchvision",
   "tqdm",
   "transformers==5.19.0",
+  "urllib3>=2.3",
   "uvicorn>=0.51",
   "uvloop",
   "watchfiles",

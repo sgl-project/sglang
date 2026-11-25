@@ -25,6 +25,7 @@ import socket
 import stat
 import threading
 import time
+import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -396,6 +397,7 @@ def open_remote_media(url: str, timeout: float):
             allow_redirects=False,
             stream=True,
             timeout=remaining,
+            headers={"Accept-Encoding": "identity"},
         ) as response:
             location = response.headers.get("Location")
             if response.status_code in _MEDIA_URL_REDIRECT_STATUS_CODES and location:
@@ -433,26 +435,84 @@ def open_remote_media(url: str, timeout: float):
             return
 
 
+_MEDIA_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _body_decoder(content_encoding: Optional[str]):
+    """Return a ``decode(data) -> iterator of bytes`` for a Content-Encoding.
+
+    Media requests send ``Accept-Encoding: identity``; this only handles a server
+    that compresses anyway. Output is produced in bounded pieces, so a
+    compression bomb cannot be expanded in one step.
+    """
+    encoding = (content_encoding or "identity").strip().lower()
+    if encoding in ("", "identity"):
+        return lambda data: iter((data,)) if data else iter(())
+    if encoding not in ("gzip", "x-gzip", "deflate"):
+        raise requests.exceptions.ContentDecodingError(
+            f"Unsupported Content-Encoding for media: {content_encoding}"
+        )
+
+    if encoding == "deflate":
+        # servers send either zlib-wrapped or raw deflate; decide on the first bytes
+        decompressors = [zlib.decompressobj(), zlib.decompressobj(-zlib.MAX_WBITS)]
+    else:
+        decompressors = [zlib.decompressobj(16 + zlib.MAX_WBITS)]
+    state = {"first": True}
+
+    def decode(data):
+        if state["first"] and data:
+            state["first"] = False
+            if len(decompressors) == 2:
+                # a zlib header is (CMF * 256 + FLG) % 31 == 0 with CM == 8
+                zlib_wrapped = len(data) >= 2 and (
+                    data[0] & 0x0F == 8 and (data[0] * 256 + data[1]) % 31 == 0
+                )
+                decompressors[:] = (
+                    decompressors[:1] if zlib_wrapped else decompressors[1:]
+                )
+        decompressor = decompressors[0]
+        try:
+            while data:
+                piece = decompressor.decompress(data, _MEDIA_READ_CHUNK_BYTES)
+                if piece:
+                    yield piece
+                data = decompressor.unconsumed_tail
+                # output held back by max_length is drained with empty input
+                while not data and len(piece) == _MEDIA_READ_CHUNK_BYTES:
+                    piece = decompressor.decompress(b"", _MEDIA_READ_CHUNK_BYTES)
+                    if piece:
+                        yield piece
+        except zlib.error as e:
+            raise requests.exceptions.ContentDecodingError(e) from e
+
+    return decode
+
+
 def _read_body_until(response: requests.Response, deadline: float):
     """Yield the decoded body, failing once the total deadline passes.
 
-    Each socket read waits at most the time left, and ``read1`` returns what one
-    read brings, so a server that trickles bytes cannot outlast the deadline.
+    Each raw socket read is preceded by re-arming the socket timeout to the time
+    left, and ``read1`` returns what one read brings, so a server that trickles
+    bytes cannot outlast the deadline. The body is read undecoded and decoded
+    here, since urllib3 may loop on several raw reads inside one decoded read.
     urllib3 errors are raised as the requests errors ``iter_content`` raises.
     """
-    sock = response.raw.media_sock
+    raw = response.raw
+    sock = getattr(raw, "media_sock", None)
+    decode = _body_decoder(response.headers.get("Content-Encoding"))
     try:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise requests.exceptions.Timeout("Media download timed out")
-            if not response.raw.isclosed():
+            if sock is not None and not raw.isclosed():
                 # http.client closes the socket once the whole body is read
                 sock.settimeout(remaining)
-            chunk = response.raw.read1(64 * 1024, decode_content=True)
-            if not chunk:
+            data = raw.read1(_MEDIA_READ_CHUNK_BYTES, decode_content=False)
+            if not data:
                 return
-            yield chunk
+            yield from decode(data)
     except urllib3.exceptions.ReadTimeoutError as e:
         raise requests.exceptions.Timeout("Media download timed out") from e
     except urllib3.exceptions.SSLError as e:
