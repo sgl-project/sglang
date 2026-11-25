@@ -131,6 +131,12 @@ jobs:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
               - "python/sglang/srt/observability/**"
+              # srt models and layers the diffusion encoders run on
+              # (scripts/ci/test_diffusion_srt_paths.py keeps the model list complete)
+              - "python/sglang/srt/models/{clip,hunyuan,qwen2,qwen2_5_vl,qwen3,qwen3_vl,siglip,siglip2,utils}.py"
+              - "python/sglang/srt/layers/{activation,layernorm,linear,radix_attention,vocab_parallel_embedding}.py"
+              - "python/sglang/srt/layers/{layer_boundary,rotary_embedding}/**"
+              - "python/sglang/srt/model_executor/prefill_only.py"
               - "python/sglang/kernels/ops/diffusion/**"
               - "python/sglang/kernels/jit/csrc/diffusion/**"
               - "test/registered/kernels/ops/diffusion/**"
@@ -159,6 +165,12 @@ jobs:
               - "python/sglang/multimodal_gen/test/unit/**/*/!(*.md|*.ipynb)"
               - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
               - "python/sglang/srt/observability/**"
+              # srt models and layers the diffusion encoders run on
+              # (scripts/ci/test_diffusion_srt_paths.py keeps the model list complete)
+              - "python/sglang/srt/models/{clip,hunyuan,qwen2,qwen2_5_vl,qwen3,qwen3_vl,siglip,siglip2,utils}.py"
+              - "python/sglang/srt/layers/{activation,layernorm,linear,radix_attention,vocab_parallel_embedding}.py"
+              - "python/sglang/srt/layers/{layer_boundary,rotary_embedding}/**"
+              - "python/sglang/srt/model_executor/prefill_only.py"
               - "python/sglang/kernels/ops/diffusion/**"
               - "python/sglang/kernels/jit/csrc/diffusion/**"
               - "test/registered/kernels/ops/diffusion/**"
