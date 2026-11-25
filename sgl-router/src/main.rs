@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{ensure, Context, Result};
-use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
     config::{
@@ -58,7 +57,8 @@ const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 #[tokio::main]
 async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
-    let cli = Cli::parse();
+    let cli = Cli::try_parse_rejecting_gateway_flags(std::env::args_os())
+        .unwrap_or_else(|error| error.exit());
     let routing = cli.routing.chat_routing;
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
     #[cfg(feature = "fips")]
@@ -644,6 +644,7 @@ fn handle_further_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn prefix_index_config_preserves_router_limits() {
