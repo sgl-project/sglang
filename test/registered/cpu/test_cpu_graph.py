@@ -518,7 +518,8 @@ class TestCPUGraph(CustomTestCase):
                     prefill=PhaseConfig(backend=prefill_backend, max_bs=prefill_max_bs),
                     decode=PhaseConfig(backend=decode_backend, max_bs=decode_max_bs),
                 )
-            )
+            ),
+            moe=SimpleNamespace(enable_paged_experts=False),
         )
         flags_ctx = SimpleNamespace(
             capture=SimpleNamespace(enable_torch_compile=enable_torch_compile)
