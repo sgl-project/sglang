@@ -1694,7 +1694,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         if self.qsa_profile is not None and metadata is not None:
             layout = metadata.indexer_metadata.prefill_tp_layout
-            if layout is not None and layout.num_kv_groups < len(layout.attention_splits):
+            if layout is not None and layout.num_kv_groups < len(
+                layout.attention_splits
+            ):
                 output = self._forward_extend_tp(
                     q, layer, topk_indices, metadata, layout
                 )
@@ -1801,7 +1803,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             q = F.pad(q, (0, 0, 0, 0, 0, padded_rows - num_rows))
         received = qsa_all_to_all(q.contiguous(), layout.attention_splits)
         local_rows = layout.num_kv_groups * layout.rows_per_rank
-        slots = self._logical_to_physical(topk_indices, metadata, layout.attention_slice)
+        slots = self._logical_to_physical(
+            topk_indices, metadata, layout.attention_slice
+        )
         if slots.shape[0] != local_rows:
             padded = slots.new_full((local_rows, slots.shape[1]), -1)
             padded[: slots.shape[0]].copy_(slots)

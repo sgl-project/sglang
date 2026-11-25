@@ -1,15 +1,17 @@
 """NPU QSA selection, KV layout and graph metadata updates."""
 
 import sys
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as backend_module
-from sglang.srt.layers.attention.qsa import kernel, mqa
+from sglang.srt.layers.attention.qsa import kernel, mqa, qsa_indexer
 from sglang.srt.layers.attention.qsa.metadata import build_qsa_row_ranges
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+from sglang.srt.layers.attention.qsa.tp_shard import QSAPrefillTPLayout
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -78,19 +80,63 @@ def test_qwen38_packed_prefill_selection():
     _check_selected(actual, scores, starts.cpu(), ends.cpu(), positions, row_lengths)
 
 
-def test_qsa_tp_topk_keeps_unsharded_selection():
-    rows, keys = 8192, 2048
-    # An unsharded chunk uses hybrid Top-K, while an eighth uses tiled Top-K.
-    columns = torch.arange(keys, dtype=torch.int32, device="npu")
-    scores = ((columns * 1999) % 2063).float().expand(rows, -1).contiguous()
-    starts = torch.zeros(rows, dtype=torch.int32, device="npu")
-    ends = (torch.arange(rows, dtype=torch.int32, device="npu") + 1) // 4
-    expected = kernel.qsa_fast_topk(scores, starts, ends, 512)
-    local = slice(-rows // 8, None)
-    actual = kernel.qsa_fast_topk(scores[local], starts[local], ends[local], 512)
+def test_qsa_tp_prefill_selection_matches_unsharded(monkeypatch):
+    # Rank 7 exchanges compact blocks with three KV groups and pads three rows.
+    rows = 8192 - 3
+    layout = QSAPrefillTPLayout.build(rows, tp_size=8, rank=7, num_kv_groups=4)
+    positions = torch.arange(rows, dtype=torch.int32, device="npu")
+    request_ids = torch.zeros_like(positions)
+    lengths = positions.new_tensor([rows])
+    q = torch.ones(rows, 4, 128, dtype=torch.bfloat16, device="npu")
+    keys = _index_keys(rows // 4)
+    indexer = SimpleNamespace(
+        layer_id=0, token_topk=2048, block_topk=512, compress_ratio=4
+    )
+    indexer.select_prefill_tokens = partial(QSAIndexer.select_prefill_tokens, indexer)
+
+    def mqa_inputs(layer_id, query_positions, query_sequence_ids):
+        return (
+            keys,
+            torch.zeros_like(query_positions),
+            (query_positions + 1) // 4,
+            lengths,
+        )
+
+    metadata = SimpleNamespace(
+        get_token_to_batch_idx=lambda: request_ids, get_prefill_mqa_inputs=mqa_inputs
+    )
+    full_blocks = indexer.select_prefill_tokens(
+        q,
+        keys,
+        request_ids,
+        (positions + 1) // 4,
+        positions,
+        lengths.expand(rows),
+        defer_expansion=True,
+    )
+
+    def exchange(blocks, splits):
+        assert splits == [0, 1024, 0, 1024, 0, 1024, 0, 0]
+        sent = blocks.view(3, 1024, 512)
+        torch.testing.assert_close(sent[1:], sent[0].expand_as(sent[1:]))
+        assert (sent[:, -3:] == -1).all().item()
+        return full_blocks[4096:7168]
+
+    monkeypatch.setattr(qsa_indexer, "qsa_all_to_all", exchange)
+    actual = QSAIndexer.select_prefill_tokens_tp(
+        indexer, q, positions, metadata, layout
+    )
+    expected = kernel.torch_expand_qsa_block_indices(
+        full_blocks[4096:].cpu(),
+        positions[4096:].cpu(),
+        lengths.expand(rows - 4096).cpu(),
+        4,
+        2048,
+    )
+    # The shard can select a different Top-K implementation. Compare membership.
     torch.testing.assert_close(
         actual.cpu().sort(dim=-1).values,
-        expected[local].cpu().sort(dim=-1).values,
+        expected.sort(dim=-1).values,
         atol=0,
         rtol=0,
     )
