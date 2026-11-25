@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.models.dits.zimage_joint_sp import shard_block_inputs
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def _fake_sp(monkeypatch, sp_size, sp_rank=0):
@@ -25,21 +26,181 @@ def _fake_sp(monkeypatch, sp_size, sp_rank=0):
 @pytest.mark.parametrize("rank", [0, 1])
 def test_joint_sp_preserves_batched_condition_and_rope(monkeypatch, rank):
     _fake_sp(monkeypatch, 2, rank)
-    # Three image tokens followed by five condition tokens per sample.
     tokens = torch.tensor(
         [[0, 1, 2, 100, 101, 102, 103, 104], [3, 4, 5, 105, 106, 107, 108, 109]]
     ).unsqueeze(-1)
     positions = torch.arange(16)
     cache = positions.square().unsqueeze(-1)
-    cosine = cache.view(2, 8, 1)
-    local, (local_cos, local_sin), (indexed_cache, indices, _) = shard_block_inputs(
-        tokens, (cosine, -cosine), (cache, positions, None), None, None
-    )
     expected = slice(rank * 4, (rank + 1) * 4)
+    local, (indexed_cache, indices, _) = shard_block_inputs(
+        tokens, (cache, positions, None), None, None
+    )
     torch.testing.assert_close(local, tokens[:, expected])
-    torch.testing.assert_close(local_cos, cosine[:, expected])
-    torch.testing.assert_close(local_sin, -local_cos)
-    torch.testing.assert_close(indexed_cache[indices].view_as(local_cos), local_cos)
+    torch.testing.assert_close(
+        indexed_cache[indices].view(2, 4, 1), cache.view(2, 8, 1)[:, expected]
+    )
+
+    single = torch.arange(16, dtype=torch.float32).view(1, 8, 2)
+    cache_2d = torch.arange(8, dtype=torch.float32).unsqueeze(-1)
+    complex_freqs = torch.complex(cache_2d, -cache_2d)
+    local_single, (sharded_cache, pos_out, sharded_complex) = shard_block_inputs(
+        single, (cache_2d, None, complex_freqs), None, None
+    )
+    assert pos_out is None
+    assert local_single.stride() == (8, 2, 1)
+    torch.testing.assert_close(local_single, single[:, expected])
+    torch.testing.assert_close(sharded_cache, cache_2d[expected])
+    torch.testing.assert_close(sharded_complex, complex_freqs[expected])
+
+
+@pytest.mark.parametrize(
+    "seq_len,mask,mask_meta",
+    [
+        (7, None, None),
+        (8, torch.ones(1, 8, dtype=torch.bool), None),
+        (8, None, {"max_seqlen": 8}),
+    ],
+)
+def test_joint_sp_rejects_padded_or_masked_sequences(
+    monkeypatch, seq_len, mask, mask_meta
+):
+    _fake_sp(monkeypatch, 2, 0)
+    tokens = torch.zeros(1, seq_len, 2)
+    with pytest.raises(ValueError, match="evenly divisible"):
+        shard_block_inputs(tokens, (None, None, None), mask, mask_meta)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() and not current_platform.is_cpu(),
+    reason="zimage import requires CUDA or CPU diffusion platform",
+)
+def test_zimage_forward_joint_sp_shards_blocks_and_runs_final_layer_before_gather(
+    monkeypatch,
+):
+    import threading
+
+    from sglang.multimodal_gen.runtime.models.dits import zimage as zimage_mod
+
+    local_rank = threading.local()
+    local_rank.rank = 0
+    observed = {
+        rank: {"events": [], "noise_shapes": [], "layer_calls": []} for rank in (0, 1)
+    }
+
+    class _LinearStub(torch.nn.Module):
+        def forward(self, x):
+            return torch.cat([x, x + 0.5], dim=-1), None
+
+    class _BlockStub(torch.nn.Module):
+        def __init__(self, tag):
+            super().__init__()
+            self.tag = tag
+
+        def forward(
+            self,
+            x,
+            freqs_cis,
+            adaln_input=None,
+            rope_cos_sin_cache=None,
+            rope_positions=None,
+            attn_mask=None,
+            attn_mask_meta=None,
+            num_replicated_suffix=0,
+            rope_freqs_complex=None,
+        ):
+            rec = observed[local_rank.rank]
+            if self.tag == "noise":
+                rec["noise_shapes"].append(tuple(x.shape))
+                return x + 1.0
+            if self.tag == "layer":
+                rec["layer_calls"].append((tuple(x.shape), num_replicated_suffix))
+                return x + 2.0
+            return x
+
+    class _FinalLayerStub(torch.nn.Module):
+        def forward(self, x, c):
+            observed[local_rank.rank]["events"].append(("final_layer", tuple(x.shape)))
+            return (x[..., :4] + x[..., 4:]) * 1.5
+
+    class _Host(zimage_mod.ZImageTransformer2DModel):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.shard_joint_sequence = True
+            self.all_patch_size = (2,)
+            self.all_f_patch_size = (1,)
+            self.t_scale = 1.0
+            self.out_channels = 1
+            self._rope_caches = {}
+            self._unified_freqs_cis = None
+            self.t_embedder = lambda t: t.unsqueeze(-1)
+            self.all_x_embedder = torch.nn.ModuleDict({"2-1": _LinearStub()})
+            self.cap_embedder = _LinearStub()
+            self.x_pad_token = torch.nn.Parameter(torch.zeros(1, 8))
+            self.cap_pad_token = torch.nn.Parameter(torch.zeros(1, 8))
+            self.noise_refiner = torch.nn.ModuleList([_BlockStub("noise")])
+            self.context_refiner = torch.nn.ModuleList([_BlockStub("ctx")])
+            self.layers = torch.nn.ModuleList([_BlockStub("layer")])
+            self.all_final_layer = torch.nn.ModuleDict({"2-1": _FinalLayerStub()})
+
+    hidden = torch.arange(256, dtype=torch.float32).view(1, 1, 1, 8, 32)
+    cap = [torch.arange(128, dtype=torch.float32).view(32, 4)]
+    freqs = (
+        (torch.ones(32, 4), torch.zeros(32, 4)),
+        (torch.ones(64, 4), torch.zeros(64, 4)),
+    )
+    t = torch.tensor([0.5])
+
+    _fake_sp(monkeypatch, 1, 0)
+    monkeypatch.setattr(zimage_mod, "get_sp_world_size", lambda: 1)
+    ref = _Host()(hidden, cap, t, freqs_cis=freqs)
+
+    for rec in observed.values():
+        rec["events"].clear()
+        rec["noise_shapes"].clear()
+        rec["layer_calls"].clear()
+    monkeypatch.setattr(sps, "get_sp_world_size", lambda: 2)
+    monkeypatch.setattr(sps, "get_sp_parallel_rank", lambda: local_rank.rank)
+    monkeypatch.setattr(zimage_mod, "get_sp_world_size", lambda: 2)
+
+    barrier = threading.Barrier(2)
+    gather_slots: list[torch.Tensor | None] = [None, None]
+
+    def _gather(tensor, orig_len, dim=1):
+        rank = local_rank.rank
+        observed[rank]["events"].append(("gather", tuple(tensor.shape), orig_len))
+        gather_slots[rank] = tensor
+        barrier.wait(timeout=5.0)
+        gathered = torch.cat([gather_slots[0], gather_slots[1]], dim=dim)[:, :orig_len]
+        barrier.wait(timeout=5.0)
+        return gathered
+
+    monkeypatch.setattr(sps, "gather_seq", _gather)
+    outs: dict[int, torch.Tensor] = {}
+    errors: list[BaseException] = []
+
+    def _run_rank(rank: int) -> None:
+        local_rank.rank = rank
+        try:
+            outs[rank] = _Host()(hidden, cap, t, freqs_cis=freqs)
+        except BaseException as exc:
+            errors.append(exc)
+            barrier.abort()
+
+    threads = [threading.Thread(target=_run_rank, args=(r,)) for r in (0, 1)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+    assert not errors
+
+    for rank in (0, 1):
+        assert observed[rank]["noise_shapes"] == [(1, 32, 8)]
+        assert observed[rank]["layer_calls"] == [((1, 48, 8), 0)]
+        assert observed[rank]["events"][0] == ("gather", (1, 32, 8), 64)
+        assert observed[rank]["events"][1] == ("final_layer", (1, 48, 8))
+        assert observed[rank]["events"][2] == ("gather", (1, 48, 4), 96)
+        torch.testing.assert_close(outs[rank], ref)
 
 
 def test_plan_shard_divisible(monkeypatch):

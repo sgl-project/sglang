@@ -12,17 +12,15 @@ RopeCache = tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]
 
 def shard_block_inputs(
     hidden_states: torch.Tensor,
-    freqs_cis: tuple[torch.Tensor, torch.Tensor],
     rope: RopeCache,
     mask: torch.Tensor | None,
     mask_meta: dict[str, torch.Tensor | int] | None,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], RopeCache]:
+) -> tuple[torch.Tensor, RopeCache]:
     shard = build_shard_plan(hidden_states.shape[1])
     if shard.num_pad or mask is not None or mask_meta is not None:
         raise ValueError(
             "Joint sequence SP requires uniform, evenly divisible padded sequences"
         )
-    cos, sin = freqs_cis
     cache, positions, complex_freqs = rope
     if positions is not None:
         # Indices still address the full batched cache.
@@ -36,8 +34,4 @@ def shard_block_inputs(
     local = shard_like(hidden_states, shard).contiguous()
     # Canonical singleton batch strides enable fused normalization.
     local = local.view(-1, local.shape[-1]).view(local.shape)
-    return (
-        local,
-        (shard_like(cos, shard, dim=-2), shard_like(sin, shard, dim=-2)),
-        (cache, positions, complex_freqs),
-    )
+    return local, (cache, positions, complex_freqs)
