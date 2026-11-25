@@ -83,7 +83,7 @@ Prefill CP can coexist with supported speculative-decoding configurations. The C
 
 ### Prefill CP × CUDA graphs
 
-The shared CP breakable-prefill-graph path currently requires `zigzag`, the `trtllm_mha` prefill backend, PP=1, and attention CP size equal to TP size. It uses CP-local static input buffers and selects capture buckets large enough for each rank's padded input. Support for combining other attention backends with prefill CP and Breakable CUDA Graph is under development.
+The shared CP breakable-prefill-graph path currently requires `zigzag`, the `trtllm_mha` prefill backend, and attention CP size equal to TP size. It uses CP-local static input buffers and selects capture buckets large enough for each rank's padded input. With PP, prefill graph replay is opt-in (`--cuda-graph-backend-prefill breakable`), and pipeline stages exchange CP-local hidden states. Support for combining other attention backends with prefill CP and Breakable CUDA Graph is under development.
 
 ### Prefill CP × PD disaggregation and DSA cache LayerSplit
 

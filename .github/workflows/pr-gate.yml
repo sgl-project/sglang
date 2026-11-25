@@ -9,9 +9,19 @@ on:
         description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
         type: number
         default: 120
+      approval-mode:
+        description: >-
+          'label' (default): the run-ci label on the PR opts it in.
+          'commit' (run_ci_approval.APPROVAL_WORKFLOWS): a run passes only if the PR has
+          run-ci now and, unless its author may approve, its head commit carries a ci/run-ci-approved
+          status, which an approver's slash command records
+          (scripts/ci/utils/run_ci_approval.py). Every push needs a new approval.
+          The caller's job must grant statuses: read.
+        type: string
+        default: label
     outputs:
       opted-in:
-        description: "'false' for a draft PR or one lacking run-ci or require-label; callers skip their test jobs instead of failing"
+        description: "'false' for a draft PR or one lacking run-ci (approval-mode commit: also an approval of its head commit, unless its author may approve) or require-label; callers skip their test jobs instead of failing"
         value: ${{ jobs.pr-gate.outputs.opted-in }}
 
 jobs:
@@ -55,22 +65,70 @@ jobs:
           echo "Cool down minutes: ${{ inputs.cool-down-minutes }}"
           echo "==================="
 
-      # Live-fetched labels, not event-payload expressions, which do not
-      # refresh on rerun. A draft PR, a missing `run-ci`, or a missing opt-in
-      # tier label (scripts/ci/opt_in_ci_tiers.json) runs this step, and the
-      # caller's test jobs skip on opted-in=false instead of failing. The slash
-      # command handler and pr-states.yml find such runs by this step's name.
+      # 'commit' mode: the live run-ci label and, unless the author may approve, a
+      # ci/run-ci-approved status on the payload's head commit.
+      # run_ci_approval.is_approved is the Python twin; keep the two in step.
+      - name: Check run-ci approval
+        id: approval
+        if: env.IS_PR_EVENT == 'true'
+        uses: actions/github-script@v8
+        env:
+          APPROVAL_MODE: ${{ inputs.approval-mode }}
+          LABELS: ${{ steps.pr.outputs.labels }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const labeled = JSON.parse(process.env.LABELS).includes("run-ci");
+            if (process.env.APPROVAL_MODE !== "commit") {
+              core.setOutput("approved", labeled ? "true" : "false");
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const sha = context.payload.pull_request.head.sha;
+            const author = context.payload.pull_request.user.login;
+            async function authorMayApprove() {
+              try {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: author });
+                if (["admin", "maintain", "write"].includes(data.permission)) return true;
+              } catch (e) {
+                if (e.status !== 403 && e.status !== 404) throw e;
+              }
+              try {
+                const { data } = await github.rest.repos.getContent({
+                  owner, repo, path: ".github/CI_PERMISSIONS.json", ref: context.payload.repository.default_branch,
+                });
+                const perms = JSON.parse(Buffer.from(data.content, data.encoding).toString());
+                return Boolean(perms[author] && perms[author].can_tag_run_ci_label);
+              } catch (e) {
+                core.warning(`Could not read CI_PERMISSIONS.json: ${e.message}`);
+                return false;
+              }
+            }
+            async function headApproved() {
+              const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, { owner, repo, ref: sha, per_page: 100 });
+              return statuses.some(s => s.context === "ci/run-ci-approved" && s.state === "success"
+                && s.creator && s.creator.login === "github-actions[bot]");
+            }
+            const ok = labeled && (await headApproved() || await authorMayApprove());
+            core.setOutput("approved", ok ? "true" : "false");
+            core.info(ok ? `${sha} may run CI.`
+              : !labeled ? `The PR lacks run-ci; a maintainer must comment /tag-and-rerun-ci, which adds it and approves ${sha}.`
+              : `${sha} has no run-ci approval; a maintainer must approve this commit with /approve-ci.`);
+
+      # Live labels: event-payload expressions do not refresh on rerun. The slash handler
+      # and pr-states.yml find these runs by this step's name.
       - name: Skip tests
         id: skip
         if: >-
           env.IS_PR_EVENT == 'true' && (
             fromJson(steps.pr.outputs.draft)
-            || !contains(fromJson(steps.pr.outputs.labels), 'run-ci')
+            || steps.approval.outputs.approved != 'true'
             || inputs.require-label != '' && !contains(fromJson(steps.pr.outputs.labels), inputs.require-label)
           )
         env:
           REQUIRED_LABEL: ${{ inputs.require-label }}
-        run: echo "::notice::Tests skipped. To run them, the PR must not be a draft and needs 'run-ci'${REQUIRED_LABEL:+ and '$REQUIRED_LABEL'}."
+          APPROVAL: ${{ inputs.approval-mode == 'commit' && '''run-ci'' and, unless its author may approve, a maintainer''s approval of this commit' || '''run-ci''' }}
+        run: echo "::notice::Tests skipped. To run them, the PR must not be a draft and needs ${APPROVAL}${REQUIRED_LABEL:+ and '$REQUIRED_LABEL'}."
 
       - name: Enforce rate limit for low-permission actors (optional)
         if: env.IS_PR_EVENT == 'true' && inputs.cool-down-minutes > 0 && steps.skip.outcome != 'success'
@@ -82,11 +140,8 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const eventName = context.eventName;
-            // pr-test.yml runs on pull_request, so pull_request_target callers must
-            // query that event to share the same rate-limit history.
-            const rateLimitEventName = eventName === "pull_request_target"
-              ? "pull_request"
-              : eventName;
+            // pr-test.yml's runs are pull_request_target, whatever workflow called the gate.
+            const rateLimitEventName = "pull_request_target";
             const curRun = await github.rest.actions.getWorkflowRun({
               owner, repo, run_id: context.runId
             });
@@ -175,13 +230,9 @@ jobs:
             const runs = data.workflow_runs || [];
 
             // Rate Limiting Logic:
-            // We only count workflow runs that actually consumed CI resources (i.e., passed the gate).
-            // A run "passes the gate" if any jobs beyond the gate jobs (check-changes, pr-gate, call-gate)
-            // actually executed (not skipped/cancelled). This prevents scenarios where:
-            // - User has PR A with missing 'run-ci' label (tests skipped at gate)
-            // - User opens PR B with 'run-ci' label
-            // - PR B should be able to run even though PR A triggered a run recently
-
+            // A run passes the gate if a job beyond the gate jobs (detect-changes, check-changes,
+            // pr-gate, call-gate, finish and notify) executed. A PR skipped at the gate (no run-ci)
+            // must not rate-limit the user's other PRs.
             // Helper function to check if a run passed the gate (i.e., actually consumed CI resources)
             async function didRunPassGate(run) {
               try {
@@ -199,7 +250,7 @@ jobs:
                 }
 
                 // Gate jobs that don't consume significant CI resources
-                const gateJobs = ['check-changes', 'pr-gate', 'call-gate', 'pr-test-finish'];
+                const gateJobs = ['detect-changes', 'check-changes', 'pr-gate', 'call-gate', 'pr-test-finish', 'notify-pr-states'];
                 const jobsBeyondGate = jobs.filter(j => !gateJobs.some(g => j.name === g || j.name.startsWith(g + ' ')));
 
                 // A job "ran" if it reached a terminal conclusion state that indicates actual execution

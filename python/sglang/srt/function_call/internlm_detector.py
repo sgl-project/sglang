@@ -157,8 +157,6 @@ class InternlmDetector(BaseFormatDetector):
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing for InternLM format.
-
-        Supports a single tool call in streaming mode.
         """
         self._buffer += new_text
         current_text = self._buffer
@@ -167,23 +165,23 @@ class InternlmDetector(BaseFormatDetector):
         start = current_text.find(self.bot_token)
         if start == -1:
             # No tool call marker found
+            # Check if buffer could be partial start of bot_token
+            if self._ends_with_partial_token(current_text, self.bot_token):
+                # Might be partial start token, keep buffering
+                return StreamingParseResult()
+
             # If we've already processed tool calls, don't return text again
             if self.current_tool_id > 0:
                 self._buffer = ""
                 return StreamingParseResult(normal_text="")
 
-            # Check if buffer could be partial start of bot_token
-            if not self._ends_with_partial_token(current_text, self.bot_token):
-                # Not a partial match, return as normal text
-                normal_text = current_text
-                self._buffer = ""
-                # Clean up any stray end tokens
-                if self.eot_token in normal_text:
-                    normal_text = normal_text.replace(self.eot_token, "")
-                return StreamingParseResult(normal_text=normal_text)
-            else:
-                # Might be partial start token, keep buffering
-                return StreamingParseResult()
+            # Not a partial match, return as normal text
+            normal_text = current_text
+            self._buffer = ""
+            # Clean up any stray end tokens
+            if self.eot_token in normal_text:
+                normal_text = normal_text.replace(self.eot_token, "")
+            return StreamingParseResult(normal_text=normal_text)
 
         # Check if we have a complete tool call (with end marker)
         end = current_text.find(self.eot_token)
