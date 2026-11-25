@@ -19,9 +19,9 @@ from sglang.test.test_utils import (
 
 # RadixAttention server integration tests
 register_cuda_ci(est_time=145, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=405, suite="stage-b-test-cpu-intel")
-register_ppu_ci(est_time=450, suite="stage-a-test-1-gpu-ppu")
+register_amd_ci(est_time=100, suite="base-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=405, suite="extra-test-cpu-intel")
+register_ppu_ci(est_time=450, suite="extra-test-1-gpu-ppu")
 
 
 class TestRadixCacheFCFS(CustomTestCase):

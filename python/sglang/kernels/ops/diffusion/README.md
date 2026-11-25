@@ -41,6 +41,7 @@ quantization/ FP8 rowwise producers fused into the GEMM input path
 attention/   sparse linear attention, gated delta-net
 routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
+conv/        convolutions in a library solver's accumulation order (MIOpen replicas)
 common/      platform predicates, non-Triton fallbacks, cached Triton launches (numerics: kernels/numerics.py)
 sites/       request-scoped mount policy — NOT kernels (see below)
 ext/         JIT C++/CUDA extensions (Hunyuan3D raster/inpaint) — NOT kernels
@@ -75,6 +76,10 @@ and FP8/NVFP4 producers can belong to the selected model or deployment path.
 The request `quality` tier neither selects nor disables those independent
 choices.
 
+Sana image LN+modulation fusion is limited to CUDA-graph streams. SANA-Video
+also enables it for default-stream inference, retaining the same per-signature
+bit-exact verification and fallback.
+
 SANA-Video's depthwise convolution/GLU fusion reuses input rows and avoids
 materializing the convolution output. It is enabled for large (`numel >= 2**24`)
 channels-last BF16 inputs with cuDNN enabled on SM120, after an exact comparison with the existing
@@ -86,6 +91,12 @@ SANA-WM uses a different convolution/bias rounding contract and is unchanged.
 SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
 first GEMM while requesting FP32 accumulation/output, then runs the second
 GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
+
+SANA-Video 2.0's quality-gated softmax-attention site hands the anchor layers'
+BF16-valued Q/K/V to SDPA without the FP32 upcast, so flash attention is
+eligible instead of the FP32 memory-efficient kernel. Accumulation stays FP32
+inside the kernel; the probabilities round to BF16 before the PV GEMM. The
+default path still promotes Q/K/V to FP32.
 
 ## Entry-point protocol
 
@@ -158,6 +169,7 @@ Several norms look interchangeable and are not. Start here.
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
 | `rmsnorm_cast_before_weight_bitexact` | Triton / aten | FP32 reduction, BF16 round before learned scale | MOSS-Image token and head RMSNorm |
+| `rmsnorm_mean_square_bitexact` | Triton | ATen-ordered `x.float().square().mean(-1, keepdim=True)` | BF16 head-64/128 views or contiguous width 4096, at least 16 rows and fewer than 2^29 elements; Nomas DiT/VAE, verified against the live reference per reduction layout |
 | `triton_group_norm_silu` / `apply_group_norm_silu` | Triton | close | NCHW-contiguous, any channels-per-group, always applies SiLU |
 | `group_norm_silu_4d` / `group_norm_silu_rows` | Triton | close | **channels_last only**; power-of-two `C <= 2048`; optional SiLU. This is what lets a VAE decoder run channels_last end-to-end with no `nchwToNhwc` |
 | `wan_rmsnorm_silu` | Triton | close | dense `channels_last_3d` 5D (`stride(C) == 1`), Wan VAE channel-first RMSNorm + SiLU; `[ROWS, C]` tiles (~3 TB/s at C = 96); optional `conv_bias` folds the preceding conv's bias with aten `add_` arithmetic |
@@ -210,7 +222,6 @@ tensor copy at each residual site.
 | `fused_rope_rotate_half_fp32` | Triton | paired split-half Q/K RoPE with separately rounded FP32 products and sum before the FP16/BF16 cast; Anima verifies each new signature against eager |
 | `flux3_video_qknorm_rope` | Triton | bit-exact vs affine-free ``nn.RMSNorm`` (head dim 64) plus eager rotate-half RoPE; FLUX 3 video VAE, ``eps=1e-5`` |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |
-| `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for FP16/BF16 inputs and materializes strided inputs as contiguous; Qwen-Image 2.1 verifies its first call |
 | `qknorm_complex_rope_cuda` / `qknorm_complex_rope_pack_` | JIT CUDA | bit-exact vs `RMSNorm(cast_x_before_out_mul=True)` + complex64 RoPE for head_dim 128; both accept token-strided views of a packed QKV buffer; the pack variant normalizes Q and K in place behind a prefix and copies prefix K/V (and optionally V) in the same launch; Qwen-Image 2.1 verifies its first call |
 | `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
 | `fused_inplace_helios_qk_rope` | JIT CUDA | bit-exact paired in-place RoPE for Helios' transposed frequency layout |

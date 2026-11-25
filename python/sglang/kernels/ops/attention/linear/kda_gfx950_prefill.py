@@ -60,8 +60,6 @@ def extend(
         available()
         # spec-decode extends stay on the reference path
         and not kwargs.get("is_spec_decode", False)
-        # breakable prefill CUDA graphs pass padded chunk tables
-        and kwargs.get("chunk_indices") is None
         and (track_state is None) == (track_chunk_idx is None)
         # aligned-only tracking reads the final state, so h is not needed
         and not (
@@ -85,6 +83,9 @@ def extend(
         return None
     # the launch layout depends on the longest sequence; T bounds it without a sync
     seq_lens = kwargs.get("extend_seq_lens_cpu")
+    # A breakable prefill graph pads the batch to its bound with empty PAD_SLOT_ID
+    # sequences (its chunk tables are not needed); pick the launch path for one.
+    padded = kwargs.get("chunk_indices") is not None
     output = get_kernel("attention.kda_prefill_gfx950", KernelBackend.KDA)(
         q.contiguous(),
         k.contiguous(),
@@ -104,5 +105,14 @@ def extend(
             if track_chunk_idx is None
             else track_chunk_idx.to(torch.int64).contiguous()
         ),
+        path_seqs=1 if padded else 0,
     )
     return (output, None) if return_intermediate_states else output
+
+
+def preload() -> None:
+    """Load the kernel outside CUDA-graph capture; a no-op off gfx950."""
+    if available():
+        from sglang.kernels.kda_kernels.kda_prefill_gfx950 import ensure_loaded
+
+        ensure_loaded()

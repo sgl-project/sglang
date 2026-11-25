@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8Mo
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
+    apply_fp8_linear_deterministic,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     flashinfer_per_tensor_fp8_supported,
@@ -68,7 +69,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.device import get_device_capability, is_cuda
@@ -656,6 +657,17 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+        if (
+            self.use_sm120_fp8
+            and get_exec().deterministic.enable_deterministic_inference
+        ):
+            return apply_fp8_linear_deterministic(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+            )
         if self.use_sm120_fp8:
             from sglang.kernels.ops.gemm import try_sm120_fp8_linear
 
@@ -827,6 +839,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         self.fp8_block_config = fp8_block_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
+        self.block_fp8_moe_online_config: Optional[QuantizationConfig] = None
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -1043,6 +1056,25 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     def resolve_quant_algo(self, prefix: str) -> Optional[str]:
         return self._resolve_quant_algo(prefix)
 
+    def convert_block_fp8_experts_to_nvfp4(self) -> None:
+        """Quantize block-FP8 MoE experts to NVFP4 while they load.
+
+        An explicit `modelopt_fp4` draft does this for the BF16 MTP experts of
+        NVFP4 checkpoints; MIXED_PRECISION exports that ship block-FP8 MTP
+        experts get the same NVFP4 draft experts.
+        """
+        from sglang.srt.layers.quantization.nvfp4_online import (
+            make_modelopt_fp4_online_config_from_fp8,
+        )
+
+        self.block_fp8_moe_online_config = make_modelopt_fp4_online_config_from_fp8(
+            {
+                "quant_method": "fp8",
+                "weight_block_size": self.fp8_block_config.weight_block_size,
+                "packed_modules_mapping": self.packed_modules_mapping,
+            }
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -1094,6 +1126,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
             if quant_algo in _BLOCK_FP8_ALGOS:
+                if self.block_fp8_moe_online_config is not None:
+                    return self.block_fp8_moe_online_config.get_quant_method(
+                        layer, prefix
+                    )
                 return Fp8MoEMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
@@ -2430,7 +2466,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     #
     # "v2" (standard): cutedsl + none/flashinfer a2a.
     #   - MoeRunner fused func calls CuteDslMoEWrapper kernels.
-    #   - Expects W13 in [Up, Gate] order, interleaved in 64-row chunks.
+    #   - Expects W13 in [Up, Gate] order, interleaved in 16-row chunks for
+    #     Blackwell swap-AB, or 64-row chunks for the legacy layout.
     #   - Uses MMA-layout blockscales (w13_blockscale_mma).
 
     @property
@@ -2459,19 +2496,24 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
+    def _trtllm_hidden_alignment(self, layer) -> int:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            trtllm_nvfp4_hidden_alignment,
+        )
+
+        return trtllm_nvfp4_hidden_alignment(
+            use_per_token_activation=self.quant_config.use_per_token_activation,
+            is_gated=layer.moe_runner_config.is_gated,
+        )
+
     def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
         """Align TRT-LLM weights, allowing model-specific storage layouts."""
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             align_fp4_moe_weights_for_flashinfer_trtllm,
-            trtllm_nvfp4_hidden_alignment,
         )
 
         align_fp4_moe_weights_for_flashinfer_trtllm(
-            layer,
-            hidden_alignment=trtllm_nvfp4_hidden_alignment(
-                use_per_token_activation=self.quant_config.use_per_token_activation,
-                is_gated=layer.moe_runner_config.is_gated,
-            ),
+            layer, hidden_alignment=self._trtllm_hidden_alignment(layer)
         )
 
     def create_weights(
@@ -2506,7 +2548,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = self.prepare_weight_loader(
             layer, extra_weight_attrs.get("weight_loader")
         )
-        if get_moe_runner_backend().is_flashinfer_megamoe():
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
                 make_nvfp4_megamoe_weight_loader,
             )
@@ -2557,13 +2600,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
-        # during process_weights_after_loading, so skip the expensive
-        # swizzle+allocate here to avoid GPU memory fragmentation
-        if (
+        # AUTO is resolved later in create_moe_runner(); process_weights_after_loading()
+        # rebinds the swizzled scales for every backend that reads them.
+        skip_swizzled_blockscales = (
             self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
+            or moe_runner_backend.is_flashinfer_megamoe()
+            or moe_runner_backend.is_marlin()
+            or moe_runner_backend.is_lora_marlin()
+            or moe_runner_backend.is_auto()
+        )
+        if skip_swizzled_blockscales:
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2583,10 +2629,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if (
-            self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
+        if skip_swizzled_blockscales:
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
@@ -2919,10 +2962,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.device,
             )
 
+        # The TRT-LLM runner pads a misaligned hidden dim and so needs BF16
+        # activations; FP4 dispatch would quantize them at the unpadded size.
+        trtllm_pads_hidden = (
+            self.enable_flashinfer_trtllm_moe
+            and layer.hidden_size % self._trtllm_hidden_alignment(layer) != 0
+        )
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = (
             not self.quant_config.use_per_token_activation
             and not use_w4a16
+            and not trtllm_pads_hidden
             and (
                 use_nvfp4_dispatch or should_use_flashinfer_cutlass_moe_fp4_allgather()
             )
@@ -2988,27 +3038,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # CUTLASS processing - handle w13 and w2 separately
 
             if self._is_cutedsl_v2_standard and layer.moe_runner_config.is_gated:
-                # CuteDSL v2 only: interleave the two logical W13 halves in
-                # 64-row chunks for the fused SwiGLU GEMM1 layout expected by
-                # CuteDslMoEWrapper.  The v1 (deepep) path uses
-                # grouped_gemm_nt_masked which expects plain contiguous halves.
+                # Prepare paired [up, gate] weights/scales before swizzling,
+                # using the same layout as CuteDslMoEWrapper. The v1 (deepep)
+                # masked GEMM keeps plain contiguous halves.
+                from flashinfer.fused_moe import interleave_cute_dsl_moe_weights
+
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-                    interleave_w13_halves,
+                    use_cutedsl_moe_swap_ab,
                 )
 
-                copy_or_rebind_param(
-                    layer,
-                    "w13_weight",
-                    interleave_w13_halves(
-                        layer.w13_weight.view(torch.uint8), group_size=64, dim=1
-                    ).contiguous(),
+                w13_weight, w13_weight_scale = interleave_cute_dsl_moe_weights(
+                    layer.w13_weight.view(torch.uint8),
+                    layer.w13_weight_scale,
+                    swap_ab=use_cutedsl_moe_swap_ab(layer.w13_weight.device),
                 )
+                copy_or_rebind_param(layer, "w13_weight", w13_weight.contiguous())
                 copy_or_rebind_param(
-                    layer,
-                    "w13_weight_scale",
-                    interleave_w13_halves(
-                        layer.w13_weight_scale, group_size=64, dim=1
-                    ).contiguous(),
+                    layer, "w13_weight_scale", w13_weight_scale.contiguous()
                 )
 
             # Process w13 weights

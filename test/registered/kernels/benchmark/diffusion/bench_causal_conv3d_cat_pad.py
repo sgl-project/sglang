@@ -17,7 +17,7 @@ register_cuda_ci(
     runner_config="1-gpu-large",
     disabled="standalone benchmark",
 )
-register_amd_ci(est_time=20, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=20, stage="base-a-jit-kernel-benchmark", runner_config="amd")
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -68,7 +68,7 @@ def make_inputs(case: Case) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]
 
 
 @marker.parametrize("case_name", CASE_NAMES, ci_vals=CASE_NAMES[:2])
-@marker.benchmark("provider", ["triton", "cuda"])
+@marker.benchmark("provider", ["triton", "cuda"], gate=["cuda"])
 def benchmark(case_name: str, provider: str) -> marker.BenchResult:
     case = CASE_BY_NAME[case_name]
     x, cache_x, padding = make_inputs(case)

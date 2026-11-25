@@ -17,8 +17,10 @@ from urllib.error import URLError
 
 import psutil
 import zmq.asyncio
-from fastapi import Response
+from fastapi import FastAPI, Response
 
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.runtime import server_warmup
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import DiffusionServer
 from sglang.multimodal_gen.runtime.entrypoints import http_server
 from sglang.multimodal_gen.runtime.entrypoints.http_server import (
@@ -28,6 +30,7 @@ from sglang.multimodal_gen.runtime.entrypoints.http_server import (
 )
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.test.server.test_server_utils import ServerManager
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_request(warmup_done) -> SimpleNamespace:
@@ -40,7 +43,110 @@ def _make_request(warmup_done) -> SimpleNamespace:
     return SimpleNamespace(app=SimpleNamespace(state=state))
 
 
-class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
+class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
+    async def test_worker_death_during_warmup_aborts_startup(self):
+        """#51188: a dead scheduler must never pass the synthetic warmup gate."""
+        send_signal = os.kill
+        for outcome in ("exception", "error", "success", "healthy_error"):
+            with self.subTest(outcome=outcome):
+                client = AsyncSchedulerClient()
+                args = SimpleNamespace(
+                    pipeline_config=SimpleNamespace(task_type=ModelTaskType.T2V),
+                    warmup_mode="server",
+                    warmup_resolutions=None,
+                    scheduler_endpoints=["unused"],
+                    progress_endpoint=None,
+                    cancel_endpoint=None,
+                    prompt_enhancer_config=None,
+                    log_requests=False,
+                    log_requests_level=0,
+                    log_requests_format="text",
+                    log_requests_target=None,
+                )
+                aborted = asyncio.Event()
+
+                async def broker(_):
+                    await asyncio.Future()
+
+                async def forward(*_, **__):
+                    if outcome != "healthy_error":
+                        worker.kill()
+                        worker.wait(timeout=5)
+                    if outcome == "exception":
+                        # Exercise failure propagation from the existing monitor.
+                        await http_server._monitor_backend(app)
+                        raise RuntimeError(client.failure_reason)
+                    return SimpleNamespace(
+                        error=None if outcome == "success" else "unsupported probe"
+                    )
+
+                with (
+                    subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(60)"]
+                    ) as worker,
+                    mock.patch.object(http_server, "async_scheduler_client", client),
+                    mock.patch.object(client, "forward", side_effect=forward) as probe,
+                    mock.patch.object(http_server, "run_zeromq_broker", broker),
+                    mock.patch.object(
+                        http_server, "_wait_until_http_live", mock.AsyncMock()
+                    ),
+                    mock.patch.object(
+                        http_server,
+                        "should_run_synthetic_server_warmup",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        server_warmup,
+                        "build_client_warmup_reqs",
+                        return_value=[object()],
+                    ),
+                    mock.patch.object(
+                        http_server.os,
+                        "kill",
+                        side_effect=lambda pid, sig: (
+                            aborted.set()
+                            if pid == os.getpid()
+                            else send_signal(pid, sig)
+                        ),
+                    ),
+                ):
+                    app = FastAPI()
+                    app.state.server_args = args
+                    app.state.worker_processes = [psutil.Process(worker.pid)]
+                    app.state.disagg_server = None
+                    app.state.broker_task = None
+                    try:
+                        async with http_server.lifespan(app):
+
+                            async def wait_for_startup():
+                                while not (
+                                    aborted.is_set()
+                                    or app.state.server_warmup_done.is_set()
+                                ):
+                                    await asyncio.sleep(0)
+
+                            await asyncio.wait_for(wait_for_startup(), 5)
+                            probe.assert_awaited_once()
+                            ready = app.state.server_warmup_done.is_set()
+                            response = await health(SimpleNamespace(app=app))
+                            if outcome == "healthy_error":
+                                self.assertTrue(ready)
+                                self.assertFalse(aborted.is_set())
+                                self.assertEqual(response, {"status": "ok"})
+                            else:
+                                self.assertTrue(
+                                    ready
+                                )  # warmup_done wakes in-flight waiters on failure
+                                self.assertTrue(aborted.is_set())
+                                self.assertIn("Scheduler worker", client.failure_reason)
+                                self.assertEqual(response.status_code, 503)
+                                self.assertIn(b"Scheduler worker", response.body)
+                                self.assertIn(b"cgroup", response.body)
+                    finally:
+                        if worker.poll() is None:
+                            worker.terminate()
+                            worker.wait(timeout=5)
+
     async def test_router_exit_fails_pending_requests_without_rpc_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
             endpoint = f"ipc://{directory}/frontend"
@@ -94,6 +200,8 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
             port = occupied.bind_to_random_port("tcp://127.0.0.1")
             args = SimpleNamespace(
                 enable_metrics=False,
+                api_key=None,
+                admin_api_key=None,
                 warmup_mode="off",
                 progress_endpoint=None,
                 cancel_endpoint=None,
@@ -131,6 +239,8 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
         client = AsyncSchedulerClient()
         args = SimpleNamespace(
             enable_metrics=False,
+            api_key=None,
+            admin_api_key=None,
             pipeline_config=mock.Mock(
                 supports_action_endpoint=lambda: False,
                 supports_openpi_endpoint=lambda: False,
@@ -159,6 +269,36 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     (await http.get("/completed")).json(), {"result": "saved"}
                 )
+
+    async def test_waiting_models_request_wakes_with_503_on_warmup_failure(self):
+        client = AsyncSchedulerClient()
+        args = SimpleNamespace(
+            enable_metrics=False,
+            api_key=None,
+            admin_api_key=None,
+            pipeline_config=mock.Mock(
+                supports_action_endpoint=lambda: False,
+                supports_openpi_endpoint=lambda: False,
+            ),
+        )
+        with mock.patch.object(http_server, "async_scheduler_client", client):
+            app = http_server.create_app(args)
+            warmup_done = asyncio.Event()
+            app.state.server_warmup_done = warmup_done
+            async with http_server.httpx.AsyncClient(
+                transport=http_server.httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as http:
+                req_task = asyncio.create_task(http.get("/v1/models"))
+                await asyncio.sleep(0.01)
+                self.assertFalse(req_task.done())
+
+                client.mark_failed("Scheduler worker exited; restart the server.")
+                warmup_done.set()
+
+                resp = await asyncio.wait_for(req_task, timeout=5)
+                self.assertEqual(resp.status_code, 503)
+                self.assertIn("Scheduler worker", resp.json()["error"])
 
     async def test_liveness_returns_200_before_warmup(self):
         self.assertEqual(await liveness(), {"status": "ok"})

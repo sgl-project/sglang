@@ -182,6 +182,221 @@ def select_candidate_block_ids(
     return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
 
 
+@triton.jit
+def _radix_select_candidate_ids(
+    ordered, blocks, OUTPUT, row, K: tl.constexpr, KEY_BITS: tl.constexpr
+):
+    # Narrow the Kth key to one radix bucket per pass.
+    bins = tl.arange(0, 256)
+    prefix = tl.full((), 0, tl.uint32)
+    rank = K
+    for shift in tl.static_range(KEY_BITS - 8, -1, -8):
+        digit = ((ordered >> shift) & 255).to(tl.int32)
+        active = (ordered >> shift >> 8) == (prefix >> shift >> 8)
+        hist = tl.histogram(digit, 256, mask=active)
+        above = tl.cumsum(hist, axis=0, reverse=True) - hist
+        bucket = tl.max(tl.where(above + hist >= rank, bins, -1), axis=0)
+        rank -= tl.sum(tl.where(bins == bucket, above, 0), axis=0)
+        prefix |= bucket.to(tl.uint32) << shift
+    equal = ordered == prefix
+    equal_rank = tl.cumsum(equal.to(tl.int32), axis=0)
+    keep = (ordered > prefix) | (equal & (equal_rank <= rank))
+    # Zero and the all-ones key represent padding and NaN, respectively.
+    picked = keep & (ordered != 0) & (ordered != ((1 << KEY_BITS) - 1))
+    count = tl.cumsum(picked.to(tl.int32), axis=0)
+    total = tl.sum(picked.to(tl.int32), axis=0)
+    tl.store(OUTPUT + row * K + count - 1, blocks, picked)
+    tl.store(OUTPUT + row * K + blocks, -1, (blocks >= total) & (blocks < K))
+
+
+@triton.jit
+def _ordered_candidate_keys(maxima, valid, has_nan, KEY_BITS: tl.constexpr):
+    bits = maxima.to(tl.uint32, bitcast=True)
+    ordered = tl.where(bits & 0x80000000 != 0, ~bits, bits | 0x80000000)
+    ordered = tl.where(has_nan, 0xFFFFFFFF, tl.where(valid, ordered, 0))
+    return ordered >> (32 - KEY_BITS)
+
+
+@triton.jit(do_not_specialize=["width", "row_stride"])
+def _reduce_candidate_keys_kernel(
+    LOGITS,
+    LENGTHS,
+    KEYS,
+    width,
+    row_stride,
+    length,
+    NUM_BLOCKS,
+    LENGTH_STRIDE: tl.constexpr,
+    HAS_LENGTHS: tl.constexpr,
+    KEY_BITS: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    cols = block[:, None] * 8 + tl.arange(0, 8)[None, :]
+    scores = tl.load(LOGITS + row * row_stride + cols, cols < width, -float("inf")).to(
+        tl.float32
+    )
+    maxima = tl.max(scores, axis=1)
+    has_nan = tl.max((scores != scores).to(tl.int32), axis=1) != 0
+    if HAS_LENGTHS:
+        length = tl.load(LENGTHS + row * LENGTH_STRIDE)
+    is_newest = (length > 0) & (block == (length - 1) // 8)
+    maxima = tl.where(is_newest, float("inf"), maxima)
+    has_nan &= ~is_newest
+    keys = _ordered_candidate_keys(
+        maxima, (maxima > -float("inf")) & ~has_nan, has_nan, KEY_BITS
+    )
+    tl.store(KEYS + row * NUM_BLOCKS + block, keys, block < NUM_BLOCKS)
+
+
+@triton.jit(do_not_specialize=["num_blocks"])
+def _select_reduced_candidate_keys_kernel(
+    KEYS,
+    OUTPUT,
+    num_blocks,
+    K: tl.constexpr,
+    TILE: tl.constexpr,
+    KEY_BITS: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    block = tl.arange(0, TILE)
+    keys = tl.load(KEYS + row * num_blocks + block, block < num_blocks, 0)
+    _radix_select_candidate_ids(keys.to(tl.uint32), block, OUTPUT, row, K, KEY_BITS)
+
+
+@triton.jit(do_not_specialize=["width", "row_stride"])
+def _select_candidate_block_ids_kernel(
+    LOGITS,
+    LENGTHS,
+    OUTPUT,
+    width,
+    row_stride,
+    length,
+    LENGTH_STRIDE: tl.constexpr,
+    HAS_LENGTHS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    K: tl.constexpr,
+    TILE: tl.constexpr,
+    SELECT_ALL: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    blocks = tl.arange(0, TILE)
+    cols = blocks[:, None] * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
+    scores = tl.load(LOGITS + row * row_stride + cols, cols < width, -float("inf")).to(
+        tl.float32
+    )
+    maxima = tl.max(scores, axis=1)
+    has_nan = tl.max((scores != scores).to(tl.int32), axis=1) != 0
+    if HAS_LENGTHS:
+        length = tl.load(LENGTHS + row * LENGTH_STRIDE)
+    newest = (length - 1) // BLOCK_SIZE
+    is_newest = (length > 0) & (blocks == newest)
+    maxima = tl.where(is_newest, float("inf"), maxima)
+    has_nan &= ~is_newest
+    valid = (blocks * BLOCK_SIZE < width) & (maxima > -float("inf")) & ~has_nan
+
+    if SELECT_ALL:
+        # Keep valid IDs at the front without sorting the block scores.
+        count = tl.cumsum(valid.to(tl.int32), axis=0)
+        total = tl.sum(valid.to(tl.int32), axis=0)
+        dest = tl.where(valid, count - 1, total + blocks - count)
+        selected = tl.where(valid, blocks, -1)
+        tl.store(OUTPUT + row * K + dest, selected, blocks < K)
+    else:
+        KEY_BITS: tl.constexpr = 16 if LOGITS.dtype.element_ty == tl.bfloat16 else 32
+        keys = _ordered_candidate_keys(maxima, valid, has_nan, KEY_BITS)
+        _radix_select_candidate_ids(keys, blocks, OUTPUT, row, K, KEY_BITS)
+
+
+def select_candidate_block_ids_triton(
+    logits: torch.Tensor,
+    compress_lens: Union[torch.Tensor, int],
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Per row the ids of the ``topk_blocks`` blocks with the largest score, the
+    block of position ``compress_lens - 1`` always kept: int32
+    ``[rows, min(topk_blocks, blocks)]``, unordered, ``-1`` past the finite blocks.
+    ``logits`` must be ``-inf`` past each row's causal length."""
+    width = logits.size(-1)
+    if (
+        logits.is_cuda
+        and torch.version.hip is None
+        and logits.ndim == 2
+        and logits.stride(1) == 1
+        and logits.dtype in (torch.float32, torch.bfloat16)
+        and block_size == 8
+        and 0 < width <= 131072
+        and (width <= 32768 or topk_blocks == 2048)
+        and (
+            isinstance(compress_lens, int)
+            or (
+                isinstance(compress_lens, torch.Tensor)
+                and compress_lens.device == logits.device
+                and compress_lens.dtype in (torch.int32, torch.int64)
+                and compress_lens.shape == (logits.shape[0], 1)
+            )
+        )
+    ):
+        rows = logits.shape[0]
+        num_blocks = triton.cdiv(width, block_size)
+        k = min(topk_blocks, num_blocks)
+        out = torch.empty((rows, k), dtype=torch.int32, device=logits.device)
+        if rows and k:
+            has_lengths = isinstance(compress_lens, torch.Tensor)
+            if k == 2048 and num_blocks > k:
+                # Parallelize the full-width read and keep only one key per block
+                # live during selection.
+                key_bits = 16 if logits.dtype == torch.bfloat16 else 32
+                keys = torch.empty(
+                    (rows, num_blocks),
+                    dtype=torch.uint16 if key_bits == 16 else torch.uint32,
+                    device=logits.device,
+                )
+                _reduce_candidate_keys_kernel[(rows, triton.cdiv(num_blocks, 256))](
+                    logits,
+                    compress_lens if has_lengths else None,
+                    keys,
+                    width,
+                    logits.stride(0),
+                    0 if has_lengths else compress_lens,
+                    num_blocks,
+                    compress_lens.stride(0) if has_lengths else 0,
+                    has_lengths,
+                    key_bits,
+                    256,
+                    num_warps=4,
+                )
+                _select_reduced_candidate_keys_kernel[(rows,)](
+                    keys,
+                    out,
+                    num_blocks,
+                    k,
+                    triton.next_power_of_2(num_blocks),
+                    key_bits,
+                    num_warps=16,
+                )
+                return out
+            _select_candidate_block_ids_kernel[(rows,)](
+                logits,
+                compress_lens if has_lengths else None,
+                out,
+                width,
+                logits.stride(0),
+                0 if has_lengths else compress_lens,
+                compress_lens.stride(0) if has_lengths else 0,
+                has_lengths,
+                block_size,
+                k,
+                triton.next_power_of_2(num_blocks),
+                k == num_blocks,
+                num_warps=8,
+            )
+        return out
+    return select_candidate_block_ids(logits, compress_lens, topk_blocks, block_size)
+
+
 def topk_among_blocks(
     scores: torch.Tensor,
     lens: torch.Tensor,
