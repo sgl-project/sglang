@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_backend import AiterIndicesUpdaterPrefill
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
@@ -19,13 +20,15 @@ register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
 )
 class TestAiterFixedPoolPrefillIndices(unittest.TestCase):
     def test_page_sizes(self):
-        for page_size in (1, 16):
-            with self.subTest(page_size=page_size):
-                self._check(page_size)
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override("0"):
+            for page_size in (1, 16):
+                with self.subTest(page_size=page_size):
+                    self._check(page_size)
 
     def _check(self, page_size):
         rows = (2, 0, 1)
         lengths = (33, 5, 17)
+        prefix_lens = torch.tensor((17, 2, 7), dtype=torch.int32, device="cuda")
         # Reverse page order so successive logical pages are not contiguous.
         table = (
             torch.arange(page_size, page_size + 3 * 48, dtype=torch.int32)
@@ -67,19 +70,25 @@ class TestAiterFixedPoolPrefillIndices(unittest.TestCase):
                 req_pool_indices,
                 seq_lens,
                 sum(lengths),
-                prefix_lens=torch.zeros_like(seq_lens),
+                prefix_lens=prefix_lens,
                 encoder_lens=None,
                 spec_info=None,
                 plan=plan,
             )
         pack.assert_called_once()
 
-        expected_indptr = torch.tensor((0, 33, 38, 55), dtype=torch.int32)
+        expected_kv_indptr = torch.tensor((0, 33, 38, 55), dtype=torch.int32)
+        expected_qo_indptr = torch.tensor((0, 16, 19, 29), dtype=torch.int32)
+        # KV includes the prefixes in request order; Q offsets count only new tokens.
         expected_indices = torch.cat([table[row, :n] for row, n in zip(rows, lengths)])
-        torch.testing.assert_close(updater.kv_indptr.cpu(), expected_indptr)
-        # The additional 256 entries are padding for the attention consumer.
+        torch.testing.assert_close(updater.kv_indptr.cpu(), expected_kv_indptr)
+        torch.testing.assert_close(updater.qo_indptr.cpu(), expected_qo_indptr)
         torch.testing.assert_close(
             updater.kv_indices[: sum(lengths)].cpu(), expected_indices
+        )
+        # The attention consumer may read the 256-entry tail, filled with a valid slot.
+        torch.testing.assert_close(
+            updater.kv_indices[sum(lengths) :].cpu(), expected_indices[0].expand(256)
         )
 
 
