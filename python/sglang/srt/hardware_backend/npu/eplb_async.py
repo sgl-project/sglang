@@ -433,7 +433,7 @@ class NpuEplbRuntime:
                                 self.metadata.logical_to_all_physical_map_cpu[
                                     :, :, : self._replica_width
                                 ]
-                                if self.spec.use_physical_counts
+                                if self.spec.physical_count_mode is not None
                                 else None
                             ),
                         )
@@ -645,6 +645,12 @@ def create_npu_async_eplb(model_config, weights, metadata):
     order_submissions = get_disagg().disaggregation_mode == "decode"
     if algorithm.name.startswith("elasticity"):
         raise ValueError("Async EPLB requires a non-elastic CPU placement algorithm")
+    physical_count_mode = None
+    if (
+        moe.ep_dispatch_algorithm == "dynamic"
+        and metadata.num_physical_experts > metadata.num_logical_experts
+    ):
+        physical_count_mode = "row" if moe.moe_a2a_backend == "none" else "random"
     spec = PlanningSpec(
         metadata.num_physical_experts,
         metadata.num_local_physical_experts,
@@ -652,10 +658,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
         parallel.nnodes,
         algorithm,
         rank_fixed_dispatch=moe.ep_dispatch_algorithm == "static",
-        use_physical_counts=(
-            moe.moe_a2a_backend == "none"
-            and metadata.num_physical_experts > metadata.num_logical_experts
-        ),
+        physical_count_mode=physical_count_mode,
     )
     # Fixed PP=1 TP=EP=WORLD: group construction order is identical on all ranks.
     timeout = timedelta(seconds=90)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import numpy as np
 import torch
@@ -37,7 +37,7 @@ class PlanningSpec:
     nodes: int
     algorithm: EplbAlgorithm
     rank_fixed_dispatch: bool = False
-    use_physical_counts: bool = False
+    physical_count_mode: Literal["row", "random"] | None = None
 
     def compute(self, counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         from sglang.srt.eplb.eplb_algorithms import rebalance_experts
@@ -62,9 +62,9 @@ def plan_migration(
     *,
     current_replicas: torch.Tensor | None = None,
 ) -> MigrationPlacement | None:
-    """Plan on the root rank; row-index dispatch records physical slot counts."""
+    """Plan on the root rank, keeping measured slot loads for dynamic replicas."""
     physical_counts = None
-    if spec.use_physical_counts:
+    if spec.physical_count_mode is not None:
         from sglang.srt.eplb.expert_distribution import (
             _convert_global_physical_count_to_logical_count,
         )
@@ -82,13 +82,29 @@ def plan_migration(
     # ranks. Keep the base planner's rank assignments for static dispatch.
     replicated_static = replicated and spec.rank_fixed_dispatch
     score_steps = spec.nodes == 1 and not replicated_static
+    # Initial A2A routing prefers local replicas. Preserve the busiest rank's
+    # observed load at each step as the baseline for every candidate.
+    observed_peaks = None
+    if spec.physical_count_mode == "random":
+        steps, layers, _ = physical_counts.shape
+        observed_peaks = (
+            physical_counts.reshape(steps, layers, -1, spec.local_experts)
+            .sum(axis=3)
+            .max(axis=2)
+        )
     fallbacks = {}
     if score_steps and replicated:
         base_physical, base_logical = physical, logical
         physical, logical = _balance_recorded_steps(
-            physical, logical, counts, spec.local_experts, current, layer_ids
+            physical,
+            logical,
+            counts,
+            spec.local_experts,
+            current,
+            layer_ids,
+            observed_peaks=observed_peaks,
         )
-        if physical_counts is not None:
+        if spec.physical_count_mode == "row":
             # Only a layer changed by refinement has a distinct fallback.
             fallbacks = {
                 i: (base_physical[i : i + 1], base_logical[i : i + 1])
@@ -108,7 +124,7 @@ def plan_migration(
         physical, logical, known_gains = _prefer_fewer_moves(
             current, physical, logical, counts, spec.local_experts
         )
-    if physical_counts is not None:
+    if spec.physical_count_mode == "row":
         known_gains = _admit_row_dispatch_layers(
             layer_ids,
             current,
@@ -126,7 +142,13 @@ def plan_migration(
         changed = tuple(layer for layer in layer_ids if moved[layer])
     if changed and (score_steps or physical_counts is not None):
         changed = _select_layers_for_migration(
-            changed, current, physical, counts, spec.local_experts, known_gains
+            changed,
+            current,
+            physical,
+            counts,
+            spec.local_experts,
+            known_gains,
+            observed_peaks=observed_peaks,
         )
     elif changed and not replicated:
         # Hierarchical placement can trade compute for locality. If no expert
@@ -339,7 +361,14 @@ def _build_step_profiles(samples, totals, replicas, eligible_layers):
 
 
 def _balance_recorded_steps(
-    physical, logical, counts, local_experts, current, layer_ids
+    physical,
+    logical,
+    counts,
+    local_experts,
+    current,
+    layer_ids,
+    *,
+    observed_peaks=None,
 ):
     """Refine replica placement, spending extra searches on layers with headroom."""
     layers, capacity = physical.shape
@@ -403,10 +432,11 @@ def _balance_recorded_steps(
             improvement = 1 - (candidate_score / baseline[layer]).mean()
             live = current[layer].numpy().reshape(slots.shape)
             target = ids[layer, candidate]
-            if not _migration_gain(samples[:, layer], live, target):
+            observed = None if observed_peaks is None else observed_peaks[:, layer]
+            if not _migration_gain(samples[:, layer], live, target, observed):
                 continue
             primary = ids[layer, order[layer]]
-            primary_gain = _migration_gain(samples[:, layer], live, primary)
+            primary_gain = _migration_gain(samples[:, layer], live, primary, observed)
             if primary_gain and improvement <= 1e-12:
                 continue
             extra = _min_remote_rows(live, target, logical.shape[1]) - _min_remote_rows(
@@ -552,7 +582,7 @@ def _row_dispatch_gain(samples, live_replicas, target_replicas, local_experts):
     return _peak_gain(before, upper, samples.sum(1), ranks)
 
 
-def _migration_gain(samples, live, target):
+def _migration_gain(samples, live, target, before_peak=None):
     num_experts = samples.shape[-1]
 
     def peak_tokens(layer_load, rank_experts):
@@ -566,7 +596,8 @@ def _migration_gain(samples, live, target):
             peak[block] = per_replica[:, rank_experts].sum(axis=-1).max(axis=1)
         return peak
 
-    before_peak = peak_tokens(samples, live)
+    if before_peak is None:
+        before_peak = peak_tokens(samples, live)
     after_peak = peak_tokens(samples, target)
     return _peak_gain(before_peak, after_peak, samples.sum(axis=1), len(live))
 
@@ -587,7 +618,7 @@ def _peak_gain(before_peak, after_peak, totals, ranks):
 
 
 def _select_layers_for_migration(
-    changed, old, physical, counts, local_experts, known_gains
+    changed, old, physical, counts, local_experts, known_gains, *, observed_peaks=None
 ):
     """Skip marginal improvements and stage the most useful layers first."""
     load = counts.numpy()
@@ -599,7 +630,8 @@ def _select_layers_for_migration(
         target = after[layer].reshape(live.shape)
         gain = known_gains.get(layer)
         if gain is None:
-            gain = _migration_gain(load[:, layer], live, target)
+            observed = None if observed_peaks is None else observed_peaks[:, layer]
+            gain = _migration_gain(load[:, layer], live, target, observed)
         if not gain:
             continue
         receives = max(

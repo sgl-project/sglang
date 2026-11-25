@@ -222,7 +222,7 @@ class NpuAsyncEPLBManager(EPLBManager):
             return
         start = time.perf_counter()
         counts, utilization = recorder.snapshot_for_rebalance(
-            physical=coordinator.runtime.spec.use_physical_counts
+            physical=coordinator.runtime.spec.physical_count_mode is not None
         )
         snapshot_seconds = time.perf_counter() - start
         if not self._check_rebalance_needed(utilization):

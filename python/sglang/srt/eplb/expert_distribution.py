@@ -433,8 +433,8 @@ class _SinglePassGatherer(ABC):
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
         if get_exec().moe.expert_distribution_recorder_mode == "stat_approx":
-            # Ascend Ops reports physical IDs at TopK, not at DeepEP dispatch.
-            if get_exec().moe.moe_a2a_backend == "ascend_ops":
+            # Both Ascend dispatchers report physical IDs at TopK.
+            if get_exec().moe.moe_a2a_backend in ("ascend_ops", "ascend_fuseep"):
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             if get_exec().moe.moe_a2a_backend != "none" and (
                 get_exec().moe.deepep_mode == "normal"
