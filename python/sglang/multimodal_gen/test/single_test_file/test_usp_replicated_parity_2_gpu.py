@@ -132,8 +132,8 @@ def _worker() -> int:
 
 class TestUSPReplicatedParity(CustomTestCase):
     def test_replicated_parity_two_ranks(self):
-        if not current_platform.is_cuda():
-            self.skipTest("CUDA-only test")
+        if not (current_platform.is_cuda() or current_platform.is_rocm()):
+            self.skipTest("CUDA/ROCm-only test")
         if torch.cuda.device_count() < _WORLD:
             self.skipTest(f"needs {_WORLD} GPUs")
         procs = []
