@@ -87,6 +87,40 @@ def load_scheduler_tokenizer(*, is_multimodal: bool):
     return get_tokenizer(serving.tokenizer_path, **kwargs), None
 
 
+def _warm_dynamic_module_files(model_path: Path) -> int:
+    """Copy the model's remote tokenizer/processor files into HF_MODULES_CACHE.
+
+    Uses transformers' own cache layout and relative-import handling, but only
+    copies files: no remote class is imported or instantiated in this process.
+    """
+    from transformers.dynamic_module_utils import get_cached_module_file
+
+    module_files = set()
+    for config_name in (
+        "tokenizer_config.json",
+        "processor_config.json",
+        "preprocessor_config.json",
+    ):
+        config_path = model_path / config_name
+        if not config_path.is_file():
+            continue
+        auto_map = json.loads(config_path.read_text(encoding="utf-8")).get(
+            "auto_map", {}
+        )
+        for reference in auto_map.values():
+            for item in reference if isinstance(reference, list) else [reference]:
+                if not isinstance(item, str) or "." not in item:
+                    continue
+                # repo_id--module.Class points into another snapshot; that repo
+                # warms its own copy when it is loaded.
+                if "--" in item:
+                    continue
+                module_files.add(item.rsplit(".", 1)[0] + ".py")
+    for module_file in sorted(module_files):
+        get_cached_module_file(str(model_path), module_file)
+    return len(module_files)
+
+
 def maybe_prewarm_scheduler_tokenizer():
     """Populate the local HF modules cache before concurrent scheduler loads."""
     # Best effort: a failure here must never block the server launch. The guard
@@ -104,9 +138,24 @@ def maybe_prewarm_scheduler_tokenizer():
             return
 
         # huggingface/transformers#50843: a late copier can truncate a module
-        # another scheduler is importing. Populate the cache before spawning
-        # either.
-        load_scheduler_tokenizer(is_multimodal=process_model_config().is_multimodal)
+        # another scheduler is importing. Copy the files before spawning either.
+        try:
+            warmed = _warm_dynamic_module_files(Path(serving.tokenizer_path))
+            logger.info(
+                "Prewarmed %d HF dynamic module file(s) from %s",
+                warmed,
+                serving.tokenizer_path,
+            )
+        except Exception:
+            # auto_map does not always list every module a processor pulls in;
+            # fall back to a full load so the cache is still complete. This is
+            # the slow path and only runs when the file-level pass fails.
+            logger.warning(
+                "File-level prewarm failed for %s; falling back to a full load.",
+                serving.tokenizer_path,
+                exc_info=True,
+            )
+            load_scheduler_tokenizer(is_multimodal=process_model_config().is_multimodal)
     except Exception:
         logger.warning(
             "Could not prewarm the HF modules cache; schedulers will load it "
