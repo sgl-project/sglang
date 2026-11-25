@@ -54,9 +54,9 @@ class HiCacheStorageConfig:
 
     # Whole-page replication can differ from the target's attention layout.
     rank_replicated: Optional[bool] = None
-    # Sharded storage keys name the head shard, while tp_rank still identifies
-    # the process that owns the relevant buffers.
-    key_tp_rank: Optional[int] = None
+    sharded_file: bool = False
+    # Page-interleaved File storage elects writers according to page placement.
+    storage_writer_override: Optional[bool] = None
 
     def __post_init__(self):
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
@@ -93,14 +93,8 @@ class HiCacheStorageConfig:
         MLA uses one writer per DCP shard in the first DCP group; with DCP
         disabled, MLA uses TP rank 0 and non-MLA uses every TP rank.
         """
-        if self.key_tp_rank is not None:
-            # Plain TP gives each MLA rank different pages. With CP, each CP
-            # rank's pages have identical bytes across attention TP replicas.
-            return (
-                not self.is_rank_replicated
-                or self.attn_cp_size == 1
-                or self.key_tp_rank == 0
-            )
+        if self.storage_writer_override is not None:
+            return self.storage_writer_override
         if self.unified_suffixes is not None and self.attn_cp_rank != 0:
             return False
         return not self.is_rank_replicated or self.tp_rank == self.dcp_rank
@@ -912,13 +906,6 @@ class HiCacheFile(HiCacheStorage):
         shard_suffix = ""
         if storage_config.pp_size > 1:
             shard_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
-        if storage_config.key_tp_rank is not None:
-            # A page can change owners. The model namespace already includes
-            # attention TP size, so only nonreplicated KV needs a head rank.
-            if not storage_config.is_rank_replicated:
-                shard_suffix += f"_head{storage_config.key_tp_rank}"
-            self.config_suffix = self.tp_config_suffix = f"_{model_name}{shard_suffix}"
-            return
         # Under NSA context parallel each CP rank holds a disjoint slice of
         # every page, so give each rank its own file key to avoid a cross-rank
         # write race.
@@ -1009,7 +996,7 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             owned_suffixes=owned_suffixes,
             tp_rank=tp_rank,
-            allow_eviction=storage_config.key_tp_rank is None,
+            allow_eviction=not storage_config.sharded_file,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None

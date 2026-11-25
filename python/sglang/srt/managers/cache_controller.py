@@ -70,8 +70,6 @@ def storage_model_name(
     model_name: Optional[str],
     host_pool: HostKVCache | LogicalHostPool | PageInterleaveHostPool,
     kv_cache_dtype: torch.dtype,
-    *,
-    storage_format_tag: Optional[str] = None,
 ) -> str:
     """Namespace storage keys by page format and the server's logical KV dtype."""
     if not isinstance(kv_cache_dtype, torch.dtype):
@@ -81,7 +79,7 @@ def storage_model_name(
         )
     parts = [
         model_name,
-        storage_format_tag or host_pool.storage_format_tag,
+        host_pool.storage_format_tag,
         f"dtype_{normalize_dtype(kv_cache_dtype)}",
     ]
     return "-".join(part for part in parts if part)
@@ -771,27 +769,16 @@ class HiCacheController:
                 host_memory_mode=self.host_memory_mode,
                 key_scheme=key_scheme,
             )
-            if self.mem_pool_host is not self.storage_host_pool:
-                other_pools = [
-                    str(entry.name)
-                    for entry in self.mem_pool_host.entries
-                    if entry.host_pool is not self.storage_host_pool
-                ]
-                if other_pools:
-                    raise ValueError(
-                        "HiCache storage with KV sharding supports only the KV "
-                        f"host pool, not {other_pools}."
-                    )
 
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
+        self.storage_config = self._generate_storage_config(
+            model_name, storage_backend_extra_config, sharded_file=sharded_file
+        )
         self.storage_backend_type = storage_backend
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
-        self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config, sharded_file=sharded_file
-        )
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -994,23 +981,20 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
-        host_pool = self.storage_host_pool
         # Token KV views carry the server's resolved logical dtype, including
         # FP8 variants that share a uint8 backing buffer.
         model_name = storage_model_name(
-            model_name,
-            host_pool,
-            getattr(anchor, "dtype", None),
-            storage_format_tag=(
-                host_pool.sharded_storage_format_tag if sharded_file else None
-            ),
+            model_name, self.storage_host_pool, getattr(anchor, "dtype", None)
         )
-        key_tp_rank = None
+        storage_writer_override = None
         if sharded_file:
-            # A page's owner depends on its chain's rotation, so keys name only
-            # the head shard; the tag keeps writers of other page bytes apart.
-            key_tp_rank = parallel.attn_tp_rank
-            model_name = f"{model_name}-atp{parallel.attn_tp_size}"
+            # CP ranks own disjoint pages. With MLA and CP, elect one attention
+            # TP replica per CP owner. With plain-TP MLA, TP ranks own the pages.
+            storage_writer_override = (
+                not is_rank_replicated
+                or attn_cp_size == 1
+                or parallel.attn_tp_rank == 0
+            )
         unified_plan = self._build_unified_plan(model_name, attn_cp_size)
         unified_chunk_spans = None
         if unified_plan is not None:
@@ -1041,7 +1025,8 @@ class HiCacheController:
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
-            key_tp_rank=key_tp_rank,
+            sharded_file=sharded_file,
+            storage_writer_override=storage_writer_override,
         )
 
     def _build_unified_plan(

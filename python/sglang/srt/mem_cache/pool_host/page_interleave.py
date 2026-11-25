@@ -16,7 +16,6 @@ logical host capacity grows with the shard group, like the device's.
 
 from __future__ import annotations
 
-import hashlib
 from typing import Optional, Tuple
 
 import torch
@@ -24,7 +23,6 @@ import torch
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.page_interleave import PageInterleavePlacement
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, synchronized
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
 
 class PageInterleaveHostPool:
@@ -52,30 +50,6 @@ class PageInterleaveHostPool:
     @property
     def logical_size(self) -> int:
         return self.size * self.shard_size
-
-    @property
-    def sharded_storage_format_tag(self) -> str:
-        # Storage can be read by a different owner, or a different shard group.
-        # Name the page bytes, excluding rank and pool capacity. Shape, dtype
-        # and layer range must agree even when two formats have equal sizes.
-        if isinstance(self.host_pool, MLATokenToKVPoolHost):
-            head_geometry = (
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                self.kv_cache_dim,
-            )
-        else:
-            head_geometry = (self.head_num, self.head_dim, self.v_head_dim)
-        geometry = (
-            str(self.dtype),
-            self.page_size,
-            self.start_layer,
-            self.end_layer,
-            self.layer_num,
-            *head_geometry,
-        )
-        fingerprint = hashlib.sha256(repr(geometry).encode()).hexdigest()[:16]
-        return f"kvshard-v1-{self.layout}-{fingerprint}"
 
     @synchronized
     def clear(self):

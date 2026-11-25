@@ -182,7 +182,11 @@ class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
         self.assertEqual(b._evictor._total_bytes, 0)
 
     def test_sharded_file_refuses_eviction_before_scanning_files(self):
-        config = replace(_make_config(extra_config={"max_size": 1}), key_tp_rank=0)
+        config = replace(
+            _make_config(extra_config={"max_size": 1}),
+            sharded_file=True,
+            unified_suffixes=["ukv1-test_L0-1_H0"],
+        )
         with (
             mock.patch.object(LRUFileEvictor, "_scan_existing_files") as scan,
             self.assertRaisesRegex(ValueError, "eviction"),
@@ -305,22 +309,6 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
         self.assertTrue(b0.config_suffix.endswith("_cp0_4"))
         self.assertTrue(b1.config_suffix.endswith("_cp3_4"))
         self.assertNotEqual(b0.config_suffix, b1.config_suffix)
-
-    def test_sharded_gqa_keys_follow_head_shard_across_cp_ranks(self):
-        suffixes = []
-        for cp_rank, head_rank in ((0, 1), (1, 1), (1, 0)):
-            config = _make_config(
-                tp_rank=cp_rank * 2 + head_rank,
-                tp_size=4,
-                attn_cp_rank=cp_rank,
-                attn_cp_size=2,
-            )
-            backend = HiCacheFile(
-                replace(config, key_tp_rank=head_rank), file_path=self.tmpdir
-            )
-            suffixes.append(backend.config_suffix)
-        self.assertEqual(suffixes[0], suffixes[1])
-        self.assertNotEqual(suffixes[1], suffixes[2])
 
 
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):

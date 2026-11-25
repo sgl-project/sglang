@@ -144,10 +144,10 @@ def check_kv_shard_storage(
             "--enable-kv-cache-sharding requires --hicache-host-memory-mode "
             "cache with a storage backend."
         )
-    if key_scheme != "rank-suffix":
+    if key_scheme != "unified":
         raise ValueError(
             "--enable-kv-cache-sharding requires --hicache-storage-key-scheme "
-            "rank-suffix with File storage."
+            "unified with File storage."
         )
 
 

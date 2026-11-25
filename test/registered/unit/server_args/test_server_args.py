@@ -4985,6 +4985,8 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                     )
                     args.enable_hierarchical_cache = True
                     args.hicache_storage_backend = backend
+                    if backend == "file":
+                        args.hicache_storage_key_scheme = "unified"
                     handle_kv_cache_sharding(args, 80 * 1024)
 
         for backend in ("fast_file", "mooncake"):
@@ -4995,9 +4997,20 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, backend):
                     handle_kv_cache_sharding(args)
 
+    def test_hicache_file_storage_requires_unified_keys(self):
+        args = self._args(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="file",
+            hicache_storage_key_scheme="rank-suffix",
+        )
+        with self.assertRaisesRegex(ValueError, "requires .*key-scheme unified"):
+            handle_kv_cache_sharding(args)
+
     def test_hicache_file_storage_rejects_dsa(self):
         args = self._args(
-            enable_hierarchical_cache=True, hicache_storage_backend="file"
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="file",
+            hicache_storage_key_scheme="unified",
         )
         args._model_config.hf_config = SimpleNamespace(
             architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
