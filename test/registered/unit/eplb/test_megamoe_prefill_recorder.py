@@ -141,6 +141,33 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         )
         self.assertTrue(torch.equal(gatherer._data, torch.tensor([[1, 0, 0, 1]])))
 
+    def test_local_count_buffer_is_this_ranks_slice_of_the_layer_row(self):
+        recorder = _ExpertDistributionRecorderReal.__new__(
+            _ExpertDistributionRecorderReal
+        )
+        gatherer = _SelectExpertsSinglePassGatherer.__new__(
+            _SelectExpertsSinglePassGatherer
+        )
+        gatherer._data = torch.zeros((3, 8), dtype=torch.int32)
+        recorder._single_pass_gatherers = {"primary": gatherer}
+        recorder._current_layer_idx = SimpleNamespace(value=1)
+        local = dict(num_experts=8, ep_rank=2, ep_size=4)
+        with patch.object(recorder, "_hook_enabled", return_value=True):
+            recorder.get_current_pass_local_count_buffer(**local).fill_(1)
+            expected = torch.zeros((3, 8), dtype=torch.int32)
+            expected[1, 4:6] = 1
+            self.assertTrue(torch.equal(gatherer._data, expected))
+            self.assertIsNone(
+                recorder.get_current_pass_local_count_buffer(
+                    num_experts=12, ep_rank=2, ep_size=4
+                )
+            )
+            recorder._current_layer_idx = SimpleNamespace(value=None)
+            self.assertIsNone(recorder.get_current_pass_local_count_buffer(**local))
+        recorder._current_layer_idx = SimpleNamespace(value=1)
+        with patch.object(recorder, "_hook_enabled", return_value=False):
+            self.assertIsNone(recorder.get_current_pass_local_count_buffer(**local))
+
     def _make_recorder(self):
         recorder = _ExpertDistributionRecorderReal.__new__(
             _ExpertDistributionRecorderReal

@@ -43,7 +43,7 @@ def get_mla_metadata(
 
     Delegates to ``flash_mla.get_mla_metadata``.
 
-    Arguments mirror :func:`sgl_kernel.flash_mla.get_mla_metadata`.
+    Arguments mirror :func:`sglang.kernels.ops.attention.flash_mla_interface.get_mla_metadata`.
     """
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error

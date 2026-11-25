@@ -17,8 +17,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BAR_FORMAT, is_hip, set_weight_attrs
+from sglang.srt.utils import BAR_FORMAT, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
@@ -414,8 +415,11 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_aiter():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            raise ValueError(
+                "quark_int4fp8_moe runs only on the aiter MoE runner; "
+                f"--moe-runner-backend {moe_runner_backend.value} with "
+                f"--moe-a2a-backend {get_moe_a2a_backend().value} does not select it."
+            )
 
     def apply(
         self,

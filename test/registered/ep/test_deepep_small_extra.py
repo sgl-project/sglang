@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -83,10 +82,6 @@ class TestTBOWithTPAttn(CustomTestCase):
                 "--mem-fraction-static",  # temp fix as DeepEP buffer is too large.
                 "0.7",
             ],
-            env={
-                **os.environ,
-                "SGLANG_TBO_DEBUG": "1",
-            },
         )
 
     @classmethod
@@ -136,10 +131,6 @@ class TestTBOWithTPAttnAndDenseDP(CustomTestCase):
                 "--mem-fraction-static",  # temp fix as DeepEP buffer is too large.
                 "0.7",
             ],
-            env={
-                **os.environ,
-                "SGLANG_TBO_DEBUG": "1",
-            },
         )
 
     @classmethod

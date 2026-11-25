@@ -25,11 +25,12 @@ from transformers import CLIPVisionModel, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import flatten_nested_list
 
 
 class LlavaVidForCausalLM(nn.Module):
@@ -87,7 +88,7 @@ class LlavaVidForCausalLM(nn.Module):
         if self.vision_feature_select_strategy in ["default", "patch"]:
             selected_image_feature = selected_image_feature[:, 1:]
         elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
+            pass
         else:
             raise ValueError(
                 f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
@@ -157,18 +158,12 @@ class LlavaVidForCausalLM(nn.Module):
 
                 if pixel_values[0].ndim == 4:
                     # llava-hd: BS, num_patch, C=3, H=336, W=336, num_patch obtained from process_images
-                    np.concatenate(pixel_values, axis=0)
                     # ndim=4
                     concat_images = torch.tensor(
                         np.concatenate(pixel_values, axis=0),
                         device=self.vision_tower.device,
                     )
-                    # image_features = self.encode_images(concat_images)
-                    # split_sizes = [image.shape[0] for image in pixel_values]
-                    # image_features = torch.split(image_features, split_sizes, dim=0)
-                    image_features = self.encode_images(
-                        concat_images
-                    )  # , prompts)#, image_counts, long_video=long_video)
+                    image_features = self.encode_images(concat_images)
                     split_sizes = [image.shape[0] for image in pixel_values]
                     image_features = torch.split(image_features, split_sizes, dim=0)
 

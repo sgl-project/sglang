@@ -27,11 +27,12 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding.utils import rotate_half
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, envs, get_compiler_backend, round_up
+from sglang.srt.utils import envs, get_compiler_backend, round_up
 
 logger = logging.getLogger(__name__)
 
@@ -323,7 +324,7 @@ class CLIPEncoderLayer(nn.Module):
             prefix=f"{prefix}.mlp.fc1",
             parallel_group="replicated" if use_data_parallel else "attn_tp",
         )
-        hidden_act = getattr(config, "hidden_act", "gelu")
+        hidden_act = config.hidden_act
         assert hidden_act == "gelu", (
             f"Only gelu activation is supported, got {hidden_act}"
         )

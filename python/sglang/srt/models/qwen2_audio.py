@@ -37,6 +37,7 @@ from transformers.models.qwen2_audio.modeling_qwen2_audio import (
 )
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -46,7 +47,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -170,14 +170,10 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

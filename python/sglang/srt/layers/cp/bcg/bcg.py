@@ -21,18 +21,29 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
-from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
+    CPAttentionBackendKind,
     get_cp_strategy_kind,
 )
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_shard_position_ids,
     cp_split_before_forward,
     prepare_cp_forward,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.model_interfaces import (
+    CPBoundedTailLogits,
+    CPLogitsInputs,
+)
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -83,13 +94,21 @@ class PrefillCPBCGInput:
     positions: torch.Tensor
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
+    # CP-local rows an eager pipeline stage exchanges for the live batch.
+    eager_local_tokens: int = 0
+    supports_max_context_size = False
 
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
         if cls is PrefillCPBCGInput:
             from sglang.srt.layers.cp.bcg import get_cp_bcg_input_type
 
-            return get_cp_bcg_input_type(get_cp_strategy_kind()).create(runner)
+            backend, _ = attention_backends_of(
+                resolved_view(runner.model_runner.server_args)
+            )
+            return get_cp_bcg_input_type(
+                get_cp_strategy_kind(), CPAttentionBackendKind.from_string(backend)
+            ).create(runner)
         with torch.device(runner.device):
             return cls(
                 input_embeds=torch.zeros(
@@ -111,6 +130,9 @@ class PrefillCPBCGInput:
     def model_positions(self, forward_batch):
         # No override: retain the runner's existing model/mRoPE selection.
         return None
+
+    def model_input_ids(self, forward_batch):
+        return forward_batch.input_ids
 
     @staticmethod
     def supports(server_args: ServerArgs) -> bool:
@@ -185,6 +207,11 @@ class PrefillCPBCGInput:
         # built for a different request layout. Always rebuild before sharding.
         forward_batch.attn_cp_metadata = None
         prepare_cp_forward(forward_batch)
+        metadata = forward_batch.attn_cp_metadata
+        if hasattr(metadata, "per_rank_actual_token"):
+            self.eager_local_tokens = int(
+                metadata.per_rank_actual_token[get_parallel().attn_cp_rank]
+            )
 
         captured_local_tokens = None
         if not capture:
@@ -212,17 +239,24 @@ class PrefillCPBCGInput:
                 metadata.max_rank_len = [captured_local_tokens] * cp_size
 
         raw_tokens = int(forward_batch.extend_num_tokens)
-        global_input_ids = forward_batch.input_ids[:raw_tokens]
         global_positions = forward_batch.positions[:raw_tokens]
-        global_input_embeds = runner.model_runner.model.get_input_embeddings()(
-            global_input_ids
-        )
-        local_input_embeds, local_positions = cp_split_before_forward(
-            global_input_embeds,
-            global_positions,
-            forward_batch,
-        )
-        live_local_tokens = int(local_input_embeds.shape[0])
+        is_first_pp_rank = runner.model_runner.pp_group.is_first_rank
+        if is_first_pp_rank:
+            global_input_ids = forward_batch.input_ids[:raw_tokens]
+            global_input_embeds = runner.model_runner.model.get_input_embeddings()(
+                global_input_ids
+            )
+            local_input_embeds, local_positions = cp_split_before_forward(
+                global_input_embeds,
+                global_positions,
+                forward_batch,
+            )
+        else:
+            # Later pipeline stages take the previous stage's CP-local hidden
+            # states (the PP proxy), so only the positions are sharded here.
+            local_input_embeds = None
+            local_positions = cp_shard_position_ids(global_positions, forward_batch)
+        live_local_tokens = int(local_positions.shape[0])
 
         if capture:
             captured_local_tokens = live_local_tokens
@@ -242,13 +276,16 @@ class PrefillCPBCGInput:
                 f"fixed input buffer has capacity {self.input_embeds.shape[0]}"
             )
 
-        input_embeds = self.input_embeds[:captured_local_tokens]
         positions = self.positions[:captured_local_tokens]
-        input_embeds.zero_()
         positions.zero_()
-        input_embeds[:live_local_tokens].copy_(local_input_embeds)
         positions[:live_local_tokens].copy_(local_positions)
-        forward_batch.input_embeds = input_embeds
+        if local_input_embeds is not None:
+            input_embeds = self.input_embeds[:captured_local_tokens]
+            input_embeds.zero_()
+            input_embeds[:live_local_tokens].copy_(local_input_embeds)
+            forward_batch.input_embeds = input_embeds
+        else:
+            forward_batch.input_embeds = None
         forward_batch.positions = positions
         self.live_local_tokens = live_local_tokens
 
@@ -281,21 +318,20 @@ def execute_prefill_cp_bcg(
             static_forward_batch,
             **kwargs,
         )
-        local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
 
+        if not model.pp_group.is_last_rank:
+            # A middle stage returns its PP proxy (aux hidden states, if any,
+            # are packed inside it). Send the rows an eager stage would send,
+            # so the next stage may replay or run eagerly on the same shard.
+            return _slice_output_rows(local_output, cp_input.eager_local_tokens)
+
+        local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:
             hidden_states, aux_hidden_states = local_output
         else:
             hidden_states = local_output
-
-        if not model.pp_group.is_last_rank:
-            return (
-                (hidden_states, aux_hidden_states)
-                if capture_aux_hidden_states
-                else hidden_states
-            )
 
         hidden_states = cp_gather_after_forward(
             hidden_states,
@@ -325,11 +361,22 @@ def execute_prefill_cp_bcg(
             hidden_states, hidden_states_before_norm = hidden_states
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
-            forward_batch.input_ids,
+        logits_inputs = CPLogitsInputs(forward_batch.input_ids, forward_batch)
+        if isinstance(model, CPBoundedTailLogits):
+            logits_inputs = model.prepare_cp_logits_inputs(
+                forward_batch.input_ids, forward_batch
+            )
+
+        output = model.logits_processor(
+            logits_inputs.input_ids,
             hidden_states,
             model.lm_head,
-            forward_batch,
+            logits_inputs.logits_metadata,
             aux_hidden_states,
             **logits_kwargs,
         )
+        if logits_inputs.hidden_states_token_indices is not None:
+            output.hidden_states_token_indices = (
+                logits_inputs.hidden_states_token_indices
+            )
+        return output

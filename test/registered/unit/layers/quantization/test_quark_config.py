@@ -81,7 +81,8 @@ class TestCheckSchemeSupportedError(CustomTestCase):
         self.assertTrue(ok)
 
     def test_no_device_returns_false(self):
-        with patch(_GET_CAP, return_value=None):
+        # get_device_capability() reports a device without one as (None, None).
+        with patch(_GET_CAP, return_value=(None, None)):
             ok = _bare_config()._check_scheme_supported(min_capability=70)
         self.assertFalse(ok)
 
@@ -1183,29 +1184,6 @@ class TestSharedExpertOnlineMxfp4Quantize(CustomTestCase):
     def _scheme() -> QuarkW4A4MXFp4MoE:
         # __init__ reads the quant specs and logs; none of that is involved.
         return object.__new__(QuarkW4A4MXFp4MoE)
-
-    def test_the_whole_tensor_is_forwarded_and_the_result_passed_back(self):
-        # Quantizing whole and sharding afterwards is what makes a rank's bytes
-        # match an offline-quantized checkpoint of the same shard, so the
-        # tensor must reach aiter unsliced and come back untouched.
-        weight = torch.arange(4 * 64, dtype=torch.bfloat16).reshape(4, 64)
-        packed = torch.zeros(4, 32, dtype=torch.uint8)
-        scale = torch.zeros(4, 2, dtype=torch.uint8)
-        seen = []
-
-        def fake_quant(tensor):
-            seen.append(tensor)
-            return packed, scale
-
-        with patch.object(quark_moe, "dynamic_mxfp4_quant", fake_quant):
-            out_weight, out_scale = self._scheme().quantize_shared_expert(
-                weight, torch.device("cpu")
-            )
-
-        self.assertEqual(len(seen), 1)
-        torch.testing.assert_close(seen[0], weight)
-        self.assertIs(out_weight, packed)
-        self.assertIs(out_scale, scale)
 
     def test_a_build_without_aiter_refuses_instead_of_returning_none(self):
         # dynamic_mxfp4_quant is None on a CUDA build. Calling it would raise

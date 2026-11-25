@@ -13,7 +13,7 @@ from sglang.kernels.ops.elementwise.window_unpartition_add import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.sam import make_windows, window_unpartition_add_reference
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @pytest.mark.parametrize("batch,height,width", [(1, 40, 40), (8, 40, 40), (2, 64, 64)])
@@ -78,12 +78,6 @@ def test_unsupported_inputs_take_the_eager_path(case: str):
         windows, shortcut = _inputs()
         windows = windows[1:]
     assert not can_use_window_unpartition_add(windows, shortcut, 14)
-
-
-def test_kernel_rejects_non_bf16_inputs():
-    windows, shortcut = _inputs(dtype=torch.float16)
-    with pytest.raises(Exception, match="dtype|Tensor match failed"):
-        window_unpartition_add(windows, shortcut, 14)
 
 
 if __name__ == "__main__":

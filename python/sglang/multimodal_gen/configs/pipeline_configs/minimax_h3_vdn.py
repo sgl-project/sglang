@@ -26,6 +26,10 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
             'audited high-quality deployment. Use quality="exact".'
         )
 
+    def extra_dit_components(self, server_args) -> tuple[str, ...]:
+        # one partition; validate_server_args rejects --model-variant
+        return ()
+
     def validate_server_args(self, server_args) -> None:
         if server_args.model_variant is not None:
             raise ValueError(

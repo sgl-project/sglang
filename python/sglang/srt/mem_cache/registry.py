@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_serving,
 )
@@ -116,7 +117,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         # A pure-window model keeps no full-attention prefix in LMCache.
         params.tree_slots = tuple(
             slot
-            for slot in storage.tree_slots(window_reach=params.draft_swa_window)
+            for slot in storage.tree_slots()
             if not (is_pure_swa and slot.family == TREE_TOKEN)
         )
         return LMCacheUnifiedRadixCache(
@@ -151,6 +152,13 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         return _flexkv_factory(ctx)
 
     return create_unified_radix_cache(ctx)
+
+
+def keep_full_kv_only(params: CacheInitParams, tree_slots) -> list:
+    from sglang.srt.mem_cache.kv.plan import TREE_STATE
+
+    params.request_mamba_only = True
+    return [slot for slot in tree_slots if slot.family != TREE_STATE]
 
 
 def _static_tree_shape(ctx: TreeCacheBuildContext, allocator):
@@ -192,9 +200,16 @@ def create_unified_radix_cache(
         allocator,
         shape=_static_tree_shape(ctx, allocator),
     )
-    tree_slots = list(storage.tree_slots(window_reach=params.draft_swa_window))
+    tree_slots = list(storage.tree_slots())
+    if ctx.is_hybrid_ssm and get_exec().mamba.decode_state_free_radix:
+        tree_slots = keep_full_kv_only(params, tree_slots)
 
-    if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
+    # C128 pages are owned through the allocator's dedicated C128 sub-allocator,
+    # so the component only applies to models carrying ratio-128 layers (V4).
+    # V4.1 reuses the NPU req pool but has no C128 pool and runs on the generic
+    # SWA allocator, whose hooks would fail on the missing c128_attn_allocator.
+    has_c128_layers = 128 in (getattr(ctx.model_config, "compress_ratios", None) or ())
+    if has_c128_layers and hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
             C128SidecarComponent,
         )
@@ -233,10 +248,16 @@ def create_unified_radix_cache(
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
 
         def publish_linker(linker):
-            counter = None if linker is None else linker.layer_done_counter
+            counter = draft_counter = None
+            if linker is not None:
+                counter = linker.layer_done_counter
+                if PoolName.MAMBA in linker.pools:
+                    kvcache.layer_router.load_parts_layer_wise()
+                if PoolName.DRAFT in linker.pools:
+                    draft_counter = linker.draft_layer_counter()
             kvcache.register_layer_transfer_counter(counter)
-            if linker is not None and PoolName.MAMBA in linker.pools:
-                kvcache.layer_router.load_parts_layer_wise()
+            for draft_pool in params.sidecar_draft_device_pools:
+                draft_pool.register_layer_transfer_counter(draft_counter)
             ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
 
         cache.init_linker_attachment(
