@@ -159,6 +159,9 @@ class TestSmallMRouterGfx950(CustomTestCase):
         from sglang.srt.configs.shared_experts import SharedExpertsConfig
         from sglang.srt.layers.moe.topk import TopKConfig
 
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        if arch not in R._GLM_ARCHS:
+            self.skipTest(f"glm_moe_topk_output takes the unfused path on {arch}")
         x, wg, bias = self._glm_inputs(R, 8)
         cfg = TopKConfig(
             top_k=R.GLM_TOPK + 1,
