@@ -7,13 +7,12 @@ The only place that decides which algorithm runs: each entry point dispatches on
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.watermarking.gumbel import adapter as gumbel_adapter
-from sglang.srt.sampling.watermarking.interface import NO_WATERMARK_VIEW_FIELDS
 from sglang.srt.sampling.watermarking.synthid import adapter as synthid_adapter
 
 if TYPE_CHECKING:
@@ -71,11 +70,3 @@ def watermark_request_enabled(sampling_params: SamplingParams) -> bool:
 
 def check_watermark_algorithm_args(cfg: ResolvingConfig) -> None:
     _ADAPTERS[cfg.watermark_algorithm].check_server_args(cfg)
-
-
-def watermark_view_fields(rows: Optional[WatermarkRows]) -> dict[str, Any]:
-    if rows is None:
-        return NO_WATERMARK_VIEW_FIELDS
-    return _ADAPTERS[get_exec().features.watermark_algorithm].watermark_view_fields(
-        rows
-    )

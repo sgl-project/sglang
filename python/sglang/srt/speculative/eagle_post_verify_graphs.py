@@ -19,12 +19,10 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
-from sglang.srt.speculative.eagle_worker_common import (
-    STOCK_SPECULATIVE_RUNTIME_HOOKS,
-    make_post_verify_io,
-)
+from sglang.srt.speculative.eagle_worker_common import STOCK_SPECULATIVE_RUNTIME_HOOKS
 
 if TYPE_CHECKING:
+    from sglang.kernels.plugin_kernels.nvidia.spec import LocalKeysFn
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 
@@ -137,7 +135,7 @@ class EaglePostVerifyGraphs:
             or batch.hisparse_coordinator is not None
             or verify_input.draft_probs is not None
             or route.adjusts_logits
-            # the replayed sampling view carries no seeds and no min-p
+            # the replayed sampling info carries no seeds and no min-p
             or info.sampling_seed is not None
             or info.need_min_p_sampling
             # compute_spec_logprobs reads the gathered logits off logits_output
@@ -203,7 +201,7 @@ class EaglePostVerifyGraphs:
         from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 
         predict, accept_lens, accept_index = _sample(
-            slot, self._speculative_runtime_hooks
+            slot, self._speculative_runtime_hooks.local_keys
         )
         new_seq_lens, bonus_tokens, commit_steps, draft_extend_inputs = (
             prepare_verify_commit_outputs(
@@ -255,8 +253,12 @@ class EaglePostVerifyGraphs:
         )
 
 
-def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
-    """Run post-verify through the same bound strategy as the eager path."""
+def _sample(slot: SimpleNamespace, local_keys: LocalKeysFn) -> tuple:
+    """eagle_sample over the slot's staged inputs, with the runtime hooks' local
+    keys as on the eager path."""
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+    from sglang.srt.speculative.eagle_utils import eagle_sample
 
     staged = slot.staged
     unused = slot.unused_sampling_tensor
@@ -279,6 +281,7 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
         top_ps=staged.get("top_ps", unused),
         min_ps=unused,
         max_top_k=None,
+        has_custom_logit_processor=False,
     )
     verify_view = SimpleNamespace(
         draft_token=staged["draft_tokens"],
@@ -292,29 +295,33 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
         custom_mask=None,
         positions=None,
     )
-    output = speculative_runtime_hooks.post_verify(
-        make_post_verify_io(
-            verify_input=verify_view,
-            sampling_info=sampling_info,
-            sequence_lengths=staged["seq_lens"],
-            request_pool_indices=staged["req_pool_indices"],
-            device=slot.device,
-            logits_output=SimpleNamespace(
-                next_token_logits=slot.logits,
-                next_token_logits_vocab_shard=slot.vocab_shard,
-            ),
-            grammar_mask=None,
-            # Post-verify graph eligibility excludes every watermark round.
-            watermark=None,
-            watermark_full_mask=True,
-            return_logprob=slot.return_logprob,
-            is_idle=False,
-            simulated_accept_length=staged.get("sim_accept_len"),
-            sparse_target_max_top_k=slot.max_top_k,
-            sparse_bonus_argmax=slot.max_top_k is not None,
-        )
+    batch = SimpleNamespace(
+        device=slot.device,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        seq_lens=staged["seq_lens"],
+        sampling_info=sampling_info,
+        req_pool_indices=staged["req_pool_indices"],
+        return_logprob=slot.return_logprob,
     )
-    return output.token_ids, output.accepted_lengths, output.accepted_indices
+    # Post-verify graph eligibility excludes every grammar and watermark round.
+    verify = VerifyStep(
+        batch=batch,
+        route=VerifyRoute.derive(sampling_info, has_grammar=False, has_watermark=False),
+        watermark=None,
+        watermark_full_mask=True,
+    )
+    return eagle_sample(
+        verify_view,
+        verify,
+        SimpleNamespace(
+            next_token_logits=slot.logits,
+            next_token_logits_vocab_shard=slot.vocab_shard,
+        ),
+        uno_target_max_top_k=slot.max_top_k,
+        simulated_acc_len=staged.get("sim_accept_len"),
+        sparse_bonus_argmax=slot.max_top_k is not None,
+        local_keys=local_keys,
+    )
 
 
 class _PostVerifyGraphs:

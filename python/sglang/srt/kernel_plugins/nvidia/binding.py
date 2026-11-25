@@ -37,7 +37,6 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     BuiltMegakernel,
     Feature,
     MegakernelSpec,
-    PostVerifyStrategy,
     SpeculativeRuntimeHooks,
     Step,
     SupportsDecodeTensorEntry,
@@ -1073,12 +1072,12 @@ def bind_speculative_runtime_hooks(
     model: torch.nn.Module,
     defaults: SpeculativeRuntimeHooks,
 ) -> SpeculativeRuntimeHooks:
-    """Resolve target-side speculative strategies once at the binding boundary.
+    """Resolve the target-side speculative runtime hooks once, at binding.
 
-    The caller's stock strategies are returned by identity when the runtime master
+    The caller's stock hooks are returned by identity when the runtime master
     switch is off or the built provider has no factory. Provider presence must agree
-    across ranks before any rank can call it. The provider may change the local key
-    builder, but the runtime-owned verification runner cannot be replaced.
+    across ranks before any rank can call it. The provider may change only the
+    local key builder.
     """
     if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
         return defaults
@@ -1097,12 +1096,8 @@ def bind_speculative_runtime_hooks(
         raise TypeError(
             "speculative runtime hooks factory must return SpeculativeRuntimeHooks"
         )
-    if not isinstance(hooks.post_verify, PostVerifyStrategy):
-        raise TypeError("post_verify must be a PostVerifyStrategy")
-    if hooks.post_verify.run is not defaults.post_verify.run:
-        raise ValueError("a provider cannot replace the runtime post-verify runner")
-    if not callable(hooks.post_verify.local_keys):
-        raise TypeError("post_verify.local_keys must be callable")
+    if not callable(hooks.local_keys):
+        raise TypeError("local_keys must be callable")
     return hooks
 
 

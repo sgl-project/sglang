@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 import torch
@@ -294,7 +294,7 @@ class GumbelSample:
 
 
 class GumbelVerify:
-    """One verify's forcing; also the provider ABI v2 ``WatermarkStateView``."""
+    """One verify's forcing."""
 
     def __init__(
         self, state: WatermarkState, rows: GumbelRows, full_mask: bool
@@ -329,7 +329,7 @@ class GumbelVerify:
             draft_tokens = draft_tokens.reshape(-1)
             positions = positions.reshape(-1)
         if logits.is_cuda:
-            context_hashes, selected = self.force_speculative_from_tree(
+            context_hashes, selected = self.state.force_speculative_from_tree(
                 logits=logits,
                 req_pool_indices=req_pool_indices,
                 draft_tokens=draft_tokens,
@@ -338,24 +338,29 @@ class GumbelVerify:
                 sampling_info=sampling_info,
                 draft_token_num=draft_token_num,
                 full_mask=self.full_mask,
+                keys=self.rows.keys,
+                context_windows=self.rows.context_windows,
+                watermark_enabled=self.rows.enabled,
             )
         else:
-            contexts, context_lengths = self.speculative_contexts(
+            contexts, context_lengths = self.state.speculative_contexts(
                 req_pool_indices=req_pool_indices,
                 draft_tokens=draft_tokens,
                 custom_mask=custom_mask,
                 positions=positions,
                 draft_token_num=draft_token_num,
                 full_mask=self.full_mask,
-                context_windows=self.context_windows(sampling_info),
+                context_windows=self.rows.context_windows,
             )
-            context_hashes, selected = self.force_speculative(
+            context_hashes, selected = self.state.force_speculative(
                 logits=logits,
                 req_pool_indices=req_pool_indices,
                 contexts=contexts,
                 context_lengths=context_lengths,
                 sampling_info=sampling_info,
                 draft_token_num=draft_token_num,
+                keys=self.rows.keys,
+                watermark_enabled=self.rows.enabled,
             )
         self._forced = (req_pool_indices, context_hashes, selected)
         return logits, sampling_info
@@ -368,102 +373,12 @@ class GumbelVerify:
             accept_index = torch.arange(
                 selected.numel(), dtype=torch.int32, device=selected.device
             ).view(-1, self._chain_width)
-        self.record_speculative(
+        self.state.record_speculative(
             req_pool_indices, context_hashes, selected, accept_index, accept.accept_lens
         )
         self.state.append_speculative(
             req_pool_indices, accept.accept_tokens(), accept.accept_lens
         )
-
-    # Provider ABI v2 WatermarkStateView: the state's operations on these rows.
-    def context_windows(self, sampling: Any) -> torch.Tensor:
-        return self.rows.context_windows
-
-    def speculative_contexts(
-        self,
-        req_pool_indices: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        custom_mask: torch.Tensor,
-        positions: torch.Tensor,
-        draft_token_num: int,
-        full_mask: bool,
-        context_windows: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.state.speculative_contexts(
-            req_pool_indices=req_pool_indices,
-            draft_tokens=draft_tokens,
-            custom_mask=custom_mask,
-            positions=positions,
-            draft_token_num=draft_token_num,
-            full_mask=full_mask,
-            context_windows=context_windows,
-        )
-
-    def force_speculative(
-        self,
-        logits: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        contexts: torch.Tensor,
-        context_lengths: torch.Tensor,
-        sampling_info: Any,
-        draft_token_num: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.state.force_speculative(
-            logits=logits,
-            req_pool_indices=req_pool_indices,
-            contexts=contexts,
-            context_lengths=context_lengths,
-            sampling_info=sampling_info,
-            draft_token_num=draft_token_num,
-            keys=self.rows.keys,
-            watermark_enabled=self.rows.enabled,
-        )
-
-    def force_speculative_from_tree(
-        self,
-        logits: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        custom_mask: torch.Tensor,
-        positions: torch.Tensor,
-        sampling_info: Any,
-        draft_token_num: int,
-        full_mask: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.state.force_speculative_from_tree(
-            logits=logits,
-            req_pool_indices=req_pool_indices,
-            draft_tokens=draft_tokens,
-            custom_mask=custom_mask,
-            positions=positions,
-            sampling_info=sampling_info,
-            draft_token_num=draft_token_num,
-            full_mask=full_mask,
-            keys=self.rows.keys,
-            context_windows=self.rows.context_windows,
-            watermark_enabled=self.rows.enabled,
-        )
-
-    def record_speculative(
-        self,
-        req_pool_indices: torch.Tensor,
-        context_hashes: torch.Tensor,
-        selected: torch.Tensor,
-        accept_index: torch.Tensor,
-        accept_lens: torch.Tensor,
-    ) -> None:
-        self.state.record_speculative(
-            req_pool_indices, context_hashes, selected, accept_index, accept_lens
-        )
-
-
-def watermark_view_fields(rows: GumbelRows) -> dict[str, Any]:
-    return {
-        "watermark_keys": rows.keys,
-        "watermark_context_windows": rows.context_windows,
-        "watermark_enabled": rows.enabled,
-        "has_watermark_candidates": True,
-    }
 
 
 def check_server_args(cfg: ResolvingConfig) -> None:

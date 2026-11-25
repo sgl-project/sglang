@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
 
 # bumped on any breaking change to the contracts in this module
-MEGAKERNEL_API_VERSION = 3
+MEGAKERNEL_API_VERSION = 4
 
 # the sglang.srt.plugins entry point that registers the specs
 ENTRY_POINT = "nvidia_megakernel"
@@ -178,219 +178,11 @@ class ShardedLogitsView(msgspec.Struct, frozen=True):
 LocalKeysFn = Callable[[ShardedLogitsView], Optional[torch.Tensor]]
 
 
-class VerifyLogitsView(Protocol):
-    """The mutable logits fields consumed by the stock verifier.
-
-    If verification gathers a full vocabulary, it writes the full tensor back to
-    ``next_token_logits`` and clears ``next_token_logits_vocab_shard`` in place.
-    """
-
-    next_token_logits: torch.Tensor
-    next_token_logits_vocab_shard: Optional[VocabShardView]
-
-
-class GrammarMaskView(Protocol):
-    def apply(self, logits: torch.Tensor) -> None:
-        """Mask ``logits`` in place."""
-
-
-class VerifyTreeView(msgspec.Struct, frozen=True):
-    """Borrowed tree topology and proposal tensors for one verify."""
-
-    draft_tokens: torch.Tensor
-    draft_probabilities: Optional[torch.Tensor]
-    retrieve_index: torch.Tensor
-    next_child: torch.Tensor
-    next_sibling: torch.Tensor
-    custom_mask: Optional[torch.Tensor]
-    positions: Optional[torch.Tensor]
-    tokens_per_request: int
-    max_depth: int
-    topk: int
-
-    # Compatibility names used by the stock verifier. They are properties rather
-    # than stored fields, so the frozen public view stays exact.
-    @property
-    def draft_token(self) -> torch.Tensor:
-        return self.draft_tokens
-
-    @property
-    def draft_probs(self) -> Optional[torch.Tensor]:
-        return self.draft_probabilities
-
-    @property
-    def retrieve_next_token(self) -> torch.Tensor:
-        return self.next_child
-
-    @property
-    def retrieve_next_sibling(self) -> torch.Tensor:
-        return self.next_sibling
-
-    @property
-    def draft_token_num(self) -> int:
-        return self.tokens_per_request
-
-    @property
-    def max_tree_depth(self) -> int:
-        return self.max_depth
-
-    @property
-    def tree_topk(self) -> int:
-        return self.topk
-
-
-class VerifyPenaltiesView(Protocol):
-    def apply_verify(
-        self,
-        logits: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        next_child: Optional[torch.Tensor] = None,
-        next_sibling: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Apply each verify row's own sampling penalties to ``logits`` in place."""
-
-
-class VerifySamplingView(msgspec.Struct, frozen=True):
-    """Borrowed model-independent sampling tensors and resolved host flags."""
-
-    sequence_lengths: torch.Tensor
-    temperatures: torch.Tensor
-    top_ks: torch.Tensor
-    top_ps: torch.Tensor
-    min_ps: torch.Tensor
-    step_penalties: Optional[VerifyPenaltiesView]
-    logit_bias: Optional[torch.Tensor]
-    sampling_seed: Optional[torch.Tensor]
-    is_all_greedy: bool
-    need_top_k_sampling: bool
-    need_top_p_sampling: bool
-    need_min_p_sampling: bool
-    watermark_keys: Optional[torch.Tensor]
-    watermark_context_windows: Optional[torch.Tensor]
-    watermark_enabled: Optional[torch.Tensor]
-    has_watermark_candidates: bool
-    max_top_k: Optional[int]
-    device: torch.device
-
-    # A compatibility name read by the stock verifier, a property so the view's
-    # fields stay exact: the view carries no custom logit processors.
-    @property
-    def has_custom_logit_processor(self) -> bool:
-        return False
-
-
-class WatermarkStateView(Protocol):
-    """The watermark operations used during speculative verification."""
-
-    def context_windows(self, sampling: VerifySamplingView) -> torch.Tensor: ...
-
-    def speculative_contexts(
-        self,
-        req_pool_indices: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        custom_mask: torch.Tensor,
-        positions: torch.Tensor,
-        draft_token_num: int,
-        full_mask: bool,
-        context_windows: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-    def force_speculative(
-        self,
-        logits: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        contexts: torch.Tensor,
-        context_lengths: torch.Tensor,
-        sampling_info: VerifySamplingView,
-        draft_token_num: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-    def force_speculative_from_tree(
-        self,
-        logits: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        custom_mask: torch.Tensor,
-        positions: torch.Tensor,
-        sampling_info: VerifySamplingView,
-        draft_token_num: int,
-        full_mask: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-    def record_speculative(
-        self,
-        req_pool_indices: torch.Tensor,
-        context_hashes: torch.Tensor,
-        selected: torch.Tensor,
-        accept_index: torch.Tensor,
-        accept_lens: torch.Tensor,
-    ) -> None: ...
-
-
-class PostVerifyIO(msgspec.Struct, frozen=True):
-    """Borrowed inputs for target-side speculative acceptance and sampling.
-
-    The runtime owns every object in this view. A hook may use them for the current
-    call but must not retain references after it returns.
-    """
-
-    logits: VerifyLogitsView
-    verify_tree: VerifyTreeView
-    sampling: VerifySamplingView
-    grammar_mask: Optional[GrammarMaskView]
-    watermark: Optional[WatermarkStateView]
-    watermark_full_mask: bool
-    request_pool_indices: torch.Tensor
-    return_logprob: bool
-    is_idle: bool
-    simulated_accept_length: Optional[torch.Tensor]
-    simulated_accept_length_rng: Optional[torch.Generator]
-    sparse_target_max_top_k: Optional[int]
-    sparse_bonus_argmax: bool
-
-    # Compatibility names used by the stock verifier.
-    @property
-    def seq_lens(self) -> torch.Tensor:
-        return self.sampling.sequence_lengths
-
-    @property
-    def sampling_info(self) -> VerifySamplingView:
-        return self.sampling
-
-    @property
-    def req_pool_indices(self) -> torch.Tensor:
-        return self.request_pool_indices
-
-    @property
-    def device(self) -> torch.device:
-        return self.sampling.device
-
-
-class PostVerifyOutput(msgspec.Struct, frozen=True):
-    """Runtime-consumed results valid until this round's graph slot is reused."""
-
-    token_ids: torch.Tensor
-    accepted_lengths: torch.Tensor
-    accepted_indices: torch.Tensor
-
-
-VerifyRunner = Callable[[PostVerifyIO, LocalKeysFn], PostVerifyOutput]
-
-
-class PostVerifyStrategy(msgspec.Struct, frozen=True):
-    """Runtime verifier plus the provider-replaceable local key builder."""
-
-    run: VerifyRunner
-    local_keys: LocalKeysFn
-
-    def __call__(self, io: PostVerifyIO) -> PostVerifyOutput:
-        return self.run(io, self.local_keys)
-
-
 class SpeculativeRuntimeHooks(msgspec.Struct, frozen=True):
-    """The provider-adjustable strategy around speculative verification."""
+    """The provider-adjustable policy of speculative verification: the local key
+    builder the target verify reduces vocabulary shards with."""
 
-    post_verify: PostVerifyStrategy
+    local_keys: LocalKeysFn
 
 
 HooksFactory = Callable[[SpeculativeRuntimeHooks], SpeculativeRuntimeHooks]
@@ -440,8 +232,8 @@ class BuiltMegakernel(Protocol):
     when it provides no factory. A target's factory receives SGLang's stock bundle
     and returns a bundle. SGLang selects it only under the independent
     runtime-optimization master switch and otherwise keeps the caller's stock
-    strategies unchanged. A provider may replace only the local key builder within
-    post-verify; the runtime runner remains authoritative.
+    hooks unchanged. A provider replaces only the local key builder; the
+    verify itself stays SGLang's.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested
