@@ -37,6 +37,7 @@ def _handle_pd_request(mode, req):
     scheduler._record_kv_event_lora_name = MagicMock()
     scheduler.spec_algorithm = SimpleNamespace(
         is_dflash_family=lambda: False,
+        uses_block_verify=lambda: False,
         is_uno=lambda: False,
     )
     scheduler._add_request_to_queue = MagicMock()
@@ -133,6 +134,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler._record_kv_event_lora_name = MagicMock()
                 scheduler.spec_algorithm = SimpleNamespace(
                     is_dflash_family=lambda: False,
+                    uses_block_verify=lambda: False,
                     is_uno=lambda: False,
                     is_none=lambda: True,
                 )
