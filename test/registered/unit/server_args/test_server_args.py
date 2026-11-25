@@ -483,6 +483,30 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(joined._radix_eviction_policy_explicitly_set)
         self.assertTrue(configured._radix_eviction_policy_explicitly_set)
 
+    def test_elastic_ep_backend_none_leaves_elastic_ep_off(self):
+        """`--elastic-ep-backend none` is the documented off choice: it must
+        resolve to None, which is what every reader tests, on the command line
+        and in a config file."""
+        cases = (
+            (None, [], None),
+            (None, ["--elastic-ep-backend", "none"], None),
+            (None, ["--elastic-ep-backend=none"], None),
+            ("elastic-ep-backend: none\n", [], None),
+            (None, ["--elastic-ep-backend", "nixl"], "nixl"),
+            ("elastic-ep-backend: mooncake\n", [], "mooncake"),
+        )
+        for config, cli, expected in cases:
+            with self.subTest(config=config, cli=cli):
+                argv = ["--model-path", "dummy", *cli]
+                if config is not None:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".yaml", delete=False
+                    ) as f:
+                        f.write(config)
+                    self.addCleanup(os.unlink, f.name)
+                    argv += ["--config", f.name]
+                self.assertEqual(prepare_server_args(argv).elastic_ep_backend, expected)
+
     def test_monokernel_flags_in_config_and_cli(self):
         """--enable-amd-monokernel and --enable-nvidia-megakernel parse the same
         from the command line and from a config file."""
@@ -933,6 +957,19 @@ class TestPrepareServerArgs(CustomTestCase):
             ):
                 ServerArgs(model_path="dummy", **fields).resolve_once()
             self.assertEqual(str(raised.exception), message)
+
+    def test_malformed_env_value_stops_startup(self):
+        """A registered environment variable whose value does not parse stops
+        startup, even when only a later code path would read it."""
+        with (
+            envs.SGLANG_EXA_NUM_RESULTS.override("ten"),
+            self.assertRaisesRegex(
+                ValueError,
+                'Invalid value for SGLANG_EXA_NUM_RESULTS: "ten" is not a valid '
+                "integer value",
+            ),
+        ):
+            ServerArgs(model_path="dummy").resolve_once()
 
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()

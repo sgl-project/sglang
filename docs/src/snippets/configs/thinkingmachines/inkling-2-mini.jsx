@@ -4,10 +4,10 @@
 export const config = {
   modelName: "Inkling-2-Mini",
 
-  supportedHardware: ["h200", "gb300", "rtx6000", "rtx5090", "dgx-spark", "mi350x", "mi355x", "tpu7x"],
+  supportedHardware: ["h200", "gb300", "rtxpro6000", "rtx5090", "dgx-spark", "mi350x", "mi355x", "tpu7x"],
 
   hardware: [
-    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+    { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
     { id: "tpu7x", label: "TPU7x", vram: "192GB", vendor: "tpu" },
   ],
@@ -54,7 +54,7 @@ export const config = {
   dockerImages: {
     h200:  "lmsysorg/sglang:inkling-2-mini",
     gb300: "lmsysorg/sglang:inkling-2-mini",
-    rtx6000: "lmsysorg/sglang:inkling-2-mini",
+    rtxpro6000: "lmsysorg/sglang:inkling-2-mini",
     rtx5090: "lmsysorg/sglang:inkling-2-mini",
     "dgx-spark": "lmsysorg/sglang:inkling-2-mini",
     mi350x: "lmsysorg/sglang:inkling-2-mini-mi35x",
@@ -185,7 +185,7 @@ sgl-eval run gsm8k \\
           // colocated server; NiXL matched it token for token.
           hide: { hw: ["mi350x", "mi355x"] } },
         { id: "nixl", label: "NiXL",
-          hide: { hw: ["h200", "gb300", "rtx6000", "rtx5090", "dgx-spark", "tpu7x"] } },
+          hide: { hw: ["h200", "gb300", "rtxpro6000", "rtx5090", "dgx-spark", "tpu7x"] } },
       ],
       router: {
         port: 8000,
@@ -392,7 +392,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "rtx6000", quant: "nvfp4", strategy: "balanced" },
+      match: { hw: "rtxpro6000", quant: "nvfp4", strategy: "balanced" },
       nnodes: 1,
       verified: true,
       env: [],
@@ -412,7 +412,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "rtx6000", quant: "nvfp4", strategy: "dspark" },
+      match: { hw: "rtxpro6000", quant: "nvfp4", strategy: "dspark" },
       nnodes: 1,
       verified: true,
       env: [

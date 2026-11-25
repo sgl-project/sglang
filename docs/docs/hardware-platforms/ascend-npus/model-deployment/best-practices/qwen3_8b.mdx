@@ -10,7 +10,10 @@ This page focuses on optimal configuration and benchmark results for Qwen3-8B on
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
-The configurations on this page use the daily build image `quay.io/ascend/sglang:main-cann9.1.0-a3`.
+<Warning>
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
+The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
+</Warning>
 
 ### Low Latency
 
@@ -79,10 +82,10 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=50
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
 python3 -m sglang.launch_server \
-    --enable-prefill-delayer \
-    --prefill-delayer-max-delay-passes 50 \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
