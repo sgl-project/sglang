@@ -503,6 +503,12 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+def routes_with_fp32_correction_bias(config) -> bool:
+    """GLM-5.3-Flash's 288 fp32 biases per layer sit in a ~0.4-wide band where bf16
+    keeps 8-11 of them, which reorders top-k, so it routes with the fp32 bias."""
+    return config.model_type == "glm5_next_text"
+
+
 class MoEGate(nn.Module):
     def __init__(
         self,
@@ -529,7 +535,11 @@ class MoEGate(nn.Module):
             correction_bias_dtype = torch.float32
             # GLM-5.2's bias sits at an offset where its spread is only a few bf16 ULPs
             # wide, so bf16 collapses it and reorders top-k routing. HF stores it fp32.
-            if quant_config is not None and not is_glm_moe_dsa(config):
+            if (
+                quant_config is not None
+                and not is_glm_moe_dsa(config)
+                and not routes_with_fp32_correction_bias(config)
+            ):
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
@@ -2983,6 +2993,28 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = ffn_exit.finish(hidden_states)
 
         return (hidden_states, topk_indices)
+
+    def forward_kv_only(
+        self,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Write this layer's KV cache for the batch's tokens; no attention or MLP."""
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            quant_format=self._resolve_gfx95_quant_format(),
+        )
+        try:
+            self.self_attn.forward_kv_only(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        finally:
+            get_attn_tp_context().clear_attn_inputs()
 
     def op_comm_prepare_attn(
         self,

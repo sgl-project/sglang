@@ -31,7 +31,7 @@ The rule of thumb: if the value's lifecycle is owned by sglang code (we read it,
 
 | Type | Use for |
 |---|---|
-| `EnvBool(default)` | boolean flag |
+| `EnvBool(default)` | boolean flag; accepts `true`/`1`/`yes`/`y`/`on` and `false`/`0`/`no`/`n`/`off`, case-insensitive |
 | `EnvInt(default)` | integer |
 | `EnvFloat(default)` | float |
 | `EnvStr(default)` | string |
@@ -75,10 +75,10 @@ if envs.SGLANG_FOO.get():
 
 | Method | Use |
 |---|---|
-| `.get()` | Read value (parsed). Returns `default` if unset, or `None` if explicitly set to None. |
+| `.get()` | Read value (parsed). Returns `default` if unset, or `None` if explicitly set to None. An empty value reads as unset, except for `EnvStr` and `EnvTuple`. Raises `ValueError` naming the variable when the value does not parse; server startup parses every set variable first (`validate_env_values`). |
 | `.set(value)` | Set value. `set(None)` flips the internal `_set_to_none` flag so the next `.get()` returns `None`, not `default`. |
 | `.clear()` | Unset entirely. Next `.get()` returns `default`. |
-| `.is_set()` | True iff the key is present in `os.environ` (regardless of value, including the explicit-None case). |
+| `.is_set()` | True iff the key is present in `os.environ` (including the explicit-None case) and, for a type other than `EnvStr` and `EnvTuple`, its value is not empty. |
 | `.override(value)` | Context manager — set on enter, restore exactly what was there on exit. Use this in tests. |
 
 The `_set_to_none` distinction matters: `clear()` → `is_set()=False, get()=default`; `set(None)` → `is_set()=True, get()=None`. A few descriptors (e.g. `SGLANG_TEST_MAX_RETRY = EnvInt(None)`, `SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)`) rely on this to distinguish "user opted out" from "default applies".
