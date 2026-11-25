@@ -27,6 +27,7 @@ from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa import mqa_logits_fused_topk
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_all_gather_rows_,
     dcp_split_rows,
@@ -47,6 +48,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     pcg_dsa_indexer_prefill_split,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.flashindexer import flashindexer_select_heads
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -620,6 +622,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if self.use_aiter_fused_fp8_writer and not _FUSED_FP8_WRITER_LOGGED:
             logger.info("Enabled AITER fused FP8 DSA indexer writer")
             _FUSED_FP8_WRITER_LOGGED = True
+
+        self.init_mqa_logits_fused_topk()
+
+    def init_mqa_logits_fused_topk(self):
+        self.use_mqa_logits_fused_topk = (
+            _is_cuda
+            and mqa_logits_fused_topk.resolve_indexer_gate(
+                self,
+            )
+        )
 
     def _can_use_dsa_indexer_fusion(self, config, is_neox_style: bool) -> bool:
         return (
@@ -1392,7 +1404,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ks: torch.Tensor,
         ke: torch.Tensor,
     ) -> torch.Tensor:
-        q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
+        # FlashIndexer's 8 selected heads are a native DeepGEMM count: skip the fixed-32 pad.
+        q_padded, w_padded = q_fp8, weights
+        if q_fp8.shape[1] == self.n_heads:
+            q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
         if use_bf16_indexer_logits():
             return fp8_mqa_logits_bf16(q_padded, kv_fp8, w_padded, ks, ke)
         return resolve_fp8_mqa_logits_fn()(
@@ -1781,6 +1796,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
         topk_result: Optional[torch.Tensor] = None,
+        flashindexer_hidden: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -1873,10 +1889,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = kv_fp8.num_keys if self.fp4_index_k else k_fp8.shape[0]
+        # FlashIndexer: top-8 heads per token, once before K-axis chunking; no-op when off.
+        q_fp8, weights = flashindexer_select_heads(
+            self, q_fp8, weights, flashindexer_hidden
+        )
         # Short contexts keep the dense path: with fewer than ~8 x topk keys the sampled filter keeps most keys
         # and loses to DeepGEMM logits + top-k (measured on B200 / B300).
+        # LiteTopK needs 32 or 64 heads, so FlashIndexer's 8 selected heads take the dense path.
         if (
             self.use_prefill_lite_topk
+            and q_fp8.shape[1] == self.n_heads
             and max_seq_len >= 8 * self.index_topk
             and isinstance(metadata, DSAIndexerMetadata)
             and not metadata.force_unfused_topk
@@ -1892,6 +1914,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_result[:q_offset],
             )
             return topk_result
+
+        if self.use_mqa_logits_fused_topk:
+            fused_topk_result = mqa_logits_fused_topk.mqa_logits_fused_topk(
+                self,
+                metadata,
+                q=q_fp8[:q_offset],
+                q_sf=None,
+                kv=kv_fp8,
+                weights=weights[:q_offset],
+                out=topk_result,
+                forward_batch=forward_batch,
+            )
+            if fused_topk_result is not None:
+                return fused_topk_result
+
         # Every DCP rank holds the whole index K: score 1/W of the rows each, then
         # all-gather the top-k.
         split = _is_hip and getattr(metadata, "dcp_size", 1) > 1
@@ -2838,6 +2875,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     q_fp8,
                     weights,
                     metadata,
+                    flashindexer_hidden=x,
                 )
         else:
             raise NotImplementedError("DSA indexer only supports CUDA, HIP, and NPU")

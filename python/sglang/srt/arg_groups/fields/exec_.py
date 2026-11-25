@@ -524,6 +524,10 @@ class ExecKernel(msgspec.Struct):
         "(Kimi-K3.1 on gfx950 with DCP): the row-group kernel in decode and target verify, the "
         "prefill kernel over the DCP-gathered keys in prefill.",
     ] = False
+    enable_flashindexer: A[
+        bool,
+        "Use FlashIndexer head selection in the DSA indexer: a learned gate keeps the top-8 heads per token on prefill. Needs a checkpoint with the FlashIndexer gate weights (ERNIE 5.5). Default keeps all heads.",
+    ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],
         Arg(

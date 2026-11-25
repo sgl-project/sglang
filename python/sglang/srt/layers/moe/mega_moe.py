@@ -337,6 +337,7 @@ def allocate_mega_moe_buffers(model: torch.nn.Module) -> None:
     if not get_moe_a2a_backend().is_megamoe() or _use_amd_flydsl_mega_moe():
         return
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+    from sglang.srt.models.ernie55 import Ernie5_5Moe
 
     buffers = {}
     for module in model.modules():
@@ -344,7 +345,13 @@ def allocate_mega_moe_buffers(model: torch.nn.Module) -> None:
             module.experts
         ):
             buf = _mega_moe_buffer(module)
-            buffers[id(buf)] = buf
+        elif isinstance(module, Ernie5_5Moe) and is_mega_moe_experts_ready(
+            module.experts
+        ):
+            buf = module.mega_moe_buffer()
+        else:
+            continue
+        buffers[id(buf)] = buf
     if buffers:
         logger.info(
             "MegaMoE symmetric buffers resident before KV cache sizing: "

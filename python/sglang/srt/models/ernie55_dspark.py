@@ -30,7 +30,6 @@ from torch import nn
 
 from sglang.kernels.ops.activation.multimax import multimax
 from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
-from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
@@ -85,14 +84,8 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
             prefix=prefix,
             alt_streams=alt_streams,
         )
-        # compress_ratio 0 selected the main rope, but the stages were trained on
-        # the compressed YaRN rope of the HCA layers.
-        self.rope_base = config.compress_rope_theta
-        self.rope_kwargs.update(
-            base=self.rope_base,
-            original_seq_len=self.rope_scaling["original_max_position_embeddings"],
-        )
-        self.freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
+        # The stages keep the base's plain rope (rope_theta, no YaRN), as they are
+        # trained; not the HCA layers' compressed YaRN rope.
         self._init_gated_wq_b(quant_config, prefix)
         self.postmix = VhaPostMix(self.n_local_heads, self.n_heads)
 
@@ -166,12 +159,12 @@ class Ernie5_5DSparkStage(Ernie5_5DecoderLayer):
     ):
         super().__init__(config, stage_id, quant_config, prefix, alt_streams)
         if stage_id == 0:
-            # Shipped in bf16, so it takes no quant config.
+            # An older export ships this in bf16; the weight loader quantizes it.
             self.main_proj = ReplicatedLinear(
                 config.hidden_size * num_target_layers,
                 config.hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=add_prefix("main_proj", prefix),
             )
             self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -239,9 +232,11 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)
         )
-        # The target's multimax, applied to the draft logits as in training.
+        # The target's multimax. Training applies it to the Markov-refined draft
+        # logits, so it runs on each step's base + bias, not on the base logits.
         self.multimax_ranges = nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
         self.multimax_ts = nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+        self.markov_head.step_logits_activation = self._multimax
         self.embed_tokens: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
@@ -355,10 +350,12 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
             local_logits = torch.nn.functional.linear(x_normed.float(), weight.float())
         else:
             local_logits = project_through_lm_head(x_normed, self.lm_head)
-        local_logits = multimax(local_logits, self.multimax_ranges, self.multimax_ts)
         if not self._opt_markov_w2_tp_shard:
             local_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return local_logits, x_post_hc
+
+    def _multimax(self, logits: torch.Tensor) -> torch.Tensor:
+        return multimax(logits, self.multimax_ranges, self.multimax_ts)
 
     def compute_confidence(
         self,
@@ -387,7 +384,9 @@ class _Ernie5_5DSparkWeightLoader(Ernie5_5WeightLoader):
     # The draft attention keeps wq_a and wkv apart, which _HCA_UNFUSED_QKV_A loads.
     _HCA_STACKED = {}
     _DRAFT_RENAMES = {
-        "model.mtp.feature_projection.weight": "stages.0.main_proj.weight",
+        "model.mtp.feature_projection.weight_scale_inv": (
+            "stages.0.main_proj.weight_scale_inv"
+        ),
         "model.mtp.feature_norm.weight": "stages.0.main_norm.weight",
         "model.mtp.norm.weight": "norm.weight",
         "model.mtp.mhc_contract.hc_head_fn": "hc_head.fn",
@@ -411,7 +410,25 @@ class _Ernie5_5DSparkWeightLoader(Ernie5_5WeightLoader):
             () if model.confidence_head is not None else ("confidence_head.",)
         )
 
+    def _load_main_proj(self, tensor: torch.Tensor) -> None:
+        name = "stages.0.main_proj.weight"
+        param = self.params[name]
+        if param.dtype != torch.float8_e4m3fn or tensor.dtype == torch.float8_e4m3fn:
+            self._load(name, tensor)
+            return
+        from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
+
+        # A bf16 export meets an fp8 module: quantize it as the fp8 export would.
+        quantized, scale = per_block_cast_to_fp8(
+            tensor.to(device=param.device, dtype=torch.bfloat16)
+        )
+        self._load(name, quantized)
+        self._load("stages.0.main_proj.weight_scale_inv", scale)
+
     def load(self, name: str, tensor: torch.Tensor) -> None:
+        if name == "model.mtp.feature_projection.weight":
+            self._load_main_proj(tensor)
+            return
         if name in self._DRAFT_TRANSPOSED:
             target = self._DRAFT_TRANSPOSED[name]
             self.params[target].data.copy_(tensor.t())

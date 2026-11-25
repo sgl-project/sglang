@@ -27,6 +27,7 @@ MLA, DSA, VHA, mHC, SiTU, ``wo_a``/``wo_b``).
 
 from __future__ import annotations
 
+from functools import cached_property
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -40,10 +41,14 @@ from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.layernorm.mhc import mhc_post, mhc_pre
 from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 from sglang.kernels.ops.moe.multi_router import multi_router_topk
-from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
+from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig, check_megamoe_situ_betas
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SituAndMul
+from sglang.srt.layers.attention.dsa.flashindexer import (
+    attach_flashindexer_gate,
+    resolve_flashindexer_weights_dir,
+)
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
@@ -93,6 +98,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -109,7 +115,7 @@ from sglang.srt.models.deepseek_v4 import (
     make_hc_head_params,
     make_hc_mixing_params,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 from sglang.srt.utils import BumpAllocator, is_cuda
 
 
@@ -559,6 +565,11 @@ class Ernie5_5Moe(nn.Module):
             prefix=add_prefix("fc2_latent_proj", prefix),
         )
         self.latent_norm = RMSNorm(latent_size, eps=config.rms_norm_eps)
+        self.top_k = config.num_experts_per_tok
+        self.intermediate_size = config.moe_intermediate_size
+        self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        if self._use_mega_moe:
+            check_megamoe_situ_betas(config)
 
     def _route(self, hidden_states, gating_output, topk, renormalize):
         # gating_output is the raw [T, 2E] gate|gate_1 GEMM output.
@@ -571,13 +582,60 @@ class Ernie5_5Moe(nn.Module):
             num_routers=2,
         )
 
+    def mega_moe_buffer(self):
+        from sglang.srt.layers.moe.mega_moe import (
+            _get_mega_moe_symm_buffer,
+            _mega_moe_mma_type,
+        )
+
+        return _get_mega_moe_symm_buffer(
+            get_parallel().moe_ep_group.device_group,
+            num_experts=self.experts.num_experts,
+            num_max_tokens_per_rank=(
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+            ),
+            num_topk=self.top_k,
+            hidden=self.latent_size,
+            intermediate_hidden=self.intermediate_size,
+            mma_type=_mega_moe_mma_type(self.experts),
+            activation="situ",
+        )
+
+    def _run_experts(self, latent: torch.Tensor, topk_output) -> torch.Tensor:
+        if not self._use_mega_moe:
+            return self.experts(latent, topk_output)
+        from sglang.srt.layers.moe.mega_moe import (
+            is_mega_moe_experts_ready,
+            run_mega_routed_experts,
+        )
+
+        if not is_mega_moe_experts_ready(self.experts):
+            raise RuntimeError(
+                "--moe-a2a-backend megamoe needs MXFP4 routed experts on an SM100 "
+                "GPU; load an FP4-expert checkpoint."
+            )
+        # The router weights already carry per_expert_scale: no routed scaling here.
+        return run_mega_routed_experts(
+            self.experts,
+            latent,
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            hidden_size=self.latent_size,
+            intermediate_size=self.intermediate_size,
+            top_k=self.top_k,
+            num_tokens=latent.shape[0],
+            # The kernel bakes SiTU beta=4.0/linear_beta=25.0, checked in __init__.
+            activation="situ",
+            buf=self.mega_moe_buffer(),
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             if get_moe_a2a_backend().is_none():
                 # Every TP rank sees the same (DP-gathered) tokens: all skip together.
                 return hidden_states
             # An all-to-all dispatch still needs this rank, tokens or not.
-            self.experts(
+            self._run_experts(
                 hidden_states.new_empty((0, self.latent_size)),
                 self.topk.empty_topk_output(
                     hidden_states.device, layer_id=self.layer_id
@@ -607,7 +665,7 @@ class Ernie5_5Moe(nn.Module):
             hidden_states, linear_bf16_fp32(hidden_states, self.gate_weight)
         )
         latent, _ = self.fc1_latent_proj(hidden_states)
-        routed = self.experts(latent, topk_output)
+        routed = self._run_experts(latent, topk_output)
         # An all-to-all combine already returns the complete sum, so all-reducing
         # it again would multiply by tp_size.
         if get_parallel().tp_size > 1 and get_moe_a2a_backend().is_none():
@@ -871,6 +929,11 @@ class Ernie5_5Model(nn.Module):
             ),
             prefix=add_prefix("layers", prefix),
         )
+        # FlashIndexer gates only the target's MLA indexers; the MTP draft keeps all heads.
+        if get_exec().kernel.enable_flashindexer:
+            for layer in self.layers[self.start_layer : self.end_layer]:
+                if isinstance(layer.self_attn, Ernie5_5MlaAttention):
+                    attach_flashindexer_gate(layer.self_attn.indexer)
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.hc_head = Ernie5_5HcHead(config)
@@ -975,6 +1038,18 @@ class Ernie5_5_MoeForCausalLM(nn.Module):
         self.logits_processor = Ernie5_5LogitsProcessor(config)
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.hybrid_mla_q_lora_rank, is_dsa=True)
+
+    @cached_property
+    def secondary_weights(self) -> list[DefaultModelLoader.Source]:
+        # Resolved lazily: load formats that never read it must not pay for a download.
+        if not get_exec().kernel.enable_flashindexer:
+            return []
+        return [
+            DefaultModelLoader.Source(
+                model_or_path=resolve_flashindexer_weights_dir(),
+                revision=get_model().revision,
+            )
+        ]
 
     @torch.no_grad()
     def forward(

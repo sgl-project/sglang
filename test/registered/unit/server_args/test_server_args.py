@@ -752,6 +752,102 @@ class TestPrepareServerArgs(CustomTestCase):
             ):
                 validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
 
+    def test_megamoe_token_budget_covers_eager_decode_for_ernie(self):
+        """ERNIE has no non-mega MoE fallback, so an eager decode past the largest
+        graph bucket (256 requests here, graph max 64) overflowed the MegaMoE
+        workspace even though the graph-bucket check passed."""
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                chunked_prefill_size=128,
+                max_running_requests=256,
+                cuda_graph_max_bs_decode=64,
+                disaggregation_mode="decode",
+            )
+            args.resolve_once()
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                128
+            ):
+                validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+                with self.assertRaisesRegex(ValueError, "decode / verify"):
+                    validate_mega_moe_token_budget(args, "Ernie5_5_MoeForCausalLM")
+
+    def _assert_ernie_megamoe_buffer_floor(self, floor: int, **server_args):
+        """The ERNIE MegaMoE decode check accepts a ``floor``-row buffer and
+        rejects one row less."""
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
+            declared = server_args.pop("declared", {})
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                chunked_prefill_size=128,
+                disaggregation_mode="decode",
+                **server_args,
+            )
+            args.resolve_once()
+            if declared:
+                # cuda_graph_config is only resolved on a GPU host.
+                declare_resolution(args, "test_resolution", **declared)
+            budget = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK
+            with budget.override(floor):
+                validate_mega_moe_token_budget(args, "Ernie5_5_MoeForCausalLM")
+            with budget.override(floor - 1):
+                with self.assertRaisesRegex(ValueError, "decode / verify"):
+                    validate_mega_moe_token_budget(args, "Ernie5_5_MoeForCausalLM")
+
+    def test_megamoe_token_budget_counts_ernie_attn_tp_slice(self):
+        """Under attention TP 2 each ERNIE rank routes half of a 256-request eager
+        decode, so a 128-row MegaMoE buffer must be accepted, not rejected."""
+        self._assert_ernie_megamoe_buffer_floor(
+            128, tp_size=2, max_running_requests=256, cuda_graph_max_bs_decode=64
+        )
+
+    def test_megamoe_token_budget_counts_ernie_eagle_draft_extend_graph(self):
+        """The EAGLE draft-extend graph does not shard its batch over attention
+        TP, so its largest captured bucket (32 under a 33 limit) x 4 draft tokens
+        puts 128 rows on each rank; without that graph the draft extend runs
+        eagerly and sharded, so only 40 requests x 4 / 2 = 80 rows."""
+        from sglang.srt.environ import envs
+
+        decode = SimpleNamespace(backend="full", max_bs=33, bs=[1, 2, 4, 8, 16, 32])
+        for disabled, floor in ((False, 128), (True, 80)):
+            with self.subTest(draft_extend_graph_disabled=disabled):
+                with envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.override(disabled):
+                    self._assert_ernie_megamoe_buffer_floor(
+                        floor,
+                        tp_size=2,
+                        max_running_requests=40,
+                        declared={
+                            "speculative_algorithm": "EAGLE",
+                            "speculative_num_draft_tokens": 4,
+                            "cuda_graph_config": SimpleNamespace(decode=decode),
+                        },
+                    )
+
+    def test_megamoe_token_budget_follows_ernie_mlp_gather_sharding(self):
+        """With attention DP, disabling the attention gather still leaves the MLP
+        gather on, so ERNIE routes half of each worker's 128 rows; the check
+        treated the batch as unsharded and refused a 64-row buffer."""
+        self._assert_ernie_megamoe_buffer_floor(
+            64,
+            tp_size=4,
+            attn_dp_size=2,
+            disable_attn_tp_gather=True,
+            max_running_requests=256,
+            cuda_graph_max_bs_decode=64,
+        )
+
     def test_megamoe_token_budget_uses_resolved_dp_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
         from sglang.srt.environ import envs
