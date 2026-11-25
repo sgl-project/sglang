@@ -6,22 +6,110 @@ You can install SGLang using any of the methods below. Please go through [`Syste
 
 ## Component Version Mapping For SGLang
 
-Each CANN version requires its own matched set of component versions — do not mix versions across sets.
+The table describes the published B051 images. Each CANN version requires its own matched set of component versions — do not mix versions across sets.
 
-The A3 and 950PR/DT builds in [the NPU Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/npu.Dockerfile) use the following versions with Python 3.12.
+<Tabs>
+  <Tab title="A3 Series">
 
-| Component | Source build on main |
-|---|---|
-| CANN | 9.2.0 |
-| PyTorch / torchvision / torchaudio | 2.13.0 / 0.28.0 / 2.11.0 |
-| torch_npu | 2.13.0 |
-| Triton Ascend | 3.6.0+dev20261105160244 |
-| sgl-kernel-npu | 2026.11.0.post14 (choose `a3` or `950` for your device) |
-| MemFabric-Hybrid | 1.5.0.dev20261124 |
-| Mooncake Transfer Engine for MemFabric | 0.3.14 |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Component</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Version</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Obtain Method</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.2.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers?ids=d803%2Cbcc87fc38cd74df28cf5c415cf2aea75%2C31%2CAArch64%2Coffline_run_file">HDK driver download</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>9.2.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#obtain-cann-image">Obtain Images</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.13.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">TorchNPU releases</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.5.0.dev20261119</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-hybrid==1.5.0.dev20261119 --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.6.0+dev20261105160244</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[triton_ascend-3.6.0+dev20261105160244](https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/triton-ascend/20261105160244/triton_ascend-3.6.0%2Bdev20261105160244-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_34_aarch64.whl)<br/>(x86_64 host: replace aarch64 with x86_64)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.11.0.post12</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.11.0.post12">sgl-kernel-npu releases</a></td>
+    </tr>
+  </tbody>
+</table>
 
-Select the host driver and firmware for your device and CANN version on the [Ascend driver download page](https://www.hiascend.com/hardware/firmware-drivers/community). For a prebuilt image, check its tag in the [image dependency manifest](https://ascend.github.io/sglang/). For example, the B051 images pin MemFabric-Hybrid to `1.5.0.dev20261119`.
+  </Tab>
+  <Tab title="950PR/DT Series">
 
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Component</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Version</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Obtain Method</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.2.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers?ids=d803%2Cbcc87fc38cd74df28cf5c415cf2aea75%2C31%2CAArch64%2Coffline_run_file">HDK driver download</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>9.2.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#obtain-cann-image">Obtain Images</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.13.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">TorchNPU releases</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.5.0.dev20261119</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-hybrid==1.5.0.dev20261119 --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.6.0+dev20261105160244</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[triton_ascend-3.6.0+dev20261105160244](https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/triton-ascend/20261105160244/triton_ascend-3.6.0%2Bdev20261105160244-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_34_aarch64.whl)<br/>(x86_64 host: replace aarch64 with x86_64)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.11.0.post12</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.11.0.post12">sgl-kernel-npu releases</a></td>
+    </tr>
+  </tbody>
+</table>
+
+  </Tab>
+</Tabs>
 
 ### Obtain CANN Image
 
@@ -83,7 +171,7 @@ the version mapping table and do not mix versions across CANN sets.
 
 ### Method 1: Installing from source with prerequisites
 
-The steps below use the source-build versions in the [component table](#component-version-mapping-for-sglang). For the torch_npu Dynamo trace-rule patch, runtime libraries, and libmmpa loader setup, follow the corresponding steps in the [NPU Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/npu.Dockerfile) for your architecture and Python installation.
+These commands follow the source-build versions in the [NPU Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/npu.Dockerfile). The source build uses MemFabric-Hybrid `1.5.0.dev20261124` with Mooncake Transfer Engine for MemFabric `0.3.14`. Follow the Dockerfile for the torch_npu Dynamo patch, runtime libraries, and libmmpa loader setup.
 
 #### Python Version
 
@@ -130,8 +218,8 @@ pip install memfabric-hybrid==1.5.0.dev20261124 --index-url https://mirrors.huaw
 pip install --no-deps "https://github.com/kvcache-ai/Mooncake/releases/download/v0.3.14/mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_$(uname -m).whl"
 
 # Install the device-specific MemFabric kernels:
-# --soc-version is A5 on the 950PR/DT Series, A3 on the A3 Series
-mfcli kernel install --soc-version A5
+SOC_VERSION=A3  # Use A5 for 950PR/DT Series.
+mfcli kernel install --soc-version "$SOC_VERSION"
 ```
 
 #### PyTorch and PyTorch Framework Adapter on Ascend
@@ -272,10 +360,11 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 1. Download SGLang image
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag (e.g., `main-cann9.2.0-a3`, `main-cann9.2.0-950`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag if you need the latest development changes. CANN 9.2.0 has no daily builds published yet, so daily-build tags are currently available only for CANN 9.1.0 (e.g., `main-cann9.1.0-a3`, `main-cann9.1.0-950`).
 
-The examples below use build B051. See the [image dependency manifest](https://ascend.github.io/sglang/) for the exact components in each published build.
+CANN 9.2.0 has no stable release yet, so use a validated build for now. The `cann9.2.0-<device>-B<NN>` tags (e.g., `cann9.2.0-a3-B051`, `cann9.2.0-950-B051`) are validated builds rather than stable releases; they stand in until a stable release is published. The exact component versions inside each build are listed in the [image dependency manifest](https://ascend.github.io/sglang/) — see for example the `cann9.2.0-950-B051` entry for the 950PR/DT Series.
 
+{/* TODO: Interim explanation (CANN 9.2.0 has no stable release yet). Remove it and switch the tags below to the stable release once it is published. */}
 </Tip>
 
 <Tabs>
@@ -297,17 +386,28 @@ docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/s
 
 2. Build an image based on Dockerfile
 
+The Dockerfile clones SGLang from GitHub during the build and does not use the local checkout, which only provides
+`npu.Dockerfile`. Pass `SGLANG_TAG` to build a specific branch or tag.
+
 ```bash Command
-# Clone the SGLang repository
+# Clone the SGLang repository to obtain the Dockerfile
 git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-# Replace <arch_tag> with the target architecture, e.g., amd64, arm64.
-# Optional build arguments:
-#   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror to improve download speed
+# Required arguments:
+#   TARGETARCH: target architecture, e.g., amd64, arm64
+#   DEVICE_TYPE: target hardware, a3 or 950. The Dockerfile defaults to 950, so A3 Series builds must set a3.
+# Optional arguments:
+#   SGLANG_TAG: SGLang branch or tag to clone, e.g., main (default)
+#   CANN_VERSION: CANN version, e.g., 9.2.0 (default)
+#   SGLANG_KERNEL_NPU_TAG: sgl-kernel-npu release tag (default 2026.11.0.post14)
 # If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
-docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
+docker build \
+    --build-arg TARGETARCH=<arch_tag> \
+    --build-arg DEVICE_TYPE=<a3|950> \
+    --build-arg SGLANG_TAG=<branch_or_tag> \
+    -t <image_name> -f npu.Dockerfile .
 ```
 
 #### Create Docker Container
@@ -324,6 +424,12 @@ weights path — see [How do I provide model weights?](#how-do-i-provide-model-w
   <Tab title="A3 Series">
 
 ```bash Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <secret>: your Hugging Face access token
+#   <image_name>: SGLang container image
+# ============================================================
+
 # Create a shortcut 'drun' to launch a privileged Docker container
 # ASCEND_VISIBLE_DEVICES=0-15 selects all 16 DIE devices of a full A3 Series node
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
@@ -343,6 +449,12 @@ drun --env "HF_TOKEN=<secret>" \
   <Tab title="950PR/DT Series">
 
 ```bash Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <secret>: your Hugging Face access token
+#   <image_name>: SGLang container image
+# ============================================================
+
 # Create a shortcut 'drun' to launch a privileged Docker container
 # ASCEND_VISIBLE_DEVICES=0-7 selects all 8 devices of a full 950PR/DT Series node
 # ASCEND_USE_FIA=1 is required on the 950PR/DT Series
