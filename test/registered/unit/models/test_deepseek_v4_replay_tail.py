@@ -67,6 +67,32 @@ class TestDecoderReplayTailState(CustomTestCase):
         self.assertEqual(len(leaves), 1)
         self.assertIsNone(rebuild(leaves).pre)
 
+    def test_rebuild_closes_over_no_state_tensor(self):
+        """The prefill-graph tail break keeps rebuild for the graph's lifetime,
+        so its closure must not pin the full-row state in the graph pool."""
+        rows = [torch.full((2, 3), v) for v in range(1, 6)]
+        for streams in (rows[0], HcPending(*rows[:4])):
+            for pre in (None, rows[4]):
+                with self.subTest(pending=type(streams).__name__, has_pre=pre):
+                    leaves, _, rebuild = _flatten_state(HcState(streams, pre))
+                    cells = [cell.cell_contents for cell in rebuild.__closure__]
+                    self.assertFalse(any(_holds_tensor(value) for value in cells))
+
+                    rebuilt = rebuild(leaves)
+                    self.assertIs(type(rebuilt.streams), type(streams))
+                    if isinstance(streams, HcPending):
+                        for actual, expected in zip(rebuilt.streams, streams):
+                            self.assertIs(actual, expected)
+                    else:
+                        self.assertIs(rebuilt.streams, streams)
+                    self.assertIs(rebuilt.pre, pre)
+
+
+def _holds_tensor(value) -> bool:
+    if isinstance(value, torch.Tensor):
+        return True
+    return isinstance(value, (tuple, list)) and any(_holds_tensor(v) for v in value)
+
 
 def _model(tail_writes_source_kv=True):
     return SimpleNamespace(
