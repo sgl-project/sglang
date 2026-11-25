@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import bisect
 import functools
-import logging
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import msgspec
@@ -39,8 +38,7 @@ from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 if TYPE_CHECKING:
     from sglang.srt.models.dspark import BaseDSparkMarkovHead, VocabShard
-
-logger = logging.getLogger(__name__)
+    from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
 
 
 # Draft step logits: NaN is a bug, but -inf is legitimate (masking).
@@ -165,8 +163,40 @@ def resolve_draft_params(
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 
 
-# Arbitrary; how often the proposer logs its restage-skip count, in graph steps.
-STAGED_PARAMS_LOG_EVERY = 500
+def resolve_draft_params_by_slot(
+    table: SamplingParamsTable,
+    slots: torch.Tensor,
+    *,
+    force_greedy: torch.Tensor,
+    out: DraftParams,
+) -> None:
+    """`resolve_draft_params` read from the batch's slots of the sampling table, so
+    a graph captures it; ``force_greedy`` ([1] bool) stands for no sampling info."""
+    temperatures, greedy_mask, step_temperatures = (
+        buf[: slots.shape[0]] for buf in out
+    )
+    torch.clamp(table.temperatures(slots), min=1e-5, out=temperatures)
+    temperatures.masked_fill_(force_greedy, 1.0)
+    torch.le(table.top_ks(slots), 1, out=greedy_mask)
+    greedy_mask.logical_or_(force_greedy)
+    torch.where(
+        greedy_mask, _zero(temperatures.device), temperatures, out=step_temperatures
+    )
+
+
+class ForceGreedy:
+    """A draft graph's switch to draft every row greedily at temperature 1, as for
+    a step with no sampling info; written only when it flips."""
+
+    def __init__(self, device):
+        self.flag = torch.zeros((1,), dtype=torch.bool, device=device)
+        self._value = False
+
+    def set(self, value: bool) -> None:
+        if value != self._value:
+            self.flag.fill_(value)
+            self._value = value
+
 
 # XORed into the server seed so the draft noise differs from other samplers'.
 _DRAFT_NOISE_DOMAIN = 0x2D2A9C317E44B1F3
@@ -343,9 +373,6 @@ def sample_draft_block(
 
 
 class DraftBlockProposer:
-    _staged_params_key = None
-    num_staged_params_skips = 0
-    num_staged_params_calls = 0
     deferred_draft_kv = None
 
     def __init__(
@@ -397,11 +424,6 @@ class DraftBlockProposer:
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
-        # (sampler, bs, temperatures, top_ks) last staged: SamplingBatchInfo rebinds
-        # these tensors when the batch changes, never edits them in place
-        self._staged_params_key: Optional[tuple] = None
-        self.num_staged_params_skips = 0
-        self.num_staged_params_calls = 0
         self._num_token_non_padded = (
             torch.empty((1,), dtype=torch.int32, device=self.draft_model_runner.device)
             if enable_num_token_non_padded()
@@ -418,34 +440,6 @@ class DraftBlockProposer:
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
-
-    def _stage_sampling_params(self, draft_sampler, *, bs: int, sampling_info) -> None:
-        """The draft graph's sampling params, restaged only when the sampler, bs or
-        the batch's temperature / top-k tensors changed since the last stage."""
-        key = (
-            draft_sampler,
-            bs,
-            None if sampling_info is None else sampling_info.temperatures,
-            None if sampling_info is None else sampling_info.top_ks,
-        )
-        staged = self._staged_params_key
-        self.num_staged_params_calls += 1
-        skip = (
-            staged is not None
-            and staged[1] == bs
-            and all(staged[i] is key[i] for i in (0, 2, 3))
-        )
-        self.num_staged_params_skips += skip
-        if self.num_staged_params_calls % STAGED_PARAMS_LOG_EVERY == 0:
-            logger.debug(
-                "DSpark draft: sampling params restage skipped on %d of %d steps",
-                self.num_staged_params_skips,
-                self.num_staged_params_calls,
-            )
-        if skip:
-            return
-        draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
-        self._staged_params_key = key
 
     def _base_logits_context(self):
         return draft_tp_context(self._base_logits_layout)
@@ -669,9 +663,7 @@ class DraftBlockProposer:
             draft_forward_batch
         )
         if draft_sampler is not None and runs_graph:
-            self._stage_sampling_params(
-                draft_sampler, bs=bs, sampling_info=sampling_info
-            )
+            draft_sampler.force_greedy.set(sampling_info is None)
         deferred_draft_kv = self.deferred_draft_kv
         if deferred_draft_kv is not None:
             deferred_draft_kv.before_draft_forward(

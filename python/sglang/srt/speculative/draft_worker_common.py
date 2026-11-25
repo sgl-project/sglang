@@ -151,7 +151,9 @@ def make_draft_block_spec_info(
     )
 
 
-def make_draft_sampler_capture_hook(draft_sampler):
+def make_draft_sampler_capture_hook(draft_sampler, *, reads_slots: bool = False):
+    """``reads_slots``: the sampler also takes the batch's slots. At capture they
+    are the graph's req_pool_indices buffer, which each replay fills."""
 
     def capture_hook(runner, out, forward_batch, num_tokens):
         del runner, num_tokens
@@ -160,7 +162,14 @@ def make_draft_sampler_capture_hook(draft_sampler):
                 "draft sampler set but the draft forward has no "
                 "hidden_states to capture into the graph."
             )
-        draft_sampler(out.hidden_states, forward_batch.input_ids)
+        if reads_slots:
+            draft_sampler(
+                out.hidden_states,
+                forward_batch.input_ids,
+                forward_batch.req_pool_indices,
+            )
+        else:
+            draft_sampler(out.hidden_states, forward_batch.input_ids)
 
     return capture_hook
 
