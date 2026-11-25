@@ -33,7 +33,6 @@ from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
 )
 from sglang.srt.hardware_backend.npu.kv_capability import (
     DSA_KV_QUANT_BLOCK_SIZE,
-    packed_dsa_kv_rope_head_dim,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
@@ -2012,6 +2011,28 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv,
     ):
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
+        actual_seq_qlen = actual_seq_qlen.to(device=q_nope.device, dtype=torch.int32)
+        actual_seq_lengths_kv = actual_seq_lengths_kv.to(
+            device=q_nope.device, dtype=torch.int32
+        )
+        if packed_kv.dtype == torch.int8 and self.qk_rope_head_dim == 0:
+            from sgl_kernel_npu.operators.attention import (
+                kv_quant_sparse_flash_attention,
+            )
+
+            # The indexer supplies causal indices for the packed operator.
+            return kv_quant_sparse_flash_attention(
+                query=q_nope,
+                query_rope=q_pe,
+                packed_kv=packed_kv,
+                sparse_indices=topk_indices,
+                block_table=self.forward_metadata.block_tables,
+                actual_seq_lengths_query=actual_seq_qlen,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                scale_value=layer.scaling,
+                return_softmax_lse=False,
+            )[0]
+
         # The pool hands back the packed record in its storage dtype.
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
@@ -2023,12 +2044,8 @@ class AscendAttnBackend(AttentionBackend):
             value_quant_mode=2,
             key_dequant_scale=None,
             value_dequant_scale=None,
-            actual_seq_lengths_query=actual_seq_qlen.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
+            actual_seq_lengths_query=actual_seq_qlen,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
             block_table=self.forward_metadata.block_tables,
             sparse_block_size=1,
             layout_query="TND",
@@ -2040,9 +2057,7 @@ class AscendAttnBackend(AttentionBackend):
             # that do not carry the attribute.
             tile_size=getattr(self.token_to_kv_pool, "quant_block_size", None)
             or DSA_KV_QUANT_BLOCK_SIZE,
-            rope_head_dim=packed_dsa_kv_rope_head_dim(
-                packed_kv.dtype, self.qk_rope_head_dim
-            ),
+            rope_head_dim=self.qk_rope_head_dim,
         )
 
     def do_cp_attn_fia(
@@ -2155,14 +2170,11 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        # SFA's MLA interface requires a fixed 64-dimensional query_rope even
-        # for models without RoPE.
-        if self.qk_rope_head_dim == 0:
-            if k_nope.dtype == torch.int8:
-                # The packed INT8 record already holds a zero BF16 RoPE.
-                rope_dim = packed_dsa_kv_rope_head_dim(k_nope.dtype, 0)
-                q_pe = q_nope.new_zeros((*q_nope.shape[:-1], rope_dim))
-            elif is_npu_arch35():
+        # The native SFA path requires 64-dimensional query_rope for NoPE.
+        if self.qk_rope_head_dim == 0 and not (
+            self.token_to_kv_pool.dsa_kv_cache_store_fp8 and k_nope.dtype == torch.int8
+        ):
+            if is_npu_arch35():
                 k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
                 q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
             else:

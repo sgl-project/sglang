@@ -181,7 +181,6 @@ def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
         )
     from sglang.srt.hardware_backend.npu.kv_capability import DSA_INT8_KV_ROPE_HEAD_DIM
 
-    # NoPE is passed to the native reader with zero-filled RoPE64.
     if model_config.qk_rope_head_dim not in (0, DSA_INT8_KV_ROPE_HEAD_DIM):
         raise ValueError(
             "--kv-cache-dtype int8 needs a DSA model with qk_rope_head_dim "
@@ -196,9 +195,6 @@ def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
             f"{model_config.dtype}. Use --dtype bfloat16, or --kv-cache-dtype "
             "bf16 or auto."
         )
-    # SGLANG_NPU_USE_MLAPO needs no check here: MLAProlog writes the INT8
-    # record from dynamic INT8 projections, and NPUFusedMLAPreprocess rejects
-    # other projection weights once they are loaded, as it does for FP8.
 
 
 def handle_kv4_compatibility(server_args: Any) -> None:

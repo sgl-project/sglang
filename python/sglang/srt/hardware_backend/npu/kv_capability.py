@@ -46,13 +46,6 @@ class PackedQuantKvCapability(msgspec.Struct, frozen=True, kw_only=True):
         return self.unsupported_reason is None
 
 
-def packed_dsa_kv_rope_head_dim(dtype: torch.dtype, qk_rope_head_dim: int) -> int:
-    # The native INT8 sparse attention expects RoPE64 even for NoPE models.
-    if dtype == torch.int8 and qk_rope_head_dim == 0:
-        return DSA_INT8_KV_ROPE_HEAD_DIM
-    return qk_rope_head_dim
-
-
 def resolve_kv_capability(
     *,
     kv_cache_dtype: torch.dtype,

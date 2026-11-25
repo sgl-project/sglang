@@ -4023,14 +4023,6 @@ def calculate_mla_kv_cache_dim(
             f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
         )
 
-        if _is_npu and kv_cache_dtype == torch.int8:
-            from sglang.srt.hardware_backend.npu.kv_capability import (
-                packed_dsa_kv_rope_head_dim,
-            )
-
-            qk_rope_head_dim = packed_dsa_kv_rope_head_dim(
-                kv_cache_dtype, qk_rope_head_dim
-            )
         return fp8_ds_mla_row_width(kv_lora_rank, qk_rope_head_dim)
 
     return kv_cache_dim

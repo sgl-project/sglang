@@ -8,7 +8,6 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.kv_capability import (
     DSA_KV_QUANT_BLOCK_SIZE,
     PackedQuantKvCapability,
-    packed_dsa_kv_rope_head_dim,
     resolve_npu_kv_capability,
 )
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
@@ -842,7 +841,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 + kv_lora_rank
                 // self.quant_block_size
                 * kv_capability.main_kv_scale_dtype.itemsize
-                + packed_dsa_kv_rope_head_dim(dtype, qk_rope_head_dim) * 2
+                + qk_rope_head_dim * 2
             ), f"packed DSA KV cache needs kv_cache_dim, got {kv_cache_dim}"
             self.store_dtype = dtype
         if modelslim_cache_layout is not None:
@@ -1410,15 +1409,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             latent.reshape(-1, self.quant_block_size), dst_type=self.dtype
         )
         rows = latent.shape[0]
-        rope_dim = packed_dsa_kv_rope_head_dim(self.dtype, self.qk_rope_head_dim)
-        if rope_dim != self.qk_rope_head_dim:
-            cache_v = latent.new_zeros((rows, rope_dim), dtype=torch.bfloat16)
         # Opaque record: quantized latent | rope BF16 bytes | per-tile FP32 scales.
         packed = torch.cat(
             (
                 quantized.reshape(rows, self.kv_lora_rank).view(torch.uint8),
                 cache_v.to(torch.bfloat16)
-                .reshape(rows, rope_dim)
+                .reshape(rows, self.qk_rope_head_dim)
                 .contiguous()
                 .view(torch.uint8),
                 scale.to(torch.float32)
