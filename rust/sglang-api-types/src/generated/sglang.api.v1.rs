@@ -1051,11 +1051,19 @@ pub struct FinishStop {
     #[prost(message, optional, tag = "1")]
     pub matched: ::core::option::Option<Matched>,
 }
+/// `ignore_eos`: the output length its first stop token would have ended at.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct IgnoredStop {
+    #[prost(uint64, tag = "1")]
+    pub position: u64,
+}
 /// `FINISH_LENGTH` — hit `max_new_tokens` (or the context limit).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FinishLength {
     #[prost(uint64, optional, tag = "1")]
     pub length: ::core::option::Option<u64>,
+    #[prost(message, optional, tag = "2")]
+    pub ignored_stop: ::core::option::Option<IgnoredStop>,
 }
 /// The `FINISH_ABORT` payload. Python emits all three keys, nulls included.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

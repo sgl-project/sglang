@@ -415,6 +415,9 @@ class HostKVCache(abc.ABC):
     # Names this pool's page byte format in storage keys when it has one of its
     # own, so pages persisted in another format miss instead of loading.
     storage_format_tag: Optional[str] = None
+    # Page strides are multiples of this many bytes (get_storage_page_align); the
+    # bytes from a page's end up to the next multiple belong to that page.
+    storage_page_align = 1
 
     def __init__(
         self,
@@ -665,14 +668,6 @@ class HostKVCache(abc.ABC):
             return 0, device_pool.layer_num
         return device_pool._owned_local_layer_range()
 
-    def _effective_host_layer_num(self, device_pool=None) -> int:
-        """Number of layers the host pool allocates for this rank."""
-        device_pool = device_pool or self.device_pool
-        if not self._is_device_layer_sharded(device_pool):
-            return device_pool.layer_num
-        shard_size = device_pool.layer_shard_size
-        return (device_pool.layer_num + shard_size - 1) // shard_size
-
     def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
         start, end = self._device_owned_layer_range(device_pool)
         return start <= layer_id < end
@@ -813,10 +808,6 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def clear(self):
-        # Initialize memory states and tracking structures.
-        self.mem_state = torch.zeros(
-            (self.logical_size,), dtype=torch.uint8, device=self.device
-        )
         self.free_slots = torch.arange(self.logical_size, dtype=torch.int64)
         # Keep freed chunks aside and consume them lazily from alloc() to avoid
         # concatenating a large free-list on every host-pool free.

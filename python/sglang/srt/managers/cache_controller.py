@@ -42,6 +42,7 @@ from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKEN
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.cpp_utils.native_hash import ensure_native_hash
 from sglang.srt.mem_cache.hicache_key_scheme import (
     UnifiedKVPlan,
     namespace_digest,
@@ -266,6 +267,9 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        # Monotonic; read by the scheduler thread in _drain_backup to time the
+        # enqueue-to-ack span of L2->L3 writes.
+        self.enqueue_time = time.perf_counter()
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -459,6 +463,7 @@ class HiCacheController:
         # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
         self.write_fence_stream = None
+        self.forward_on_fence_stream = False
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
@@ -736,6 +741,9 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP requires a generic MLA page layout."
                 )
+        # Storage page keys come from the native hash extension;
+        # load it before creating the backend, so attach raises if it cannot build.
+        ensure_native_hash()
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
