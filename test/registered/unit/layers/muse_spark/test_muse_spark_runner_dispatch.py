@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.token_dispatcher import flashinfer
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import FlashinferA2ADispatchType
 from sglang.srt.layers.muse_spark import muse_spark_bf16_moe as bf16
+from sglang.srt.layers.muse_spark import muse_spark_fp4_moe as fp4
 from sglang.srt.layers.muse_spark.fused import glue
 from sglang.srt.layers.muse_spark.muse_spark_bf16_moe import MuseSpark1xBf16Experts
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
@@ -62,6 +63,9 @@ class TestMuseSparkRunnerDispatch(CustomTestCase):
                 "get_platform",
                 return_value=SimpleNamespace(is_blackwell=True),
             ),
+            # The TRT-LLM FP4 experts refuse a pre-Blackwell GPU; fake SM100 so
+            # the case also runs on a CUDA host.
+            patch.object(fp4, "get_device_capability", return_value=(10, 0)),
         ):
             experts = (
                 MuseSpark1xBf16Experts(
