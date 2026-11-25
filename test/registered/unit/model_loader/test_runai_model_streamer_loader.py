@@ -342,6 +342,23 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                 self.assertEqual(weights[0][0], "draft.weight")
                 self.assertIs(weights[0][1], source_tensor)
 
+    def test_clone_only_clones_marked_tensors(self):
+        unmarked = torch.tensor([1], dtype=torch.int32)
+
+        self.assertIs(
+            weight_utils.clone_if_runai_streamed_tensor(unmarked),
+            unmarked,
+        )
+
+        marked = torch.tensor([1], dtype=torch.int32)
+        setattr(marked, weight_utils.RUNAI_STREAMER_TENSOR_ATTR, True)
+
+        cloned = weight_utils.clone_if_runai_streamed_tensor(marked)
+
+        self.assertIsNot(cloned, marked)
+        marked.fill_(2)
+        self.assertEqual(cloned.item(), 1)
+
     def test_runai_streamed_tensor_is_consumed_before_buffer_reuse(self):
         def consume_view(mark_as_runai: bool):
             shared_buffer = torch.tensor([1], dtype=torch.int32)
