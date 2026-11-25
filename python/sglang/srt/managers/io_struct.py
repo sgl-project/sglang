@@ -2203,6 +2203,8 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     flush_cache: bool = True
     # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
+    # Internal PP relay: an earlier busy stage refused before loading.
+    pp_load_error: Optional[str] = None
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):

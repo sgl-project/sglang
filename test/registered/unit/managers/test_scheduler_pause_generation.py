@@ -106,6 +106,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.weight_updater = SimpleNamespace(
+            take_held_control_requests=lambda: [],
+            defer_control_request=lambda req: False,
+        )
         scheduler.pause_state = PauseState()
         scheduler.enable_overlap = False
         scheduler.enable_skip_finishing_decode = False

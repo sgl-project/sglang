@@ -32,6 +32,9 @@ from sglang.srt.distributed.communication_op import (
     control_request_barrier,
 )
 from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
     ChecksumInfo,
@@ -51,6 +54,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -70,7 +75,11 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
 )
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import (
+    get_model,
+    get_parallel,
+    is_control_broadcast_local,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -142,9 +151,64 @@ class SchedulerWeightUpdaterManager:
     _session: Optional[_WeightUpdateSession] = None
     _plugin_state: Dict[str, Any] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
+    _pending_rejected_receive: Optional[UpdateWeightsFromDistributedReqInput] = None
+    _held_control_requests: List[Any] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.tp_cpu_group = get_parallel().tp_group.cpu_group
+
+    def has_pending_rejected_receive(self) -> bool:
+        return self._pending_rejected_receive is not None
+
+    def take_held_control_requests(self) -> List[Any]:
+        if self.has_pending_rejected_receive():
+            return []
+        requests, self._held_control_requests = self._held_control_requests, []
+        return requests
+
+    def defer_control_request(self, recv_req) -> bool:
+        if self.has_pending_rejected_receive():
+            # Keep later pause/destroy/session controls behind the receive.
+            # Work and aborts must still reach batch sync while it is pending.
+            if isinstance(
+                recv_req,
+                (
+                    AbortReq,
+                    TokenizedGenerateReqInput,
+                    TokenizedEmbeddingReqInput,
+                    BatchTokenizedGenerateReqInput,
+                    BatchTokenizedEmbeddingReqInput,
+                ),
+            ):
+                return False
+            self._held_control_requests.append(recv_req)
+            return True
+        if not (
+            isinstance(recv_req, UpdateWeightsFromDistributedReqInput)
+            and recv_req.receive_only_error
+            and is_control_broadcast_local()
+            and get_parallel().pp_size == 1
+            and self.scheduler.require_mlp_sync
+            and not self.scheduler.pause_state.paused
+        ):
+            return False
+        from sglang.srt.managers.scheduler_components.dp_attn import (
+            should_skip_scheduler_all_gather,
+        )
+
+        if should_skip_scheduler_all_gather(get_parallel().num_dp_ranks):
+            return False
+        self._pending_rejected_receive = recv_req
+        return True
+
+    def drain_pending_rejected_receive(self) -> None:
+        # Called only after the batch-sync metadata says every active DP shard
+        # has this round. No shard can be waiting in that sync while we receive.
+        request = self._pending_rejected_receive
+        assert request is not None
+        result = self.update_weights_from_distributed(request)
+        self._pending_rejected_receive = None
+        self.scheduler.send_control_output(result, request)
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -248,6 +312,17 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if get_parallel().pp_size > 1:
+            if error := getattr(recv_req, "pp_load_error", None):
+                return UpdateWeightFromDiskReqOutput(success=False, message=error)
+            idle, message = self._agree_native_update(
+                self.is_fully_idle(), "Pipeline disk reload requires an idle engine."
+            )
+            if not idle:
+                # The same request is relayed after dispatch. A later idle
+                # stage must not reload behind a busy stage's refusal.
+                recv_req.pp_load_error = message
+                return UpdateWeightFromDiskReqOutput(success=False, message=message)
         with self._observe_weight_load("disk"):
             self.scheduler.wait_for_launched_forward()
             success, message, weights_loaded = self._update_native_runners(

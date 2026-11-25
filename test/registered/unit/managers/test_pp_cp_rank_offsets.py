@@ -17,6 +17,8 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import (  # noqa: E402
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
@@ -330,6 +332,61 @@ class TestReleaseVerdictRing(CustomTestCase):
         SchedulerPPMixin._pp_pass_verdict(stage, self.RELEASED, self.REQUEST)
 
         stage._pp_send_pyobj_to_next_stage.assert_not_called()
+
+    def test_disk_reload_folds_later_loads_even_when_the_first_flush_failed(self):
+        """A stage-zero flush refusal cannot publish a checkpoint a later
+        stage failed to load; all successful loads must still publish that path."""
+        request = UpdateWeightFromDiskReqInput(model_path="checkpoint")
+        for first_flushed, later_loaded, later_flushed in (
+            (True, True, True),
+            (False, True, True),
+            (False, False, True),
+            (True, True, False),
+        ):
+            with self.subTest(
+                first_flushed=first_flushed,
+                later_loaded=later_loaded,
+                later_flushed=later_flushed,
+            ):
+                first = self._stage(is_first_rank=True)
+                local = UpdateWeightFromDiskReqOutput(
+                    success=first_flushed,
+                    weights_loaded=True,
+                    message="ok" if first_flushed else "flush refused",
+                )
+                with get_parallel().override(pp_rank=0):
+                    SchedulerPPMixin._pp_pass_verdict(first, local, request)
+                first.send_control_output.assert_not_called()
+                (sent,), _ = first._pp_send_pyobj_to_next_stage.call_args
+                last = self._stage(
+                    is_first_rank=False, is_last_rank=True, from_prev_stage=sent
+                )
+                with get_parallel().override(pp_rank=1):
+                    SchedulerPPMixin._pp_pass_verdict(
+                        last,
+                        UpdateWeightFromDiskReqOutput(
+                            success=later_loaded and later_flushed,
+                            weights_loaded=later_loaded,
+                            message="checkpoint missing"
+                            if not later_loaded
+                            else "ok"
+                            if later_flushed
+                            else "flush refused",
+                        ),
+                        request,
+                    )
+                (returned,), _ = last._pp_send_pyobj_to_next_stage.call_args
+                first._pp_recv_pyobj_from_prev_stage.return_value = returned
+                SchedulerPPMixin._pp_answer_verdict_requests(first)
+                verdict = first.send_control_output.call_args.args[0]
+                self.assertEqual(
+                    verdict.success, first_flushed and later_loaded and later_flushed
+                )
+                self.assertEqual(verdict.weights_loaded, later_loaded)
+                if not later_loaded:
+                    self.assertIn("checkpoint missing", verdict.message)
+                if not first_flushed:
+                    self.assertIn("flush refused", verdict.message)
 
 
 if __name__ == "__main__":

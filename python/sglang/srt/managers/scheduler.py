@@ -214,6 +214,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -2383,7 +2384,8 @@ class Scheduler(
         recv_start_ns = time.monotonic_ns()
         received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
         recv_reqs = self.pause_state.take_inputs(
-            received_reqs, stop_at_pause=stop_at_pause
+            self.weight_updater.take_held_control_requests() + received_reqs,
+            stop_at_pause=stop_at_pause,
         )
 
         if recv_reqs:
@@ -2422,12 +2424,19 @@ class Scheduler(
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
                 continue
 
+            if self.weight_updater.defer_control_request(recv_req):
+                continue
             output = self._request_dispatcher(recv_req)
             if output is None:
                 output = self._rust_control_ack(recv_req)
             if output is not None:
                 if get_parallel().pp_size > 1 and isinstance(
-                    output, (ReleaseMemoryOccupationReqOutput, RpcReqOutput)
+                    output,
+                    (
+                        ReleaseMemoryOccupationReqOutput,
+                        RpcReqOutput,
+                        UpdateWeightFromDiskReqOutput,
+                    ),
                 ):
                     # Answered by the first stage once every stage has run it.
                     self._pp_pass_verdict(output, recv_req)
@@ -2786,6 +2795,8 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
             get_shutting_down=lambda: self.gracefully_exit,
             on_peer_shutdown=self.handle_peer_shutdown,
+            get_pending_weight_receive=self.weight_updater.has_pending_rejected_receive,
+            on_weight_receive_ready=self.weight_updater.drain_pending_rejected_receive,
             **self._dp_drain_column_callbacks(),
         )
 

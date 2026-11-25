@@ -500,6 +500,9 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
 
         for route in self._requests:
             for version in (None, "v2"):
+                if route == "disk" and version is None:
+                    # The existing Engine API is supported through PP verdicts.
+                    continue
                 with (
                     self.subTest(route=route, version=version),
                     get_context().override_server_args(weight_version="v1"),
@@ -560,6 +563,44 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
             ),
         ):
             asyncio.run(scenario())
+
+    def test_engine_keeps_the_unversioned_pipeline_disk_reload_api(self):
+        """The PP safety guard must not disable an idle checkpoint reload
+        through the existing Engine API, which sends no version."""
+        from sglang.srt.entrypoints.engine import Engine
+
+        with (
+            get_context().override_server_args(weight_version="v1"),
+            get_parallel().override(
+                pp_size=2,
+                tp_size=1,
+                num_dp_ranks=1,
+                dp_size=1,
+                tp_group=SimpleNamespace(cpu_group=None, world_size=1),
+            ),
+        ):
+            manager, residents, state, tasks, _ = self._manager("disk", worker_count=1)
+            manager.model_path = manager.served_model_name = "old"
+            manager._update_model_path_info = (
+                TokenizerManager._update_model_path_info.__get__(manager)
+            )
+            engine = Engine.__new__(Engine)
+            engine.loop = asyncio.new_event_loop()
+            engine.tokenizer_manager = manager
+            try:
+                result = engine.update_weights_from_disk("checkpoint")
+                self.assertTrue(result[0], result)
+                self.assertEqual(manager.model_path, "checkpoint")
+                self.assertEqual(manager.config_value("weight_version"), "v1")
+                self.assertEqual(residents[0].weights, "v2")
+                self.assertEqual(state.commits, 0)
+            finally:
+
+                async def finish():
+                    await asyncio.gather(*tasks)
+
+                engine.loop.run_until_complete(finish())
+                engine.loop.close()
 
     def test_version_preflight_rejects_before_the_trainer_enters_broadcast(self):
         """A trainer declaring its intended version can stop at preparation,

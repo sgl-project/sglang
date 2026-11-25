@@ -3,17 +3,23 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import DEFAULT, MagicMock, Mock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.distributed.communication_op import control_request_all_gather_object
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
+    PauseGenerationReqInput,
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -23,6 +29,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
@@ -328,7 +335,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         )
         gather.start()
         self.addCleanup(gather.stop)
-        override = get_parallel().override(tp_rank=0, tp_size=1)
+        override = get_parallel().override(tp_rank=0, tp_size=1, pp_size=1)
         override.__enter__()
         self.addCleanup(override.__exit__, None, None, None)
         self.recorded = []
@@ -452,6 +459,63 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
 class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
     _routes = ("disk", "distributed", "tensor", "ipc")
+
+    def test_rejected_receive_keeps_controls_behind_it_and_work_moving(self):
+        """A pending drain must let the late shard finish batch sync, while
+        a following pause or group teardown cannot overtake the receive."""
+        target = _runner()
+        updater = self._manager(target, session=False)
+        replies = []
+        updater.scheduler.require_mlp_sync = True
+        updater.scheduler.pause_state = PauseState()
+        updater.scheduler.send_control_output = lambda result, request: replies.append(
+            result
+        )
+        request = UpdateWeightsFromDistributedReqInput(
+            names=[], dtypes=[], shapes=[], receive_only_error="unsupported version"
+        )
+        pause = PauseGenerationReqInput()
+        with (
+            get_parallel().override(
+                pp_size=1,
+                num_dp_ranks=2,
+                attn_dp_enabled=True,
+                enable_dp_attention_local_control_broadcast=True,
+            ),
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
+        ):
+            self.assertTrue(updater.defer_control_request(request))
+            self.assertTrue(updater.defer_control_request(pause))
+            self.assertFalse(updater.defer_control_request(AbortReq()))
+            self.assertEqual(updater.take_held_control_requests(), [])
+            self.assertEqual(replies, [])
+            target.weight_updater.receive_weights_from_distributed.assert_not_called()
+            updater.drain_pending_rejected_receive()
+        self.assertFalse(replies[0].success)
+        self.assertFalse(replies[0].weights_loaded)
+        self.assertEqual(updater.take_held_control_requests(), [pause])
+        self.assertIsNone(updater._session)
+        self.assertEqual(self.recorded, [])
+        target.weight_updater.load_weights_from_distributed.assert_not_called()
+
+    def test_busy_pipeline_disk_reload_does_not_enter_the_loader(self):
+        """The verdict ring may wait only on an idle pipeline; refuse before
+        changing weights when microbatches are still in flight."""
+        target = _runner()
+        updater = self._manager(target, session=False)
+        updater.is_fully_idle = lambda: False
+        request = UpdateWeightFromDiskReqInput(model_path="checkpoint")
+        with get_parallel().override(pp_size=2):
+            result = updater.update_weights_from_disk(request)
+            relayed = msgspec.msgpack.decode(
+                msgspec.msgpack.encode(request), type=UpdateWeightFromDiskReqInput
+            )
+            later = self._manager(target, session=False)
+            later_result = later.update_weights_from_disk(relayed)
+        self.assertFalse(result.success)
+        self.assertFalse(later_result.success)
+        self.assertFalse(result.weights_loaded)
+        target.weight_updater.update_weights_from_disk.assert_not_called()
 
     def test_staggered_attention_dp_updates_do_not_wait_for_other_shards(self):
         """A shard receiving control early must finish its update while another

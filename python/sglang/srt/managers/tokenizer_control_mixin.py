@@ -83,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -486,8 +487,13 @@ class TokenizerControlMixin:
         return FanOutCommunicator.merge_results(results)
 
     def _native_weight_update_error(self: TokenizerManager, obj) -> Optional[str]:
-        if get_parallel().pp_size > 1:
-            return "Native weight updates are not supported with pipeline parallelism."
+        if get_parallel().pp_size > 1 and not (
+            isinstance(obj, UpdateWeightFromDiskReqInput) and obj.weight_version is None
+        ):
+            return (
+                "With pipeline parallelism, only unversioned disk weight updates "
+                "on an idle engine are supported."
+            )
         if (
             getattr(obj, "weight_version", None) is None
             or get_parallel().num_dp_ranks == 1

@@ -570,6 +570,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.weight_updater = SimpleNamespace(
+            take_held_control_requests=lambda: []
+        )
         scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.tp_size = get_parallel().tp_size
