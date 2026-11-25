@@ -55,7 +55,8 @@ _FLASH_SM_FACTOR = 2
 _FLASH_UNSPLIT_OCCUPANCY = 0.8
 _FLASH_SPLIT_EFFICIENCY_RATIO = 0.85
 _FLASH_MAX_SPLITS = 128
-# Arbitrary bound; one entry per distinct attention shape an impl has seen.
+# Arbitrary bound; one entry per distinct attention shape an impl has seen. The
+# shared split-count cache uses it too, since a plan needs at most two counts.
 _MAX_SPLIT_PADDING_PLANS = 256
 # Tiers that rule out "lossless" fast paths, i.e. the requests that pad.
 _EXACT_QUALITY_LEVELS = frozenset(
@@ -68,6 +69,8 @@ def _multi_processor_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+# Every layer plans the same shapes, so only the first layer runs the search.
+@functools.lru_cache(maxsize=2 * _MAX_SPLIT_PADDING_PLANS)
 def _flash_num_splits(
     query_blocks: int, key_len: int, head_dim: int, num_sms: int
 ) -> int:

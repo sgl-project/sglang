@@ -231,6 +231,14 @@ class TestSDPAShardedHeads(CustomTestCase):
             )
             self.assertEqual(impl._unsplit_query_len(full, 1025), 1025)
             self.assertEqual(impl._split_padding_plans, {})
+        with self.subTest("layers share the split search"):
+            searches = sdpa._flash_num_splits.cache_info
+            sdpa._flash_num_splits.cache_clear()
+            _impl(heads=6, global_num_heads=24)._unsplit_query_len(query, 1025)
+            first_layer = searches().misses
+            _impl(heads=6, global_num_heads=24)._unsplit_query_len(query, 1025)
+            self.assertGreater(first_layer, 0)
+            self.assertEqual(searches().misses, first_layer)
         with self.subTest("short keys never split"):
             impl = _impl(heads=6, global_num_heads=24)
             self.assertEqual(impl._unsplit_query_len(query, 128), 1025)
