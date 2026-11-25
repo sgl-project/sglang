@@ -559,10 +559,13 @@ def sp_all_gather(local_rows: torch.Tensor, total_rows: int) -> torch.Tensor:
     return output[:total_rows]
 
 
-def sp_partial_rows(name: str, like: torch.Tensor, width: int) -> torch.Tensor:
-    """``[like.shape[0], width]`` storage for a TP-partial output that
-    sp_reduce_scatter can read in place."""
-    rows = like.shape[0]
+def sp_partial_rows(
+    name: str, like: torch.Tensor, width: int, rows: Optional[int] = None
+) -> torch.Tensor:
+    """``[rows, width]`` storage (``rows`` defaults to ``like.shape[0]``) for a
+    TP-partial output that sp_reduce_scatter can read in place."""
+    if rows is None:
+        rows = like.shape[0]
     if _sp_multicast():
         padded = ceil_align(rows, get_parallel().tp_group.world_size)
         buffer = k3_ar_fusion.try_symm_buffer(
@@ -599,3 +602,12 @@ def sp_reduce_scatter(
         input_mc_ptr=k3_ar_fusion.get_mc_ptr(full),
         tuning=_sp_tuning(num_blocks),
     )
+
+
+def sp_can_gather_routed() -> bool:
+    return get_parallel().tp_group.get_available_pynccl_comm() is not None
+
+
+def sp_gather_routed(segments: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Every rank's rows of each routed MoE input, in one grouped all-gather."""
+    return get_parallel().tp_group.all_gatherv(segments)

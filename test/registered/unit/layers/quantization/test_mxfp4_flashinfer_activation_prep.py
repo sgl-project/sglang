@@ -12,6 +12,9 @@ from sglang.srt.layers.quantization.mxfp4 import (
     Mxfp4MoEMethod,
     _prepare_flashinfer_mxfp8_activations,
 )
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    Mxfp8RoutedInputPreQuant,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -170,6 +173,33 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         self.assertIs(actual_packed, packed_topk)
         self.assertIs(actual_quant, x_quant)
         self.assertTrue(torch.equal(actual_scale.view(torch.uint8), x_scale))
+
+    def test_pre_quantized_input_skips_the_quant(self):
+        x = torch.empty(1, 1).expand(3, 64)
+        x_quant = torch.empty(3, 64, dtype=torch.float8_e4m3fn)
+        x_scale = torch.empty(3, 2, dtype=torch.float8_e4m3fn)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.route_quant_handoff.take",
+                side_effect=AssertionError,
+            ),
+            patch.object(
+                per_token_group_quant_module,
+                "per_token_group_quant",
+                side_effect=AssertionError,
+            ),
+        ):
+            out_x, packed_topk, actual_quant, actual_scale = (
+                _prepare_flashinfer_mxfp8_activations(
+                    x, 64, Mxfp8RoutedInputPreQuant(x_quant, x_scale, None)
+                )
+            )
+
+        self.assertIs(out_x, x)
+        self.assertIsNone(packed_topk)
+        self.assertIs(actual_quant, x_quant)
+        self.assertIs(actual_scale, x_scale)
 
 
 class TestMxfp4FlashinferSituGuard(CustomTestCase):
