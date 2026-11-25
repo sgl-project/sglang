@@ -2241,7 +2241,9 @@ class KVCacheConfigurator:
             unified_fp8=unified_fp8,
             kv_source_layers=kv_source_layers,
             full_size=full_max_total_num_tokens,
-            **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
+            # Register swa_valid_from as PD request-row state on every platform;
+            # a PD decode (barred from the encoder window) misses its peer's mark.
+            is_draft_worker=self.is_draft_worker,
             **kv_layout_kwargs,
         )
         if not self.is_draft_worker:
@@ -3176,7 +3178,14 @@ class KVCacheConfigurator:
                 or is_compressed_kv_model
                 or self.hybrid_gdn_config is not None
             ):
-                if self.is_hybrid_swa:
+                # Encoder replay moves SWA into the request window; a size-0
+                # SWA allocator reports available_size() == 0 and blocks all
+                # prefills.
+                effective_hybrid_swa = self.is_hybrid_swa and not (
+                    isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    and not token_to_kv_pool.needs_paged_swa_allocator
+                )
+                if effective_hybrid_swa:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
                     # V4.1 (compress_ratios 1/2) is excluded: its compressed

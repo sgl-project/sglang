@@ -106,7 +106,9 @@ def window_layout(
     n = pos.numel()
     if n == 0:
         raise ValueError("request-window layout needs at least one query")
-    if req.is_cuda and not _is_hip:
+    # torch_npu aliases Tensor.is_cuda to is_npu, so select the CUDA kernel by
+    # the device type instead of the tensor flag.
+    if req.device.type == "cuda" and not _is_hip:
         from sglang.kernels.ops.kvcache.dsv41_window_layout import build_window_layout
 
         group, first, last = _first_row_offsets(req)

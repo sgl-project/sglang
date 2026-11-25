@@ -1994,9 +1994,16 @@ class TestSWAPoolFloor(CustomTestCase):
                 dflash_draft_num_layers=40, dspark_num_stages=3
             ),
         )
-        with patch(
-            "sglang.srt.model_executor.pool_configurator.uses_draft_swa_ring",
-            return_value=draft_ring,
+        from sglang.srt.platforms.interface import SRTPlatform
+
+        # The expectations below are the CUDA packed-page formula; keep a host
+        # whose platform computes exact row bytes out of the planner.
+        with (
+            patch("sglang.srt.platforms.current_platform", SRTPlatform()),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.uses_draft_swa_ring",
+                return_value=draft_ring,
+            ),
         ):
             return DSV4PoolConfigurator(kvc)
 

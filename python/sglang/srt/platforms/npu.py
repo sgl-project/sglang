@@ -88,3 +88,54 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
         )
 
         destroy_mega_moe_buffers()
+
+    def request_window_nbytes(
+        self,
+        *,
+        num_slots: int,
+        layers: int,
+        page_size: int,
+        capacity: int,
+        workspace_rows: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        draft_ring_size: int,
+        draft_ring_layers: int,
+    ) -> Optional[int]:
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+            NPUDSV4KVLayout,
+        )
+        from sglang.srt.hardware_backend.npu.dsv4.npu_request_window import (
+            dsv41_request_window_spec,
+        )
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        row_layout = (
+            NPUDSV4KVLayout.V41_SWA_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V41_BF16
+        )
+        # A V4.1 draft worker still uses the V4 sparse-attention op, so its ring
+        # rows keep the V4 format; budget them separately from the target window.
+        draft_row_layout = (
+            NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
+        )
+        row_dim, row_dtype = row_layout.kv_info(qk_nope_head_dim, qk_rope_head_dim)
+        spec = dsv41_request_window_spec(
+            num_slots=num_slots,
+            layers=layers,
+            page_size=page_size,
+            capacity=capacity,
+            workspace_rows=workspace_rows,
+            row_dim=row_dim,
+            row_dtype=row_dtype,
+        )
+        nbytes = spec.nbytes
+        if draft_ring_size and draft_ring_layers:
+            # Share the pool's page formula so the budget matches the
+            # allocation (whole pages plus one spare).
+            draft_dim, draft_dtype = draft_row_layout.kv_info(
+                qk_nope_head_dim, qk_rope_head_dim
+            )
+            ring_rows = (num_slots * draft_ring_size + page_size + 1) // page_size
+            row_bytes = draft_dim * draft_dtype.itemsize
+            nbytes += ring_rows * page_size * draft_ring_layers * row_bytes
+        return nbytes

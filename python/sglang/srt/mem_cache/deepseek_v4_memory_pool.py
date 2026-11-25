@@ -1218,35 +1218,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             not uses_draft_swa_ring() and get_spec().speculative_algorithm is not None
         )
         if encoder_replay and not is_draft_worker:
-            from sglang.srt.mem_cache.dsv41_request_window import (
-                RequestWindowSpec,
-                request_window_workspace_rows,
-            )
-            from sglang.srt.mem_cache.kv.memory.request_window import (
-                RequestWindowMemory,
-            )
-
             self.swa_kv_pool = None
             self.unified_kv_pool = None
-            window_spec = RequestWindowSpec.create(
-                num_slots=self.num_req_slots,
+            (
+                self.request_window,
+                self.request_window_memory,
+            ) = self._build_request_window(
                 layers=swa_layer_num,
                 page_size=swa_page_size,
-                capacity=self.sliding_window + (online_mtp_max_draft_tokens or 0),
-                workspace_rows=request_window_workspace_rows(
-                    self.num_req_slots,
-                    self.sliding_window,
-                    online_mtp_max_draft_tokens or 0,
-                ),
-                kv_layout=self._window_kv_layout(),
-            )
-            self.request_window_memory = RequestWindowMemory(
-                window_spec,
                 dtype=dtype,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
+                draft_tokens=online_mtp_max_draft_tokens or 0,
             )
-            self.request_window = self.request_window_memory.view
         elif uses_draft_swa_ring():
             # The DSpark draft writes SWA rows only from target hidden states, never
             # while attending, so it addresses its ring directly with no workspace.
@@ -1873,6 +1857,39 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         :func:`compressed_kv_layout` so backends resolve their row format per
         pool role; the default keeps the model-level value."""
         return self.kv_layout
+
+    def _build_request_window(
+        self,
+        *,
+        layers: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        enable_memory_saver: bool,
+        draft_tokens: int,
+    ):
+        """Create the encoder-replay request window; NPU subclasses replace the
+        packed-page window with their row representation."""
+        from sglang.srt.mem_cache.dsv41_request_window import (
+            RequestWindowSpec,
+            request_window_workspace_rows,
+        )
+        from sglang.srt.mem_cache.kv.memory.request_window import RequestWindowMemory
+
+        spec = RequestWindowSpec.create(
+            num_slots=self.num_req_slots,
+            layers=layers,
+            page_size=page_size,
+            capacity=self.sliding_window + draft_tokens,
+            workspace_rows=request_window_workspace_rows(
+                self.num_req_slots, self.sliding_window, draft_tokens
+            ),
+            kv_layout=self._window_kv_layout(),
+        )
+        memory = RequestWindowMemory(
+            spec, dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
+        )
+        return memory.view, memory
 
     def compressed_kv_layout(self, compress_ratio: int) -> KVLayout:
         """See :func:`resolve_compressed_kv_layout`."""

@@ -30,7 +30,6 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
 )
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
-    late_layer_tail_layout,
 )
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     HEAD_DIM as SWAPAB_HEAD_DIM,
@@ -64,11 +63,7 @@ from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
-    LateLayerTail,
     _as_int_list,
-    _tail_rows,
-    late_layer_num_tokens,
-    late_layer_whole_extend,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -77,6 +72,13 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.late_layer_tail import (
+    LateLayerTail,
+    _tail_rows,
+    late_layer_num_tokens,
+    late_layer_tail_layout,
+    late_layer_whole_extend,
+)
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     LowRatioExtendSlots,
     build_low_ratio_decode_workspaces,

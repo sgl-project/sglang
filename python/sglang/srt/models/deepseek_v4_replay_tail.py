@@ -67,7 +67,7 @@ from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
+    from sglang.srt.layers.attention.dsv4.late_layer_tail import LateLayerTail
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -170,7 +170,7 @@ class DecoderReplayTail:
             and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
         ):
             return None
-        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+        from sglang.srt.layers.attention.dsv4.late_layer_tail import SWA_WINDOW
 
         return cls(
             model=model,

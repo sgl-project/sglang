@@ -1508,6 +1508,25 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.request_window_bytes = max(
                 self.request_window_bytes, window_spec.nbytes + draft_ring_bytes
             )
+            from sglang.srt.platforms import current_platform
+
+            exact_window_bytes = current_platform.request_window_nbytes(
+                num_slots=request_slots,
+                layers=layers,
+                page_size=self.page_size,
+                capacity=(
+                    self.sliding_window_size + self.online_c128_mtp_max_draft_tokens
+                ),
+                workspace_rows=window_spec.workspace_rows,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                draft_ring_size=draft_ring_size,
+                draft_ring_layers=draft_ring_layers,
+            )
+            if exact_window_bytes is not None:
+                self.request_window_bytes = max(
+                    self.request_window_bytes, exact_window_bytes
+                )
             if not self.paged_draft_layers:
                 self.swa_ratio = 0
         self.swa_prefix_tails = self._resolve_swa_prefix_tails()

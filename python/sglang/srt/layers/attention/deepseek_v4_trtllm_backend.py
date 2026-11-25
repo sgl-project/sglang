@@ -14,13 +14,13 @@ import torch
 from sglang.kernels.ops.attention.dsv4.trtllm_metadata import pack_sparse_tail
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
-    SWA_WINDOW,
     DeepseekV4AttnBackend,
     DeepseekV4MultiStepBackend,
 )
 from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
     DeepseekV4MegaAttnBackend,
 )
+from sglang.srt.layers.attention.dsv4.late_layer_tail import SWA_WINDOW
 from sglang.srt.runtime_context import (
     get_buffer,
     get_exec,

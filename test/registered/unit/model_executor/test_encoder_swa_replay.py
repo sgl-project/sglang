@@ -8,16 +8,16 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
-    late_layer_tail_layout,
-)
 from sglang.srt.arg_groups import deepseek_v4_hook
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.attention.deepseek_v4_backend import (
-    SWA_WINDOW,
     DeepseekV4AttnBackend,
     DSV4AttnMetadata,
+)
+from sglang.srt.layers.attention.dsv4.late_layer_tail import (
+    SWA_WINDOW,
+    late_layer_tail_layout,
     late_layer_whole_extend,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -39,6 +39,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.platforms.cuda import CudaSRTPlatform
+from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.runtime_context import get_context, get_parallel, override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -538,7 +540,7 @@ class TestFoldedReplayUnderPrefillGraph(CustomTestCase):
 
 
 class TestEncoderReplayPrefillGraphGate(CustomTestCase):
-    def _validate(self, prefill_backend):
+    def _validate(self, prefill_backend, platform):
         args = ServerArgs(
             model_path="local-deepseek-v41",
             attention_backend="dsv4",
@@ -551,26 +553,30 @@ class TestEncoderReplayPrefillGraphGate(CustomTestCase):
         args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(model_type="deepseek_v41")
         )
-        with patch(f"{_ENV_GATE}.is_unified_kv_triton", return_value=False):
+        with (
+            patch(f"{_ENV_GATE}.is_unified_kv_triton", return_value=False),
+            patch("sglang.srt.platforms.current_platform", platform),
+        ):
             deepseek_v4_hook.validate_deepseek_v41_features(args)
 
-    @override_platform(is_cuda=True, is_hip=False)
+    @override_platform(is_cuda=True, is_hip=False, is_npu=False)
     def test_cuda_accepts_only_the_breakable_prefill_graph(self):
-        self._validate(Backend.BREAKABLE)
+        platform = CudaSRTPlatform()
+        self._validate(Backend.BREAKABLE, platform)
         for backend in (Backend.FULL, Backend.TC_PIECEWISE):
             with (
                 self.subTest(backend=backend),
                 self.assertRaisesRegex(ValueError, "other than breakable"),
             ):
-                self._validate(backend)
+                self._validate(backend, platform)
 
-    @override_platform(is_cuda=False, is_hip=True)
+    @override_platform(is_cuda=False, is_hip=True, is_npu=False)
     def test_rocm_rejects_the_prefill_graph(self):
         with (
             patch.object(deepseek_v4_hook, "is_gfx95_supported", return_value=True),
             self.assertRaisesRegex(ValueError, "prefill CUDA graph on ROCm"),
         ):
-            self._validate(Backend.BREAKABLE)
+            self._validate(Backend.BREAKABLE, RocmSRTPlatform())
 
 
 class TestFoldMlpSync(CustomTestCase):
@@ -764,6 +770,10 @@ class TestEncoderReplayDpStartupCheck(CustomTestCase):
                 is_cuda=not is_hip, is_hip=is_hip, is_npu=False, is_musa=False
             ),
             patch.object(deepseek_v4_hook, "is_gfx95_supported", return_value=True),
+            patch(
+                "sglang.srt.platforms.current_platform",
+                RocmSRTPlatform() if is_hip else CudaSRTPlatform(),
+            ),
             patch.object(deepseek_v4_hook, "resolving_view", return_value=view),
             patch.object(
                 deepseek_v4_hook, "model_config_of", return_value=model_config
