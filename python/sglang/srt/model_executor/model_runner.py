@@ -1351,7 +1351,7 @@ class ModelRunner:
     def maybe_warmup_flashtopk(self):
         if self.device != "cuda" or not envs.SGLANG_OPT_USE_PREFILL_FLASHTOPK.get():
             return
-        from sglang.kernels.ops.attention.dsa.flashtopk_prefill import (
+        from sglang.kernels.ops.attention.dsa.flashtopk import (
             warmup_flashtopk_prefill,
         )
 

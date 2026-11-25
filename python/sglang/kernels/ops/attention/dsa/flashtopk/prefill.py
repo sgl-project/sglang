@@ -1,7 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
 """FlashTopK prefill indexer top-k for DSA (`Indexer`) and KPool DSA (`IndexerKPool`).
 
-Wraps the vendored exact, deterministic FP8 fused scoring + top-k selector
-(``sglang.kernels.flashtopk``) for SM90 (Hopper) and SM100 (Blackwell) GPUs:
+Wraps the trimmed exact FP8 fused scoring + top-k selector
+(``sglang.kernels.ops.attention.dsa.flashtopk.topk``) for SM90 (Hopper) and SM100
+(Blackwell) GPUs:
 
 - ``flashtopk_fp8_indexer_topk``: drop-in prefill top-k for ``Indexer`` (32 heads x 128),
   matching the output contract of ``litetopk_prefill.fp8_indexer_topk`` (``j - ks[r] +
@@ -12,9 +14,9 @@ Wraps the vendored exact, deterministic FP8 fused scoring + top-k selector
 - ``warmup_flashtopk_prefill``: startup pre-compilation of CuTe DSL and Triton kernels so no
   serving prefill stalls on JIT compilation.
 
-A cached ``Selector`` per ``(device, topk)`` is planned with ``scratch=False`` (tiny per-row
-state only); each call allocates its uint8 scratch transiently through PyTorch's caching
-allocator so FlashTopK does not shrink the static KV cache pool.
+A cached ``Selector`` per ``(device, topk)`` holds only tiny per-row state; each call
+allocates its uint8 scratch transiently through PyTorch's caching allocator and frees it
+on return so FlashTopK does not shrink the static KV cache pool.
 """
 
 from __future__ import annotations
@@ -39,15 +41,14 @@ FLASHTOPK_MAX_TOPK = 4096
 # Adaptive key pruning activates from 128K keys (flashtopk.plan.ADAPTIVE_MIN_KEYS).
 FLASHTOPK_ADAPTIVE_MIN_KEYS = 1 << 17
 
-# Rows processed per internal slice: bounds transient scratch to ~1 GiB even at 1M keys.
-_CHUNK_SIZE = 8192
+# Upper bound on rows processed per internal slice; per-GPU _chunk_size() picks
+# 2 full waves of 16-row pruning tiles (4 waves of 8-row scan/refine tiles),
+# keeping peak transient scratch below ~750 MiB even at 1M keys.
+_MAX_SLICE_ROWS = 8192
 _INITIAL_PLAN_KEYS = 1 << 20
-_PRUNING = "adaptive"
 
 # Triton specialization coverage for FlashTopK's adaptive-pruning planner:
-# rows and their padding to the row group (2 on SM100, 16 on SM90) by divisibility
-# by 16 and 1, and keys and their padding to 4 by divisibility by 16.
-_WARMUP_ROWS = (_CHUNK_SIZE, _CHUNK_SIZE - 1, 1000, 1)
+# keys and their padding to 4 by divisibility by 16.
 _WARMUP_KEYS = (
     FLASHTOPK_ADAPTIVE_MIN_KEYS,
     FLASHTOPK_ADAPTIVE_MIN_KEYS + 1,
@@ -68,43 +69,57 @@ def is_flashtopk_supported() -> bool:
 
 @functools.cache
 def _import_flashtopk():
-    """Import the vendored FlashTopK package; raises if CuTe DSL / TVM FFI are missing."""
+    """Import FlashTopK's ``topk`` module on first use; raises if CuTe DSL / TVM FFI are missing."""
     try:
-        from sglang.kernels import flashtopk
+        from . import topk
     except ImportError as exc:
         raise ImportError(
             "SGLANG_OPT_USE_PREFILL_FLASHTOPK=1 requires nvidia-cutlass-dsl and "
             "apache-tvm-ffi."
         ) from exc
-    return flashtopk
+    return topk
 
 
-def _device_index(device: torch.device) -> int:
-    return device.index if device.index is not None else torch.cuda.current_device()
+def _device_index(device: Optional[torch.device]) -> int:
+    if device is None or device.index is None:
+        return torch.cuda.current_device()
+    return device.index
 
 
 @functools.cache
-def _get_selector(device_index: int, topk: int, chunk_size: int = _CHUNK_SIZE):
-    """Cached scratch-free Selector for ``(device_index, topk, chunk_size)``."""
-    flashtopk = _import_flashtopk()
+def _chunk_size(device_index: int) -> int:
+    """Rows per slice on ``cuda:device_index``: two full waves of 16-row pruning tiles
+    (four waves of 8-row scan/refine tiles), keeping 100% wave efficiency while bounding
+    peak transient per-call scratch."""
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    return min(_MAX_SLICE_ROWS, max(1024, 32 * sms))
+
+
+def _warmup_rows(device_index: int) -> tuple[int, ...]:
+    """Row counts covering all Triton planner specializations on ``cuda:device_index``."""
+    chunk = _chunk_size(device_index)
+    return (chunk, chunk - 1, 1000, 1)
+
+
+@functools.cache
+def _get_selector(device_index: int, topk: int):
+    """Cached scratch-free Selector for ``(device_index, topk)``."""
+    topk_mod = _import_flashtopk()
+    chunk_size = _chunk_size(device_index)
     logger.info(
-        "Planning FlashTopK prefill selector (topk=%d, chunk_size=%d, pruning=%s) on cuda:%d.",
+        "Planning FlashTopK prefill selector (topk=%d, chunk_size=%d) on cuda:%d.",
         topk,
         chunk_size,
-        _PRUNING,
         device_index,
     )
     # Allocate persistent per-row state as normal tensors (never InferenceMode
     # tensors) so in-place ops inside Selector.run() work under torch.no_grad().
     with torch.inference_mode(False), torch.no_grad():
-        return flashtopk.Selector(
+        return topk_mod.Selector(
             topk=topk,
-            num_heads=FLASHTOPK_HEADS,
-            dtype=torch.float8_e4m3fn,
             device=torch.device("cuda", device_index),
-            pruning=_PRUNING,
             chunk_size=chunk_size,
-        ).plan(chunk_size, _INITIAL_PLAN_KEYS, warmup=False, scratch=False)
+        ).plan(chunk_size, _INITIAL_PLAN_KEYS)
 
 
 def flashtopk_min_keys(topk: int) -> int:
@@ -123,31 +138,51 @@ def flashtopk_min_keys(topk: int) -> int:
     return (1 << 16) if topk > 1024 else (1 << 15)
 
 
+def flashtopk_prunes(device_index: int, num_rows: int, num_keys: int) -> bool:
+    """Whether ``(num_rows, num_keys)`` on ``cuda:device_index`` has enough key length
+    and CTA wave occupancy for adaptive key pruning to activate."""
+    if num_keys < FLASHTOPK_ADAPTIVE_MIN_KEYS or num_rows <= 0:
+        return False
+    topk_mod = _import_flashtopk()
+    slice_rows = min(num_rows, _chunk_size(device_index))
+    return topk_mod.planner.adaptive_threshold(device_index, slice_rows, num_keys) > 0.0
+
+
 def flashtopk_should_use(
     *,
     max_seq_len: int,
     num_keys: int,
     topk: int,
     has_lite_topk: bool,
+    num_rows: Optional[int] = None,
+    device: Optional[torch.device] = None,
 ) -> bool:
     """Whether a standard DSA prefill call should run on FlashTopK.
 
-    When both ``SGLANG_OPT_USE_PREFILL_LITE_TOPK`` and
-    ``SGLANG_OPT_USE_PREFILL_FLASHTOPK`` are enabled on SM100, LiteTopK handles
-    shorter contexts and FlashTopK takes calls with ``>= 128K`` keys where its
-    adaptive key pruning activates (unless overridden by
-    ``SGLANG_OPT_PREFILL_FLASHTOPK_MIN_KEYS``).
+    On SM100 (with or without ``SGLANG_OPT_USE_PREFILL_LITE_TOPK``), FlashTopK handles
+    calls with ``>= 128K`` keys whose row count gives adaptive key pruning enough CTA
+    occupancy to beat scanning (unless overridden by
+    ``SGLANG_OPT_PREFILL_FLASHTOPK_MIN_KEYS``). On SM90, FlashTopK runs from
+    ``flashtopk_min_keys(topk)`` keys upward.
     """
     if num_keys <= 0:
         return False
     override = envs.SGLANG_OPT_PREFILL_FLASHTOPK_MIN_KEYS.get()
     if override is not None:
         return max_seq_len >= override
-    if has_lite_topk:
-        return (
-            num_keys >= FLASHTOPK_ADAPTIVE_MIN_KEYS
-            and max_seq_len >= FLASHTOPK_ADAPTIVE_MIN_KEYS
-        )
+    dev_idx = _device_index(device)
+    is_sm100 = has_lite_topk or (
+        torch.cuda.is_available() and torch.cuda.get_device_capability(dev_idx)[0] >= 10
+    )
+    if is_sm100:
+        if (
+            num_keys < FLASHTOPK_ADAPTIVE_MIN_KEYS
+            or max_seq_len < FLASHTOPK_ADAPTIVE_MIN_KEYS
+        ):
+            return False
+        if num_rows is not None and not flashtopk_prunes(dev_idx, num_rows, num_keys):
+            return False
+        return True
     return max_seq_len >= flashtopk_min_keys(topk)
 
 
@@ -156,10 +191,25 @@ def flashtopk_kpool_should_use(
     max_pool_len: int,
     num_keys: int,
     group_topk: int,
+    num_rows: Optional[int] = None,
+    device: Optional[torch.device] = None,
 ) -> bool:
     """Whether a KPool DSA prefill call should run on FlashTopK."""
     if num_keys <= 0:
         return False
+    override = envs.SGLANG_OPT_PREFILL_FLASHTOPK_MIN_KEYS.get()
+    if override is not None:
+        return max_pool_len >= override
+    dev_idx = _device_index(device)
+    if torch.cuda.is_available() and torch.cuda.get_device_capability(dev_idx)[0] >= 10:
+        if (
+            num_keys < FLASHTOPK_ADAPTIVE_MIN_KEYS
+            or max_pool_len < FLASHTOPK_ADAPTIVE_MIN_KEYS
+        ):
+            return False
+        if num_rows is not None and not flashtopk_prunes(dev_idx, num_rows, num_keys):
+            return False
+        return True
     return max_pool_len >= flashtopk_min_keys(group_topk)
 
 
@@ -232,12 +282,12 @@ def flashtopk_fp8_indexer_topk(
     out_offsets: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Exact, deterministic FP8 prefill indexer top-k using FlashTopK.
+    """Exact FP8 prefill indexer top-k using FlashTopK (deterministic selected set).
 
     Matches :func:`sglang.kernels.ops.attention.dsa.litetopk_prefill.fp8_indexer_topk`:
     ``out[r]`` holds ``j - ks[r] + out_offsets[r]`` (or ``j - ks[r]`` when
     ``out_offsets is None``) for the ``topk`` highest-scoring keys ``j`` in
-    ``[ks[r], ke[r])``, ``-1`` padded past ``min(topk, ke[r] - ks[r])``.
+    ``[ks[r], ke[r])`` (unordered), ``-1`` padded past ``min(topk, ke[r] - ks[r])``.
     """
     rows = q_fp8.shape[0]
     if out is None:
@@ -485,7 +535,7 @@ def flashtopk_kpool_indexer_topk(
     topk_offsets: Optional[torch.Tensor] = None,
     out_rows: Optional[int] = None,
 ) -> torch.Tensor:
-    """Exact, deterministic FP8 KPool prefill top-k using FlashTopK.
+    """Exact FP8 KPool prefill top-k using FlashTopK (deterministic selected set).
 
     Matches :func:`sglang.srt.layers.attention.dsa.kpool_fp8_index.topk_from_pooled_history_logits`
     after scoring ``q_fp8`` against the pooled ``(kv_fp8, kv_scale)`` keys over ``[starts, ends)``.
@@ -570,7 +620,8 @@ def warmup_flashtopk_prefill(model: torch.nn.Module, device: torch.device) -> No
 
     dev_idx = _device_index(device)
     cuda_dev = torch.device("cuda", dev_idx)
-    max_rows = max(_WARMUP_ROWS)
+    warmup_rows = _warmup_rows(dev_idx)
+    max_rows = max(warmup_rows)
     max_keys = max(_WARMUP_KEYS)
 
     pending = [
@@ -605,16 +656,14 @@ def warmup_flashtopk_prefill(model: torch.nn.Module, device: torch.device) -> No
 
         for eff_topk, is_kpool, kpool in pending:
             selector = _get_selector(dev_idx, eff_topk)
-            selector.plan(
-                selector.max_rows, selector.max_kv, warmup=True, scratch=False
-            )
+            selector.compile()
             scratch = torch.empty(
                 selector.scratch_bytes(max_rows, max_keys),
                 dtype=torch.uint8,
                 device=cuda_dev,
             )
             out = torch.empty(max_rows, eff_topk, dtype=torch.int32, device=cuda_dev)
-            for r in _WARMUP_ROWS:
+            for r in warmup_rows:
                 for n in _WARMUP_KEYS:
                     ends = torch.full((r,), n, dtype=torch.int32, device=cuda_dev)
                     selector.run(

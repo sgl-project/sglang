@@ -10,17 +10,23 @@ from typing import List, Sequence, Tuple
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsa.flashtopk_prefill import (
-    _WARMUP_KEYS,
-    _WARMUP_ROWS,
+from sglang.kernels.ops.attention.dsa.flashtopk import (
     FLASHTOPK_ADAPTIVE_MIN_KEYS,
     FLASHTOPK_HEAD_DIM,
     FLASHTOPK_HEADS,
-    _get_selector,
     flashtopk_fp8_indexer_topk,
     flashtopk_kpool_indexer_topk,
+    flashtopk_kpool_should_use,
+    flashtopk_prunes,
+    flashtopk_should_use,
     is_flashtopk_supported,
     warmup_flashtopk_prefill,
+)
+from sglang.kernels.ops.attention.dsa.flashtopk.prefill import (
+    _WARMUP_KEYS,
+    _chunk_size,
+    _get_selector,
+    _warmup_rows,
 )
 from sglang.kernels.ops.attention.topk_page_table import topk_page_table_transform_
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
@@ -138,7 +144,12 @@ def _check_fp8_topk_against_ref(
         if k_eff > 0:
             top_vals = logits.topk(k_eff, dim=1).values
             kth = top_vals.gather(1, (n - 1).clamp(min=0)[:, None])
-            tol = 1e-4 * logits.masked_fill(~torch.isfinite(logits), 0).abs().amax(
+            # SM90 FP8 WGMMA uses an internal ~13-bit accumulator, so FP8 MQA
+            # scores can drift up to ~0.5% vs exact fp32 when head weights cancel.
+            rtol = (
+                1e-2 if torch.cuda.get_device_capability(out.device)[0] == 9 else 1e-4
+            )
+            tol = rtol * logits.masked_fill(~torch.isfinite(logits), 0).abs().amax(
                 1, keepdim=True
             ).clamp(min=1.0)
             assert (got >= kth - tol).all(), "selected key below k-th logit"
@@ -169,7 +180,9 @@ def test_flashtopk_fp8_indexer_ragged(topk: int, with_offsets: bool):
         q, w, kv, sf, ks, ke, topk, out_offsets=out_offsets
     )
     torch.cuda.synchronize()
-    assert torch.equal(out1, out2), "FlashTopK must be bit-deterministic"
+    assert torch.equal(out1.sort(dim=1).values, out2.sort(dim=1).values), (
+        "FlashTopK must select a deterministic top-k set"
+    )
     _check_fp8_topk_against_ref(out1, q, w, kv, sf, ks, ke, topk, out_offsets)
 
 
@@ -447,6 +460,50 @@ def test_flashtopk_kpool_adaptive_pruning_128k():
 
 
 @requires_flashtopk
+def test_flashtopk_wave_aware_gate_and_small_row_128k(monkeypatch):
+    """Wave-aware gate skips 1-CTA pruning on small rows, and direct 1-row >=128K
+    calls fall back internally to full-GPU Scan while staying exact."""
+    monkeypatch.delenv("SGLANG_OPT_PREFILL_FLASHTOPK_MIN_KEYS", raising=False)
+    keys = FLASHTOPK_ADAPTIVE_MIN_KEYS + 2048
+    dev = torch.device("cuda", 0)
+
+    assert not flashtopk_prunes(0, 1, keys)
+    assert not flashtopk_prunes(0, 1024, FLASHTOPK_ADAPTIVE_MIN_KEYS - 1)
+    assert flashtopk_prunes(0, 1024, keys)
+
+    if torch.cuda.get_device_capability(dev)[0] >= 10:
+        assert not flashtopk_should_use(
+            max_seq_len=keys,
+            num_keys=keys,
+            topk=2048,
+            has_lite_topk=True,
+            num_rows=1,
+            device=dev,
+        )
+        assert flashtopk_should_use(
+            max_seq_len=keys,
+            num_keys=keys,
+            topk=2048,
+            has_lite_topk=True,
+            num_rows=1024,
+            device=dev,
+        )
+        assert not flashtopk_kpool_should_use(
+            max_pool_len=keys, num_keys=keys, group_topk=512, num_rows=1, device=dev
+        )
+        assert flashtopk_kpool_should_use(
+            max_pool_len=keys, num_keys=keys, group_topk=512, num_rows=1024, device=dev
+        )
+
+    ks = torch.zeros(1, dtype=torch.int32, device=dev)
+    ke = torch.tensor([keys], dtype=torch.int32, device=dev)
+    q, w, kv, sf = _gen_inputs(1, keys, seed=23, device=dev)
+    out = flashtopk_fp8_indexer_topk(q, w, kv, sf, ks, ke, 2048)
+    torch.cuda.synchronize()
+    _check_fp8_topk_against_ref(out, q, w, kv, sf, ks, ke, 2048)
+
+
+@requires_flashtopk
 def test_flashtopk_warmup(monkeypatch):
     """warmup_flashtopk_prefill compiles both standard and KPool selectors cleanly."""
     monkeypatch.setenv("SGLANG_OPT_USE_PREFILL_FLASHTOPK", "1")
@@ -460,19 +517,27 @@ def test_flashtopk_warmup(monkeypatch):
 
     model = torch.nn.Sequential(_DummyIndexer(2048, 1), _DummyIndexer(2048, 4))
     warmup_flashtopk_prefill(model, torch.device("cuda", 0))
-    # Verify selectors are cached and usable outside inference_mode even when
-    # num_q > _CHUNK_SIZE (triggers multi-slice total.zero_() path).
+    # Verify selectors are cached with per-GPU chunk_size and usable outside
+    # inference_mode even when num_q > chunk_size (multi-slice path), with zero
+    # persistent memory growth after each call.
+    expected_chunk = _chunk_size(0)
+    warmup_rows = _warmup_rows(0)
     for eff_topk in (512, 2048):
         sel = _get_selector(0, eff_topk)
-        assert sel.max_rows >= max(_WARMUP_ROWS)
+        assert sel.chunk_size == expected_chunk
+        assert sel.max_rows >= max(warmup_rows)
         assert sel.max_kv >= max(_WARMUP_KEYS)
-    rows_multi = max(_WARMUP_ROWS) + 16
+    rows_multi = expected_chunk + 16
     q, w, kv, sf = _gen_inputs(rows_multi, 2048, seed=7)
     ks = torch.zeros(rows_multi, dtype=torch.int32, device="cuda")
     ke = torch.full((rows_multi,), 2048, dtype=torch.int32, device="cuda")
-    with torch.no_grad():
-        out = flashtopk_fp8_indexer_topk(q, w, kv, sf, ks, ke, 512)
+    out = torch.empty((rows_multi, 512), dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
+    mem_before = torch.cuda.memory_allocated(0)
+    with torch.no_grad():
+        flashtopk_fp8_indexer_topk(q, w, kv, sf, ks, ke, 512, out=out)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated(0) == mem_before
     assert out.shape == (rows_multi, 512)
 
 

@@ -8,7 +8,7 @@ import torch
 from einops import rearrange
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.attention.dsa.flashtopk_prefill import (
+from sglang.kernels.ops.attention.dsa.flashtopk import (
     FLASHTOPK_HEAD_DIM,
     FLASHTOPK_HEADS,
     FLASHTOPK_MAX_TOPK,
@@ -1925,6 +1925,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 num_keys=k_offset,
                 topk=self.index_topk,
                 has_lite_topk=self.use_prefill_lite_topk,
+                num_rows=q_offset,
+                device=q_fp8.device,
             )
         ):
             self._prefill_flashtopk(

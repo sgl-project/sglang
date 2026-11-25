@@ -663,7 +663,7 @@ for _fn in ("flashtopk_fp8_indexer_topk", "flashtopk_kpool_indexer_topk"):
         KernelSpec(
             op=f"attention.{_fn}",
             backend=KernelBackend.CUTE_DSL,
-            target=f"sglang.kernels.ops.attention.dsa.flashtopk_prefill:{_fn}",
+            target=f"sglang.kernels.ops.attention.dsa.flashtopk.prefill:{_fn}",
             capabilities=frozenset(
                 {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(10, 9))}
             ),

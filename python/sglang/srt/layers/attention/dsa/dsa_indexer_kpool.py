@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.attention.dsa.flashtopk_prefill import (
+from sglang.kernels.ops.attention.dsa.flashtopk import (
     FLASHTOPK_HEAD_DIM,
     FLASHTOPK_HEADS,
     FLASHTOPK_MAX_TOPK,
@@ -1136,6 +1136,8 @@ class IndexerKPool(MultiPlatformOp):
                 ),
                 num_keys=kv_fp8[0].shape[0],
                 group_topk=self.index_topk // self.index_kpool,
+                num_rows=pool_lens.shape[0],
+                device=q_fp8.device,
             )
         ):
             print_info_once(
