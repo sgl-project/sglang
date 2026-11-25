@@ -568,6 +568,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_token_space_processor",
     "indexer_kv_cache_dtype",
     "enable_flashmla_prefill_token_packing",
+    "k31_sparse_prefill_reader",
     "decode_state_free_radix_default",
     "disable_multimodal",
     "gc_freeze_on_idle_secs",
