@@ -5,15 +5,23 @@ def resolve_min_free_slots(
     user_value: Optional[int],
     max_running_requests: int,
     is_dflash_family: bool = False,
+    admission_cap: Optional[int] = None,
 ) -> Optional[int]:
     """Resolve the min-free-slots threshold (None = disabled).
 
-    An explicit user value always wins, capped by max_running_requests
+    An explicit user value always wins, capped by the running-request limit
     (<= 1 disables). When unset, DFlash workloads fall back to the legacy
-    formula (preserving the always-on behavior, disabled when
-    max_running_requests < 8); other workloads stay disabled.
+    formula (preserving the always-on behavior, disabled when the limit is
+    < 8); other workloads stay disabled.
+
+    The limit is ``max_running_requests``, lowered to ``admission_cap`` (the
+    per-batch admission budget, ``--pp-max-micro-batch-size``) when that is
+    smaller: a threshold above the slots that can ever be free while a request
+    runs would hold every admission until the running batch drains.
     """
     max_running_requests = max(0, int(max_running_requests))
+    if admission_cap is not None:
+        max_running_requests = min(max_running_requests, max(0, int(admission_cap)))
     if user_value is not None:
         threshold = min(user_value, max_running_requests)
         return threshold if threshold > 1 else None
