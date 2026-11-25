@@ -82,10 +82,19 @@ def plan_migration(
     # ranks. Keep the base planner's rank assignments for static dispatch.
     replicated_static = replicated and spec.rank_fixed_dispatch
     score_steps = spec.nodes == 1 and not replicated_static
+    fallbacks = {}
     if score_steps and replicated:
+        base_physical, base_logical = physical, logical
         physical, logical = _balance_recorded_steps(
             physical, logical, counts, spec.local_experts, current, layer_ids
         )
+        if physical_counts is not None:
+            # Only a layer changed by refinement has a distinct fallback.
+            fallbacks = {
+                i: (base_physical[i : i + 1], base_logical[i : i + 1])
+                for i in layer_ids
+                if not torch.equal(base_logical[i], logical[i])
+            }
     physical, logical = _align_placement(
         current,
         physical,
@@ -99,21 +108,22 @@ def plan_migration(
         physical, logical, known_gains = _prefer_fewer_moves(
             current, physical, logical, counts, spec.local_experts
         )
-    moved = (physical != current).any(dim=1).tolist()
-    changed = tuple(layer for layer in layer_ids if moved[layer])
-    # All ranks start with the same layout and commit layers together.
-    # An unchanged plan only needs the completion message.
     if physical_counts is not None:
-        # Search with logical totals, but admit against observed replica loads.
-        known_gains = {
-            layer: _row_dispatch_gain(
-                physical_counts[:, layer],
-                current_replicas[layer].numpy(),
-                logical[layer].numpy(),
-                spec.local_experts,
-            )
-            for layer in changed
-        }
+        known_gains = _admit_row_dispatch_layers(
+            layer_ids,
+            current,
+            current_replicas,
+            physical,
+            logical,
+            physical_counts,
+            spec.local_experts,
+            ranks_per_node,
+            fallbacks,
+        )
+        changed = tuple(known_gains)
+    else:
+        moved = (physical != current).any(dim=1).tolist()
+        changed = tuple(layer for layer in layer_ids if moved[layer])
     if changed and (score_steps or physical_counts is not None):
         changed = _select_layers_for_migration(
             changed, current, physical, counts, spec.local_experts, known_gains
@@ -478,8 +488,49 @@ def _prefer_fewer_moves(old, physical, logical, counts, local_experts):
     return physical, logical, cheaper_gains
 
 
+def _admit_row_dispatch_layers(
+    layer_ids,
+    current,
+    current_replicas,
+    physical,
+    logical,
+    samples,
+    local_experts,
+    ranks_per_node,
+    fallbacks,
+):
+    """Keep a passing refinement, or try the base placement for that layer."""
+    gains = {}
+    for layer in layer_ids:
+        live = current_replicas[layer].numpy()
+        target = logical[layer].numpy()
+        gain = _row_dispatch_gain(samples[:, layer], live, target, local_experts)
+        if not gain and layer in fallbacks:
+            base, inverse = _align_placement(
+                current[layer : layer + 1],
+                *fallbacks[layer],
+                local_experts,
+                ranks_per_node,
+            )
+            if not torch.equal(inverse[0], logical[layer]):
+                gain = _row_dispatch_gain(
+                    samples[:, layer], live, inverse[0].numpy(), local_experts
+                )
+                if gain:
+                    physical[layer].copy_(base[0])
+                    logical[layer].copy_(inverse[0])
+        if gain:
+            gains[layer] = gain
+    return gains
+
+
 def _row_dispatch_gain(samples, live_replicas, target_replicas, local_experts):
     """Bound rank peaks when a token row picks replica row % num_replicas."""
+    # Both inverse maps cover all physical slots. Any extra columns in the
+    # wider table are padding if the common prefix agrees, including its order.
+    width = min(live_replicas.shape[1], target_replicas.shape[1])
+    if np.array_equal(live_replicas[:, :width], target_replicas[:, :width]):
+        return 0.0
     ranks = samples.shape[1] // local_experts
     reachable = np.zeros((ranks, samples.shape[1]), dtype=bool)
     # A row previously choosing column i can choose column j iff the two

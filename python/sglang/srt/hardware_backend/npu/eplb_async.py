@@ -362,7 +362,7 @@ class NpuEplbRuntime:
         self.log_metrics = get_bool_env_var(
             "SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS"
         )
-        self.layer_ids = tuple(sorted(weights))
+        self.layer_ids = tuple(sorted(weights.keys()))
         adapter = _ExpertWeightAdapter(weights, list(self.layer_ids), rank)
         weight_formats = hashlib.sha256()
         for layer in self.layer_ids:
@@ -517,10 +517,27 @@ class NpuEplbRuntime:
         start = time.perf_counter()
         routing = self._routing_plan
         assert routing is not None
-        staged_rows = []
         pending_work = []
+        with self.device_module.stream(self._p2p_stream):
+            self._p2p_stream.wait_event(self._owner_ready)
+            for name, row in routing.device_rows.items():
+                row.copy_(routing.host_rows[name][layer], non_blocking=True)
+            writeback = self._stage_weights(layer, routing, pending_work)
+            if submitted is not None:
+                submitted.set_result(None)
+            # The caller can install only after the stream and its Work handles drain.
+            self._p2p_stream.synchronize()
+        self.stage_seconds += time.perf_counter() - start
+        return writeback
+
+    def _stage_weights(self, layer, routing, pending_work) -> WeightWriteback:
         old_layout = self.metadata.physical_to_logical_map_cpu[layer].tolist()
         new_layout = routing.host_rows["physical_to_logical_map"][layer].tolist()
+        if old_layout == new_layout:
+            # A replica-order update only publishes the staged routing rows.
+            return lambda: None
+
+        staged_rows = []
         get_comm_ranks = _make_comm_rank_lookup(
             old_layout, new_layout, self.spec.local_experts
         )
@@ -548,50 +565,40 @@ class NpuEplbRuntime:
                 p2p_op_infos, expert_order, self._p2p_batch_size, pending_work
             )
 
-        with self.device_module.stream(self._p2p_stream):
-            self._p2p_stream.wait_event(self._owner_ready)
-            for name, row in routing.device_rows.items():
-                row.copy_(routing.host_rows[name][layer], non_blocking=True)
-            weights, staging = self.weights[layer], self.staging
-            sends, receives = weights, staging
-            packed = self._packed_fields
-            packed_for_local_copy = False
-            if packed is not None:
-                first = self.rank * self.spec.local_experts
-                local = slice(first, first + self.spec.local_experts)
-                resident = old_layout[local]
-                # The updater copies local moves before calling stage_transfers.
-                # Other sources only need packing if an isend was selected.
-                resident_experts = set(resident)
-                packed_for_local_copy = any(
-                    old != new and new in resident_experts
-                    for old, new in zip(resident, new_layout[local], strict=True)
-                )
-                if packed_for_local_copy:
-                    packed.pack(weights)
-                sends = [weights[i] for i in packed.direct] + [packed.send]
-                receives = packed.receive
-            update_expert_weights_single_layer(
-                routed_experts_weights=sends,
-                temp_buffers=receives,
-                old_physical_to_logical_map=old_layout,
-                new_physical_to_logical_map=new_layout,
-                num_local_physical_experts=self.spec.local_experts,
-                num_gpu_per_node=self.ranks_per_node,
-                rank=self.rank,
-                world_size=self.world_size,
-                log_metrics=self.log_metrics,
-                group=self.p2p_group,
-                get_comm_ranks=get_comm_ranks,
-                stage_transfers=stage_transfers,
+        weights, staging = self.weights[layer], self.staging
+        sends, receives = weights, staging
+        packed = self._packed_fields
+        packed_for_local_copy = False
+        if packed is not None:
+            first = self.rank * self.spec.local_experts
+            local = slice(first, first + self.spec.local_experts)
+            resident = old_layout[local]
+            # The updater copies local moves before calling stage_transfers.
+            # Other sources only need packing if an isend was selected.
+            resident_experts = set(resident)
+            packed_for_local_copy = any(
+                old != new and new in resident_experts
+                for old, new in zip(resident, new_layout[local], strict=True)
             )
-            writeback = _make_weight_writeback(weights, staging, staged_rows)
-            if submitted is not None:
-                submitted.set_result(None)
-            # The caller can install only after the stream and its Work handles drain.
-            self._p2p_stream.synchronize()
-        self.stage_seconds += time.perf_counter() - start
-        return writeback
+            if packed_for_local_copy:
+                packed.pack(weights)
+            sends = [weights[i] for i in packed.direct] + [packed.send]
+            receives = packed.receive
+        update_expert_weights_single_layer(
+            routed_experts_weights=sends,
+            temp_buffers=receives,
+            old_physical_to_logical_map=old_layout,
+            new_physical_to_logical_map=new_layout,
+            num_local_physical_experts=self.spec.local_experts,
+            num_gpu_per_node=self.ranks_per_node,
+            rank=self.rank,
+            world_size=self.world_size,
+            log_metrics=self.log_metrics,
+            group=self.p2p_group,
+            get_comm_ranks=get_comm_ranks,
+            stage_transfers=stage_transfers,
+        )
+        return _make_weight_writeback(weights, staging, staged_rows)
 
     def install(self, layer: int, writeback: WeightWriteback) -> None:
         self._check_stream()
