@@ -21,6 +21,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(
     est_time=35, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
+register_cuda_ci(
+    est_time=35, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
+)
 
 HIDDEN = 2048
 LAYOUTS = {
