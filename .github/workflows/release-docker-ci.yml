@@ -18,13 +18,13 @@ on:
         required: false
         default: ""
       cu_version:
-        description: "CU_VERSION the install script uses; keep in step with the fleet"
+        description: "CU_VERSION the install script uses; keep in step with the fleet. Empty uses cu130."
         required: false
-        default: "cu130"
+        default: ""
       cuda_version:
-        description: "CUDA base image version"
+        description: "CUDA base image version. Empty uses 13.0.3."
         required: false
-        default: "13.0.3"
+        default: ""
       tag:
         description: "Custom tag suffix, e.g. 'my-test' -> blackwell-my-test. Empty publishes the rolling and nightly tags."
         required: false
@@ -40,7 +40,8 @@ on:
 concurrency:
   group: release-docker-ci-${{ inputs.gpu_family || 'blackwell' }}-${{ inputs.tag || 'nightly' }}
   # Runs that publish the rolling tag queue behind each other, so a manual
-  # dispatch never cancels the nightly build; custom-tag runs replace older ones.
+  # dispatch never cancels a running build (a newer run still replaces a pending
+  # one); custom-tag runs replace older ones.
   cancel-in-progress: ${{ inputs.tag != '' }}
 
 permissions:
@@ -54,21 +55,28 @@ jobs:
   prepare:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
+    # Scheduled runs have no inputs, so every default and every per-family
+    # setting is resolved here once and the build reads these outputs.
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+      matrix: ${{ steps.config.outputs.matrix }}
+      is_blackwell: ${{ steps.config.outputs.is_blackwell }}
+      cu_version: ${{ steps.config.outputs.cu_version }}
+      cuda_version: ${{ steps.config.outputs.cuda_version }}
     steps:
-      - name: Compute build matrix
-        id: matrix
+      - name: Resolve build config
+        id: config
         env:
           ARCHES: ${{ inputs.arches }}
           TAG_SUFFIX: ${{ inputs.tag }}
-          CU_VERSION: ${{ inputs.cu_version || 'cu130' }}
-          CUDA_VERSION: ${{ inputs.cuda_version || '13.0.3' }}
+          CU_VERSION: ${{ inputs.cu_version }}
+          CUDA_VERSION: ${{ inputs.cuda_version }}
         run: |
           set -euo pipefail
+          CU_VERSION="${CU_VERSION:-cu130}"
+          CUDA_VERSION="${CUDA_VERSION:-13.0.3}"
           case "${GPU_FAMILY}" in
-            blackwell) DEFAULT_ARCHES=arm64 ;;
-            hopper) DEFAULT_ARCHES=amd64 ;;
+            blackwell) IS_BLACKWELL=1 DEFAULT_ARCHES=arm64 ;;
+            hopper) IS_BLACKWELL=0 DEFAULT_ARCHES=amd64 ;;
           esac
           ARCHES=$(printf '%s' "${ARCHES:-${DEFAULT_ARCHES}}" | tr ',' '\n' | tr -d ' ' | sed '/^$/d' | sort -u | paste -sd, -)
 
@@ -94,7 +102,12 @@ jobs:
               elif . == "arm64" then {arch: ., runner: "arm-docker-build-node"}
               else error("unsupported arch: \(.)") end
             ) | {include: .}')
-          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          {
+            echo "matrix=${MATRIX}"
+            echo "is_blackwell=${IS_BLACKWELL}"
+            echo "cu_version=${CU_VERSION}"
+            echo "cuda_version=${CUDA_VERSION}"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -125,9 +138,9 @@ jobs:
 
       - name: Build and push ${{ matrix.arch }} image
         env:
-          IS_BLACKWELL: ${{ env.GPU_FAMILY == 'blackwell' && '1' || '0' }}
-          CU_VERSION: ${{ inputs.cu_version || 'cu130' }}
-          CUDA_VERSION: ${{ inputs.cuda_version || '13.0.3' }}
+          IS_BLACKWELL: ${{ needs.prepare.outputs.is_blackwell }}
+          CU_VERSION: ${{ needs.prepare.outputs.cu_version }}
+          CUDA_VERSION: ${{ needs.prepare.outputs.cuda_version }}
         run: |
           set -euo pipefail
           docker buildx build \

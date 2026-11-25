@@ -20,7 +20,10 @@ ARG IS_BLACKWELL=1
 # script would keep under HOME lives in /opt instead. Compiled kernels get their
 # own directory, empty in the image, so a runner can mount a persistent volume
 # there without hiding anything baked in. Model weights come from the runner's
-# HF_HOME / HF_HUB_CACHE.
+# HF_HOME / HF_HUB_CACHE. SGLang derives FLASHINFER_WORKSPACE_BASE and
+# TRITON_CACHE_DIR from SGLANG_CACHE_DIR itself (third_party_cache_defaults in
+# python/sglang/srt/environ.py); they are set here for processes that import
+# FlashInfer or Triton without SGLang.
 ENV CU_VERSION=${CU_VERSION} \
     XDG_CACHE_HOME=/opt/sglang-ci/cache \
     SGLANG_CACHE_DIR=/opt/sglang-ci/kernels \
@@ -30,11 +33,13 @@ ENV CU_VERSION=${CU_VERSION} \
     RUSTUP_HOME=/opt/sglang-ci/rustup \
     UV_PYTHON_INSTALL_DIR=/opt/sglang-ci/python
 
-# The install script's apt list is skipped once these are present; the rest are
-# what its bootstrap and the artifact download steps need.
+# Only what the install script and the artifact download steps need before the
+# script runs: the script installs its own apt list as root below, so a job
+# finds it complete. No sudo: the job user has no sudo rights, and a sudo it
+# cannot use fails where a missing one is skipped.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl git jq sudo python3 python3-pip python3-venv zstd \
+        ca-certificates curl git jq python3 python3-pip python3-venv zstd \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
@@ -44,8 +49,15 @@ RUN apt-get update \
 # Leftovers no job reuses are dropped: the downloaded FlashInfer wheels (already
 # installed), the cargo target dir (CI stages download prebuilt Rust extensions),
 # the GDRCopy build tree, and the apt lists the script's installs fetched.
+# These paths, and the venv /opt/sglang-ci-py3.12 (UV_VENV in its
+# configure_environment, next to this file's /opt/sglang-ci), belong to the
+# install script: rename them there and here together.
+# env.sh is emptied because the build wrote the stub into its LD_LIBRARY_PATH
+# line; a job inside Actions rewrites it, a container run by hand does not.
 # The job user owns the environment, and group 0 gets the same rights for a
 # runner that picks another UID; done in the same step to avoid a second copy.
+# /opt is group-writable so the job user can rebuild the venv after an
+# interrupted install.
 RUN --mount=type=bind,source=.,target=/sgl-src,rw \
     mkdir -p /tmp/cuda-stub \
     && ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-stub/libcuda.so.1 \

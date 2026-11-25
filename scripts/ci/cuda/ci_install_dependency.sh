@@ -250,16 +250,27 @@ install_apt_packages() {
 install_gdrcopy() {
     # DeepEP tests only run on 4+ GPU hosts. Keep GDRCopy in the shared CUDA
     # bootstrap while avoiding the libgdrapi package build on the 1- and 2-GPU jobs.
-    local gpu_count=0
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        gpu_count=$(
-            (nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true) |
-                awk 'NF {count++} END {print count + 0}'
-        )
+    # INSTALL_GDRCOPY overrides the GPU count either way, e.g. docker/ci.Dockerfile
+    # builds with no GPU visible.
+    local install=0
+    if [ "${INSTALL_GDRCOPY+set}" = set ]; then
+        case "$INSTALL_GDRCOPY" in 1 | true | yes) install=1 ;; esac
+        echo "INSTALL_GDRCOPY=${INSTALL_GDRCOPY} (manually set via environment)"
+    else
+        local gpu_count=0
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            gpu_count=$(
+                (nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true) |
+                    awk 'NF {count++} END {print count + 0}'
+            )
+        fi
+        echo "${gpu_count}-GPU runner"
+        if [ "${gpu_count}" -ge 4 ]; then
+            install=1
+        fi
     fi
-    # INSTALL_GDRCOPY=1 forces the build where nvidia-smi sees no GPUs, e.g. docker/ci.Dockerfile.
-    if [ "${gpu_count}" -lt 4 ] && [ "${INSTALL_GDRCOPY:-0}" != "1" ]; then
-        echo "Skipping GDRCopy install on ${gpu_count}-GPU runner"
+    if [ "${install}" != 1 ]; then
+        echo "Skipping GDRCopy install"
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
@@ -625,7 +636,7 @@ install_sglang() {
     echo "Installing python extras: [${EXTRAS}]"
     # editable checkout paths are identical across runner containers; keep
     # distribution locks separate while reusing each runner's warm cache
-    local editable_cache_dir="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+    local editable_cache_dir="${UV_CACHE_DIR:-${CI_CACHE_DIR}/uv}"
     if [ -n "${RUNNER_NAME:-}" ]; then
         editable_cache_dir="${editable_cache_dir}/runners/${RUNNER_NAME}"
     fi
@@ -757,6 +768,7 @@ download_flashinfer_cache() {
         CU_VERSION="$CU_VERSION" \
         PIP_CMD="$PIP_CMD" \
         PIP_INSTALL_SUFFIX="$PIP_INSTALL_SUFFIX" \
+        CI_CACHE_DIR="$CI_CACHE_DIR" \
         bash "${SCRIPT_DIR}/ci_download_flashinfer_jit_cache.sh"
 
     mark_step_done "${FUNCNAME[0]}"
