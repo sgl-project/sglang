@@ -282,12 +282,12 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_NPU_USE_MLAPO=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
 python3 -m sglang.launch_server \
+    --enable-prefill-delayer \
+    --prefill-delayer-max-delay-passes 200 \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
