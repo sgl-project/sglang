@@ -202,6 +202,7 @@ fn decide(
     // Probes and scrapes never carry a key.
     if method == Method::OPTIONS
         || path.starts_with("/health")
+        || path.starts_with("/liveness")
         || path.starts_with("/ready")
         || path.starts_with("/metrics")
     {
@@ -231,11 +232,15 @@ fn bearer_matches(authorization: Option<&str>, key: &str) -> bool {
     let Some((scheme, token)) = authorization.and_then(|value| value.split_once(' ')) else {
         return false;
     };
-    scheme.eq_ignore_ascii_case("bearer")
-        && token.len() == key.len()
-        && token
-            .bytes()
-            .zip(key.bytes())
+    scheme.eq_ignore_ascii_case("bearer") && secret_matches(token.as_bytes(), key)
+}
+
+/// Whether `presented` is `secret`, compared in constant time.
+pub(super) fn secret_matches(presented: &[u8], secret: &str) -> bool {
+    presented.len() == secret.len()
+        && presented
+            .iter()
+            .zip(secret.bytes())
             .fold(0u8, |diff, (a, b)| diff | (a ^ b))
             == 0
 }
@@ -354,6 +359,7 @@ mod tests {
             rust_server_endpoints: vec![RustServerEndpoint {
                 dp_rank: 1,
                 endpoint: url,
+                peer_token: None,
             }],
             ..Default::default()
         };

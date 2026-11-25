@@ -43,7 +43,6 @@ class Pi05BenchProfile:
     sglang_action_horizon: int
     openpi_action_horizon: int
     action_dim: int
-    output_action_dim: int
 
 
 PROFILES = {
@@ -56,7 +55,6 @@ PROFILES = {
         sglang_action_horizon=50,
         openpi_action_horizon=50,
         action_dim=32,
-        output_action_dim=7,
     ),
     "aloha": Pi05BenchProfile(
         name="aloha",
@@ -67,7 +65,6 @@ PROFILES = {
         sglang_action_horizon=50,
         openpi_action_horizon=50,
         action_dim=32,
-        output_action_dim=14,
     ),
 }
 
@@ -1150,7 +1147,6 @@ def main() -> None:
             sglang_action_horizon=profile.sglang_action_horizon,
             openpi_action_horizon=profile.openpi_action_horizon,
             action_dim=profile.action_dim,
-            output_action_dim=profile.output_action_dim,
         )
     openpi_config = args.openpi_config or profile.openpi_config
     openpi_checkpoint = args.openpi_checkpoint or profile.openpi_checkpoint

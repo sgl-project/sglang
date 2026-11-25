@@ -1,6 +1,6 @@
 """Greedy argmax recorded inside Unlimited-OCR v2 decode CUDA graphs.
 
-The decode graph I/O (``runner/uocr_decode_graph_io.py``) relays these ids to the
+The decode graph I/O (``decode_graph_io.py`` in this package) relays these ids to the
 next step's inputs on device, so all-greedy decode skips the eager sampler.
 """
 
@@ -89,16 +89,13 @@ class UocrGreedyGraph:
             or forward_batch.return_logprob
         ):
             return None
-        # The argmax ran inside the graph, before _preprocess_logits and watermark
-        # forcing, so any transform of the logits invalidates it.
+        # The argmax ran inside the graph, before the sampling pipeline's
+        # adjustments, so any transform of the logits invalidates it.
         if (
             sampling_info.logit_bias is not None
-            or sampling_info.grammar_mask is not None
+            or sampling_info.grammars is not None
             or sampling_info.has_custom_logit_processor
-            or (
-                sampling_info.penalizer_orchestrator is not None
-                and sampling_info.penalizer_orchestrator.is_required
-            )
+            or sampling_info.step_penalties is not None
         ):
             return None
         rows = int(logits_output.next_token_logits.shape[0])
