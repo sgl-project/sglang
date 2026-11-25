@@ -189,19 +189,19 @@ class TestXpuMoeWna16(CustomTestCase):
 
         return reference
 
-    def _assert_output_matches_reference(self, output, reference, rtol=0.03, atol=0.03):
+    def _assert_output_matches_reference(
+        self, output, reference, rtol=0.03, atol=0.03, expected_dtype=torch.bfloat16
+    ):
         self.assertIsInstance(output, StandardCombineInput)
         self.assertEqual(output.hidden_states.shape, reference.shape)
-        self.assertEqual(output.hidden_states.dtype, torch.bfloat16)
+        self.assertEqual(output.hidden_states.dtype, expected_dtype)
         torch.testing.assert_close(
             output.hidden_states.float().cpu(), reference, rtol=rtol, atol=atol
         )
 
-    def _create_dispatch_output(self):
+    def _create_dispatch_output(self, dtype=torch.bfloat16):
         x = (
-            torch.randn(
-                self.num_tokens, self.hidden, dtype=torch.bfloat16, device=self.device
-            )
+            torch.randn(self.num_tokens, self.hidden, dtype=dtype, device=self.device)
             * 0.5
         )
         topk_weights = torch.full(
@@ -217,13 +217,17 @@ class TestXpuMoeWna16(CustomTestCase):
     def _build_moe_layer(
         self,
         method,
-        params_dtype=torch.float8_e4m3fn,
         with_bias=False,
         routed_scaling_factor=None,
         runner_config=None,
     ):
         if runner_config is None:
-            runner_config = MoeRunnerConfig(routed_scaling_factor=routed_scaling_factor)
+            runner_config = MoeRunnerConfig(
+                params_dtype=torch.bfloat16,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+        elif runner_config.params_dtype is None:
+            runner_config.params_dtype = torch.bfloat16
         layer = nn.Module()
         layer.moe_tp_size = 1
         layer.moe_runner_config = runner_config
@@ -236,11 +240,24 @@ class TestXpuMoeWna16(CustomTestCase):
             num_experts=self.num_experts,
             hidden_size=self.hidden,
             intermediate_size_per_partition=self.intermediate,
-            params_dtype=params_dtype,
+            params_dtype=runner_config.params_dtype,
         )
         if with_bias:
             create_kwargs["with_bias"] = True
         method.create_weights(**create_kwargs)
+        expected_weight_dtype = (
+            runner_config.params_dtype
+            if isinstance(method, Fp8MoEMethod)
+            and not method.quant_config.is_checkpoint_fp8_serialized
+            else torch.float8_e4m3fn
+        )
+        self.assertEqual(layer.w13_weight.dtype, expected_weight_dtype)
+        self.assertEqual(layer.w2_weight.dtype, expected_weight_dtype)
+        if expected_weight_dtype == torch.float8_e4m3fn and getattr(
+            method, "use_mxfp8", False
+        ):
+            self.assertEqual(layer.w13_weight_scale_inv.dtype, torch.uint8)
+            self.assertEqual(layer.w2_weight_scale_inv.dtype, torch.uint8)
         method.create_moe_runner(layer, runner_config)
 
         w13_intermediate = (
@@ -433,6 +450,8 @@ class TestXpuMoeWna16(CustomTestCase):
         with patch("sgl_kernel.fused_experts", wraps=fused_experts) as native:
             output = method.apply(layer, dispatch_output)
             native.assert_called_once()
+            self.assertTrue(native.call_args.kwargs["use_fp8_w8a8"])
+            self.assertEqual(native.call_args.args[1].dtype, torch.float8_e4m3fn)
             self.assertIsNone(native.call_args.kwargs["block_shape"])
         self._assert_output_matches_reference(output, reference)
 
@@ -446,9 +465,8 @@ class TestXpuMoeWna16(CustomTestCase):
         dispatch_output = self._create_dispatch_output()
         quant_config = Fp8Config(is_checkpoint_fp8_serialized=False, use_mxfp8=True)
         method = Fp8MoEMethod(quant_config)
-        layer, w13_bf16, w2_bf16 = self._build_moe_layer(
-            method, params_dtype=torch.bfloat16
-        )
+        layer, w13_bf16, w2_bf16 = self._build_moe_layer(method)
+        self.assertEqual(layer.w13_weight.dtype, torch.bfloat16)
 
         layer.to(self.device)
         method.process_weights_after_loading(layer)
@@ -589,10 +607,16 @@ class TestXpuMoeWna16(CustomTestCase):
         )
         for activation, is_gated, expected in cases:
             with self.subTest(activation=activation, is_gated=is_gated):
-                config = MoeRunnerConfig(activation=activation, is_gated=is_gated)
+                config = MoeRunnerConfig(
+                    activation=activation,
+                    is_gated=is_gated,
+                    params_dtype=torch.bfloat16,
+                )
                 self.assertEqual(can_use_xpu_fp8_moe(config, None), expected)
 
-        default_config = MoeRunnerConfig(activation="silu", is_gated=True)
+        default_config = MoeRunnerConfig(
+            activation="silu", is_gated=True, params_dtype=torch.bfloat16
+        )
         # Block size checks
         self.assertTrue(can_use_xpu_fp8_moe(default_config, [1, 32], use_mxfp8=True))
         self.assertFalse(can_use_xpu_fp8_moe(default_config, [32, 32], use_mxfp8=True))
@@ -603,13 +627,33 @@ class TestXpuMoeWna16(CustomTestCase):
 
         # EP checks
         local_config = MoeRunnerConfig(
-            activation="silu", is_gated=True, num_experts=8, num_local_experts=8
+            activation="silu",
+            is_gated=True,
+            num_experts=8,
+            num_local_experts=8,
+            params_dtype=torch.bfloat16,
         )
         self.assertTrue(can_use_xpu_fp8_moe(local_config, None))
         non_local_config = MoeRunnerConfig(
-            activation="silu", is_gated=True, num_experts=8, num_local_experts=4
+            activation="silu",
+            is_gated=True,
+            num_experts=8,
+            num_local_experts=4,
+            params_dtype=torch.bfloat16,
         )
         self.assertFalse(can_use_xpu_fp8_moe(non_local_config, None))
+
+        # Dtype checks
+        self.assertFalse(can_use_xpu_fp8_moe(MoeRunnerConfig(), None))
+        self.assertTrue(
+            can_use_xpu_fp8_moe(MoeRunnerConfig(params_dtype=torch.bfloat16), None)
+        )
+        self.assertFalse(
+            can_use_xpu_fp8_moe(MoeRunnerConfig(params_dtype=torch.float16), None)
+        )
+        self.assertFalse(
+            can_use_xpu_fp8_moe(MoeRunnerConfig(params_dtype=torch.float32), None)
+        )
 
         # TP block size refinement: skipped on native XPU path, applied on Triton fallback
         tp_method = Fp8MoEMethod(
@@ -626,13 +670,72 @@ class TestXpuMoeWna16(CustomTestCase):
             ),
             ([128, 128], None),
         )
-        tp_layer.moe_runner_config = MoeRunnerConfig(activation="gelu", is_gated=True)
-        self.assertEqual(
-            tp_method._tp_weight_block_sizes(
-                layer=tp_layer, hidden_size=256, intermediate_size_per_partition=64
+        for fallback_cfg in (
+            MoeRunnerConfig(
+                activation="gelu", is_gated=True, params_dtype=torch.bfloat16
             ),
-            ([64, 128], [128, 64]),
-        )
+            MoeRunnerConfig(params_dtype=torch.float16),
+            MoeRunnerConfig(),
+        ):
+            tp_layer.moe_runner_config = fallback_cfg
+            self.assertEqual(
+                tp_method._tp_weight_block_sizes(
+                    layer=tp_layer, hidden_size=256, intermediate_size_per_partition=64
+                ),
+                ([64, 128], [128, 64]),
+            )
+
+    def test_fp16_activation_fallback(self):
+        from sgl_kernel import fused_experts
+
+        for backend in (MoeRunnerBackend.AUTO, MoeRunnerBackend.INTEL_XPU):
+            with get_flags().moe.override(runner_backend=backend):
+                methods = (
+                    Fp8MoEMethod(Fp8Config(is_checkpoint_fp8_serialized=True)),
+                    CompressedTensorsW8A8Fp8MoE(
+                        MagicMock(strategy=QuantizationStrategy.TENSOR),
+                        MagicMock(strategy=QuantizationStrategy.TENSOR, dynamic=True),
+                    ),
+                )
+                for method in methods:
+                    with self.subTest(backend=backend, method=type(method).__name__):
+                        config = MoeRunnerConfig(
+                            inplace=False, params_dtype=torch.float16
+                        )
+                        layer, _, _ = self._build_moe_layer(
+                            method,
+                            runner_config=config,
+                        )
+                        self.assertEqual(layer.w13_weight.dtype, torch.float8_e4m3fn)
+                        layer.to(self.device)
+                        method.process_weights_after_loading(layer)
+                        self.assertTrue(method.runner.runner_backend.is_triton())
+
+                        dispatch = self._create_dispatch_output(dtype=torch.float16)
+                        reference = self._reference_moe(
+                            dispatch,
+                            layer.w13_weight,
+                            layer.w2_weight,
+                            layer.w13_weight_scale,
+                            layer.w2_weight_scale,
+                            runner_config=config,
+                        )
+                        with patch(
+                            "sgl_kernel.fused_experts", wraps=fused_experts
+                        ) as native:
+                            output = (
+                                method.apply_weights(layer, dispatch)
+                                if isinstance(method, CompressedTensorsW8A8Fp8MoE)
+                                else method.apply(layer, dispatch)
+                            )
+                            native.assert_not_called()
+                        self._assert_output_matches_reference(
+                            output,
+                            reference,
+                            rtol=0.1,
+                            atol=0.1,
+                            expected_dtype=torch.float16,
+                        )
 
     def test_compressed_tensors_runner_config_fallback(self):
         from sgl_kernel import fused_experts
@@ -768,9 +871,6 @@ class TestXpuMoeWna16(CustomTestCase):
                     config = MoeRunnerConfig(inplace=False, **settings)
                     layer, w13_bf16, w2_bf16 = self._build_moe_layer(
                         method,
-                        params_dtype=(
-                            torch.float8_e4m3fn if serialized else torch.bfloat16
-                        ),
                         runner_config=config,
                     )
                     layer.to(self.device)
@@ -864,6 +964,10 @@ class TestXpuMoeWna16(CustomTestCase):
                                 else method.apply(layer, dispatch)
                             )
                             native.assert_called_once()
+                            self.assertTrue(native.call_args.kwargs["use_fp8_w8a8"])
+                            self.assertEqual(
+                                native.call_args.args[1].dtype, torch.float8_e4m3fn
+                            )
                             self.assertEqual(
                                 native.call_args.kwargs["activation"], "gelu"
                             )

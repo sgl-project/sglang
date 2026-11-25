@@ -173,12 +173,14 @@ sglang serve                 \
 | FP8 block-wise [128, 128] | Supported | DeepSeek-V3 / Mixtral FP32 block scales |
 | MXFP8 block-wise [1, 32] | Supported | OCP microscaling UE8M0 scales per 32 elements, including online quantization |
 
-The native path supports gated SiLU, gated GELU (`gelu_tanh`), non-gated squared ReLU,
-and GPT-OSS / DeepSeek-V4 SwiGLU. Expert biases and routed scaling are supported.
+The native path supports BF16 activations with gated SiLU, gated GELU (`gelu_tanh`),
+non-gated squared ReLU, and GPT-OSS / DeepSeek-V4 SwiGLU. Expert biases and routed
+scaling are supported.
 
-Configurations not handled by the native path (such as per-channel scales, other block
-shapes, uncombined expert outputs, input-side router weighting, exact erf GELU, or expert parallelism), as well
-as an explicit `--moe-runner-backend triton`, automatically use the Triton MoE runner.
+Configurations not handled by the native path (such as FP16 activations, per-channel
+scales, other block shapes, uncombined expert outputs, input-side router weighting,
+exact erf GELU, or expert parallelism), as well as an explicit
+`--moe-runner-backend triton`, automatically use the Triton MoE runner.
 
 ## Benchmarking with Requests
 

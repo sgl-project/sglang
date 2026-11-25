@@ -176,7 +176,9 @@ class TestXpuCallSitesNeverPassTheSentinel(CustomTestCase):
     def test_fp8_apply(self) -> None:
         topk_weights, topk_ids = self.routing(top_k=2)
         moe_method = SimpleNamespace(
-            moe_runner_config=MoeRunnerConfig(activation="silu"),
+            moe_runner_config=MoeRunnerConfig(
+                activation="silu", params_dtype=torch.bfloat16
+            ),
             is_fp4_expert=False,
             block_quant=False,
             weight_block_size=None,

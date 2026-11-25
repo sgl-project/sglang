@@ -913,7 +913,8 @@ def can_use_xpu_fp8_moe(
         and config.num_experts != config.num_local_experts
     )
     return (
-        valid_block
+        config.params_dtype == torch.bfloat16
+        and valid_block
         and supported_act
         and not config.apply_router_weight_on_input
         and not config.no_combine
