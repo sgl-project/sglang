@@ -16,12 +16,6 @@ from sglang.kernels.ops.speculative.dflash import (
     _prepare_dflash_mamba_commit,
     compute_dflash_correct_drafts_and_bonus,
 )
-from sglang.kernels.ops.speculative.dflash_sparse_verify import (
-    merge_shard_topk,
-    pack_shard_topk,
-    shard_topk_width,
-    sparse_chain_speculative_sampling,
-)
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     accept_sampling,
@@ -88,6 +82,10 @@ from sglang.srt.speculative.dflash_draft_ring import (
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_sparse_verify import (
+    DFlashSparseVerify,
+    SparseSupport,
+)
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -174,24 +172,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.dflash_mla_ctx import MlaContextKV
 
 logger = logging.getLogger(__name__)
-
-# Measured at top_k 64. A larger cap widens each row's merge sort to
-# tp_size * next_power_of_2(top_k + 16) keys.
-_SPARSE_VERIFY_MAX_TOP_K = 64
-
-
-def _sparse_verify_enabled(
-    *, target_logits_processor: Optional[LogitsProcessor], tp_size: int
-) -> bool:
-    # Only a softcapped target defers the verify gather to a vocab shard.
-    return (
-        envs.SGLANG_OPT_DFLASH_SPARSE_VERIFY.get()
-        and is_cuda()
-        and target_logits_processor is not None
-        and bool(target_logits_processor.final_logit_softcapping)
-        and tp_size > 1
-    )
-
 
 _FusedKVMaterializeHelper = None
 
@@ -795,15 +775,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             is_hip() and envs.SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS.get()
         )
         self._target_logits_processor = self._defer_target_verify_gather()
-        self._sparse_verify = _sparse_verify_enabled(
-            target_logits_processor=self._target_logits_processor,
+        # LiLiCorr stages the same candidate ids and q rows as the selector.
+        self._sparse_verify = DFlashSparseVerify.create(
+            logits_processor=self._target_logits_processor,
             tp_size=get_parallel().tp_group.world_size,
+            has_selector=self.selector is not None or self._lilicorr_sampling_enabled,
+            block_verification=self._block_verification,
+            lm_head=unwrap_lora_layer(
+                getattr(self.target_worker.model_runner.model, "lm_head", None)
+            ),
         )
-        if self._sparse_verify and get_parallel().tp_rank == 0:
-            logger.info(
-                "DFLASH sparse verify enabled for sampled batches with top_k <= %d.",
-                _SPARSE_VERIFY_MAX_TOP_K,
-            )
         self._aux_graphs = {}
         self._mamba_commit_buffers = None
         self._use_commit_metadata = (
@@ -930,6 +911,11 @@ class DFlashWorkerV2(BaseSpecWorker):
     def clear_info_records(self) -> None:
         self._info_dumper.clear()
 
+    @property
+    def sparse_verify_ct(self) -> Optional[int]:
+        """Verify steps accepted on the top-k support; None when it cannot run."""
+        return None if self._sparse_verify is None else self._sparse_verify.verify_ct
+
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
         processors = [
             module
@@ -961,70 +947,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         # overrides it, and without a sampling verify kernel it falls back to greedy.
         return SIMULATE_ACC_LEN > 0 or (
             self._selector_sample is None and not is_dflash_sampling_verify_available()
-        )
-
-    def _can_sparse_verify(
-        self, *, batch: ScheduleBatch, sampling_info, max_top_k: int, shard_width: int
-    ) -> bool:
-        """Whether the top-k support reproduces this batch's dense selector verify."""
-        # A staged selector sample implies a sampling_info that is not all greedy,
-        # and max_top_k <= 64 implies a top-k (top_k -1 is TOP_K_ALL).
-        if (
-            not self._sparse_verify
-            or self._selector_sample is None
-            or self._block_verification
-            or batch.has_grammar
-            or batch.return_logprob
-        ):
-            return False
-        return (
-            max_top_k <= _SPARSE_VERIFY_MAX_TOP_K
-            and not sampling_info.need_top_p_sampling
-            and not sampling_info.need_min_p_sampling
-            and shard_topk_width(max_top_k) <= shard_width
-            and get_parallel().tp_group.world_size * shard_width
-            == self._target_logits_processor.vocab_size
-            and not adjusts_logits(sampling_info, has_grammar=batch.has_grammar)
-            # A sampling mask is captured from the full target distribution.
-            and sampling_info.sampling_mask_batch_indices is None
-        )
-
-    def _sparse_verify_support(
-        self,
-        *,
-        batch: ScheduleBatch,
-        sampling_info,
-        draft_input: DFlashDraftInputV2,
-        logits_shard: torch.Tensor,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """``merge_shard_topk``'s support of the full softcapped verify rows from
-        this rank's vocab shard, or None to keep the dense gather."""
-        num_rows, shard_width = logits_shard.shape
-        max_top_k = draft_input.max_top_k
-        if not self._can_sparse_verify(
-            batch=batch,
-            sampling_info=sampling_info,
-            max_top_k=max_top_k,
-            shard_width=shard_width,
-        ):
-            return None
-        group = get_parallel().tp_group
-        local = pack_shard_topk(
-            logits_shard,
-            max_top_k=max_top_k,
-            col_offset=group.rank_in_group * shard_width,
-        )
-        gathered = torch.empty(
-            (group.world_size * num_rows, local.shape[1]),
-            dtype=local.dtype,
-            device=local.device,
-        )
-        group.all_gather_into_tensor(gathered, local)
-        return merge_shard_topk(
-            gathered,
-            world=group.world_size,
-            softcap=self._target_logits_processor.final_logit_softcapping,
-            max_top_k=max_top_k,
         )
 
     @property
@@ -1237,42 +1159,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         torch.cuda.synchronize()
         return torch.cuda.memory_stats()["allocated_bytes.all.peak"] - base_bytes
 
-    def _prewarm_sparse_verify(self) -> None:
-        """Compile the sparse verify kernels at the top_k cap, for one and two
-        requests (both row-count specializations), without a collective."""
-        group = get_parallel().tp_group
-        shard_width = self._target_logits_processor.vocab_size // group.world_size
-        top_k = _SPARSE_VERIFY_MAX_TOP_K
-        if shard_topk_width(top_k) > shard_width:
-            return
-        block, device, fp32 = int(self.block_size), self.device, torch.float32
-        q_shape = (block - 1, self.selector.top_k)
-        for bs in (1, 2):
-            local = pack_shard_topk(
-                torch.zeros((bs * block, shard_width), dtype=fp32, device=device),
-                max_top_k=top_k,
-                col_offset=group.rank_in_group * shard_width,
-            )
-            sup_vals, sup_ids, _ = merge_shard_topk(
-                local.repeat(group.world_size, 1),
-                world=group.world_size,
-                softcap=self._target_logits_processor.final_logit_softcapping,
-                max_top_k=top_k,
-            )
-            sparse_chain_speculative_sampling(
-                sup_vals=sup_vals,
-                sup_ids=sup_ids,
-                candidates=torch.zeros((bs, block), dtype=torch.int64, device=device),
-                q_ids=torch.zeros((bs, *q_shape), dtype=torch.int64, device=device),
-                q_vals=torch.zeros((bs, *q_shape), dtype=fp32, device=device),
-                temperatures=torch.ones((bs, 1), dtype=fp32, device=device),
-                top_ks=torch.full((bs,), top_k, dtype=torch.int32, device=device),
-                max_top_k=top_k,
-                vocab_size=self._target_logits_processor.vocab_size,
-                uniform_samples=torch.zeros((bs, block - 1), dtype=fp32, device=device),
-                uniform_samples_final=torch.zeros((bs,), dtype=fp32, device=device),
-            )
-
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Rehearse the non-greedy verify path so an undersized graph-pool
         borrow surfaces at startup rather than under traffic."""
@@ -1283,8 +1169,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             or not is_dflash_sampling_verify_available()
         ):
             return self.model_runner.prewarm_sampling()
-        if self._sparse_verify and self.selector is not None:
-            self._prewarm_sparse_verify()
+        if self._sparse_verify is not None and self.selector is not None:
+            self._sparse_verify.prewarm(
+                device=self.device,
+                block_size=int(self.block_size),
+                selector_top_k=self.selector.top_k,
+                tp_group=get_parallel().tp_group,
+            )
 
         block_size = int(self.block_size)
         vocab_size = self.model_config.vocab_size
@@ -2100,41 +1991,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             # call scatters different ids and reads q across the whole vocabulary.
             draft_probs.scatter_(-1, candidate_ids, 0.0)
         return accept_len.to(torch.int32), bonus.to(torch.int64), cap_trim_lens
-
-    def _selector_sparse_accept(
-        self,
-        *,
-        candidates: torch.Tensor,
-        support: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        candidate_ids: torch.Tensor,
-        q_rows: torch.Tensor,
-        sampling_info,
-        draft_input,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """``_selector_sampling_accept`` on the merged top-k support."""
-        bs, block = candidates.shape
-        sup_vals, sup_ids, _ = support
-        # The dense path's two draws, same shapes and order, so the RNG stream
-        # continues as it would there.
-        uniform_samples = torch.rand(
-            (bs, block - 1), dtype=torch.float32, device=candidates.device
-        )
-        uniform_samples_final = torch.rand(
-            (bs,), dtype=torch.float32, device=candidates.device
-        )
-        return sparse_chain_speculative_sampling(
-            sup_vals=sup_vals,
-            sup_ids=sup_ids,
-            candidates=candidates,
-            q_ids=candidate_ids,
-            q_vals=q_rows.float(),
-            temperatures=sampling_info.temperatures,
-            top_ks=sampling_info.top_ks,
-            max_top_k=draft_input.max_top_k,
-            vocab_size=self._target_logits_processor.vocab_size,
-            uniform_samples=uniform_samples,
-            uniform_samples_final=uniform_samples_final,
-        )
 
     def _greedy_sample_from_quantized_head(
         self,
@@ -2982,9 +2838,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs: int,
         target_predict: Optional[torch.Tensor] = None,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
-        sparse_support: Optional[
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = None,
+        sparse_support: Optional[SparseSupport] = None,
     ):
         """With cutoff_verify_lens, request i accepts at most
         cutoff_verify_lens[i] - 1 drafts and takes its bonus from the last row
@@ -2994,13 +2848,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         if sparse_support is not None:
             assert cutoff_verify_lens is None
             selector_candidate_ids, selector_q_rows = self._selector_sample
-            accept_len, bonus = self._selector_sparse_accept(
+            accept_len, bonus = self._sparse_verify.accept(
                 candidates=candidates,
                 support=sparse_support,
                 candidate_ids=selector_candidate_ids,
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
-                draft_input=draft_input,
+                max_top_k=draft_input.max_top_k,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
@@ -3818,18 +3672,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits
                 )
                 logits_output.next_token_logits = None
+            # A staged selector sample implies a sampled (not all-greedy) batch.
             elif (
-                layout is None
-                and (
-                    sparse_support := self._sparse_verify_support(
-                        batch=batch,
-                        sampling_info=sampling_info,
-                        draft_input=draft_input,
-                        logits_shard=logits_output.next_token_logits,
-                    )
+                self._sparse_verify is not None
+                and layout is None
+                and self._selector_sample is not None
+                and self._sparse_verify.eligible(
+                    batch=batch,
+                    sampling_info=sampling_info,
+                    max_top_k=draft_input.max_top_k,
+                    shard_width=logits_output.next_token_logits.shape[1],
                 )
-                is not None
             ):
+                sparse_support = self._sparse_verify.support(
+                    tp_group=get_parallel().tp_group,
+                    logits_shard=logits_output.next_token_logits,
+                    max_top_k=draft_input.max_top_k,
+                )
                 # The support's argmax is the full row's torch.argmax, for
                 # simulated acceptance; nothing on this path reads the dense logits.
                 target_predict = sparse_support[2].view(bs, int(self.block_size))

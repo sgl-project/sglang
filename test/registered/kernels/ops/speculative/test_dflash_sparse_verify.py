@@ -1,5 +1,5 @@
 """DFLASH sparse top-k verify (SGLANG_OPT_DFLASH_SPARSE_VERIFY) against the dense
-selector verify, through the worker's own support and accept methods."""
+selector verify: DFlashSparseVerify's support and accept vs accept_sampling."""
 
 import sys
 from types import SimpleNamespace
@@ -9,9 +9,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.activation.softcap import gathered_softcap_logits
+from sglang.kernels.ops.speculative.dspark.dspark_accept import accept_sampling
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative import dflash_utils
-from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+from sglang.srt.speculative.dflash_sparse_verify import DFlashSparseVerify
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -44,16 +45,8 @@ class _SimulatedTpGroup:
             output.zero_()
 
 
-def _worker(*, block_verification=False):
-    worker = worker_mod.DFlashWorkerV2.__new__(worker_mod.DFlashWorkerV2)
-    worker._sparse_verify = True
-    worker._selector_sample = (None, None)
-    worker._block_verification = block_verification
-    worker._draft_probs_buf = None
-    worker._target_logits_processor = SimpleNamespace(
-        vocab_size=VOCAB, final_logit_softcapping=SOFTCAP
-    )
-    return worker
+def _sparse_verify(world):
+    return DFlashSparseVerify(softcap=SOFTCAP, vocab_size=VOCAB, tp_size=world)
 
 
 def _make_case(*, bs, top_ks, temperature, seed, scale=3.0, noise=0.3, peak=0.0):
@@ -118,23 +111,25 @@ def _rank_shards(raw, world):
 
 def _support_on_every_rank(*, raw, world, sampling_info, draft_input):
     shards = _rank_shards(raw, world)
+    sparse_verify = _sparse_verify(world)
+    batch = SimpleNamespace(has_grammar=False, return_logprob=False)
+    assert sparse_verify.eligible(
+        batch=batch,
+        sampling_info=sampling_info,
+        max_top_k=draft_input.max_top_k,
+        shard_width=shards[0].shape[1],
+    )
     packed = {}
     # Pass 1 records every rank's packed shard; pass 2 gathers them all.
     for _ in range(2):
-        supports = []
-        for rank in range(world):
-            parallel = SimpleNamespace(
-                tp_group=_SimulatedTpGroup(world, rank, packed), tp_rank=rank
+        supports = [
+            sparse_verify.support(
+                tp_group=_SimulatedTpGroup(world, rank, packed),
+                logits_shard=shards[rank],
+                max_top_k=draft_input.max_top_k,
             )
-            with mock.patch.object(worker_mod, "get_parallel", return_value=parallel):
-                supports.append(
-                    _worker()._sparse_verify_support(
-                        batch=SimpleNamespace(has_grammar=False, return_logprob=False),
-                        sampling_info=sampling_info,
-                        draft_input=draft_input,
-                        logits_shard=shards[rank],
-                    )
-                )
+            for rank in range(world)
+        ]
     return supports
 
 
@@ -146,6 +141,25 @@ def _dense_full_logits(raw, world):
     ).contiguous()
     full = torch.empty(raw.shape[0], VOCAB, dtype=torch.float32, device=raw.device)
     return gathered_softcap_logits(gathered, SOFTCAP, full)
+
+
+def _dense_selector_accept(
+    *, candidates, full, q_ids, q_rows, sampling_info, draft_input
+):
+    """The worker's dense selector accept: q scattered over the vocabulary."""
+    bs, block = candidates.shape
+    draft_probs = torch.zeros(bs, block - 1, VOCAB, device=candidates.device)
+    draft_probs.scatter_(-1, q_ids, q_rows.float())
+    accept_len, bonus, _ = accept_sampling(
+        candidates=candidates,
+        target_logits=full,
+        draft_probs=draft_probs,
+        sampling_info=sampling_info,
+        draft_input=draft_input,
+        gamma=block - 1,
+        verify_num_draft_tokens=block,
+    )
+    return accept_len.to(torch.int32), bonus.to(torch.int64)
 
 
 def _topk_lowest_id_ties(scores, k):
@@ -176,22 +190,30 @@ def _check_parity(*, world, bs, top_ks, temperature, trials, seed, **case_kw):
         )
         torch.testing.assert_close(argmax, torch.argmax(full, dim=-1), rtol=0, atol=0)
 
-        accept_kw = dict(
-            candidates=cands,
-            candidate_ids=q_ids,
-            q_rows=q_rows,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-        )
         torch.cuda.manual_seed(1000 + t)
         with mock.patch.object(dflash_utils, "radix_topk", _topk_lowest_id_ties):
-            dense = _worker()._selector_sampling_accept(
-                next_token_logits=full, **accept_kw
+            dense = _dense_selector_accept(
+                candidates=cands,
+                full=full,
+                q_ids=q_ids,
+                q_rows=q_rows,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
             )
         dense_probe = torch.rand(4, device="cuda")
         torch.cuda.manual_seed(1000 + t)
-        sparse = _worker()._selector_sparse_accept(support=supports[0], **accept_kw)
+        sparse_verify = _sparse_verify(world)
+        sparse = sparse_verify.accept(
+            candidates=cands,
+            support=supports[0],
+            candidate_ids=q_ids,
+            q_rows=q_rows,
+            sampling_info=sampling_info,
+            max_top_k=k,
+        )
         sparse_probe = torch.rand(4, device="cuda")
+        # /server_info reports this count; an e2e test asserts the sparse path ran.
+        assert sparse_verify.verify_ct == 1
         msg = f"world={world} bs={bs} top_ks={top_ks} T={temperature} trial={t}"
         assert torch.equal(dense[0], sparse[0]), msg
         assert torch.equal(dense[1], sparse[1]), msg

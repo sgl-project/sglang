@@ -132,6 +132,17 @@ class SchedulerInternalStateController:
             info_record = scheduler.draft_worker.dump_info_records()
             if info_record is not None:
                 state["dspark_info_record"] = info_record
+            if scheduler.spec_algorithm.is_dflash():
+                self._add_dflash_sparse_verify(state)
+
+    def _add_dflash_sparse_verify(self, state: Dict[str, Any]) -> None:
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        draft_worker = self.scheduler.draft_worker
+        if isinstance(draft_worker, DFlashWorkerV2):
+            sparse_verify_ct = draft_worker.sparse_verify_ct
+            if sparse_verify_ct is not None:
+                state["dflash_sparse_verify_ct"] = sparse_verify_ct
 
     def _add_step_times(self, state: Dict[str, Any]) -> None:
         if self.record_step_time:

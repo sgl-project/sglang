@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.models.dflash import (
     CandidateSelector,
     DFlash2DraftModel,
@@ -483,19 +484,38 @@ _SPARSE_WORLD = 4
 _SPARSE_SHARD = 256
 
 
-def _sparse_verify_support(
-    monkeypatch,
-    *,
-    rank=0,
-    top_ks=(64, 20, 1, 64),
-    shard_width=_SPARSE_SHARD,
-    worker_fields=(),
-    batch_fields=(),
-    sampling_fields=(),
-):
-    """``_sparse_verify_support`` on rank ``rank`` of 4 for 8-token verify blocks."""
-    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+def _sparse_verify():
+    from sglang.srt.speculative.dflash_sparse_verify import DFlashSparseVerify
 
+    return DFlashSparseVerify(
+        softcap=20.0, vocab_size=_SPARSE_WORLD * _SPARSE_SHARD, tp_size=_SPARSE_WORLD
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        (dict(), True),
+        (dict(top_ks=(65,)), False),
+        (dict(top_ks=(64, 128)), False),
+        (dict(top_ks=(64, TOP_K_ALL)), False),
+        (dict(top_ks=(TOP_K_ALL, TOP_K_ALL)), False),
+        (dict(shard_width=_SPARSE_SHARD + 1), False),
+        (dict(sampling_fields={"need_top_p_sampling": True}), False),
+        (dict(sampling_fields={"need_min_p_sampling": True}), False),
+        (dict(sampling_fields={"has_custom_logit_processor": True}), False),
+        (dict(sampling_fields={"step_penalties": object()}), False),
+        (dict(sampling_fields={"logit_bias": torch.zeros(1)}), False),
+        (dict(sampling_fields={"watermark": object()}), False),
+        (dict(sampling_fields={"sampling_mask_batch_indices": torch.zeros(1)}), False),
+        (dict(batch_fields={"has_grammar": True}), False),
+        (dict(batch_fields={"return_logprob": True}), False),
+    ],
+)
+def test_sparse_verify_is_eligible_only_where_the_support_matches(case, expected):
+    """Only a sampled batch with top_k <= 64, no logit adjustment and unpadded vocab
+    shards may skip the dense gather; top_k -1 or above 64 keeps it."""
+    top_ks = case.get("top_ks", (64, 20, 1, 64))
     bs = len(top_ks)
     sampling_info = SamplingBatchInfo(
         temperatures=torch.ones(bs, 1),
@@ -509,80 +529,26 @@ def _sparse_verify_support(
         need_min_p_sampling=False,
         vocab_size=_SPARSE_WORLD * _SPARSE_SHARD,
     )
-    worker = worker_mod.DFlashWorkerV2.__new__(worker_mod.DFlashWorkerV2)
-    worker._sparse_verify = True
-    worker._selector_sample = (None, None)
-    worker._block_verification = False
-    worker._target_logits_processor = SimpleNamespace(
-        vocab_size=_SPARSE_WORLD * _SPARSE_SHARD, final_logit_softcapping=20.0
-    )
     batch = SimpleNamespace(has_grammar=False, return_logprob=False)
     for target, fields in (
-        (worker, worker_fields),
-        (batch, batch_fields),
-        (sampling_info, sampling_fields),
+        (batch, case.get("batch_fields", {})),
+        (sampling_info, case.get("sampling_fields", {})),
     ):
-        for name, value in dict(fields).items():
+        for name, value in fields.items():
             setattr(target, name, value)
-    gathered = []
-    group = SimpleNamespace(
-        world_size=_SPARSE_WORLD,
-        rank_in_group=rank,
-        all_gather_into_tensor=lambda output, input: gathered.append(output.shape),
-    )
-    parallel = SimpleNamespace(tp_group=group, tp_rank=rank)
-    monkeypatch.setattr(worker_mod, "get_parallel", lambda: parallel)
-    support = worker._sparse_verify_support(
+    eligible = _sparse_verify().eligible(
         batch=batch,
         sampling_info=sampling_info,
-        draft_input=SimpleNamespace(max_top_k=max(top_ks)),
-        logits_shard=torch.zeros(bs * 8, shard_width),
+        max_top_k=max(top_ks),
+        shard_width=case.get("shard_width", _SPARSE_SHARD),
     )
-    return support, gathered
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        dict(top_ks=(65,)),
-        dict(top_ks=(64, 128)),
-        dict(top_ks=(64, TOP_K_ALL)),
-        dict(top_ks=(TOP_K_ALL, TOP_K_ALL)),
-        dict(shard_width=_SPARSE_SHARD + 1),
-        dict(sampling_fields={"need_top_p_sampling": True}),
-        dict(sampling_fields={"need_min_p_sampling": True}),
-        dict(sampling_fields={"has_custom_logit_processor": True}),
-        dict(sampling_fields={"step_penalties": object()}),
-        dict(sampling_fields={"logit_bias": torch.zeros(1)}),
-        dict(sampling_fields={"watermark": object()}),
-        dict(sampling_fields={"sampling_mask_batch_indices": torch.zeros(1)}),
-        dict(batch_fields={"has_grammar": True}),
-        dict(batch_fields={"return_logprob": True}),
-        dict(worker_fields={"_block_verification": True}),
-        dict(worker_fields={"_selector_sample": None}),
-        dict(worker_fields={"_sparse_verify": False}),
-    ],
-)
-def test_sparse_verify_keeps_the_dense_gather_when_the_support_cannot_match(
-    case, monkeypatch
-):
-    """Only a sampled batch with top_k <= 64, no logit adjustment and unpadded vocab
-    shards may skip the dense gather; top_k -1 or above 64 keeps it."""
-    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
-
-    monkeypatch.setattr(
-        worker_mod,
-        "pack_shard_topk",
-        lambda *args, **kwargs: pytest.fail("the dense gather must run"),
-    )
-    support, gathered = _sparse_verify_support(monkeypatch, **case)
-    assert support is None and gathered == []
+    assert eligible is expected
 
 
 def test_sparse_verify_gathers_rank_major_shards_with_global_ids(monkeypatch):
     """The merge reads rank r's candidates at gathered rows r * rows.., with ids
     offset by r * shard_width."""
-    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+    from sglang.srt.speculative import dflash_sparse_verify as sparse_mod
 
     calls = []
 
@@ -594,10 +560,17 @@ def test_sparse_verify_gathers_rank_major_shards_with_global_ids(monkeypatch):
         calls.append(("merge", world, softcap, max_top_k))
         return "support"
 
-    monkeypatch.setattr(worker_mod, "pack_shard_topk", fake_pack)
-    monkeypatch.setattr(worker_mod, "merge_shard_topk", fake_merge)
-
-    support, gathered = _sparse_verify_support(monkeypatch, rank=2)
+    monkeypatch.setattr(sparse_mod, "pack_shard_topk", fake_pack)
+    monkeypatch.setattr(sparse_mod, "merge_shard_topk", fake_merge)
+    gathered = []
+    group = SimpleNamespace(
+        world_size=_SPARSE_WORLD,
+        rank_in_group=2,
+        all_gather_into_tensor=lambda output, input: gathered.append(output.shape),
+    )
+    support = _sparse_verify().support(
+        tp_group=group, logits_shard=torch.zeros(4 * 8, _SPARSE_SHARD), max_top_k=64
+    )
     assert support == "support"
     assert calls == [
         ("pack", 64, 2 * _SPARSE_SHARD),
@@ -606,25 +579,60 @@ def test_sparse_verify_gathers_rank_major_shards_with_global_ids(monkeypatch):
     assert gathered == [torch.Size([_SPARSE_WORLD * 4 * 8, 256])]
 
 
-@pytest.mark.parametrize(
-    ("softcap", "tp_size", "expected"),
-    [(20.0, 4, True), (None, 4, False), (20.0, 1, False)],
-)
-def test_sparse_verify_needs_a_softcapped_target_and_tp(
-    softcap, tp_size, expected, monkeypatch
-):
-    """A target without softcap never defers the verify gather; enabling sparse
-    verify there compiled the merge kernel with softcap=None and failed startup."""
-    from sglang.srt.environ import envs
-    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+class _SparseHead(VocabParallelEmbedding):
+    """A target lm_head with a 256-wide vocab shard and no ``weight`` (as GGUF)."""
 
-    monkeypatch.setattr(worker_mod, "is_cuda", lambda: True)
-    with envs.SGLANG_OPT_DFLASH_SPARSE_VERIFY.override(True):
-        enabled = worker_mod._sparse_verify_enabled(
-            target_logits_processor=SimpleNamespace(final_logit_softcapping=softcap),
-            tp_size=tp_size,
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+        self.num_embeddings_per_partition = _SPARSE_SHARD
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        (dict(), True),
+        (dict(enabled=False), False),
+        (dict(softcap=None), False),
+        (dict(tp_size=1), False),
+        (dict(has_selector=False), False),
+        (dict(block_verification=True), False),
+        # 1000 splits evenly over TP 4, but the LM head pads each shard to 256.
+        (dict(vocab_size=1000), False),
+        # No vocab-parallel head, so verify never gets a vocab shard.
+        (dict(lm_head=None), False),
+    ],
+)
+def test_sparse_verify_is_built_only_where_it_can_run(case, expected, monkeypatch):
+    """A target without softcap never defers the verify gather; enabling sparse
+    verify there compiled the merge kernel with softcap=None and failed startup.
+    Without a sampled draft, under block verification or with padded vocab shards
+    the sparse path never runs, so it must not log, prewarm or count."""
+    from sglang.srt.environ import envs
+    from sglang.srt.speculative import dflash_sparse_verify as sparse_mod
+
+    monkeypatch.setattr(sparse_mod, "is_cuda", lambda: True)
+    monkeypatch.setattr(sparse_mod, "get_parallel", lambda: SimpleNamespace(tp_rank=0))
+    args = dict(
+        enabled=True,
+        softcap=20.0,
+        tp_size=_SPARSE_WORLD,
+        has_selector=True,
+        block_verification=False,
+        vocab_size=_SPARSE_WORLD * _SPARSE_SHARD,
+        lm_head=_SparseHead(),
+    )
+    args.update(case)
+    with envs.SGLANG_OPT_DFLASH_SPARSE_VERIFY.override(args["enabled"]):
+        built = sparse_mod.DFlashSparseVerify.create(
+            logits_processor=SimpleNamespace(
+                final_logit_softcapping=args["softcap"], vocab_size=args["vocab_size"]
+            ),
+            tp_size=args["tp_size"],
+            has_selector=args["has_selector"],
+            block_verification=args["block_verification"],
+            lm_head=args["lm_head"],
         )
-    assert enabled is expected
+    assert (built is not None) is expected
 
 
 def test_sparse_support_samples_even_with_a_resolved_argmax(monkeypatch):
@@ -646,7 +654,7 @@ def test_sparse_support_samples_even_with_a_resolved_argmax(monkeypatch):
         sparse_calls.append(kwargs["support"])
         return torch.ones(bs, dtype=torch.int32), torch.zeros(bs, dtype=torch.int64)
 
-    worker._selector_sparse_accept = fake_sparse_accept
+    worker._sparse_verify = SimpleNamespace(accept=fake_sparse_accept)
     worker._selector_sampling_accept = lambda **kwargs: pytest.fail("dense accept")
     worker._use_triton_accept_bonus = False
     accept_len, commit_lens, *_, cap_trim_lens = worker._accept_block(
