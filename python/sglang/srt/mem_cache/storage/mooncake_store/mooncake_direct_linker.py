@@ -39,6 +39,7 @@ device_module = get_device_module()
 
 DEFAULT_LOAD_LAYER_GROUP = 8
 DEFAULT_LOAD_THREADS = 4
+MAX_RANGES_PER_READ = 4096
 
 
 def _storage_suffix(
@@ -576,7 +577,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if meta is None or not keys:
             return []
         ptrs, sizes, offsets = meta
-        step = -(-len(keys) // self.load_threads)
+        # Mooncake's RDMA submit is quadratic in queued ranges, so bound each read.
+        # TODO: remove once Mooncake fixes its submit path.
+        step = min(
+            -(-len(keys) // self.load_threads),
+            max(1, MAX_RANGES_PER_READ // len(sizes[0])),
+        )
         return [
             (
                 name,
