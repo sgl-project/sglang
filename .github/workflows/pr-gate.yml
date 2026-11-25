@@ -12,8 +12,8 @@ on:
       approval-mode:
         description: >-
           'label' (default): the run-ci label on the PR opts it in.
-          'commit' (pr-test.yml, pr-test-extra.yml): a run passes only if the PR has run-ci
-          now and, unless its author may approve, its head commit carries a ci/run-ci-approved
+          'commit' (run_ci_approval.APPROVAL_WORKFLOWS): a run passes only if the PR has
+          run-ci now and, unless its author may approve, its head commit carries a ci/run-ci-approved
           status, which an approver's slash command records
           (scripts/ci/utils/run_ci_approval.py). Every push needs a new approval.
           The caller's job must grant statuses: read.
@@ -113,7 +113,7 @@ jobs:
             core.setOutput("approved", ok ? "true" : "false");
             core.info(ok ? `${sha} may run CI.`
               : !labeled ? `The PR lacks run-ci; a maintainer must comment /tag-and-rerun-ci, which adds it and approves ${sha}.`
-              : `${sha} has no run-ci approval; a maintainer must approve this commit with /tag-and-rerun-ci.`);
+              : `${sha} has no run-ci approval; a maintainer must approve this commit with /approve-ci.`);
 
       # Live labels: event-payload expressions do not refresh on rerun. The slash handler
       # and pr-states.yml find these runs by this step's name.
