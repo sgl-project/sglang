@@ -1,5 +1,6 @@
 import dataclasses
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,9 @@ from sglang.multimodal_gen.runtime.layers.attention import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.models.dits.flux3_image import Packed
+from sglang.multimodal_gen.runtime.models.dits.ming_image import (
+    MingImageTransformer2DModel,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     _attn_mask_meta_local_pad,
 )
@@ -423,6 +427,27 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             kwargs = self._qwen21_kwargs(5)
             self.assertIs(self._qwen21_pad(kwargs, sp_world_size=2), kwargs)
 
+    def test_qwen21_packed_prefix_lives_with_request_and_replaces_bucket(self):
+        kwargs = self._qwen21_kwargs(5)
+        with self._patch_buckets(16, 32):
+            first = self._qwen21_pad(kwargs)
+            repeat = self._qwen21_pad(kwargs)
+            self.assertIs(first["prefix_kv"], repeat["prefix_kv"])
+            previous = weakref.ref(first["prefix_kv"])
+            del first, repeat
+            self.assertIsNotNone(previous())
+
+        with self._patch_buckets(32):
+            larger = self._qwen21_pad(kwargs)
+        self.assertIsNone(previous())
+        self.assertEqual(larger["prefix_kv"].shape[2], 32)
+        self.assertEqual(larger["prefix_pad"].item(), 27)
+        current = weakref.ref(larger["prefix_kv"])
+        del larger
+        self.assertIsNotNone(current())
+        del kwargs
+        self.assertIsNone(current())
+
     def test_longcat_keeps_its_fixed_512_token_prompt_shape(self):
         kwargs = {
             "hidden_states": torch.zeros(1, 4096, 64),
@@ -545,6 +570,21 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         # native lengths -> different signatures, by design.
         self.assertEqual(_signature_kwargs(short), _signature_kwargs(short_again))
         self.assertNotEqual(_signature_kwargs(short), _signature_kwargs(longer))
+
+    def test_ming_image_keeps_its_caption_length_when_a_prompt_mask_is_present(self):
+        """Ming-Image's caption length sets every image token's first RoPE
+        coordinate, so a masked caption must not be padded to a text bucket."""
+        ming_model = MingImageTransformer2DModel.__new__(MingImageTransformer2DModel)
+        torch.nn.Module.__init__(ming_model)
+        kwargs = {
+            "encoder_hidden_states": torch.zeros(1, 19, 16),
+            "prompt_attention_mask": torch.ones(1, 19, dtype=torch.bool),
+        }
+        with self._patch_buckets(64, 128):
+            out = self.stage._bcg_pad_prompt_kwargs(kwargs, current_model=ming_model)
+
+        self.assertIs(out, kwargs)
+        self.assertEqual(out["encoder_hidden_states"].shape, (1, 19, 16))
 
     def _minimax_h3_kwargs(self, text_seq: int):
         image_seq = 4

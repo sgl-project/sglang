@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_mps_ci(est_time=180, suite="stage-b-e2e-mps")
+register_mps_ci(est_time=180, suite="extra-e2e-test-mps")
 
 MODEL_PATH = os.environ.get("SGLANG_MPS_UOCR_MODEL", "baidu/Unlimited-OCR-2")
 # Same no-repeat processor the model card's client attaches, pickled by reference.
