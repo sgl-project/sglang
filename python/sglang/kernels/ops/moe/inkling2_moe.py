@@ -4,8 +4,11 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.srt.utils import is_hip
 
 PDL = is_arch_support_pdl()
+_is_hip = is_hip()
+_IS_HIP = tl.constexpr(_is_hip)
 # Below this many rows the Triton _mxfp8_quantize is as fast.
 MXFP8_CUDA_MIN_ROWS = 64
 
@@ -29,6 +32,30 @@ def routed_quant_module(width: int):
 
 
 @triton.jit
+def _rcp_rn(x):
+    """1 / x rounded to nearest; ROCm's libdevice has no rcp_rn."""
+    if _IS_HIP:
+        return tl.div_rn(1.0, x)
+    else:
+        return libdevice.rcp_rn(x)
+
+
+@triton.jit
+def _tanh_approx(x):
+    if _IS_HIP:
+        return libdevice.tanh(x)
+    else:
+        return tl.inline_asm_elementwise(
+            "tanh.approx.f32 $0, $1;",
+            "=f,f",
+            [x],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
+
+@triton.jit
 def _mxfp8_block(groups):
     amax = tl.max(tl.abs(groups), 1)
     raw_scale = amax * (1.0 / 448.0)
@@ -38,7 +65,7 @@ def _mxfp8_block(groups):
     exponent = tl.where(raw_scale != raw_scale, 255, exponent)
     scale = tl.maximum((exponent << 23).to(tl.float32, bitcast=True), min_scale)
     scale = tl.where(exponent == 255, float("nan"), scale)
-    inverse = tl.where(exponent == 0, 2.0**127, libdevice.rcp_rn(scale))
+    inverse = tl.where(exponent == 0, 2.0**127, _rcp_rn(scale))
     inverse = tl.where(exponent == 255, 0.0, inverse)
     values = groups * inverse[:, None]
     values = tl.minimum(
@@ -86,34 +113,23 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 @triton.jit
 def _capped_swiglu(gate, up, gamma, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr):
-    sigmoid = tl.inline_asm_elementwise(
-        "{ .reg .f32 t; mul.rn.f32 t, $1, 0fBFB8AA3B; "
-        "ex2.approx.ftz.f32 t, t; add.rn.f32 t, t, 0f3F800000; "
-        "rcp.approx.ftz.f32 $0, t; }",
-        "=f,f",
-        [gate],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    if _IS_HIP:
+        sigmoid = 1.0 / (tl.exp2(gate * -1.4426950408889634) + 1.0)
+    else:
+        sigmoid = tl.inline_asm_elementwise(
+            "{ .reg .f32 t; mul.rn.f32 t, $1, 0fBFB8AA3B; "
+            "ex2.approx.ftz.f32 t, t; add.rn.f32 t, t, 0f3F800000; "
+            "rcp.approx.ftz.f32 $0, t; }",
+            "=f,f",
+            [gate],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
     if GATE_CAP > 0:
-        gate = GATE_CAP * tl.inline_asm_elementwise(
-            "tanh.approx.f32 $0, $1;",
-            "=f,f",
-            [tl.div_rn(gate, GATE_CAP)],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+        gate = GATE_CAP * _tanh_approx(tl.div_rn(gate, GATE_CAP))
     if UP_CAP > 0:
-        up = UP_CAP * tl.inline_asm_elementwise(
-            "tanh.approx.f32 $0, $1;",
-            "=f,f",
-            [tl.div_rn(up, UP_CAP)],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+        up = UP_CAP * _tanh_approx(tl.div_rn(up, UP_CAP))
     return ((gate * sigmoid) * up) * gamma
 
 
