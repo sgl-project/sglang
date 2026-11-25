@@ -122,10 +122,10 @@ jobs:
   #   secrets: inherit
 
   # Single-machine (Ascend 950/a5): 4-card DeepSeek-V4-Flash FP8 with DSPARK,
-  # L2 host + L3 Mooncake HiCache, run directly on the runner. The case file
-  # runs both its test methods (GPQA accuracy and the GSP cache hit-rate check).
+  # L2 host HiCache, run directly on the runner. The case file runs both its
+  # test methods (GPQA accuracy and the GSP L2 cache hit-rate check).
   collect:
-    name: test_npu_deepseek_v4_flash_fp8_4p_mooncake_a5
+    name: test_npu_deepseek_v4_flash_fp8_4p_l2_a5
     needs: [metadata]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -133,8 +133,8 @@ jobs:
       test_type: accuracy
       # test_suite names the persisted output/metrics directory; the case file
       # itself is handed over through test_case.
-      test_suite: test_npu_deepseek_v4_flash_fp8_4p_mooncake_a5
-      test_case: test/registered/npu/basic_function/mooncake/test_npu_deepseek_v4_flash_fp8_4p_mooncake_a5.py
+      test_suite: test_npu_deepseek_v4_flash_fp8_4p_l2_a5
+      test_case: test/registered/npu/basic_function/mooncake/test_npu_deepseek_v4_flash_fp8_4p_l2_a5.py
       image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050' }}
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
       use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
