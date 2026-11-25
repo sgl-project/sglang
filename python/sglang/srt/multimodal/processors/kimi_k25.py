@@ -294,7 +294,11 @@ def _gpu_preprocess_bytes(
     RGB inputs: the uint8 source, its copy in the joined source batch and its
     fp32 resize input, plus the fp32 RGBA output."""
     if isinstance(image, Image.Image):
-        source = 3 * image.width * image.height
+        has_alpha = image.mode != "RGB" and (
+            "A" in image.getbands() or "transparency" in image.info
+        )
+        channels = 4 if has_alpha else 3
+        source = channels * image.width * image.height
     else:
         source = image.numel()
     return source * (1 + 1 + 4) + 4 * 4 * padded_pixels

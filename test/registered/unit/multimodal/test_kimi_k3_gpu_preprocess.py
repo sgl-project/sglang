@@ -194,6 +194,21 @@ def test_gpu_preprocess_chunks_count_source_bytes(monkeypatch):
     assert [len(chunk) for chunk in chunks] == [2, 2]
 
 
+def test_gpu_preprocess_bytes_counts_alpha_channel():
+    """K3 keeps alpha when moving a PIL image to the GPU, so RGBA and
+    transparent palette images are sized like a four-channel tensor."""
+    padded = 56 * 84
+    rgb = kimi_k25._gpu_preprocess_bytes(Image.new("RGB", (40, 30)), padded)
+    rgba = kimi_k25._gpu_preprocess_bytes(Image.new("RGBA", (40, 30)), padded)
+    palette = Image.new("P", (40, 30))
+    palette.info["transparency"] = 0
+    tensor = kimi_k25._gpu_preprocess_bytes(
+        torch.zeros(4, 30, 40, dtype=torch.uint8), padded
+    )
+    assert rgba == tensor == kimi_k25._gpu_preprocess_bytes(palette, padded)
+    assert rgb < rgba
+
+
 def test_prepare_image_features_falls_back_to_cpu_on_gpu_oom(monkeypatch):
     """A tokenizer-side GPU OOM is served by the CPU path, not surfaced."""
     images = [Image.fromarray(_natural_image(56, 84))] * 2
