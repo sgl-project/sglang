@@ -134,8 +134,11 @@ def test_overlapped_audio_feeds_the_encoder_and_is_shared_before_it_closes(
     monkeypatch.setattr(decoding, "streamed_video_output_path", lambda *args: "a.mp4")
 
     class Stream:
-        def __init__(self, path, request, finish_frames, audio, sample_rate):
+        def __init__(
+            self, path, request, finish_frames, audio, sample_rate, *, use_nvenc
+        ):
             # the encoder resolves the audio on its own thread
+            assert use_nvenc == decoding.diffusion_envs.SGLANG_USE_NVENC
             assert callable(audio) and sample_rate == 32000
             assert torch.equal(audio(), output_waveform[0])
 
