@@ -1,4 +1,8 @@
-"""Muse Spark NVFP4 + DFlash on 8x H200 with the Hopper kernels (the documented launch)."""
+"""Muse Spark NVFP4 + DFlash on 8x H200 with the Hopper kernels (the documented launch).
+
+Manual validation (about 25 minutes on eight H200s):
+    python test/manual/8-gpu-models/test_muse_spark_h200.py
+"""
 
 import json
 import os
@@ -8,8 +12,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import requests
-
-from sglang.test.ci.ci_register import register_cuda_ci
 
 # Aliased so pytest does not collect the imported `test_`-prefixed helpers as tests.
 from sglang.test.kl_test_utils import (
@@ -34,8 +36,6 @@ from sglang.test.test_utils import (
     is_in_ci,
     write_github_step_summary,
 )
-
-register_cuda_ci(est_time=1500, stage="nightly", runner_config="8-gpu-h200")
 
 MODEL_PATH = "meta-models/Muse-Spark-Open-816B-A42B-NVFP4"
 DRAFT_MODEL_PATH = "RadixArk/Muse-Spark-Open-DFlash2"
