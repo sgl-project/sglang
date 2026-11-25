@@ -4115,6 +4115,33 @@
             "load_peak_host_anon_mb": 2895.4,
             "runtime_peak_host_anon_mb": 2895.4,
             "estimated_full_test_time_s": 268.0
+        },
+        "magi2_two_stage_t2va_ep4_4gpu_h100": {
+            "stages_ms": {
+                "Magi2InputStage": 0.02,
+                "Magi2ImageEncodingStage": 0.01,
+                "Magi2TextEncodingStage": null,
+                "Magi2LatentPreparationStage": null,
+                "Magi2TimestepPreparationStage": null,
+                "Magi2PackingStage": null,
+                "Magi2DenoisingStage": null,
+                "Magi2StageHandoffStage": null,
+                "Magi2DecodingStage": null,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 117481.68,
+            "expected_load_ms": null,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "load_peak_vram_mb": null,
+            "runtime_peak_vram_mb": 63186.0,
+            "warmup_peak_vram_mb": null,
+            "load_peak_allocated_mb": null,
+            "runtime_peak_allocated_mb": null,
+            "load_peak_host_anon_mb": null,
+            "runtime_peak_host_anon_mb": null,
+            "estimated_full_test_time_s": 420.0
         }
     }
 }

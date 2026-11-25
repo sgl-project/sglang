@@ -995,7 +995,59 @@ MAGI2_FOUR_GPU_H100_CASES = [
     ),
 ]
 
-FOUR_GPU_H100_CASES = MINIMAX_H3_FOUR_GPU_H100_CASES + MAGI2_FOUR_GPU_H100_CASES
+MAGI2_TWO_STAGE_FOUR_GPU_H100_CASES = [
+    DiffusionTestCase(
+        "magi2_two_stage_t2va_ep4_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="sand-ai/MAGI-2-preview",
+            modality="video",
+            num_gpus=4,
+            ulysses_degree=4,
+            extras=[
+                "--pipeline-config-path",
+                str(_CACHE_DIT_CONFIG_DIR / "magi2_ep4_two_stage.json"),
+                "--warmup-resolutions",
+                "1920x1088",
+                "--dit-layerwise-offload",
+                "true",
+                "--enable-torch-compile",
+                "false",
+            ],
+            env_vars={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A street musician plays an acoustic guitar under a stone archway "
+                "at dusk, strumming a slow folk melody while pigeons settle nearby."
+            ),
+            output_size="1920x1088",
+            seconds=10,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "num_inference_steps": 2,
+                "refiner_num_inference_steps": 1,
+                "seed": 42,
+            },
+        ),
+        # Consistency: no golden file in sgl-project/ci-data-diffusion yet.
+        run_consistency_check=False,
+        # Component accuracy: same lane constraint as the preview-only case.
+        run_component_accuracy_check=False,
+        # Perf: baseline measured on H100 × 4 with layerwise offload (117.5 s,
+        # peak VRAM 61.7 GiB). run_perf_check=False until the lane is wired.
+        run_perf_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+]
+
+FOUR_GPU_H100_CASES = (
+    MINIMAX_H3_FOUR_GPU_H100_CASES
+    + MAGI2_FOUR_GPU_H100_CASES
+    + MAGI2_TWO_STAGE_FOUR_GPU_H100_CASES
+)
 
 TWO_GPU_CASES = [
     DiffusionTestCase(
