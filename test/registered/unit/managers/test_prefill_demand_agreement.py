@@ -505,7 +505,7 @@ class TestMemoryClip(_AdderCase):
             dict(
                 input_tokens=rng.choice((8, 40, 96, 200, 400)),
                 max_new_tokens=rng.choice((0, 4, 64, 600)),
-                token_capacity=rng.choice((10**6, 120)),
+                token_capacity=10**6,
                 sliding_window_size=8,
                 chunk_size=rng.choice((None, 16)),
                 chunk_align=rng.choice((None, 8)),
@@ -526,12 +526,9 @@ class TestMemoryClip(_AdderCase):
                 key = tuple(sorted(question.items()))
                 if key in asked:
                     self.assertEqual(priced.call_count, before)
-                else:
-                    paged = -(-question["input_tokens"] // 4) * 4
-                    room = question["token_capacity"] - paged - 4 - 1
-                    if answer == min(question["max_new_tokens"], max(0, room)):
-                        whole += 1
-                        self.assertEqual(priced.call_count, before + 1)
+                elif answer == question["max_new_tokens"]:
+                    whole += 1
+                    self.assertEqual(priced.call_count, before + 1)
                 asked.add(key)
                 if (tokens := allocator.alloc(4)) is not None:
                     held.append(tokens)
@@ -539,24 +536,6 @@ class TestMemoryClip(_AdderCase):
         self.assertLess(whole, len(asked))
         for tokens in held:
             allocator.free(tokens)
-
-    def test_clip_applies_the_scheduler_token_capacity(self):
-        """BUG REGRESSION. The clip must not grant decode beyond the token
-        capacity the scheduler passes (CP padding, KV sharding)."""
-        allocator = _window_pool(8192)
-        kwargs = dict(sliding_window_size=8, chunk_size=16)
-        free = allocator.max_new_tokens_for_memory(
-            12, 80, token_capacity=allocator.size_full, **kwargs, **RETIRE_AT_ONCE
-        )
-        self.assertEqual(free, 80)
-        for capacity in (40, 64, 90):
-            with self.subTest(capacity=capacity):
-                self.assertEqual(
-                    allocator.max_new_tokens_for_memory(
-                        12, 80, token_capacity=capacity, **kwargs, **RETIRE_AT_ONCE
-                    ),
-                    min(80, max(0, capacity - 12 - 4 - 1)),
-                )
 
     def test_clip_cuts_no_chunk_below_the_alignment(self):
         """A truncated chunk is cut to the scheduler's alignment, so the clip

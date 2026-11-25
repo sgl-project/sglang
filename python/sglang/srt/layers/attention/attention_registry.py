@@ -86,13 +86,6 @@ def create_flashinfer_backend(runner):
             FlashInferAttnBackend,
         )
 
-        # Init streams
-        if get_spec().speculative_algorithm == "EAGLE":
-            if (
-                not hasattr(runner, "plan_stream_for_flashinfer")
-                or not runner.plan_stream_for_flashinfer
-            ):
-                runner.plan_stream_for_flashinfer = torch.cuda.Stream()
         return flashinfer_backend_cls(FlashInferAttnBackend)(
             runner, init_new_workspace=runner.init_new_workspace
         )

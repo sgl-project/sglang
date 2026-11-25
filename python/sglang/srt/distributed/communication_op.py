@@ -86,13 +86,6 @@ def tensor_model_parallel_all_gather(
     return get_tp_group().all_gather(input_, dim)
 
 
-def tensor_model_parallel_gather(
-    input_: torch.Tensor, dst: int = 0, dim: int = -1
-) -> Optional[torch.Tensor]:
-    """Gather the input tensor across model parallel group."""
-    return get_tp_group().gather(input_, dst, dim)
-
-
 def broadcast_tensor_dict(
     tensor_dict: Optional[Dict[Any, Union[torch.Tensor, Any]]] = None, src: int = 0
 ):
