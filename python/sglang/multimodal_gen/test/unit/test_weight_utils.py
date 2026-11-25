@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -225,7 +226,13 @@ class TestDitParameterCount(CustomTestCase):
             partial = Path(tmpdir) / "partial"
             _write_sharded_transformer(partial)
             (partial / "transformer" / "shard-2.safetensors").unlink()
-            header = SimpleNamespace(parameter_count={"F32": 10, "BF16": 2})
+            both_reading = Barrier(2, timeout=10)
+
+            def header(*, repo_id, filename, revision):
+                self.assertEqual((repo_id, revision), ("org/model", "abc"))
+                both_reading.wait()
+                return SimpleNamespace(parameter_count={"F32": 10, "BF16": 2})
+
             for snapshot in (
                 Mock(side_effect=LocalEntryNotFoundError("not cached")),
                 Mock(return_value=str(partial)),
@@ -237,7 +244,7 @@ class TestDitParameterCount(CustomTestCase):
                     patch(f"{_LOADER_UTILS}.hf_hub_download", return_value=str(index)),
                     patch(
                         f"{_LOADER_UTILS}.parse_safetensors_file_metadata",
-                        return_value=header,
+                        side_effect=header,
                     ) as parse,
                 ):
                     self.assertEqual(
@@ -246,14 +253,32 @@ class TestDitParameterCount(CustomTestCase):
                         ),
                         24,
                     )
-                    self.assertEqual(
+                    self.assertCountEqual(
                         [call.kwargs["filename"] for call in parse.call_args_list],
                         [
                             "transformer/shard-1.safetensors",
                             "transformer/shard-2.safetensors",
                         ],
                     )
-                    self.assertEqual(parse.call_args.kwargs["revision"], "abc")
+
+    def test_one_bad_hub_shard_does_not_report_a_partial_size(self):
+        def header(*, filename, **kwargs):
+            if filename.endswith("shard-2.safetensors"):
+                raise OSError("range request failed")
+            return SimpleNamespace(parameter_count={"F32": 10})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = Path(tmpdir) / "index.json"
+            index.write_text(_TWO_SHARD_INDEX)
+            with (
+                patch.dict(os.environ, {"SGLANG_USE_MODELSCOPE": "0"}),
+                patch(_SNAPSHOT_DOWNLOAD, side_effect=LocalEntryNotFoundError("miss")),
+                patch(f"{_LOADER_UTILS}.hf_hub_download", return_value=str(index)),
+                patch(f"{_LOADER_UTILS}.parse_safetensors_file_metadata", header),
+            ):
+                self.assertIsNone(
+                    dit_parameter_count("org/model", subfolder=None, revision=None)
+                )
 
     def test_unreachable_hub_or_modelscope_leaves_the_dit_unsized(self):
         for use_modelscope, hub_download in (

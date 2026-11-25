@@ -13,6 +13,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
 
 # This module loads tokenizers and processors straight from transformers.
@@ -31,8 +32,25 @@ def parse_custom_headers(header_list: List[str]) -> Dict[str, str]:
     return {k: v for h in header_list for k, _, v in [h.partition("=")] if k and v}
 
 
+def dp_listener_urls(server_info: dict) -> List[str]:
+    """Every DP rank's listener URL, by rank, from a `/server_info` response.
+
+    A server whose DP ranks each have their own HTTP listener lists them under
+    `dp_listeners`; each listener serves only its own rank, so a client that
+    wants every rank loaded must spread its requests over them itself. Empty
+    when the server publishes no such map (one listener for every rank, as
+    with the in-process DP controller) or only one rank.
+    """
+    listeners = sorted(
+        server_info.get("dp_listeners") or [], key=lambda listener: listener["dp_rank"]
+    )
+    if len(listeners) < 2:
+        return []
+    return [listener["url"].rstrip("/") for listener in listeners]
+
+
 def get_model(pretrained_model_name_or_path: str) -> str:
-    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
+    if envs.SGLANG_USE_MODELSCOPE.get():
         import huggingface_hub.constants
         from modelscope import snapshot_download
 
