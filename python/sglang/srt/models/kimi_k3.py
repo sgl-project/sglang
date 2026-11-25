@@ -603,6 +603,15 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 "Kimi-K3 supports initial expert placement without online EPLB "
                 "or redundant experts."
             )
+        if get_moe_a2a_backend().is_megamoe() and not _is_hip:
+            # DeepGEMM would assert on this in the first forward, after the
+            # weights are loaded and repacked.
+            from sglang.srt.layers.moe.mega_moe import check_mega_moe_num_experts
+
+            check_mega_moe_num_experts(
+                getattr(config, "n_routed_experts", config.num_experts),
+                get_parallel().moe_ep_size,
+            )
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
         moe_renormalize = config.moe_renormalize
