@@ -304,7 +304,6 @@ class EncoderPreprocessor:
         self,
         data,
         modality: Modality,
-        frame_count_limit=None,
         discard_alpha_channel=True,
     ):
         from sglang.srt.disaggregation.encoder.server import BadRequestError, MMError
@@ -350,7 +349,7 @@ class EncoderPreprocessor:
                     }
                 return img
             elif modality == Modality.VIDEO:
-                vid = load_video(data, frame_count_limit)
+                vid = load_video(data, use_gpu=False)
                 if (
                     media_metadata
                     and self.encoder_media_processor_config.preserve_media_metadata
@@ -935,6 +934,9 @@ class EncoderPreprocessor:
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
         """Compatibility helper for callers that still provide patch grids."""
+        if self.model_type == "inkling2" and modality == Modality.IMAGE:
+            # One Inkling2 image token per 40-pixel cell of the (1, rows, cols) grid.
+            return int(grid[0] * grid[1] * grid[2])
         if self.model_type == "muse_spark":
             # Muse's hook returns output grids, after spatial/temporal merging.
             return (

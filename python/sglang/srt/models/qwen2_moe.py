@@ -170,10 +170,6 @@ def can_fuse_shared_expert(
         return False
 
     if quant_config is not None:
-        exclude_layers = getattr(quant_config, "exclude_layers", None)
-        if exclude_layers is None:
-            exclude_layers = getattr(quant_config, "ignored_layers", [])
-
         # Other backends than quark do not exclude the shared expert here, so they
         # intentionally fall through and remain fusable
         can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
@@ -571,7 +567,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     gate = self.shared_expert_gate(hidden_states)
                     shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
                 elif _is_npu:
-                    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+                    from sgl_kernel_npu.operators.activation import (
                         fused_sigmoid_mul_broadcast,
                     )
 
@@ -918,8 +914,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 final_hidden_states += shared_output
         if self.reduce_results:
             final_hidden_states = reduce_moe_output(final_hidden_states)
-
-        # Debug removed - was causing issues during CUDA graph capture
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1385,14 +1379,11 @@ class Qwen2MoeForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
