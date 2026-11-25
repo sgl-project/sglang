@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.rust_extensions._server import ServerArgs
+    from sglang.srt.rust_server.multimodal import RustMmSpec
     from sglang.srt.server_args import ServerArgs as PyServerArgs
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,7 @@ def _build_server_args(
     scheduler: Scheduler,
     *,
     extension: Optional[ModuleType] = None,
+    mm_spec: Optional[RustMmSpec] = None,
     health_generate_headers: Optional[Dict[str, str]] = None,
     default_max_new_tokens: Optional[int] = SamplingParams().max_new_tokens,
     request_class: Optional[type] = None,
@@ -164,6 +166,8 @@ def _build_server_args(
         ),
         grpc_port=get_serving().grpc_port,
         grpc_response_timeout_secs=get_serving().grpc_response_timeout_secs,
+        reject_fingerprint_mismatch=get_serving().on_fingerprint_mismatch == "reject",
+        mm_render_config=mm_spec.render_config_json() if mm_spec is not None else None,
         api_key=get_serving().api_key,
         admin_api_key=get_serving().admin_api_key,
         log_level=get_observability().log_level,

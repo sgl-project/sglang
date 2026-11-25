@@ -728,6 +728,7 @@ class TestRustServerExtension(CustomTestCase):
         build_args.assert_called_once_with(
             scheduler,
             extension=extension,
+            mm_spec=None,
             health_generate_headers={},
             default_max_new_tokens=128,
             request_class=GenerateReqInput,
@@ -1296,7 +1297,7 @@ class TestRustServerExtension(CustomTestCase):
             ),
         )
         with (
-            launch_context(BuiltinServer),
+            launch_context(BuiltinServer) as build_args,
             patch.object(server_module, "RustMmProcessor") as mm_processor,
             patch.object(
                 BuiltinServer, "_build_mm_spec", return_value=sentinel.worker_spec
@@ -1319,6 +1320,7 @@ class TestRustServerExtension(CustomTestCase):
             instance = BuiltinServer.launch(scheduler)
 
         extension.Server.assert_called_once()
+        self.assertIs(build_args.call_args.kwargs["mm_spec"], spec)
         instance.server.start_mm_workers.assert_called_once_with(
             sentinel.worker_spec, 8
         )

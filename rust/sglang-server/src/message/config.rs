@@ -156,6 +156,8 @@ pub struct ServerArgs {
     /// next response event before ending with DEADLINE_EXCEEDED. `0` keeps
     /// the default, as the legacy gRPC bridge does.
     pub grpc_response_timeout_secs: u64,
+    pub reject_fingerprint_mismatch: bool,
+    pub mm_render_config: Option<JsonObject>,
     /// `--api-key` / `--admin-api-key`, enforced on the HTTP routes as
     /// Python's `add_api_key_middleware` enforces them.
     pub api_keys: ApiKeys,
@@ -281,6 +283,17 @@ pub struct ServerArgs {
     pub server_added_custom_params: Vec<String>,
 }
 
+impl ServerArgs {
+    pub(crate) fn chat_formatter_options(&self) -> sglang_processor::ChatFormatterOptions {
+        sglang_processor::ChatFormatterOptions {
+            tokenizer_path: self.tokenizer_path.clone(),
+            model_path: self.model_path.clone(),
+            revision: self.revision.clone(),
+            chat_template: self.chat_template.clone(),
+        }
+    }
+}
+
 #[pyo3::pymethods]
 impl ServerArgs {
     #[new]
@@ -301,6 +314,8 @@ impl ServerArgs {
         http2,
         grpc_port,
         grpc_response_timeout_secs,
+        reject_fingerprint_mismatch,
+        mm_render_config,
         api_key,
         admin_api_key,
         log_level,
@@ -368,6 +383,8 @@ impl ServerArgs {
         http2: Option<Http2Config>,
         grpc_port: Option<u16>,
         grpc_response_timeout_secs: u64,
+        reject_fingerprint_mismatch: bool,
+        mm_render_config: Option<JsonObject>,
         api_key: Option<String>,
         admin_api_key: Option<String>,
         log_level: String,
@@ -433,6 +450,8 @@ impl ServerArgs {
             http2,
             grpc_port,
             grpc_response_timeout_secs,
+            reject_fingerprint_mismatch,
+            mm_render_config,
             api_keys: ApiKeys::new(api_key, admin_api_key),
             log_level,
             log_level_http,
@@ -506,6 +525,8 @@ impl Default for ServerArgs {
             http2: None,
             grpc_port: None,
             grpc_response_timeout_secs: DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
+            reject_fingerprint_mismatch: false,
+            mm_render_config: None,
             api_keys: ApiKeys::default(),
             log_level: "info".into(),
             log_level_http: None,

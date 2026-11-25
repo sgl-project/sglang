@@ -1,0 +1,26 @@
+{
+  "model_files": {
+    "tokenizer.json": "{\"version\":\"1.0\",\"model\":{\"type\":\"WordLevel\",\"vocab\":{\"[UNK]\":0},\"unk_token\":\"[UNK]\"}}",
+    "tokenizer_config.json": "{\"chat_template\":\"{{ messages }}\"}"
+  },
+  "context_length": 2048,
+  "reasoning_parser": null,
+  "incremental_streaming_output": true,
+  "default_chat_template_kwargs": {"enable_thinking": false},
+  "mm_render_config": {
+    "family": "qwen_vl",
+    "image_token_id": 10,
+    "patch_size": 14,
+    "merge_size": 2,
+    "temporal_patch_size": 2,
+    "min_pixels": 1024,
+    "max_pixels": 65536,
+    "image_mean": [0.48145466, 0.4578275, 0.40821073],
+    "image_std": [0.26862954, 0.26130258, 1.0],
+    "resample": "pil",
+    "vision_start_token_id": 11,
+    "vision_end_token_id": 12,
+    "video_token_id": null
+  },
+  "expected_fingerprint": "9bb3d46e5cf6e5c94c795714ba5304e927b2ebda4121e5c716af15b9c51762ce"
+}

@@ -269,6 +269,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
+    <tr>
+      <td>`--on-fingerprint-mismatch`</td>
+      <td>Set to `reject` to check the caller's `x-render-fingerprint` on the Rust worker's gRPC Generate RPC (`SGLANG_RUST_SERVER=1` and `--grpc-port`). A mismatch returns `FAILED_PRECONDITION`. Callers may omit the header. With `--enable-metrics`, the `render_fingerprint` label on `sglang:render_info` reports the worker digest. Workers using `--skip-tokenizer-init` have no render fingerprint and fail to start in `reject` mode.</td>
+      <td>`"ignore"`</td>
+      <td>`ignore`, `reject`</td>
+    </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--skip-server-warmup`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>If set, skip warmup.</td>

@@ -10,6 +10,7 @@ use futures::{Stream, StreamExt};
 use sglang_api_types::api::v1 as api;
 use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
+use tonic_types::{ErrorDetails, StatusExt};
 
 use super::{info, native_api};
 use crate::api_server::anthropic::Anthropic;
@@ -41,6 +42,8 @@ pub(super) type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>>
 /// configuration.
 #[derive(Clone)]
 struct AdapterConfig {
+    /// The worker digest when caller fingerprint checks are enabled.
+    expected_render_fingerprint: Option<String>,
     preferred_sampling_params: Option<PreferredSamplingParams>,
     incremental_streaming_output: bool,
     /// Longest wait for the next event of any in-flight call before the RPC
@@ -68,10 +71,12 @@ impl GrpcService {
         core: CoreHandle,
         server_args: Arc<ServerArgs>,
         hicache_manager: Arc<HiCacheManager>,
+        expected_render_fingerprint: Option<String>,
     ) -> Self {
         Self {
             core,
             config: AdapterConfig {
+                expected_render_fingerprint,
                 preferred_sampling_params: server_args.preferred_sampling_params.clone(),
                 incremental_streaming_output: server_args.incremental_streaming_output,
                 response_timeout: response_timeout(server_args.grpc_response_timeout_secs),
@@ -103,6 +108,7 @@ impl GrpcService {
             hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &args)),
             core,
             config: AdapterConfig {
+                expected_render_fingerprint: None,
                 preferred_sampling_params,
                 incremental_streaming_output,
                 response_timeout,
@@ -216,6 +222,23 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        if let Some(expected) = &self.config.expected_render_fingerprint
+            && request
+                .metadata()
+                .get_all("x-render-fingerprint")
+                .iter()
+                .any(|caller| caller.as_bytes() != expected.as_bytes())
+        {
+            return Err(Status::with_error_details(
+                tonic::Code::FailedPrecondition,
+                "Caller and worker render fingerprints differ",
+                ErrorDetails::with_error_info(
+                    "RENDER_FINGERPRINT_MISMATCH",
+                    "sglang.api.v1",
+                    std::collections::HashMap::new(),
+                ),
+            ));
+        }
         let mut request = request.into_inner();
         // Read before the fills below: only a `max_new_tokens` the client set
         // is checked against the context window.
@@ -1344,6 +1367,7 @@ mod tests {
     use sglang_api_types::api::v1::generate_stream_item::Item;
     use sglang_api_types::api::v1::sglang_service_server::SglangService;
     use tonic::{Code, Request};
+    use tonic_types::StatusExt;
 
     use super::GrpcService;
     use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata, HiCacheManager};
@@ -1537,6 +1561,64 @@ mod tests {
             .output_ids
             .as_ref()
             .map_or(&[], |ids| ids.ids.as_slice())
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_mismatched_render_fingerprint_before_intake() {
+        let mut harness = Harness::new(2, false, Duration::from_secs(1));
+        harness.service.config.expected_render_fingerprint = Some("worker".into());
+        let mismatches: &[&[&str]] = &[
+            &["caller"],
+            &[""],
+            &["worker", "caller"],
+            &["caller", "worker"],
+        ];
+        for &values in mismatches {
+            let mut request = Request::new(ids_request(&[1, 2], None));
+            for value in values {
+                request
+                    .metadata_mut()
+                    .append("x-render-fingerprint", value.parse().unwrap());
+            }
+
+            let status = harness
+                .service
+                .generate(request)
+                .await
+                .err()
+                .expect("mismatch must reject the RPC");
+            assert_eq!(status.code(), Code::FailedPrecondition, "{values:?}");
+            let info = status
+                .get_details_error_info()
+                .expect("google.rpc.ErrorInfo");
+            assert_eq!(info.reason, "RENDER_FINGERPRINT_MISMATCH");
+            assert_eq!(info.domain, "sglang.api.v1");
+            assert!(harness.intake_rx.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_admits_compatible_render_fingerprint_requests() {
+        let compatible: &[(Option<&str>, &[&str])] = &[
+            (Some("worker"), &[]),
+            (Some("worker"), &["worker"]),
+            (Some("worker"), &["worker", "worker"]),
+            (None, &["caller"]),
+        ];
+        for &(expected, values) in compatible {
+            let mut harness = Harness::new(2, false, Duration::from_secs(1));
+            harness.service.config.expected_render_fingerprint = expected.map(String::from);
+            let mut request = Request::new(ids_request(&[1, 2], None));
+            for value in values {
+                request
+                    .metadata_mut()
+                    .append("x-render-fingerprint", value.parse().unwrap());
+            }
+
+            let _response = harness.service.generate(request).await.unwrap();
+            let intake = harness.next_generation().await;
+            assert_eq!(intake.request.input_ids.as_deref(), Some(&[1, 2][..]));
+        }
     }
 
     #[tokio::test]
@@ -1783,6 +1865,7 @@ mod tests {
                 harness.service.core.clone(),
                 Arc::new(server_args),
                 harness.service.hicache_manager.clone(),
+                None,
             )
             .config
             .response_timeout

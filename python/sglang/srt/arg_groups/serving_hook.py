@@ -292,6 +292,14 @@ def handle_grpc_args(server_args: Any):
     if cfg.grpc_response_timeout_secs <= 0:
         raise ValueError("--grpc-response-timeout-secs must be positive")
 
+    if cfg.on_fingerprint_mismatch == "reject" and (
+        cfg.grpc_port is None or not envs.SGLANG_RUST_SERVER.get()
+    ):
+        raise ValueError(
+            "--on-fingerprint-mismatch=reject requires the Rust api.v1 server "
+            "(SGLANG_RUST_SERVER=1 and --grpc-port)"
+        )
+
     if cfg.grpc_port is not None:
         if not (1 <= cfg.grpc_port <= 65535):
             raise ValueError(

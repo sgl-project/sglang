@@ -517,6 +517,7 @@ class RustServer:
             _build_server_args(
                 scheduler,
                 extension=extension,
+                mm_spec=mm_spec,
                 health_generate_headers=cls._health_generate_headers(scheduler),
                 default_max_new_tokens=cls._default_max_new_tokens(scheduler),
                 request_class=cls._request_input_class(),

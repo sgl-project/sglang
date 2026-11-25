@@ -12,7 +12,6 @@ use axum::{
     response::Response,
 };
 use futures::StreamExt;
-use sglang_processor::ChatFormatterOptions;
 use std::sync::Arc;
 
 pub(crate) mod chat;
@@ -72,12 +71,8 @@ pub(crate) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
     }
-    let (formatter, error) = sglang_processor::select_chat_formatter(&ChatFormatterOptions {
-        tokenizer_path: server_args.tokenizer_path.clone(),
-        model_path: server_args.model_path.clone(),
-        revision: server_args.revision.clone(),
-        chat_template: server_args.chat_template.clone(),
-    });
+    let (formatter, error) =
+        sglang_processor::select_chat_formatter(&server_args.chat_formatter_options());
     if let Some(error) = error {
         tracing::warn!(%error, "OpenAI chat completions disabled");
     }

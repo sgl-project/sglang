@@ -295,11 +295,30 @@ pub(crate) fn thinking(request: &Value, defaults: &HashMap<String, Value>) -> bo
     if let Some(thinking) = requested_thinking(request) {
         return thinking;
     }
+    default_thinking(defaults)
+}
+
+fn default_thinking(defaults: &HashMap<String, Value>) -> bool {
     if let Some(thinking) = defaults.get("thinking") {
         return minijinja::Value::from_serialize(thinking).is_true();
     }
     std::env::var("SGLANG_DEFAULT_THINKING")
         .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()))
+}
+
+/// Process defaults observable by the recipe in addition to the launch kwargs.
+pub(in crate::render) fn fingerprint_defaults(
+    v41: bool,
+    defaults: &HashMap<String, Value>,
+) -> Value {
+    // A request with effort "none" still reaches the environment fallback even
+    // when the server supplies a default effort. Resolve it just as render does.
+    let fallback = env_effort(v41);
+    let effort = match resolve_effort(v41, fallback.clone()) {
+        Ok((_, Some(budget))) => Some(Value::from(budget)),
+        _ => fallback,
+    };
+    json!({"thinking": default_thinking(defaults), "fallback_effort": effort})
 }
 
 /// The named effort recipe renders, or V4.1's integer budget. Kwargs effort
@@ -324,6 +343,13 @@ fn effort(
         })
         .filter(|effort| effort != "none")
         .or_else(|| env_effort(v41));
+    resolve_effort(v41, requested)
+}
+
+fn resolve_effort(
+    v41: bool,
+    requested: Option<Value>,
+) -> Result<(Option<String>, Option<u32>), String> {
     match requested {
         None => Ok((None, None)),
         Some(Value::String(effort)) => Ok((Some(effort), None)),

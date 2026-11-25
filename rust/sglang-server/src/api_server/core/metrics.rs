@@ -457,6 +457,8 @@ struct RequestSeries {
 
 /// The frontend's metric families and where they are written.
 pub(crate) struct FrontendMetrics {
+    /// The live gRPC worker's digest, exported once per scrape.
+    pub(crate) render_fingerprint: Option<String>,
     /// `tokenizer_metric_labels()`: the labels on every family.
     labels: Labels,
     /// `--enable-priority-scheduling`: the `priority` label takes each
@@ -498,6 +500,28 @@ pub(crate) struct FrontendMetrics {
 }
 
 impl FrontendMetrics {
+    pub(crate) const RENDER_INFO: &str = "sglang:render_info";
+
+    /// A scrape describes the worker reached at this listener. Keep the gauge
+    /// out of shared multiprocess files, which can outlive their writer.
+    pub(crate) fn render_info(&self) -> Option<prometheus::Family> {
+        let digest = self.render_fingerprint.as_ref()?;
+        let mut labels = self.labels.clone();
+        // The worker owns this label even if --extra-metric-labels sets it.
+        labels.retain(|(name, _)| name != "render_fingerprint");
+        labels.push(("render_fingerprint".into(), digest.clone()));
+        Some(prometheus::Family {
+            name: Self::RENDER_INFO.into(),
+            help: "Worker render configuration.".into(),
+            kind: "gauge".into(),
+            samples: vec![prometheus::Sample {
+                name: Self::RENDER_INFO.into(),
+                labels,
+                value: 1.0,
+            }],
+        })
+    }
+
     pub(crate) fn new(
         config: &MetricsConfig,
         disaggregation_mode: DisaggregationMode,
@@ -507,6 +531,7 @@ impl FrontendMetrics {
         };
         let pid = std::process::id();
         let metrics = Self {
+            render_fingerprint: None,
             labels: config
                 .labels
                 .iter()

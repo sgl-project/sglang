@@ -357,6 +357,55 @@ fn notify_drained(name: &str) {
     }
 }
 
+fn worker_render_fingerprint(cfg: &RuntimeConfig) -> Result<Option<String>, String> {
+    let args = &cfg.server_args;
+    if cfg.rust_server_args.grpc_addr.is_none()
+        || (!args.reject_fingerprint_mismatch && args.metrics.is_none())
+    {
+        return Ok(None);
+    }
+    // A token-IDs-only worker loads neither a tokenizer nor a detokenizer.
+    // Files at tokenizer_path do not identify a renderer used by this process.
+    if args.skip_tokenizer_init {
+        if args.reject_fingerprint_mismatch {
+            return Err(
+                "--on-fingerprint-mismatch=reject is incompatible with --skip-tokenizer-init"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    }
+    let result = if args.model_is_multimodal() && args.mm_render_config.is_none() {
+        Err(std::io::Error::other(
+            "missing resolved multimodal configuration",
+        ))
+    } else {
+        sglang_processor::render_fingerprint(
+            &args.chat_formatter_options(),
+            &sglang_processor::RenderFingerprintConfig {
+                default_chat_template_kwargs: &args.default_chat_template_kwargs,
+                context_length: args.model_config.context_len,
+                reasoning_parser: args.reasoning_parser.as_deref(),
+                incremental_streaming_output: args.incremental_streaming_output,
+                multimodal_token_config: args
+                    .mm_render_config
+                    .as_ref()
+                    .map(|config| config.0.as_ref()),
+            },
+        )
+    };
+    match result {
+        Ok(digest) => Ok(Some(digest)),
+        Err(error) if args.reject_fingerprint_mismatch => {
+            Err(format!("computing render fingerprint: {error}"))
+        }
+        Err(error) => {
+            tracing::warn!(%error, "worker render fingerprint unavailable");
+            Ok(None)
+        }
+    }
+}
+
 /// Boot the whole frontend, `http_layer` wrapping the HTTP app (see
 /// [`HttpLayer`]). Returns once threads are spawned (non-blocking).
 /// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
@@ -366,13 +415,17 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     let (startup_failure_tx, startup_failure_rx) = flume::bounded::<String>(1);
     let mut threads = Vec::new();
     let cpus = frontend_cpu_set(&cfg);
-    // Validated before anything is spawned, so a bad bucket list fails startup
-    // cleanly.
+    let fingerprint = worker_render_fingerprint(&cfg)?;
+    // Validate the bucket list before spawning any threads.
     let metrics = match &cfg.server_args.metrics {
-        Some(config) => Some(Arc::new(crate::api_server::core::FrontendMetrics::new(
-            config,
-            cfg.server_args.disaggregation_mode,
-        )?)),
+        Some(config) => {
+            let mut metrics = crate::api_server::core::FrontendMetrics::new(
+                config,
+                cfg.server_args.disaggregation_mode,
+            )?;
+            metrics.render_fingerprint = fingerprint.clone();
+            Some(Arc::new(metrics))
+        }
         None => None,
     };
 
@@ -615,6 +668,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                 core.clone(),
                 cfg.server_args.clone(),
                 hicache_manager.clone(),
+                fingerprint.filter(|_| cfg.server_args.reject_fingerprint_mismatch),
             );
             (listener, service)
         });
@@ -2038,6 +2092,137 @@ mod tests {
         assert!(rt.core.is_serving());
         take_startup_freeze_gc(&rt);
         rt.request_shutdown();
+    }
+
+    #[test]
+    fn unknown_multimodal_pipeline_has_no_worker_fingerprint() {
+        let (http, grpc) = free_loopback_addrs();
+        let mut cfg = test_config(http, Some(grpc));
+        let args = Arc::make_mut(&mut cfg.server_args);
+        args.skip_tokenizer_init = false;
+        args.model_config.is_multimodal = true;
+        args.reject_fingerprint_mismatch = true;
+        args.metrics = Some(crate::message::config::MetricsConfig::for_dir(
+            &std::env::temp_dir(),
+        ));
+        let error = worker_render_fingerprint(&cfg).unwrap_err();
+        assert!(
+            error.contains("missing resolved multimodal configuration"),
+            "{error}"
+        );
+        Arc::make_mut(&mut cfg.server_args).reject_fingerprint_mismatch = false;
+        assert_eq!(worker_render_fingerprint(&cfg).unwrap(), None);
+    }
+
+    #[test]
+    fn reject_fingerprint_mismatch_fails_startup_without_tokenizer() {
+        let (http, grpc) = free_loopback_addrs();
+        let mut cfg = test_config(http, Some(grpc));
+        let dir = std::env::temp_dir().join(format!("no-tokenizer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let args = Arc::make_mut(&mut cfg.server_args);
+        args.skip_tokenizer_init = false;
+        args.tokenizer_path = dir.to_str().unwrap().into();
+        args.reject_fingerprint_mismatch = true;
+        let error = start(cfg, None)
+            .err()
+            .expect("reject requires a worker digest");
+        assert!(error.contains("computing render fingerprint"), "{error}");
+        assert!(error.contains("tokenizer"), "{error}");
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    const TEST_TOKENIZER_DIR: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/sglang-simulator/examples/assets/tokenizer"
+    );
+
+    fn assert_skipped_tokenizer_has_no_fingerprint(path: &std::path::Path) {
+        let (http, grpc) = free_loopback_addrs();
+        let mut cfg = test_config(http, Some(grpc));
+        let args = Arc::make_mut(&mut cfg.server_args);
+        args.tokenizer_path = path.to_str().unwrap().into();
+        args.skip_tokenizer_init = true;
+        args.metrics = Some(crate::message::config::MetricsConfig::for_dir(
+            &std::env::temp_dir(),
+        ));
+        assert_eq!(worker_render_fingerprint(&cfg).unwrap(), None);
+
+        Arc::make_mut(&mut cfg.server_args).reject_fingerprint_mismatch = true;
+        let error = start(cfg, None)
+            .err()
+            .expect("a token-only worker cannot enforce a render fingerprint");
+        assert!(error.contains("--skip-tokenizer-init"), "{error}");
+    }
+
+    #[test]
+    fn skipped_tokenizer_has_no_fingerprint_even_with_tokenizer_files() {
+        let dir = std::path::Path::new(TEST_TOKENIZER_DIR);
+        assert!(dir.join("tokenizer.json").is_file());
+        assert_skipped_tokenizer_has_no_fingerprint(dir);
+    }
+
+    #[test]
+    fn skipped_tokenizer_has_no_fingerprint_without_tokenizer_files() {
+        let dir = std::env::temp_dir().join(format!("absent-tokenizer-{}", uuid::Uuid::new_v4()));
+        assert!(!dir.exists());
+        assert_skipped_tokenizer_has_no_fingerprint(&dir);
+    }
+
+    /// The normal startup path supplies the same digest to /metrics and Generate.
+    #[test]
+    fn grpc_checks_the_published_render_fingerprint() {
+        use tonic_types::StatusExt;
+
+        let dir = std::env::temp_dir().join(format!("render-info-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let (http, grpc) = free_loopback_addrs();
+        let mut cfg = test_config(http, Some(grpc));
+        let args = Arc::make_mut(&mut cfg.server_args);
+        args.tokenizer_path = TEST_TOKENIZER_DIR.into();
+        args.skip_tokenizer_init = false;
+        args.reject_fingerprint_mismatch = true;
+        args.metrics = Some(crate::message::config::MetricsConfig::for_dir(&dir));
+        let rt = start(cfg, None).expect("start fingerprint-enabled worker");
+        take_startup_freeze_gc(&rt);
+        let metrics = read_response(send_http(http, "GET", "/metrics", ""));
+        let digest = metrics
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("sglang:render_info{")?
+                    .split_once("render_fingerprint=\"")?
+                    .1
+                    .split_once('"')
+                    .map(|(digest, _)| digest)
+            })
+            .expect("worker digest on /metrics");
+        assert_eq!(digest.len(), 64);
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc).await;
+            let request = |value: &str| {
+                let mut request = tonic::Request::new(grpc_ids_request(&[1], "fingerprint"));
+                request
+                    .metadata_mut()
+                    .insert("x-render-fingerprint", value.parse().unwrap());
+                request
+            };
+            let status = client.generate(request("other")).await.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(
+                status.get_details_error_info().unwrap().reason,
+                "RENDER_FINGERPRINT_MISMATCH"
+            );
+            assert!(rt.to_scheduler_rx.drain(1).is_empty());
+            let _response = client.generate(request(digest)).await.unwrap();
+            let rid = crate::message::ids::Rid::from(next_scheduler_rid(&rt));
+            assert_eq!(rid.client_facing(), "fingerprint");
+        });
+        rt.request_shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// End to end over the configured socket: the generated api.v1 client
