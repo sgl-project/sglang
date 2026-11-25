@@ -108,7 +108,11 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_input_v2,
     make_draft_sampler_capture_hook,
 )
-from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    ForceGreedy,
+    resolve_greedy_mask,
+    resolve_greedy_rows_by_slot,
+)
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     DecodeStepObservation,
     DsparkInfoDumper,
@@ -122,6 +126,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
 )
 from sglang.srt.speculative.lilicorr_utils import (
+    LiLiCorrDraftSampler,
     build_lilicorr_draft_sampler,
     propose_lilicorr_block,
     publish_anchor,
@@ -165,6 +170,7 @@ _is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
     from sglang.srt.speculative.dflash_mla_ctx import MlaContextKV
 
 logger = logging.getLogger(__name__)
@@ -348,7 +354,8 @@ class _SelectorDraftSampler:
     """Selector decode folded into the draft cuda graph.
 
     On sampling-enabled backends, one captured graph serves both: it always walks
-    the sampling path, and a static greedy_mask selects the argmax per row.
+    the sampling path, and a greedy_mask it reads from the batch's slots selects
+    the argmax per row. Without sampling, every row is greedy at temperature 1.
     """
 
     def __init__(
@@ -359,17 +366,20 @@ class _SelectorDraftSampler:
         max_bs,
         device,
         sampling_enabled: bool,
+        sampling_params_table: SamplingParamsTable,
         acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
     ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
         self.sampling_enabled = sampling_enabled
+        self.sampling_params_table = sampling_params_table
+        self.force_greedy = ForceGreedy(device)
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
         self.max_bs = max_bs
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
-        # Written by the host before replay, or read after it; the addresses are
-        # baked into the captured graph.
+        # Written by the graph, or read after it; the addresses are baked into the
+        # captured graph.
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
         self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
         self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
@@ -388,26 +398,16 @@ class _SelectorDraftSampler:
             )
             self.confidence_out = torch.empty_like(self.feature_out)
 
-    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
-        """Host-side refresh of the static sampling params; must run before the draft
-        graph replay that consumes them."""
-        if sampling_info is None or not self.sampling_enabled:
-            self.temperatures[:bs].fill_(1.0)
-            self.greedy_mask[:bs].fill_(True)
-            return
-        torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
-            min=1e-5,
-            out=self.temperatures[:bs],
-        )
-        self.greedy_mask[:bs].copy_(
-            resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
-            )
-        )
-
-    def __call__(self, hidden_states, input_ids):
+    def __call__(self, hidden_states, input_ids, req_pool_indices):
         bs = hidden_states.shape[0] // self.block_size
+        if self.sampling_enabled:
+            resolve_greedy_rows_by_slot(
+                self.sampling_params_table,
+                req_pool_indices[:bs],
+                force_greedy=self.force_greedy.flag,
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+            )
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
@@ -1077,7 +1077,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
-                        make_draft_sampler_capture_hook(self._draft_sampler)
+                        make_draft_sampler_capture_hook(
+                            self._draft_sampler,
+                            reads_slots=self._draft_sampler_reads_slots,
+                        )
                     )
                 if is_cuda() and envs.SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH.get():
                     self._install_draft_l2_prefetch()
@@ -1228,13 +1231,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         return result
 
+    @property
+    def _draft_sampler_reads_slots(self) -> bool:
+        """Whether the draft graph's sampler reads its params from the batch's slots
+        of the sampling table; a bound runtime's sampler is staged instead."""
+        return isinstance(
+            self._draft_sampler, (_SelectorDraftSampler, LiLiCorrDraftSampler)
+        )
+
     def _stage_draft_sampler(self, *, bs: int, sampling_info) -> None:
-        # A batch past the sampler's static buffers has no captured bucket,
-        # so its draft runs eager and the eager head reads none of them.
         sampler = self._draft_sampler
         if sampler is None:
             return
-        if sampler.max_bs is None or bs <= sampler.max_bs:
+        if self._draft_sampler_reads_slots:
+            sampler.force_greedy.set(sampling_info is None)
+        elif sampler.max_bs is None or bs <= sampler.max_bs:
+            # A batch past the sampler's static buffers has no captured bucket,
+            # so its draft runs eager and the eager head reads none of them.
             sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
 
     def _maybe_build_draft_sampler(self):
@@ -1247,10 +1260,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
         if self.block_size <= 1:
             return _eager("block_size<=1")
-        target_model = self._target_worker.model_runner.model
+        target_runner = self._target_worker.model_runner
+        target_model = target_runner.model
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None:
             return _eager("no target lm_head")
+        sampling_params_table = target_runner.req_to_token_pool.sampling_params_table
 
         # A gate-admitted quantized head is capture-safe: the target's own
         # logits path already runs the same kernel under CUDA graphs.
@@ -1281,6 +1296,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
                 sampling_enabled=self._selector_sampling_enabled,
+                sampling_params_table=sampling_params_table,
                 acceptance_estimator=self._acceptance_estimator,
             )
         if self.lilicorr is not None:
@@ -1288,6 +1304,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("unsupported quantized lm_head")
             return build_lilicorr_draft_sampler(
                 sampling_enabled=self._lilicorr_sampling_enabled,
+                sampling_params_table=sampling_params_table,
                 head=self.lilicorr,
                 draft_model=self.draft_model,
                 embed_tokens=target_input_embeddings(target_model),
@@ -2429,9 +2446,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                             window_locs=layer_window_locs(
                                 self.draft_model_runner.token_to_kv_pool,
                                 attn.attn.layer_id,
-                                swa_cache_loc.view_as(cache_loc_2d)
-                                if swa_cache_loc is not None
-                                else None,
+                                (
+                                    swa_cache_loc.view_as(cache_loc_2d)
+                                    if swa_cache_loc is not None
+                                    else None
+                                ),
                             ),
                             physical=True,
                         ),
@@ -2639,9 +2658,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                         window_locs=layer_window_locs(
                             token_to_kv_pool,
                             attn.layer_id,
-                            ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
-                            if ctx_swa_cache_loc is not None
-                            else None,
+                            (
+                                ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
+                                if ctx_swa_cache_loc is not None
+                                else None
+                            ),
                         ),
                         physical=True,
                     ),

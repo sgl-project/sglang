@@ -163,6 +163,23 @@ def resolve_draft_params(
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 
 
+def resolve_greedy_rows_by_slot(
+    table: SamplingParamsTable,
+    slots: torch.Tensor,
+    *,
+    force_greedy: torch.Tensor,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+) -> None:
+    """The batch's clamped temperatures and greedy rows, read from its slots of the
+    sampling table so a graph captures it; ``force_greedy`` ([1] bool) stands for
+    no sampling info."""
+    torch.clamp(table.temperatures(slots), min=1e-5, out=temperatures)
+    temperatures.masked_fill_(force_greedy, 1.0)
+    torch.le(table.top_ks(slots), 1, out=greedy_mask)
+    greedy_mask.logical_or_(force_greedy)
+
+
 def resolve_draft_params_by_slot(
     table: SamplingParamsTable,
     slots: torch.Tensor,
@@ -170,15 +187,17 @@ def resolve_draft_params_by_slot(
     force_greedy: torch.Tensor,
     out: DraftParams,
 ) -> None:
-    """`resolve_draft_params` read from the batch's slots of the sampling table, so
-    a graph captures it; ``force_greedy`` ([1] bool) stands for no sampling info."""
+    """`resolve_draft_params` read from the batch's slots of the sampling table."""
     temperatures, greedy_mask, step_temperatures = (
         buf[: slots.shape[0]] for buf in out
     )
-    torch.clamp(table.temperatures(slots), min=1e-5, out=temperatures)
-    temperatures.masked_fill_(force_greedy, 1.0)
-    torch.le(table.top_ks(slots), 1, out=greedy_mask)
-    greedy_mask.logical_or_(force_greedy)
+    resolve_greedy_rows_by_slot(
+        table,
+        slots,
+        force_greedy=force_greedy,
+        temperatures=temperatures,
+        greedy_mask=greedy_mask,
+    )
     torch.where(
         greedy_mask, _zero(temperatures.device), temperatures, out=step_temperatures
     )
