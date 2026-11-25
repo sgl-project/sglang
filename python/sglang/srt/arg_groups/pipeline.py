@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
+from sglang.srt.environ import validate_env_values
 
 
 def run_resolution_pipeline(server_args: Any) -> None:
@@ -27,6 +28,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.kernel_plugins.nvidia.kimi_k31_gb_runtime_optimization import (
         apply_k31_gb_runtime_optimization,
     )
+
+    validate_env_values()
 
     # Before any step reads the environment; spawned processes inherit it.
     apply_k31_gb_runtime_optimization()
