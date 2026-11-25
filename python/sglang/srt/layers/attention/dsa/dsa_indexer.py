@@ -314,6 +314,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_MAX_BYTES_ROCM = MQA_LOGITS_MAX_BYTES_ROCM
     # Index-K bytes per token: 128 FP8 values and one FP32 scale.
     _HEAD_DIM_WITH_SF = 132
+    _PROJECT_VERIFY_QUERY_ON_MAIN_STREAM = False
     # ROCm (AITER) parts, set by dsa_indexer_hip.init_indexer_hip
     _hist_topk = None
     fp4_index_k = False
@@ -1299,7 +1300,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q = q[:num_tokens]
             return self._fused_q_quant(q, weights_raw, positions)
 
-        # Two overlap stages: wq_b GEMM (alt) || wk_weights_proj GEMM (current),
+        # Normally two overlap stages: wq_b GEMM (alt) || wk_weights_proj GEMM (current),
         # then fused Q kernel (current) || fused K kernel + cache store (alt).
         # wait_stream calls are ordered by issue position so each side waits only
         # on the GEMMs it consumes, not on the other side's fused kernel.
@@ -1311,8 +1312,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key = key[:num_tokens]
             weights_raw = weights_raw[:num_tokens]
 
-        # Issued after the main GEMM so the join stays on the main lane at graph replay.
-        with torch.cuda.stream(self.alt_stream):
+        # FP4 scoring packs the original BF16 Q later on the current stream.
+        q_stream = (
+            current_stream
+            if self._PROJECT_VERIFY_QUERY_ON_MAIN_STREAM
+            and forward_batch.forward_mode.is_target_verify()
+            and get_is_capture_mode()
+            else self.alt_stream
+        )
+        with torch.cuda.stream(q_stream):
             q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
             if num_tokens is not None:
                 q = q[:num_tokens]
