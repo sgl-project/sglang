@@ -468,6 +468,7 @@ class NpuEplbRuntime:
                             self.ranks_per_node,
                             self.layer_ids,
                             source_totals=host_sources,
+                            narrowed_layers=self._narrowed_layers,
                             current_replicas=(
                                 self.metadata.logical_to_all_physical_map_cpu[
                                     :, :, : self._replica_width
@@ -653,6 +654,7 @@ class NpuEplbRuntime:
         _install_routing_layer(
             self.metadata, routing.host_rows[layer], layer, routing.device_rows
         )
+        self._narrowed_layers.discard(layer)
         if layer == routing.last_layer:
             self._routing_plan = None
         self.install_enqueue_seconds += time.perf_counter() - start
@@ -685,7 +687,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
     groups = common["model_config_for_expert_location"].num_groups
     moe = get_exec().moe
     algorithm = compute_algorithm(moe.eplb_algorithm, groups, parallel.nnodes)
-    order_submissions = get_disagg().disaggregation_mode == "decode"
+    decode_worker = get_disagg().disaggregation_mode == "decode"
     if algorithm.name.startswith("elasticity"):
         raise ValueError("Async EPLB requires a non-elastic CPU placement algorithm")
     physical_count_mode = None
@@ -696,6 +698,17 @@ def create_npu_async_eplb(model_config, weights, metadata):
             physical_count_mode = "row" if moe.moe_a2a_backend == "none" else "random"
     elif parallel.nnodes > 1 and moe.moe_a2a_backend != "none":
         physical_count_mode = "unique"
+    # AllGather moves the same rows regardless of expert placement. A unified
+    # recorder window can include both AllGather prefill and routed decode.
+    score_locality = True
+    if (
+        parallel.nnodes > 1
+        and moe.moe_a2a_backend == "ascend_ops"
+        and not decode_worker
+    ):
+        from sglang.srt.layers.moe import get_moe_ascend_ops_config
+
+        score_locality = get_moe_ascend_ops_config().prefill != "allgather"
     spec = PlanningSpec(
         metadata.num_physical_experts,
         metadata.num_local_physical_experts,
@@ -703,13 +716,14 @@ def create_npu_async_eplb(model_config, weights, metadata):
         parallel.nnodes,
         algorithm,
         physical_count_mode=physical_count_mode,
+        score_locality=score_locality,
     )
     # Fixed PP=1 TP=EP=WORLD: group construction order is identical on all ranks.
     timeout = timedelta(seconds=90)
     control_group = dist.new_group(backend="gloo", timeout=timeout)
     plan_group = dist.new_group(backend="gloo", timeout=timeout)
     error = None
-    signature = None
+    setup = None
     try:
         p2p_options = eplb_hccl_options()
         p2p_buffer_mib = p2p_options.hccl_config["hccl_buffer_size"]
@@ -723,7 +737,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             world_size // parallel.nnodes,
             plan_group,
             parallel.world_group.device_group,
-            order_submissions=order_submissions,
+            order_submissions=decode_worker,
             use_prefill_admission=(
                 borrow_world_group
                 and not get_schedule().disable_overlap_schedule
@@ -739,7 +753,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             runtime.layer_ids,
             runtime.weight_format_digest,
             borrow_world_group,
-            order_submissions,
+            decode_worker,
             runtime.use_prefill_admission,
             runtime._p2p_batch_size,
             p2p_buffer_mib,
@@ -753,17 +767,33 @@ def create_npu_async_eplb(model_config, weights, metadata):
             moe.ep_dispatch_algorithm,
             hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
         )
+        # init_by_mapping can narrow only a non-root rank's replica choices.
+        # Include those layers in the existing startup exchange. Once a layer
+        # is installed all ranks use the solver's complete replica table.
+        narrowed = []
+        if spec.physical_count_mode == "random":
+            replicas = metadata.logical_to_all_physical_map_cpu[
+                :, :, : runtime._replica_width
+            ]
+            narrowed = (
+                ((replicas >= 0).sum(dim=(1, 2)) < spec.physical_experts)
+                .nonzero()
+                .flatten()
+                .tolist()
+            )
+        setup = (signature, narrowed)
     except Exception as exc:
         error = exc
-    signatures = [None] * world_size
-    dist.all_gather_object(signatures, signature, group=control_group)
-    if None in signatures:
+    peers = [None] * world_size
+    dist.all_gather_object(peers, setup, group=control_group)
+    if None in peers:
         raise RuntimeError("Async EPLB setup failed on at least one rank") from error
-    if any(s != signature for s in signatures):
+    if any(s != signature for s, _ in peers):
         raise ValueError(
             "Async EPLB ranks disagree on transport, placement, expert weight format, "
             "batching, scheduling or recorder configuration"
         )
+    runtime._narrowed_layers = {layer for _, layers in peers for layer in layers}
     # All ranks must agree before any enters a conditional HCCL group creation.
     if not borrow_world_group:
         runtime.p2p_group = dist.new_group(

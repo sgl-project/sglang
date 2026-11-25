@@ -38,12 +38,17 @@ class PlanningSpec:
     nodes: int
     algorithm: EplbAlgorithm
     physical_count_mode: Literal["row", "random", "static", "unique"] | None = None
+    score_locality: bool = True
 
     @property
     def source_groups(self) -> int:
         if self.physical_count_mode == "static":
             return self.physical_experts // self.local_experts
-        if self.physical_count_mode in ("random", "unique") and self.nodes > 1:
+        if (
+            self.score_locality
+            and self.physical_count_mode in ("random", "unique")
+            and self.nodes > 1
+        ):
             return self.nodes
         return 0
 
@@ -70,9 +75,11 @@ def plan_migration(
     *,
     current_replicas: torch.Tensor | None = None,
     source_totals: torch.Tensor | None = None,
+    narrowed_layers: frozenset[int] | set[int] = frozenset(),
 ) -> MigrationPlacement | None:
     """Plan on the root rank using measured slot loads for replicated experts."""
     physical_counts = None
+    observed_peaks = None
     if spec.physical_count_mode is not None:
         from sglang.srt.eplb.expert_distribution import (
             _convert_global_physical_count_to_logical_count,
@@ -80,6 +87,21 @@ def plan_migration(
 
         assert current_replicas is not None
         physical_counts = counts.numpy()
+        if spec.physical_count_mode != "row":
+            # Use the measured rank loads, including any source-local replica picks.
+            steps, layers, _ = physical_counts.shape
+            rank_load = physical_counts.reshape(
+                steps, layers, -1, spec.local_experts
+            ).sum(axis=3)
+            observed_peaks = rank_load.max(axis=2)
+            if spec.nodes == 1:
+                # No placement can lower a step's peak below its average rank load.
+                mass = rank_load.sum(axis=(0, 2))
+                headroom = observed_peaks.sum(axis=0) * rank_load.shape[2] - mass
+                layer_ids = tuple(i for i in layer_ids if headroom[i] > 0.01 * mass[i])
+                if not layer_ids:
+                    return None
+            del rank_load
         counts = _convert_global_physical_count_to_logical_count(
             counts, current.size(0), current_replicas.size(1), current
         )
@@ -91,16 +113,6 @@ def plan_migration(
     # ranks. Keep the base planner's rank assignments for static dispatch.
     replicated_static = spec.physical_count_mode == "static"
     score_steps = spec.nodes == 1 and not replicated_static
-    # Initial A2A routing prefers local replicas. Preserve the busiest rank's
-    # observed load at each step as the baseline for every candidate.
-    observed_peaks = None
-    if spec.physical_count_mode in ("random", "static", "unique"):
-        steps, layers, _ = physical_counts.shape
-        observed_peaks = (
-            physical_counts.reshape(steps, layers, -1, spec.local_experts)
-            .sum(axis=3)
-            .max(axis=2)
-        )
     fallbacks = {}
     if score_steps and replicated:
         base_physical, base_logical = physical, logical
@@ -136,13 +148,9 @@ def plan_migration(
     changed = layer_ids
     if spec.physical_count_mode != "row":
         moved = (physical != current).any(dim=1).tolist()
-        changed = tuple(i for i in layer_ids if moved[i] or i in fallbacks)
-    if changed and spec.nodes == 1 and observed_peaks is not None:
-        # The maximum rank load cannot beat the per-step average.
-        totals = counts.numpy().sum(axis=2)
-        ranks = spec.physical_experts // spec.local_experts
-        headroom = (observed_peaks * ranks - totals).sum(axis=0)
-        changed = tuple(i for i in changed if headroom[i] > 0.01 * totals[:, i].sum())
+        changed = tuple(
+            i for i in layer_ids if moved[i] or i in fallbacks or i in narrowed_layers
+        )
     if changed and replicated_static:
         from sglang.srt.eplb.expert_location import (
             compute_logical_to_rank_dispatch_physical_map,
@@ -162,7 +170,7 @@ def plan_migration(
                     inverse.numpy(),
                     spec.local_experts,
                 )
-            if torch.equal(target, current[layer]):
+            if layer not in narrowed_layers and torch.equal(target, current[layer]):
                 return 0.0
             return _a2a_migration_gain(
                 counts[:, layer].numpy(),
@@ -174,6 +182,7 @@ def plan_migration(
                 ranks_per_node,
                 static_dispatch[layer].numpy() if static_dispatch is not None else None,
                 source_totals[:, layer].numpy() if source_totals is not None else None,
+                score_locality=spec.score_locality,
             )
 
         known_gains = _admit_dispatch_layers(
@@ -676,6 +685,8 @@ def _a2a_migration_gain(
     ranks_per_node,
     dispatch,
     sources,
+    *,
+    score_locality=True,
 ):
     ranks = slots.shape[1] // local_experts
     slot_ranks = np.arange(len(live)) // local_experts
@@ -690,13 +701,14 @@ def _a2a_migration_gain(
                 .sum(2)
                 .max(1)
             )
-            source_nodes = np.arange(len(sources))
         else:
             destinations = dispatch[live].T // local_experts
             peak = _static_rank_peak_bound(slots, destinations, sources, ranks)
-            source_nodes = np.arange(ranks) // ranks_per_node
         tail_peak = peak
-        if ranks > ranks_per_node:
+        if score_locality and ranks > ranks_per_node:
+            source_nodes = np.arange(len(sources))
+            if dispatch is not None:
+                source_nodes //= ranks_per_node
             remote_saved = (
                 sources[source_nodes[:, None] != slot_ranks // ranks_per_node].sum()
                 - sources[source_nodes[:, None] != destinations // ranks_per_node].sum()
@@ -713,7 +725,7 @@ def _a2a_migration_gain(
             draws / 65536,
         )
         peak, tail_peak = _random_rank_peak_bounds(samples, probability)
-        if ranks > ranks_per_node:
+        if score_locality and ranks > ranks_per_node:
             nodes = ranks // ranks_per_node
             local_probability = probability.reshape(
                 len(inverse), nodes, ranks_per_node
@@ -739,7 +751,8 @@ def _peak_gain(
     # Require a saving of 1% of an ideally balanced rank's recorded tokens.
     if gain < 0 or (gain <= 0.01 * totals.sum() / ranks and remote_saved <= 0):
         return 0.0
-    # A move can help large batches but overload small ones, even without replicas.
+    # Compare the busiest rank's share of each step. With mixed batch sizes
+    # this percentile differs from the P95 of absolute assignment counts.
     active = totals > 0
     tail = int(np.ceil(0.95 * active.sum())) - 1
     if tail_peak is None:
