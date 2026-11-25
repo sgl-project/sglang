@@ -309,9 +309,8 @@ def fused_decode_sconv_metadata(
     B: int, cache_indices: torch.Tensor, out: SconvMetadataOut | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, SconvDecodeMetadata]:
     """Single-launch replacement for the decode metadata prep: the two arange calls,
-    ones, `!= PAD`, `&`, `clamp` and `.long()` that
-    ``precompute_helion_decode_metadata`` (+ its callers) issued as ~7 tiny
-    elementwise kernels. Returns
+    ones, `!= PAD`, `&`, `clamp` and `.long()` that the unfused prep issued as ~7
+    tiny elementwise kernels. Returns
     ``(query_start_loc, has_initial_state, SconvDecodeMetadata)`` with tensors
     bit-identical to the unfused path. Pass ``out`` to write into preallocated
     (e.g. cuda-graph-static) destinations instead of fresh allocations.
@@ -341,28 +340,6 @@ def fused_decode_sconv_metadata(
         query_start_loc,
         has_initial_state,
         SconvDecodeMetadata(cache_mask=cache_mask, safe_idx=safe_idx, cu=cu, si=si),
-    )
-
-
-def precompute_helion_decode_metadata(
-    B: int,
-    W: int,
-    cache_indices: torch.Tensor,
-    has_initial_state: torch.Tensor,
-) -> SconvDecodeMetadata:
-    """Precompute metadata for the helion decode path. Call once, reuse across layers."""
-    device = cache_indices.device
-    valid = cache_indices != PAD_SLOT_ID
-    cache_mask = (has_initial_state & valid)[:, None, None]  # [B, 1, 1]
-    safe_idx = cache_indices.clamp(min=0).long()
-    # Each sequence has exactly 1 token in the packed [1, B, D] layout
-    cu = torch.arange(B + 1, dtype=torch.int64, device=device)
-    si = torch.arange(B, dtype=torch.int32, device=device)
-    return SconvDecodeMetadata(
-        cache_mask=cache_mask,
-        safe_idx=safe_idx,
-        cu=cu,
-        si=si,
     )
 
 
@@ -541,8 +518,6 @@ def precompute_helion_extend_metadata(
     query_start_loc: torch.Tensor,
 ) -> SconvExtendMetadata:
     """Precompute metadata for the helion extend path. Call once, reuse across layers."""
-    device = cache_indices.device
-
     valid = cache_indices != PAD_SLOT_ID
     cache_mask = (has_initial_state & valid)[:, None, None]  # [B, 1, 1]
     safe_idx = cache_indices.clamp(min=0).long()
