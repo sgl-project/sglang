@@ -30,10 +30,6 @@ logger = init_logger(__name__)
 FLUX_SPECTRUM_A: float = 203.615097
 FLUX_SPECTRUM_BETA: float = 1.915461
 
-# Module-level aliases for test discoverability and external reuse.
-_flux_unpack = unpack_2x2_latent
-_flux_pack = pack_2x2_latent
-
 
 class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
     """FLUX-specific progressive denoising stage.
@@ -41,7 +37,6 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
     Handles:
     - FLUX patchify pack/unpack
     - freqs_cis (RoPE image position embeddings) update on resolution change
-    - img_ids cache keyed on (h_lat, w_lat) to avoid redundant computation
     """
 
     def __init__(self, transformer, scheduler, pipeline=None, vae=None) -> None:
@@ -53,11 +48,6 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
             spectrum_A=FLUX_SPECTRUM_A,
             spectrum_beta=FLUX_SPECTRUM_BETA,
         )
-        # Cache freqs_cis per latent resolution (h_lat, w_lat) to avoid
-        # redundant rotary embedding recomputation between requests.
-        self._freqs_cis_cache: dict[
-            tuple[int, int], tuple[torch.Tensor, torch.Tensor]
-        ] = {}
 
     # ------------------------------------------------------------------
     # Pack / Unpack overrides
@@ -104,18 +94,13 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
         )
         new_h_lat = new_h_pixel // vae_scale_factor
         new_w_lat = new_w_pixel // vae_scale_factor
-        key = (new_h_lat, new_w_lat)
 
-        if key not in self._freqs_cis_cache:
-            new_pos_kwargs = self._prepare_resolution_pos_cond_kwargs(
-                ctx, batch, server_args
-            )
-            freqs_cis = new_pos_kwargs.get("freqs_cis")
-            if freqs_cis is not None:
-                self._freqs_cis_cache[key] = freqs_cis
-
-        cached = self._freqs_cis_cache.get(key)
-        if cached is None:
+        # The table has one row per text token as well as per image token, so it
+        # is specific to the request, not to the latent size.
+        freqs_cis = self._prepare_resolution_pos_cond_kwargs(
+            ctx, batch, server_args
+        ).get("freqs_cis")
+        if freqs_cis is None:
             logger.warning(
                 "freqs_cis not available for %dx%d latent; skipping update",
                 new_h_lat,
@@ -123,7 +108,7 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
             )
             return
 
-        self._update_cfg_branch_kwargs(ctx, {"freqs_cis": cached})
+        self._update_cfg_branch_kwargs(ctx, {"freqs_cis": freqs_cis})
 
         logger.info(
             "Updated freqs_cis for %dx%d latent (pixel %dx%d) across %d branch(es)",

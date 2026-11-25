@@ -26,8 +26,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -56,6 +57,7 @@ class GDNAttentionCase:
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
     linear_attn_prefill_backend: str | None = None
+    linear_attn_verify_backend: str | None = None
     mis_delimiter_indices: tuple[tuple[int, ...], ...] = ()
     conv_history_weight: float = 0.0
 
@@ -259,6 +261,7 @@ class MockGDNModelRunner(ModelRunner):
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
             linear_attn_prefill_backend=case.linear_attn_prefill_backend,
+            linear_attn_verify_backend=case.linear_attn_verify_backend,
             max_running_requests=None,
             revision=None,
             speculative_algorithm=None,
@@ -325,6 +328,7 @@ class MockGDNModelRunner(ModelRunner):
             get_kvcache=lambda: self.token_to_kv_pool,
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
         self.is_draft_worker = False
         self.init_runner_ids()

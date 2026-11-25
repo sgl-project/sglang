@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology
 
-register_amd_ci(est_time=60, stage="stage-c", runner_config="large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-c", runner_config="large-8-gpu-amd-mi35x")
 pytestmark = pytest.mark.skipif(
     not is_hip() or "LOCAL_RANK" not in os.environ,
     reason="run through the four-GPU entry point",
@@ -175,7 +175,7 @@ def _replay_fused_and_unfused(group, run, check, *, residual, pre):
     "rows,verify", [(1, False), (8, True)], ids=["decode", "verify"]
 )
 def test_model_handoff_and_graph_replay(group, rows, verify):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.models.deepseek_v4_platform_stage import (
         forward_hc_pre_from_prev_fused_boundary,
     )
@@ -264,7 +264,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
 )
 def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
     from sglang.srt.layers.moe import MoeA2ABackend
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.models.deepseek_v4 import (
         DeepseekV4DecoderLayer,
         DeepseekV4PlatformDecoderLayer,

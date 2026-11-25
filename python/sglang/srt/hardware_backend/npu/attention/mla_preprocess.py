@@ -82,6 +82,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         qk_rope_head_dim,
         v_head_dim,
         quant_config: Optional["QuantizationConfig"] = None,
+        kv_quant_scheme=None,
     ):
         super().__init__()
         self.qkv_a_proj = fused_qkv_a_proj_with_mqa
@@ -92,6 +93,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.rotary_emb = rotary_emb
         self.layer_id = layer_id
         self.quant_config = quant_config
+        self.kv_quant_scheme = kv_quant_scheme
         self.has_preprocess_weights = False
         self.dtype = None
 
@@ -483,6 +485,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         return (q_pe, k_rope, q_nope, k_nope, forward_batch, zero_allocator, positions)
 
     def forward_mlapo(self, positions, hidden_states, forward_batch, zero_allocator):
+        # Imported lazily so this module stays importable on CPU-only hosts.
+        from sgl_kernel_npu.operators.attention import mla_preprocess
+
         input_dtype = hidden_states.dtype
         if not self.has_preprocess_weights:
             self.preprocess_weights(hidden_states)
@@ -523,7 +528,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         else:
             q_a_layernorm_bias = self.dummy
 
-        torch.ops.npu.mla_preprocess(
+        mla_preprocess(
             hidden_states,
             self.dummy,
             self.dummy,
@@ -654,6 +659,13 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             mla_prolog_input_args.update(
                 ckvkr_repo_mode=1, quant_scale_repo_mode=1, tile_size=128
             )
+        if self.kv_quant_scheme is not None:
+            mla_prolog_input_args.update(
+                kv_cache_quant_mode=1,
+                query_quant_mode=1,
+                quant_scale_ckv=self.kv_quant_scheme.k_inv_scale.view(1),
+                query_norm_flag=False,
+            )
         import torch_npu
 
         mlaprolog = self.no_rope_mlaprolog or torch_npu.npu_mla_prolog_v3
@@ -678,6 +690,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             forward_batch,
             positions,
             dequant_q_norm,
+            dequant_scale_q_nope,
         )
 
     def uses_mlaprolog(self) -> bool:
@@ -703,7 +716,15 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             )
         )
 
-    def forward(self, positions, hidden_states, forward_batch, zero_allocator):
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        zero_allocator,
+        *,
+        return_q_descale=False,
+    ):
         # assert self.quant_config and self.quant_config.get_name() == "modelslim"
         # route by `qkv_a_proj` quant type as MTP layers can be unquantized
         _is_w8a8 = (
@@ -713,13 +734,17 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
         # with the mlaprolog enabled, the kv_b_proj layers are unquantized
         _is_mlaprolog = self.uses_mlaprolog()
+        q_descale = None
         if _is_w8a8 and not _is_mlaprolog:
-            return self.forward_mlapo(
+            result = self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif _is_mlaprolog:
-            return self.forward_mlaprolog(positions, hidden_states, forward_batch)
+            result = self.forward_mlaprolog(positions, hidden_states, forward_batch)
+            result, q_descale = result[:-1], result[-1]
         else:
-            return self.forward_absorb_prepare_npu_rms_norm_cache(
+            result = self.forward_absorb_prepare_npu_rms_norm_cache(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+        # Existing callers keep the original 7/8-item result.
+        return (result, q_descale) if return_q_descale else result

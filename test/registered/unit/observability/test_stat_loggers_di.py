@@ -26,10 +26,11 @@ from unittest.mock import MagicMock, patch
 import prometheus_client
 
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import (
@@ -225,6 +226,24 @@ class TestHiCacheMetrics(unittest.TestCase):
             [({**labels, "reason": "device_capacity"}, 7)],
         )
 
+    def test_backup_storage_duration_metrics(self):
+        # _drain_backup reads operation.enqueue_time on every L2->L3 ack; a
+        # StorageOperation without the field (renamed or dropped) would crash
+        # the scheduler drain path instead of merely missing one sample.
+        from sglang.srt.managers.cache_controller import StorageOperation
+
+        operation = StorageOperation(host_indices=None, token_ids=[1, 2, 3])
+        self.assertIsInstance(operation.enqueue_time, float)
+        self.assertGreater(operation.enqueue_time, 0)
+
+        labels = {"model_name": "test"}
+        collector = _RecordingStorageMetricsCollector(labels=labels)
+        collector.observe_backup_storage_duration(0.5)
+        self.assertEqual(
+            collector.backup_storage_duration_seconds.observations,
+            [(labels, 0.5)],
+        )
+
 
 class TestDeferredKVReleaseMetrics(CustomTestCase):
     def setUp(self):
@@ -280,18 +299,22 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             disaggregation_mode=DisaggregationMode.DECODE,
             disagg_decode_transfer_queue=queue,
             disagg_decode_prealloc_queue=SimpleNamespace(
-                queue=[], pre_allocated_token_counts=lambda: (0, 0)
+                queue=[],
+                num_tokens_pending_prealloc=0,
+                pre_allocated_token_counts=lambda windows: (0, {}),
             ),
+            max_total_num_tokens=1,
             running_batch=SimpleNamespace(reqs=[]),
-            waiting_queue=[],
-            grammar_manager=[],
+            request_lists=lambda: {kind: [] for kind in ListKind},
             enable_fpm=False,
             enable_priority_scheduling=False,
+            kv_events_publisher=SimpleNamespace(emit_kv_metrics=MagicMock()),
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(
                     update_scheduler_stats=lambda stats: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
+                    target_window_stats=lambda: None,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -362,11 +385,12 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 queue=[],
                 retracted_queue=[],
                 num_tokens_pre_allocated=0,
-                pre_allocated_token_counts=lambda: (0, 0),
+                num_tokens_pending_prealloc=0,
+                pre_allocated_token_counts=lambda windows: (0, {}),
             ),
             running_batch=batch,
             waiting_queue=[],
-            grammar_manager=[],
+            request_lists=lambda: {kind: [] for kind in ListKind},
             enable_priority_scheduling=False,
             max_total_num_tokens=1,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
@@ -375,7 +399,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                     get_decode_usage_msg_parts=lambda: [],
                     update_scheduler_stats=lambda stats: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
+                    target_window_stats=lambda: None,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -498,12 +523,14 @@ class TestHiCacheHostMambaStats(CustomTestCase):
     def _reporter(self, entry_map):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         tree_cache = MagicMock(spec=UnifiedRadixCache)
-        tree_cache.token_to_kv_pool_host = SimpleNamespace(
+        tree_cache.full_kv_pool_host = SimpleNamespace(
             logical_size=1000, available_size=lambda: 400
         )
         tree_cache.host_pool_group = SimpleNamespace(entry_map=entry_map)
         reporter.scheduler = SimpleNamespace(
-            enable_hierarchical_cache=True, tree_cache=tree_cache
+            enable_hierarchical_cache=True,
+            tree_cache=tree_cache,
+            kv_events_publisher=SimpleNamespace(emit_kv_metrics=MagicMock()),
         )
         reporter.stats = SchedulerStats()
         return reporter
@@ -568,13 +595,12 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         reporter = self._reporter(
             {PoolName.MAMBA: SimpleNamespace(host_pool=mamba_pool)}
         )
-        reporter.scheduler.tree_cache.token_to_kv_pool_host = SimpleNamespace(
+        reporter.scheduler.tree_cache.full_kv_pool_host = SimpleNamespace(
             logical_size=1000, available_size=lambda: 1000
         )
         reporter.scheduler.disaggregation_mode = DisaggregationMode.NULL
         reporter.scheduler.running_batch = SimpleNamespace(reqs=[])
-        reporter.scheduler.waiting_queue = []
-        reporter.scheduler.grammar_manager = []
+        reporter.scheduler.request_lists = lambda: {kind: [] for kind in ListKind}
         reporter.scheduler.enable_fpm = False
         reporter.scheduler.enable_priority_scheduling = False
         reporter.scheduler.pool_stats_observer = SimpleNamespace(

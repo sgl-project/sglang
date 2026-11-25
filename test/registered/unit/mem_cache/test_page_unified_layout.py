@@ -237,6 +237,66 @@ class TestUnifiedKeyGrid(CustomTestCase):
                         _plan(**shard, attn_cp_size=1),
                     )
 
+    def test_chunk_spans_address_each_suffixs_slice(self):
+        """A per-chunk backend stores page base + offset under each suffix.
+
+        So each span must be exactly the bytes of its (layer range, head group)
+        slice of the page block, ragged tail included, or a chunk is stored
+        under its neighbour's key.
+        """
+        cases = {
+            "mha": (
+                _plan(
+                    local_kv_heads=4,
+                    attn_tp_rank=1,
+                    attn_tp_size=2,
+                    head_group=2,
+                    layer_partition=30,
+                    end_layer=61,
+                ),
+                _mha(layer_num=61, head_group_num=2),
+            ),
+            "mla": (
+                _plan(
+                    rank_replicated=True,
+                    local_kv_heads=0,
+                    attn_tp_rank=1,
+                    attn_tp_size=2,
+                    layer_partition=30,
+                    end_layer=61,
+                ),
+                PageUnifiedLayout(
+                    page_size=4,
+                    layer_num=61,
+                    head_num=1,
+                    head_group_num=1,
+                    head_dim=16,
+                    itemsize=2,
+                    is_mla=True,
+                ),
+            ),
+        }
+        for name, (plan, layout) in cases.items():
+            with self.subTest(name):
+                page = torch.empty(layout.page_dims(2), dtype=torch.bfloat16)[1]
+                spans = plan.chunk_spans(layout)
+                self.assertEqual(len(spans), len(plan.suffixes))
+                chunks = [
+                    (layer_range, group)
+                    for layer_range in plan.layer_ranges
+                    for group in range(plan.head_group_num)
+                ]
+                for ((start, end), group), (offset, length) in zip(chunks, spans):
+                    view = page[start:end] if layout.is_mla else page[group, start:end]
+                    self.assertTrue(view.is_contiguous())
+                    self.assertEqual(view.data_ptr() - page.data_ptr(), offset)
+                    self.assertEqual(view.nbytes, length)
+
+    def test_chunk_spans_refuse_a_pool_cut_differently(self):
+        plan = _plan(local_kv_heads=4, attn_tp_rank=0, attn_tp_size=2, head_group=2)
+        with self.assertRaisesRegex(ValueError, "head groups"):
+            plan.chunk_spans(_mha(layer_num=80, head_group_num=1))
+
 
 class TestNamespaceIdentity(CustomTestCase):
     def test_identity_fields_partition_the_keyspace(self):

@@ -23,7 +23,7 @@ from sglang.multimodal_gen.configs.models.vaes.wanvae import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import HunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import _try_save_cuda_video_direct
 from sglang.multimodal_gen.runtime.models.vaes.hunyuanvae import (
     AutoencoderKLHunyuanVideo,

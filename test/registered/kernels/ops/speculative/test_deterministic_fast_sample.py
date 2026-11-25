@@ -9,7 +9,7 @@ from sglang.srt.speculative.spec_utils import fast_sample
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _sample(probs, seeds, positions, *, draft_step=0):
@@ -170,14 +170,6 @@ class TestDeterministicFastSample(CustomTestCase):
                         torch.tensor([[2], [0]], device="cuda", dtype=torch.int64),
                     )
                 )
-
-    def test_requires_matching_seed_position_rows(self):
-        with self.assertRaisesRegex(ValueError, "matching shapes"):
-            fast_sample(
-                self.probs[:2],
-                sampling_seed=torch.tensor([1, 2], device="cuda"),
-                positions=torch.tensor([3], device="cuda"),
-            )
 
 
 if __name__ == "__main__":

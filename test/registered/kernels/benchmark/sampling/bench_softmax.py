@@ -2,13 +2,14 @@ from importlib.util import find_spec
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
 )
 
 
@@ -37,7 +38,7 @@ FN_MAP = {"jit": jit_softmax, "torch": torch_softmax, "cake": cake_softmax}
 # fp32 logits with one temperature per row: what `Sampler.forward` hands the softmax
 @marker.parametrize("vocab_size", [32000, 129280, 163840, 201088, 262144], [163840])
 @marker.parametrize("batch_size", [2**n for n in range(0, 13)], [1, 64, 1024])
-@marker.benchmark("impl", ["jit", "cake", "torch"])
+@marker.benchmark("impl", ["jit", "cake", "torch"], gate=["jit"])
 def benchmark(vocab_size: int, batch_size: int, impl: str):
     logits = create_random(batch_size, vocab_size, dtype=torch.float32)
     temperatures = torch.linspace(0.5, 1.5, batch_size, device=logits.device)
@@ -45,7 +46,7 @@ def benchmark(vocab_size: int, batch_size: int, impl: str):
 
 
 if __name__ == "__main__":
-    if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+    if is_hip_runtime() or not current_arch().is_sm(10):
         print("The JIT softmax requires an SM100-family CUDA GPU. Skipping.")
     else:
         benchmark.run()

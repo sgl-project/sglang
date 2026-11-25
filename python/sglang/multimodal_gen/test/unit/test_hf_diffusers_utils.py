@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     _check_index_files_for_missing_shards,
     _is_revisionless_snapshot_root,
     _verify_diffusers_model_complete,
+    external_component_path,
     maybe_download_model,
 )
 from sglang.srt.environ import envs
@@ -24,7 +25,7 @@ def test_component_override_resolves_hub_subfolder_before_loading(tmp_path):
     repo_root = tmp_path / "FLUX.1-dev-bnb-4bit"
     component_root = repo_root / "text_encoder_2"
     component_root.mkdir(parents=True)
-    pipeline = SimpleNamespace(model_path="/base")
+    pipeline = SimpleNamespace(model_path="/base", _external_component_paths={})
     server_args = SimpleNamespace(
         component_paths={
             "text_encoder_2": "diffusers/FLUX.1-dev-bnb-4bit/text_encoder_2"
@@ -47,6 +48,116 @@ def test_component_override_resolves_hub_subfolder_before_loading(tmp_path):
         "diffusers/FLUX.1-dev-bnb-4bit",
         allow_patterns=["text_encoder_2/**", "text_encoder_2/*"],
     )
+
+
+def _h3_text_encoder_spec(**source):
+    return [
+        "transformers",
+        "Qwen3VLForConditionalGeneration",
+        {
+            "type_hint": ["transformers", "Qwen3VLForConditionalGeneration"],
+            "pretrained_model_name_or_path": "MiniMaxAI/MiniMax-H3",
+            "subfolder": "text_encoder",
+            "variant": None,
+            "revision": None,
+            **source,
+        },
+    ]
+
+
+def test_model_index_component_from_another_repo_is_not_a_local_directory(
+    tmp_path,
+):
+    (tmp_path / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "MiniMaxH3ImagePipeline",
+                "_diffusers_version": "0.37.0",
+                "text_encoder": _h3_text_encoder_spec(),
+                "transformer": ["diffusers", "MiniMaxH3DiTModel"],
+            }
+        )
+    )
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "transformer" / "model.safetensors").write_bytes(b"weights")
+
+    config = hf_diffusers_utils.verify_model_config_and_directory(str(tmp_path))
+
+    assert _verify_diffusers_model_complete(str(tmp_path))
+    assert (
+        external_component_path("text_encoder", config["text_encoder"])
+        == "MiniMaxAI/MiniMax-H3/text_encoder"
+    )
+    assert external_component_path("transformer", config["transformer"]) is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {"variant": "fp16"},
+        {"revision": "main"},
+        {"type_hint": ["transformers", "T5EncoderModel"]},
+        {"subfolder": ""},
+        {"device": "cpu"},
+    ],
+)
+def test_model_index_rejects_unsupported_component_sources(source):
+    with pytest.raises(ValueError, match="text_encoder"):
+        external_component_path("text_encoder", _h3_text_encoder_spec(**source))
+
+
+def test_external_component_loads_from_its_repository(tmp_path):
+    h3_root = tmp_path / "MiniMax-H3"
+    (h3_root / "text_encoder").mkdir(parents=True)
+    release = tmp_path / "release"
+    release.mkdir()
+    pipeline = SimpleNamespace(
+        model_path=str(release),
+        _external_component_paths={"text_encoder": "MiniMaxAI/MiniMax-H3/text_encoder"},
+    )
+    resolve = ComposedPipelineBase._resolve_component_path
+
+    with patch(
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model",
+        return_value=str(h3_root),
+    ) as download:
+        path = resolve(
+            pipeline,
+            SimpleNamespace(component_paths={}),
+            "text_encoder",
+            "text_encoder",
+        )
+    assert path == str(h3_root / "text_encoder")
+    download.assert_called_once_with(
+        "MiniMaxAI/MiniMax-H3",
+        allow_patterns=["text_encoder/**", "text_encoder/*"],
+    )
+
+    # An explicit --component-paths override takes precedence.
+    local = str(h3_root / "text_encoder")
+    assert (
+        resolve(
+            pipeline,
+            SimpleNamespace(component_paths={"text_encoder": local}),
+            "text_encoder",
+            "text_encoder",
+        )
+        == local
+    )
+
+    # A release that bundles its own copy loads it without another download.
+    (release / "text_encoder").mkdir()
+    with patch(
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model",
+    ) as download:
+        path = resolve(
+            pipeline,
+            SimpleNamespace(component_paths={}),
+            "text_encoder",
+            "text_encoder",
+        )
+    assert path == str(release / "text_encoder")
+    download.assert_not_called()
 
 
 def _write_model_index(root):
@@ -262,6 +373,83 @@ def test_cached_snapshot_respects_requested_revision(monkeypatch, tmp_path):
             "revision": "a" * 40,
         }
     ]
+
+
+@pytest.mark.parametrize("index_name", ["model_index.json", "modular_model_index.json"])
+@pytest.mark.parametrize(
+    "cached", ["missing_index", "metadata_only", "partial", "complete"]
+)
+def test_pipeline_load_repairs_only_its_requested_cached_subfolder(
+    monkeypatch, tmp_path, index_name, cached
+):
+    # The root and another partition can be cached independently of Ref2VA.
+    _write_model_index(tmp_path)
+    _populate_components(tmp_path / "T2VA", ("transformer",))
+    selected = tmp_path / "Ref2VA"
+    selected.mkdir()
+    external_text_encoder = index_name == "model_index.json"
+    local_components = ("transformer", "vae")
+    text_encoder = _h3_text_encoder_spec()
+    if not external_text_encoder:
+        local_components += ("text_encoder",)
+        text_encoder = text_encoder[:2]
+    config = {
+        "_class_name": "MiniMaxH3Ref2VAPipeline",
+        "_diffusers_version": "0.37.0",
+        "text_encoder": text_encoder,
+        "transformer": ["diffusers", "MiniMaxH3DiTModel"],
+        "vae": ["diffusers", "AutoencoderKL"],
+    }
+    if cached != "missing_index":
+        (selected / index_name).write_text(json.dumps(config))
+    if cached in ("partial", "complete"):
+        _populate_components(selected, ("vae",))
+    if cached == "complete":
+        _populate_components(selected, local_components)
+    calls = []
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            (selected / index_name).write_text(json.dumps(config))
+            _populate_components(selected, local_components)
+        return str(tmp_path)
+
+    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", snapshot_download)
+    pipeline = SimpleNamespace(
+        model_path="org/repo",
+        default_model_subfolder="Ref2VA",
+        server_args=SimpleNamespace(model_subfolder=None, revision="a" * 40),
+    )
+
+    loaded = ComposedPipelineBase._load_config(pipeline)
+
+    assert loaded == config
+    assert pipeline.model_path == str(selected)
+    assert [call.get("local_files_only", False) for call in calls] == (
+        [True] if cached == "complete" else [True, False]
+    )
+    assert all(call["allow_patterns"] == ["Ref2VA/**"] for call in calls)
+    assert all(call["revision"] == "a" * 40 for call in calls)
+    # modular indexes use local components; standard indexes can reference a repo
+    assert (selected / "text_encoder").exists() == (not external_text_encoder)
+    assert not (tmp_path / "transformer").exists()
+
+
+def test_incomplete_cached_subfolder_does_not_download_when_disabled(
+    recording_snapshot_download, tmp_path
+):
+    calls = recording_snapshot_download(tmp_path)
+
+    with pytest.raises(ValueError, match="missing requested files"):
+        maybe_download_model(
+            "org/repo",
+            allow_patterns=["Ref2VA/**"],
+            model_subfolder="Ref2VA",
+            download=False,
+        )
+
+    assert calls == ["probe"]
 
 
 def test_partially_populated_cached_snapshot_is_served_without_download(

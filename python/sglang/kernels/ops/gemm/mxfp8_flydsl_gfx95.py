@@ -30,8 +30,6 @@ Epilogue. B is the MFMA's first operand, so a lane accumulates 4 consecutive col
 one row of C; the tile is staged through the idle LDS.
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -40,6 +38,8 @@ import triton.language as tl
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
+
+from sglang.kernels.arch import current_arch
 
 BLOCK_N, BLOCK_K, NUM_WAVES = 256, 128, 8
 GROUP_STEPS = 4  # K steps per scale word, one byte each
@@ -120,18 +120,13 @@ def _workgroup_tile(n_tiles_m, n_tiles_n, band):
     return first_m + in_band % band_rows, in_band // band_rows
 
 
-@functools.lru_cache
-def _num_cus(device):
-    return torch.cuda.get_device_properties(device).multi_processor_count
-
-
 def _default_block_m(m, n, device):
     """
     The tile height needing fewer rounds of workgroups over the CUs; a 128-row tile
     costs ~0.6 of a 256-row one (fits every shape and M measured on MI355X).
     """
     rounds = {
-        bm: _ceil_div(_ceil_div(m, bm) * _ceil_div(n, BLOCK_N), _num_cus(device))
+        bm: _ceil_div(_ceil_div(m, bm) * _ceil_div(n, BLOCK_N), current_arch().num_sms)
         for bm in (128, 256)
     }
     return 128 if 0.6 * rounds[128] < rounds[256] else 256

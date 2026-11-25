@@ -30,16 +30,8 @@ from sglang.kernels.ops.attention.flash_attn.cute.pack_gqa import (
 from sglang.kernels.ops.attention.flash_attn.cute.paged_kv import PagedKVManager
 from sglang.kernels.ops.attention.flash_attn.cute.seqlen_info import SeqlenInfoQK
 from sglang.kernels.ops.attention.flash_attn.cute.softmax import SoftmaxSm100
-from sglang.kernels.ops.attention.flash_attn.cute.tile_scheduler import (
-    ClcState,
-    ParamsBase,
-    SchedulingMode,
-    SingleTileLPTScheduler,
-    SingleTileScheduler,
-    SingleTileVarlenScheduler,
-    TileSchedulerArguments,
-    TileSchedulerProtocol,
-)
+from sglang.kernels.ops.attention.flash_attn.cute.tile_scheduler import ClcState, SchedulingMode, SingleTileLPTScheduler, SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments, TileSchedulerProtocol
+from quack.cute_dsl_utils import ParamsBase
 from sglang.kernels.ops.attention.flash_attn.cute.topk_gather_kv import (
     CpasyncGatherKVManager,
 )

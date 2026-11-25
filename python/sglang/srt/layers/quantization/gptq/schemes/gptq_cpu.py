@@ -9,7 +9,6 @@ from sglang.srt.hardware_backend.cpu.quantization.gptq_kernels import (
     GPTQIntelAMXLinearKernel,
     GPTQIntelAMXMoEKernel,
 )
-from sglang.srt.layers.linear import set_weight_attrs
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
@@ -18,6 +17,7 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     RowvLLMParameter,
 )
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 from .gptq_linear import GPTQLinearScheme
 from .gptq_scheme import GPTQMoESchemeBase

@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
     HiCacheL3Cleaner,
@@ -16,6 +17,7 @@ from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
 )
 from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlBackendConfig,
+    NixlBackendSelection,
     NixlFileManager,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -76,6 +78,11 @@ class TestHiCacheL3Cleaner(CustomTestCase):
             "page-a_model_7_8_indexer_2",
             "page-a_model_7_8_draft_swa",
             "page-a_model_deepseek_v4_c4_indexer_state_2",
+            "page-a_model_7_8_window",
+            "page-a_model_7_8_window_4096",
+            "page-a_model_7_8_window_4096_k",
+            "page-a_model_7_8_window_128_v",
+            "page-a_model_7_8_window_128_3",
         ]
 
         for name in names:
@@ -116,6 +123,38 @@ class TestHiCacheL3Cleaner(CustomTestCase):
             for rank in range(2)
             for suffix in physical_suffixes
         ]
+        old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
+        new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
+
+        self._run_single_group_cleanup()
+        self.assertFalse(any(os.path.exists(path) for path in old_paths))
+        self.assertTrue(all(os.path.exists(path) for path in new_paths))
+
+    def test_tick_deletes_named_windows_with_their_page(self):
+        """BUG REGRESSION. Objects of window sub-pools named by length
+        (``window_<n>``) must group with their page's KV across every rank."""
+        physical_suffixes = [
+            "",
+            "_k",
+            "_v",
+            "_window_4096_k",
+            "_window_4096_v",
+            "_window_128",
+            "_window_128_0",
+        ]
+        old_keys = [
+            f"page-old_model_{rank}_4{suffix}"
+            for rank in range(4)
+            for suffix in physical_suffixes
+        ]
+        new_keys = [
+            f"page-new_model_{rank}_4{suffix}"
+            for rank in range(4)
+            for suffix in physical_suffixes
+        ]
+        self.assertEqual(
+            {_parse_group_key(key) for key in old_keys}, {"page-old_model"}
+        )
         old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
         new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
 
@@ -187,6 +226,31 @@ class TestHiCacheL3Cleaner(CustomTestCase):
 
         with self.assertRaises(ValueError):
             cfg.get_l3_cleaner_config()
+
+
+class _FailingPluginListAgent:
+    def get_plugin_list(self):
+        raise RuntimeError("plugin discovery failed")
+
+
+class TestNixlPluginSelection(CustomTestCase):
+    _PLUGIN_ENV = "SGLANG_HICACHE_NIXL_BACKEND_PLUGIN"
+
+    def test_no_active_plugin_falls_back_to_env_then_auto(self):
+        """A fully qualified config that marks no plugin active selects the
+        plugin like an empty config does: the env var, else "auto"."""
+        cfg = NixlBackendConfig({"plugin": {"posix": {"active": False}, "gds": {}}})
+        with mock.patch.dict(os.environ):
+            os.environ.pop(self._PLUGIN_ENV, None)
+            self.assertEqual(cfg.get_specified_plugin(), "auto")
+            os.environ[self._PLUGIN_ENV] = "GDS"
+            self.assertEqual(cfg.get_specified_plugin(), "GDS")
+
+    def test_create_backend_reports_plugin_listing_failure(self):
+        """A failure before the plugin list is known is reported as False, not
+        raised out of the error handler."""
+        selection = NixlBackendSelection("auto", None)
+        self.assertFalse(selection.create_backend(_FailingPluginListAgent()))
 
 
 if __name__ == "__main__":
