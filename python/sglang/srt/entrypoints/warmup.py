@@ -183,8 +183,10 @@ _CONCURRENT_PREFILL_LOGPROB_SIZES = (513, 512)
 class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
     """The scheduler's effective limits that the warmup plan must stay inside."""
 
-    # Effective running-request slots, summed over DP ranks.
+    # Effective running-request slots of one DP rank (the smallest).
     max_running_requests: int
+    # DP dispatch spreads a round evenly, so each rank gets its own share.
+    dp_ranks: int = 1
     # Per scheduler; None is unlimited or not applied.
     max_queued_requests: Optional[int]
     # None or <= 0: chunked prefill is off.
@@ -216,9 +218,10 @@ def concurrent_prefill_limits(
     state = internal_states[0]
     spec_algorithm = SpeculativeAlgorithm.from_string(state["speculative_algorithm"])
     return ConcurrentPrefillLimits(
-        max_running_requests=sum(
+        max_running_requests=min(
             s["effective_max_running_requests_per_dp"] for s in internal_states
         ),
+        dp_ranks=len(internal_states),
         # Only the regular scheduler applies the queue limit; a PD prefill
         # server queues requests for bootstrap instead.
         max_queued_requests=(
@@ -243,11 +246,12 @@ def concurrent_prefill_limits(
 
 def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefillPlan:
     """Prompt lengths of each concurrent round (1, about 1/8 and all of the
-    running slots) and of the input-logprob probes.
+    running slots of every DP rank) and of the input-logprob probes.
 
-    A round sends at least one round budget (two prefill chunks, at least
-    `_CONCURRENT_PREFILL_TOKENS`) and less than two: each prompt gets an equal
-    share plus an offset below that share, stepped by 37 so extends do not align.
+    Each DP rank gets at least one round budget (two prefill chunks, at least
+    `_CONCURRENT_PREFILL_TOKENS`) per round and less than two: each prompt gets
+    an equal share plus an offset below that share, stepped by 37 so extends do
+    not align.
     """
     page = limits.page_size
     new_tokens = _CONCURRENT_PREFILL_NEW_TOKENS
@@ -262,7 +266,8 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     )
     slots = limits.max_running_requests
     if limits.max_queued_requests is not None:
-        # A round arriving in one scheduler poll must fit in the waiting queue.
+        # A rank's share of a round can arrive in one scheduler poll, so it
+        # must fit in that rank's waiting queue.
         slots = min(slots, limits.max_queued_requests)
     if max_prompt < 1 or slots < 1:
         return ConcurrentPrefillPlan(rounds=[], logprob_sizes=[])
@@ -274,7 +279,12 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     rounds = []
     for n in sorted({1, slots // 8 or 1, slots}):
         share = max(1, budget // n)
-        rounds.append([min(max_prompt, share + 37 * i % share + 1) for i in range(n)])
+        rounds.append(
+            [
+                min(max_prompt, share + 37 * i % share + 1)
+                for i in range(n * limits.dp_ranks)
+            ]
+        )
     logprob_sizes = []
     if limits.serves_input_logprobs:
         logprob_sizes = [min(max_prompt, s) for s in _CONCURRENT_PREFILL_LOGPROB_SIZES]

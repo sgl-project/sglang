@@ -94,7 +94,7 @@ class TestConcurrentPrefillPlan(CustomTestCase):
 
     def test_unset_max_running_requests_uses_effective_slots(self):
         """Without --max-running-requests the server-arg is None; the rounds
-        must follow the scheduler's effective slot count, summed over DP ranks."""
+        must follow the scheduler's effective slot count of every DP rank."""
         states = [
             _internal_state(effective_max_running_requests_per_dp=48),
             _internal_state(effective_max_running_requests_per_dp=48),
@@ -103,7 +103,22 @@ class TestConcurrentPrefillPlan(CustomTestCase):
             states, context_len=131072, max_req_input_len=131066, num_reserved_tokens=0
         )
         plan = concurrent_prefill_plan(limits)
-        self.assertEqual([len(r) for r in plan.rounds], [1, 12, 96])
+        self.assertEqual([len(r) for r in plan.rounds], [2, 12, 96])
+
+    def test_each_dp_rank_gets_a_full_round_budget(self):
+        """Four 8-slot DP ranks with 16K chunks: the round is sized per rank, so
+        every rank (round robin) runs more than two chunks of prompts."""
+        states = [
+            _internal_state(effective_max_running_requests_per_dp=8) for _ in range(4)
+        ]
+        limits = concurrent_prefill_limits(
+            states, context_len=131072, max_req_input_len=131066, num_reserved_tokens=0
+        )
+        plan = concurrent_prefill_plan(limits)
+        self.assertEqual([len(r) for r in plan.rounds], [4, 32])
+        for sizes in plan.rounds:
+            for rank in range(4):
+                self.assertGreater(sum(sizes[rank::4]), 2 * 16384)
 
     def test_round_never_exceeds_the_waiting_queue(self):
         """A whole round can land in one scheduler poll, so a round larger than
