@@ -27,6 +27,10 @@ struct FusedQkvParams {
   // Elements between consecutive cache slots; may exceed kv_dim (strided per-layer views).
   int64_t k_cache_stride;
   int64_t v_cache_stride;
+  // HND pools ([pages, heads, page_size, head_dim]) pass page_size > 1: a slot is
+  // (slot / page_size, :, slot % page_size, :). NHD pools pass page_size = 1.
+  uint32_t page_size;
+  uint32_t head_dim;
   uint32_t num_tokens;
   uint32_t q_dim;
   uint32_t kv_dim;
@@ -34,8 +38,15 @@ struct FusedQkvParams {
 
 constexpr uint32_t kBlockSize = 128;
 
+// Element i goes to dst[(i / head_dim) * head_stride + i % head_dim]; head_dim % kVecN == 0.
 template <typename T, int kVecN>
-SGL_DEVICE void quant_row(const T* __restrict__ src, fp8_e4m3_t* __restrict__ dst, uint32_t n, float inv_scale) {
+SGL_DEVICE void quant_row(
+    const T* __restrict__ src,
+    fp8_e4m3_t* __restrict__ dst,
+    uint32_t n,
+    float inv_scale,
+    uint32_t head_dim,
+    uint32_t head_stride) {
   using namespace device;
   using in_vec = AlignedVector<T, kVecN>;
   using out_vec = AlignedVector<fp8_e4m3_t, kVecN>;
@@ -49,12 +60,13 @@ SGL_DEVICE void quant_row(const T* __restrict__ src, fp8_e4m3_t* __restrict__ ds
     for (int i = 0; i < kVecN; ++i) {
       ov[i] = static_cast<fp8_e4m3_t>(static_cast<float>(iv[i]) * inv_scale);
     }
-    ov.store(dst, vi);
+    const uint32_t e = vi * kVecN;
+    ov.store(dst + (e / head_dim) * head_stride + e % head_dim);
   }
 
   const uint32_t base = n_vec * kVecN;
   for (uint32_t i = base + threadIdx.x; i < n; i += blockDim.x) {
-    dst[i] = static_cast<fp8_e4m3_t>(static_cast<float>(src[i]) * inv_scale);
+    dst[(i / head_dim) * head_stride + i % head_dim] = static_cast<fp8_e4m3_t>(static_cast<float>(src[i]) * inv_scale);
   }
 }
 
@@ -75,18 +87,30 @@ __global__ void fused_fp8_qkv_kv_cache_kernel(const __grid_constant__ FusedQkvPa
         static_cast<const T*>(params.q) + static_cast<size_t>(token) * params.q_stride,
         static_cast<fp8_e4m3_t*>(params.q_out) + static_cast<size_t>(token) * params.q_dim,
         params.q_dim,
-        1.0f);
+        1.0f,
+        params.q_dim,
+        params.q_dim);
   }
+  // HND: page base + token offset, heads page_size * head_dim apart (page_size 1 = slot rows).
+  const int64_t page = static_cast<int64_t>(slot) / params.page_size;
+  const int64_t off = static_cast<int64_t>(slot) % params.page_size;
+  const int64_t k_row = page * params.page_size * params.k_cache_stride + off * params.head_dim;
+  const int64_t v_row = page * params.page_size * params.v_cache_stride + off * params.head_dim;
+  const uint32_t head_stride = params.page_size * params.head_dim;
   quant_row<T, kVecN>(
       static_cast<const T*>(params.k) + static_cast<size_t>(token) * params.k_stride,
-      static_cast<fp8_e4m3_t*>(params.k_cache) + static_cast<size_t>(slot) * params.k_cache_stride,
+      static_cast<fp8_e4m3_t*>(params.k_cache) + k_row,
       params.kv_dim,
-      inv_k);
+      inv_k,
+      params.head_dim,
+      head_stride);
   quant_row<T, kVecN>(
       static_cast<const T*>(params.v) + static_cast<size_t>(token) * params.v_stride,
-      static_cast<fp8_e4m3_t*>(params.v_cache) + static_cast<size_t>(slot) * params.v_cache_stride,
+      static_cast<fp8_e4m3_t*>(params.v_cache) + v_row,
       params.kv_dim,
-      inv_v);
+      inv_v,
+      params.head_dim,
+      head_stride);
 
   PDLTriggerSecondary<kUsePDL>();
 }
@@ -119,7 +143,9 @@ struct FusedFp8QkvKvCache {
       const tvm::ffi::TensorView v_cache,
       const tvm::ffi::TensorView cache_loc,
       const tvm::ffi::TensorView k_scale,
-      const tvm::ffi::TensorView v_scale) {
+      const tvm::ffi::TensorView v_scale,
+      int64_t page_size,
+      int64_t head_dim) {
     using namespace host;
     const bool quantize_q = q.has_value();
     RuntimeCheck(
@@ -165,12 +191,16 @@ struct FusedFp8QkvKvCache {
     const int64_t k_cache_stride = SKC.unwrap();
     const int64_t v_cache_stride = SVC.unwrap();
     RuntimeCheck(num_tokens > 0, "fused_fp8_qkv_kv_cache: num_tokens must be > 0, got ", num_tokens);
+    RuntimeCheck(
+        page_size >= 1 && head_dim >= 1 && kv_dim % head_dim == 0 &&
+            (page_size == 1 || (k_cache_stride == kv_dim && v_cache_stride == kv_dim)),
+        "fused_fp8_qkv_kv_cache: bad paged geometry");
 
     auto fits = [&](int vec) {
       const int in_bytes = vec * static_cast<int>(sizeof(T));
       const int out_bytes = vec * static_cast<int>(sizeof(fp8_e4m3_t));
-      bool ok = kv_dim % vec == 0 && k_stride % vec == 0 && v_stride % vec == 0 && aligned(k.data_ptr(), in_bytes) &&
-                aligned(v.data_ptr(), in_bytes);
+      bool ok = kv_dim % vec == 0 && head_dim % vec == 0 && k_stride % vec == 0 && v_stride % vec == 0 &&
+                aligned(k.data_ptr(), in_bytes) && aligned(v.data_ptr(), in_bytes);
       ok = ok && k_cache_stride % vec == 0 && v_cache_stride % vec == 0 && aligned(k_cache.data_ptr(), out_bytes) &&
            aligned(v_cache.data_ptr(), out_bytes);
       if (quantize_q) {
@@ -195,6 +225,8 @@ struct FusedFp8QkvKvCache {
         .v_stride = v_stride,
         .k_cache_stride = k_cache_stride,
         .v_cache_stride = v_cache_stride,
+        .page_size = static_cast<uint32_t>(page_size),
+        .head_dim = static_cast<uint32_t>(head_dim),
         .num_tokens = num_tokens,
         .q_dim = q_dim,
         .kv_dim = kv_dim,

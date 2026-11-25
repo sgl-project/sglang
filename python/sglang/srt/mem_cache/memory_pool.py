@@ -234,6 +234,8 @@ def _set_kv_buffer_prefix_valid_impl(
     commit_lens: torch.Tensor,
     row_dim: int,
     store_dtype: torch.dtype,
+    page_size: int = 1,
+    head_dim: int = 1,
 ) -> None:
     if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
         return
@@ -281,6 +283,8 @@ def _set_kv_buffer_prefix_valid_impl(
         int(loc_2d.shape[1]),
         ROW_BYTES=row_bytes,
         BYTES_PER_TILE=bytes_per_tile,
+        PAGE=page_size,
+        HEAD_BYTES=head_dim * store_dtype.itemsize,
         num_warps=num_warps,
         num_stages=2,
     )
@@ -298,6 +302,8 @@ def _set_kv_buffer_prefix_valid_impl_fp8(
     row_dim: int,
     k_scale_is_tensor: bool = False,
     v_scale_is_tensor: bool = False,
+    page_size: int = 1,
+    head_dim: int = 1,
 ) -> None:
     if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
         return
@@ -347,6 +353,8 @@ def _set_kv_buffer_prefix_valid_impl_fp8(
         FP8_MAX=torch.finfo(k_cache.dtype).max,
         K_SCALE_IS_TENSOR=k_scale_is_tensor,
         V_SCALE_IS_TENSOR=v_scale_is_tensor,
+        PAGE=page_size,
+        HEAD_ELEMS=head_dim,
         num_warps=num_warps,
         num_stages=2,
     )
@@ -2205,6 +2213,8 @@ def _set_mha_kv_buffer_prefix_valid(
             f"head_dim={pool.head_dim} v_head_dim={pool.v_head_dim}."
         )
 
+    page_size = pool.page_size if pool.use_hnd else 1  # HND: address rows by page.
+
     # No scale on ROCm: the eager fallback below is a plain saturating cast, which the fused kernel does
     # bit-exactly at scale 1.0 (one launch instead of five per layer).
     fused_k_scale = (
@@ -2244,6 +2254,8 @@ def _set_mha_kv_buffer_prefix_valid(
             row_dim=pool.row_dim,
             k_scale_is_tensor=isinstance(k_scale, torch.Tensor) and k_scale.is_cuda,
             v_scale_is_tensor=isinstance(v_scale, torch.Tensor) and v_scale.is_cuda,
+            page_size=page_size,
+            head_dim=pool.head_dim,
         )
         return
 
@@ -2276,6 +2288,8 @@ def _set_mha_kv_buffer_prefix_valid(
         commit_lens,
         row_dim=pool.row_dim,
         store_dtype=pool.store_dtype,
+        page_size=page_size,
+        head_dim=pool.head_dim,
     )
 
 

@@ -25,6 +25,8 @@ def set_kv_buffer_prefix_valid_tiled(
     block_size,
     ROW_BYTES: tl.constexpr,
     BYTES_PER_TILE: tl.constexpr,
+    PAGE: tl.constexpr = 1,
+    HEAD_BYTES: tl.constexpr = 1,
 ):
     bid = tl.program_id(0)
     row = tl.program_id(1)
@@ -46,10 +48,18 @@ def set_kv_buffer_prefix_valid_tiled(
     dst_k_ptr = tl.cast(dst_k_ptr, tl.pointer_type(tl.uint8))
     dst_v_ptr = tl.cast(dst_v_ptr, tl.pointer_type(tl.uint8))
 
+    # HND pages [pages, heads, PAGE, head]; PAGE == 1 is the slot-row layout.
+    dst_off = (
+        (byte_off // HEAD_BYTES) * (PAGE * HEAD_BYTES)
+        + byte_off % HEAD_BYTES
+        + (loc % PAGE) * HEAD_BYTES
+    )
+    loc = loc // PAGE
+
     src_k_row_ptr = src_k_ptr + src_row * src_k_row_stride + byte_off
     src_v_row_ptr = src_v_ptr + src_row * src_v_row_stride + byte_off
-    dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + byte_off
-    dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + byte_off
+    dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + dst_off
+    dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + dst_off
 
     k_val = tl.load(src_k_row_ptr, mask=mask_byte, other=0)
     v_val = tl.load(src_v_row_ptr, mask=mask_byte, other=0)
@@ -96,6 +106,8 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
     FP8_MAX: tl.constexpr,
     K_SCALE_IS_TENSOR: tl.constexpr = False,
     V_SCALE_IS_TENSOR: tl.constexpr = False,
+    PAGE: tl.constexpr = 1,
+    HEAD_ELEMS: tl.constexpr = 1,
 ):
     bid = tl.program_id(0)
     row = tl.program_id(1)
@@ -111,10 +123,18 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
     loc = tl.load(loc_2d_ptr + bid * block_size + row)
     src_row = bid * block_size + row
 
+    # HND pages [pages, heads, PAGE, head]; PAGE == 1 is the slot-row layout.
+    dst_off = (
+        (elem_off // HEAD_ELEMS) * (PAGE * HEAD_ELEMS)
+        + elem_off % HEAD_ELEMS
+        + (loc % PAGE) * HEAD_ELEMS
+    )
+    loc = loc // PAGE
+
     src_k_row_ptr = src_k_ptr + src_row * src_k_row_stride + elem_off
     src_v_row_ptr = src_v_ptr + src_row * src_v_row_stride + elem_off
-    dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + elem_off
-    dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + elem_off
+    dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + dst_off
+    dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + dst_off
 
     # Tensor division rounds the divisor first and uses correctly rounded division.
     k_val = tl.load(src_k_row_ptr, mask=mask_elem, other=0).to(tl.float32)
