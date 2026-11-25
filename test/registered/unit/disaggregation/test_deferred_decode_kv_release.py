@@ -12,6 +12,7 @@ All decode attention-TP ranks must agree on holding and releasing each request.
 import datetime
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1170,6 +1171,79 @@ class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
 
         self.assertEqual(at_failure, [("hisparse", "r13"), ("kv", "r13")])
         self.assertEqual(log, at_failure)
+
+
+class _ReadPausingStatusMap(dict):
+    """Parks the named thread right after its first ``get``."""
+
+    def __init__(self, pause_thread_name: str):
+        super().__init__()
+        self._pause_thread_name = pause_thread_name
+        self.paused = threading.Event()
+        self.resume = threading.Event()
+
+    def get(self, key, default=None):
+        value = super().get(key, default)
+        if (
+            threading.current_thread().name == self._pause_thread_name
+            and not self.paused.is_set()
+        ):
+            self.paused.set()
+            self.resume.wait(timeout=10)
+        return value
+
+
+class _ContentionSignalingLock:
+    """A lock that records when a second thread has to wait for it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.contended = threading.Event()
+
+    def __enter__(self):
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+
+
+class TestUpdateStatusOpeningRace(CustomTestCase):
+    def test_late_bootstrapping_does_not_overwrite_waiting_for_input(self):
+        room = 4242
+        mgr = _make_prefill_manager()
+        mgr._status_lock = _ContentionSignalingLock()
+        mgr.request_status = _ReadPausingStatusMap("sender-init")
+        sender = threading.Thread(
+            name="sender-init",
+            target=CommonKVManager.update_status,
+            args=(mgr, room, KVPoll.Bootstrapping),
+        )
+        bootstrap = threading.Thread(
+            name="bootstrap",
+            target=CommonKVManager.update_status,
+            args=(mgr, room, KVPoll.WaitingForInput),
+        )
+
+        sender.start()
+        self.assertTrue(mgr.request_status.paused.wait(timeout=10))
+        bootstrap.start()
+        deadline = time.monotonic() + 10
+        while (
+            bootstrap.is_alive()
+            and not mgr._status_lock.contended.is_set()
+            and time.monotonic() < deadline
+        ):
+            bootstrap.join(timeout=0.01)
+        mgr.request_status.resume.set()
+        sender.join(timeout=10)
+        bootstrap.join(timeout=10)
+
+        self.assertFalse(sender.is_alive())
+        self.assertFalse(bootstrap.is_alive())
+        self.assertEqual(mgr.request_status[room], KVPoll.WaitingForInput)
 
 
 class TestBackendOptIn(CustomTestCase):
