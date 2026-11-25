@@ -132,7 +132,36 @@ class TestPullFilesFromDb(CustomTestCase):
         self.assertEqual(self._pulled(local_dir), {"config.json": "{}"})
         self.assertEqual(store.getstr_keys, ["model/files/config.json"])
 
-    def test_no_patterns_downloads_everything(self):
+    def test_empty_allow_pattern_downloads_nothing(self):
+        """An empty allow list matches nothing; the `is not None` check
+        must keep this distinct from `None` (unrestricted)."""
+        store, local_dir = self._store(
+            {
+                "model/files/config.json": "{}",
+                "model/files/tokenizer.json": "[2]",
+            }
+        )
+
+        pull_files_from_db(store, "model", allow_pattern=[])
+
+        self.assertEqual(self._pulled(local_dir), {})
+        self.assertEqual(store.getstr_keys, [])
+
+    def test_empty_ignore_pattern_downloads_everything(self):
+        """An empty ignore list excludes nothing."""
+        store, local_dir = self._store(
+            {
+                "model/files/config.json": "{}",
+                "model/files/tokenizer.json": "[2]",
+            }
+        )
+
+        pull_files_from_db(store, "model", ignore_pattern=[])
+
+        self.assertEqual(
+            self._pulled(local_dir),
+            {"config.json": "{}", "tokenizer.json": "[2]"},
+        )
         """Without patterns the behavior is unchanged (backwards compat)."""
         store, local_dir = self._store(
             {
