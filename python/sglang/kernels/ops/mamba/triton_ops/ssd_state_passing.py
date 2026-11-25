@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .autotune import autotune_cache_kwargs, prune_oversized_tiles
+from .autotune import autotune_cache_kwargs, prune_oversized_tiles, unused_index
 
 
 @triton.autotune(
@@ -41,6 +41,8 @@ def _state_passing_fwd_kernel(
     seq_idx_ptr,
     chunk_offsets_ptr,
     chunk_meta_num,
+    init_idx_ptr,
+    init_has_ptr,
     # Matrix dimensions
     dim,
     nchunks,
@@ -71,6 +73,7 @@ def _state_passing_fwd_kernel(
     HAS_INITSTATES: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
     IS_CONT_BATCHED: tl.constexpr,
+    INIT_FROM_POOL: tl.constexpr = False,
     BLOCK_SIZE: tl.constexpr = 16,
 ):
     pid_b = tl.program_id(axis=1)
@@ -104,10 +107,22 @@ def _state_passing_fwd_kernel(
         states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
     else:
         initstates_ptr += offs_m * stride_initstates_dim
-        initstates_ptrs = initstates_ptr
-        # - for cont batches, for the first chunk mean it will be the first batch's
-        #   init state
-        states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        if INIT_FROM_POOL:
+            # sequence 0's state, read from its pool slot; zero without a prefix
+            slot0 = tl.load(init_idx_ptr).to(tl.int64)
+            has0 = tl.load(init_has_ptr).to(tl.int32) != 0
+            states = tl.load(
+                initstates_ptr + slot0 * stride_initstates_batch,
+                mask=(offs_m < dim) & has0,
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            initstates_ptrs = initstates_ptr
+            # - for cont batches, for the first chunk mean it will be the first batch's
+            #   init state
+            states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(
+                tl.float32
+            )
 
     tl.store(out_ptrs, states, mask=offs_m < dim)
     out_ptrs += stride_out_chunk
@@ -131,14 +146,25 @@ def _state_passing_fwd_kernel(
                     # has changed.
                     # - so we do not propagate the state from previous chunk
                     # - but rather we load that sequence's init state
-                    initstates_ptrs = (
-                        initstates_ptr + seq_idx_chunk_end * stride_initstates_batch
-                    )
+                    if INIT_FROM_POOL:
+                        slot = tl.load(init_idx_ptr + seq_idx_chunk_end).to(tl.int64)
+                        has = (
+                            tl.load(init_has_ptr + seq_idx_chunk_end).to(tl.int32) != 0
+                        )
+                        states = tl.load(
+                            initstates_ptr + slot * stride_initstates_batch,
+                            mask=(offs_m < dim) & has,
+                            other=0.0,
+                        ).to(tl.float32)
+                    else:
+                        initstates_ptrs = (
+                            initstates_ptr + seq_idx_chunk_end * stride_initstates_batch
+                        )
 
-                    # - update state with seq_idx_new's init state
-                    states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(
-                        tl.float32
-                    )
+                        # - update state with seq_idx_new's init state
+                        states = tl.load(
+                            initstates_ptrs, mask=offs_m < dim, other=0.0
+                        ).to(tl.float32)
 
                     # - we need to consider the cumsum only of the last sequence in the chunk
                     # - find its starting position (given by c_off of the logical chunk index)
@@ -194,7 +220,10 @@ def _state_passing_fwd(
     out_dtype=None,
     is_cont_batched=False,
     chunk_offsets=None,
+    init_idx=None,
+    init_has=None,
 ):
+    init_from_pool = init_idx is not None
     batch, nchunks, nheads, dim = states.shape
     if chunk_size is None:
         chunk_size = dA_cumsum.shape[-1]
@@ -215,7 +244,7 @@ def _state_passing_fwd(
             assert chunk_offsets is not None, (
                 "chunk_offsets must be provided for continuous batching"
             )
-        else:
+        elif not init_from_pool:
             # - this is the regular batching case, where initial
             #   states are used are for each example of the batch.
             assert initial_states.shape == (batch, nheads, dim)
@@ -241,6 +270,8 @@ def _state_passing_fwd(
             seq_idx,
             chunk_offsets,
             len(chunk_offsets) if chunk_offsets is not None else 0,
+            init_idx if init_from_pool else unused_index(states.device, torch.int32),
+            init_has if init_from_pool else unused_index(states.device, torch.bool),
             dim,
             nchunks,
             seqlen if seq_idx is not None else 0,
@@ -277,5 +308,6 @@ def _state_passing_fwd(
             HAS_INITSTATES=initial_states is not None,
             HAS_SEQ_IDX=seq_idx is not None,
             IS_CONT_BATCHED=is_cont_batched,
+            INIT_FROM_POOL=init_from_pool,
         )
     return out, final_states

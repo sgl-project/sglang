@@ -453,6 +453,8 @@ class MambaMixer2(torch.nn.Module):
         metadata: Mamba2Metadata,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
+        ssm_state_in_pool: bool = False,
+        track_states_in_pool: bool = False,
     ):
         # Returns the projected result. When `output` is given it is also
         # written into that buffer (required by the cuda-graph split ops, which
@@ -600,8 +602,23 @@ class MambaMixer2(torch.nn.Module):
             hidden_states_p, B_p, C_p = split_hidden_states_B_C_fn(hidden_states_B_C_p)
 
             # 3. State Space Model sequence transformation
+            has_prefix = has_initial_states_p is not None and prep_initial_states
             initial_states = None
-            if has_initial_states_p is not None and prep_initial_states:
+            pool_kwargs = {}
+            if ssm_state_in_pool:
+                # The SSD kernels read the initial states from, and write the final
+                # (and tracked) states to, the pool slots directly.
+                pool_kwargs = dict(
+                    state_pool=ssm_state,
+                    state_indices=state_indices_tensor_p,
+                    has_initial_state=has_initial_states_p if has_prefix else None,
+                )
+                if track_states_in_pool:
+                    pool_kwargs.update(
+                        final_track_slots=metadata.track_ssm_final_dst_per_row,
+                        track_out_slots=metadata.track_ssm_recompute_dst,
+                    )
+            elif has_prefix:
                 initial_states = torch.where(
                     has_initial_states_p[:, None, None, None],
                     ssm_state[state_indices_tensor_p],
@@ -637,9 +654,10 @@ class MambaMixer2(torch.nn.Module):
                     1, num_prefill_tokens, -1, self.head_dim
                 ),
                 state_dtype=ssm_state.dtype,
+                **pool_kwargs,
             )
 
-            # update ssm states
+            # update ssm states (None when the kernels wrote them in the pool)
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
             if varlen_state is not None:
                 ssm_state[state_indices_tensor_p] = varlen_state
