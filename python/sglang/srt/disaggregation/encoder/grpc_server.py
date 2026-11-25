@@ -196,59 +196,62 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             )
             if sources
         ]
-        layouts = {
-            modality: []
-            for modality in (Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
-        }
-        tensors = []
-        root = None
+        parts = []
         async with self.encoder.encode_dispatch_lock:
             for index, (modality, sources) in enumerate(groups):
                 name = part_id if index == 0 else f"{part_id}_{modality.name.lower()}"
                 try:
-                    data = await self._encode_modality(name, sources, modality)
-                    if root is None:
-                        root = data
-                    if modality == Modality.IMAGE:
-                        layouts[modality] = self._image_layouts(
-                            data, explicit_rows=bool(audios)
-                        )
-                    elif modality == Modality.VIDEO:
-                        layouts[modality] = self._video_layouts(
-                            data, explicit_rows=bool(audios)
-                        )
-                    else:
-                        layouts[modality] = self._audio_layouts(data)
-                    tensor = data.embedding
-                    if tensor.dtype != root.dtype or tensor.ndim != 2:
-                        raise RuntimeError("Incompatible staged embedding formats")
-                    if tensor.shape[1] != root.shape[1] and (
-                        modality != Modality.AUDIO or tensor.shape[1] > root.shape[1]
-                    ):
-                        raise RuntimeError("Incompatible staged embedding widths")
-                    tensors.append(tensor)
+                    parts.append(await self._encode_modality(name, sources, modality))
                 finally:
                     if index:
                         await await_task_completion_on_cancel(
                             asyncio.create_task(self._release_staged_modality(name)),
                             f"Retire staged {modality.name.lower()} {name}",
                         )
-            if len(tensors) > 1:
-                if tensors[-1].shape[1] == tensors[0].shape[1]:
-                    packed = torch.cat(tensors)
-                else:
-                    # DeepStack vision and audio have different native widths.
-                    # Preserve each contiguous block in a single 2-D transfer.
-                    packed = torch.cat([part.reshape(-1, 1) for part in tensors])
-                root.embedding = packed
-                root.shape = list(packed.shape)
-                await meta_registry.publish(part_id, packed.nbytes, *packed.shape)
-        return (
-            layouts[Modality.IMAGE],
-            layouts[Modality.VIDEO],
-            layouts[Modality.AUDIO],
-            tensors[0].shape[1],
+
+        # Stage uses host embeddings. Keep their storage and this request's
+        # admission slot until the worker finishes, including on cancellation.
+        layouts, packed = await await_task_completion_on_cancel(
+            asyncio.create_task(asyncio.to_thread(self._prepare_staged_payload, parts)),
+            f"Prepare staged embeddings for {part_id}",
         )
+        root = parts[0]
+        width = root.shape[1]
+        if len(parts) > 1:
+            root.embedding = packed
+            root.shape = list(packed.shape)
+            await meta_registry.publish(part_id, packed.nbytes, *packed.shape)
+        return (*layouts, width)
+
+    def _prepare_staged_payload(self, parts):
+        images, videos, audios = [], [], []
+        root = parts[0].embedding
+        explicit_rows = parts[-1].modality == Modality.AUDIO
+        tensors = []
+        for data in parts:
+            tensor = data.embedding
+            if tensor.dtype != root.dtype or tensor.ndim != 2:
+                raise RuntimeError("Incompatible staged embedding formats")
+            if tensor.shape[1] != root.shape[1] and (
+                data.modality != Modality.AUDIO or tensor.shape[1] > root.shape[1]
+            ):
+                raise RuntimeError("Incompatible staged embedding widths")
+            if data.modality == Modality.IMAGE:
+                images = self._image_layouts(data, explicit_rows=explicit_rows)
+            elif data.modality == Modality.VIDEO:
+                videos = self._video_layouts(data, explicit_rows=explicit_rows)
+            else:
+                audios = self._audio_layouts(data)
+            tensors.append(tensor)
+
+        if len(tensors) == 1:
+            packed = root
+        elif tensors[-1].shape[1] == root.shape[1]:
+            packed = torch.cat(tensors)
+        else:
+            # DeepStack vision and audio have different native widths.
+            packed = torch.cat([part.reshape(-1, 1) for part in tensors])
+        return (images, videos, audios), packed
 
     async def _encode_modality(self, part_id, items, modality):
         request = {

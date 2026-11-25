@@ -925,6 +925,48 @@ class TestStagedNativeTransfer(CustomTestCase):
                 with self.subTest(model=model, backend=backend):
                     asyncio.run(run(model, backend))
 
+    def test_stage_digest_keeps_source_alive_without_blocking_dispatch_or_release(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+        from sglang.srt.disaggregation.encoder import grpc_server
+
+        async def run():
+            with self.native_encoder() as (svc, enc, *_):
+                svc._ttl = 10
+                req = pb.StageRequest(request_id="r", mm_items=["a", "b"])
+                other = (await svc.Stage(req, Mock())).transfer
+                started, resume = asyncio.Event(), threading.Event()
+                loop = asyncio.get_running_loop()
+                grpc_thread = threading.get_ident()
+                digest = grpc_server.staged_embedding_digest
+
+                def held_digest(modality, tensor):
+                    self.assertNotEqual(threading.get_ident(), grpc_thread)
+                    loop.call_soon_threadsafe(started.set)
+                    self.assertTrue(resume.wait(5))
+                    return digest(modality, tensor)
+
+                with patch.object(grpc_server, "staged_embedding_digest", held_digest):
+                    pending = asyncio.create_task(svc.Stage(req, Mock()))
+                    try:
+                        await asyncio.wait_for(started.wait(), 2)
+                        self.assertFalse(enc.encode_dispatch_lock.locked())
+                        await svc.Release(
+                            pb.ReleaseRequest(transfer_id=other.transfer_id), Mock()
+                        )
+                        pending.cancel()
+                        await asyncio.sleep(0)
+                        self.assertFalse(pending.done())
+                        (state,) = enc.req_states.values()
+                        self.assertIsNone(state.staged_transfer)
+                        self.assertIsNotNone(state.embedding_data.embedding)
+                    finally:
+                        resume.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await pending
+                self.assert_retired(svc, enc, [state])
+
+        asyncio.run(run())
+
     def test_tp_stage_drains_cancelled_dispatch_before_next_modality(self):
         from sglang.encoder.v1 import encoder_pb2 as pb
         from sglang.srt.disaggregation.encoder import grpc_server
