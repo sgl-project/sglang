@@ -18,6 +18,11 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.multimodal.media_budget import (
+    MAX_DECODED_BYTES,
+    ByteBudget,
+    check_decoded_bytes,
+)
 from sglang.srt.multimodal.media_io import get_video_bytes
 
 __all__ = [
@@ -270,6 +275,7 @@ def read_reference_video_frames(path: str, fps_target: int) -> np.ndarray:
         num_frames_source = len(video_reader)
         fps_source = video_reader.get_avg_fps()
         num_frames_target = int(num_frames_source / fps_source * fps_target)
+        check_decoded_bytes(num_frames_target * int(np.prod(video_reader[0].shape)))
         indices = get_frame_indices(
             num_frames_source, fps_source, num_frames_target, fps_target
         )
@@ -281,11 +287,15 @@ def read_reference_video_frames(path: str, fps_target: int) -> np.ndarray:
     with av.open(source) as container:
         stream = container.streams.video[0]
         fps_source = float(stream.average_rate)
-        frames_source = [
-            frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)
-        ]
+        frames_source = []
+        budget = ByteBudget(MAX_DECODED_BYTES)
+        for frame in container.decode(video=0):
+            budget.charge(frame.width * frame.height * 3)
+            frames_source.append(frame.to_ndarray(format="rgb24"))
     num_frames_source = len(frames_source)
     num_frames_target = int(num_frames_source / fps_source * fps_target)
+    if frames_source:
+        check_decoded_bytes(num_frames_target * frames_source[0].nbytes)
     indices = get_frame_indices(
         num_frames_source, fps_source, num_frames_target, fps_target
     )

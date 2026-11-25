@@ -44,9 +44,12 @@ from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 from sglang.srt.multimodal.media_budget import (
+    MAX_DECODED_BYTES,
+    MediaBudgetExceeded,
     charge_base64,
     charge_media_buffer,
     charge_media_bytes,
+    check_decoded_bytes,
 )
 from sglang.srt.utils.device import is_cuda, is_npu
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
@@ -584,10 +587,20 @@ def load_audio(
                 sample_rate=sr,
                 num_channels=1 if mono else None,
             )
-            samples = decoder.get_all_samples()
+            channels = 1 if mono else decoder.metadata.num_channels
+            if not channels or channels < 1:
+                raise ValueError("Audio channel count is unavailable")
+            start = decoder.metadata.begin_stream_seconds or 0.0
+            max_frames = MAX_DECODED_BYTES // (channels * 4)
+            samples = decoder.get_samples_played_in_range(
+                start_seconds=start, stop_seconds=start + (max_frames + 1) / sr
+            )
+            check_decoded_bytes(samples.data.nbytes)
             if mono:
                 return samples.data.squeeze(0).numpy()
             return samples.data.T.numpy()
+        except MediaBudgetExceeded:
+            raise
         except Exception as e:
             # torchcodec's bytes-buffer IO can fail on WAV files that carry
             # large trailing metadata chunks. Fall back to soundfile, which reads the PCM payload directly.
@@ -601,10 +614,14 @@ def load_audio(
     import torchaudio
 
     try:
-        if isinstance(source, bytes):
-            audio, original_sr = sf.read(BytesIO(source))
-        else:
-            audio, original_sr = sf.read(source)
+        with sf.SoundFile(
+            BytesIO(source) if isinstance(source, bytes) else source
+        ) as stream:
+            original_sr = stream.samplerate
+            check_decoded_bytes(stream.frames * stream.channels * 8)
+            resampled_frames = (stream.frames * sr + original_sr - 1) // original_sr
+            check_decoded_bytes(resampled_frames * (1 if mono else stream.channels) * 4)
+            audio = stream.read(frames=stream.frames)
     except sf.LibsndfileError as e:
         raise ValueError(f"Could not decode audio: {e}") from e
 

@@ -95,6 +95,8 @@ class VideoDecoderWrapper:
 
     def __getitem__(self, idx):
         """Return one NHWC uint8 frame (numpy on CPU, tensor on CUDA)."""
+        count = len(range(*idx.indices(len(self)))) if isinstance(idx, slice) else 1
+        self._check_batch_size(count)
         if _BACKEND == "torchcodec":
             frame = self._decoder[idx]
             data = frame.data if hasattr(frame, "data") else frame
@@ -118,11 +120,18 @@ class VideoDecoderWrapper:
             width = getattr(metadata, "width", None)
             if height and width:
                 return int(height), int(width)
-        shape = self[0].shape
+        shape = self._decoder[0].shape
         return int(shape[-3]), int(shape[-2])
+
+    def _check_batch_size(self, count):
+        from sglang.srt.multimodal.media_budget import check_decoded_bytes
+
+        height, width = self.frame_shape
+        check_decoded_bytes(height * width * 3 * count)
 
     def get_frames_at(self, indices: list):
         """Return NHWC uint8 frames (numpy on CPU, tensor on CUDA)."""
+        self._check_batch_size(len(indices))
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
             return batch.data if batch.data.is_cuda else batch.data.numpy()
@@ -133,6 +142,7 @@ class VideoDecoderWrapper:
         """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
         import torch
 
+        self._check_batch_size(len(indices))
         if (
             _BACKEND == "torchcodec"
             and self._num_decode_threads != 1

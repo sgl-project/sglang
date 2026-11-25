@@ -111,7 +111,13 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     preprocess_image,
 )
 from sglang.srt.environ import envs
-from sglang.srt.multimodal.media_budget import charge_base64, charge_media_bytes
+from sglang.srt.multimodal.media_budget import (
+    MAX_DECODED_BYTES,
+    ByteBudget,
+    charge_base64,
+    charge_media_bytes,
+    check_decoded_bytes,
+)
 from sglang.srt.utils.device import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -313,6 +319,14 @@ def _iter_video_frames_pyav(
         stream.codec_context.thread_type = "SLICE"
         stream.codec_context.thread_count = 1
 
+        # The tail path holds up to num_frames decoder-owned frames before RGB conversion.
+        if keep == "last":
+            check_decoded_bytes(
+                stream.codec_context.width
+                * stream.codec_context.height
+                * 3
+                * num_frames
+            )
         if keep == "first":
             frames = islice(container.decode(stream), num_frames)
         else:
@@ -334,7 +348,9 @@ def _iter_video_frames_pyav(
             else:
                 frames = deque(container.decode(stream), maxlen=num_frames)
 
+        budget = ByteBudget(MAX_DECODED_BYTES)
         for frame in frames:
+            budget.charge(frame.width * frame.height * 3)
             yield frame.to_ndarray(format="rgb24")
 
 

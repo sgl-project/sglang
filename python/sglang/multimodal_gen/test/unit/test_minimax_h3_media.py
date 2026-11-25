@@ -545,3 +545,28 @@ def test_plain_base64_material_skips_the_per_character_loop(tmp_path, monkeypatc
         condition_index=0,
     )
     assert Path(path).read_bytes() == data
+
+
+def test_reference_pcm_limit_rejects_longer_clip_and_preserves_shorter_one(
+    tmp_path, monkeypatch
+):
+    import wave
+
+    from sglang.srt.multimodal import media_budget
+
+    path = tmp_path / "reference.wav"
+    with wave.open(str(path), "wb") as source:
+        source.setnchannels(2)
+        source.setsampwidth(2)
+        source.setframerate(8000)
+        source.writeframes(bytes(800 * 2 * 2))
+    # 3200 bytes fit exactly 400 stereo float32 frames at this sample rate.
+    monkeypatch.setattr(reference_encoding, "MAX_DECODED_BYTES", 3200)
+    monkeypatch.setattr(media_budget, "MAX_DECODED_BYTES", 3200)
+    kwargs = {"material_chain": "audio", "source_sample_rate": 8000}
+    output, rate = reference_encoding._load_waveform(
+        str(path), max_duration_seconds=0.05, **kwargs
+    )
+    assert rate == 8000 and output.shape == (2, 400)
+    with pytest.raises(media_budget.MediaBudgetExceeded):
+        reference_encoding._load_waveform(str(path), **kwargs)

@@ -9,8 +9,17 @@ from threading import Lock
 MAX_REQUEST_BYTES = 1280 << 20
 
 
+# Limit the materialized PCM or RGB output of a decode independently of ingress.
+MAX_DECODED_BYTES = 1280 << 20
+
+
 class MediaBudgetExceeded(ValueError):
     pass
+
+
+def check_decoded_bytes(size: int):
+    if size > MAX_DECODED_BYTES:
+        raise MediaBudgetExceeded("Decoded media exceeds the byte budget")
 
 
 class ByteBudget:

@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from sglang.multimodal_gen.configs.sample.kandinsky6_sr_resolution import (
     ASPECT_MISMATCH_TOLERANCE,
 )
+from sglang.srt.multimodal.media_budget import MAX_DECODED_BYTES, ByteBudget
 
 logger = logging.getLogger(__name__)
 # trained on 5 s at 24 fps; select at most 121 frames, aligned to 1+8k
@@ -86,6 +87,7 @@ def decode_clip(
     """Decode the first video stream into the aligned uint8 clip the SR model expects."""
     import av
 
+    budget = ByteBudget(MAX_DECODED_BYTES)
     frames: list[torch.Tensor] = []
     seen = 0
     with av.open(str(path), mode="r") as container:
@@ -101,6 +103,7 @@ def decode_clip(
         stream.thread_type = "AUTO"
         for frame in container.decode(stream):
             if selector.keep(seen):
+                budget.charge(frame.width * frame.height * 3)
                 array = frame.to_ndarray(format="rgb24")
                 frames.append(torch.from_numpy(array).permute(2, 0, 1))
                 selector.mark_kept()
@@ -134,6 +137,7 @@ def extract_source_audio(
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
     limit = None if max_seconds is None else round(max_seconds * sample_rate)
+    budget = ByteBudget(MAX_DECODED_BYTES)
     chunks: list[np.ndarray] = []
     produced = 0
     with av.open(str(path), mode="r") as container:
@@ -142,6 +146,7 @@ def extract_source_audio(
         resampler = av.AudioResampler(format="fltp", layout="mono", rate=sample_rate)
         for frame in container.decode(audio=0):
             for resampled in resampler.resample(frame):
+                budget.charge(resampled.samples * 4)
                 chunk = resampled.to_ndarray().reshape(-1)
                 chunks.append(chunk)
                 produced += chunk.shape[0]
@@ -149,6 +154,7 @@ def extract_source_audio(
                 break
         else:
             for resampled in resampler.resample(None):
+                budget.charge(resampled.samples * 4)
                 chunks.append(resampled.to_ndarray().reshape(-1))
     if not chunks:
         return None

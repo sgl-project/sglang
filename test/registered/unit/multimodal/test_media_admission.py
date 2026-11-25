@@ -203,5 +203,28 @@ def test_pinned_https_preserves_original_sni_host_and_redirect_policy(
         thread.join()
 
 
+@pytest.mark.parametrize("backend", ["soundfile", "torchcodec"])
+def test_ordinary_pcm_has_a_decoded_sample_budget(monkeypatch, backend):
+    import numpy as np
+    import soundfile as sf
+
+    from sglang.srt.multimodal import media_budget as budget_module
+
+    stream = io.BytesIO()
+    sf.write(stream, np.zeros((64, 2), dtype="float32"), 16000, format="WAV")
+    payload = stream.getvalue()
+    monkeypatch.setattr(media_io, "_BACKEND", backend)
+
+    def limit(n):
+        monkeypatch.setattr(media_io, "MAX_DECODED_BYTES", n)
+        monkeypatch.setattr(budget_module, "MAX_DECODED_BYTES", n)
+
+    limit(4096)
+    assert media_io.load_audio(payload, sr=16000, mono=False).shape == (64, 2)
+    limit(128)
+    with pytest.raises(MediaBudgetExceeded):
+        media_io.load_audio(payload, sr=16000, mono=False)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
