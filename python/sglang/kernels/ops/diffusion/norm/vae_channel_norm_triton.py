@@ -18,6 +18,7 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
 from sglang.kernels.ops.diffusion.norm.channel_rmsnorm_silu_nhwc_jit import (
+    has_same_layout,
     is_channels_last_dense,
 )
 
@@ -165,7 +166,7 @@ def can_use_bias_residual_add_triton(
         and h.device == y.device
         and bias.device == y.device
         and h.shape == y.shape
-        and h.stride() == y.stride()
+        and has_same_layout(y, h)
         and bias.numel() == y.shape[1]
         and bias.is_contiguous()
         and (is_channels_last_dense(y) or y.is_contiguous())

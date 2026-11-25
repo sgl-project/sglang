@@ -74,6 +74,24 @@ def test_bias_residual_add_matches_eager_bits(channels, spatial, channels_last):
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+def test_bias_residual_add_ignores_size1_strides():
+    torch.manual_seed(0)
+    y = _channels_last((1, 96, 1, 32, 32))
+    h0 = _channels_last((1, 96, 1, 32, 32))
+    # only the stride of the size-1 frame dim differs
+    h = h0.as_strided(
+        h0.shape,
+        (h0.stride(0), h0.stride(1), h0.stride(2) + 7, h0.stride(3), h0.stride(4)),
+    )
+    bias = torch.randn(96, device="cuda", dtype=torch.bfloat16)
+    assert h.stride() != y.stride()
+    assert can_use_bias_residual_add_triton(y, bias, h)
+    expected = (y + bias.view(96, 1, 1, 1)) + h
+    actual = bias_residual_add_triton(y, bias, h)
+    assert actual.stride() == y.stride()
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
 def test_rejects_unsupported_inputs():
     x = _channels_last((1, 96, 8, 8))
     gamma = _vector(96, 4)
