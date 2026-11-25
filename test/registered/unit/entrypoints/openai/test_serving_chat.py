@@ -405,6 +405,26 @@ class TestPythonChatTemplateSegments(CustomTestCase):
         self.assertEqual(ids, self.tokenizer.encode(rendered))
         self.assertEqual(documents_ids, ids)
 
+    def test_final_assistant_turn_preserves_reasoning(self):
+        """A final assistant reply with reasoning used to render as a user turn."""
+        self.tokenizer.add_tokens(["<think>", "</think>", "reason", "answer"])
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                *self.messages,
+                {
+                    "role": "assistant",
+                    "reasoning_content": "reason",
+                    "content": "answer",
+                },
+            ],
+        )
+        result = self.chat._apply_jinja_template(request, None, False)
+        suffix = self.tokenizer.encode(
+            "<|assistant|><think>reason</think>answer<|assistant|><think>"
+        )
+        self.assertEqual(result.prompt_ids[-len(suffix) :], suffix)
+
 
 class ServingChatTestCase(CustomTestCase):
     # ------------- common fixtures -------------

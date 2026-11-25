@@ -532,8 +532,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         If continue_final_message is enabled and the last message is from assistant,
         extract its content and remove it from the message list.
-        If continue_final_message is False and the last message is from assistant,
-        convert it to a user message to ensure the last message is always from user.
+        Otherwise, convert a final text reply to a user message only when
+        it has no reasoning_content for the template to render.
 
         Only processes text-based content (strings), ignoring multimodal content (lists).
 
@@ -555,7 +555,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Extract content and remove the assistant message
                     assistant_prefix = last_content
                     messages = messages[:-1]
-                else:
+                elif messages[-1].get("reasoning_content") is None:
                     # Convert the last assistant message to user message
                     messages[-1] = {"role": "user", "content": last_content}
         return messages, assistant_prefix
