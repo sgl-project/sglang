@@ -6,6 +6,10 @@ penalty index, its seed, and the watermark algorithm's per-request values.
   one `gather`, so a step with no admission copies none of them to the device.
 - Writes and gathers are enqueued on the scheduler's stream in host order: a
   launch's gather runs before a later admission rewrites a reused slot.
+- A graph reads the table at replay, on the forward stream. Under overlap a
+  later admission may rewrite a slot before an earlier replay reads it; only a
+  finished, retracted, or aborted row's slot is reused, so the row it changes is
+  discarded, and the target sampler reads the launch's gather.
 - The host keeps what the batch-level flags and counts need, so a launch derives
   them without a pass over its requests or a device sync.
 - A captured graph reads the table by its batch's slots instead (see
@@ -120,7 +124,7 @@ class SamplingParamsTable:
 
     def seeds(self, slots: torch.Tensor) -> torch.Tensor:
         """[n] int64, capturable."""
-        return _seeds(
+        return _join_seed_halves(
             self.values[self.SEED_LO][slots], self.values[self.SEED_HI][slots]
         )
 
@@ -194,7 +198,9 @@ class SamplingParamsPool:
         floats = values.view(torch.float32)
         seeds = None
         if _deterministic() or _any_row_with_seed(self.has_seed_host[slots], top_ks):
-            seeds = _seeds(values[self.table.SEED_LO], values[self.table.SEED_HI])
+            seeds = _join_seed_halves(
+                values[self.table.SEED_LO], values[self.table.SEED_HI]
+            )
         return SamplingRows(
             temperatures=floats[self.table.TEMPERATURE].view(-1, 1),
             top_ps=floats[self.table.TOP_P],
@@ -219,7 +225,7 @@ class SamplingParamsPool:
         )
 
 
-def _seeds(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
+def _join_seed_halves(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
     """[n] int64 seeds from their int32 halves."""
     return torch.stack((lo, hi), dim=1).view(torch.int64).view(-1)
 

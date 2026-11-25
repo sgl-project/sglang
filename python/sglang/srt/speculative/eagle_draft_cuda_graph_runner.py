@@ -256,7 +256,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             # temperature 0 to temperature=1.0 with top_k=1.
             # TOP_K_ALL, not -1: -1 is not a top_k this pipeline ever carries
             # (SamplingParams rewrites it), and it would read as top_k <= 1, i.e.
-            # greedy, for the padded rows and for a run that never reads them.
+            # greedy, for a run that never reads them.
             self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
 
             if self.require_gathered_buffer:

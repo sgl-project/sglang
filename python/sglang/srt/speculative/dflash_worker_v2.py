@@ -2446,11 +2446,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                             window_locs=layer_window_locs(
                                 self.draft_model_runner.token_to_kv_pool,
                                 attn.attn.layer_id,
-                                (
-                                    swa_cache_loc.view_as(cache_loc_2d)
-                                    if swa_cache_loc is not None
-                                    else None
-                                ),
+                                swa_cache_loc.view_as(cache_loc_2d)
+                                if swa_cache_loc is not None
+                                else None,
                             ),
                             physical=True,
                         ),
@@ -2658,11 +2656,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                         window_locs=layer_window_locs(
                             token_to_kv_pool,
                             attn.layer_id,
-                            (
-                                ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
-                                if ctx_swa_cache_loc is not None
-                                else None
-                            ),
+                            ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
+                            if ctx_swa_cache_loc is not None
+                            else None,
                         ),
                         physical=True,
                     ),

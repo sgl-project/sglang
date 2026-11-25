@@ -24,6 +24,7 @@ import torch
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling import sampling_params_pool as sp_pool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_draft_cuda_graph_runner as draft_graph
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -431,6 +432,37 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         output = runner.execute(forward_batch)
 
         self.assertIs(output[-1], pooled_probs)
+
+    def test_rejection_sampling_params_are_read_from_the_slots(self):
+        """The graph reads each row's params from its slot of the sampling table, so
+        a replay after a slot is rewritten samples with its new params."""
+        with patch.object(sp_pool, "num_watermark_fields", return_value=0):
+            table = sp_pool.SamplingParamsTable(8, "cpu")
+        floats = table.values.view(torch.float32)
+        seeds = torch.tensor([7, 2**40 + 3], dtype=torch.int64).view(torch.int32)
+        for slot, temperature, top_k, (lo, hi) in (
+            (5, 0.7, 20, seeds[:2].tolist()),
+            (2, 0.9, 1, seeds[2:].tolist()),
+        ):
+            floats[table.TEMPERATURE, slot] = temperature
+            table.values[table.TOP_K, slot] = top_k
+            table.values[table.SEED_LO, slot] = lo
+            table.values[table.SEED_HI, slot] = hi
+        runner = EAGLEDraftCudaGraphRunner.__new__(EAGLEDraftCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(sampling_params_table=table)
+        )
+        runner.temperatures = torch.ones((CAPTURE_BS, 1))
+        runner.top_ks = torch.zeros((CAPTURE_BS,), dtype=torch.int32)
+        runner.buffers = SimpleNamespace(
+            sampling_seed=torch.zeros((CAPTURE_BS,), dtype=torch.int64)
+        )
+
+        runner._read_sampling_params(torch.tensor([5, 2]))
+
+        torch.testing.assert_close(runner.temperatures[:2, 0], torch.tensor([0.7, 0.9]))
+        self.assertEqual(runner.top_ks[:2].tolist(), [20, 1])
+        self.assertEqual(runner.buffers.sampling_seed[:2].tolist(), [7, 2**40 + 3])
 
 
 if __name__ == "__main__":

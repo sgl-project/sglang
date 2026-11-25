@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -13,7 +13,6 @@ from sglang.srt.kernel_plugins.nvidia.dspark_binding import (
     bind_dspark_draft_strategy,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     block_accept_estimate_enabled,
 )
@@ -31,6 +30,9 @@ from sglang.srt.speculative.online_acceptance_estimator import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.utils import is_xpu
+
+if TYPE_CHECKING:
+    from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +105,9 @@ class DsparkDraftSampler:
         self.sharded_accept = sharded_accept
         self._noise = noise
         self._tp_sync = tp_sync
-        # Written by the graph from the batch's slots; the proposer reads them after.
         self.sampling_params_table = sampling_params_table
         self.force_greedy = ForceGreedy(device)
+        # Written by the graph from the batch's slots; the proposer reads them after.
         self.params = DraftParams(
             temperatures=torch.ones((self.max_bs,), dtype=torch.float32, device=device),
             greedy_mask=torch.ones((self.max_bs,), dtype=torch.bool, device=device),

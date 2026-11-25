@@ -203,8 +203,7 @@ class TestSeeds(_PoolTestCase):
         self.assertEqual(_gather(pool, [1]).sampling_seed.tolist(), [123])
         self.assertIsNone(_gather(pool, [2]).sampling_seed)
         self.assertIsNone(_gather(pool, []).sampling_seed)
-        # The algorithm is fixed per server; a new pool, so no cached gather
-        # outlives the change.
+        # The algorithm is fixed per server, so a server under it builds a new pool.
         self.spec_ns.speculative_algorithm = "EAGLE"
         pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write([_req(1, seed=123, top_k=50)])
