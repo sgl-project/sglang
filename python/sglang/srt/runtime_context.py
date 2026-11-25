@@ -520,6 +520,17 @@ def is_scheduler_io_rank() -> bool:
     )
 
 
+def is_control_broadcast_local() -> bool:
+    """Whether each attention-DP group leader receives control requests from
+    the DP controller and broadcasts them within its group, instead of the
+    first leader broadcasting them over the whole TP group."""
+    parallel = get_parallel()
+    return parallel.attn_dp_enabled and (
+        parallel.enable_dp_attention_local_control_broadcast
+        or get_exec().moe.is_ep_scale_joiner
+    )
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -1419,8 +1430,8 @@ def _validated_role_ns_mode(value: str) -> str:
 
 def _role_ns_mode_from_env() -> str:
     # Resolved once at import so the config_bag gate stays a dynamo-prunable
-    # constant; validated fail-loud here (EnvField's warn-and-default parse
-    # would silently turn a typo into "off").
+    # constant; validated fail-loud here (EnvStr accepts any string, so a typo
+    # would otherwise silently read as "off").
     from sglang.srt.environ import envs
 
     return _validated_role_ns_mode(envs.SGLANG_ROLE_NAMESPACES.get())

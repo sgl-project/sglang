@@ -18,17 +18,7 @@ from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
-from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
-    ListLorasReq,
-    MergeLoraWeightsReq,
-    SetLoraReq,
-    ShutdownReq,
-    UnmergeLoraWeightsReq,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    format_lora_message,
-    save_outputs,
-)
+from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
 )
@@ -47,16 +37,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_generation_timer,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
-
-# re-export LoRA protocol types for backward compatibility
-__all__ = [
-    "SetLoraReq",
-    "MergeLoraWeightsReq",
-    "UnmergeLoraWeightsReq",
-    "ListLorasReq",
-    "ShutdownReq",
-    "format_lora_message",
-]
 
 logger = init_logger(__name__)
 

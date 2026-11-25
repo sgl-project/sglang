@@ -1,6 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import ipaddress
 import logging
 import os
 import socket
@@ -42,14 +41,6 @@ def upload_without_sync(batch, device):
         }
     )
     return pinned.to(device, non_blocking=True)
-
-
-def is_valid_ipv6_address(address: str) -> bool:
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ValueError:
-        return False
 
 
 def normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:

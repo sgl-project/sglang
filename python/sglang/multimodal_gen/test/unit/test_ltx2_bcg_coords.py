@@ -273,6 +273,8 @@ class TestLTX2GuidanceBCG(CustomTestCase):
         stage.post_forward_for_ti2v_task = lambda batch, args, mask, latents, z: latents
         # the stub DiT reads the prompt itself instead of projecting cached K/V
         stage._use_cached_ltx2_prompt_kv = lambda ctx, step, kwargs: kwargs
+        # the stub DiT has no blocks to resume from: model the no-sharing schedule
+        stage._ltx2_stg_shared_prefix_block = lambda *_: None
         args = SimpleNamespace(
             enable_cfg_parallel=False,
             pipeline_class_name=(

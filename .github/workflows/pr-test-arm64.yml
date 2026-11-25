@@ -79,10 +79,10 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Build container
+        env:
+          PR_REPO: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF: ${{ github.head_ref }}
         run: |
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
-
           docker build \
             ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
             ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
