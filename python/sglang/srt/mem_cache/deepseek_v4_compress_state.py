@@ -44,12 +44,6 @@ class KVAndScore:
         assert kv.shape == score.shape
         return KVAndScore(torch.cat([kv, score], dim=-1))
 
-    def new_empty(self, new_shape) -> KVAndScore:
-        assert new_shape[-1] == self._item_size
-        new_shape = list(new_shape)
-        new_shape[-1] = 2 * self._item_size
-        return KVAndScore(self.kv_score.new_empty(new_shape, requires_grad=False))
-
     def __getitem__(self, index) -> KVAndScore:
         return KVAndScore(self.kv_score[index])
 
@@ -59,27 +53,6 @@ class KVAndScore:
     def clear(self):
         self.kv.zero_()
         self.score.fill_(float("-inf"))
-
-    def view(self, *args):
-        args = list(args)
-        if isinstance(args[-1], int) and args[-1] != -1:
-            args[-1] = 2 * self._item_size
-        return KVAndScore(self.kv_score.view(*args))
-
-    def clone(self) -> KVAndScore:
-        return KVAndScore(self.kv_score.clone())
-
-    @staticmethod
-    def cat(tensors: list[KVAndScore], dim: int) -> KVAndScore:
-        assert dim != -1, "Concatenation along last dim is not supported."
-        assert len(tensors) > 0, "At least one tensor is required for concatenation."
-        item_size = tensors[0]._item_size
-        for v in tensors:
-            assert v._item_size == item_size, (
-                "All tensors must have the same item size."
-            )
-
-        return KVAndScore(torch.cat([v.kv_score for v in tensors], dim=dim))
 
 
 def request_scoped_state_transfer_indices(
