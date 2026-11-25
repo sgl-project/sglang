@@ -2714,7 +2714,11 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             or self.adaln_cache is not None
             or get_tp_world_size() > 1
             or torch.compiler.is_compiling()
-            or torch.cuda.is_current_stream_capturing()
+            # torch.cuda's capture query fails on builds without a GPU
+            or (
+                adaln_input.device.type == "cuda"
+                and torch.cuda.is_current_stream_capturing()
+            )
             or envs.SGLANG_CACHE_DIT_ENABLED
             or hasattr(self, "_sglang_cache_dit_adapter")
             or is_layerwise_offloaded_module(self)

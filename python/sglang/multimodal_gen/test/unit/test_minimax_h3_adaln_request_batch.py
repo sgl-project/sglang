@@ -118,9 +118,6 @@ def _assert_same_params(got, expected):
 def request_batch(monkeypatch):
     monkeypatch.setattr(h3, "_H3_ADALN_REQUEST_BATCH", True)
     monkeypatch.setattr(h3, "_H3_ADALN_REQUEST_CHECK", False)
-    if not torch.cuda.is_available():
-        # The capture query needs a device runtime; there is nothing to capture here.
-        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
 
 def _record_rows(model) -> list[list[int]]:
@@ -269,8 +266,12 @@ def _fallback(case, model, monkeypatch):
 def test_unsupported_configurations_fall_back_without_building(
     case, request_batch, monkeypatch
 ):
-    model = _model(_SMALL, 2, "cpu")
-    steps = _step_timesteps(4, "cpu")
+    # graph capture applies to CUDA tensors only
+    device = "cuda" if case == "graph_capture" else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    model = _model(_SMALL, 2, device)
+    steps = _step_timesteps(4, device)
     model.prepare_adaln_plans(steps)
     request = model.__dict__["_h3_adaln_request"]
     x = _adaln_input(model, steps[0])
