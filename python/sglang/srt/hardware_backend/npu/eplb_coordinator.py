@@ -182,8 +182,8 @@ class AsyncEplbCoordinator:
             submitted = self.runtime.record_source_ready()
             staged = self._executor.submit(self.runtime.stage, layer, submitted)
         except Exception as error:
-            self._error = error
-            return
+            # Peers may already be waiting for our transfers on this layer.
+            self._fatal(f"EPLB could not launch transfers for layer {layer}", error)
         self._future = staged
         if submitted is not None:
             self._wait_for_submission(submitted, staged)

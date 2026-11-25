@@ -409,6 +409,11 @@ def validate_async_eplb_args(cfg) -> None:
         )
     if cfg.ep_dispatch_algorithm not in (None, "static", "dynamic"):
         raise ValueError("Async NPU EPLB supports static or dynamic dispatch")
+    if cfg.weight_cache_mode != "off":
+        raise ValueError(
+            "--eplb-async-rebalance requires --weight-cache-mode off because "
+            "expert migration writes to model weights in place"
+        )
     if (
         cfg.pp_size != 1
         or cfg.elastic_ep_backend is not None

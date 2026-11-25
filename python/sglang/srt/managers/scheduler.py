@@ -7002,6 +7002,10 @@ class Scheduler(
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         action = recv_req.action
+        if _is_npu and get_exec().moe.eplb_async_rebalance:
+            # Manual dumps and resets run on the scheduler stream; counts and
+            # routing updates from the last forward must be visible here.
+            self.wait_for_launched_forward()
         if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
         elif action == ExpertDistributionReqType.STOP_RECORD:

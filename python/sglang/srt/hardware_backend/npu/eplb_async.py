@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     compute_logical_to_rank_dispatch_physical_map,
@@ -398,21 +399,32 @@ class NpuEplbRuntime:
         self.stage_seconds = self.install_enqueue_seconds = 0.0
         self.interleaved_layers = 0
         self._owner_stream = self.device_module.current_stream()
-        # dump_record returns a fresh, globally reduced tensor. Keep it in the
-        # worker closure and copy it on the migration stream only on rank 0.
+        # Only the root needs the reduced counts, until its D2H copy completes.
         event_error = None
         if self.rank == 0:
             try:
                 self._owner_ready.record(self._owner_stream)
             except Exception as error:
                 event_error = str(error)
+        else:
+            counts = None
 
         def compute():
+            nonlocal counts
             error = event_error
             placement = None
             if self.rank == 0 and error is None:
                 try:
-                    placement = self._plan_on_root(counts)
+                    host_counts = self._copy_counts_to_host(counts)
+                    counts = None
+                    if host_counts.any().item():
+                        placement = plan_migration(
+                            host_counts,
+                            self.metadata.physical_to_logical_map_cpu,
+                            self.spec,
+                            self.ranks_per_node,
+                            self.layer_ids,
+                        )
                 except Exception as exc:
                     error = str(exc)
             return _broadcast_placement(
@@ -426,21 +438,11 @@ class NpuEplbRuntime:
 
         return compute
 
-    def _plan_on_root(self, counts):
+    def _copy_counts_to_host(self, counts):
         self.device_module.set_device(self.device)
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
-            host = counts.cpu()
-        if not host.any().item():
-            return None
-
-        return plan_migration(
-            host,
-            self.metadata.physical_to_logical_map_cpu,
-            self.spec,
-            self.ranks_per_node,
-            self.layer_ids,
-        )
+            return counts.cpu()
 
     def prepare(self, placement: MigrationPlacement | None) -> tuple[int, ...]:
         if placement is None:
@@ -564,6 +566,7 @@ class NpuEplbRuntime:
         start = time.perf_counter()
         routing = self._routing_plan
         assert routing is not None
+        get_global_expert_distribution_recorder().before_layer_install(layer)
         writeback()
         _install_routing_layer(
             self.metadata, routing.host_rows, layer, routing.device_rows

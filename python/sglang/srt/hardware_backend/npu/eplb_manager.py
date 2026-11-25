@@ -9,6 +9,8 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderReal,
+    _StatAccumulator,
+    _convert_global_physical_count_to_logical_count,
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -23,24 +25,68 @@ from sglang.srt.runtime_context import get_exec
 logger = logging.getLogger(__name__)
 
 
+class _AsyncStatAccumulator(_StatAccumulator):
+    """Keep the routing row used by samples recorded before a layer moves."""
+
+    def __init__(self, metadata, rank):
+        super().__init__(metadata, rank)
+        self.window_samples = 0
+        self._previous_layouts = {}
+
+    def append(self, forward_pass_id, gatherer_key, single_pass_data, outputs):
+        super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
+        self.window_samples += 1
+
+    def before_layer_install(self, layer):
+        # Each layer moves once per epoch. Reset discards its history.
+        if self.window_samples:
+            old_row = self._expert_location_metadata.physical_to_logical_map_cpu[layer]
+            self._previous_layouts[layer] = (self.window_samples, old_row.clone())
+
+    def reset(self):
+        super().reset()
+        self.window_samples = 0
+        self._previous_layouts.clear()
+
+    def _logical_counts(self, physical_counts):
+        logical = super()._logical_counts(physical_counts)
+        if not self._previous_layouts:
+            return logical
+        # A manual dump can fall between layer installs. Correct only samples
+        # still in the ring that predate each install, including wraparound.
+        capacity = physical_counts.size(0)
+        cursor = self._global_physical_count_of_buffered_step._curr_index
+        for layer, (at_install, old_row) in self._previous_layouts.items():
+            newer = self.window_samples - at_install
+            retained = min(at_install, capacity - newer)
+            if retained <= 0:
+                continue
+            first = (cursor - newer - retained) % capacity
+            end = first + retained
+            old_map = old_row.unsqueeze(0).to(physical_counts.device)
+            for lo, hi in ((first, min(end, capacity)), (0, end - capacity)):
+                if lo < hi:
+                    rows = physical_counts[lo:hi, layer : layer + 1]
+                    logical[lo:hi, layer : layer + 1].copy_(
+                        _convert_global_physical_count_to_logical_count(
+                            rows, 1, logical.size(-1), old_map
+                        )
+                    )
+        return logical
+
+
 class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
-    """Count the target forwards in the current recorder window."""
-
-    window_samples = 0
-
     def __init__(self, metadata, rank):
         if metadata is None:
             raise ValueError("Async EPLB requires expert location metadata")
-        super().__init__(metadata, rank)
+        super().__init__(metadata, rank, accumulator_factory=_AsyncStatAccumulator)
 
-    def _on_forward_pass_end(self, forward_pass_id, outputs):
-        super()._on_forward_pass_end(forward_pass_id, outputs)
-        if self._recording and self._record_current_pass:
-            self.window_samples += 1
+    @property
+    def window_samples(self):
+        return self._accumulator.window_samples
 
-    def _reset(self):
-        super()._reset()
-        self.window_samples = 0
+    def before_layer_install(self, layer):
+        self._accumulator.before_layer_install(layer)
 
     def mark_statistics_group_warmed(self):
         # NPU startup already warmed TP and emptied the allocator cache.
@@ -166,6 +212,7 @@ class NpuAsyncEPLBManager(EPLBManager):
             return
         coordinator.control.wait_seconds = 0.0
         coordinator.start(coordinator.runtime.planner(snapshot["logical_count"]))
+        del snapshot
         try:
             while True:
                 yield

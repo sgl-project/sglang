@@ -3,13 +3,14 @@
 
 import os
 
-from sglang.srt.runtime_context import get_disagg, get_exec
+from sglang.srt.runtime_context import get_context, get_disagg, get_exec
 
 
 def eplb_reuses_world_group() -> bool:
     # Disaggregated serving can use the WORLD device group for KV transfers.
     return (
-        get_exec().moe.eplb_async_rebalance
+        get_context().is_config_namespace_published("exec")
+        and get_exec().moe.eplb_async_rebalance
         and get_disagg().disaggregation_mode == "null"
     )
 
