@@ -44,6 +44,14 @@ def supports_native_heads() -> bool:
     return hasattr(flash_mla, "sparse_decode_num_sm_parts")
 
 
+def supports_sparse_prefill_token_packing() -> bool:
+    """Whether the installed wheel's legacy sparse prefill runs on the real head
+    count with token packing (``flash_mla_sparse_fwd_packed``) and has the index
+    pack and V3.2 dequant operators that feed it."""
+    has = getattr(flash_mla, "has_sparse_prefill_token_packing", None)
+    return has is not None and bool(has())
+
+
 def sparse_decode_num_sm_parts(b: int, s_q: int, h_q: int) -> int:
     """Rows of the split-KV schedule the legacy sparse decode kernel expects."""
     return flash_mla.sparse_decode_num_sm_parts(b, s_q, h_q)
@@ -261,3 +269,24 @@ def flash_mla_sparse_fwd_small_heads(
     return flash_mla.flash_mla_sparse_fwd_small_heads(
         q, kv, indices, sm_scale, active_heads, attn_sink, topk_length
     )
+
+
+def flash_mla_sparse_fwd_packed(
+    q, kv, indices, sm_scale, heads_per_group=0, topk_length=None, out=None
+):
+    """Output-only BF16 sparse prefill on the real head count (no padding to
+    64 heads); ``heads_per_group`` > 0 reads token-packed ``indices``."""
+    return flash_mla.flash_mla_sparse_fwd_packed(
+        q, kv, indices, sm_scale, heads_per_group, topk_length, out
+    )
+
+
+def flash_mla_sparse_pack_indices(indices, group, packed=None, lengths=None):
+    """Deterministic union of the top-k lists of each ``group`` consecutive rows,
+    in the token-packing index format: (packed, lengths)."""
+    return flash_mla.flash_mla_sparse_pack_indices(indices, group, packed, lengths)
+
+
+def flash_mla_dequant_v32_kv(kv, out=None, rows=None):
+    """V3.2 FP8 pages [pages, 64, 1, 656] to BF16 rows [n, 1, 576]."""
+    return flash_mla.flash_mla_dequant_v32_kv(kv, out, rows)
