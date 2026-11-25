@@ -22,6 +22,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
     with_phase,
 )
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     parse_connector_type,
 )
@@ -167,6 +168,27 @@ def apply_cuda_graph_compatibility(server_args: Any):
         disable_full_prefill_cudagraph_if_incompatible(server_args)
 
 
+def _is_kimi_k31_dcp_on_cuda(server_args: Any) -> bool:
+    """Kimi-K3.1 with decode context parallelism on CUDA."""
+    from sglang.srt.configs.model_config import is_kimi_k31
+
+    return (
+        get_platform().is_cuda
+        and resolving_view(server_args).dcp_size > 1
+        and is_kimi_k31(model_config_of(server_args).hf_config)
+    )
+
+
+def _kda_keeps_breakable_prefill(server_args: Any) -> bool:
+    """KDA models whose prefill is BCG-validated: GLM-5.3 Flash, and Kimi-K3.1
+    with decode context parallelism on CUDA. Other KDA models stay off by default."""
+    architectures = model_config_of(server_args).hf_config.architectures
+    return (
+        "Glm5NextForConditionalGeneration" in architectures
+        or _is_kimi_k31_dcp_on_cuda(server_args)
+    )
+
+
 def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     """Breakable (segmented capture, no torch.compile). Breakable enforces
     memory-saver rejection in its own __init__; config-time rules can be
@@ -175,28 +197,17 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
 
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
-        is_kimi_k31,
         uses_compressed_kv_attention,
         uses_kda_attention,
     )
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
-    from sglang.srt.utils.device import is_hip
-
-    def kimi_k31_on_cuda() -> bool:
-        """Kimi-K3.1's breakable prefill capture is validated on CUDA, with and
-        without decode context parallelism."""
-        return is_kimi_k31(model_config_of(server_args).hf_config) and not is_hip()
 
     rules = [
         (
             "KDA hybrid linear attention",
-            # GLM-5.3 Flash and Kimi-K3.1 on CUDA are BCG-validated; other KDA
-            # models stay off by default.
             lambda: (
                 uses_kda_attention(model_config_of(server_args).hf_config)
-                and "Glm5NextForConditionalGeneration"
-                not in model_config_of(server_args).hf_config.architectures
-                and not kimi_k31_on_cuda()
+                and not _kda_keeps_breakable_prefill(server_args)
             ),
         ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
@@ -222,7 +233,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         # stays opt-in under DCP except for models validated with it.
         (
             "decode context parallel (dcp_size > 1)",
-            lambda: cfg.dcp_size > 1 and not kimi_k31_on_cuda(),
+            lambda: cfg.dcp_size > 1 and not _is_kimi_k31_dcp_on_cuda(server_args),
         ),
         # TBO capture is unsupported.
         (
