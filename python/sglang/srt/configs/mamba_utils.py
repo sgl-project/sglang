@@ -111,6 +111,7 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
 class BaseLinearStateParams(ABC):
     dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
     layers: list[int]
+    is_mamba2_ssd: bool = False
 
     @property
     def mamba_cache_per_req(self) -> int:
@@ -134,7 +135,13 @@ class BaseLinearStateParams(ABC):
         h_k = self.shape.num_k_heads_per_tp
         conv_b = self.dtype.conv.itemsize
         fp32_b = 4
-        if self.is_kda:
+        if self.is_mamba2_ssd:
+            per_layer = record_len * (
+                hv * v_dim * conv_b
+                + self.mamba2_local_groups * k_dim * conv_b
+                + 2 * hv * fp32_b
+            )
+        elif self.is_kda:
             per_layer = (
                 hv * record_len * v_dim * conv_b  # rawv
                 + h_k * record_len * k_dim * conv_b  # rawk
@@ -155,6 +162,12 @@ class BaseLinearStateParams(ABC):
                     + h_k * record_len * k_dim * conv_b  # normalized-k low part
                 )
         return per_layer * len(self.layers)
+
+    @property
+    def mamba2_local_groups(self) -> int:
+        """B/C groups per attn-TP rank, including head-shard extension groups."""
+        hv, v_dim, k_dim = self.shape.temporal
+        return (self.shape.conv[0][0] - hv * v_dim) // (2 * k_dim)
 
     @property
     def is_kda(self) -> bool:

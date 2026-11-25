@@ -1197,6 +1197,11 @@ class KVCacheConfigurator:
             layer_ids = tuple(i for i in cache_params.layers if start <= i < end)
             geometry = StateGeometry.of(cache_params)
             mamba = get_exec().mamba
+            if self._mamba2_replayssm_spec():
+                raise ValueError(
+                    "--enable-linear-replayssm-spec for Mamba2 models does not "
+                    "support --enable-unified-memory yet."
+                )
             replay_spec = mamba.enable_linear_replayssm_spec and (
                 self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
             )
@@ -1514,6 +1519,23 @@ class KVCacheConfigurator:
             ),
         )
 
+    def _replayssm_spec_model(self) -> bool:
+        """--enable-linear-replayssm-spec applies to this model's state pool."""
+        if not get_exec().mamba.enable_linear_replayssm_spec:
+            return False
+        return (
+            self.hybrid_gdn_config is not None
+            or self.hybrid_kda_config is not None
+            or self._mamba2_replayssm_spec()
+        )
+
+    def _mamba2_replayssm_spec(self) -> bool:
+        return (
+            get_exec().mamba.enable_linear_replayssm_spec
+            and self.mambaish_config is not None
+            and self.mambaish_config.mamba2_cache_params.is_mamba2_ssd
+        )
+
     def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:
         """Per-token bytes of ``sub_pool_name``'s fused entry (host + draft +
         pad), from the same plan the pool is built from, so the priced and
@@ -1716,17 +1738,9 @@ class KVCacheConfigurator:
             **self._get_ple_req_pool_kwargs(),
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
-            # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
-            # fold); activate the pool machinery only for those, so any other
-            # mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
-            # flag set stays byte-identical to flag-off.
-            enable_linear_replayssm_spec=(
-                get_exec().mamba.enable_linear_replayssm_spec
-                and (
-                    self.hybrid_gdn_config is not None
-                    or self.hybrid_kda_config is not None
-                )
-            ),
+            # Other mamba-ish models (lightning, ...) run with the flag set
+            # stay byte-identical to flag-off.
+            enable_linear_replayssm_spec=self._replayssm_spec_model(),
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
@@ -1786,17 +1800,9 @@ class KVCacheConfigurator:
             enable_linear_replayssm=get_exec().mamba.enable_linear_replayssm,
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
-            # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
-            # fold); activate the pool machinery only for those, so any other
-            # mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
-            # flag set stays byte-identical to flag-off.
-            enable_linear_replayssm_spec=(
-                get_exec().mamba.enable_linear_replayssm_spec
-                and (
-                    self.hybrid_gdn_config is not None
-                    or self.hybrid_kda_config is not None
-                )
-            ),
+            # Other mamba-ish models (lightning, ...) run with the flag set
+            # stay byte-identical to flag-off.
+            enable_linear_replayssm_spec=self._replayssm_spec_model(),
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
@@ -3743,11 +3749,13 @@ class KVCacheConfigurator:
         # The ring is not part of mamba_cache_per_req. GDN replay is fixed-size
         # request scratch. KDA replay stays on each mamba slot unless host-only
         # checkpoints are on, in which case it follows live requests too.
-        replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
-            self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
-        )
+        replayssm_active = self._replayssm_spec_model()
         if replayssm_active:
-            record_len = get_exec().mamba.linear_replayssm_cache_len
+            record_len = (
+                max_speculative_num_draft_tokens()
+                if self._mamba2_replayssm_spec()
+                else get_exec().mamba.linear_replayssm_cache_len
+            )
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
                     record_len=record_len

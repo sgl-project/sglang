@@ -1667,6 +1667,28 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_pool = self.linear_attn_backend.state_pool
         mamba_caches = mamba_pool.get_speculative_mamba2_params_all_layers()
 
+        if mamba_pool.replayssm_is_mamba2:
+            from sglang.kernels.ops.mamba.mamba2_replayssm_spec import (
+                commit_mamba2_replayssm_after_verify,
+            )
+
+            commit_mamba2_replayssm_after_verify(
+                spec_state=mamba_caches,
+                state_batch_indices=state_indices_tensor,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                src_indices_raw=src_indices_raw,
+            )
+            self._update_ple_state_after_mtp_verify(
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw,
+            )
+            return
+
         # ReplaySSM-KDA: the accepted drafts live in the ring (written during
         # verify); no intermediate_ssm is allocated. Replay the accepted
         # prefix into `temporal` instead of scattering an intermediate state.
