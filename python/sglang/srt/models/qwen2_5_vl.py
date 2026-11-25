@@ -71,7 +71,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -821,25 +820,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
-    def post_process(
-        self,
-        inputs_embeds,
-        modalities: List[Modality],
-        embeddings: List[torch.Tensor],
-        indices: List[torch.Tensor],
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        # Placeholder for post_process
-        new_embeddings = []
-        for i, (modality, embedding, index) in enumerate(
-            zip(modalities, embeddings, indices)
-        ):
-            if embedding is None or index is None:
-                continue
-
-            new_embeddings.append(embedding)
-        return new_embeddings, forward_batch
-
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -970,18 +950,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                    else:
-                        continue
-
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name in params_dict.keys():
+                    param = params_dict[name]
+                else:
+                    continue
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -991,7 +966,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         self.capture_aux_hidden_states = True
-        self.model.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [
