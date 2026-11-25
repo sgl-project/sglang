@@ -3,12 +3,16 @@
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from sglang.multimodal_gen.runtime.pipelines_core.lora import format_adapter
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     LoRAFormat,
     detect_lora_format_from_state_dict,
     normalize_lora_state_dict,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
+    load_peft_config,
 )
 
 RANK, ALPHA, DIM = 4, 8.0, 16
@@ -330,3 +334,92 @@ def test_dot_format_z_image_lora_without_alpha_loads():
         @ out["layers.0.attention.to_q.lora_A.weight"]
     )
     torch.testing.assert_close(got, up @ down)
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["layers_0_attention_to_q", "transformer_blocks_0_img_mlp_net_0_proj"],
+)
+def test_negative_kohya_alpha_is_rejected_before_the_converter(module):
+    # Diffusers' converters loop forever on a negative alpha / rank scale.
+    sd = _kohya([module])
+    sd[f"lora_unet_{module}.alpha"] = torch.tensor(-ALPHA)
+    with pytest.raises(ValueError, match="must be a non-negative number"):
+        normalize_lora_state_dict(sd)
+
+
+def test_module_dropped_by_the_converter_fails_the_load(monkeypatch):
+    # Releases that cannot split a fused qkv drop it and keep the rest, which
+    # would load only the feed-forward part of the LoRA.
+    convert = format_adapter.lcu._convert_non_diffusers_z_image_lora_to_diffusers
+
+    def drops_qkv(state_dict):
+        return convert({k: v for k, v in state_dict.items() if "_qkv." not in k})
+
+    monkeypatch.setattr(
+        format_adapter.lcu,
+        "_convert_non_diffusers_z_image_lora_to_diffusers",
+        drops_qkv,
+    )
+    sd = _kohya(["layers_0_attention_qkv", "layers_0_feed_forward_w1"])
+    with pytest.raises(ValueError, match="drops 1 module"):
+        normalize_lora_state_dict(sd)
+
+
+def test_metadata_alpha_reaches_a_kohya_file_with_an_adapter_slot(tmp_path):
+    # `.lora_down.default.weight` keys still count as one rank, so the global
+    # alpha in the safetensors metadata applies: alpha 8 at rank 4 is 2x.
+    module = "layers_0_attention_to_q"
+    raw = _kohya([module])
+    sd = {
+        f"lora_unet_{module}.lora_down.default.weight": raw[
+            f"lora_unet_{module}.lora_down.weight"
+        ],
+        f"lora_unet_{module}.lora_up.default.weight": raw[
+            f"lora_unet_{module}.lora_up.weight"
+        ],
+    }
+    path = tmp_path / "slot.safetensors"
+    save_file(sd, str(path), metadata={"alpha": str(int(ALPHA))})
+    config = load_peft_config(str(path))
+    assert config["lora_alpha"] == ALPHA
+
+    out = normalize_lora_state_dict(sd, adapter_config=config)
+    got = (
+        out["layers.0.attention.to_q.lora_B.weight"]
+        @ out["layers.0.attention.to_q.lora_A.weight"]
+    )
+    ref = (
+        raw[f"lora_unet_{module}.lora_up.weight"]
+        @ raw[f"lora_unet_{module}.lora_down.weight"]
+    )
+    torch.testing.assert_close(got, (ALPHA / RANK) * ref)
+
+
+def test_z_image_lora_on_adaln_only_resolves_by_loaded_dit():
+    sd = _kohya(["layers_0_adaLN_modulation_0"])
+    assert (
+        detect_lora_format_from_state_dict(sd, "ZImageTransformer2DModel")
+        == LoRAFormat.KOHYA_Z_IMAGE
+    )
+    out = normalize_lora_state_dict(sd, dit_class_name="ZImageTransformer2DModel")
+    assert {k for k in out if k.endswith("lora_A.weight")} == {
+        "layers.0.adaLN_modulation.0.lora_A.weight"
+    }
+
+
+def test_qwen_image_top_level_projection_loads_with_the_blocks():
+    # diffusers' converter does not rename `img_in`; it is mapped here and
+    # keeps its alpha, so it applies at alpha / rank like the block modules.
+    sd = _kohya(["transformer_blocks_0_img_mlp_net_0_proj", "img_in", "proj_out"])
+    out = normalize_lora_state_dict(sd)
+    for kohya, native in (("img_in", "img_in"), ("proj_out", "proj_out")):
+        got = out[f"{native}.lora_B.weight"] @ out[f"{native}.lora_A.weight"]
+        ref = (
+            sd[f"lora_unet_{kohya}.lora_up.weight"]
+            @ sd[f"lora_unet_{kohya}.lora_down.weight"]
+        )
+        torch.testing.assert_close(
+            got * out[f"{native}.alpha"].item() / RANK, (ALPHA / RANK) * ref
+        )
+    assert "transformer_blocks.0.img_mlp.net.0.proj.lora_A.weight" in out

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from enum import Enum
 from typing import Any, Dict, Iterable, Mapping, Optional
@@ -247,6 +248,10 @@ def _is_qwen_image21_dit(dit_class_name: str | None) -> bool:
     )
 
 
+def _is_z_image_dit(dit_class_name: str | None) -> bool:
+    return bool(dit_class_name) and dit_class_name.endswith("ZImageTransformer2DModel")
+
+
 def detect_lora_format_from_state_dict(
     state_dict: Mapping[str, torch.Tensor],
     dit_class_name: str | None = None,
@@ -280,6 +285,10 @@ def detect_lora_format_from_state_dict(
     ):
         return LoRAFormat.KOHYA_QWEN_IMAGE
     if _looks_like_kohya_z_image(state_dict):
+        return LoRAFormat.KOHYA_Z_IMAGE
+    # A Z-Image LoRA trained only on e.g. adaLN_modulation has no attention or
+    # feed-forward names to recognize it by.
+    if _is_z_image_dit(dit_class_name) and _has_prefix_key(keys, "lora_unet_"):
         return LoRAFormat.KOHYA_Z_IMAGE
 
     if _looks_like_wan_lora(state_dict):
@@ -529,17 +538,14 @@ def _run_kohya_dit_converter(
     return out
 
 
-def _kohya_alpha_pattern_matches(
-    downs: Mapping[str, str],
-    alpha_patterns: list[tuple[re.Pattern[str], int]],
-    run_converter,
-) -> Dict[str, Dict[str, int | None]]:
-    """Match PEFT alpha_pattern against each Kohya module's converted names.
+def _kohya_converted_names(
+    downs: Mapping[str, str], run_converter
+) -> Dict[str, list[str]]:
+    """Map each Kohya module to the converted module names it produces.
 
     The converter only renames (or splits fused qkv) modules, so a unit-scale
     probe whose A weight holds the module index recovers the Kohya ->
-    converted name mapping. Returns {kohya module: {converted name: alpha}},
-    with None where no pattern matches.
+    converted name mapping. A module the converter drops has no entry.
     """
     probe: Dict[str, torch.Tensor] = {}
     modules = list(downs)
@@ -550,16 +556,69 @@ def _kohya_alpha_pattern_matches(
         # Three rows so a fused qkv up weight splits into q, k and v.
         probe[up_key] = torch.ones(3, 1)
         probe[_kohya_alpha_key(module)] = torch.tensor(1.0)
-    matches: Dict[str, Dict[str, int | None]] = {}
+    names: Dict[str, list[str]] = {}
     for key, tensor in run_converter(probe).items():
-        if not key.endswith(".lora_A.weight"):
-            continue
-        name = key.removesuffix(".lora_A.weight")
-        module = modules[int(tensor.flatten()[0].item()) - 1]
-        matches.setdefault(module, {})[name] = match_peft_alpha_pattern(
-            name, alpha_patterns
+        if key.endswith(".lora_A.weight"):
+            module = modules[int(tensor.flatten()[0].item()) - 1]
+            names.setdefault(module, []).append(key.removesuffix(".lora_A.weight"))
+    return names
+
+
+def _resolve_kohya_alpha(
+    module: str,
+    own_alpha: torch.Tensor | None,
+    rank: int,
+    fill_alpha: int | None,
+    pattern_alphas: Mapping[str, int | None],
+) -> float:
+    """The alpha one Kohya module applies with, checked against its patterns.
+
+    One Kohya alpha covers every module converted from it (q/k/v of a fused
+    qkv), so their pattern values and its own alpha must agree.
+    """
+    if own_alpha is not None:
+        default = float(own_alpha.item())
+        # Diffusers' converters loop on the alpha / rank scale and never return
+        # for a negative one.
+        if not math.isfinite(default) or default < 0:
+            raise ValueError(
+                f"Kohya LoRA alpha of {module!r} must be a non-negative number, "
+                f"got {default:g}"
+            )
+    elif fill_alpha is not None:
+        default = float(fill_alpha)
+    else:
+        default = float(rank)
+    resolved = {
+        name: default if alpha is None else float(alpha)
+        for name, alpha in pattern_alphas.items()
+    }
+    values = set(resolved.values())
+    if own_alpha is not None:
+        values.add(default)
+    if len(values) > 1:
+        own = f"its alpha {default:g}" if own_alpha is not None else "each other"
+        raise ValueError(
+            f"PEFT alpha_pattern alphas {resolved} for Kohya module "
+            f"{module!r} conflict with {own}"
         )
-    return matches
+    return values.pop() if values else default
+
+
+# Qwen-Image modules outside the transformer blocks, which diffusers' Kohya
+# converter does not rename.
+_QWEN_IMAGE_KOHYA_TOP_LEVEL_MODULES = {
+    "lora_unet_img_in": "img_in",
+    "lora_unet_txt_in": "txt_in",
+    "lora_unet_proj_out": "proj_out",
+    "lora_unet_norm_out_linear": "norm_out.linear",
+    "lora_unet_time_text_embed_timestep_embedder_linear_1": (
+        "time_text_embed.timestep_embedder.linear_1"
+    ),
+    "lora_unet_time_text_embed_timestep_embedder_linear_2": (
+        "time_text_embed.timestep_embedder.linear_2"
+    ),
+}
 
 
 def _convert_kohya_dit_via_diffusers(
@@ -570,6 +629,7 @@ def _convert_kohya_dit_via_diffusers(
     fill_alpha: int | None = None,
     module_name_fixups: Mapping[str, str] | None = None,
     alpha_patterns: list[tuple[re.Pattern[str], int]] | None = None,
+    top_level_modules: Mapping[str, str] | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Convert a Kohya/musubi DiT LoRA with the matching diffusers helper.
 
@@ -579,6 +639,10 @@ def _convert_kohya_dit_via_diffusers(
     `fill_alpha`, else its rank, since older diffusers releases require one.
     A pattern that disagrees with a module's own `.alpha` is rejected. Each
     converted module then records `alpha = rank`, so no alpha is applied twice.
+    `top_level_modules` names modules the helper does not handle; they are
+    renamed here and keep their alpha. A module the helper drops (e.g. a fused
+    qkv on a release that cannot split it) fails the load instead of silently
+    leaving part of the LoRA out.
     """
 
     def run_converter(sd: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -598,46 +662,79 @@ def _convert_kohya_dit_via_diffusers(
         for suffix in _KOHYA_DOWN_SUFFIXES
         if key.endswith(suffix)
     }
-    pattern_matches = (
-        _kohya_alpha_pattern_matches(downs, alpha_patterns, run_converter)
-        if alpha_patterns
-        else {}
+    top_level = {
+        module: name
+        for module, name in (top_level_modules or {}).items()
+        if module in downs
+    }
+    block_downs = {m: k for m, k in downs.items() if m not in top_level}
+    # Without any block module (e.g. a LoKr file) the converter still runs, so
+    # an adapter it cannot read fails instead of loading as a no-op.
+    run_blocks = bool(block_downs) or not top_level
+    converted_names = (
+        _kohya_converted_names(block_downs, run_converter) if block_downs else {}
     )
+    dropped = sorted(set(block_downs) - set(converted_names))
+    if dropped:
+        raise ValueError(
+            f"The installed diffusers drops {len(dropped)} module(s) of this Kohya "
+            f"{model_name} LoRA (e.g. {dropped[:3]}); loading the rest would "
+            "silently apply only part of it"
+        )
+    alphas = {}
     for module, down_key in downs.items():
         alpha_key = _kohya_alpha_key(module)
         own_alpha = state_dict.get(alpha_key)
-        matches = pattern_matches.get(module, {})
+        names = (
+            [top_level[module]]
+            if module in top_level
+            else converted_names.get(module, [])
+        )
+        pattern_alphas = {
+            name: match_peft_alpha_pattern(name, alpha_patterns or []) for name in names
+        }
         if own_alpha is not None and own_alpha.numel() != 1:
-            if any(alpha is not None for alpha in matches.values()):
+            if any(alpha is not None for alpha in pattern_alphas.values()):
                 raise ValueError(f"PEFT alpha_pattern conflicts with {alpha_key!r}")
             continue
-        if own_alpha is not None:
-            default = float(own_alpha.item())
-        elif fill_alpha is not None:
-            default = float(fill_alpha)
-        else:
-            default = float(state_dict[down_key].shape[0])
-        # One Kohya alpha covers every module converted from it (q/k/v of a
-        # fused qkv), so their pattern values and its own alpha must agree.
-        resolved = {
-            name: default if alpha is None else float(alpha)
-            for name, alpha in matches.items()
-        }
-        values = set(resolved.values())
-        if own_alpha is not None:
-            values.add(default)
-        if len(values) > 1:
-            own = f"its alpha {default:g}" if own_alpha is not None else "each other"
-            raise ValueError(
-                f"PEFT alpha_pattern alphas {resolved} for Kohya module "
-                f"{module!r} conflict with {own}"
-            )
+        alphas[module] = _resolve_kohya_alpha(
+            module,
+            own_alpha,
+            state_dict[down_key].shape[0],
+            fill_alpha,
+            pattern_alphas,
+        )
         if own_alpha is None:
-            state_dict[alpha_key] = torch.tensor(values.pop() if values else default)
-    out = run_converter(state_dict)
+            state_dict[alpha_key] = torch.tensor(alphas[module])
+
+    top_level_keys = {
+        key
+        for module in top_level
+        for key in (
+            downs[module],
+            downs[module].replace("down.weight", "up.weight"),
+            _kohya_alpha_key(module),
+        )
+    }
+    out = (
+        run_converter({k: v for k, v in state_dict.items() if k not in top_level_keys})
+        if run_blocks
+        else {}
+    )
     for key in [k for k in out if k.endswith(".lora_A.weight")]:
         out[key.removesuffix(".lora_A.weight") + ".alpha"] = torch.tensor(
             float(out[key].shape[0])
+        )
+    for module, name in top_level.items():
+        down_key = downs[module]
+        out[f"{name}.lora_A.weight"] = state_dict[down_key]
+        out[f"{name}.lora_B.weight"] = state_dict[
+            down_key.replace("down.weight", "up.weight")
+        ]
+        out[f"{name}.alpha"] = (
+            torch.tensor(alphas[module])
+            if module in alphas
+            else state_dict[_kohya_alpha_key(module)]
         )
     return out
 
@@ -846,6 +943,7 @@ def convert_lora_state_dict_by_format(
             log,
             fill_alpha,
             alpha_patterns=alpha_patterns,
+            top_level_modules=_QWEN_IMAGE_KOHYA_TOP_LEVEL_MODULES,
         )
 
     if fmt == LoRAFormat.KOHYA_Z_IMAGE:
