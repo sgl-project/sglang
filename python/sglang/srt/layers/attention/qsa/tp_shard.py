@@ -1,4 +1,4 @@
-"""Token row layout for the two QSA GQA KV groups on Ascend."""
+"""Token row layout for QSA GQA KV groups on Ascend."""
 
 from typing import NamedTuple
 
@@ -14,27 +14,34 @@ class QSAPrefillTPLayout(NamedTuple):
     attention_slice: slice
     rows_per_rank: int
     kv_group: int
+    num_kv_groups: int
     peer_splits: list[int]
     attention_splits: list[int]
 
     @staticmethod
-    def build(num_rows: int, tp_size: int, rank: int) -> "QSAPrefillTPLayout":
-        # TP partitions Q heads contiguously. Each half of the ranks holds
-        # one replicated GQA KV head, and both halves use the same row order.
-        group_width = tp_size // 2
+    def build(
+        num_rows: int, tp_size: int, rank: int, num_kv_groups: int
+    ) -> "QSAPrefillTPLayout":
+        # Each contiguous group of TP ranks holds the same GQA KV head.
+        group_width = tp_size // num_kv_groups
         kv_group, owner = divmod(rank, group_width)
         rows = cdiv(num_rows, tp_size)
-        attention_start = 2 * owner * rows
+        attention_rows = num_kv_groups * rows
+        attention_start = owner * attention_rows
         indexer_start = attention_start + kv_group * rows
-        partner = (rank + group_width) % tp_size
         return QSAPrefillTPLayout(
             indexer_slice=slice(indexer_start, indexer_start + rows),
-            attention_slice=slice(attention_start, attention_start + 2 * rows),
+            attention_slice=slice(attention_start, attention_start + attention_rows),
             rows_per_rank=rows,
             kv_group=kv_group,
-            peer_splits=[rows if r == partner else 0 for r in range(tp_size)],
+            num_kv_groups=num_kv_groups,
+            peer_splits=[
+                rows if r % group_width == owner and r != rank else 0
+                for r in range(tp_size)
+            ],
             attention_splits=[
-                2 * rows if r // group_width == kv_group else 0 for r in range(tp_size)
+                attention_rows if r // group_width == kv_group else 0
+                for r in range(tp_size)
             ],
         )
 

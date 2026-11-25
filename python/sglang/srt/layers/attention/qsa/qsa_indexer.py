@@ -553,12 +553,18 @@ class QSAIndexer(MultiPlatformOp):
             lengths.index_select(0, local_request_ids.long()),
             defer_expansion=True,
         )
-        if local_blocks.shape[0] != shard_rows:
-            padded = local_blocks.new_full((shard_rows, self.block_topk), -1)
-            padded[: local_blocks.shape[0]].copy_(local_blocks)
-            local_blocks = padded
-        peer = qsa_all_to_all(local_blocks, layout.peer_splits)
-        ordered = (peer, local_blocks) if layout.kv_group else (local_blocks, peer)
+        peer_blocks = None
+        if layout.num_kv_groups > 1:
+            if local_blocks.shape[0] != shard_rows:
+                padded = local_blocks.new_full((shard_rows, self.block_topk), -1)
+                padded[: local_blocks.shape[0]].copy_(local_blocks)
+                local_blocks = padded
+            send_blocks = (
+                local_blocks.expand(layout.num_kv_groups - 1, -1, -1)
+                .flatten(0, 1)
+                .contiguous()
+            )
+            peer_blocks = qsa_all_to_all(send_blocks, layout.peer_splits)
         attn_rows = layout.attention_slice
         request_ids = request_ids[attn_rows]
         logical_positions = logical_positions[attn_rows]
@@ -566,9 +572,13 @@ class QSAIndexer(MultiPlatformOp):
             return local_blocks.new_empty(
                 (0, self.token_topk + self.compress_ratio - 1)
             )
-        blocks = torch.cat(ordered)[: request_ids.numel()]
+        if peer_blocks is not None:
+            # A2A returns peer shards in KV-group order with the local group omitted.
+            peers = peer_blocks.split(shard_rows)
+            group = layout.kv_group
+            local_blocks = torch.cat(peers[:group] + (local_blocks,) + peers[group:])
         return expand_qsa_block_indices(
-            blocks,
+            local_blocks[: request_ids.numel()],
             logical_positions,
             lengths.index_select(0, request_ids.long()),
             compress_ratio=self.compress_ratio,

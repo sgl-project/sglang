@@ -355,16 +355,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         if config is None:
             config = getattr(model_config, "hf_config", None)
         self.qsa_profile = parse_qsa_profile(config)
+        self._prefill_tp_kv_groups = getattr(config, "num_key_value_heads", None) or 0
         # The Ascend fast kernel consumes three Q heads sharing one KV head.
-        # Keep each replicated KV-head group on its existing cache.
-        self._use_npu_prefill_tp_attention = (
+        # Each rank holds one KV head when the KV groups evenly divide TP.
+        self._use_npu_prefill_tp_sharding = (
             _is_npu
             and getattr(config, "num_attention_heads", None) == 24
-            and getattr(config, "num_key_value_heads", None) == 2
+            and self._prefill_tp_kv_groups > 0
             and not runner.is_draft_worker
             and self._kv_shard_pool is None
-            and get_parallel().attn_tp_size == 8
-            and not get_parallel().dcp_enabled
+            and (parallel := get_parallel()).attn_tp_size == 8
+            and parallel.attn_tp_size % self._prefill_tp_kv_groups == 0
+            and not parallel.dcp_enabled
         )
         self.max_context_len = int(getattr(model_config, "context_len", 0))
         self.compress_ratio = (
@@ -885,14 +887,17 @@ class QwenSparseAttnBackend(AttentionBackend):
                     )
         prefill_tp_layout = None
         if (
-            self._use_npu_prefill_tp_attention
+            self._use_npu_prefill_tp_sharding
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is None
             and token_to_batch_idx.numel() >= 8
         ):
             parallel = get_parallel()
             prefill_tp_layout = QSAPrefillTPLayout.build(
-                token_to_batch_idx.numel(), parallel.attn_tp_size, parallel.attn_tp_rank
+                token_to_batch_idx.numel(),
+                parallel.attn_tp_size,
+                parallel.attn_tp_rank,
+                self._prefill_tp_kv_groups,
             )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
@@ -1693,10 +1698,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
-        if self._use_npu_prefill_tp_attention:
+        if self._use_npu_prefill_tp_sharding:
             metadata = self._resolve_metadata(forward_batch)
             layout = metadata.indexer_metadata.prefill_tp_layout
-            if layout is not None:
+            if layout is not None and layout.num_kv_groups < get_parallel().attn_tp_size:
                 output = self._forward_extend_tp(
                     q, layer, topk_indices, metadata, layout
                 )
@@ -1798,7 +1803,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if num_rows != padded_rows:
             q = F.pad(q, (0, 0, 0, 0, 0, padded_rows - num_rows))
         received = qsa_all_to_all(q, layout.attention_splits)
-        local_rows = 2 * layout.rows_per_rank
+        local_rows = layout.num_kv_groups * layout.rows_per_rank
         slots = self._logical_to_physical(topk_indices, metadata, layout.attention_slice)
         if slots.shape[0] != local_rows:
             padded = slots.new_full((local_rows, slots.shape[1]), -1)
