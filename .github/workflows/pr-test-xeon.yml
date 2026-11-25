@@ -3,7 +3,10 @@ name: PR Test (Xeon)
 on:
   push:
     branches: [ main ]
-  pull_request:
+  # The workflow file comes from the base branch, so a PR cannot edit the gate (pr-gate.yml,
+  # approval-mode commit). No `labeled` type: the approving slash command reruns the gated run.
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [ main ]
   workflow_dispatch:
   workflow_call:
@@ -20,8 +23,17 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-xeon-${{ inputs.ref || github.ref }}
+  # A PR keys on its number: under pull_request_target github.ref is the base branch.
+  group: pr-test-xeon-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+# Read-only for every job that runs PR code.
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+  statuses: read
 
 jobs:
   # ==================== Check Changes ==================== #
@@ -37,11 +49,14 @@ jobs:
           sudo rm -rf ${{ github.workspace }} || true
           sudo mkdir -p ${{ github.workspace }}
           sudo chown -R $(id -u):$(id -g) ${{ github.workspace }}
+      # Trusted code only: under pull_request_target github.sha is the base branch. On a PR
+      # event dorny/paths-filter lists the changed files through the API.
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           clean: false
-          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Determine run mode
         id: run-mode
@@ -77,6 +92,7 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-label: run-ci-xeon-extra
+      approval-mode: commit
     secrets: inherit
 
   build-test:
@@ -110,7 +126,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           clean: false
-          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - name: Check disk space
         timeout-minutes: 10
