@@ -1430,8 +1430,8 @@ def _validated_role_ns_mode(value: str) -> str:
 
 def _role_ns_mode_from_env() -> str:
     # Resolved once at import so the config_bag gate stays a dynamo-prunable
-    # constant; validated fail-loud here (EnvField's warn-and-default parse
-    # would silently turn a typo into "off").
+    # constant; validated fail-loud here (EnvStr accepts any string, so a typo
+    # would otherwise silently read as "off").
     from sglang.srt.environ import envs
 
     return _validated_role_ns_mode(envs.SGLANG_ROLE_NAMESPACES.get())
