@@ -171,11 +171,19 @@ runs:
                 );
                 return;
               }
-              const remainingMs = deadlineMs - Date.now();
+              const now = Date.now();
+              const remainingMs = deadlineMs - now;
               if (remainingMs <= 0) {
                 break;
               }
-              const sleepMs = Math.min(pollIntervalSeconds * 1000, remainingMs);
+              let sleepMs = Math.min(pollIntervalSeconds * 1000, remainingMs);
+              const headers = err.response?.headers;
+              const resetMs = Number(headers?.['x-ratelimit-reset']) * 1000;
+              // a primary rate limit applies to every poll until the advertised reset
+              if ([403, 429].includes(err.status) && headers?.['x-ratelimit-remaining'] === '0' &&
+                  Number.isSafeInteger(resetMs) && resetMs > now && resetMs + 1000 < deadlineMs) {
+                sleepMs = Math.max(sleepMs, resetMs + 1000 - now);
+              }
               console.log(`Waiting ${Math.ceil(sleepMs / 1000)}s... (attempt ${attempt + 1}, ${Math.ceil(remainingMs / 60000)} min left of ${maxWaitMinutes})`);
               await new Promise(resolve => setTimeout(resolve, sleepMs));
               continue;

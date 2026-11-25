@@ -229,9 +229,7 @@ jobs:
     secrets: inherit
 
   # =============================================== aggregator ====================================================
-  # Mirrors pr-test.yml's `pr-test-finish` so notify-pr-states below only
-  # depends on one job rather than re-listing every stage. Fails if any
-  # dependent failed/cancelled.
+  # Mirrors pr-test.yml's `pr-test-finish`: fails if any dependent failed/cancelled.
   pr-test-extra-finish:
     needs:
       [
@@ -257,29 +255,3 @@ jobs:
             echo "::error::A dependent job failed or was cancelled."
             exit 1
           fi
-
-  # =============================================== notify pr-states ====================================================
-  # Dispatches pr-states.yml after every attempt (initial + every rerun).
-  # workflow_run.completed only fires on the initial completion (one
-  # workflow_run record across attempts), so we explicitly dispatch —
-  # workflow_dispatch is the only event GITHUB_TOKEN can cascade-create.
-  #
-  # Fork PRs included: a pull_request_target token is not forced read-only.
-  notify-pr-states:
-    needs: [pr-test-extra-finish]
-    if: |
-      always() &&
-      github.event_name == 'pull_request_target'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write # gh workflow run
-    steps:
-      - name: Dispatch pr-states refresh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          gh workflow run pr-states.yml \
-            --repo ${{ github.repository }} \
-            --ref main \
-            -f pr_number="$PR_NUMBER"
