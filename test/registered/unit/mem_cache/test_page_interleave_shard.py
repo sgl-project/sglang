@@ -118,6 +118,7 @@ from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -818,6 +819,17 @@ def _alloc_extend(alloc, prefix_len, seq_len, rotation_base, last_loc=-1):
 
 
 class TestClassedAllocator(CustomTestCase):
+    def test_decode_uses_caller_batch_rotation_base(self):
+        out = StaticKVStorage(None, _make_allocator()).take_decode(
+            rows=None,
+            seq_lens=torch.tensor([1]),
+            seq_lens_cpu=torch.tensor([1]),
+            last_loc=torch.tensor([-1]),
+            make_room=lambda _: None,
+            batch=SimpleNamespace(reqs=[SimpleNamespace(kv_rotation_base=3)]),
+        )
+        self.assertEqual(int(out[0] // PS % N), 3)
+
     def test_index_space_widened_classes_mirror_ranks(self):
         alloc = _make_allocator(pages_per_rank=32)
         self.assertEqual(alloc.size, 32 * PS * N)  # logical slots
@@ -996,10 +1008,6 @@ class TestClassedAllocator(CustomTestCase):
         alloc = _make_allocator()
         with self.assertRaises(NotImplementedError):
             alloc.alloc(GS)
-        with self.assertRaises(NotImplementedError):
-            alloc.alloc_decode(
-                torch.tensor([PS + 1]), torch.tensor([PS + 1]), torch.tensor([PS - 1])
-            )
 
     def test_batch_alloc_per_request_rotation(self):
         """bs > 1: each request draws its own cyclic run; out_cache_loc is
