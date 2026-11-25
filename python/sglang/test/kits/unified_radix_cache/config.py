@@ -26,6 +26,7 @@ class CacheConfig:
     enable_mamba_extra_buffer_lazy: bool = False
     # Two ping-pong tracking slots with the overlap scheduler, one without.
     enable_overlap_schedule: bool = True
+    enable_mamba_unit_eviction: bool = False
     mamba_cache_size: int = 20
     mamba_intermediate_size: int = 256
     mamba_n_groups: int = 1

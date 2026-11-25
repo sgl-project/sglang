@@ -588,5 +588,6 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_boundary_decay_start_chunks",
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
+    "enable_mamba_unit_eviction",
 )
 # fmt: on
