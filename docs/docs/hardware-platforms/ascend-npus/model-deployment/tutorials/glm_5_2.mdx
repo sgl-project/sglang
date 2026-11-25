@@ -101,31 +101,23 @@ A5 MXFP formats require a separate platform/layout adapter. Groupwise INT scales
 activation clipping, nonzero weight offsets, mixed projection formats and BF16
 expert biases are unsupported.
 
-Use matching CANN toolkit/operator packages and DeepEP exposing
+Use an Ascend runtime with operator packages and DeepEP exposing
 `FuseMode.MEGA_MOE` and `Buffer.fused_deep_moe(..., fuse_mode=3, activation=...,
 l1_bias=..., l2_bias=...)`. The MegaMoE JIT extension requires `ninja`.
-If the operator rejects `activation_params`, upgrade the CANN toolkit and its
-matching `cann_ops_transformer` operator package instead of applying a legacy
-DeepEP patch. The recorded API reference environment loads both ACL and MegaMoE
-from **CANN 9.2.0-beta.2**. A version label alone is insufficient: verify the
-actual imported module and accepted keywords in the serving environment.
-Keep PyTorch and `torch_npu` compatible with the selected toolkit; no separate
-Torch upgrade is implied by this keyword mismatch.
+The runtime checks the operator loaded by DeepEP and reports its accepted
+arguments and package paths. Use a runtime that exposes those interfaces.
 
-After sourcing the selected CANN `set_env.sh`, check the serving Python:
+In the serving environment, check the DeepEP interface and inspect the loaded
+operator package:
 
 ```bash
 python3 - <<'PY_CHECK'
 import inspect
 import cann_ops_transformer
 import deep_ep
-from cann_ops_transformer.ops import mega_moe
 
 print("operator package:", cann_ops_transformer.__file__)
 print("DeepEP:", deep_ep.__file__)
-inspect.signature(mega_moe).bind_partial(
-    activation="swiglu", activation_params=None
-)
 assert {"fuse_mode", "quant_mode", "activation", "beta", "linear_beta", "l1_bias", "l2_bias"} <= set(
     inspect.signature(deep_ep.Buffer.fused_deep_moe).parameters
 )

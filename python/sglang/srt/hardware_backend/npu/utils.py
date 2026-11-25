@@ -281,6 +281,30 @@ def init_npu_backend():
         torch.cuda.is_available = lambda: False
         torch.cuda.get_device_capability = lambda device=None: (0, 0)
 
+        # torch 2.13 + torch_npu 2.13: transfer_to_npu aliases torch.cuda RNG
+        # functions to NPU implementations, which torch_npu's dynamo
+        # integration also registers in-graph via torch.npu.random.* qualnames
+        # while torch skip-registers the torch.cuda.* qualnames. When the
+        # torch.npu.random and torch_npu.npu.random module instances unify
+        # (import-order dependent), both qualnames resolve to one function
+        # object and torch 2.13's dynamo rule-map builder raises
+        # "Duplicate torch object ... with different rules", which breaks
+        # every sglang.srt.models import and forces a Transformers-backend
+        # fallback. Rebind the skip-ruled cuda qualnames to distinct wrappers
+        # (still calling the NPU implementation) so the object-identity
+        # collision cannot occur.
+        for _rng_name in ("manual_seed_all", "manual_seed", "seed_all", "seed"):
+            _rng_fn = getattr(torch.cuda, _rng_name, None)
+            if _rng_fn is None:
+                continue
+
+            def _rng_wrapper(*args, __fn=_rng_fn, **kwargs):
+                return __fn(*args, **kwargs)
+
+            setattr(torch.cuda, _rng_name, _rng_wrapper)
+            if hasattr(torch.cuda.random, _rng_name):
+                setattr(torch.cuda.random, _rng_name, _rng_wrapper)
+
         def configure_internal_format():
             if not is_ascend_950():
                 torch_npu.npu.config.allow_internal_format = True

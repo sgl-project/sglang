@@ -1,4 +1,3 @@
-import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -75,13 +74,8 @@ def fused_topk_npu(
         or num_token_non_padded is not None
     ):
         gating_op = moe_gating_top_k
-        if (
-            topk_config.scoring_func == "sigmoid"
-            and os.path.basename(os.environ.get("ASCEND_HOME_PATH", "").rstrip("/"))
-            == "cann-9.2.0-beta.2"
-        ):
-            # The public dispatcher cannot read the beta SDK's release metadata.
-            gating_op = torch.ops.npu.npu_moe_gating_top_k
+        if topk_config.scoring_func == "sigmoid":
+            gating_op = getattr(torch.ops.npu, "npu_moe_gating_top_k", gating_op)
         topk_weights, topk_ids, _ = gating_op(
             router_logits.to(torch.float32),
             k=topk_config.top_k,
