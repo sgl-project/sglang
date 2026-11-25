@@ -594,16 +594,19 @@ class TestPrefetchPacing(CustomTestCase):
                     ),
                 ):
                     handle = _prefetch_all_checkpoints(paths, num_threads=2, pace=True)
+                    # Release waiting prefetch threads even if an assertion fails.
+                    self.addCleanup(handle.cancel)
+                    # Two threads read concurrently, so compare without order.
                     self.assertTrue(_wait_until(lambda: len(read) == 3))
                     time.sleep(0.05)
-                    self.assertEqual(read, paths[:3])  # 3000 bytes ahead.
+                    self.assertEqual(sorted(read), paths[:3])  # 3000 bytes ahead.
                     handle.advance(paths[2])
                     self.assertTrue(_wait_until(lambda: len(read) == 5))
-                    self.assertEqual(read, paths[:5])
+                    self.assertEqual(sorted(read), paths[:5])
                     stop(handle)
 
                 self.assertTrue(handle.done)
-                self.assertEqual(read, paths[:5])
+                self.assertEqual(sorted(read), paths[:5])
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_pacing_follows_an_unsorted_loader_order(self, _):
@@ -628,6 +631,7 @@ class TestPrefetchPacing(CustomTestCase):
                 handle = _prefetch_all_checkpoints(
                     paths, num_threads=1, pace=True, loader_files=order
                 )
+                self.addCleanup(handle.cancel)
                 self.assertTrue(_wait_until(lambda: len(read) == 2))
                 time.sleep(0.05)
                 self.assertEqual(read, order[:2])  # 2000 bytes ahead.
