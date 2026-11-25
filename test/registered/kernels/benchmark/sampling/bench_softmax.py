@@ -9,10 +9,7 @@ from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=15,
-    stage="base-b-kernel-benchmark",
-    runner_config="1-gpu-small",
-    disabled="requires SM100; no benchmark lane runs SM100",
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
 )
 
 
@@ -41,7 +38,7 @@ FN_MAP = {"jit": jit_softmax, "torch": torch_softmax, "cake": cake_softmax}
 # fp32 logits with one temperature per row: what `Sampler.forward` hands the softmax
 @marker.parametrize("vocab_size", [32000, 129280, 163840, 201088, 262144], [163840])
 @marker.parametrize("batch_size", [2**n for n in range(0, 13)], [1, 64, 1024])
-@marker.benchmark("impl", ["jit", "cake", "torch"])
+@marker.benchmark("impl", ["jit", "cake", "torch"], gate=["jit"])
 def benchmark(vocab_size: int, batch_size: int, impl: str):
     logits = create_random(batch_size, vocab_size, dtype=torch.float32)
     temperatures = torch.linspace(0.5, 1.5, batch_size, device=logits.device)
