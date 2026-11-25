@@ -2,9 +2,9 @@
 // and select unified KV memory by strategy.
 // Deployment selects hardware, quantization, and strategy; further tuning lives
 // in Playground. NVIDIA uses FA4, MI355X uses Triton for DFlash draft attention.
-// Xeon keeps its CPU-engine INT4 recipe. H200 runs NVFP4 on one node with
-// Marlin W4A16 experts and BF16 at TP16 across two nodes; it has no
-// SP/MegaMoE (SM100-only kernels).
+// Xeon keeps its CPU-engine INT4 recipe. H200 runs NVFP4 on one node (Marlin
+// backend; Muse Spark swaps in its Hopper kernels on SM90) and BF16 at TP16
+// across two nodes; it has no layernorm SP/MegaMoE (SM100-only kernels).
 export const config = {
   modelName: "Muse Spark Open",
   supportedHardware: ["b300", "gb300", "b200", "h200", "mi355x", "xeon", "tpu7x"],
@@ -218,7 +218,7 @@ export const config = {
           {
             id: "on", label: "On", flags: ["--enable-layernorm-sp"],
             disable: { hw: ["h200"] },
-            disableReason: "Layernorm SP needs SM100 collective GEMM kernels; unavailable on H200.",
+            disableReason: "Layernorm SP needs SM100 collective GEMM kernels; on H200, Muse Spark NVFP4 runs its own Hopper prefill SP.",
           },
           { id: "off", label: "Off" },
         ],
@@ -472,6 +472,7 @@ export const config = {
         "--port {{PORT}}",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path {{DRAFT_MODEL_ID}}",
+        "--enable-mixed-chunk",
         "--enable-hierarchical-cache",
         "--hicache-size 200",
         "--reasoning-parser muse",
