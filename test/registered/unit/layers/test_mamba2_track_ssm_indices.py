@@ -54,6 +54,7 @@ def _split(extend_lens, prefix_lens, track_seqlens, track_mask):
         seq_idx,
         end_locs,
         recompute_dst,
+        _final_dst_per_row,
     ) = backend._init_track_ssm_indices(
         cache_indices,
         _forward_batch(extend_lens, prefix_lens, track_seqlens, track_mask),
