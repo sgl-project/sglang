@@ -201,9 +201,7 @@ def hist_topk_workspace(indexer, config):
         prealloc_workspace,
         supported_hardware,
     )
-    from sglang.srt.mem_cache.allocation_sizing import (
-        get_req_to_token_extra_context_len,
-    )
+    from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_headroom
 
     if not (
         supported_hardware()
@@ -218,8 +216,8 @@ def hist_topk_workspace(indexer, config):
     if not max_ctx or loader.modules_or_none() is None:
         return None
     # the req_to_token row headroom past the context, then 4 more pages of slack
-    extra = get_req_to_token_extra_context_len()
-    max_ctx = (-(-(max_ctx + extra) // 64) + 4) * 64
+    headroom = get_req_to_token_headroom()
+    max_ctx = (-(-(max_ctx + headroom) // 64) + 4) * 64
     device = torch.device("cuda", torch.cuda.current_device())
     prealloc_workspace(device=device, max_cols=max_ctx, fp8_dtype=fp8_dtype)
     workspace = _WORKSPACES.get(_workspace_key(device, fp8_dtype))

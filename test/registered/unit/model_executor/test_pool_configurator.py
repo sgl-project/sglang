@@ -662,7 +662,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             speculative_num_steps=3,
             speculative_eagle_topk=2,
             speculative_num_draft_tokens=5,
-            disable_overlap_schedule=True,  # spec-v1: no double allocation
+            disable_overlap_schedule=True,
         )
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
@@ -672,18 +672,18 @@ class TestHybridSWAConfigurator(CustomTestCase):
             cfg = create_memory_pool_configurator(mr)
             config = cfg.calculate_pool_sizes(available, page_size=4)
 
-        # spec-v1 (overlap off): decode_alloc = max(ceil_align(3+4,4)*2,
-        # ceil_align(5,4)) = 16. trailing = 8 + 20 + page(4) = 32; per req =
-        # 32 + 16 = 48. Global prefill = 1*chunk(4) + page(4) = 8.
-        # cap = 48 * 2 + 8 = 104 -> ceil_align(104, 4) = 104.
-        self.assertEqual(config.swa_max_total_num_tokens, 104)
+        # Overlap off keeps the reserve too: decode_alloc = get_decode_reserve()
+        # + page - 1 = 2 * max(ceil((3 + 3) / 4) * 4 * topk(2), 5) + 3 = 35.
+        # trailing = 8 + 20 + page(4) = 32; per req = 32 + 35 = 67. Global
+        # prefill = 1*chunk(4) + page(4) = 8. cap = 67 * 2 + 8 = 142, aligned
+        # up to the page: 144.
+        self.assertEqual(config.swa_max_total_num_tokens, 144)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_swa_request_cap_doubles_decode_alloc_for_spec_v2_overlap(self):
-        # Overlap on -> spec-v2: decode_alloc = 2 * get_alloc_len_per_decode =
-        # 2 * max(steps*topk, max_draft) = 2 * max(6, 5) = 12 (page=1, since the
-        # v2 allocator does not support page>1 & topk>1). trailing = 8 + 20 +
-        # page(1) = 29; per req = 29 + 12 = 41. Global prefill =
+    def test_swa_request_cap_with_overlap_counts_two_chunks(self):
+        # Overlap on: decode_alloc = get_decode_reserve() + page - 1 =
+        # 2 * max(steps*topk, max_draft) + 0 = 2 * max(6, 5) = 12 (page=1).
+        # trailing = 8 + 20 + page(1) = 29; per req = 29 + 12 = 41. Global prefill =
         # 2*chunk(4) + page(1) = 9; cap = 41 * 2 + 9 = 91.
         available = 1_000_000
         mr = _make_model_runner(
@@ -702,7 +702,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             speculative_num_steps=3,
             speculative_eagle_topk=2,
             speculative_num_draft_tokens=5,
-            disable_overlap_schedule=False,  # spec-v2: 2 * get_alloc_len_per_decode
+            disable_overlap_schedule=False,
         )
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (

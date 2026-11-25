@@ -36,17 +36,16 @@ def get_alloc_page_size() -> int:
     return get_schedule().page_size * get_parallel().attn_dcp_size
 
 
-def get_alloc_len_per_decode() -> int:
-    """KV length one request may allocate in a single decode step.
+def get_decode_reserve() -> int:
+    """KV length a speculative decode allocation runs ahead of kv_committed_len.
+
+    Twice what one decode step writes: the double buffer absorbs the
+    kv_committed_len lag in overlap mode.
 
     Reads the bags: adaptive speculative decoding moves the step count and the
     draft-token bound after publish, and this runs per decode batch.
     """
     spec = get_spec()
-    if spec.speculative_algorithm is None:
-        return 1
-
-    # Spec decoding allocates max(topk * num_steps, num_draft_tokens) per decode step.
     spec_steps = spec.speculative_num_steps or 1
     spec_topk = spec.speculative_eagle_topk or 1
     spec_tokens = max_speculative_num_draft_tokens()
@@ -54,14 +53,15 @@ def get_alloc_len_per_decode() -> int:
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+    # A decode step writes max(topk * num_steps, num_draft_tokens).
     spec_algo = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
     if spec_algo.is_uno():
         if spec_tokens is None:
             raise RuntimeError("UNO requires speculative_num_draft_tokens")
         # UNO retains an additional clean-root position beside Q/F draft slots.
-        return spec_tokens + 1
-    if page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
-        return max(spec_steps * spec_topk, spec_tokens)
+        write_len = spec_tokens + 1
+    elif page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
+        write_len = max(spec_steps * spec_topk, spec_tokens)
     else:
         # spec v2 tree (page>1, topk>1): worst-case page-aligned footprint per
         # topk branch is ceil((page_size-1 + num_steps) / page) pages, each branch
@@ -69,26 +69,15 @@ def get_alloc_len_per_decode() -> int:
         num_new_pages_per_topk = (
             (page_size - 1) + spec_steps + page_size - 1
         ) // page_size
-        return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
+        write_len = max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
+    return 2 * write_len
 
 
-def get_alloc_reserve_per_decode() -> int:
-    """KV length reserved per request at each decode step.
-
-    The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_utils.eagle_prepare_for_decode.
-    """
-    return 2 * get_alloc_len_per_decode()
-
-
-def page_aligned_decode_alloc_lens(
-    reqs,
-    *,
-    reserve: int,
-    page_size: int,
-):
-    """Whole-page decode alloc lens: nxt rounds committed up to page so allocated
-    == recorded (unaligned tails leak at ps>1)."""
+def decode_alloc_lens(reqs, *, page_size: int):
+    """Per-request cur/nxt KV lens and the total tokens of one speculative decode
+    allocation: nxt runs get_decode_reserve() past kv_committed_len, rounded up
+    to a page so allocated == recorded (unaligned tails leak at ps>1)."""
+    reserve = get_decode_reserve()
     cur_kv_lens = [0] * len(reqs)
     nxt_kv_lens = [0] * len(reqs)
     num_needed_tokens = 0
@@ -122,18 +111,17 @@ def add_spec_decode_headroom_pages(
     batch: ScheduleBatch,
     nxt_kv_lens: List[int],
     num_needed_tokens: int,
-    *,
-    reserve: int,
-    page_size: int,
 ) -> tuple[List[int], int]:
     """On a step that allocates anyway, extend every request to the configured
     pages beyond its page-aligned need in the same allocation."""
+    page_size = batch.token_to_kv_pool_allocator.page_size
     if num_needed_tokens == 0 or page_size == 1:
         return nxt_kv_lens, num_needed_tokens
     pages = _spec_decode_headroom_pages(batch.hisparse_coordinator is not None)
     if pages == 0:
         return nxt_kv_lens, num_needed_tokens
     row_cap = batch.req_to_token_pool.req_to_token.shape[1] // page_size * page_size
+    reserve = get_decode_reserve()
     lens = list(nxt_kv_lens)
     extra = 0
     for i, req in enumerate(batch.reqs):
@@ -156,19 +144,19 @@ def add_spec_decode_headroom_pages(
     return lens, num_needed_tokens + extra
 
 
-def get_req_to_token_extra_context_len() -> int:
-    """req_to_token row headroom beyond the model context length: how far one
-    decode step writes the row past kv_committed_len, which admission keeps
+def get_req_to_token_headroom() -> int:
+    """req_to_token row columns beyond the model context length: the furthest
+    one decode step writes the row past kv_committed_len, which admission keeps
     within the context length.
 
-    A non-speculative step writes the one slot at kv_committed_len; a paged
-    allocator keeps the rest of that page off the row. A speculative step
-    writes up to kv_committed_len + get_alloc_reserve_per_decode(), rounded up
-    to a page (page_aligned_decode_alloc_lens). alloc_for_spec_decode checks
-    the row holds it. The row headroom and the pools it sits next to derive
-    from the same bag leaves, so they cannot disagree after a post-publish
-    override.
+    A non-speculative step records only the one slot at kv_committed_len in the
+    row; a paged allocator keeps the rest of that page off the row, so there is
+    no page rounding. A speculative step writes up to kv_committed_len +
+    get_decode_reserve(), rounded up to a page (decode_alloc_lens), and
+    alloc_for_spec_decode checks the row holds it. The row headroom and the
+    pools it sits next to derive from the same bag leaves, so they cannot
+    disagree after a post-publish override.
     """
     if get_spec().speculative_algorithm is None:
-        return get_alloc_len_per_decode()
-    return get_alloc_reserve_per_decode() + get_alloc_page_size() - 1
+        return 1
+    return get_decode_reserve() + get_alloc_page_size() - 1

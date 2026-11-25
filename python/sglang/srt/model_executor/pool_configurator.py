@@ -38,7 +38,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.allocation_sizing import get_decode_reserve
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -68,33 +68,6 @@ from sglang.srt.utils.device import is_float4_e2m1fn_x2, is_hip, is_npu
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-
-
-def spec_decode_alloc_len_per_request(
-    *,
-    page_size,
-    speculative_num_steps,
-    speculative_eagle_topk,
-    speculative_num_draft_tokens,
-) -> int:
-    """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
-    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned. A pure
-    function of the resolved values its one caller reads off the bags.
-    """
-    len_per_topk = speculative_num_steps or 1
-    spec_topk = speculative_eagle_topk or 1
-    spec_tokens = speculative_num_draft_tokens or 1
-
-    if page_size > 1 and spec_topk > 1:
-        # last partial page and ceil alignment
-        len_per_topk = ceil_align(len_per_topk + page_size, page_size)
-        spec_tokens = ceil_align(spec_tokens, page_size)
-    elif page_size > 1:
-        # only page alignment
-        len_per_topk = ceil_align(len_per_topk, page_size)
-        spec_tokens = ceil_align(spec_tokens, page_size)
-
-    return max(len_per_topk * spec_topk, spec_tokens)
 
 
 @dataclass
@@ -1108,18 +1081,9 @@ def compute_swa_request_cap(
     trailing_tokens = window + eviction_interval * draft_tokens + page_size
     if get_spec().speculative_algorithm is None:
         decode_alloc = page_size
-    elif get_schedule().disable_overlap_schedule:
-        # spec-v1: new_tokens_required_next_decode per request.
-        decode_alloc = spec_decode_alloc_len_per_request(
-            page_size=page_size,
-            speculative_num_steps=get_spec().speculative_num_steps,
-            speculative_eagle_topk=get_spec().speculative_eagle_topk,
-            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
-        )
     else:
-        # spec-v2: the overlap allocator keeps the per-decode reserve outstanding
-        # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + reserve).
-        decode_alloc = get_alloc_reserve_per_decode()
+        # Page-rounded reach of decode_alloc_lens, in both overlap modes.
+        decode_alloc = get_decode_reserve() + page_size - 1
     per_request = trailing_tokens + decode_alloc
 
     if max_running_requests is None:

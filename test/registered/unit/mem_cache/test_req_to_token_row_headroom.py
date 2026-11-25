@@ -9,9 +9,8 @@ import torch
 
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
-    get_alloc_reserve_per_decode,
-    get_req_to_token_extra_context_len,
-    page_aligned_decode_alloc_lens,
+    decode_alloc_lens,
+    get_req_to_token_headroom,
 )
 from sglang.srt.runtime_context import get_schedule, get_spec, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -56,7 +55,7 @@ class TestRowHoldsDecodeAllocation(CustomTestCase):
                     ),
                     get_schedule().override(page_size=page_size),
                 ):
-                    extra = get_req_to_token_extra_context_len()
+                    headroom = get_req_to_token_headroom()
                     # A request at the context length, at every page phase of it.
                     context_lens = range(1000, 1000 + page_size)
                     reqs = [
@@ -68,13 +67,9 @@ class TestRowHoldsDecodeAllocation(CustomTestCase):
                         )
                         for context_len in context_lens
                     ]
-                    _, nxt_kv_lens, _ = page_aligned_decode_alloc_lens(
-                        reqs,
-                        reserve=get_alloc_reserve_per_decode(),
-                        page_size=page_size,
-                    )
+                    _, nxt_kv_lens, _ = decode_alloc_lens(reqs, page_size=page_size)
                     for context_len, nxt_kv_len in zip(context_lens, nxt_kv_lens):
-                        self.assertLessEqual(nxt_kv_len, context_len + extra)
+                        self.assertLessEqual(nxt_kv_len, context_len + headroom)
 
 
 class TestSpecDecodeAllocationRowGuard(CustomTestCase):

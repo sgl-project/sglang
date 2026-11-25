@@ -872,8 +872,8 @@ def alloc_for_spec_decode(
         raise RuntimeError(
             f"Speculative decode allocation ({max_nxt_kv_len}) exceeds the "
             f"req_to_token row width ({row_width}); the row headroom "
-            "(get_req_to_token_extra_context_len) must cover the per-decode "
-            "reserve (get_alloc_reserve_per_decode) and its page rounding."
+            "(get_req_to_token_headroom) must cover the decode reserve "
+            "(get_decode_reserve) and its page rounding."
         )
 
     if num_needed_tokens > 0:
