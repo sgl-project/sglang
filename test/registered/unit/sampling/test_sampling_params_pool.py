@@ -280,27 +280,9 @@ class TestPenaltyIndices(_PoolTestCase):
         self.assertEqual(info.step_penalties.batch_indices.tolist(), [1])
         self.assertEqual(info.step_penalties.penalty_indices.tolist(), [0])
 
-    def test_unchanged_batch_reuses_its_params_until_a_write(self):
-        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
-        pool.write([_req(1, temperature=0.7), _req(4, top_k=1)])
-
-        first = _gather(pool, [1, 4])
-        again = _gather(pool, [1, 4])
-        self.assertIs(again.temperatures, first.temperatures)
-        self.assertIs(again.top_ks, first.top_ks)
-        self.assertIsNot(_gather(pool, [4, 1]).temperatures, first.temperatures)
-
-        after_slot_change = _gather(pool, [1, 4])
-        self.assertIsNot(after_slot_change.temperatures, first.temperatures)
-        pool.write([_req(4, temperature=1.2)])
-        params = _gather(pool, [1, 4])
-        self.assertIsNot(params.temperatures, after_slot_change.temperatures)
-        self.assertAlmostEqual(params.temperatures[1].item(), 1.2, places=6)
-        self.assertFalse(params.is_any_greedy)
-
     def test_unchanged_batch_takes_each_steps_penalties(self):
-        """A reused gather still builds the step's penalties from the counts the
-        previous step committed."""
+        """A gather over the same slots builds the step's penalties from the counts
+        the previous step committed."""
         penalty_pool = PenaltyStatusPool(vocab_size=8, device=DEVICE)
         req = _req(2)
         req.output_ids = []
@@ -321,7 +303,6 @@ class TestPenaltyIndices(_PoolTestCase):
         first.step_penalties.commit(torch.tensor([0, 5]))
 
         second = _gather(pool, [3, 2])
-        self.assertIs(second.temperatures, first.temperatures)
         additive, _ = second.step_penalties.logit_penalties()
         self.assertEqual(additive[1, 5].item(), -0.5)
         self.assertEqual(additive[0].tolist(), [0.0] * 8)
