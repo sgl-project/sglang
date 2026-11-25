@@ -338,35 +338,31 @@ def _expert_storage_view(
     if not layout.needs_storage_alias:
         return weight.view(torch.uint8).view(layout.expert_byte_shape)
 
+    import torch_npu
+
     # A separate storage descriptor presents the same allocation as ND bytes.
     # Reusing weight.untyped_storage() would also reuse its NZ descriptor.
-    view = _expert_byte_alias(
+    storage = torch_npu._C._construct_storage_from_data_pointer(
         weight.data_ptr(),
-        layout.storage_bytes,
-        layout.expert_byte_shape,
         weight.device,
+        layout.storage_bytes,
+    )
+    _, bytes_per_expert = layout.expert_byte_shape
+    view = torch_npu._C._construct_NPU_Tensor_From_Storage_And_Metadata(
+        {
+            "dtype": torch.uint8,
+            "size": layout.expert_byte_shape,
+            "stride": (bytes_per_expert, 1),
+            "storage_offset": 0,
+            "npu_format": _FORMAT_ND,
+        },
+        storage,
     )
     # The new storage borrows the pointer. Keep the owning tensor alive while
     # submitting work, then protect its allocation until this stream completes.
     view._eplb_weight_owner = weight
     weight.record_stream(torch.npu.current_stream())
     return view
-
-
-def _expert_byte_alias(pointer, size, shape, device) -> torch.Tensor:
-    import torch_npu
-
-    storage = torch_npu._C._construct_storage_from_data_pointer(pointer, device, size)
-    return torch_npu._C._construct_NPU_Tensor_From_Storage_And_Metadata(
-        {
-            "dtype": torch.uint8,
-            "size": shape,
-            "stride": (shape[1], 1),
-            "storage_offset": 0,
-            "npu_format": _FORMAT_ND,
-        },
-        storage,
-    )
 
 
 class _ExpertWeightAdapter:
@@ -388,12 +384,7 @@ class _ExpertWeightAdapter:
     ):
         self._layouts = _validate_migration_weights(weights_by_layer, layer_ids, rank)
 
-    def create_temp_buffers(self, allocate=None) -> list[torch.Tensor]:
-        if allocate is not None:
-            return [
-                allocate(layout.expert_byte_shape, layout.device)
-                for layout in self._layouts
-            ]
+    def create_temp_buffers(self) -> list[torch.Tensor]:
         return [
             torch.empty(
                 layout.expert_byte_shape,
