@@ -89,34 +89,20 @@ For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/fa
 
 {/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tag below to the stable release once it is published. */}
 
+The command requires
+[Ascend Docker Runtime](/docs/hardware-platforms/ascend-npus/getting-started/installation#install-ascend-docker-runtime)
+on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
+
 ```bash Command
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
--v /var/queue_schedule:/var/queue_schedule \
+-e ASCEND_VISIBLE_DEVICES=0-15 \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
 -v /usr/local/sbin:/usr/local/sbin \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
---device=/dev/davinci0:/dev/davinci0  \
---device=/dev/davinci1:/dev/davinci1  \
---device=/dev/davinci2:/dev/davinci2  \
---device=/dev/davinci3:/dev/davinci3  \
---device=/dev/davinci4:/dev/davinci4  \
---device=/dev/davinci5:/dev/davinci5  \
---device=/dev/davinci6:/dev/davinci6  \
---device=/dev/davinci7:/dev/davinci7  \
---device=/dev/davinci8:/dev/davinci8  \
---device=/dev/davinci9:/dev/davinci9  \
---device=/dev/davinci10:/dev/davinci10  \
---device=/dev/davinci11:/dev/davinci11  \
---device=/dev/davinci12:/dev/davinci12  \
---device=/dev/davinci13:/dev/davinci13  \
---device=/dev/davinci14:/dev/davinci14  \
---device=/dev/davinci15:/dev/davinci15  \
---device=/dev/davinci_manager:/dev/davinci_manager \
---device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
 swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 ```

@@ -12,6 +12,8 @@ from typing import Any, Callable, Dict, Optional
 
 import requests
 
+from sglang.srt.utils.auth import admin_auth_headers
+
 # Server-supplied names used to build a local path for a downloaded video.
 _SAFE_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]+")
 _VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv")
@@ -52,6 +54,11 @@ class SGLDiffusionServerAPI:
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+        }
+        # LoRA loading needs the server's --admin-api-key, read from SGLANG_ADMIN_API_KEY.
+        self.admin_headers = {
+            "Content-Type": "application/json",
+            **admin_auth_headers(),
         }
 
     def get_model_info(self) -> Dict[str, Any]:
@@ -620,7 +627,7 @@ class SGLDiffusionServerAPI:
             response = requests.post(
                 f"{self.base_url}/set_lora",
                 json=payload,
-                headers=self.headers,
+                headers=self.admin_headers,
                 timeout=30,
             )
             response.raise_for_status()
@@ -650,7 +657,7 @@ class SGLDiffusionServerAPI:
             response = requests.post(
                 f"{self.base_url}/unmerge_lora_weights",
                 json=payload,
-                headers=self.headers,
+                headers=self.admin_headers,
                 timeout=30,
             )
             response.raise_for_status()

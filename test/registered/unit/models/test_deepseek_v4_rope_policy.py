@@ -10,7 +10,11 @@ from torch import nn
 import sglang.srt.models.deepseek_v4 as deepseek_v4
 from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
+from sglang.srt.runtime_context import reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -140,6 +144,40 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
                 if compress_ratio == 4:
                     self.assertIs(layer.indexer.freqs_cis, layer.compressor.freqs_cis)
                     self.assertIs(layer.indexer.rotary_emb, layer.compressor.rotary_emb)
+
+
+class TestDeepseekV41IndexSourceLayerMove(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", device="cpu"), role="test")
+
+    def test_moving_a_v41_index_source_layer_does_not_raise(self):
+        """A V4.1 ratio-1/2 index-source layer owns an indexer without a nested
+        compressor; converting or moving the layer must not look for one."""
+        config = SimpleNamespace(
+            index_n_heads=2,
+            index_head_dim=8,
+            qk_rope_head_dim=4,
+            index_topk=4,
+            kv_source_layer_ids=[0],
+            candidate_source_layer_id=-1,
+            candidate_topk_blocks=0,
+            candidate_block_size=0,
+            q_lora_rank=8,
+            hidden_size=16,
+            rms_norm_eps=1e-6,
+        )
+        layer = deepseek_v4.MQALayer.__new__(deepseek_v4.MQALayer)
+        nn.Module.__init__(layer)
+        layer.compressor = None
+        layer.indexer = DeepseekV41Indexer(
+            config, layer_id=1, head_dim=16, quant_config=None, prefix="indexer"
+        )
+
+        layer.to(torch.float32)
+
+        self.assertEqual(layer.indexer.wq_b.weight.dtype, torch.float32)
 
 
 if __name__ == "__main__":
