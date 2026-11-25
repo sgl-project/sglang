@@ -513,6 +513,34 @@ def test_mixed_verify_result_carries_the_kv_weight_version_record(monkeypatch):
     assert result.kv_weight_version_record is record
 
 
+def test_deferred_mixed_tails_wait_for_the_d2h_copy_once():
+    """A mixed DFlash step binds its decode tails inside the forward, whose isolation
+    then restores the batch; the scheduler's batch must still end with the fresh
+    lengths, behind one wait on the D2H stream per step."""
+    from sglang.srt.managers.overlap_utils import FutureMap
+
+    waits = []
+    fm = object.__new__(FutureMap)
+    fm.fwd_prepare_d2h_stream = SimpleNamespace(synchronize=lambda: waits.append(1))
+    fm.new_seq_lens_cpu_pinned = torch.tensor([0, 9, 0, 6])
+    fm.deferred_tails = torch.tensor([3, 1])
+    batch = SimpleNamespace(
+        seq_lens_cpu=torch.tensor([4, 5, 2, 2]),
+        seq_lens_sum=13,
+        prefix_lens=[0, 1, 1, 1],
+    )
+    scheduled = dict(vars(batch))
+    fm.bind_tails(batch)  # the worker's callback
+    bound = dict(vars(batch))
+    vars(batch).update(scheduled)  # the forward isolation restores the batch
+    fm.finish_deferred_tails(batch)
+    assert waits == [1] and fm.deferred_tails is None
+    assert batch.prefix_lens == bound["prefix_lens"] == [0, 1, 6, 9]
+    assert batch.seq_lens_cpu.tolist() == [4, 5, 7, 10] and batch.seq_lens_sum == 26
+    fm.finish_deferred_tails(batch)  # nothing deferred: no wait
+    assert waits == [1]
+
+
 def test_grouped_conv_supports_runtime_block_sizes():
     """The conv indexes a position inside the block, so it must follow whatever
     block size the worker resolved -- including one that is not a power of two."""

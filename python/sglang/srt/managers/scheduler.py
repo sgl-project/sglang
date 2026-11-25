@@ -5592,10 +5592,7 @@ class Scheduler(
                                 self._copy_result_to_cpu(batch_result, batch)
                         else:
                             batch_result.future_indices = future_indices
-                    # Bind the deferred tails if the forward did not need them (idempotent).
-                    if self.future_map.deferred_tails is not None:
-                        self.future_map.bind_tails(batch)
-                        self.future_map.deferred_tails = None
+                    self.future_map.finish_deferred_tails(batch)
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
