@@ -150,6 +150,6 @@ def sample_random_requests(
                 )
             )
 
-    print(f"#Input tokens: {np.sum(input_lens)}")
-    print(f"#Output tokens: {np.sum(output_lens)}")
+    print(f"#Input tokens: {sum(row.prompt_len for row in input_requests)}")
+    print(f"#Output tokens: {sum(row.output_len for row in input_requests)}")
     return input_requests
