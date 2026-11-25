@@ -739,6 +739,9 @@ class Scheduler(
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+        self.metrics_reporter.shortest_prefill_load_scaling = (
+            self.policy.shortest_prefill_load_scaling
+        )
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
