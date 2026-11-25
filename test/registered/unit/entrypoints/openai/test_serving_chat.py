@@ -2853,6 +2853,41 @@ class ServingChatTestCase(CustomTestCase):
                 prompt = self.tm.tokenizer.encode.call_args.args[0]
                 self.assertEqual("calculator" in prompt, expects_tools)
 
+    def test_dsv32_tool_choice_none_omits_message_tools_from_prompt(self):
+        """A tool declared on a message must not reach the prompt when
+        tool_choice="none" turns tool-call parsing off."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "parameters": {"type": "object"},
+            },
+        }
+
+        self.chat.chat_encoding_spec = "dsv32"
+        for tool_choice, expects_tools in (("none", False), ("auto", True)):
+            with self.subTest(tool_choice=tool_choice):
+                self.tm.tokenizer.encode.reset_mock()
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {
+                            "role": "developer",
+                            "content": "Follow the request.",
+                            "tools": [tool],
+                        },
+                        {"role": "user", "content": "Solve 100 / 7."},
+                    ],
+                    tool_choice=tool_choice,
+                )
+
+                self.chat._process_messages(request, is_multimodal=False)
+
+                prompt = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertEqual("calculator" in prompt, expects_tools)
+
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
         _use_chat_encoding(self.chat, "kimi_k3")
