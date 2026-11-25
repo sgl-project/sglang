@@ -152,6 +152,29 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 
 logger = init_logger(__name__)
 
+# ROCm gfx950: QKV and gate+up through AITER's pre-shuffled-B asm GEMM.
+_H3_AITER_BPRESHUFFLE = os.environ.get("SGLANG_DIFFUSION_H3_AITER_BPRESHUFFLE") == "1"
+# Project every step's block AdaLN once per request, several plans per GEMM.
+_H3_ADALN_REQUEST_BATCH = (
+    os.environ.get("SGLANG_DIFFUSION_H3_ADALN_REQUEST_BATCH") == "1"
+)
+# Validation only: compare each step's AdaLN input with the planned one (syncs).
+_H3_ADALN_REQUEST_CHECK = (
+    os.environ.get("SGLANG_DIFFUSION_H3_ADALN_REQUEST_CHECK") == "1"
+)
+# hipBLASLt keeps the M == 1..4 AdaLN kernel (MT64x16x128) up to 16 rows, so the
+# rows of a batched call are bit-identical to each plan's own call; at 17+ rows
+# it switches to another tile and the results differ.
+_H3_ADALN_BATCH_ROWS = 16
+
+
+def _is_gfx950() -> bool:
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return getattr(props, "gcnArchName", "").startswith("gfx950")
+
+
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 
 _NON_LORA_DELTA_SUFFIXES = (".diff", ".diff_b", ".set_weight")
@@ -1986,6 +2009,13 @@ class MiniMaxH3DiTBlock(nn.Module):
             prefix=f"{prefix}.attn",
         )
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
+        if _H3_AITER_BPRESHUFFLE and _is_gfx950():
+            for linear in (self.attn.qkv_proj, self.mlp.fc1):
+                if (
+                    isinstance(linear.quant_method, UnquantizedLinearMethod)
+                    and linear.params_dtype == _BF16_DTYPE
+                ):
+                    linear.aiter_bpreshuffle_asm = True
         self.adaln_proj = (
             None
             if use_adaln_cache
@@ -2475,6 +2505,11 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         """
         cache = self.adaln_cache
         if cache is None:
+            self.__dict__["_h3_adaln_request"] = (
+                self._h3_adaln_request_plan(step_timesteps)
+                if _H3_ADALN_REQUEST_BATCH
+                else None
+            )
             return None
         # Keying costs one D2H sync per plan; compute the keys once and share
         # them between build and resolve.
@@ -2615,6 +2650,96 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         return tuple(
             block.adaln_proj.split_output(output)
             for block, output in zip(self.blocks, outputs)
+        )
+
+    def _h3_adaln_request_plan(
+        self, step_timesteps: list[torch.Tensor]
+    ) -> dict[str, Any]:
+        """Record this request's per-step unique timesteps, keyed like forward's
+        ``adaln_timestep_bits``; the projections are built on first use."""
+        plans: dict[tuple[int, ...], torch.Tensor] = {}
+        for timesteps in step_timesteps:
+            flat = timesteps.detach().reshape(-1)
+            bits = tuple(flat.to("cpu", _FP32_DTYPE).view(torch.int32).tolist())
+            plans.setdefault(bits, flat)
+        return {"plans": plans, "inputs": None, "table": None}
+
+    def _h3_adaln_request_build(
+        self, plans: dict[tuple[int, ...], torch.Tensor], device: torch.device
+    ) -> tuple[dict, dict]:
+        """Every planned step's block AdaLN projections for this request.
+
+        Each step's AdaLN input is computed exactly as forward computes it. Plans
+        of equal width share one projection GEMM of at most _H3_ADALN_BATCH_ROWS
+        rows, where hipBLASLt keeps the kernel of a single plan's call, so each
+        plan's rows are bit-identical to projecting it alone; the weights are
+        read once per chunk instead of once per step.
+        """
+        inputs = {}
+        for bits, timesteps in plans.items():
+            t_emb = self._time_embedding(timesteps.to(device))
+            inputs[bits] = (
+                t_emb
+                if self.adaln_t_table is not None
+                else nn.functional.silu(t_emb).to(_BF16_DTYPE)
+            )
+        by_width: dict[int, list[tuple[int, ...]]] = {}
+        for bits, x in inputs.items():
+            by_width.setdefault(int(x.shape[0]), []).append(bits)
+        chunks = []
+        for width, keys in by_width.items():
+            per = max(1, _H3_ADALN_BATCH_ROWS // width)
+            chunks.extend((width, keys[i : i + per]) for i in range(0, len(keys), per))
+        table: dict[tuple[int, ...], list[torch.Tensor]] = {k: [] for k in inputs}
+        for block in self.blocks:
+            for width, keys in chunks:
+                x = (
+                    inputs[keys[0]]
+                    if len(keys) == 1
+                    else torch.cat([inputs[k] for k in keys])
+                )
+                y = block.adaln_proj.project_local(x)
+                for p, key in enumerate(keys):
+                    table[key].append(y[p * width : (p + 1) * width])
+        return inputs, table
+
+    def _h3_adaln_request_params(
+        self, adaln_input: torch.Tensor, timestep_bits: tuple[int, ...] | None
+    ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
+        request = self.__dict__.get("_h3_adaln_request")
+        if (
+            request is None
+            or timestep_bits is None
+            or timestep_bits not in request["plans"]
+            or self.adaln_cache is not None
+            or get_tp_world_size() > 1
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or hasattr(self, "_sglang_cache_dit_adapter")
+            or is_layerwise_offloaded_module(self)
+            or adaln_input.dtype != _BF16_DTYPE
+            or not all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
+            or any(block.adaln_proj is None for block in self.blocks)
+            or any(
+                block.adaln_proj.linear.weight.dtype != _BF16_DTYPE
+                for block in self.blocks
+            )
+        ):
+            return None
+        if request["table"] is None:
+            request["inputs"], request["table"] = self._h3_adaln_request_build(
+                request["plans"], adaln_input.device
+            )
+        if _H3_ADALN_REQUEST_CHECK and not torch.equal(
+            request["inputs"][timestep_bits], adaln_input
+        ):
+            raise RuntimeError(
+                "MiniMax H3 request AdaLN plan input differs from forward's"
+            )
+        return tuple(
+            block.adaln_proj.split_output(output)
+            for block, output in zip(self.blocks, request["table"][timestep_bits])
         )
 
     def _can_batch_block_adaln(self) -> bool:
@@ -3563,6 +3688,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     cache_plan_index=adaln_cache_plan_index,
                     num_timesteps=adaln_input.shape[0],
                 )
+            elif (
+                planned := self._h3_adaln_request_params(
+                    adaln_input, kwargs.get("adaln_timestep_bits")
+                )
+            ) is not None:
+                block_adaln_params = planned
             elif (
                 memo := self._adaln_memo_params(
                     adaln_input, kwargs.get("adaln_timestep_bits")
