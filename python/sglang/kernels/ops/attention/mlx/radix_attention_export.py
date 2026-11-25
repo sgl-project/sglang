@@ -160,4 +160,4 @@ def _fake(
         tail_k,
         tail_v,
     )
-    return torch.empty_like(q)
+    return torch.empty_like(q, memory_format=torch.contiguous_format)

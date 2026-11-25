@@ -146,6 +146,7 @@ class TestCompiledGraph(CustomTestCase):
             req_pool_indices=torch.tensor([0], device="mps"),
             seq_lens=torch.tensor([tokens], device="mps"),
             seq_lens_sum=tokens,
+            global_num_token_non_padded_cpu=tokens,
             out_cache_loc=torch.arange(1, tokens + 1, device="mps"),
             extend_num_tokens=tokens if prefill else None,
             extend_seq_lens=torch.tensor([tokens], device="mps") if prefill else None,
@@ -282,6 +283,7 @@ class TestCompiledGraph(CustomTestCase):
                 batch.out_cache_loc = torch.arange(1, 6, device="mps")
                 batch.seq_lens.fill_(5)
                 batch.seq_lens_sum = batch.extend_num_tokens = 5
+                batch.global_num_token_non_padded_cpu = 5
                 batch.extend_seq_lens.fill_(5)
                 batch.extend_seq_lens_cpu = [5]
                 with failure:
@@ -340,6 +342,72 @@ class TestCompiledGraph(CustomTestCase):
             actual = mlx_to_torch(graph.launch(graph.bind(inputs))[0])
             torch.testing.assert_close(actual, Model()(*inputs), rtol=0, atol=0)
 
+    def test_phase_limits_fall_back_before_preparing_an_over_limit_shape(self):
+        """Resolved phase limits must bound graph work, not just eager dispatch."""
+        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
+        from sglang.srt.arg_groups.overrides import resolution_result
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.server_args import ServerArgs
+
+        for prefill, limit, field in (
+            (False, 1, "cuda_graph_max_bs_decode"),
+            (True, 3, "cuda_graph_max_seq_len_prefill"),
+            (True, 3, "cuda_graph_max_bs_prefill"),
+        ):
+            for use_json in (False, True):
+                phase = "prefill" if prefill else "decode"
+                key = "max_seq_len" if "seq_len" in field else "max_bs"
+                fields = (
+                    {"cuda_graph_config": {phase: {key: limit}}}
+                    if use_json
+                    else {field: limit}
+                )
+                args = ServerArgs(
+                    model_path="dummy",
+                    cuda_graph_backend_decode="full",
+                    cuda_graph_backend_prefill="full",
+                    **fields,
+                )
+                parse_cuda_graph_config(args)
+                with (
+                    self.subTest(phase=phase, field=field, json=use_json),
+                    get_context().override_server_args(
+                        device="mps",
+                        cuda_graph_config=resolution_result(args, "cuda_graph_config"),
+                    ),
+                ):
+                    runner, batch, _ = self._runner_fixture(
+                        prefill=prefill, tokens=limit if prefill else 1
+                    )
+                    runner._max_batch_size = 4
+                    self.assertTrue(runner.can_run_graph(batch))
+                    if prefill:
+                        batch.input_ids = torch.ones(4, device="mps", dtype=torch.int64)
+                        batch.positions = torch.arange(4, device="mps")
+                        batch.out_cache_loc = torch.arange(1, 5, device="mps")
+                        batch.seq_lens.fill_(4)
+                        batch.seq_lens_sum = batch.extend_num_tokens = 4
+                        batch.global_num_token_non_padded_cpu = 4
+                        batch.extend_seq_lens.fill_(4)
+                        batch.extend_seq_lens_cpu = [4]
+                    else:
+                        batch.batch_size = 2
+                        for name in (
+                            "input_ids",
+                            "positions",
+                            "out_cache_loc",
+                            "req_pool_indices",
+                            "seq_lens",
+                        ):
+                            setattr(batch, name, getattr(batch, name).repeat(2))
+                    with patch.object(
+                        runner,
+                        "_prepare_graph",
+                        side_effect=AssertionError("prepared an over-limit batch"),
+                    ):
+                        self.assertFalse(runner.can_run_graph(batch))
+                    self.assertEqual(runner.execution_count, 0)
+
     def test_cpu_fp64_binding_does_not_silently_downcast(self):
         """The graph's CPU branch must preserve values below fp32 resolution."""
         import mlx.core as mx
@@ -383,6 +451,7 @@ class TestCompiledGraph(CustomTestCase):
         from sglang.srt.hardware_backend.mps.compiled_region import (
             UnsupportedMlxRegion,
             discover_decode_region,
+            static_metadata_matches,
         )
         from sglang.srt.hardware_backend.mps.compiled_runner import (
             _causal_sdpa,
@@ -390,9 +459,14 @@ class TestCompiledGraph(CustomTestCase):
         )
         from sglang.srt.layers.logits_processor import LogitsProcessor
         from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
+        )
+        from sglang.srt.model_executor.forward_mode import (
+            CaptureHiddenMode,
+            ForwardMode,
         )
         from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.tensor_bridge import mlx_to_torch
@@ -441,6 +515,7 @@ class TestCompiledGraph(CustomTestCase):
                     dynamic_tokens=True,
                 )
                 self.addCleanup(graph.close)
+                exported_reads = wrapper.static_reads.copy()
                 for ids in (
                     [1, 2, 3],
                     [4, 5],
@@ -448,6 +523,8 @@ class TestCompiledGraph(CustomTestCase):
                     [1, 2, 3, 4],
                     [1, 2, 3, 4, 5, 6],
                     [4, 5, 6],
+                    [1] * 137,
+                    [2] * 73,
                 ):
                     current = (
                         torch.tensor(ids, device="mps"),
@@ -458,6 +535,31 @@ class TestCompiledGraph(CustomTestCase):
                     )
                     wrapper.static_reads.clear()
                     expected = wrapper(*current)
+                    self.assertNotIn(
+                        "extend_logprob_start_lens_cpu", wrapper.static_reads
+                    )
+                    batch = ForwardBatch(
+                        forward_mode=ForwardMode.EXTEND,
+                        batch_size=1,
+                        input_ids=current[0],
+                        req_pool_indices=current[2],
+                        seq_lens=current[3],
+                        out_cache_loc=current[4],
+                        seq_lens_sum=len(ids),
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                        global_num_token_non_padded_cpu=len(ids),
+                        extend_num_tokens=len(ids),
+                        extend_seq_lens=current[3],
+                        extend_seq_lens_cpu=[len(ids)],
+                        extend_prefix_lens_cpu=[0],
+                        extend_logprob_start_lens_cpu=[len(ids)],
+                    )
+                    self.assertTrue(static_metadata_matches(batch, exported_reads))
+                    batch.return_logprob = True
+                    self.assertFalse(static_metadata_matches(batch, exported_reads))
+                    batch.return_logprob = False
+                    batch.is_prefill_only = True
+                    self.assertFalse(static_metadata_matches(batch, exported_reads))
                     torch.mps.synchronize()
                     actual = graph.launch(graph.bind(current))
                     for lhs, rhs in zip(actual, expected):
@@ -643,7 +745,10 @@ class TestCompiledGraph(CustomTestCase):
             ForwardContext,
             forward_context,
         )
-        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.model_executor.forward_mode import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
         from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.tensor_bridge import mlx_to_torch
 
@@ -706,6 +811,22 @@ class TestCompiledGraph(CustomTestCase):
                     model=wrapper, example_inputs=inputs, attention=radix_decode
                 )
                 self.addCleanup(graph.close)
+                batch = ForwardBatch(
+                    forward_mode=ForwardMode.DECODE,
+                    batch_size=1,
+                    input_ids=inputs[0],
+                    req_pool_indices=inputs[2],
+                    seq_lens=inputs[3],
+                    out_cache_loc=inputs[4],
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    seq_lens_sum=1,
+                    global_num_token_non_padded_cpu=1,
+                    return_logprob=True,
+                    top_logprobs_nums=[5],
+                    token_ids_logprobs=[None],
+                    extend_input_logprob_token_ids_gpu=torch.empty(0, device="mps"),
+                )
+                self.assertTrue(static_metadata_matches(batch, wrapper.static_reads))
                 for token, position in ((3, 0), (4, 1)):
                     current = (
                         torch.full_like(inputs[0], token),
@@ -1032,8 +1153,11 @@ class TestCompiledGraph(CustomTestCase):
         )
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
         from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+        self.enterContext(get_context().override_server_args(device="mps"))
 
         class Decoder(torch.nn.Module):
             def __init__(self):

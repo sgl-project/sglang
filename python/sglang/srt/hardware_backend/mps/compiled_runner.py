@@ -25,6 +25,7 @@ from sglang.srt.hardware_backend.mps.compiled_graph import (
 )
 from sglang.srt.hardware_backend.mps.compiled_region import (
     RegionBatch,
+    StaticMetadataReads,
     UnsupportedMlxRegion,
     discover_decode_region,
     static_metadata_matches,
@@ -39,7 +40,7 @@ from sglang.srt.model_executor.forward_mode import (
     ForwardMode,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.sampling.sampling_batch_info import adjusts_logits
 from sglang.srt.utils.tensor_bridge import MlxTensorView, _export_evaluated_mlx
 
@@ -161,7 +162,7 @@ class _DecodeModule(torch.nn.Module):
         super().__init__()
         self.model = model
         self.region = region
-        self.static_reads = {}
+        self._metadata_reads = StaticMetadataReads()
         self.prefill = prefill
         self.cache = torch.nn.Module()
         if not prefill:
@@ -176,6 +177,10 @@ class _DecodeModule(torch.nn.Module):
             layers=region.layers,
             prefill=prefill,
         )
+
+    @property
+    def static_reads(self):
+        return self._metadata_reads.values
 
     def forward(self, input_ids, positions, requests, lengths, locations):
         batch = RegionBatch(
@@ -293,16 +298,22 @@ class CompiledMlxRunner(BaseRunner):
         self.compile_seconds = 0.0
         self._refresh_region()
         if self._prefill and self._unsupported_reason is None:
+            phase = get_exec().graph.cuda_graph_config.prefill
+            tokens = min(
+                limit
+                for limit in (8, phase.max_bs, phase.max_seq_len)
+                if limit is not None
+            )
             # Dummy preparation is read-only and never commits warmup K/V.
             batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=1,
-                input_ids=torch.zeros(8, device="mps", dtype=torch.int64),
-                positions=torch.arange(8, device="mps"),
+                input_ids=torch.zeros(tokens, device="mps", dtype=torch.int64),
+                positions=torch.arange(tokens, device="mps"),
                 req_pool_indices=torch.zeros(1, device="mps", dtype=torch.int64),
-                seq_lens=torch.tensor([8], device="mps"),
-                seq_lens_sum=8,
-                out_cache_loc=torch.arange(8, device="mps"),
+                seq_lens=torch.tensor([tokens], device="mps"),
+                seq_lens_sum=tokens,
+                out_cache_loc=torch.arange(tokens, device="mps"),
             )
             try:
                 self._graph(batch)
@@ -324,6 +335,12 @@ class CompiledMlxRunner(BaseRunner):
             if self._prefill
             else forward_batch.batch_size
         )
+        config = get_exec().graph.cuda_graph_config
+        phase = (
+            (config.prefill if self._prefill else config.decode)
+            if config is not None
+            else None
+        )
         reason = self._unsupported_reason
         if reason is not None:
             pass
@@ -333,6 +350,15 @@ class CompiledMlxRunner(BaseRunner):
             reason = "non-decode mode"
         elif not 1 <= forward_batch.batch_size <= self._max_batch_size:
             reason = "batch outside supported graph range"
+        elif phase is not None and (
+            (phase.max_bs is not None and size > phase.max_bs)
+            or (
+                self._prefill
+                and phase.max_seq_len is not None
+                and size > phase.max_seq_len
+            )
+        ):
+            reason = "batch exceeds configured graph phase limits"
         elif (
             forward_batch.input_embeds is not None
             or forward_batch.spec_info is not None

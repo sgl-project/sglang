@@ -17,6 +17,37 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestRadixExportContract(CustomTestCase):
+    def test_fake_output_matches_real_layout_for_noncontiguous_queries(self):
+        """Export must describe the contiguous result, not the query's layout."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        from sglang.kernels.ops.attention.mlx.radix_attention_export import radix_decode
+
+        query = torch.randn(4, 2, 64).transpose(0, 1)
+        keys = torch.randn(2, 2, 64)
+        pool = torch.randn(16, 2, 64)
+        for q in (query, query.contiguous()):
+            with self.subTest(stride=q.stride()):
+                inputs = (
+                    q,
+                    keys,
+                    keys,
+                    pool,
+                    pool,
+                    torch.arange(16, dtype=torch.int32).repeat(2, 1),
+                    torch.tensor([0, 1]),
+                    torch.tensor([3, 5]),
+                )
+                actual = radix_decode(*inputs, 0.125)
+                with FakeTensorMode() as mode:
+                    fake = radix_decode(
+                        *(mode.from_tensor(tensor) for tensor in inputs), 0.125
+                    )
+                self.assertEqual(fake.shape, actual.shape)
+                self.assertEqual(fake.dtype, actual.dtype)
+                self.assertEqual(fake.device, actual.device)
+                self.assertEqual(fake.stride(), actual.stride())
+
     def test_pending_tail_is_explicit_read_only_and_validated_during_export(self):
         """An uncommitted previous token must not read its invalid pool slot."""
         from sglang.kernels.ops.attention.mlx.radix_attention_export import radix_decode

@@ -460,13 +460,25 @@ class LogitsMetadata:
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
+            extend_logprob_start_lens_cpu=(
+                forward_batch.extend_logprob_start_lens_cpu
+                if extend_return_logprob
+                else None
+            ),
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
-            top_logprobs_nums=forward_batch.top_logprobs_nums,
+            top_logprobs_nums=(
+                forward_batch.top_logprobs_nums if forward_mode.is_extend() else None
+            ),
             input_candidate_selectors=forward_batch.input_candidate_selectors,
             extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
-            token_ids_logprobs=forward_batch.token_ids_logprobs,
-            extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
+            token_ids_logprobs=(
+                forward_batch.token_ids_logprobs if forward_mode.is_extend() else None
+            ),
+            extend_input_logprob_token_ids_gpu=(
+                forward_batch.extend_input_logprob_token_ids_gpu
+                if extend_return_logprob
+                else None
+            ),
             is_prefill_only=forward_batch.is_prefill_only,
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
             beam_trie_levels=(

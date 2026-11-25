@@ -17,6 +17,11 @@ class UnsupportedMlxRegion(ValueError):
     pass
 
 
+class StaticMetadataReads(msgspec.Struct):
+    # Non-strict export restores module-owned dicts but retains opaque objects.
+    values: dict = {}
+
+
 class DecodeRegion(msgspec.Struct, frozen=True, kw_only=True):
     layers: tuple[RadixAttention, ...]
     position_arg: str
@@ -171,6 +176,16 @@ class RegionBatch(ForwardBatch):
 def static_metadata_matches(batch: ForwardBatch, reads: dict) -> bool:
     for name, expected in reads.items():
         actual = getattr(batch, name)
+        if batch.forward_mode == ForwardMode.EXTEND:
+            # These export inputs are derived from the admitted uncached prompt.
+            if name in (
+                "seq_lens_sum",
+                "extend_num_tokens",
+                "global_num_token_non_padded_cpu",
+            ):
+                expected = batch.input_ids.numel()
+            elif name == "extend_seq_lens_cpu":
+                expected = [batch.input_ids.numel()]
         if type(actual) is not type(expected) or actual != expected:
             return False
     return True
