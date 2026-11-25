@@ -189,6 +189,9 @@ class MockModelRunner:
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self.dtype = self.config["dtype"]
         self.kv_cache_dtype = self.config["kv_cache_dtype"]
+        self.kv_cache_dtype_str = (
+            "fp8_e4m3" if self.kv_cache_dtype == torch.float8_e4m3fn else "auto"
+        )
         self.is_draft_worker = False
         self.is_hybrid_swa = False
 

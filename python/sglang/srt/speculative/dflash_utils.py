@@ -150,7 +150,10 @@ def dflash_draft_cell_size_per_token(
 
         # One latent row per token, replicated across TP ranks.
         kv_dim = calculate_mla_kv_cache_dim(
-            model_config=draft_model_config, kv_cache_dtype=draft_kv_cache_dtype
+            model_config=draft_model_config,
+            kv_cache_dtype=draft_kv_cache_dtype,
+            # A DFLASH draft has no DSA layers, so it never stores nvfp4_ds_mla rows.
+            kv_cache_dtype_str=None,
         )
         return int(kv_dim * int(draft_num_layers) * dtype_size)
     num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)

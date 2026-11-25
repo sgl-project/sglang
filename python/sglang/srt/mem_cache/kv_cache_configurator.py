@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.kv_cache_dtype import uses_nvfp4_ds_mla_kv
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -1069,7 +1070,9 @@ class KVCacheConfigurator:
                 "--enable-unified-memory."
             )
         row_bytes = calculate_mla_kv_cache_dim(
-            model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+            model_config=self.model_config,
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype_str=self.kv_cache_dtype_str,
         )
         if (
             self.kv_cache_dtype != torch.float8_e4m3fn
@@ -2109,7 +2112,9 @@ class KVCacheConfigurator:
                 or get_dsa_index_kpool_compress(self.model_config.hf_config)
                 or index_head_dim != target_pool.index_head_dim
                 or calculate_mla_kv_cache_dim(
-                    model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    kv_cache_dtype_str=self.kv_cache_dtype_str,
                 )
                 != target_pool.kv_cache_dim
             ):
@@ -2124,6 +2129,7 @@ class KVCacheConfigurator:
                 index_head_dim=index_head_dim,
                 index_kpool=1,
                 use_fp4_indexer=target_pool.use_fp4_indexer,
+                nvfp4_ds_mla=target_pool.dsa_kv_nvfp4,
             )
         if self.use_mla_backend:
             return PageInterleaveMLATokenToKVPool(
@@ -2457,7 +2463,9 @@ class KVCacheConfigurator:
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=(
                 calculate_mla_kv_cache_dim(
-                    model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    kv_cache_dtype_str=self.kv_cache_dtype_str,
                 )
                 if use_dsa_fp8_kv_cache_storage
                 else None
@@ -2548,6 +2556,11 @@ class KVCacheConfigurator:
             PoolCls = dsa_pool_class
         if self.loc_space_scale > 1:
             pool_kwargs["dcp_replicated"] = True
+        if uses_nvfp4_ds_mla_kv(
+            hf_config=self.model_config.hf_config,
+            kv_cache_dtype=self.kv_cache_dtype_str,
+        ):
+            pool_kwargs["nvfp4_ds_mla"] = True
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -2566,6 +2579,7 @@ class KVCacheConfigurator:
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
                 kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dtype_str=self.kv_cache_dtype_str,
             ),
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
@@ -2616,9 +2630,15 @@ class KVCacheConfigurator:
                 kv_cache_dim=calculate_mla_kv_cache_dim(
                     model_config=self.model_config,
                     kv_cache_dtype=self.kv_cache_dtype,
+                    kv_cache_dtype_str=self.kv_cache_dtype_str,
                 ),
                 use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             )
+            if uses_nvfp4_ds_mla_kv(
+                hf_config=self.model_config.hf_config,
+                kv_cache_dtype=self.kv_cache_dtype_str,
+            ):
+                full_pool_kwargs["nvfp4_ds_mla"] = True
 
         return SWAKVPool(
             size=full_max_total_num_tokens,
@@ -2852,6 +2872,7 @@ class KVCacheConfigurator:
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,
                         kv_cache_dtype=self.kv_cache_dtype,
+                        kv_cache_dtype_str=self.kv_cache_dtype_str,
                     ),
                     index_kpool=dsa_index_kpool,
                     index_kpool_compress=get_dsa_index_kpool_compress(
@@ -2868,6 +2889,11 @@ class KVCacheConfigurator:
                         ]
                     ),
                 )
+                if uses_nvfp4_ds_mla_kv(
+                    hf_config=self.model_config.hf_config,
+                    kv_cache_dtype=self.kv_cache_dtype_str,
+                ):
+                    extra_args["nvfp4_ds_mla"] = True
                 if dsa_index_kpool > 1:
                     extra_args.update(
                         tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
@@ -3896,7 +3922,10 @@ class KVCacheConfigurator:
 
 
 def calculate_mla_kv_cache_dim(
-    *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
+    *,
+    model_config: ModelConfig,
+    kv_cache_dtype: torch.dtype,
+    kv_cache_dtype_str: Optional[str],
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
     kv_lora_rank = model_config.kv_lora_rank
@@ -3914,17 +3943,39 @@ def calculate_mla_kv_cache_dim(
 
     disaggregation_mode = get_disagg().disaggregation_mode
     if disaggregation_mode == "decode":
-        uses_raw_fp8_kv_layout = uses_raw_fp8_dsa_kv_layout(
-            get_exec().kernel.dsa_decode_backend
-        )
+        local_backends = (get_exec().kernel.dsa_decode_backend,)
     elif disaggregation_mode == "prefill":
-        uses_raw_fp8_kv_layout = uses_raw_fp8_dsa_kv_layout(
-            get_exec().kernel.dsa_prefill_backend
-        )
+        local_backends = (get_exec().kernel.dsa_prefill_backend,)
     else:
-        uses_raw_fp8_kv_layout = uses_raw_fp8_dsa_kv_layout(
-            get_exec().kernel.dsa_prefill_backend
-        ) or uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
+        local_backends = (
+            get_exec().kernel.dsa_prefill_backend,
+            get_exec().kernel.dsa_decode_backend,
+        )
+    uses_raw_fp8_kv_layout = any(uses_raw_fp8_dsa_kv_layout(b) for b in local_backends)
+
+    if uses_nvfp4_ds_mla_kv(
+        hf_config=model_config.hf_config, kv_cache_dtype=kv_cache_dtype_str
+    ):
+        from sglang.kernels.ops.kvcache.mla_buffer import NVFP4_DS_MLA_ROW_BYTES
+
+        # Startup validation already enforces this; a pool sized for 352 B rows
+        # that a non-Prims-TS kernel reads would be silently corrupt.
+        if any(b != "prims_ts" for b in local_backends):
+            raise ValueError(
+                "--kv-cache-dtype nvfp4_ds_mla needs --dsa-prefill-backend and "
+                f"--dsa-decode-backend prims_ts for every local role; got {local_backends}."
+            )
+        if (
+            kv_cache_dtype != torch.float8_e4m3fn
+            or kv_lora_rank != 512
+            or qk_rope_head_dim != 64
+        ):
+            raise ValueError(
+                "--kv-cache-dtype nvfp4_ds_mla needs E4M3 elements and the D576 "
+                f"MLA latent (kv_lora_rank 512, rope 64); got {kv_cache_dtype}, "
+                f"{kv_lora_rank}, {qk_rope_head_dim}."
+            )
+        return NVFP4_DS_MLA_ROW_BYTES
 
     if uses_raw_fp8_kv_layout:
         return kv_cache_dim

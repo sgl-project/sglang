@@ -35,6 +35,7 @@ def _resolve(
     """The (label, dtype) a runner stamps from the given flags."""
     runner = ModelRunner.__new__(ModelRunner)
     runner.model = SimpleNamespace(quant_config=quant_config)
+    runner.model_config = SimpleNamespace(hf_config=None)
     runner.dtype = torch.bfloat16
     runner.is_draft_worker = is_draft_worker
     runner.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
