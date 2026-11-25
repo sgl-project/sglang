@@ -115,7 +115,9 @@ jobs:
       decode_size: ${{ matrix.decode_size }}
       router_size: ${{ matrix.router_size }}
       test_case: ${{ matrix.test_case }}
-      image: ${{ inputs.image }}
+      # workflow_dispatch defaults the image; pull_request runs have no inputs,
+      # so fall back to the a3 image here as well.
+      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050' }}
       prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
       container_patches: ${{ matrix.container_patches || '' }}
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
