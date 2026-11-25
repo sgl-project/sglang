@@ -70,9 +70,11 @@ def _marlin():  # Hopper's stock NVFP4 MoE (Marlin) on the same weights
 def _inputs(M, n, skew, seed):
     torch.manual_seed(seed)
     ids = torch.rand(M, n, device=G).argsort(1)[:, :8]
-    if skew:  # experts 0-5 take every token, odd experts above 5 none
+    if skew == 1:  # experts 0-5 take every token, odd experts above 5 none
         odd = 6 + 2 * torch.rand(M, n // 2 - 3, device=G).argsort(1)[:, :2]
         ids = torch.cat([torch.arange(6, device=G).expand(M, 6), odd], 1)
+    elif skew == 2:  # repeated ids: experts 0 and n - 1 take two slots of every token
+        ids[:, :2], ids[:, -2:] = 0, n - 1
     x = torch.randn(M, H, device=G, dtype=torch.bfloat16)
     tw, nw = torch.rand(M, 8, device=G), (torch.rand(H, device=G) + 0.5).bfloat16()
     return x, ids.int(), tw, nw
@@ -104,7 +106,9 @@ def _ref(x, ids, tw, nw, exact=False):
     "M,sp,skew",
     [(1, 0, 0), (100, 0, 1), (512, 0, 0), (513, 0, 1), (1025, 0, 0), (65, 1, 0)]
     + [(300, 1, 1), (2048, 1, 0), (2049, 1, 1), (8192, 1, 0), (8193, 1, 1)]
-    + [(16384, 1, 0)],
+    + [(16384, 1, 0)]
+    # repeated ids: more routes per expert than tokens in the large-M route lists
+    + [(100, 0, 2), (2049, 1, 2), (8193, 1, 2)],
 )
 def test_matches_reference(M, sp, skew):
     (w13, w2), (g13, g2) = (_experts(n)[2] for n in (2 * H, H)), _gs()[:, :E]

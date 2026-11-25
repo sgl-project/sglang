@@ -257,7 +257,8 @@ def _big_workspace(device_index: int) -> dict:
     ws = {
         "xt": torch.empty((_BIG_SLOTS, _HIDDEN), dtype=torch.bfloat16, device=dev),
         "h": torch.empty((_BIG_SLOTS, _INTER), dtype=torch.bfloat16, device=dev),
-        "rev": torch.empty((_BIG_NE + _TOP_K) * _BIG_MAXT, **i32),
+        # per expert a list of up to 8 routes per token (ids may repeat in a token), then ranks
+        "rev": torch.empty((_BIG_NE + 1) * _TOP_K * _BIG_MAXT, **i32),
         "ucnt": torch.empty(_BIG_MAXT // 128 * 64, **i32),
         "ctr": torch.zeros(_BIG_CTR, **i32),
     }
@@ -485,7 +486,10 @@ def nvfp4_w4a16_moe_sp(
     recv_ptrs,
     dg: Optional[DynamicGuests] = None,
 ) -> None:
-    """Route j of token t (row t % R of rank t // R's ``shard``) -> row j * R + t % R of that rank's recv."""
+    """Route j of token t (row t % R of rank t // R's ``shard``) -> row j * R + t % R of that rank's recv.
+
+    Below BIG_MIN tokens a token's ids must be distinct (the small-M kernel writes one recv
+    row per token and expert); the large-M kernel also takes repeated ids."""
     ids = _local_ids(local_ids)
     tw = topk_weights.to(torch.float32).contiguous()
     M, R = ids.shape[0], shard.shape[0]

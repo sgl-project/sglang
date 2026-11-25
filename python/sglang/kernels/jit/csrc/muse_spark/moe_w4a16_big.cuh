@@ -99,6 +99,11 @@ DEVI void stmatrix_t2(u32 a, u32 r0, u32 r1) {
 DEVI float silu(float v) {
   return __fdividef(v, 1.f + ex2(v * -1.4426950216293334961f));
 }
+// `rev`: the route list of each expert (up to TOPK * M entries: a token may name an expert in
+// several slots), then at list NE the rank of every (token, slot) in its expert's list.
+DEVI size_t rev_at(const Params& p, int e, int i) {
+  return (size_t)e * TOPK * p.M + i;
+}
 DEVI int tile_of_row(const Plan& pl, int e, int row) {
   const int q = pl.q[e], r = pl.r[e], v = (row + (row >= pl.cut[e] ? pl.sh[e] : 0)) >> 5;
   return pl.tb[e] + (v < r * (q + 1) ? v / (q + 1) : r + (v - r * (q + 1)) / q);
@@ -554,7 +559,7 @@ DEVI void publisher(const Params& p, u8* sm, u32 bars, const int* pq, const Plan
     } else {
       const int r0 = row0 - pl.off[e], nr = min(n, pl.cnt[e] - r0), rs = rg2 ? 528 : 272, cb = rg2 ? 512 : 256;
       for (int i = lane; i < nr; i += 32) {
-        const int tj = __ldcg(p.rev + (size_t)e * p.M + r0 + i), t = tj >> 3, o = t / p.R;
+        const int tj = __ldcg(p.rev + rev_at(p, e, r0 + i)), t = tj >> 3, o = t / p.R;
         bulk_s2g(AS(u8, p.os[o]) + ((size_t)(tj & 7) * p.R + t - o * p.R) * 8192 + bi * cb, stg + i * rs, cb);
       }
       bulk_commit_wait_read();
@@ -770,8 +775,8 @@ DEVI void list_unit(const Params& p, int u, int ctid, int* hist) {
     for (int j = 0; j < TOPK; ++j)
       if (e8[j] >= 0 && e8[j] < p.ne) {
         const int r = hist[NE + e8[j]] + lr[j];
-        p.rev[(size_t)e8[j] * p.M + r] = t * 8 + j;
-        p.rev[(size_t)NE * p.M + t * 8 + j] = r;
+        p.rev[rev_at(p, e8[j], r)] = t * 8 + j;
+        p.rev[rev_at(p, NE, t * 8 + j)] = r;
       }
   bar_sync(1, 256);
   if (ctid == 0) {
@@ -833,8 +838,7 @@ DEVI void helper_gather(const Params& p, const Plan& pl, int lane) {
   // asm volatile keeps the next route's load ahead of this row's data loads
   auto route = [&](int x) {
     int r = 0;
-    if (x >= 0)
-      asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(r) : "l"(p.rev + (size_t)(x >> 20) * p.M + (x & 0xFFFFF)));
+    if (x >= 0) asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(r) : "l"(p.rev + rev_at(p, x >> 20, x & 0xFFFFF)));
     return r;
   };
   int x = locate(claim_k()), tj = route(x);
@@ -847,7 +851,7 @@ DEVI void helper_gather(const Params& p, const Plan& pl, int lane) {
     }
     const int e = x >> 20, t = tj >> 3, rt = t / p.R;
     const int le = lane < TOPK ? __ldcg(p.ids + 8 * t + lane) : -1;
-    int fr = lane < TOPK ? __ldcg(p.rev + (size_t)NE * p.M + 8 * t + lane) : 0;
+    int fr = lane < TOPK ? __ldcg(p.rev + rev_at(p, NE, 8 * t + lane)) : 0;
     const int xn = locate(claim_k());
     const bool v = le >= 0 && le < p.ne;
     if (__reduce_min_sync(~0u, v ? pl.rk[le] * TOPK + lane : NE * TOPK) != pl.rk[e] * TOPK + (tj & 7)) {
@@ -1187,7 +1191,8 @@ extern "C" __global__ void __launch_bounds__(256) moe_w4a16_dsplit(
   for (int k = 0; k < DSPLIT_IDS / 256; ++k)
     if (lo[k] >= 0) {
       const int r = tot[64 + lo[k]] + lr[k];
-      rev[(size_t)lo[k] * (n >> 3) + r] = i0 + 256 * k;
-      rev[(size_t)pfm::NE * (n >> 3) + i0 + 256 * k] = r;
+      // pfm::rev_at with n = TOPK * M
+      rev[(size_t)lo[k] * n + r] = i0 + 256 * k;
+      rev[(size_t)pfm::NE * n + i0 + 256 * k] = r;
     }
 }
