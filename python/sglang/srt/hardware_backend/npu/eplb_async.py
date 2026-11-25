@@ -640,6 +640,8 @@ def create_npu_async_eplb(model_config, weights, metadata):
             order_submissions,
             runtime._p2p_batch_size,
             p2p_buffer_mib,
+            moe.eplb_rebalance_num_iterations,
+            moe.expert_distribution_recorder_buffer_size,
             spec,
             metadata.num_logical_experts,
             hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
@@ -652,7 +654,8 @@ def create_npu_async_eplb(model_config, weights, metadata):
         raise RuntimeError("Async EPLB setup failed on at least one rank") from error
     if any(s != signature for s in signatures):
         raise ValueError(
-            "Async EPLB ranks disagree on transport, layout, weight geometry or batching"
+            "Async EPLB ranks disagree on transport, layout, weight geometry, "
+            "batching, rebalance interval or recorder window"
         )
     # All ranks must agree before any enters a conditional HCCL group creation.
     if not borrow_world_group:

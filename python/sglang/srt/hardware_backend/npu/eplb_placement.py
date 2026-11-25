@@ -80,8 +80,9 @@ def plan_migration(
         ranks_per_node,
         preserve_rank_assignment=replicated_static,
     )
+    cheaper_gains = {}
     if score_steps and not replicated:
-        physical, logical = _prefer_fewer_moves(
+        physical, logical, cheaper_gains = _prefer_fewer_moves(
             current, physical, logical, counts, spec.local_experts
         )
     moved = (physical != current).any(dim=1).tolist()
@@ -90,7 +91,7 @@ def plan_migration(
     # An unchanged plan only needs the completion message.
     if score_steps and changed:
         changed = _select_layers_for_migration(
-            changed, current, physical, counts, spec.local_experts
+            changed, current, physical, counts, spec.local_experts, cheaper_gains
         )
     return MigrationPlacement(changed, physical, logical) if changed else None
 
@@ -379,7 +380,7 @@ def _prefer_fewer_moves(old, physical, logical, counts, local_experts):
     target = physical.numpy().reshape(live.shape)
     result = target.copy()
     weights = counts.sum(dim=0, dtype=torch.float64).numpy()
-    changed_layers = []
+    cheaper_gains = {}
     for layer, (source, reference, weight) in enumerate(
         zip(live, target, weights, strict=True)
     ):
@@ -409,20 +410,23 @@ def _prefer_fewer_moves(old, physical, logical, counts, local_experts):
                 candidate[rank, dst],
                 candidate[heavy, src],
             )
-        if load.max() <= peak_limit and np.count_nonzero(candidate != source) < (
+        if load.max() <= peak_limit and 0 < np.count_nonzero(candidate != source) < (
             np.count_nonzero(reference != source)
         ):
-            result[layer] = candidate
-            changed_layers.append(layer)
-    if not changed_layers:
-        return physical, logical
+            # Keep the aligned plan unless the cheaper move also passes admission.
+            gain = _migration_gain(counts[:, layer].numpy(), source, candidate)
+            if gain:
+                result[layer] = candidate
+                cheaper_gains[layer] = gain
+    if not cheaper_gains:
+        return physical, logical, cheaper_gains
     physical = torch.from_numpy(result.reshape(layers, capacity))
     logical = logical.clone()
     slots = torch.arange(capacity, dtype=logical.dtype)
-    for layer in changed_layers:
+    for layer in cheaper_gains:
         logical[layer].fill_(-1)
         logical[layer, :, 0].scatter_(0, physical[layer].long(), slots)
-    return physical, logical
+    return physical, logical, cheaper_gains
 
 
 def _migration_gain(samples, live, target):
@@ -456,7 +460,9 @@ def _migration_gain(samples, live, target):
     return gain
 
 
-def _select_layers_for_migration(changed, old, physical, counts, local_experts):
+def _select_layers_for_migration(
+    changed, old, physical, counts, local_experts, cheaper_gains
+):
     """Skip marginal improvements and stage the most useful layers first."""
     load = counts.numpy()
     before = old.numpy()
@@ -465,7 +471,9 @@ def _select_layers_for_migration(changed, old, physical, counts, local_experts):
     for layer in changed:
         live = before[layer].reshape(-1, local_experts)
         target = after[layer].reshape(live.shape)
-        gain = _migration_gain(load[:, layer], live, target)
+        gain = cheaper_gains.get(layer)
+        if gain is None:
+            gain = _migration_gain(load[:, layer], live, target)
         if not gain:
             continue
         receives = max(
