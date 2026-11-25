@@ -450,7 +450,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 ]
                 if spec_details:
                     sglext_spec_tokens_details = (
-                        spec_details if request.n > 1 else spec_details[0]
+                        spec_details
+                        if (request.n > 1 or len(spec_tokens_details) > 1)
+                        else spec_details[0]
                     )
 
             if any(
@@ -559,9 +561,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
             if detail is not None
         ]
         spec_tokens_details = (
-            spec_details
-            if request.n > 1
-            else (spec_details[0] if spec_details else None)
+            (spec_details if (request.n > 1 or len(ret) > 1) else spec_details[0])
+            if spec_details
+            else None
         )
         response_sglext = None
         if routed_experts or cached_tokens_details or spec_tokens_details:

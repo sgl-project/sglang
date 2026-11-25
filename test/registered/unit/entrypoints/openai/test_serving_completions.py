@@ -16,7 +16,10 @@ from unittest.mock import AsyncMock, Mock
 
 from fastapi import Request
 
-from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    CompletionRequest,
+    SpecTokensDetails,
+)
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -639,6 +642,175 @@ class ServingCompletionTestCase(unittest.TestCase):
             chunk["sglext"] for chunk in single_parsed if "sglext" in chunk
         )["spec_tokens_details"]
         self.assertIsInstance(single_details, dict)
+
+    def test_batched_prompts_return_spec_details_per_choice(self):
+        for prompt in (["Hello", "World"], [[1, 2], [3, 4]]):
+            with self.subTest(prompt=prompt):
+                req = CompletionRequest(
+                    model="x",
+                    prompt=prompt,
+                    max_tokens=100,
+                    n=1,
+                    return_spec_tokens_details=True,
+                )
+                ret = [_spec_result(0), _spec_result(1)]
+                response = self.sc._build_completion_response(req, ret, 1234567890)
+                details = response.sglext.spec_tokens_details
+                self.assertIsInstance(details, list)
+                self.assertEqual([item.spec_cap_length for item in details], [1.0, 2.0])
+                self.assertEqual(
+                    [item.spec_cap_lens_histogram for item in details],
+                    [[0, 1], [1, 1]],
+                )
+
+        # A single-element prompt list still produces one choice -> single object.
+        single_list_req = CompletionRequest(
+            model="x",
+            prompt=["Hello"],
+            max_tokens=100,
+            n=1,
+            return_spec_tokens_details=True,
+        )
+        single_list_resp = self.sc._build_completion_response(
+            single_list_req, [_spec_result(0)], 1234567890
+        )
+        self.assertIsInstance(
+            single_list_resp.sglext.spec_tokens_details, SpecTokensDetails
+        )
+        self.assertEqual(
+            single_list_resp.sglext.spec_tokens_details.spec_cap_length, 1.0
+        )
+
+        # Partial spec stats across a batched prompt still return a list.
+        plain_result = {
+            "text": "choice-0",
+            "meta_info": {
+                "id": "cmpl-spec-test",
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "cached_tokens": 0,
+                "cached_tokens_details": {"device": 2},
+                "finish_reason": {"type": "stop"},
+                "weight_version": "default",
+            },
+            "index": 0,
+        }
+        batch_req = CompletionRequest(
+            model="x",
+            prompt=["Hello", "World"],
+            max_tokens=100,
+            n=1,
+            return_spec_tokens_details=True,
+        )
+        partial_resp = self.sc._build_completion_response(
+            batch_req, [plain_result, _spec_result(1)], 1234567890
+        )
+        self.assertIsInstance(partial_resp.sglext.spec_tokens_details, list)
+        self.assertEqual(
+            [item.spec_cap_length for item in partial_resp.sglext.spec_tokens_details],
+            [2.0],
+        )
+
+        # When no choice has spec metrics, omit spec_tokens_details (None, not []).
+        for empty_req in (
+            batch_req.model_copy(update={"return_cached_tokens_details": True}),
+            CompletionRequest(
+                model="x",
+                prompt="Hello",
+                max_tokens=100,
+                n=2,
+                return_spec_tokens_details=True,
+                return_cached_tokens_details=True,
+            ),
+        ):
+            with self.subTest(prompt=empty_req.prompt, n=empty_req.n):
+                empty_resp = self.sc._build_completion_response(
+                    empty_req, [plain_result, plain_result], 1234567890
+                )
+                self.assertIsNotNone(empty_resp.sglext)
+                self.assertIsNone(empty_resp.sglext.spec_tokens_details)
+
+    def test_streaming_batched_prompts_order_spec_details_by_choice(self):
+        async def run_stream(request):
+            adapted_request, _ = self.sc._convert_to_internal_request(request)
+            chunks = [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, request, self.fastapi_request
+                )
+            ]
+            return [
+                json.loads(chunk[len("data: ") :])
+                for chunk in chunks
+                if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+            ]
+
+        async def mock_batched_generate(*args, **kwargs):
+            for index in (1, 0):
+                yield _spec_result(index)
+
+        self.sc.tokenizer_manager.generate_request = mock_batched_generate
+        batch_req = CompletionRequest(
+            model="x",
+            prompt=["Hello", "World"],
+            max_tokens=100,
+            n=1,
+            stream=True,
+            return_spec_tokens_details=True,
+        )
+        parsed = get_or_create_event_loop().run_until_complete(run_stream(batch_req))
+        details = next(chunk["sglext"] for chunk in parsed if "sglext" in chunk)[
+            "spec_tokens_details"
+        ]
+        self.assertIsInstance(details, list)
+        self.assertEqual([item["spec_cap_length"] for item in details], [1.0, 2.0])
+        self.assertEqual(
+            [item["spec_cap_lens_histogram"] for item in details],
+            [[0, 1], [1, 1]],
+        )
+
+        # Partial spec stats on a batched prompt still return a list.
+        plain_choice_0 = {
+            "text": "choice-0",
+            "meta_info": {
+                "id": "cmpl-spec-test",
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop"},
+                "weight_version": "default",
+            },
+            "index": 0,
+        }
+
+        async def mock_partial_generate(*args, **kwargs):
+            yield _spec_result(1)
+            yield plain_choice_0
+
+        self.sc.tokenizer_manager.generate_request = mock_partial_generate
+        partial_parsed = get_or_create_event_loop().run_until_complete(
+            run_stream(batch_req)
+        )
+        partial_details = next(
+            chunk["sglext"] for chunk in partial_parsed if "sglext" in chunk
+        )["spec_tokens_details"]
+        self.assertIsInstance(partial_details, list)
+        self.assertEqual([item["spec_cap_length"] for item in partial_details], [2.0])
+
+        # Single-element prompt list returns a single dict.
+        async def mock_single_generate(*args, **kwargs):
+            yield _spec_result(0)
+
+        self.sc.tokenizer_manager.generate_request = mock_single_generate
+        single_list_req = batch_req.model_copy(update={"prompt": ["Hello"]})
+        single_parsed = get_or_create_event_loop().run_until_complete(
+            run_stream(single_list_req)
+        )
+        single_details = next(
+            chunk["sglext"] for chunk in single_parsed if "sglext" in chunk
+        )["spec_tokens_details"]
+        self.assertIsInstance(single_details, dict)
+        self.assertEqual(single_details["spec_cap_length"], 1.0)
 
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming completion responses emit cached token details in sglext."""
