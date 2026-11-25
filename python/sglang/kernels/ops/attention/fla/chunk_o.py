@@ -11,6 +11,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import use_gfx115_kernels
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -258,7 +259,12 @@ def chunk_fwd_o(
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    # Varlen T counts the whole batch's tokens, so in batch-invariant mode the tile does not
+    # shrink with it: a sequence's output would depend on its batchmates.
+    if cu_seqlens is not None and is_batch_invariant_mode_enabled():
+        BT = chunk_size
+    else:
+        BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
