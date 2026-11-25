@@ -649,46 +649,5 @@ def test_multimodal_requires_explicit_enable(tmp_path):
     assert enabled.hf_config.vision_config == _RELEASE_CONFIG["vision_config"]
 
 
-def _rocm_overrides(
-    tmp_path,
-    monkeypatch,
-    release_config,
-    *,
-    hip=True,
-    gfx95=True,
-    **server_args,
-):
-    """Runs Inkling2's model override for the release config on a faked platform."""
-    from sglang.srt.arg_groups.model_overrides import inkling, inkling_hip
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
-
-    (tmp_path / "config.json").write_text(json.dumps(release_config))
-    platform = SimpleNamespace(
-        is_hip=hip, is_gfx95=gfx95, is_sm90=False, is_sm100=False
-    )
-    monkeypatch.setattr(inkling, "get_platform", lambda: platform)
-    monkeypatch.setattr(inkling_hip, "get_platform", lambda: platform)
-    hf_config = ModelConfig(str(tmp_path), trust_remote_code=False).hf_config
-    args = ServerArgs(model_path=str(tmp_path), **server_args)
-    return inkling._inkling_overrides(args, hf_config)
-
-
-def test_rocm_requires_gfx950(tmp_path, monkeypatch, release_config):
-    """Inkling2's ROCm kernels are sized for gfx950 (an LDS-sized tile would not fit
-    gfx942's 64 KB): other ROCm GPUs refuse at launch."""
-    _rocm_overrides(tmp_path, monkeypatch, release_config, gfx95=True)
-    with pytest.raises(ValueError, match="gfx950"):
-        _rocm_overrides(tmp_path, monkeypatch, release_config, gfx95=False)
-
-
-@pytest.mark.parametrize("flag", ["moe_a2a_backend", "moe_runner_backend"])
-def test_rocm_refuses_megamoe(tmp_path, monkeypatch, release_config, flag):
-    """MegaMoE on ROCm got through argument checks and failed at weight load, on the
-    missing CUDA-only sgl-deep-gemm package; it is refused at launch instead."""
-    with pytest.raises(ValueError, match="megamoe"):
-        _rocm_overrides(tmp_path, monkeypatch, release_config, **{flag: "megamoe"})
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

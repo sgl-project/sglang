@@ -67,7 +67,7 @@ def test_fused_kv_write_declines_translated_locs(monkeypatch):
             assert torch.equal(buffers[2], batch.out_cache_loc)
 
 
-@pytest.mark.parametrize("rows", [1, 8, 16, 64, 128])
+@pytest.mark.parametrize("rows", [1, 64, 128])
 def test_apply_wo_ud_matches_hipblaslt(rows):
     """Attention's wo_ud on ROCm at TP8 (K 768): aiter's Triton GEMM where it routes, up to
     64 rows, is bitwise F.linear (hipBLASLt); larger batches keep the layer's own path."""

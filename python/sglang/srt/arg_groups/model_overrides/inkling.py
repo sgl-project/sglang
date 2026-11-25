@@ -42,7 +42,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
         if cfg.reasoning_parser is None:
             overrides["reasoning_parser"] = "inkling"
         if get_platform().is_hip:
-            _hip.rocm_overrides(cfg)
+            _hip.validate(cfg)
         moe_ranks = cfg.tp_size // cfg.moe_dp_size
         # On SM100 / SM103 / SM107, quantized experts above the routed-kernel batch
         # run only on MegaMoE at full speed.

@@ -1,13 +1,13 @@
-"""ROCm part of the inkling override declarations: the gfx950 guard and the MegaMoE
-refusal. inkling calls it on HIP; it is pure Python and never imports aiter."""
+"""ROCm part of the inkling override declarations: the gfx950 and MegaMoE guards.
+inkling calls it on HIP; it is pure Python and never imports aiter."""
 
 from typing import Any
 
 from sglang.srt.runtime_context import get_platform
 
 
-def rocm_overrides(cfg: Any) -> None:
-    """Inkling2's ROCm launch checks."""
+def validate(cfg: Any) -> None:
+    """The Inkling2 checks of ROCm."""
     # its kernels are sized and tuned for gfx950
     if not get_platform().is_gfx95:
         raise ValueError("Inkling2 on ROCm requires gfx950 (MI350X / MI355X)")
