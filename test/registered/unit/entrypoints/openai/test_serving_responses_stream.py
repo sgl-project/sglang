@@ -929,7 +929,6 @@ class HarmonyStreamLifecycleTestCase(CustomTestCase):
                 context.finish_reason = {"type": "stop"}
                 context.last_tok = None
                 context.encoding = Mock()
-                context.encoding.stop_tokens_for_assistant_actions.return_value = []
 
                 async def generate():
                     for messages, channel, recipient, text in chunks:

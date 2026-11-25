@@ -968,6 +968,27 @@ class ServingChatTestCase(CustomTestCase):
             ):
                 self.assertIsNone(self.chat._validate_request(above_limit))
 
+    def test_request_stop_joins_non_list_template_stop_str(self):
+        """A request's stop joins the template's stop strings when the template
+        declares stop_str as a string or a tuple, not only as a list."""
+        cases = {
+            "phi-4-mm": ["<|end|>"],
+            "minicpmv": ["<|im_end|>", "<|endoftext|>"],
+        }
+        for template_name, template_stop in cases.items():
+            for request_stop in ("x", ["x", "y"]):
+                with self.subTest(template=template_name, stop=request_stop):
+                    self.template_manager.chat_template_name = template_name
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        stop=request_stop,
+                    )
+                    result = self.chat._apply_conversation_template(
+                        request, is_multimodal=False
+                    )
+                    self.assertEqual(result.stop, template_stop + list(request_stop))
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (
