@@ -10,7 +10,7 @@ from unittest import mock
 import torch
 from torch import nn
 
-from sglang.srt.utils import offloader
+from sglang.srt.layers import offloader
 
 _real_tensor_to = torch.Tensor.to
 _real_move_param_to_cpu = offloader._move_param_to_cpu
