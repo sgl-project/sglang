@@ -265,8 +265,11 @@ class MinimaxM2Detector(BaseFormatDetector):
 
             # We're in a tool call, try to parse function name if not sent yet
             if not self._function_name_sent:
-                # Look for function name pattern: <invoke name=name>
-                function_match = re.search(r"<invoke name=\"([^>]+)\">", self._buf)
+                # Look for function name pattern: <invoke name=name>, only before
+                # the section end; the text after it is content.
+                section_end = self._buf.find(self.tool_call_end_token)
+                section = self._buf if section_end == -1 else self._buf[:section_end]
+                function_match = re.search(r"<invoke name=\"([^>]+)\">", section)
                 if function_match:
                     function_name = function_match.group(1).strip()
 
@@ -304,43 +307,53 @@ class MinimaxM2Detector(BaseFormatDetector):
                         self._buf = self._buf[function_match.end() :]
                         continue
                     else:
-                        # Invalid function name, reset state
-                        logger.warning(f"Invalid function name: {function_name}")
-                        self._reset_streaming_state()
-                        normal += self._buf
-                        self._buf = ""
+                        # Drop the whole invoke, as detect_and_parse does.
+                        invoke_end = section.find(
+                            self.tool_call_function_end_token, function_match.end()
+                        )
+                        if invoke_end != -1:
+                            logger.warning(f"Invalid function name: {function_name}")
+                            self._buf = self._buf[
+                                invoke_end + len(self.tool_call_function_end_token) :
+                            ]
+                            self._reset_streaming_state(True)
+                            continue
                         break
                 else:
+                    # No further invoke: leave tool-call mode at the section end.
+                    if section_end != -1:
+                        self._buf = self._buf[
+                            section_end + len(self.tool_call_end_token) :
+                        ]
+                        self._reset_streaming_state(False)
+                        continue
                     # Function name not complete yet, wait for more text
                     break
 
             # Parse parameters incrementally
             if self._function_name_sent:
-                # Process parameters and get any calls to emit
-                parameter_calls = self._parse_and_stream_parameters(self._buf, tools)
+                # Parse only this invoke; the next one may already be buffered.
+                end_pos = self._buf.find(self.tool_call_function_end_token)
+                invoke_text = self._buf if end_pos == -1 else self._buf[:end_pos]
+                parameter_calls = self._parse_and_stream_parameters(invoke_text, tools)
                 calls.extend(parameter_calls)
 
                 # Check if tool call is complete
-                if self.tool_call_function_end_token in self._buf:
-                    end_pos = self._buf.find(self.tool_call_function_end_token)
-
-                    # Add closing brace to complete the JSON object
+                if end_pos != -1:
+                    # The streamed object is left open; a call with no parameters
+                    # has streamed nothing yet.
                     current_streamed = self.streamed_args_for_tool[self.current_tool_id]
-                    if current_streamed:
-                        # Count opening and closing braces to check if JSON is complete
-                        open_braces = current_streamed.count("{")
-                        close_braces = current_streamed.count("}")
-                        if open_braces > close_braces:
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters="}",
-                                )
-                            )
-                            self.streamed_args_for_tool[self.current_tool_id] = (
-                                current_streamed + "}"
-                            )
+                    closing = "}" if current_streamed else "{}"
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=closing,
+                        )
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = (
+                        current_streamed + closing
+                    )
 
                     # Complete the tool call
                     self._buf = self._buf[

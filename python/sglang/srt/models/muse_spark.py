@@ -480,15 +480,28 @@ class MuseSpark1xMoE(nn.Module):
         parallel = get_parallel()
         int4_checkpoint = _uses_gptq_int4_experts(quant_config)
         if parallel.moe_tp_size != 1:
-            if not int4_checkpoint:
-                raise ValueError(
-                    "The torch-native Muse MoE requires expert TP1; use EP equal "
-                    "to TP. Expert TP is implemented for int4 checkpoints only."
-                )
             if parallel.moe_ep_size != 1:
                 raise ValueError(
-                    "Muse int4 experts support either expert TP or EP, not both"
+                    "Muse experts support either expert TP or EP, not both"
                 )
+            if not int4_checkpoint:
+                if is_dp_attention_enabled():
+                    raise ValueError(
+                        "Muse expert TP does not support DP attention; use EP "
+                        "equal to TP"
+                    )
+                if not is_cuda() or torch.cuda.get_device_capability()[0] != 10:
+                    raise ValueError(
+                        "Muse expert TP for non-int4 experts requires an SM10x "
+                        "GPU; use EP equal to TP"
+                    )
+                # TRT-LLM MoE kernels need a 128-aligned intermediate shard.
+                if config.moe_intermediate_size % (128 * parallel.moe_tp_size):
+                    raise ValueError(
+                        f"Muse expert TP{parallel.moe_tp_size} needs "
+                        f"moe_intermediate_size ({config.moe_intermediate_size}) "
+                        f"divisible by {128 * parallel.moe_tp_size}"
+                    )
         if config.num_local_experts % parallel.moe_ep_size:
             raise ValueError("num_experts must be divisible by expert parallel size")
         self.layer_idx = layer_idx
@@ -597,9 +610,10 @@ class MuseSpark1xMoE(nn.Module):
                 num_local_experts=self.num_local_experts,
                 local_expert_offset=self.local_expert_start,
                 hidden_size=self.expert_hidden_size,
-                intermediate_size=self.intermediate_size,
+                intermediate_size=self.intermediate_size // self.moe_tp_size,
                 top_k=self.top_k,
                 quant_config=quant_config,
+                expert_tp_size=self.moe_tp_size,
             )
         else:
             self.experts = MuseSpark1xBf16Experts(
@@ -607,8 +621,10 @@ class MuseSpark1xMoE(nn.Module):
                 num_local_experts=self.num_local_experts,
                 local_expert_offset=self.local_expert_start,
                 expert_hidden_size=self.expert_hidden_size,
-                intermediate_size=self.intermediate_size,
+                intermediate_size=self.intermediate_size // self.moe_tp_size,
                 top_k=self.top_k,
+                expert_tp_size=self.moe_tp_size,
+                expert_tp_rank=self.moe_tp_rank,
             )
         self.experts.post_expert_norm = post_expert_norm
         self.experts.use_megamoe = self.use_megamoe
@@ -1171,6 +1187,19 @@ class MuseSpark1xModel(nn.Module):
                     )
                 for moe_layer in moe_layers:
                     moe_layer.set_finalize_ar_workspace(self._finalize_ar_workspace)
+        if (
+            is_cuda()
+            and get_parallel().moe_tp_size > 1
+            and get_parallel().moe_tp_size == get_parallel().tp_size
+            and any(layer.is_moe_layer for layer in self.layers)
+        ):
+            from flashinfer.comm import init_tp_moe_finalize_rmsnorm
+
+            if not init_tp_moe_finalize_rmsnorm(get_parallel().tp_group.device_group):
+                logger.warning(
+                    "FlashInfer TP MoE finalize is unavailable; expert TP uses a "
+                    "separate all-reduce and finalize."
+                )
         if layernorm_sp.layernorm_sp_enabled():
             # Scope CUTLASS collectives to Muse; leave the generic Qwen SP
             # path unchanged. Decode never calls the SP participant hooks.
@@ -1392,12 +1421,36 @@ class MuseSparkTextForCausalLM(nn.Module):
             local = loaded_weight.shape[0] // parallel.moe_ep_size
             start = parallel.moe_ep_rank * local
             loaded_weight = loaded_weight.narrow(0, start, local)
+        if parallel.moe_tp_size > 1 and not self.int4_checkpoint:
+            loaded_weight = self._shard_expert_intermediate(
+                loaded_weight, name, parallel.moe_tp_rank, parallel.moe_tp_size
+            )
         if param.shape != loaded_weight.shape:
             raise RuntimeError(
                 f"Expert weight shape mismatch for {name}: "
                 f"parameter={tuple(param.shape)}, checkpoint={tuple(loaded_weight.shape)}"
             )
         param.data.copy_(loaded_weight)
+
+    @staticmethod
+    def _shard_expert_intermediate(
+        loaded_weight: torch.Tensor, name: str, rank: int, size: int
+    ) -> torch.Tensor:
+        if name.endswith((".gate_up_proj", ".gate_up_proj_weight_scale")):
+            # The checkpoint stacks [w1; w3]; each half is sharded separately.
+            gate, up = loaded_weight.chunk(2, dim=1)
+            shard = gate.shape[1] // size
+            return torch.cat(
+                [
+                    gate.narrow(1, rank * shard, shard),
+                    up.narrow(1, rank * shard, shard),
+                ],
+                dim=1,
+            )
+        if name.endswith((".down_proj", ".down_proj_weight_scale")):
+            shard = loaded_weight.shape[-1] // size
+            return loaded_weight.narrow(-1, rank * shard, shard)
+        return loaded_weight
 
     @staticmethod
     def _load_int4_expert_tensor(
