@@ -249,8 +249,8 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         self.assertEqual(response.status_code, 400, response.text)
 
     def test_one_token_request_without_bootstrap_is_answered(self):
-        # The one request the rejection above spares: prefill samples a single
-        # token itself, so it answers a request for exactly that with no decode.
+        # What the rejection above spares: prefill samples a single token itself,
+        # so it answers a request for no more than that with no decode.
         response = requests.post(
             self.prefill_url + "/generate",
             json={

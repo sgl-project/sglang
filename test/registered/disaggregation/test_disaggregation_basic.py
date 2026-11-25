@@ -138,7 +138,7 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         json.loads(output)
 
     def test_prefill_answers_one_token_request_alone(self):
-        def generate(url, prompt, max_new_tokens):
+        def generate(url, prompt, max_new_tokens, n=1):
             return requests.post(
                 url + "/generate",
                 json={
@@ -146,6 +146,7 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": max_new_tokens,
+                        "n": n,
                     },
                 },
                 timeout=60,
@@ -168,6 +169,19 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         first = generate(self.prefill_url, unseen, 1).json()["meta_info"]
         again = generate(self.prefill_url, unseen, 1).json()["meta_info"]
         self.assertGreater(again["cached_tokens"], first["cached_tokens"])
+
+        # A request for no token is answered too, with none.
+        empty = generate(self.prefill_url, prompt, 0)
+        self.assertEqual(empty.status_code, 200, empty.text)
+        self.assertEqual(empty.json()["output_ids"], [])
+
+        # Parallel samples first warm the prompt up with such a request.
+        samples = generate(self.prefill_url, prompt, 1, n=2)
+        self.assertEqual(samples.status_code, 200, samples.text)
+        self.assertEqual(
+            [sample["output_ids"] for sample in samples.json()],
+            [routed["output_ids"]] * 2,
+        )
 
         # Nothing would continue a longer request.
         longer = generate(self.prefill_url, prompt, 2)

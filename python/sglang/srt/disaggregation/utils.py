@@ -20,6 +20,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    Union,
     overload,
 )
 
@@ -49,6 +50,10 @@ if TYPE_CHECKING:
         CommonKVManager,
         CommonKVReceiver,
         CommonKVSender,
+    )
+    from sglang.srt.managers.io_struct import (
+        GenerateReqInput,
+        TokenizedGenerateReqInput,
     )
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.storage import KVStorage
@@ -339,7 +344,9 @@ def _is_fake_transfer(req: Req) -> bool:
     )
 
 
-def lacks_decode_peer(req: Req) -> bool:
+def lacks_decode_peer(
+    req: Union[Req, GenerateReqInput, TokenizedGenerateReqInput],
+) -> bool:
     """Whether a request to a prefill server names no bootstrap host, so that
     no decode can find its KV."""
     disagg = get_disagg()
@@ -352,10 +359,10 @@ def lacks_decode_peer(req: Req) -> bool:
 
 def is_prefill_only(req: Req) -> bool:
     """Whether the prefill server answers this admitted request by itself: it
-    has no decode peer, and the one token prefill samples is all it asks for."""
+    has no decode peer, and asks for no more than the token prefill samples."""
     if not lacks_decode_peer(req):
         return False
-    assert req.sampling_params.max_new_tokens == 1, (
+    assert req.sampling_params.max_new_tokens in (0, 1), (
         f"{req.rid=} has no decode peer but asks for "
         f"{req.sampling_params.max_new_tokens} tokens"
     )

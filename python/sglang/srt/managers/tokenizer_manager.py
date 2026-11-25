@@ -66,6 +66,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import lacks_decode_peer
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -1865,10 +1866,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Neither has a decode that would look the room up.
             if bootstrap_room is None and (
                 get_disagg().disaggregation_transfer_backend == "fake"
-                or (
-                    self.disaggregation_mode == DisaggregationMode.PREFILL
-                    and obj.bootstrap_host is None
-                )
+                or lacks_decode_peer(obj)
             ):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1

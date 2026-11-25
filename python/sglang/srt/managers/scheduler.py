@@ -3078,6 +3078,10 @@ class Scheduler(
         # 0. Constant output: every PP rank must derive the same
         # sampling_params (rank consensus hashes them).
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # No decode takes a handoff from a request prefill answers alone,
+            # so it keeps the budget it asked for.
+            if lacks_decode_peer(req) and req.sampling_params.max_new_tokens in (0, 1):
+                return
             req.sampling_params.max_new_tokens = 1
             # min <= max invariant; EOS stays legal as the handoff token
             # unless the user set min_new_tokens.
@@ -3604,11 +3608,11 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if lacks_decode_peer(req) and req.sampling_params.max_new_tokens != 1:
+        if lacks_decode_peer(req) and req.sampling_params.max_new_tokens not in (0, 1):
             self._reject_bad_request(
                 req,
                 "A prefill request without a bootstrap host has no decode to "
-                "continue it, so it must set max_new_tokens=1; got "
+                "continue it, so max_new_tokens must be 0 or 1; got "
                 f"max_new_tokens={req.sampling_params.max_new_tokens}.",
             )
             return
