@@ -9,12 +9,12 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    # Measured ~45min/round in CI (2026-08-17 nightly-acc-2-npu-a3).
+    # Measured ~45min/round in CI (2026-08-17 nightly-acc-test-2-npu-a3).
     # est_time = 2x single-round so derive_timeout_per_file (1.5x est)
     # reserves ~3 rounds of budget for accuracy retries.
     # Normalized to the shared 6500 ladder value for ~42-54min cases.
     est_time=6500,
-    suite="nightly-acc-2-npu-a3",
+    suite="nightly-acc-test-2-npu-a3",
     nightly=True,
 )
 
@@ -90,14 +90,14 @@ class TestNPUQwen3_6_27B_1P_In64k_Out1k_Prefix90_gpqa(TestNpuAccuracyTestCaseBas
     model = QWEN3_6_27B_MODEL_PATH
     envs = QWEN3_6_27B_64K_PREFIX_ENVS
     other_args = QWEN3_6_27B_64K_PREFIX_OTHER_ARGS
+    max_retries = 2
     accuracy = 0.878
-    max_retries = 1
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     eval_batch_size = 64
     generation_config = {
         "max_tokens": 81920,
-        "temperature": 1.0,
+        "temperature": 0,
         "extra_body": {
             "chat_template_kwargs": {"enable_thinking": True},
         },

@@ -285,12 +285,44 @@ def temporary_module_dtype(
         yield module
         return
 
+    original_dtypes = (
+        _snapshot_tensor_dtypes(module)
+        if restore_dtype is None and isinstance(module, torch.nn.Module)
+        else []
+    )
     original_dtype = restore_dtype or get_module_dtype(module)
     module = module.to(dtype=dtype)
     try:
         yield module
     finally:
-        module.to(dtype=original_dtype)
+        if original_dtypes:
+            _restore_tensor_dtypes(original_dtypes)
+        else:
+            module.to(dtype=original_dtype)
+
+
+def _snapshot_tensor_dtypes(
+    module: torch.nn.Module,
+) -> list[tuple[dict, str, torch.dtype]]:
+    # named_parameters()/named_buffers() skip duplicates; module.to() converts each.
+    return [
+        (tensors, name, tensor.dtype)
+        for _, submodule in module.named_modules(remove_duplicate=False)
+        for tensors in (submodule._parameters, submodule._buffers)
+        for name, tensor in tensors.items()
+        if tensor is not None
+    ]
+
+
+def _restore_tensor_dtypes(dtypes: list[tuple[dict, str, torch.dtype]]) -> None:
+    for tensors, name, dtype in dtypes:
+        tensor = tensors.get(name)
+        if tensor is None or tensor.dtype == dtype:
+            continue
+        if isinstance(tensor, torch.nn.Parameter):
+            tensor.data = tensor.data.to(dtype)
+        else:
+            tensors[name] = tensor.to(dtype)
 
 
 @dataclass

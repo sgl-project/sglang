@@ -83,7 +83,7 @@ How loading works:
 - The server resolves the checkpoint via `maybe_download_model(model_path, force_diffusers_model=True)` and verifies it contains a `model_index.json` plus the required component subdirectories (`transformer/`, `vae/`).
 - If `text_encoder` / `tokenizer` are not provided as component paths, the pipeline falls back to the default Stage-1 text encoder **`Efficient-Large-Model/gemma-2-2b-it`** (`DEFAULT_SANA_WM_TEXT_ENCODER`).
 - **Pick the path with `--pipeline-class-name`.** The checkpoint's `model_index.json` `_class_name` selects the default pipeline (`SanaWMTwoStagePipeline`). Pin it explicitly to choose: `--pipeline-class-name SanaWMTwoStagePipeline` for the `/v1/videos` paths (§4–5) or `--pipeline-class-name SanaWMRealtimePipeline` for live realtime (§6). Pinning is also required if you point `--model-path` at a bare safetensors file instead of a Diffusers directory.
-- **The Stage-2 LTX-2 refiner** lives under `refiner/` in the checkpoint: `refiner/transformer` (`transformer_2`), `refiner/connectors` (`connectors`), and `refiner/text_encoder` (the Gemma-3 encoder for `text_encoder_2`, whose tokenizer also serves as `tokenizer_2`). The refiner is **optional**: it is skipped (Stage-1-only output) when the env flag `SGLANG_SANA_WM_SKIP_REFINER` (or a `skip_refiner` request extra) is set, or when no `refiner/` is present (`transformer_2` unloaded). On the batch path it runs chunk-wise with `--refiner-chunked` (the official streaming path, default on) or whole-clip without it; on the realtime path the pipeline builds a `SanaWMChunkedRefinerChainStage` only when a refiner is available, and otherwise streams Stage-1 frames.
+- **The Stage-2 LTX-2 refiner** lives under `refiner/` in the checkpoint: `refiner/transformer` (`transformer_2`), `refiner/connectors` (`connectors`), and `refiner/text_encoder` (the Gemma-3 encoder for `text_encoder_2`, whose tokenizer also serves as `tokenizer_2`). The refiner is **optional**: it is skipped (Stage-1-only output) when the env flag `SGLANG_SANA_WM_SKIP_REFINER` (or a `skip_refiner` request extra) is set, or when no `refiner/` is present (`transformer_2` unloaded). On the batch path, the streaming launch (`--streaming`) runs it chunk-wise by default (`--refiner-chunked`; pass `--refiner-chunked false` for whole-clip), and the dense launch without `--streaming` always runs it whole-clip; on the realtime path the pipeline builds a `SanaWMChunkedRefinerChainStage` only when a refiner is available, and otherwise streams Stage-1 frames.
 
 <Note>
 Throughout this cookbook, `<checkpoint>` stands for the appropriate SANA-WM repo id from the table above (or a local materialized Diffusers directory).
@@ -218,7 +218,7 @@ Once up, the realtime WebSocket endpoint lives at `ws://127.0.0.1:30000/v1/realt
 
 ## 7. Realtime WebSocket API
 
-The realtime API is a single WebSocket at **`/v1/realtime_video/generate`**. All messages — client → server and server → client — are **msgpack** (`msgspec.msgpack.encode` / `decode`), not JSON.
+The realtime API is a single WebSocket at **`/v1/realtime_video/generate`**. Requests and control messages use **msgpack** (`msgspec.msgpack.encode` / `decode`), not JSON. Large frame batches use a msgpack header followed by a separate binary payload.
 
 The lifecycle is:
 
@@ -230,7 +230,7 @@ The client opens the WebSocket and sends exactly one **init** message (`type: "i
 While generation runs, the client may push **event** messages (`type: "event"`) to steer the camera — either `kind: "camera_actions"` (frame-by-frame lists or state transitions) or `kind: "action"` (an action-DSL string).
 </Step>
 <Step title="Receive frame batches">
-The server streams **frame batches** back. Each chunk arrives as one or more `frame_batch` messages (header fields + payload bytes); `is_final_frame_batch: true` marks the end of a chunk. The server also emits `chunk_stats` timing messages.
+The server streams **frame batches** back; `is_final_frame_batch: true` marks the end of a chunk. Clients must handle both output formats described below, as well as `chunk_stats` timing messages and `error` responses.
 </Step>
 </Steps>
 
@@ -322,13 +322,18 @@ If you omit both `intrinsics_path` and `intrinsics`, SGLang uses a centered heur
 
 ### Server frame output
 
-The server streams **frame batches**. Every batch arrives as a **single** msgpack message with `type: "frame_batch"` — the header fields below plus an inline `payload` bytes field (the wire `type` is always `"frame_batch"`; there is no separate header-then-bytes message).
+The server streams **frame batches** in two formats:
+
+- `frame_batch`: one msgpack message with header fields and an inline `payload` bytes field.
+- `frame_batch_header`: a msgpack header followed immediately by one binary WebSocket message containing the payload. Do not msgpack-decode that second message; check its length against `total_size`.
+
+The second format avoids copying large payloads into a msgpack envelope. Error and timing messages do not interrupt a header/payload pair. If the connection closes before the payload arrives, discard the incomplete batch.
 
 Header fields:
 
 | Field | Meaning |
 |---|---|
-| `type` | `"frame_batch"` (always) |
+| `type` | `"frame_batch"` or `"frame_batch_header"` |
 | `request_id` | Generation id |
 | `chunk_index` | Chunk index |
 | `content_type` | `application/x-raw-rgb`, `image/webp`, or `image/jpeg` |
@@ -342,9 +347,9 @@ Header fields:
 | `frame_batch_index`, `num_frame_batches` | Sequence multiple batches within a chunk |
 | `is_final_frame_batch` | `true` ends the chunk |
 
-```json Server output - frame_batch (msgpack dict)
+```json Server output - frame_batch_header (msgpack dict)
 {
-  "type": "frame_batch",
+  "type": "frame_batch_header",
   "request_id": "uuid-string",
   "chunk_index": 0,
   "content_type": "application/x-raw-rgb",
@@ -359,10 +364,11 @@ Header fields:
   "event_id": 1,
   "frame_batch_index": 0,
   "num_frame_batches": 1,
-  "is_final_frame_batch": true,
-  "payload": "<raw RGB24 bytes>"
+  "is_final_frame_batch": true
 }
 ```
+
+For this header, the next binary message contains 8,110,080 bytes of raw RGB24 data.
 
 **Encodings.** `application/x-raw-rgb` is uncompressed RGB24 (3 × uint8, `bytes_per_frame = width*height*3`), sent by default or with `realtime_output_format: "raw"`; `"webp"` / `"jpeg"` send preview-encoded frames.
 
@@ -407,10 +413,19 @@ async def run():
         # 3) receive frame batches (raw RGB24)
         async for message in ws:
             msg = msgspec.msgpack.decode(message)
-            if msg.get("type") != "frame_batch":
+            if msg["type"] == "frame_batch_header":
+                payload = await ws.recv()
+            elif msg["type"] == "frame_batch":
+                payload = msg["payload"]
+            elif msg["type"] == "error":
+                print("Server error:", msg["content"])
+                continue
+            else:
                 continue  # skip chunk_stats etc.
+            if not isinstance(payload, bytes) or len(payload) != msg["total_size"]:
+                raise ValueError("Invalid frame payload")
             n, h, w, c = msg["num_frames"], msg["height"], msg["width"], msg["channels"]
-            frames = np.frombuffer(msg["payload"], dtype=np.uint8).reshape(n, h, w, c)
+            frames = np.frombuffer(payload, dtype=np.uint8).reshape(n, h, w, c)
             # ... display/save frames ...
             if msg.get("is_final_frame_batch") and msg.get("chunk_index", 0) >= 9:
                 break
@@ -422,7 +437,7 @@ async def run():
 
 Camera trajectories are described by a compact string of comma-separated `<keys>-<frames>` segments, e.g. `"w-100,wd-50,d-30,none-10"`. This is the format accepted by `condition_inputs.action` at init and by `kind: "action"` events.
 
-Parsing rules (`parse_action_string`):
+Parsing rules (`parse_sana_wm_action_string`):
 
 - Each segment is `<keys>-<frames>`; `<frames>` must be a positive integer.
 - `none` means no motion for that span: `none-10` = 10 static frames.
@@ -435,7 +450,7 @@ Parsing rules (`parse_action_string`):
 | `i` / `k` | look (pitch) up / down |
 | `j` / `l` | look (yaw) left / right |
 
-Pose generation (`action_string_to_c2w`):
+Pose generation (`sana_wm_action_to_camera_to_world`):
 
 - **Translation** (`w`/`s`/`a`/`d`) moves at `translation_speed` (default `0.04` world-units/frame).
 - **Rotation** (`i`/`k` pitch, `j`/`l` yaw) turns at `rotation_speed_deg` (default `1.2`°/frame); pitch is clamped to ±85°.

@@ -7,7 +7,7 @@ import sglang.srt
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+register_cpu_ci(est_time=34, suite="base-a-test-cpu")
 
 
 class TestNgramMambaVerifyUpdate(CustomTestCase):
@@ -17,7 +17,10 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify = (
             MagicMock()
         )
-        mamba_pool = target_worker.model_runner.req_to_token_pool.mamba_pool
+        mamba_pool = MagicMock()
+        # The runner's KV pool router binds the state pool.
+        router = target_worker.model_runner.token_to_kv_pool.layer_router
+        router.part_view.return_value = mamba_pool
         mamba_pool.replayssm_spec_fold = False
         mamba_pool.replayssm_cache_base = None
         return target_worker
@@ -160,22 +163,22 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
         return spec_state
 
     def test_fold_helpers_read_pp_request_rows(self):
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
         )
-        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
             commit_kda_replayssm_after_verify,
         )
 
         cases = (
             (
                 commit_gdn_replayssm_fold_after_verify,
-                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold",
+                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold",
                 "commit_gdn_replayssm_fold_all_layers",
             ),
             (
                 commit_kda_replayssm_after_verify,
-                "sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode",
+                "sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode",
                 "commit_kda_replayssm_spec_all_layers",
             ),
         )
@@ -201,17 +204,25 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                 torch.testing.assert_close(scatter.call_args.args[4], source_rows)
 
     def test_circular_commit_reads_pp_request_rows(self):
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+            ForwardStateSlots,
+        )
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
         target_worker = MagicMock()
-        req_pool = target_worker.model_runner.req_to_token_pool
-        req_pool.mamba_pool.replayssm_spec_fold = False
-        req_pool.mamba_pool.replayssm_is_kda = False
-        req_pool.mamba_pool.replayssm_cache_base = torch.empty(1)
-        req_pool.get_mamba_indices.return_value = torch.tensor(
-            [5, 7], dtype=torch.int32
+        target_worker.model_runner.attn_backend.forward_state_slots.return_value = (
+            ForwardStateSlots(
+                torch.tensor([5, 7], dtype=torch.int32),
+                ring=torch.tensor([2, 3], dtype=torch.int32),
+            )
         )
-        req_pool.get_speculative_mamba2_params_all_layers.return_value = (
+        mamba_pool = MagicMock()
+        router = target_worker.model_runner.token_to_kv_pool.layer_router
+        router.part_view.return_value = mamba_pool
+        mamba_pool.replayssm_spec_fold = False
+        mamba_pool.replayssm_is_kda = False
+        mamba_pool.replayssm_cache_base = torch.empty(1)
+        mamba_pool.get_speculative_mamba2_params_all_layers.return_value = (
             self._spec_state()
         )
         batch = MagicMock()
@@ -232,17 +243,21 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode."
+                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
                 "commit_gdn_replayssm_spec"
             ),
             patch(
-                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode."
+                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
                 "commit_gdn_replayssm_circular"
             ),
             patch(
                 "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
                 "fused_conv_window_scatter_with_mask"
             ) as scatter,
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+                "commit_ple_states_after_verify"
+            ),
         ):
             commit_mamba_states_after_verify(
                 target_worker,
@@ -327,6 +342,7 @@ class TestMtpVerifyHookSignature(CustomTestCase):
         "mamba_steps_to_track",
         "model",
         "req_pool_indices",
+        "state_slots",
     }
     HOOK = "update_mamba_state_after_mtp_verify"
 

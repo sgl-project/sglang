@@ -32,7 +32,7 @@ from sglang.kernels.ops.communication.all_reduce import (
     get_fused_parallel_qknorm_max_occupancy,
     get_fused_parallel_qknorm_module,
 )
-from sglang.kernels.ops.communication.mp import register_comm_cleanup
+from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -190,7 +190,7 @@ def _rmsnorm_baseline(
 
 @marker.parametrize("q_dim,k_dim", Q_K_DIMS)
 @marker.parametrize("batch_size", BATCH_SIZES)
-@marker.benchmark("provider", PROVIDERS)
+@marker.benchmark("provider", PROVIDERS, gate=["fused"])
 def benchmark(q_dim: int, k_dim: int, batch_size: int, provider: str):
     cpu_group = _init_cpu_group()
     gpu_group = _init_gpu_group()

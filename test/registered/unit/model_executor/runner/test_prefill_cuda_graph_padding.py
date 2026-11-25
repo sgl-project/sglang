@@ -12,11 +12,10 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     prefill_graph_tolerates_sum_len,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -24,7 +23,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestPrefillCudaGraphPadding(CustomTestCase):
@@ -80,23 +79,25 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner.prefer_eager_mixed_prefill = True
         self.assertFalse(runner.can_run_graph(batch))
 
-    def test_replay_snapshot_uses_padded_token_count(self):
+    def test_replay_without_captured_metadata_builds_snapshot(self):
         runner = self._make_runner()
         runner.use_captured_attn_metadata = False
         attn_backend = mock.Mock()
+        attn_backend.resolve_prefill_shared_read_ends.return_value = mock.sentinel.end
         runner.model_runner = SimpleNamespace(attn_backend=attn_backend)
         forward_batch = self._make_forward_batch(8)
         static_forward_batch = self._make_forward_batch(16)
 
-        runner._prepare_forward_metadata_for_replay(
+        shared_read_ends = runner._prepare_forward_metadata_for_replay(
             forward_batch,
             static_forward_batch,
             shape_key=ShapeKey(size=16),
         )
 
+        self.assertIs(shared_read_ends, mock.sentinel.end)
         attn_backend.init_forward_metadata.assert_called_once_with(forward_batch)
-        attn_backend.prepare_prefill_shared_read_snapshot.assert_called_once_with(
-            forward_batch, num_qo_tokens=16
+        attn_backend.resolve_prefill_shared_read_ends.assert_called_once_with(
+            forward_batch, build_snapshot=True
         )
 
     def test_full_replay_pads_request_slot_cpu_mirror(self):

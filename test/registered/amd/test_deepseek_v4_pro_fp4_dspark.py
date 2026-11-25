@@ -5,7 +5,7 @@ SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton. The test uses the full GSM8K set
 to catch regressions in unified-KV target-hidden injection, verify metadata, and
 DSpark acceptance.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-dspark suite
 """
 
 import os
@@ -17,7 +17,7 @@ import requests
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import MAX_FUSED_ROWS
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+from sglang.kernels.ops.kvcache import dsv4_unified_kv_store
 from sglang.kernels.ops.speculative.dspark import dspark_verify_window
 from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
@@ -36,7 +36,9 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark", nightly=True
+    est_time=7200,
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-dspark",
+    nightly=True,
 )
 
 DEEPSEEK_V4_DSPARK_MODEL_PATH = os.environ.get(
@@ -163,11 +165,15 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
         keep = loc >= 0
         expected[loc[keep].long()] = kv[keep]
 
-        runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=unified)
+        dsv4_unified_kv_store.scatter_bf16_into_unified(
+            kv=kv, loc=loc, unified_kv=unified
+        )
         self.assertTrue(torch.equal(unified, expected))
 
         with self.assertRaises(AssertionError):
-            runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=unified.t())
+            dsv4_unified_kv_store.scatter_bf16_into_unified(
+                kv=kv, loc=loc, unified_kv=unified.t()
+            )
 
 
 class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):

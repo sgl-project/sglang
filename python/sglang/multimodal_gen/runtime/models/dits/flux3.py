@@ -47,9 +47,11 @@ from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fp8_rowwise,
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_packed_swiglu_fp8_rowwise,
     fp8_rowwise,
     fused_inplace_qknorm_rope,
     fused_packed_silu_mul_bitexact,
+    fused_packed_swiglu_fp8_rowwise,
     residual_gate_add,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
@@ -273,7 +275,7 @@ class Flux3Fp8RowwiseLinear(nn.Module):
     parallel linears so the module can replace either kind.
     """
 
-    # _scaled_mm needs M padded to a multiple of 16.
+    # Preserve the checkpoint inference path's row padding convention.
     ROW_ALIGNMENT = 16
 
     def __init__(
@@ -325,6 +327,24 @@ class Flux3Fp8RowwiseLinear(nn.Module):
                 activation, activation_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     activation, activation_scale
                 )
+        return self._forward_quantized(activation, activation_scale, leading)
+
+    def forward_swiglu(self, packed: torch.Tensor):
+        """Fuse packed BF16 SwiGLU with this layer's activation quantization."""
+        if not (
+            self.weight.dtype == torch.float8_e4m3fn
+            and packed.shape[-1] == 2 * self.in_features
+            and not torch.compiler.is_compiling()
+            and can_use_fused_packed_swiglu_fp8_rowwise(packed)
+        ):
+            return self(_swiglu(packed))
+        activation, activation_scale = fused_packed_swiglu_fp8_rowwise(
+            packed, self.ROW_ALIGNMENT
+        )
+        return self._forward_quantized(activation, activation_scale, packed.shape[:-1])
+
+    def _forward_quantized(self, activation, activation_scale, leading):
+        rows = math.prod(leading)
         out = torch._scaled_mm(
             activation,
             self.weight.T,
@@ -528,7 +548,11 @@ class Flux3Block(nn.Module):
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
             attended = self.attn(q, k, v, attn_mask_meta=sp.attn_mask_meta)
         attended = attended.reshape(batch, length, self.local_hidden)
-        out = self.attn_out(attended)[0] + self.mlp_out(_swiglu(mlp))[0]
+        if isinstance(self.mlp_out, Flux3Fp8RowwiseLinear):
+            mlp_out = self.mlp_out.forward_swiglu(mlp)[0]
+        else:
+            mlp_out = self.mlp_out(_swiglu(mlp))[0]
+        out = self.attn_out(attended)[0] + mlp_out
         if self.tp_size > 1:
             # One reduce of the summed partials, not one per branch (the order
             # the FLUX 3 reference TP uses).

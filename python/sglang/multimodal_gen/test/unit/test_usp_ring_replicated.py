@@ -50,12 +50,13 @@ class RingReplicatedBase(unittest.TestCase):
     B, S_SHARD, REP, H, D = 1, 6, 3, 2, 8
 
     def setUp(self):
-        self.enterContext(
-            patch(
-                f"{_LAYER}._usp_input_all_to_all_qkv",
-                side_effect=lambda q, k, v: (q, k, v),
-            )
+        # start() + addCleanup rather than enterContext, which is 3.11+.
+        patcher = patch(
+            f"{_LAYER}._usp_input_all_to_all_qkv",
+            side_effect=lambda q, k, v: (q, k, v),
         )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _attn(self):
         obj = USPAttention.__new__(USPAttention)

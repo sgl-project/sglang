@@ -48,7 +48,6 @@ __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConca
   using namespace device;
   static_assert((kNopeBytes + kRopeBytes) % 16 == 0, "TMA bulk store requires total row to be 16-byte aligned");
 
-  constexpr int64_t kRowBytes = kNopeBytes + kRopeBytes;
   constexpr int kQNopeDim = static_cast<int>(kNopeBytes / sizeof(bf16_t));
   constexpr int kQRopeDim = static_cast<int>(kRopeBytes / sizeof(bf16_t));
 
@@ -59,7 +58,7 @@ __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConca
   PDLWaitPrimary<kUsePDL>();
 
   if (flat_warp < params.batch_size) {
-    // --- KV scatter role: one warp per token (smem staging + TMA bulk store) ---
+    // --- KV scatter role: one warp per token (16B per lane load / store) ---
     const uint32_t item_id = flat_warp;
     const auto loc = static_cast<const TLoc*>(params.loc)[item_id];
 
@@ -153,7 +152,7 @@ struct SetMlaKVConcatQKernel {
     auto S1_qo = SymbolicSize{"q_out_stride_1"};
     auto loc_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     D_qn.set_value(kQNopeDim);
     D_qr.set_value(kQRopeDim);
@@ -462,7 +461,7 @@ struct SetMlaKVConcatQFp8Kernel {
     auto S1_qo = SymbolicSize{"q_out_stride_1"};
     auto loc_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     D_nope.set_value(kFp8NopeDim);
     D_rope.set_value(kFp8RopeDim);

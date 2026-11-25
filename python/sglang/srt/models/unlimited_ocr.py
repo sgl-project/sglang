@@ -5,15 +5,16 @@ from array import array
 from typing import Iterable, List, Optional, Set, Tuple, TypeAlias, Union
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
@@ -21,9 +22,8 @@ from sglang.srt.models.deepseek_ocr import (
     MlpProjector,
     build_clip_l,
     build_sam_vit_b,
-    merge_multimodal_embeddings,
+    clear_sam_rel_pos_cache,
 )
-from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -35,8 +35,6 @@ NestedTensors: TypeAlias = Union[
     "torch.Tensor",
     tuple["torch.Tensor", ...],
 ]
-
-MultiModalEmbeddings: TypeAlias = list[Tensor] | Tensor | tuple[Tensor, ...]
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +71,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
             )
 
-        self.model = DeepseekForCausalLM(
-            config=config.text_config,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "language"),
-        )
+        self.model = self._build_language_model(config, quant_config, prefix)
 
         self.sam_model = build_sam_vit_b()
         self.vision_model = build_clip_l()
@@ -91,7 +85,12 @@ class UnlimitedOCRForCausalLM(nn.Module):
             downsample_ratio=self.projector_config.downsample_ratio,
         )
 
-        self.image_token_id = None
+    def _build_language_model(self, config, quant_config, prefix):
+        return DeepseekForCausalLM(
+            config=config.text_config,
+            quant_config=quant_config,
+            prefix=add_prefix("language", prefix),
+        )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """Return the sliding window size from the model config, or None."""
@@ -164,39 +163,6 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 values.append(bool(value))
         return values
 
-    def _parse_and_validate_image_input(self, **kwargs: object):
-        """Parse and validate pixel values, spatial crops, and image crops."""
-        pixel_values = kwargs.pop("pixel_values", None)
-        images_spatial_crop = kwargs.pop("images_spatial_crop", None)
-        images_crop = kwargs.pop("images_crop", None)
-        has_images = kwargs.pop("has_images", None)
-
-        if pixel_values is None:
-            return None
-        if has_images is not None:
-            if not has_images:
-                return None
-        elif torch.sum(pixel_values).item() == 0:
-            return None
-
-        if pixel_values is not None:
-            if not isinstance(pixel_values, (torch.Tensor, list)):
-                raise ValueError(
-                    f"Incorrect type of pixel values. Got type: {type(pixel_values)}"
-                )
-            if not isinstance(images_spatial_crop, (torch.Tensor, list)):
-                raise ValueError(
-                    "Incorrect type of image sizes. "
-                    f"Got type: {type(images_spatial_crop)}"
-                )
-            if not isinstance(images_crop, (torch.Tensor, list)):
-                raise ValueError(
-                    f"Incorrect type of image crop. Got type: {type(images_crop)}"
-                )
-            return [pixel_values, images_crop, images_spatial_crop]
-
-        raise AssertionError("This line should be unreachable.")
-
     def _pixel_values_to_embedding(
         self,
         pixel_values: torch.Tensor,
@@ -243,6 +209,27 @@ class UnlimitedOCRForCausalLM(nn.Module):
 
         return images_in_this_batch
 
+    def _stack_crop_inputs(
+        self,
+        mm_items: List[MultimodalDataItem],
+        *,
+        has_local_crops: Optional[List[bool]],
+        target_dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Stack the items' local crops and their crop shapes, both on ``device``."""
+        images_crop = (
+            torch.stack([item.images_crop for item in mm_items], dim=0)
+            .type(target_dtype)
+            .to(device=device)
+        )
+        images_spatial_crop = (
+            torch.cat([item.images_spatial_crop for item in mm_items], dim=0)
+            .type(torch.long)
+            .to(device=device)
+        )
+        return images_crop, images_spatial_crop
+
     def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
         """Process multimodal data items into concatenated vision features."""
         target_dtype = self.vision_model.dtype
@@ -251,15 +238,11 @@ class UnlimitedOCRForCausalLM(nn.Module):
             target_dtype
         )
 
-        images_crop = (
-            torch.stack([item.images_crop for item in mm_items], dim=0)
-            .type(target_dtype)
-            .to(device=pixel_values.device)
-        )
-        images_spatial_crop = (
-            torch.cat([item.images_spatial_crop for item in mm_items], dim=0)
-            .type(torch.long)
-            .to(device=pixel_values.device)
+        images_crop, images_spatial_crop = self._stack_crop_inputs(
+            mm_items,
+            has_local_crops=has_local_crops,
+            target_dtype=target_dtype,
+            device=pixel_values.device,
         )
         pixel_values = pixel_values.view(
             pixel_values.shape[0] * pixel_values.shape[1], 1, *pixel_values.shape[2:]
@@ -284,33 +267,6 @@ class UnlimitedOCRForCausalLM(nn.Module):
         )
         vision_features = torch.cat(vision_feature_lists, dim=0).type(target_dtype)
         return vision_features
-
-    def get_language_model(self) -> torch.nn.Module:
-        """Return the underlying language model."""
-        return self.model
-
-    def get_multimodal_embeddings(
-        self, **kwargs: object
-    ) -> Optional[MultiModalEmbeddings]:
-        """Compute multimodal embeddings from image inputs, if present."""
-        image_input = self._parse_and_validate_image_input(**kwargs)
-        if image_input is None:
-            return None
-        vision_embeddings = self._process_image_input(image_input)
-        return vision_embeddings
-
-    def get_input_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
-    ) -> torch.Tensor:
-        """Get text embeddings and merge in multimodal embeddings if provided."""
-        inputs_embeds = self.model.get_input_embeddings(input_ids)
-        if multimodal_embeddings is not None:
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids, inputs_embeds, multimodal_embeddings, self.image_token_id
-            )
-        return inputs_embeds
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input token IDs with multimodal placeholder tokens."""
@@ -340,6 +296,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load and remap checkpoint weights into the model parameters."""
+        clear_sam_rel_pos_cache()
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),

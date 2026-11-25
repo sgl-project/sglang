@@ -44,7 +44,8 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils.common import copy_or_rebind_param
-from sglang.srt.utils.common import is_flashinfer_available, round_up
+from sglang.srt.utils.common import round_up
+from sglang.srt.utils.device import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ def _prepare_nvfp4_swiglu_fusion_weights(
     weight: torch.Tensor,
     scales: torch.Tensor,
 ) -> None:
-    from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+    from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
         interleave_linear_and_gate,
         swizzle_blockscale_2d,
     )
@@ -633,6 +634,29 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     apply = StaticModelOptFp8LinearMethod.apply
 
 
+def valid_modelopt_fp8_linear(linear: torch.nn.Module) -> bool:
+    """Whether ``linear`` is ModelOpt FP8 with one positive fp32 CUDA input scale."""
+    input_scale = getattr(linear, "input_scale", None)
+    return (
+        isinstance(getattr(linear, "quant_method", None), ModelOptFp8LinearMethod)
+        and isinstance(input_scale, torch.Tensor)
+        and input_scale.is_cuda
+        and input_scale.dtype == torch.float32
+        and input_scale.numel() == 1
+        and input_scale.is_contiguous()
+        and bool(torch.isfinite(input_scale).all().item())
+        and bool((input_scale > 0).all().item())
+    )
+
+
+def shared_modelopt_fp8_scale(linears: list[torch.nn.Module]) -> bool:
+    """Whether every linear is valid ModelOpt FP8 and they share one input scale."""
+    if not all(valid_modelopt_fp8_linear(linear) for linear in linears):
+        return False
+    reference = linears[0].input_scale
+    return all(torch.equal(reference, linear.input_scale) for linear in linears[1:])
+
+
 class ModelOptFp4LinearMethod(LinearMethodBase):
     """NVFP4 linear method using the selected FP4 GEMM backend."""
 
@@ -972,7 +996,7 @@ def apply_nvfp4_gemm_swiglu_quant(
     if fp4_quantize is None:
         raise RuntimeError("No FP4 quantization kernel available. Install flashinfer.")
 
-    from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+    from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
         nvfp4_gemm_swiglu_nvfp4_quant,
     )
 

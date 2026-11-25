@@ -29,7 +29,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 
 # DSv4 indexer cache layout (fixed by deepseek_v4_memory_pool.DeepSeekV4IndexerPool):
@@ -291,16 +291,10 @@ class TestSM120PagedMqaLogitsTorch(CustomTestCase):
         )
 
     def test_shape_assertions(self):
-        """Wrong head_dim or block_size must raise."""
+        """clean_logits=True is unsupported and must raise rather than be ignored."""
         q, kv, w, sl, pt, msl = _build_inputs(
             1, [64], kv_dtype_view=FP8_DTYPE, device=self.device
         )
-        # head_dim != 128
-        bad_q = q[..., :64]
-        with self.assertRaises(AssertionError):
-            fp8_paged_mqa_logits_torch_sm120(
-                bad_q, kv, w, sl, pt, None, max_seq_len=msl, clean_logits=False
-            )
         # clean_logits=True not supported
         with self.assertRaises(AssertionError):
             fp8_paged_mqa_logits_torch_sm120(

@@ -1,2 +1,3 @@
-"""Fused MoE-LoRA kernels: the fused shrink/expand Triton kernel, LoRA-aware
-block alignment (JIT), and the merged virtual-expert path."""
+"""MoE-LoRA kernels: the legacy fused shrink/expand kernel, LoRA-aware block
+alignment and virtual-expert path, and the engine's dispatch, activation, B,
+finalize stages and CuTeDSL grouped GEMMs."""

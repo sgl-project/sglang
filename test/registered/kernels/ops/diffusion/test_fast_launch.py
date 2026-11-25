@@ -18,15 +18,27 @@ from triton.runtime.jit import JITFunction
 from sglang.kernels.kda_kernels.layernorm_modulate_triton import (
     fused_layernorm_modulate_raw,
 )
+from sglang.kernels.ops.diffusion.activation.sana_conv_post_triton import (
+    fused_bias_glu,
+    fused_bias_silu,
+)
 from sglang.kernels.ops.diffusion.activation.silu_mul_bitexact import (
     fused_packed_silu_mul_bitexact,
     fused_silu_mul_bitexact,
 )
 from sglang.kernels.ops.diffusion.common import fast_launch
 from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
+from sglang.kernels.ops.diffusion.modulate.head_gate_triton import head_gate_mul
+from sglang.kernels.ops.diffusion.modulate.residual_gate_fp32 import _residual_gate_fp32
+from sglang.kernels.ops.diffusion.modulate.wan_temb_table_slices_triton import (
+    fused_temb_table_slices,
+)
 from sglang.kernels.ops.diffusion.norm.native_bf16_rmsnorm_triton import (
     rmsnorm_scale,
     rmsnorm_tanh_residual,
+)
+from sglang.kernels.ops.diffusion.norm.rmsnorm_scale_shift_bitexact import (
+    fused_rmsnorm_scale_shift_bitexact,
 )
 from sglang.kernels.ops.diffusion.norm.zimage_qk_rmsnorm_triton import (
     zimage_qk_rmsnorm_native,
@@ -34,12 +46,16 @@ from sglang.kernels.ops.diffusion.norm.zimage_qk_rmsnorm_triton import (
 from sglang.kernels.ops.diffusion.rope.flux2_qknorm_rope_triton import (
     flux2_strided_qknorm_rope,
 )
+from sglang.kernels.ops.diffusion.rope.matrix_rope import apply_matrix_rope
 from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
     fused_rope_rotate_half_bitexact,
 )
+from sglang.kernels.ops.diffusion.routing.group_limited_topk_triton import (
+    _group_limited_topk_cuda,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -56,6 +72,10 @@ def _bf16(*shape):
     return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
 
 
+def _fp32(*shape):
+    return torch.randn(*shape, device="cuda", dtype=torch.float32)
+
+
 def _qkv_slices(tokens, heads):
     """q and k of a fused qkv projection: strided tokens, packed heads."""
     qkv = _bf16(1, tokens, 3 * heads * 128)
@@ -65,6 +85,22 @@ def _qkv_slices(tokens, heads):
 
 
 WRAPPERS = {
+    "head_gate_audio": lambda: (
+        head_gate_mul,
+        (_bf16(1, 126, 32, 64), _bf16(1, 126, 32)),
+    ),
+    "head_gate_video": lambda: (
+        head_gate_mul,
+        (_bf16(2, 1536, 4096), _bf16(2, 1536, 32)),
+    ),
+    "rmsnorm_modulate_audio": lambda: (
+        fused_rmsnorm_scale_shift_bitexact,
+        (_bf16(1, 126, 2048), _bf16(2048), _bf16(1, 1, 2048), _bf16(1, 1, 2048), EPS),
+    ),
+    "rmsnorm_modulate_video": lambda: (
+        fused_rmsnorm_scale_shift_bitexact,
+        (_bf16(2, 1536, 4096), _bf16(4096), _bf16(2, 1, 4096), _bf16(2, 1, 4096), EPS),
+    ),
     "rmsnorm_scale": lambda: (
         rmsnorm_scale,
         (_bf16(1, 1088, 3840), _bf16(3840), _bf16(1, 1, 3840), EPS),
@@ -104,6 +140,24 @@ WRAPPERS = {
         fused_rope_rotate_half_bitexact,
         (_bf16(2, 64, 8, 128), _bf16(128, 64), _bf16(128, 64)),
     ),
+    "residual_gate_fp32": lambda: (
+        _residual_gate_fp32,
+        (_bf16(2, 64, 3072), _bf16(2, 64, 3072), _bf16(1, 1, 3072)),
+    ),
+    "wan_temb_table_slices": lambda: (
+        fused_temb_table_slices,
+        (_fp32(1, 6, 3072), _bf16(2, 64, 6, 3072)),
+    ),
+    "matrix_rope": lambda: (
+        apply_matrix_rope,
+        (_bf16(2, 64, 8, 64), _fp32(2, 64, 1, 32, 2, 2), None),
+    ),
+    "group_limited_topk": lambda: (
+        _group_limited_topk_cuda,
+        (_fp32(128, 64), 8, 4, 8),
+    ),
+    "bias_silu": lambda: (fused_bias_silu, (_bf16(2, 64, 8, 8), _bf16(64))),
+    "bias_glu": lambda: (fused_bias_glu, (_bf16(2, 64, 8, 8), None)),
 }
 
 
@@ -344,12 +398,41 @@ def test_capture_replays_and_records():
 
 
 @torch.no_grad()
-def test_compile_traces_the_wrapper(monkeypatch):
-    fn, args = WRAPPERS["rmsnorm_scale"]()
+@pytest.mark.parametrize(
+    "name", ["rmsnorm_scale", "head_gate_audio", "rmsnorm_modulate_audio"]
+)
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+def test_compile_traces_the_wrapper(monkeypatch, name, backend):
+    fn, args = WRAPPERS[name]()
     expected = _normal_path(monkeypatch, fn, args)
     fn(*args)  # recorded; tracing must still run the wrapper
-    compiled = torch.compile(fn, fullgraph=True, backend="eager")
+    compiled = torch.compile(fn, fullgraph=True, backend=backend)
     assert torch.equal(compiled(*args), expected)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "name",
+    [
+        "head_gate_audio",
+        "head_gate_video",
+        "rmsnorm_modulate_audio",
+        "rmsnorm_modulate_video",
+    ],
+)
+def test_production_wrapper_capture_uses_updated_inputs(monkeypatch, name):
+    fn, args = WRAPPERS[name]()
+    fn(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fn(*args)
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            arg.copy_(torch.randn_like(arg))
+    expected = _normal_path(monkeypatch, fn, args)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
 
 
 @torch.no_grad()

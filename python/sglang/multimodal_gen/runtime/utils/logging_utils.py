@@ -19,6 +19,10 @@ from logging import Logger
 from types import MethodType
 from typing import Any, cast
 
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
+
 # color
 CYAN = "\033[1;36m"
 RED = "\033[91m"
@@ -205,7 +209,7 @@ class _SGLDiffusionLogger(Logger):
         msg: object,
         *args: Any,
         main_process_only: bool = False,
-        local_main_process_only: bool = True,
+        local_main_process_only: bool = False,
         **kwargs: Any,
     ) -> None: ...
 
@@ -216,8 +220,6 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
     already been configured."""
 
     logger = logging.getLogger(name)
-
-    server_log_level = logger.getEffectiveLevel()
 
     # Patch instance methods
     setattr(logger, "info_once", MethodType(_print_info_once, logger))
@@ -237,7 +239,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
             **kwargs: Any,
         ) -> None:
             _log_process_aware(
-                server_log_level,
+                self.getEffectiveLevel(),
                 level,
                 self,
                 msg,
@@ -302,6 +304,8 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         if key_hint in ("prompt", "negative_prompt"):
             if isinstance(obj, str):
                 return f"<redacted, len={len(obj)}>"
+        if isinstance(obj, str) and obj.startswith("data:"):
+            return f"<inline media, len={len(obj)}>"
         return obj
 
     if isinstance(obj, Enum):
@@ -516,8 +520,6 @@ def suppress_stdout():
             # C library calls that would normally print to stdout
             torch.distributed.new_group(ranks, backend="gloo")
     """
-    # Don't suppress if logging level is DEBUG
-
     stdout_fd = sys.stdout.fileno()
     stdout_dup = os.dup(stdout_fd)
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
@@ -544,17 +546,7 @@ class GenerationTimer:
 def log_generation_timer(
     logger: logging.Logger,
     prompt: str,
-    request_idx: int | None = None,
-    total_requests: int | None = None,
 ):
-    if request_idx is not None and total_requests is not None:
-        logger.info(
-            "Processing prompt %d/%d: %s",
-            request_idx,
-            total_requests,
-            _sanitize_for_logging(prompt, key_hint="prompt"),
-        )
-
     timer = GenerationTimer()
     timer.start_time = time.perf_counter()
     try:
@@ -566,13 +558,8 @@ def log_generation_timer(
             timer.duration,
         )
     except Exception as e:
-        if request_idx is not None:
-            logger.error(
-                "Failed to generate output for prompt %d: %s",
-                request_idx,
-                e,
-                exc_info=True,
-            )
+        if isinstance(e, RequestCancelledError):
+            logger.info("Stopped generation: %s", e)
         else:
             logger.error(
                 f"Failed to generate output for prompt: {e}",
