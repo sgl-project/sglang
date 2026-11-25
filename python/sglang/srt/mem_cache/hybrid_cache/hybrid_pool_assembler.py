@@ -55,7 +55,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import (
     ComponentType,
     tree_slot_ids,
 )
-from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -657,29 +657,145 @@ def _dsv4_low_ratio_regions(
     return regions
 
 
+def _dsv4_native_full_regions(kvcache, infos, page_size):
+    """Keep page, head and element dimensions for the Ascend whole-page copy."""
+    import torch
+
+    regions = []
+    for ratio, kv_name, index_name in (
+        (1, PoolName.DEEPSEEK_V4_C1, PoolName.DEEPSEEK_V4_C1_INDEXER),
+        (2, PoolName.DEEPSEEK_V4_C2, PoolName.DEEPSEEK_V4_C2_INDEXER),
+    ):
+        kv, index = infos.get(kv_name), infos.get(index_name)
+        if (
+            kv is None
+            or index is None
+            or not kv.layer_ids
+            or kv.layer_ids != index.layer_ids
+            or page_size % ratio
+            or kv.buffer_info.layout != "pa_nd"
+            or index.buffer_info.layout != "pa_nd"
+        ):
+            return []
+        layers = _dsv4_transfer_layer_mapping(kv.layer_ids, kvcache.start_layer)
+        slots = page_size // ratio
+        for name, pool, info in (
+            (kv_name, kvcache.kv_pools[ratio], kv),
+            (index_name, kvcache.index_pools[ratio], index),
+        ):
+            buffers = []
+            for buf in info.buffer_info.buffers:
+                if (
+                    buf.dtype != torch.bfloat16
+                    or buf.ndim != 4
+                    or buf.shape[2] != 1
+                    or not buf.is_contiguous()
+                    or buf.shape[1] == 0
+                    or buf.shape[-1] == 0
+                    or slots % buf.shape[1]
+                ):
+                    return []
+                pages_per_full = slots // buf.shape[1]
+                if name == kv_name and pages_per_full != 1:
+                    return []
+                pages = buf.shape[0] // pages_per_full
+                if pages == 0:
+                    return []
+                buffers.append(
+                    buf[: pages * pages_per_full].view(pages, slots, 1, buf.shape[-1])
+                )
+            if len(buffers) != len(info.layer_ids) or any(
+                b.shape[1:] != buffers[0].shape[1:] for b in buffers
+            ):
+                return []
+            regions.append((name, pool, buffers, layers))
+    return regions
+
+
+def _dsv41_shared_host_arena(regions, swa_buffers, full_pages, swa_pages):
+    import torch
+    from sglang.srt.mem_cache.pool_host.base import host_memory_preflight
+    from sglang.srt.mem_cache.pool_host.common import (
+        ALLOC_MEMORY_FUNCS,
+        get_allocator_from_storage,
+    )
+    from sglang.srt.mem_cache.pool_host.dual_ended import (
+        DualEndedHostArena,
+        UnsupportedPageGeometry,
+    )
+    from sglang.srt.mem_cache.pool_host.npu_host_memory import get_host_memory_backend
+
+    if not swa_buffers or any(
+        b.device.type != "npu"
+        or b.dtype != torch.bfloat16
+        or b.ndim != 4
+        or b.shape[2] != 1
+        or not b.is_contiguous()
+        or b.shape[1:] != swa_buffers[0].shape[1:]
+        for b in swa_buffers
+    ):
+        return None
+    if not regions:
+        return None
+
+    def allocate(size):
+        device = swa_buffers[0].device
+        allocator = get_allocator_from_storage(_get_allocator_type())
+        need, available = host_memory_preflight(
+            [size], allocator=allocator, device=device
+        )
+        if need > available:
+            raise ValueError(
+                f"DSV4 shared host pages need {need} bytes, {available} available"
+            )
+        backend = get_host_memory_backend()
+        if backend is not None:
+            backend.ensure_capacity(size, torch.npu.current_device())
+        return ALLOC_MEMORY_FUNCS["npu"]((size,), torch.uint8, "cpu", True, allocator)
+
+    try:
+        return DualEndedHostArena(
+            {name: (bufs[0][0].nbytes, len(bufs)) for name, _, bufs, _ in regions},
+            (swa_buffers[0][0].nbytes, len(swa_buffers)),
+            full_pages,
+            swa_pages,
+            allocate,
+        )
+    except UnsupportedPageGeometry:
+        return None
+
+
 def _dsv4_low_ratio_entries(
     kvcache: Any,
     infos: dict[PoolName, DevicePoolInfo],
     page_size: int,
     num_host_pages: int,
     transfer_layer_id_max: int,
+    *,
+    arena=None,
+    regions=None,
 ):
     """Mirror shared KV; ratio-2 request state is rebuilt at page boundaries."""
     entries = []
-    for name, device_pool, buffers, layer_mapping in _dsv4_low_ratio_regions(
-        kvcache, infos, page_size
-    ):
+    if regions is None:
+        regions = _dsv4_low_ratio_regions(kvcache, infos, page_size)
+    for name, device_pool, buffers, layer_mapping in regions:
         entries.append(
             build_pool_entry(
                 name=name,
                 host_pool=DeepSeekV4PagedHostPool(
                     pool_name=str(name),
                     device_buffers=buffers,
-                    item_bytes=buffers[0].shape[1] * buffers[0].element_size(),
+                    item_bytes=(
+                        buffers[0][0].nbytes
+                        if arena is not None
+                        else buffers[0].shape[1] * buffers[0].element_size()
+                    ),
                     num_host_pages=num_host_pages,
                     slot_page_size=page_size,
                     layout=get_memory().hicache_mem_layout,
                     allocator_type=_get_allocator_type(),
+                    host_region=arena.region(name) if arena is not None else None,
                     page_aligned_only=True,
                 ),
                 device_pool=device_pool,
@@ -857,16 +973,55 @@ def build_deepseek_v4_hicache_stack(
         c128_attn_allocator=c128_attn_allocator,
     )
 
-    reserve_dsv4_paged_host_memory(
-        infos=infos,
-        num_host_pages=num_host_pages,
-        swa_num_host_pages=swa_num_host_pages,
-        c128_num_host_pages=c128_num_host_pages,
-        num_draft_swa_layers=len(mtp_swa_device_buffers),
-    )
-
+    memory = get_memory()
+    arena = None
+    regions = None
+    if (
+        swa_info is not None
+        and swa_info.layout == "pa_nd"
+        and not c4_layer_mapping
+        and not c128_layer_mapping
+        and memory.hicache_io_backend == "kernel_ascend"
+        and get_disagg().disaggregation_mode == "prefill"
+        and memory.hicache_mem_layout
+        in ("page_first", "layer_first", "page_first_direct")
+        and memory.hicache_host_memory_mode == "cache"
+        and storage_backend is None
+        and not any(
+            n in infos
+            for n in (
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            )
+        )
+        and not any(
+            pool.extra_host_regions()
+            for pool in (kvcache, *params.mtp_draft_device_pools)
+            if hasattr(pool, "extra_host_regions")
+        )
+    ):
+        regions = _dsv4_native_full_regions(kvcache, infos, page_size)
+        arena = _dsv41_shared_host_arena(
+            regions,
+            [*swa_info.buffers, *mtp_swa_device_buffers],
+            num_host_pages,
+            swa_num_host_pages,
+        )
+    if arena is None:
+        reserve_dsv4_paged_host_memory(
+            infos=infos,
+            num_host_pages=num_host_pages,
+            swa_num_host_pages=swa_num_host_pages,
+            c128_num_host_pages=c128_num_host_pages,
+            num_draft_swa_layers=len(mtp_swa_device_buffers),
+        )
+    else:
+        logger.info("DSV4 FULL and SWA share %d host bytes", arena.budget)
     logical_host_pool = LogicalHostPool(
-        num_host_pages * page_size, page_size, layout=get_memory().hicache_mem_layout
+        num_host_pages * page_size,
+        page_size,
+        layout=memory.hicache_mem_layout,
+        page_owner=arena.full if arena is not None else None,
     )
     entries = [
         build_pool_entry(
@@ -891,7 +1046,9 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=kvcache.swa_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
-            page_aligned_only=_dsv4_region_page_aligned_only(swa_info),
+            host_region=arena.region() if arena is not None else None,
+            page_aligned_only=arena is not None
+            or _dsv4_region_page_aligned_only(swa_info),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
@@ -1072,7 +1229,13 @@ def build_deepseek_v4_hicache_stack(
 
     entries.extend(
         _dsv4_low_ratio_entries(
-            kvcache, infos, page_size, num_host_pages, transfer_layer_id_max
+            kvcache,
+            infos,
+            page_size,
+            num_host_pages,
+            transfer_layer_id_max,
+            arena=arena,
+            regions=regions if arena is not None else None,
         )
     )
     entries.extend(

@@ -490,6 +490,13 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if storage_backend and any(
+            getattr(entry.host_pool, "host_region", None) is not None
+            for entry in self.mem_pool_host.entry_map.values()
+        ):
+            raise ValueError(
+                "Restart with the storage backend selected to use separate DSV4 host pools."
+            )
         if any(
             isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool)
             for entry in self.mem_pool_host.entry_map.values()
