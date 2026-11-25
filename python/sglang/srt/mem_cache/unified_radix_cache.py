@@ -2627,6 +2627,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if spec is None:
             return
 
+        # Throttle L3 write queueing: cap host-locked tokens to avoid starving host
+        # eviction when the store is slower than prefill (issue #52891).
+        cc = self.cache_controller
+        kv_tokens = len(spec.host_value)
+        if cc.backup_rate_limited(kv_tokens):
+            return
+
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
             host_indices=spec.host_value,
@@ -2645,6 +2652,7 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        cc.backup_tokens_occupied += kv_tokens
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
@@ -4139,7 +4147,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 ),
             )
         else:
-            self._backup_requested_tokens.pop(operation.id, None)
+            kv_tokens = self._backup_requested_tokens.pop(operation.id, None)
+            if kv_tokens is not None:
+                self.cache_controller.backup_tokens_occupied -= kv_tokens
             entry = self.ongoing_backup.pop(operation.id, None)
             if entry is not None:
                 node_id, lock_params = entry
