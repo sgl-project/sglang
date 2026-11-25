@@ -240,6 +240,9 @@ def create_unified_radix_cache(
         )
     elif get_memory().enable_unified_cache_external_linker:
         from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.unified_cache.linker_attachment import (
+            LinkerAttachment,
+        )
         from sglang.srt.mem_cache.unified_cache.linker_factory import (
             create_unified_cache_linker,
             get_startup_linker_config,
@@ -260,7 +263,8 @@ def create_unified_radix_cache(
                 draft_pool.register_layer_transfer_counter(draft_counter)
             ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
 
-        cache.init_linker_lifecycle(
+        cache.linker_attachment = LinkerAttachment(
+            cache,
             build_linker=functools.partial(
                 create_unified_cache_linker,
                 server_args,
@@ -272,6 +276,7 @@ def create_unified_radix_cache(
             ),
             publish_linker=publish_linker,
         )
+        cache.linker_attachment.launch()
     return cache
 
 

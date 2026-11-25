@@ -4352,7 +4352,7 @@ class Scheduler(
         if (
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
-            or self.enable_unified_cache_external_linker
+            or self.tree_cache_has_linker()
             or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
@@ -6418,12 +6418,11 @@ class Scheduler(
                 ),
             )
         if not recv_req.attach:
-            # A failed detach leaves ranks in different linker states, so it
-            # propagates and terminates the scheduler.
-            message = self.tree_cache.detach_cache_linker()
+            # A failed detach is fatal on every rank; let it terminate the scheduler.
+            message = self.tree_cache.linker_attachment.detach()
             return UpdateCacheLinkerReqOutput(success=True, message=message)
         try:
-            message = self.tree_cache.attach_cache_linker()
+            message = self.tree_cache.linker_attachment.attach()
         except Exception as e:
             logger.exception("Attach external linker failed with exception.")
             return UpdateCacheLinkerReqOutput(success=False, message=str(e))

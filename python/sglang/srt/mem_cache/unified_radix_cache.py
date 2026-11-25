@@ -109,6 +109,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     SWAComponent,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.linker_attachment import LinkerAttachment
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
@@ -384,10 +385,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
-        self._build_linker: Optional[Callable[[], UnifiedCacheLinker]] = None
-        self._publish_linker: Optional[
-            Callable[[Optional[UnifiedCacheLinker]], None]
-        ] = None
+        # Owns the external linker lifecycle; built by the registry.
+        self.linker_attachment: Optional[LinkerAttachment] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -480,21 +479,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 tag=P2PTag.HICACHE_PP_SYNC,
             )
             self.work_rounds[-1].append(send_work)
-
-    def init_linker_lifecycle(
-        self,
-        *,
-        build_linker: Callable[[], UnifiedCacheLinker],
-        publish_linker: Callable[[Optional[UnifiedCacheLinker]], None],
-    ) -> None:
-        """Link the launch-time external linker; runtime re-attach rebuilds it."""
-        self._build_linker = build_linker
-        self._publish_linker = publish_linker
-        self._link(build_linker())
-
-    def _link(self, cache_linker: UnifiedCacheLinker) -> None:
-        self.init_cache_linker(cache_linker)
-        self._publish_linker(cache_linker)
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
@@ -4278,41 +4262,6 @@ class UnifiedRadixCache(BasePrefixCache):
             return False, "HiCache storage backend is not initialized."
         return self._storage_attachment.detach()
 
-    def attach_cache_linker(self) -> str:
-        if self.linker is not None:
-            return "External linker is already attached."
-        cache_linker, error = None, None
-        try:
-            cache_linker = self._build_linker()
-        except Exception as e:
-            logger.exception("Failed to build the external linker.")
-            error = e
-        # The linker hooks run collectives, so every rank links or none does.
-        linked = torch.tensor([int(error is None)], dtype=torch.int)
-        self._all_reduce_attn_groups(linked, torch.distributed.ReduceOp.MIN)
-        if not linked.item():
-            if cache_linker is not None:
-                cache_linker.close()
-            raise RuntimeError(
-                "Failed to attach the external linker: "
-                f"{error or 'failed on another rank'}"
-            ) from error
-        filled = self.tree_core.backfill_missing_hash_values()
-        self._link(cache_linker)
-        logger.info(
-            "Attached the external linker; hashed %d existing radix nodes.", filled
-        )
-        return "External linker attached."
-
-    def detach_cache_linker(self) -> str:
-        if self.linker is None:
-            return "External linker is not attached."
-        self.linker.close()
-        self.linker = None
-        self._publish_linker(None)
-        logger.info("Detached the external linker.")
-        return "External linker detached."
-
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
         if self._storage_attachment is not None:
@@ -4711,9 +4660,6 @@ class UnifiedRadixCache(BasePrefixCache):
                     [bool(success) for success in successes.tolist()]
                 )
             self.linker.check_prefetch_events()
-            return
-        if self.cache_controller is None:
-            # A detached linker leaves no host tier to poll.
             return
 
         if self.enable_storage:
