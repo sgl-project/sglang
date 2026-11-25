@@ -33,7 +33,6 @@ from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
-    get_platform,
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -196,16 +195,12 @@ class Gemma4VisionAttention(nn.Module):
 
     @staticmethod
     def _select_backend() -> str:
-        """Mirror VisionAttention._determine_attention_backend for consistency."""
-
         override = get_mm().mm_attention_backend
         if override is not None:
             return override
         if is_cuda():
             major, _ = get_device_capability()
             if major == 9:
-                if get_platform().is_blackwell:
-                    return "triton_attn"
                 return "fa3"
             return "triton_attn"
         if is_hip():
