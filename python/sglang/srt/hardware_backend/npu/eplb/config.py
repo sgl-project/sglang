@@ -11,6 +11,11 @@ def validate_async_eplb_args(cfg) -> None:
             "Async NPU EPLB requires resolved EP size = TP size > 1 "
             f"(got EP={cfg.ep_size}, TP={cfg.tp_size})"
         )
+    if cfg.moe_a2a_backend == "none":
+        raise ValueError(
+            "Async NPU EPLB requires an expert-parallel MoE backend "
+            "(set --moe-a2a-backend to a supported backend such as ascend_ops)"
+        )
     if cfg.ep_dispatch_algorithm not in (None, "static", "dynamic"):
         raise ValueError("Async NPU EPLB supports static or dynamic dispatch")
     if cfg.weight_cache_mode != "off":

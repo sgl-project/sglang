@@ -26,6 +26,9 @@ class ControlPoint(IntEnum):
     NO_LAYER = -1
     RECORDER_WINDOW = -2
     PREFILL_ADMISSION = -3
+    SNAPSHOT_ADMISSION = -4
+    SNAPSHOT_PREPARE = -5
+    SNAPSHOT_COMPLETE = -6
 
 
 class RebalanceAborted(RuntimeError):

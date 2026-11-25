@@ -25,7 +25,6 @@ class TestAsyncEplbPlanning(unittest.TestCase):
         # The 50 fixed hot steps already occupy the entire top 5% of this
         # window. One ordinary step over the old peak would raise the P95.
         current = torch.tensor([[0, 1, 0, 2]])
-        local_replicas = torch.tensor([[[0], [1], [3]]])
         spec = PlanningSpec(4, 2, None, 1, EplbAlgorithm.deepseek, "random")
 
         counts = torch.tensor(
@@ -39,7 +38,7 @@ class TestAsyncEplbPlanning(unittest.TestCase):
             spec,
             2,
             (0,),
-            current_replicas=local_replicas,
+            num_logical_experts=3,
             narrowed_layers={0},
         )
 
@@ -55,13 +54,32 @@ class TestAsyncEplbPlanning(unittest.TestCase):
         # sources. The independent bound used to admit this route-only plan.
         self.assertIsNone(self._plan_two_replicas(311, 512))
 
+    def test_random_admission_uses_active_sources_per_step(self):
+        current = torch.arange(32).reshape(1, 32)
+        current[:, 2] = 0
+        current[:, 3:] -= 1
+        spec = PlanningSpec(32, 2, None, 1, EplbAlgorithm.deepseek, "random")
+        counts = torch.zeros(1000, 1, 32, dtype=torch.int32)
+        counts[:950, 0, 0] = 104
+        counts[:950, 0, 2] = 24
+        counts[950:, 0, 1] = 128
+        active_sources = torch.tensor([[2]] * 950 + [[16]] * 50)
+        args = (counts, current, spec, 16, (0,))
+        kwargs = dict(num_logical_experts=31, narrowed_layers={0})
+        self.assertIsNone(plan_migration(*args, **kwargs))
+        plan = plan_migration(*args, **kwargs, active_sources=active_sources)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.layers, (0,))
+
     def test_balanced_single_copy_window_skips_solver(self):
         current = torch.tensor([[2, 0, 3, 1]])
         spec = PlanningSpec(4, 2, None, 1, EplbAlgorithm.deepseek)
         # Counts are unequal per expert, but each live rank gets eight.
-        counts = torch.tensor([[[3, 7, 5, 1]]], dtype=torch.int32).repeat(16, 1, 1)
+        counts = torch.tensor([[[5, 3, 1, 7]]], dtype=torch.int32).repeat(16, 1, 1)
         with patch.object(PlanningSpec, "compute", autospec=True) as compute:
-            self.assertIsNone(plan_migration(counts, current, spec, 2, (0,)))
+            self.assertIsNone(
+                plan_migration(counts, current, spec, 2, (0,), num_logical_experts=4)
+            )
         compute.assert_not_called()
 
     def test_low_migration_search_receives_only_eligible_layers(self):
@@ -71,11 +89,63 @@ class TestAsyncEplbPlanning(unittest.TestCase):
         with patch.object(
             placement, "_prefer_fewer_moves", wraps=placement._prefer_fewer_moves
         ) as search:
-            plan = plan_migration(counts, current, spec, 2, (0, 1))
+            plan = plan_migration(
+                counts, current, spec, 2, (0, 1), num_logical_experts=4
+            )
 
         self.assertIsNotNone(plan)
         self.assertEqual(plan.layers, (1,))
         self.assertEqual(search.call_args.args[-1], (1,))
+
+
+class TestAsyncEplbSnapshot(unittest.TestCase):
+    def test_peer_preparation_or_copy_failure_discards_the_window(self):
+        from sglang.srt.hardware_backend.npu.eplb import manager
+
+        point = coordinator.ControlPoint
+        for failed_at in (point.SNAPSHOT_PREPARE, point.SNAPSHOT_COMPLETE):
+            with self.subTest(failed_at=failed_at):
+                counts = torch.ones(2, 1, 4, dtype=torch.int32)
+                accumulator = object.__new__(manager._AsyncStatAccumulator)
+                accumulator._enable = False
+                accumulator._communication_group = object()
+                accumulator._previous_layouts = {}
+                accumulator._global_physical_count_of_buffered_step = SimpleNamespace(
+                    get_all=lambda: counts
+                )
+                accumulator.reset = counts.zero_
+                vote = Mock(side_effect=lambda p, ready, error: (ready, p == failed_at))
+                spec = PlanningSpec(4, 2, None, 1, EplbAlgorithm.deepseek)
+                with patch.multiple(
+                    manager.dist, get_rank=Mock(return_value=1), all_reduce=Mock()
+                ):
+                    self.assertIsNone(
+                        accumulator.take_rebalance_snapshot(
+                            spec, lambda _: True, vote, source_local=True
+                        )
+                    )
+                    self.assertEqual(
+                        manager.dist.all_reduce.call_count,
+                        int(failed_at == point.SNAPSHOT_COMPLETE),
+                    )
+                self.assertFalse(counts.any().item())
+                self.assertEqual(
+                    [call.args[0] for call in vote.call_args_list],
+                    [point.SNAPSHOT_PREPARE, point.SNAPSHOT_COMPLETE],
+                )
+
+    def test_placement_preserves_holes_and_trims_only_changed_layers(self):
+        from sglang.srt.hardware_backend.npu.eplb import runtime
+
+        physical = torch.tensor([[0, 1, 0, 1], [0, 1, 0, 1]])
+        logical = torch.tensor(
+            [[[0, -1, -1, 2], [1, 3, -1, -1]], [[0, -1, 2, -1], [1, 3, -1, -1]]]
+        )
+        plan = placement.MigrationPlacement((1,), physical, logical)
+        with patch.object(runtime.dist, "broadcast") as broadcast:
+            rows = runtime._broadcast_placement(plan, None, 0, None, physical.shape, 2)
+        self.assertEqual(broadcast.call_args_list[0].args[0].tolist(), [1, 3, 0])
+        torch.testing.assert_close(rows.logical_to_physical, logical[1:, :, :3])
 
 
 class TestAsyncEplbCoordinator(unittest.TestCase):
@@ -118,6 +188,19 @@ class TestAsyncEplbCoordinator(unittest.TestCase):
 
 
 class TestAsyncEplbStartup(unittest.TestCase):
+    def test_ascend_async_requires_an_expert_parallel_backend(self):
+        from sglang.srt.hardware_backend.npu.eplb import validate_async_eplb_args
+
+        cfg = SimpleNamespace(
+            device="npu",
+            enable_eplb=True,
+            ep_size=16,
+            tp_size=16,
+            moe_a2a_backend="none",
+        )
+        with self.assertRaisesRegex(ValueError, "expert-parallel MoE backend"):
+            validate_async_eplb_args(cfg)
+
     def test_single_rank_warmup_allocation_failure_closes_control_group(self):
         from sglang.srt.hardware_backend.npu.eplb import runtime
 

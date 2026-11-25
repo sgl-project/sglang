@@ -1,6 +1,7 @@
 """EPLB scheduling and recorder state specific to asynchronous Ascend migration."""
 
 import logging
+import math
 import time
 
 import torch
@@ -9,6 +10,7 @@ from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     _convert_global_physical_count_to_logical_count,
     _ExpertDistributionRecorderReal,
+    _SelectExpertsSinglePassGatherer,
     _StatAccumulator,
     get_global_expert_distribution_recorder,
 )
@@ -16,6 +18,7 @@ from sglang.srt.hardware_backend.npu.eplb.coordinator import (
     ControlPoint,
     Phase,
     RebalanceAborted,
+    UnsafeRebalanceFailure,
 )
 from sglang.srt.hardware_backend.npu.eplb.runtime import create_npu_async_eplb
 from sglang.srt.runtime_context import get_exec
@@ -47,47 +50,89 @@ class _AsyncStatAccumulator(_StatAccumulator):
         self.window_samples = 0
         self._previous_layouts.clear()
 
+    def _finish_snapshot(self, vote, failed: bool) -> bool:
+        cleared = True
+        try:
+            self.reset()
+        except Exception:
+            logger.exception("Async EPLB could not reset its recorder window")
+            cleared = False
+        cleared, failed = vote(ControlPoint.SNAPSHOT_COMPLETE, cleared, failed)
+        if not cleared:
+            raise UnsafeRebalanceFailure(
+                "Async EPLB could not clear the recorder on all ranks"
+            )
+        return not failed
+
     def take_rebalance_snapshot(
-        self, spec, rebalance_needed
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None] | None:
+        self, spec, rebalance_needed, vote, *, source_local: bool
+    ):
         """Consume the window on all ranks. None skips the plan on all ranks.
 
-        A participating non-root rank returns (None, None) and joins the
-        planner broadcast. Only rank 0 keeps counts after reset.
+        Only rank 0 keeps counts. Other ranks return (None, None, None) and
+        join the planner broadcast.
         """
-        utilization = self._get_global_average_utilization_rate()
-        if not rebalance_needed(utilization):
-            self.reset()
-            return None
+        if self._enable and not math.isclose(
+            get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
+        ):
+            # Utilization history lives on rank 0. Share its decision on Gloo.
+            needed, failed = True, False
+            if self._rank == 0:
+                try:
+                    utilization = self._history.mean().get(self.window_sizes[-1], 0)
+                    needed = rebalance_needed(utilization)
+                except Exception:
+                    logger.exception("Async EPLB could not check window utilization")
+                    failed = True
+            needed, failed = vote(ControlPoint.SNAPSHOT_ADMISSION, needed, failed)
+            if failed or not needed:
+                self._finish_snapshot(vote, failed)
+                return None
 
         # A completed migration resets the window before the next epoch.
-        assert not self._previous_layouts
-        counts = self._global_physical_count_of_buffered_step.get_all()
         group = self._communication_group
         rank = dist.get_rank(group)
-        sources = None
-        source_groups = spec.source_groups
-        if source_groups:
-            ranks_per_group = dist.get_world_size(group) // source_groups
-            source = rank // ranks_per_group
-            sources = counts.new_zeros(
-                (source_groups, *counts.shape[1:]), dtype=torch.int64
-            )
-            torch.sum(counts, dim=0, out=sources[source])
+        snapshot = sources = active_sources = None
+        failed = False
+        try:
+            assert not self._previous_layouts
+            counts = self._global_physical_count_of_buffered_step.get_all()
+            if rank == 0:
+                snapshot = torch.empty_like(counts)
+            if source_groups := spec.source_groups:
+                ranks_per_group = dist.get_world_size(group) // source_groups
+                source = rank // ranks_per_group
+                sources = counts.new_zeros(
+                    (source_groups, *counts.shape[1:]), dtype=torch.int64
+                )
+                torch.sum(counts, dim=0, out=sources[source])
+            if spec.dispatch_mode == "random" and source_local:
+                # Count the ranks with local assignments before counts is reduced.
+                active_sources = counts.amax(dim=-1).gt(0).to(torch.int32)
+        except Exception:
+            logger.exception("Async EPLB could not prepare a recorder snapshot")
+            failed = True
+        _, failed = vote(ControlPoint.SNAPSHOT_PREPARE, not failed, failed)
+        if failed:
+            self._finish_snapshot(vote, failed)
+            return None
+
+        if sources is not None:
             dist.reduce(sources, dst=0, group=group)
-        # The window is consumed here. Give the planner an independent copy.
+        if active_sources is not None:
+            dist.reduce(active_sources, dst=0, group=group)
         dist.all_reduce(counts, group=group)
-        snapshot = None
-        if rank == 0:
-            snapshot = (
-                counts.clone()
-                if spec.physical_count_mode
-                else self._logical_counts(counts)
-            )
-        else:
-            sources = None
-        self.reset()
-        return snapshot, sources
+
+        try:
+            if snapshot is not None:
+                snapshot.copy_(counts)
+        except Exception:
+            logger.exception("Async EPLB could not copy the reduced recorder window")
+            failed = True
+        # Counts now contain the group total. No rank may reuse this window.
+        if not self._finish_snapshot(vote, failed):
+            return None
+        return (snapshot, sources, active_sources) if rank == 0 else (None, None, None)
 
     def _logical_counts(self, physical_counts):
         logical = super()._logical_counts(physical_counts)
@@ -121,6 +166,11 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
         if metadata is None:
             raise ValueError("Async EPLB requires expert location metadata")
         super().__init__(metadata, rank, accumulator_factory=_AsyncStatAccumulator)
+        # Only TopK counts describe the source rank, before dispatch.
+        self._source_local = all(
+            isinstance(gatherer, _SelectExpertsSinglePassGatherer)
+            for gatherer in self._single_pass_gatherers.values()
+        )
 
     @property
     def window_samples(self):
@@ -133,11 +183,13 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
         # NPU startup already warmed TP and emptied the allocator cache.
         self._accumulator._first_dump = False
 
-    def snapshot_for_rebalance(self, spec, rebalance_needed):
+    def snapshot_for_rebalance(self, spec, rebalance_needed, vote):
         with record_function("npu_eplb.snapshot"):
             # Per-pass gatherers reset at the next forward. The accumulator
             # owns the recorder window and clears it after taking a snapshot.
-            return self._accumulator.take_rebalance_snapshot(spec, rebalance_needed)
+            return self._accumulator.take_rebalance_snapshot(
+                spec, rebalance_needed, vote, source_local=self._source_local
+            )
 
 
 def make_prefill_release_policy(scheduler):
@@ -234,18 +286,18 @@ class NpuAsyncEPLBManager(EPLBManager):
             recorder.window_samples
             >= get_exec().moe.expert_distribution_recorder_buffer_size
         )
-        ready, _ = coordinator.control.vote(
-            coordinator.epoch,
-            Phase.IDLE,
-            ControlPoint.RECORDER_WINDOW,
-            enough_samples,
-            False,
-        )
+
+        def vote(point, ready, error):
+            return coordinator.control.vote(
+                coordinator.epoch, Phase.IDLE, point, ready, error
+            )
+
+        ready, _ = vote(ControlPoint.RECORDER_WINDOW, enough_samples, False)
         if not ready:
             return
         start = time.perf_counter()
         snapshot = recorder.snapshot_for_rebalance(
-            coordinator.runtime.spec, self._check_rebalance_needed
+            coordinator.runtime.spec, self._check_rebalance_needed, vote
         )
         snapshot_seconds = time.perf_counter() - start
         if snapshot is None:

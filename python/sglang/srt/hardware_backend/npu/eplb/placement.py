@@ -39,19 +39,15 @@ class PlanningSpec:
     groups: int | None
     nodes: int
     algorithm: EplbAlgorithm
-    physical_count_mode: Literal["row", "random", "static", "unique"] | None = None
+    dispatch_mode: Literal["unique", "random", "static"] = "unique"
     score_locality: bool = True
 
     @property
     def source_groups(self) -> int:
         """Number of source histograms: one per rank, one per node, or none."""
-        if self.physical_count_mode == "static":
+        if self.dispatch_mode == "static":
             return self.physical_experts // self.local_experts
-        if (
-            self.score_locality
-            and self.physical_count_mode in ("random", "unique")
-            and self.nodes > 1
-        ):
+        if self.score_locality and self.nodes > 1:
             return self.nodes
         return 0
 
@@ -85,14 +81,15 @@ def _rank_peaks_and_eligible_layers(slot_counts, spec, layer_ids):
 
 
 def plan_migration(
-    counts: torch.Tensor,
+    slot_counts: torch.Tensor,
     current: torch.Tensor,
     spec: PlanningSpec,
     ranks_per_node: int,
     layer_ids: tuple[int, ...],
     *,
-    current_replicas: torch.Tensor | None = None,
+    num_logical_experts: int,
     source_totals: torch.Tensor | None = None,
+    active_sources: torch.Tensor | None = None,
     narrowed_layers: frozenset[int] | set[int] = frozenset(),
 ) -> MigrationPlacement | None:
     """Refine the solver layout, admit layers against the recorded window, then order moves.
@@ -100,40 +97,32 @@ def plan_migration(
     `physical` maps slots to experts; `logical` lists the slots for each expert.
     Layer IDs index both tables even when only a subset is eligible to move.
     """
-    physical_counts = None
-    observed_peaks = None
-    if spec.physical_count_mode is not None:
-        from sglang.srt.eplb.expert_distribution import (
-            _convert_global_physical_count_to_logical_count,
-        )
+    from sglang.srt.eplb.expert_distribution import (
+        _convert_global_physical_count_to_logical_count,
+    )
 
-        assert current_replicas is not None
-        physical_counts = counts.numpy()
-        if spec.physical_count_mode != "row":
-            observed_peaks, layer_ids = _rank_peaks_and_eligible_layers(
-                physical_counts, spec, layer_ids
-            )
-            if not layer_ids:
-                return None
+    physical_counts = slot_counts.numpy()
+    observed_peaks, layer_ids = _rank_peaks_and_eligible_layers(
+        physical_counts, spec, layer_ids
+    )
+    if not layer_ids:
+        return None
+    if spec.dispatch_mode == "unique":
+        logical_to_slot = current.argsort(dim=-1)
+        counts = slot_counts.gather(
+            -1, logical_to_slot.unsqueeze(0).expand_as(slot_counts)
+        )
+    else:
         counts = _convert_global_physical_count_to_logical_count(
-            counts, current.size(0), current_replicas.size(1), current
+            slot_counts, current.size(0), num_logical_experts, current
         )
-    elif spec.nodes == 1:
-        # With one slot per expert, logical counts give the exact live slot load.
-        live_counts = np.take_along_axis(
-            counts.numpy(), current.numpy()[None, :, :], axis=2
-        )
-        _, layer_ids = _rank_peaks_and_eligible_layers(live_counts, spec, layer_ids)
-        del live_counts
-        if not layer_ids:
-            return None
     physical, logical = spec.compute(counts)
     if physical.shape != current.shape:
         raise ValueError("EPLB plan changed physical capacity")
     replicated = physical.size(1) > logical.size(1)
     # Aggregate counts cannot predict the load on replicas pinned to source
     # ranks. Keep the base planner's rank assignments for static dispatch.
-    replicated_static = spec.physical_count_mode == "static"
+    replicated_static = spec.dispatch_mode == "static"
     score_steps = spec.nodes == 1 and not replicated_static
     fallbacks = {}
     if score_steps and replicated:
@@ -168,12 +157,10 @@ def plan_migration(
         physical, logical, known_gains = _prefer_fewer_moves(
             current, physical, logical, counts, spec.local_experts, layer_ids
         )
-    candidates = layer_ids
-    if spec.physical_count_mode != "row":
-        moved = (physical != current).any(dim=1).tolist()
-        candidates = tuple(
-            i for i in layer_ids if moved[i] or i in fallbacks or i in narrowed_layers
-        )
+    moved = (physical != current).any(dim=1).tolist()
+    candidates = tuple(
+        i for i in layer_ids if moved[i] or i in fallbacks or i in narrowed_layers
+    )
     if candidates and replicated_static:
         from sglang.srt.eplb.expert_location import (
             compute_logical_to_rank_dispatch_physical_map,
@@ -183,16 +170,9 @@ def plan_migration(
         static_dispatch = compute_logical_to_rank_dispatch_physical_map(
             logical, spec.source_groups, spec.physical_experts, ep_rank=None
         )
-    if physical_counts is not None:
+    if spec.dispatch_mode != "unique" or spec.nodes > 1:
 
         def score(layer, target, inverse):
-            if spec.physical_count_mode == "row":
-                return _row_dispatch_gain(
-                    physical_counts[:, layer],
-                    current_replicas[layer].numpy(),
-                    inverse.numpy(),
-                    spec.local_experts,
-                )
             if layer not in narrowed_layers and torch.equal(target, current[layer]):
                 return 0.0
             return _a2a_migration_gain(
@@ -206,6 +186,11 @@ def plan_migration(
                 static_dispatch[layer].numpy() if static_dispatch is not None else None,
                 source_totals[:, layer].numpy() if source_totals is not None else None,
                 score_locality=spec.score_locality,
+                active_sources=(
+                    active_sources[:, layer].numpy()
+                    if active_sources is not None
+                    else None
+                ),
             )
 
         known_gains = _admit_dispatch_layers(
@@ -610,34 +595,6 @@ def _admit_dispatch_layers(
     return gains
 
 
-def _row_dispatch_gain(samples, live_replicas, target_replicas, local_experts):
-    """Bound rank peaks when a token row picks replica row % num_replicas."""
-    # Both inverse maps cover all physical slots. Any extra columns in the
-    # wider table are padding if the common prefix agrees, including its order.
-    width = min(live_replicas.shape[1], target_replicas.shape[1])
-    if np.array_equal(live_replicas[:, :width], target_replicas[:, :width]):
-        return 0.0
-    ranks = samples.shape[1] // local_experts
-    reachable = np.zeros((ranks, samples.shape[1]), dtype=bool)
-    # A row previously choosing column i can choose column j iff the two
-    # residues agree modulo gcd(old_count, new_count). Equal counts replay
-    # exactly. For splits, charge a slot to each rank that could receive it.
-    for old, new in zip(live_replicas, target_replicas, strict=True):
-        old = old[old >= 0]
-        new = new[new >= 0] // local_experts
-        if len(old) == len(new):
-            reachable[new, old] = True
-        else:
-            groups = np.gcd(len(old), len(new))
-            for residue in range(groups):
-                reachable[np.ix_(new[residue::groups], old[residue::groups])] = True
-    before = samples.reshape(len(samples), ranks, local_experts).sum(2).max(1)
-    upper = np.zeros_like(before)
-    for slots in reachable:
-        np.maximum(upper, samples[:, slots].sum(1), out=upper)
-    return _peak_gain(before, upper, samples.sum(1), ranks)
-
-
 def _migration_gain(samples, live, target, before_peak=None):
     num_experts = samples.shape[-1]
 
@@ -677,7 +634,7 @@ def _static_rank_peak_bound(slots, destinations, sources, ranks):
     return peak
 
 
-def _random_rank_peak_bound(samples, probability, before, totals):
+def _random_rank_peak_bound(samples, probability, before, totals, active_sources=None):
     """Bound the mean busiest-rank load and reject unsafe window tails."""
     # Accumulate moments and support bounds from the assignment marginals.
     weights = np.concatenate(
@@ -692,10 +649,13 @@ def _random_rank_peak_bound(samples, probability, before, totals):
     mean, variance_sum, reachable, random_counts = np.split(
         samples @ weights, 4, axis=1
     )
-    # Any EP rank can be a source, and sources can share a generator state.
-    # Cauchy-Schwarz bounds the variance of their sum by K times the sum of
-    # their variances, using independent draws only within each source.
-    source_ranks = probability.shape[1]
+    # Sources can share a generator state. With K active sources,
+    # Cauchy-Schwarz bounds the combined variance by K times their sum.
+    source_ranks = (
+        np.maximum(active_sources, 1)[:, None]
+        if active_sources is not None
+        else np.full((len(totals), 1), probability.shape[1])
+    )
     if not _random_window_tail_is_safe(
         before, totals, mean, variance_sum, reachable, random_counts, source_ranks
     ):
@@ -738,7 +698,7 @@ def _random_window_tail_is_safe(
     # Apply Hölder to the K source moment-generating functions before using
     # Bernstein and Hoeffding within each source. The exponents lose a factor
     # of K, so sources may be arbitrarily correlated (including identical draws).
-    squared_gap = gap**2 / source_ranks
+    squared_gap = gap**2 / np.broadcast_to(source_ranks[active], mean.shape)[possible]
     bernstein = squared_gap / (2 * (variance_sum[active][possible] + gap / 3))
     hoeffding = 2 * squared_gap / random_counts[possible]
     risk[possible] = np.exp(-np.maximum(bernstein, hoeffding))
@@ -774,6 +734,7 @@ def _a2a_migration_gain(
     sources,
     *,
     score_locality=True,
+    active_sources=None,
 ):
     ranks = slots.shape[1] // local_experts
     slot_ranks = np.arange(len(live)) // local_experts
@@ -804,7 +765,9 @@ def _a2a_migration_gain(
             )
     else:
         probability = _replica_rank_probabilities(inverse, ranks, local_experts)
-        peak = _random_rank_peak_bound(samples, probability, before, totals)
+        peak = _random_rank_peak_bound(
+            samples, probability, before, totals, active_sources
+        )
         if peak is None:
             return 0.0
         if compare_nodes:

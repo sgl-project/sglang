@@ -236,6 +236,12 @@ class _PlacementRows(NamedTuple):
     local_dispatch: torch.Tensor | None
 
 
+def _populated_replica_width(logical: torch.Tensor) -> int:
+    # Keep any holes in the table and trim only columns that are all padding.
+    occupied = (logical != -1).any(dim=(0, 1)).nonzero()
+    return int(occupied[-1, 0]) + 1 if occupied.numel() else 0
+
+
 def _broadcast_placement(
     placement: MigrationPlacement | None,
     error: str | None,
@@ -261,10 +267,12 @@ def _broadcast_placement(
                 ):
                     raise ValueError("EPLB placement changed the routing geometry")
                 ids = torch.tensor(changed, dtype=torch.int64, device="cpu")
+                logical_rows = logical.index_select(0, ids)
+                width = _populated_replica_width(logical_rows)
                 fields = [
                     ids,
                     physical.index_select(0, ids),
-                    logical.index_select(0, ids),
+                    logical_rows[..., :width],
                 ]
                 if dispatch is not None:
                     if dispatch.shape != (
@@ -417,13 +425,13 @@ class NpuEplbRuntime:
             if (table := getattr(metadata, name)) is not None
         }
         # A loaded placement can have holes before the last populated slot.
-        live = metadata.logical_to_all_physical_map_cpu
-        occupied = (live != -1).any(dim=(0, 1)).nonzero()
-        self._replica_width = int(occupied[-1, 0]) + 1 if occupied.numel() else 0
+        self._replica_width = _populated_replica_width(
+            metadata.logical_to_all_physical_map_cpu
+        )
         # An initial mapping may expose only nearby replicas on this rank.
         # Startup takes the union across ranks; install clears one layer at a time.
         self.narrowed_replica_layers: set[int] = set()
-        if spec.physical_count_mode == "random":
+        if spec.dispatch_mode == "random":
             visible_slots = (self._replica_map >= 0).sum(dim=(1, 2))
             narrowed = (visible_slots < spec.physical_experts).nonzero().flatten()
             self.narrowed_replica_layers.update(narrowed.tolist())
@@ -444,7 +452,7 @@ class NpuEplbRuntime:
             :, :, : self._replica_width
         ]
 
-    def planner(self, counts, sources=None):
+    def planner(self, counts, sources=None, active_sources=None):
         self.stage_seconds = self.install_enqueue_seconds = 0.0
         self.interleaved_layers = 0
         self._owner_stream = self.device_module.current_stream()
@@ -457,7 +465,7 @@ class NpuEplbRuntime:
                 event_error = str(error)
 
         def compute():
-            nonlocal counts, sources
+            nonlocal counts, sources, active_sources
             error = event_error
             placement = None
             if self.rank == 0 and error is None:
@@ -468,7 +476,12 @@ class NpuEplbRuntime:
                         if sources is not None
                         else None
                     )
-                    counts = sources = None
+                    host_active_sources = (
+                        self._copy_counts_to_host(active_sources)
+                        if active_sources is not None
+                        else None
+                    )
+                    counts = sources = active_sources = None
                     if host_counts.any().item():
                         placement = plan_migration(
                             host_counts,
@@ -476,13 +489,10 @@ class NpuEplbRuntime:
                             self.spec,
                             self.ranks_per_node,
                             self.layer_ids,
+                            num_logical_experts=self.metadata.num_logical_experts,
                             source_totals=host_sources,
+                            active_sources=host_active_sources,
                             narrowed_layers=self.narrowed_replica_layers,
-                            current_replicas=(
-                                self._replica_map
-                                if self.spec.physical_count_mode is not None
-                                else None
-                            ),
                         )
                 except Exception as exc:
                     error = str(exc)
@@ -699,14 +709,9 @@ def _make_planning_spec(model_config, metadata, moe, nodes, *, decode_worker):
     algorithm = compute_algorithm(moe.eplb_algorithm, groups, nodes)
     if algorithm.name.startswith("elasticity"):
         raise ValueError("Async EPLB requires a non-elastic CPU placement algorithm")
-    physical_count_mode = None
+    dispatch_mode = "unique"
     if metadata.num_physical_experts > metadata.num_logical_experts:
-        if moe.ep_dispatch_algorithm == "static":
-            physical_count_mode = "static"
-        else:
-            physical_count_mode = "row" if moe.moe_a2a_backend == "none" else "random"
-    elif nodes > 1 and moe.moe_a2a_backend != "none":
-        physical_count_mode = "unique"
+        dispatch_mode = "static" if moe.ep_dispatch_algorithm == "static" else "random"
     # AllGather moves the same rows regardless of expert placement. A unified
     # recorder window can include both AllGather prefill and routed decode.
     score_locality = True
@@ -720,7 +725,7 @@ def _make_planning_spec(model_config, metadata, moe, nodes, *, decode_worker):
         groups=groups,
         nodes=nodes,
         algorithm=algorithm,
-        physical_count_mode=physical_count_mode,
+        dispatch_mode=dispatch_mode,
         score_locality=score_locality,
     )
 
