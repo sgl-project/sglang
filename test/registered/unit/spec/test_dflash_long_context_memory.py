@@ -267,6 +267,7 @@ def test_build_speculative_verify_target_probs_reuses_scaled_logits_without_muta
         top_ps=torch.tensor([0.9, 0.85], dtype=torch.float32),
         need_top_k_sampling=True,
         need_top_p_sampling=True,
+        need_min_p_sampling=False,
         sampling_seed=123,
     )
 
