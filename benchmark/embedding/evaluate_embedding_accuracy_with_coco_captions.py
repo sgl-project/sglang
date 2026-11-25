@@ -128,11 +128,39 @@ class RemoteEmbeddingClient:
         )
 
 
+def canonical_service_url(url: str) -> str:
+    """Canonicalize an endpoint base URL (lowercase scheme/hostname, strip trailing '/')."""
+    import urllib.parse
+
+    raw = str(url).strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw
+    hostname = (parsed.hostname or "").lower()
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username is not None:
+        userinfo = parsed.username
+        if parsed.password is not None:
+            userinfo = f"{userinfo}:{parsed.password}"
+        netloc = f"{userinfo}@{netloc}"
+    path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit(
+        (parsed.scheme.lower(), netloc, path, parsed.query, parsed.fragment)
+    )
+
+
 def build_service_url(args: argparse.Namespace) -> str:
     """Resolve service URL from --service-url or --host/--port."""
-    if args.service_url != DEFAULT_SERVICE_URL:
-        return str(args.service_url).rstrip("/")
-    return f"{args.host.rstrip('/')}:{args.port}"
+    raw_service_url = getattr(args, "service_url", DEFAULT_SERVICE_URL)
+    host = getattr(args, "host", DEFAULT_HOST)
+    port = getattr(args, "port", DEFAULT_PORT)
+    if raw_service_url is not None and str(raw_service_url) != DEFAULT_SERVICE_URL:
+        return canonical_service_url(str(raw_service_url))
+    return canonical_service_url(f"{str(host).rstrip('/')}:{port}")
 
 
 def parse_embedding_response(
@@ -650,7 +678,7 @@ def make_image_inputs(
     return inputs
 
 
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 
 def _sha256_json(value: Any) -> str:
@@ -674,6 +702,7 @@ def _sha256_file(path: str) -> str:
 def build_cache_metadata(
     args: argparse.Namespace, data: CocoEvalData
 ) -> dict[str, Any]:
+    service_url = build_service_url(args)
     resolved_image_paths = [str(Path(p).resolve()) for p in data.image_paths]
     image_digests: list[str] = []
     for p in resolved_image_paths:
@@ -685,6 +714,8 @@ def build_cache_metadata(
     return {
         "schema_version": CACHE_SCHEMA_VERSION,
         "embeddings_are_raw": True,
+        "service_url": service_url,
+        "endpoint": f"{service_url}/v1/embeddings",
         "model": args.model,
         "split": getattr(args, "split", None),
         "query_prompt": args.query_prompt,
@@ -1242,6 +1273,9 @@ def run_self_test() -> None:
             image_to_caption_indices=[[0, 1], [2]],
         )
         base_args = argparse.Namespace(
+            service_url=DEFAULT_SERVICE_URL,
+            host="http://127.0.0.1",
+            port=30000,
             model="model-a",
             split="val2017",
             query_prompt="q-prefix",
@@ -1304,8 +1338,27 @@ def run_self_test() -> None:
             altered_captions_data,
         )
 
-        # Mismatched model, prompts, split, or transport must fail validation.
+        # Equivalent endpoint representations (e.g. --service-url with trailing
+        # slash/uppercase host vs matching --host/--port) must reuse the cache.
+        equiv_url_args = argparse.Namespace(
+            **{
+                **vars(base_args),
+                "service_url": "HTTP://127.0.0.1:30000/",
+            }
+        )
+        _, equiv_t, equiv_i = load_or_compute_embeddings(equiv_url_args, base_data)
+        assert np.allclose(equiv_t, raw_text)
+        assert np.allclose(equiv_i, raw_image)
+
+        # Cross-endpoint reuse (same model/inputs, different --service-url, --host,
+        # or --port) as well as mismatched model, prompts, split, or transport
+        # must fail validation instead of attributing cached vectors to another server.
         for override in [
+            {"service_url": "http://127.0.0.1:30001"},
+            {"service_url": "http://10.0.0.2:30000"},
+            {"host": "http://localhost"},
+            {"host": "http://10.0.0.2"},
+            {"port": 30001},
             {"model": "model-b"},
             {"query_prompt": "different-q-prefix"},
             {"query_prompt": None},
