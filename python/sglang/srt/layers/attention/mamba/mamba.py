@@ -751,11 +751,16 @@ class MambaMixer2(torch.nn.Module):
                     if is_cpu() or not use_triton_causal_conv
                     else causal_conv1d_update_triton
                 )
+            conv_bias = self.conv1d.bias
+            if is_cpu() and conv_bias is not None and conv_bias.dtype != x.dtype:
+                # CPU kernel needs bias dtype == input dtype; cast a local copy
+                # instead of mutating the parameter. Bias stays optional.
+                conv_bias = conv_bias.to(dtype=x.dtype)
                 hidden_states_B_C_d = ccu(
                     hidden_states_B_C_d,
                     conv_state,
                     conv_weights,
-                    self.conv1d.bias,
+                    conv_bias,
                     self.activation,
                     conv_state_indices=state_indices_tensor_d,
                 )
