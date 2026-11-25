@@ -123,6 +123,12 @@ class AllReduceConfig(NamedTuple):
       - ``num_mc_blocks``  : mc 2shot_pull; ``None`` disables multicast
       - ``num_ring_simple_channels``: ring_simple and hier_ring_simple grid,
                              one channel (ring) per block
+
+    ``default_max_size`` raises the workspace cap (``max_size``) to what the
+    table needs when neither the caller nor
+    ``SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB`` sets it; 0 keeps the default.
+    ``ring_simple_buffer_size`` is the ring_simple FIFO bytes per channel when
+    the caller doesn't pass one; 0 keeps ``RING_SIMPLE_BUFFER_SIZE``.
     """
 
     graph: Heuristic
@@ -131,6 +137,8 @@ class AllReduceConfig(NamedTuple):
     num_pull_blocks: int
     num_mc_blocks: Optional[int]
     num_ring_simple_channels: int = 0
+    default_max_size: int = 0
+    ring_simple_buffer_size: int = 0
 
     def max_push_bytes(self, world_size: int) -> int:
         return max(
@@ -364,7 +372,7 @@ def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
 # decode throughput. Pull stays off: it lost at every measured size.
 @cache
 def _rocm_gfx1250_configs(
-    num_sm: int, dev_kernarg: bool = False
+    num_sm: int, dev_kernarg: bool = False, spx: bool = False
 ) -> dict[int, AllReduceConfig]:
     def config(
         one_shot: int, two_shot_push: int, hier_ring_from: int = 0
@@ -461,18 +469,44 @@ def _rocm_gfx1250_configs(
         # max_size caps hier at 32 MB.
         tp16 = tp16._replace(hier_ring_simple=Range(32 * MB + 16, 4 * 1024 * MB))
     configs[16] = configs[8]._replace(graph=tp16, eager=tp16, num_push_blocks=num_sm)
+    if spx and dev_kernarg:
+        # SPX (a whole accelerator per rank), tuned at TP2/TP4: a push block
+        # per CU, as many as the device reports (num_sm); 1shot_push beats
+        # RCCL to 6 MB at TP2 and 2 MB at TP4; 2shot_push beats ring_simple to
+        # 96 MB at TP2 and 160 MB at TP4, where ring_simple loses to RCCL at
+        # 80-112 MB. 2shot push workspace is 4x its top size per rank; a 2 MB
+        # ring FIFO per channel (one channel per CU) is as fast as 4 MB and
+        # halves the ring's workspace.
+        def spx_row(world_size: int, one_shot: int, two_shot: int) -> AllReduceConfig:
+            heuristic = Heuristic(
+                one_shot,
+                0,
+                0,
+                two_shot_push_threshold=two_shot,
+                ring_simple=Range(two_shot + 16, 4 * 1024 * MB),
+            )
+            return configs[world_size]._replace(
+                graph=heuristic,
+                eager=heuristic,
+                num_push_blocks=num_sm,
+                default_max_size=two_shot_push_slot_bytes(two_shot, world_size),
+                ring_simple_buffer_size=2 * MB,
+            )
+
+        configs[2] = spx_row(2, 6 * MB, 96 * MB)
+        configs[4] = spx_row(4, 2 * MB, 160 * MB)
     return configs
 
 
 @cache
-def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
+def _get_all_reduce_configs(spx: bool = False) -> dict[int, AllReduceConfig]:
     props = torch.cuda.get_device_properties()
     num_sm = props.multi_processor_count
     if torch.version.hip:
         # ROCm reports gfx9xx as capability 9.x: never fall into the SM90 table
         if props.gcnArchName.startswith("gfx1250"):
             dev_kernarg = os.environ.get("HIP_FORCE_DEV_KERNARG") == "1"
-            return _rocm_gfx1250_configs(num_sm, dev_kernarg)
+            return _rocm_gfx1250_configs(num_sm, dev_kernarg, spx)
         return _rocm_configs(num_sm)
     cuda_major, cuda_minor = torch.cuda.get_device_capability()
     if cuda_major == 9:
@@ -498,10 +532,11 @@ def get_supported_world_sizes() -> tuple[int, ...]:
 
 
 @cache
-def get_all_reduce_config(world_size: int) -> AllReduceConfig:
+def get_all_reduce_config(world_size: int, spx: bool = False) -> AllReduceConfig:
     """Tuned thresholds and block counts for the current arch / world size.
 
     Only SM90, SM100 and SM107 are benchmarked so far; other archs get a
-    conservative default (1 MB one-shot crossovers, no multicast).
+    conservative default (1 MB one-shot crossovers, no multicast). ``spx``
+    (ROCm gfx1250: every rank is a whole accelerator) picks the SPX rows.
     """
-    return _get_all_reduce_configs()[world_size]
+    return _get_all_reduce_configs(spx)[world_size]

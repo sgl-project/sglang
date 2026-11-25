@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -7,19 +8,17 @@ import subprocess
 import threading
 import time
 from functools import wraps
-from types import SimpleNamespace
-from typing import Iterable, Union
+from typing import Iterable, Optional, Union
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     SGL_ROUTER_REQUEST_TIMEOUT_SECS,
     find_sgl_router_binary,
     sgl_router_command,
 )
-from sglang.test.test_utils import CustomTestCase, popen_launch_server
+from sglang.test.test_utils import popen_launch_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,8 +47,10 @@ BOOTSTRAP_INIT_PORT = 8995
 # Timeouts and delays
 ROUTER_CONFIGMAP_TIMEOUT = 300
 PD_WORKER_READY_TIMEOUT = 600
+MOONCAKE_MASTER_READY_TIMEOUT = 300
 SERVER_INITIALIZATION_DELAY = 30
 SERVICE_EXIT_WAIT_SECONDS = 120
+NODE_EXIT_WAIT_SECONDS = 60
 
 
 def get_nic_name():
@@ -344,6 +345,67 @@ def check_port_availability(host, port, timeout=3):
         return False
 
 
+def _resolve_mooncake_master_address(args_list, default_address):
+    """Return the master address the server launched with ``args_list`` uses.
+
+    ``--hicache-storage-backend-extra-config`` wins over the ``MOONCAKE_MASTER``
+    environment variable, so its ``master_server_address`` is the endpoint to
+    poll when the case passes one; otherwise fall back to the environment form.
+
+    Args:
+        args_list (list): Server launch args.
+        default_address (str): Address set through ``MOONCAKE_MASTER``.
+
+    Returns:
+        str: ``<host>:<port>`` of the Mooncake master.
+    """
+    from sglang.test.ascend.test_ascend_utils import get_server_args_value
+
+    extra_config = get_server_args_value(
+        args_list, "--hicache-storage-backend-extra-config"
+    )
+    if extra_config:
+        try:
+            address = json.loads(extra_config).get("master_server_address")
+        except (json.JSONDecodeError, TypeError):
+            address = None
+        if address:
+            return address
+    return default_address
+
+
+def wait_for_mooncake_master(
+    address, timeout=MOONCAKE_MASTER_READY_TIMEOUT, poll_interval=2
+):
+    """Wait until the Mooncake master at ``address`` accepts connections.
+
+    Only the node that starts the master waits for its port locally (see
+    ``maybe_start_hicache_storage_service``). The other nodes of a multi-node
+    instance launch concurrently and can reach the store setup before the
+    master is listening; the store does not retry, so they wait here first.
+
+    Args:
+        address (str): ``<host>:<port>`` of the master.
+        timeout (int): Total timeout in seconds.
+        poll_interval (int): Interval between connection attempts.
+
+    Raises:
+        RuntimeError: If the master does not open its port within ``timeout``.
+    """
+    host, _, port = address.rpartition(":")
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if check_port_availability(host, int(port)):
+            logger.info(f"Mooncake master {address} is ready")
+            return
+        logger.info(f"Mooncake master {address} is not ready yet, waiting ...")
+        time.sleep(poll_interval)
+
+    raise RuntimeError(
+        f"Mooncake master {address} did not open its port within {timeout}s"
+    )
+
+
 def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15):
     """Wait for all nodes' ports to be ready.
 
@@ -390,7 +452,11 @@ def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15
 
 
 def wait_for_pd_worker_roles(
-    expected_roles, port, timeout=PD_WORKER_READY_TIMEOUT, check_interval=5
+    expected_roles,
+    port,
+    timeout=PD_WORKER_READY_TIMEOUT,
+    check_interval=5,
+    report_interval=30,
 ):
     """Wait until every PD worker is serving and reports its own role.
 
@@ -415,11 +481,16 @@ def wait_for_pd_worker_roles(
     Requiring `/health` == 200 before reading `/server_info` removes both
     races before the router is launched.
 
+    The last `/server_info` snapshot of every pending worker is also logged
+    every ``report_interval`` seconds, so a worker that is wedged during warmup
+    leaves a trail in the router log instead of only the final timeout.
+
     Args:
         expected_roles (dict): {pod_ip: "prefill" | "decode"}.
         port (int): Worker HTTP port.
         timeout (int): Total timeout in seconds.
         check_interval (int): Interval between checks in seconds.
+        report_interval (int): Interval between state snapshots in seconds.
 
     Raises:
         RuntimeError: If a worker never becomes healthy or never reports the
@@ -428,6 +499,7 @@ def wait_for_pd_worker_roles(
     start_time = time.time()
     pending = dict(expected_roles)
     last_seen = {}
+    next_report = start_time + report_interval
 
     while time.time() - start_time < timeout:
         for ip, role in list(pending.items()):
@@ -452,7 +524,12 @@ def wait_for_pd_worker_roles(
 
             mode = info.get("disaggregation_mode")
             bootstrap_port = info.get("disaggregation_bootstrap_port")
-            last_seen[ip] = f"disaggregation_mode={mode!r}"
+            # A responsive worker answers with one internal state per DP rank,
+            # so the count shows whether the scheduler behind it is alive.
+            last_seen[ip] = (
+                f"disaggregation_mode={mode!r} bootstrap_port={bootstrap_port!r} "
+                f"dp_ranks={len(info.get('internal_states') or [])}"
+            )
             if mode != role:
                 continue
             if mode == "prefill" and not bootstrap_port:
@@ -468,6 +545,14 @@ def wait_for_pd_worker_roles(
             logger.info(f"All {len(expected_roles)} PD workers report their role")
             return
 
+        now = time.time()
+        if now >= next_report:
+            logger.info(
+                f"PD worker roles pending after {now - start_time:.0f}s: "
+                f"{ {ip: _sample_worker_server_info(ip, port) for ip in pending} }"
+            )
+            next_report = now + report_interval
+
         time.sleep(check_interval)
 
     raise RuntimeError(
@@ -476,22 +561,29 @@ def wait_for_pd_worker_roles(
     )
 
 
-def _get_arg_value(args_list, name):
-    for i, arg in enumerate(args_list):
-        # Args are not always strings: launcher-injected values (ports,
-        # sizes) are ints and must not be probed for a "--key=value" prefix.
-        if not isinstance(arg, str):
-            continue
-        if arg == name and i + 1 < len(args_list):
-            return args_list[i + 1]
-        # Also accept the --key=value form.
-        if arg.startswith(f"{name}="):
-            return arg[len(name) + 1 :]
-    return None
+def _sample_worker_server_info(ip, port, timeout=5):
+    """One-line `/server_info` snapshot of a worker that is still pending.
+
+    The readiness wait may short-circuit on a 503 `/health`, which says nothing
+    about whether the scheduler behind the tokenizer is alive. Probing
+    `/server_info` directly (it carries one internal state per DP rank) tells
+    a wedged worker (request times out) from a busy one (it answers).
+    """
+    try:
+        info = requests.get(f"http://{ip}:{port}/server_info", timeout=timeout).json()
+    except Exception as e:
+        return f"server_info failed: {e}"
+    return (
+        f"disaggregation_mode={info.get('disaggregation_mode')!r} "
+        f"bootstrap_port={info.get('disaggregation_bootstrap_port')!r} "
+        f"dp_ranks={len(info.get('internal_states') or [])}"
+    )
 
 
 def _get_nnodes_from_args(args_list):
-    nnodes = _get_arg_value(args_list, "--nnodes")
+    from sglang.test.ascend.test_ascend_utils import get_server_args_value
+
+    nnodes = get_server_args_value(args_list, "--nnodes")
     return int(nnodes) if nnodes is not None else None
 
 
@@ -515,6 +607,118 @@ def _get_pod_ip_by_keyword(configmap_data, keyword):
         if keyword in pod_name:
             return pod_ip
     return None
+
+
+# Pod name suffixes of the node that runs the HiCache L3 storage service
+# (Ascend MemCache MetaService or Mooncake master), checked in order. PD
+# separation uses the first prefill pod, PD mix uses the master node.
+STORAGE_SERVICE_NODE_SUFFIXES = ("prefill-0", "sglang-node-0")
+
+
+def _get_storage_service_node_ip(timeout: int = LOCAL_TIMEOUT, poll_interval: int = 15):
+    """Get the IP of the node that hosts the HiCache L3 storage service.
+
+    The service always runs on the first prefill node:
+    - single-machine run: the local node itself;
+    - multi-node PD mix: the master node (``*-sglang-node-0``);
+    - multi-node PD separation: the first prefill node (``*-prefill-0``).
+
+    Args:
+        timeout (int): Total timeout in seconds.
+        poll_interval (int): Interval between checks in seconds.
+
+    Returns:
+        str: IP of the node that hosts the storage service.
+
+    Raises:
+        RuntimeError: If the node entry is not published in time.
+    """
+    if not (CONFIGMAP_NAME and NAMESPACE):
+        # Single-machine run: the service binds the local pod IP.
+        from sglang.test.ascend.test_ascend_utils import resolve_local_ip
+
+        node_ip = resolve_local_ip()
+        logger.info(f"Single-machine run, HiCache storage service IP: {node_ip}")
+        return node_ip
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
+        if configmap and configmap.data:
+            for suffix in STORAGE_SERVICE_NODE_SUFFIXES:
+                node_ip = _get_pod_ip_by_keyword(configmap.data, suffix)
+                if node_ip:
+                    logger.info(f"HiCache storage service IP ({suffix}): {node_ip}")
+                    return node_ip
+        logger.info(
+            "The HiCache storage service node is not published in ConfigMap yet, "
+            "waiting ..."
+        )
+        time.sleep(poll_interval)
+
+    raise RuntimeError(
+        f"Failed to get the HiCache storage service IP "
+        f"({', '.join(STORAGE_SERVICE_NODE_SUFFIXES)}) "
+        f"from ConfigMap within {timeout}s"
+    )
+
+
+def get_memcache_meta_service_url(
+    port: Optional[int] = None,
+    timeout: int = LOCAL_TIMEOUT,
+    poll_interval: int = 15,
+):
+    """Get the URL of a memcache meta service endpoint.
+
+    The host is the node that runs the storage service (see
+    ``_get_storage_service_node_ip``). The port is owned by the common helpers:
+    it defaults to ``MEMCACHE_META_SERVICE_PORT``, and callers pass
+    ``MEMCACHE_CONFIG_STORE_PORT`` for the config store endpoint, so the ports
+    stay in one place instead of being hardcoded in each test case.
+
+    Args:
+        port (int): Endpoint port. Defaults to the meta service port.
+        timeout (int): Total timeout when resolving the host IP.
+        poll_interval (int): Interval between host IP checks.
+
+    Returns:
+        str: ``tcp://<host ip>:<port>``.
+    """
+    if port is None:
+        from sglang.test.ascend.test_ascend_utils import MEMCACHE_META_SERVICE_PORT
+
+        port = MEMCACHE_META_SERVICE_PORT
+    host_ip = _get_storage_service_node_ip(timeout=timeout, poll_interval=poll_interval)
+    return f"tcp://{host_ip}:{port}"
+
+
+def get_mooncake_master_server_address(
+    port: Optional[int] = None,
+    timeout: int = LOCAL_TIMEOUT,
+    poll_interval: int = 15,
+):
+    """Get the ``<host>:<port>`` address of the Mooncake master.
+
+    The host is the node that runs the storage service (see
+    ``_get_storage_service_node_ip``), i.e. the first prefill pod rather than
+    whichever pod asks. This is the value for ``master_server_address`` in the
+    ``--hicache-storage-backend-extra-config`` JSON.
+
+    Args:
+        port (int): Master port. Defaults to ``MOONCAKE_MASTER_PORT`` so it
+            stays in step with the master launch helper.
+        timeout (int): Total timeout when resolving the host IP.
+        poll_interval (int): Interval between host IP checks.
+
+    Returns:
+        str: ``<host ip>:<port>``.
+    """
+    if port is None:
+        from sglang.test.ascend.test_ascend_utils import MOONCAKE_MASTER_PORT
+
+        port = MOONCAKE_MASTER_PORT
+    host_ip = _get_storage_service_node_ip(timeout=timeout, poll_interval=poll_interval)
+    return f"{host_ip}:{port}"
 
 
 def check_role(allowed_roles: Union[str, Iterable[str]]):
@@ -602,6 +806,24 @@ def launch_pd_mix_node(model_config):
         logger.info(f"ENV_VAR_CASE {key}:{value}")
         os.environ[key] = value
 
+    from sglang.test.ascend.test_ascend_utils import (
+        HICACHE_STORAGE_BACKEND_ARG,
+        get_server_args_value,
+        resolve_local_ip,
+        set_mooncake_master_env,
+    )
+
+    if get_server_args_value(other_args, HICACHE_STORAGE_BACKEND_ARG) == "mooncake":
+        master_address = set_mooncake_master_env(master_node_ip)
+        # Each node registers its own address with the store instead of the
+        # shared "localhost" default, which other nodes cannot reach.
+        os.environ.setdefault("MOONCAKE_LOCAL_HOSTNAME", resolve_local_ip())
+        # Nodes other than the one hosting the master start concurrently with
+        # it and would otherwise race its listen port.
+        wait_for_mooncake_master(
+            _resolve_mooncake_master_address(other_args, master_address)
+        )
+
     host_ip = get_host_ip()
     logger.info(f"Starting node, {host_ip=} {other_args=}")
     try:
@@ -617,6 +839,123 @@ def launch_pd_mix_node(model_config):
         raise RuntimeError(f"Failed to start node on {host_ip}: {e}")
 
     return process
+
+
+def launch_pd_mix_master_node_ready(model_config, base_url, initialization_delay):
+    """Launch the pd mix master node and block until its /health answers.
+
+    The health poll runs in 60 s slices so a launcher that raised fails the pod
+    early instead of polling until timeout. Liveness is checked only after a
+    failed probe, because a successful launch ends the launcher thread as soon
+    as the node turns healthy.
+    """
+    sglang_thread = threading.Thread(
+        target=launch_pd_mix_node, args=(model_config,), daemon=True
+    )
+    sglang_thread.start()
+
+    while True:
+        try:
+            wait_server_ready(f"{base_url}/health", timeout=60)
+            break
+        except RuntimeError:
+            if not sglang_thread.is_alive():
+                raise RuntimeError(
+                    "sglang launch thread exited before the server became ready; "
+                    "check the server logs for the first rank that died"
+                ) from None
+
+    logger.info(f"Wait {initialization_delay}s, starting run benchmark ......")
+    time.sleep(initialization_delay)
+
+
+def launch_pd_mix_node_keep_alive(model_config, keep_alive_time, role, host):
+    """Launch a pd mix node in a background thread and hold this process alive.
+
+    A worker blocks until ``keep_alive_time`` elapses, or returns as soon as the
+    launch failed so the pod fails fast instead of sleeping out the window.
+    """
+    launch_error = threading.Event()
+
+    def _launch():
+        try:
+            launch_pd_mix_node(model_config)
+        except BaseException:
+            launch_error.set()
+            raise
+
+    sglang_thread = threading.Thread(target=_launch, daemon=True)
+    sglang_thread.start()
+
+    logger.info(
+        f"{role} node is launching in the background; keeping this process alive "
+        f"for up to {keep_alive_time} seconds"
+    )
+    if launch_error.wait(keep_alive_time):
+        raise RuntimeError(
+            f"Failed to start node on {host}; see the launcher traceback above"
+        )
+
+
+def kill_storage_service_process(test_cls):
+    """Kill the hicache storage service started for ``test_cls``, if any."""
+    storage_service_process = getattr(test_cls, "storage_service_process", None)
+    if not storage_service_process:
+        return
+    try:
+        kill_process_tree(storage_service_process.pid)
+    except Exception as e:
+        logger.error(f"Error during storage service teardown: {e}")
+
+
+class PdMixNodeMixin:
+    """Role-aware startup shared by multi-node pd-mix test classes.
+
+    Subclasses must define ``model_config``, ``initialization_delay`` (seconds
+    to wait after the master turns healthy) and ``keep_alive_time`` (seconds a
+    worker holds its pod). Subclasses that need to adjust class-level config
+    first should override ``setUpClass`` and call ``super().setUpClass()``.
+    """
+
+    model_config = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.local_ip = "127.0.0.1"
+        cls.host = os.getenv("POD_IP")
+        cls.port = SERVICE_PORT
+        cls.base_url = f"http://{cls.host}:{cls.port}"
+        cls.hostname = os.getenv("HOSTNAME")
+        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
+        logger.info(f"Init {cls.host} {cls.role=}!")
+
+        cls.start_pd_mix_master_node()
+        cls.start_pd_mix_worker_node()
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_storage_service_process(cls)
+
+    @classmethod
+    @check_role(allowed_roles=["master"])
+    def start_pd_mix_master_node(cls):
+        from sglang.test.ascend.test_ascend_utils import (
+            maybe_start_hicache_storage_service,
+        )
+
+        cls.storage_service_process = maybe_start_hicache_storage_service(
+            cls.model_config.get("other_args")
+        )
+        launch_pd_mix_master_node_ready(
+            cls.model_config, cls.base_url, cls.initialization_delay
+        )
+
+    @classmethod
+    @check_role(allowed_roles=["worker"])
+    def start_pd_mix_worker_node(cls):
+        launch_pd_mix_node_keep_alive(
+            cls.model_config, cls.keep_alive_time, cls.role, cls.host
+        )
 
 
 # Launch prefill/decode separation node
@@ -683,7 +1022,11 @@ def launch_pd_separation_node(model_config):
         if role == "prefill"
         else model_config["decode_args"]
     )
-    transfer_backend = _get_arg_value(role_args, "--disaggregation-transfer-backend")
+    from sglang.test.ascend.test_ascend_utils import get_server_args_value
+
+    transfer_backend = get_server_args_value(
+        role_args, "--disaggregation-transfer-backend"
+    )
     if transfer_backend in (None, "ascend"):
         mf_addr = f"tcp://{master_prefill_ip}:24666"
         os.environ["ASCEND_MF_STORE_URL"] = mf_addr
@@ -808,6 +1151,24 @@ def launch_pd_separation_node(model_config):
 
     other_args.extend(service_args)
 
+    from sglang.test.ascend.test_ascend_utils import (
+        HICACHE_STORAGE_BACKEND_ARG,
+        get_server_args_value,
+        resolve_local_ip,
+        set_mooncake_master_env,
+    )
+
+    if get_server_args_value(service_args, HICACHE_STORAGE_BACKEND_ARG) == "mooncake":
+        master_address = set_mooncake_master_env(master_prefill_ip)
+        # Each node registers its own address with the store instead of the
+        # shared "localhost" default, which other nodes cannot reach.
+        os.environ.setdefault("MOONCAKE_LOCAL_HOSTNAME", resolve_local_ip())
+        # Nodes other than the one hosting the master start concurrently with
+        # it and would otherwise race its listen port.
+        wait_for_mooncake_master(
+            _resolve_mooncake_master_address(service_args, master_address)
+        )
+
     try:
         process = popen_launch_server(
             model_config["model_path"],
@@ -819,6 +1180,100 @@ def launch_pd_separation_node(model_config):
         raise RuntimeError(f"Failed to start {role} node on {host_ip}: {e}")
 
     return process
+
+
+class PdSepNodeMixin:
+    """Role-aware startup shared by multi-node PD-separation test classes.
+
+    Subclasses must define ``model_config`` and ``initialization_delay``.
+    Subclasses that need to adjust class-level config first should override
+    ``setUpClass`` and call ``super().setUpClass()``. The router
+    records the running class in the ConfigMap so the previous class's
+    prefill/decode pods exit their wait and free the NPUs.
+    """
+
+    model_config = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.process = None
+        cls.local_ip = "127.0.0.1"
+        cls.host = os.getenv("POD_IP")
+        cls.port = SERVICE_PORT
+        cls.base_url = f"http://{cls.host}:{cls.port}"
+        cls.hostname = os.getenv("HOSTNAME")
+        cls.role = (
+            "router"
+            if "router" in cls.hostname
+            else "prefill"
+            if "prefill" in cls.hostname
+            else "decode"
+        )
+        logger.info(f"Init {cls.host} {cls.role=}!")
+
+        cls.start_pd_server()
+        cls.start_router_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process:
+            try:
+                kill_process_tree(cls.process.pid)
+                for _ in range(NODE_EXIT_WAIT_SECONDS):
+                    if cls.process.poll() is not None:
+                        logger.info("Process fully exited")
+                        break
+                    time.sleep(1)
+                else:
+                    logger.warning("Process did NOT exit in time")
+            except Exception as e:
+                logger.error(f"Error during tearDown: {e}")
+        kill_storage_service_process(cls)
+
+    @classmethod
+    @check_role(allowed_roles=["router"])
+    def start_router_server(cls):
+        wait_for_prefill_decode_exit(key=ACTIVE_TEST_CLASS, value=cls.__name__)
+        start_router_thread(cls.model_config, cls.base_url)
+
+        logger.info(
+            f"Waiting {cls.initialization_delay} seconds for the server to fully initialize..."
+        )
+        time.sleep(cls.initialization_delay)
+
+    @classmethod
+    @check_role(allowed_roles=["prefill", "decode"])
+    def start_pd_server(cls):
+        from sglang.test.ascend.test_ascend_utils import (
+            maybe_start_hicache_storage_service,
+        )
+
+        if cls.hostname.endswith("prefill-0"):
+            cls.storage_service_process = maybe_start_hicache_storage_service(
+                cls.model_config.get("prefill_args")
+            )
+        logger.info(f"Starting pd separation node...")
+        cls.process = launch_pd_separation_node(cls.model_config)
+        logger.info(f"Pd separation node started with PID: {cls.process.pid}")
+
+        while True:
+            if cls._another_class_started():
+                logger.info(f"[{cls.__name__}] exec completed, exiting waiter.")
+                return
+            if cls.process.poll() is not None:
+                exit_code = cls.process.poll()
+                raise Exception(
+                    f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
+                )
+            time.sleep(30)
+
+    @classmethod
+    def _another_class_started(cls):
+        configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
+        if not configmap or not configmap.data:
+            return False
+        executing_class = configmap.data.get(ACTIVE_TEST_CLASS)
+        return bool(executing_class) and executing_class != cls.__name__
 
 
 # Launch router node
@@ -949,11 +1404,17 @@ def start_router_thread(model_config, base_url):
     # prefill and decode workers to be registered.
     health_check_url = f"{base_url}/readiness"
     logger.info(f"Waiting for router to be ready at {health_check_url}")
-    wait_server_ready(health_check_url, process_holder=process_holder)
+    wait_server_ready(
+        health_check_url,
+        process_holder=process_holder,
+        launch_thread=router_thread,
+    )
     return router_thread
 
 
-def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
+def wait_server_ready(
+    url, timeout=LOCAL_TIMEOUT, process_holder=None, launch_thread=None
+):
     """Wait for the server to be ready.
 
     Args:
@@ -961,6 +1422,10 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
         timeout (int): Timeout in seconds.
         process_holder (list): Optional single-element list holding the router
             subprocess, so an early exit fails fast instead of polling.
+        launch_thread (threading.Thread): Optional thread running the launcher.
+            A launcher cannot outlive its thread, so a thread that exited
+            before the subprocess was created means the launcher raised (its
+            traceback is printed by the thread) — fail fast instead of polling.
 
     Raises:
         RuntimeError: If server fails to start within timeout.
@@ -974,6 +1439,15 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
             raise RuntimeError(
                 f"Router exited with code {process_holder[0].returncode} before "
                 f"serving {url}; check the router output above for the reason"
+            )
+        if (
+            launch_thread is not None
+            and not launch_thread.is_alive()
+            and not process_holder
+        ):
+            raise RuntimeError(
+                f"Server launcher exited before starting the server for {url}; "
+                "check the traceback printed by the launcher thread above"
             )
         try:
             response = requests.get(url, timeout=30)
@@ -994,211 +1468,6 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
                 f"Server {url} failed to start in {timeout}s (elapsed: {elapsed_time:.2f}s)"
             )
         time.sleep(check_interval)
-
-
-class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
-    model_config = None
-
-    @classmethod
-    def setUpClass(cls):
-        cls.process = None
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
-        logger.info(f"Init {cls.host} {cls.role=}!")
-        cls.sglang_thread = None
-        cls.stop_event = threading.Event()
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
-
-    @classmethod
-    @check_role(allowed_roles=["master"])
-    def launch_pd_mix_master_node(cls):
-        logger.info(f"Starting master node in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
-
-        logger.info(
-            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["worker"])
-    def launch_pd_mix_worker_node(cls):
-        logger.info(f"Starting master node in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-        keep_alive_time = 1800
-        logger.info(
-            f"{cls.role} node started, keeping test alive for {keep_alive_time} seconds"
-        )
-        time.sleep(keep_alive_time)
-
-    @classmethod
-    @check_role(allowed_roles=["master", "worker"])
-    def stop_sglang_thread(cls):
-        if cls.sglang_thread:
-            logger.info(f"Stopping sglang thread {cls.sglang_thread}")
-            if cls.sglang_thread.is_alive():
-                logger.info("Notifying stop event...")
-                cls.stop_event.set()
-                cls.sglang_thread.join(timeout=5)
-                if cls.sglang_thread.is_alive():
-                    logger.info(
-                        "Warning: subprocess is not terminated normally, it may has been already force stopped."
-                    )
-                else:
-                    logger.info("Subprocess has been Stopped.")
-        else:
-            logger.info("No running sglang thread.")
-
-    @check_role(allowed_roles=["master"])
-    def run_gsm8k_test(
-        self,
-        expect_accuracy,
-        num_shots=8,
-        data_path=None,
-        num_questions=200,
-        max_new_tokens=512,
-        parallel=128,
-    ):
-        args = SimpleNamespace(
-            num_shots=num_shots,
-            data_path=data_path,
-            num_questions=num_questions,
-            max_new_tokens=max_new_tokens,
-            parallel=parallel,
-            host=self.host,
-            port=self.port,
-        )
-        logger.info("Starting gsm8k test...")
-        metrics = run_eval_gsm8k(args)
-        self.assertGreaterEqual(
-            metrics["accuracy"],
-            expect_accuracy,
-            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
-        )
-
-
-class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
-    model_config = None
-
-    @classmethod
-    def setUpClass(cls):
-        cls.process = None
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = (
-            "router"
-            if "router" in cls.hostname
-            else "prefill"
-            if "prefill" in cls.hostname
-            else "decode"
-        )
-        logger.info(f"Init {cls.host} {cls.role=}!")
-        cls.sglang_thread = None
-        cls.stop_event = threading.Event()
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
-
-    @classmethod
-    @check_role(allowed_roles=["router"])
-    def start_router_server(cls):
-        cls.sglang_thread = start_router_thread(cls.model_config, cls.base_url)
-
-        logger.info(
-            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["prefill", "decode"])
-    def start_pd_server(cls):
-        logger.info(f"Starting pd separation node in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_pd_separation_node, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-        keep_alive_time = 1800
-        logger.info(
-            f"{cls.role} node started, keeping test alive for {keep_alive_time} seconds"
-        )
-        time.sleep(keep_alive_time)
-
-    @classmethod
-    @check_role(allowed_roles=["prefill", "decode", "router"])
-    def stop_sglang_thread(cls):
-        if cls.sglang_thread:
-            logger.info(f"Stopping sglang thread {cls.sglang_thread}")
-            if cls.sglang_thread.is_alive():
-                logger.info("Notifying stop event...")
-                cls.stop_event.set()
-                cls.sglang_thread.join(timeout=5)
-                if cls.sglang_thread.is_alive():
-                    logger.info(
-                        "Warning: subprocess is not terminated normally, it may has been already force stopped."
-                    )
-                else:
-                    logger.info("Subprocess has been Stopped.")
-        else:
-            logger.info("No running sglang thread.")
-
-    @check_role(allowed_roles=["router"])
-    def run_gsm8k_test(
-        self,
-        expect_accuracy,
-        num_shots=8,
-        data_path=None,
-        num_questions=200,
-        max_new_tokens=512,
-        parallel=128,
-    ):
-        args = SimpleNamespace(
-            num_shots=num_shots,
-            data_path=data_path,
-            num_questions=num_questions,
-            max_new_tokens=max_new_tokens,
-            parallel=parallel,
-            host=self.host,
-            port=self.port,
-        )
-        logger.info("Starting gsm8k test...")
-        metrics = run_eval_gsm8k(args)
-        self.assertGreaterEqual(
-            metrics["accuracy"],
-            expect_accuracy,
-            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
-        )
 
 
 def kill_process_group(process):
