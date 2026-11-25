@@ -64,6 +64,28 @@ def _interior_tile(
 
 
 @triton.jit
+def _bias_tile(
+    Bias,
+    token,
+    qh,
+    head_mask,
+    q_pos,
+    start,
+    end,
+    SB0: tl.constexpr,
+    SB1: tl.constexpr,
+    EXTENT: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    # The bias of keys [start, start + TILE) below end, as the masked loop adds it.
+    pos = start + tl.arange(0, TILE)
+    dist = q_pos[:, None] - pos[None, :]
+    keep = (pos < end)[None, :] & (dist >= 0) & (dist < EXTENT)
+    bias = Bias + token[:, None] * SB0 + qh[:, None] * SB1 + dist
+    return tl.load(bias, head_mask[:, None] & keep, other=0)
+
+
+@triton.jit
 def _decode_partials(
     Q,
     K,
@@ -144,9 +166,23 @@ def _decode_partials(
     l = tl.zeros((ROWS,), tl.float32)
     acc = tl.zeros((ROWS, D), tl.float32)
     cols = tl.arange(0, BLOCK_N)
+    if INTERIOR > 0:
+        # Each masked tile's bias is gathered one tile ahead: gathered inside the tile,
+        # its latency made 64 to 1024 keys 1.09x to 1.4x slower on H200.
+        end = tl.minimum(seqlen, tile_hi * BLOCK_N)
+        bias_next = _bias_tile(
+            Bias, token, qh, head_mask, q_pos, tile_lo * BLOCK_N, end,
+            SB0, SB1, EXTENT, BLOCK_N,
+        )  # fmt: skip
     # Keep inline rather than share a helper with _interior_tile:
     # a helper changes the sliding-window verify SASS (1.7% slower at qlen 5 on H200).
     for tile in range(tile_lo, tile_hi):
+        if INTERIOR > 0:
+            bias_now = bias_next
+            bias_next = _bias_tile(
+                Bias, token, qh, head_mask, q_pos, (tile + 1) * BLOCK_N, end,
+                SB0, SB1, EXTENT, BLOCK_N,
+            )  # fmt: skip
         pos = tile * BLOCK_N + cols
         valid = (pos < seqlen) & (pos >= first)
         if PAGE % BLOCK_N == 0:
@@ -168,11 +204,14 @@ def _decode_partials(
         keep = valid[None, :] & (dist >= 0)
         if WINDOW >= 0:
             keep &= dist <= WINDOW
-        bias = tl.load(
-            Bias + token[:, None] * SB0 + qh[:, None] * SB1 + dist,
-            head_mask[:, None] & keep & (dist < EXTENT),
-            other=0,
-        ).to(tl.float32)
+        if INTERIOR > 0:
+            bias = bias_now.to(tl.float32)
+        else:
+            bias = tl.load(
+                Bias + token[:, None] * SB0 + qh[:, None] * SB1 + dist,
+                head_mask[:, None] & keep & (dist < EXTENT),
+                other=0,
+            ).to(tl.float32)
         s = tl.where(keep, s + bias, float("-inf"))
         m_new = tl.maximum(m, tl.max(s, 1))
         m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
@@ -265,8 +304,8 @@ def decode_partials(
         interior,
         num_warps=4,
         num_stages=2 if qlen == 1 or interior else 3,
-        # main's register allocation: at 242 registers the chain ran 4% slower than main
-        # at 32 sequences of 64 keys on H200, though the kernel alone was not slower.
+        # main's register allocation: at 242 the chain ran 4% slower at 32 sequences
+        # of 64 keys though the kernel alone did not; the cap ran 1-3% faster (H200).
         maxnreg=232 if interior else None,
         launch_pdl=True,
     )
