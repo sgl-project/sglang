@@ -57,6 +57,15 @@ DESIRED_FPS = 2  # TODO: allow desired fps/num frames to be configurable
 MAX_FRAMES = 128
 
 
+def _splice_rendered(prompt: str, placeholder: str, renders: list[str]) -> str:
+    head, *tails = prompt.split(placeholder)
+    if len(tails) != len(renders):
+        # Without one placeholder per item, every item stays at the first one.
+        return prompt.replace(placeholder, "".join(renders), 1)
+    # Split before splicing: each render is itself a run of the placeholder.
+    return head + "".join(render + tail for render, tail in zip(renders, tails))
+
+
 def _create_visual_items(
     *,
     create_data_items,
@@ -421,7 +430,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                 self.render_image_dynamic(num_tokens=nt) for nt in num_tokens_per_image
             ]
             renders[self.mm_tokens.image_token_id] = rendered_images
-            prompt = prompt.replace(self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1)
+            prompt = _splice_rendered(prompt, self.IMG_CONTEXT_TOKEN, rendered_images)
             image_feature = preprocessed_images
         elif base_output.images:
             preprocessed_images = [
@@ -432,7 +441,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                 for image in preprocessed_images
             ]
             renders[self.mm_tokens.image_token_id] = rendered_images
-            prompt = prompt.replace(self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1)
+            prompt = _splice_rendered(prompt, self.IMG_CONTEXT_TOKEN, rendered_images)
             image_feature = torch.cat(preprocessed_images, dim=0)
 
         video_feature = None
