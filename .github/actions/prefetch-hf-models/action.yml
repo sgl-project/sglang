@@ -1,0 +1,65 @@
+name: Prefetch Hugging Face models
+description: >-
+  Download the Hugging Face repos one test partition needs into the runner's
+  cache. Use it only from the trusted checkout (.ci-prefetch) of the workflow's
+  own commit, never from the PR checkout: it is the one step holding the token.
+
+inputs:
+  hf-token:
+    description: Token for gated repos; only the download step sees it.
+    required: true
+  suite:
+    description: The run_suite.py suite (or diffusion suite) of this job.
+    required: true
+  partition-id:
+    description: run_suite.py --auto-partition-id.
+    default: ""
+  partition-size:
+    description: run_suite.py --auto-partition-size; empty for an unpartitioned job.
+    default: ""
+  partition-model-file:
+    description: The live partition model run_suite.py reads.
+    default: ""
+  diffusion-plan-json:
+    description: The diffusion partition plan; empty for LLM stages.
+    default: ""
+  diffusion-part:
+    description: This job's part of the diffusion plan.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # No token here: pip runs without user-site, pip config, or PIP_* left on
+    # the persistent runner, and installs only hash-pinned wheels.
+    - name: Install prefetch dependencies
+      shell: bash
+      run: |
+        python3 -s -m pip install --isolated --disable-pip-version-check --quiet \
+          --no-cache-dir --only-binary=:all: --index-url https://pypi.org/simple \
+          --target "$RUNNER_TEMP/hf-prefetch" \
+          -r "$GITHUB_ACTION_PATH/../../../scripts/ci/utils/prefetch_requirements.txt"
+
+    - name: Download the partition's repos
+      shell: bash
+      env:
+        HF_TOKEN: ${{ inputs.hf-token }}
+        SUITE: ${{ inputs.suite }}
+        PARTITION_ID: ${{ inputs.partition-id }}
+        PARTITION_SIZE: ${{ inputs.partition-size }}
+        PARTITION_MODEL_FILE: ${{ inputs.partition-model-file }}
+        PLAN: ${{ inputs.diffusion-plan-json }}
+        PART: ${{ inputs.diffusion-part }}
+      run: |
+        args=(--repo-root . --suite "$SUITE")
+        if [ -n "$PARTITION_SIZE" ]; then
+          args+=(--auto-partition-id "$PARTITION_ID" --auto-partition-size "$PARTITION_SIZE")
+        fi
+        if [ -n "$PARTITION_MODEL_FILE" ]; then
+          args+=(--partition-model-file "$PARTITION_MODEL_FILE")
+        fi
+        if [ -n "$PLAN" ]; then
+          args+=(--diffusion-plan-json "$PLAN" --diffusion-part "$PART")
+        fi
+        PYTHONPATH="$RUNNER_TEMP/hf-prefetch" python3 -s \
+          "$GITHUB_ACTION_PATH/../../../scripts/ci/utils/prefetch_hf_models.py" "${args[@]}"

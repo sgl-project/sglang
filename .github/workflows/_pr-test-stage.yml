@@ -153,8 +153,8 @@ jobs:
           curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
             "$URL" -o "$RUNNER_TEMP/partition-model.json"
 
-      # HF_TOKEN reaches only the prefetch step, which runs the workflow's own
-      # commit before any step runs PR code: the tests themselves hold no token.
+      # HF_TOKEN reaches only the prefetch action, run from this checkout of the
+      # workflow's own commit before any step runs PR code: the tests hold no token.
       - name: Check out the prefetch scripts
         id: prefetch_scripts
         continue-on-error: true
@@ -164,44 +164,21 @@ jobs:
           path: .ci-prefetch
           persist-credentials: false
           sparse-checkout: |
+            .github/actions/prefetch-hf-models
             scripts/ci
             python/sglang/test/ci
 
-      - name: Install prefetch dependencies
-        id: prefetch_deps
+      - name: Prefetch Hugging Face models
         if: steps.prefetch_scripts.outcome == 'success'
         continue-on-error: true
-        timeout-minutes: 10
-        # No HF_TOKEN here: pip runs without user-site, pip config, or PIP_*
-        # left on the persistent runner, and installs only hash-pinned wheels.
-        run: |
-          lib="$RUNNER_TEMP/hf-prefetch"
-          rm -rf "$lib"
-          python3 -s -m pip install --isolated --disable-pip-version-check --quiet \
-            --no-cache-dir --only-binary=:all: --index-url https://pypi.org/simple \
-            --target "$lib" -r .ci-prefetch/scripts/ci/utils/prefetch_requirements.txt
-
-      - name: Prefetch Hugging Face models
-        if: steps.prefetch_deps.outcome == 'success'
-        continue-on-error: true
         timeout-minutes: 60
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          SUITE: ${{ inputs.self_name }}
-          PARTITION_ID: ${{ matrix.partition }}
-          PARTITION_SIZE: ${{ fromJson(inputs.partitions)[inputs.self_name].size }}
-        run: |
-          lib="$RUNNER_TEMP/hf-prefetch"
-          PYTHONPATH="$lib" python3 -s .ci-prefetch/scripts/ci/utils/prefetch_hf_models.py \
-            --repo-root . --suite "$SUITE" \
-            --auto-partition-id "$PARTITION_ID" --auto-partition-size "$PARTITION_SIZE" \
-            --partition-model-file "$RUNNER_TEMP/partition-model.json"
-
-      - name: Remove the prefetch scripts and libraries
-        if: always()
-        continue-on-error: true
-        run: rm -rf .ci-prefetch "$RUNNER_TEMP/hf-prefetch"
-
+        uses: ./.ci-prefetch/.github/actions/prefetch-hf-models
+        with:
+          hf-token: ${{ secrets.HF_TOKEN }}
+          suite: ${{ inputs.self_name }}
+          partition-id: ${{ matrix.partition }}
+          partition-size: ${{ fromJson(inputs.partitions)[inputs.self_name].size }}
+          partition-model-file: ${{ runner.temp }}/partition-model.json
       - name: Resolve runner_config
         id: rc
         env:
