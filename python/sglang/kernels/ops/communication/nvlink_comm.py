@@ -17,7 +17,8 @@ if TYPE_CHECKING:
     from sglang.kernels.ops.communication.all_reduce import Communicator
 
 
-_PRIMITIVES: Final = ["all_gather"]
+_PUSH_PRIMITIVES: Final = ["all_gather"]
+_PULL_PRIMITIVES: Final = ["all_gather", "reduce_scatter"]
 
 
 def get_multicast_ptr(tensor: torch.Tensor) -> int:
@@ -40,7 +41,7 @@ def _jit_pull_module(dtype: torch.dtype, num_unroll: int) -> Module:
         f"unroll{num_unroll}",
         cuda_files=["distributed/nvlink_comm.cuh"],
         cuda_wrappers=[
-            (n, f"NVLinkComm<{args}>::{n}_pull<{num_unroll}>") for n in _PRIMITIVES
+            (n, f"NVLinkComm<{args}>::{n}_pull<{num_unroll}>") for n in _PULL_PRIMITIVES
         ],
     )
 
@@ -54,7 +55,7 @@ def _jit_push_module(dtype: torch.dtype, world_size: int) -> Module:
         f"world{world_size}",
         cuda_files=["distributed/nvlink_comm.cuh"],
         cuda_wrappers=[
-            (n, f"NVLinkComm<{args}>::{n}_push<{world_size}>") for n in _PRIMITIVES
+            (n, f"NVLinkComm<{args}>::{n}_push<{world_size}>") for n in _PUSH_PRIMITIVES
         ],
     )
 
@@ -88,5 +89,25 @@ def all_gather_pull(
         output,
         residual,
         out_mc_ptr or get_multicast_ptr(output),
+        num_blocks_hint,
+    )
+
+
+def reduce_scatter_pull(
+    comm: Communicator,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: torch.Tensor | None = None,
+    *,
+    in_mc_ptr: int = 0,
+    num_unroll=4,
+    num_blocks_hint: int = 0,
+) -> None:
+    _jit_pull_module(input.dtype, num_unroll).reduce_scatter(
+        comm,
+        input,
+        output,
+        residual,
+        in_mc_ptr or get_multicast_ptr(input),
         num_blocks_hint,
     )

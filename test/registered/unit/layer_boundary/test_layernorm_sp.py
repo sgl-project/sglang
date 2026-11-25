@@ -177,6 +177,53 @@ class TestSPCollectiveWorkspaceOwnership(CustomTestCase):
             )
 
 
+class TestRowParallelGbarCutlass(CustomTestCase):
+    def test_gemm_rs_pads_every_shard_to_whole_tiles(self):
+        from sglang.kernels.ops.communication.sp_collective_gemm import _tile_shards
+
+        world, tile = 8, 4
+        for tokens in (9, 32, 33, 57, 64):
+            rows = -(-tokens // world)
+            padded = -(-rows // tile) * tile
+            x = torch.arange(tokens * 2, dtype=torch.float32).view(tokens, 2) + 1
+            expected = torch.zeros(world, padded, 2)
+            shards = torch.nn.functional.pad(x, (0, 0, 0, world * rows - tokens))
+            expected[:, :rows] = shards.view(world, rows, 2)
+            out = _tile_shards(x, world, rows, tile)
+            torch.testing.assert_close(out, expected.view(world * padded, 2))
+            if tokens == world * padded:
+                self.assertIs(out, x)
+
+    def test_cutlass_gemm_rs_takes_the_unpadded_rows(self):
+        from sglang.kernels.ops.communication import sp_collective_gemm
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        rows = []
+
+        def gemm_rs(x, weight, group, *, workspace):
+            rows.append(x.shape[0])
+            return x.new_zeros((2, weight.shape[0]))
+
+        linear = SimpleNamespace(
+            bias=None,
+            quant_method=UnquantizedLinearMethod(),
+            weight=torch.zeros(4, 8, dtype=torch.bfloat16),
+            tp_group=SimpleNamespace(world_size=8),
+            _sp_use_cutlass=True,
+        )
+        parallel = SimpleNamespace(tp_group=SimpleNamespace(device_group=None))
+        with (
+            patch.object(
+                sp_collective_gemm, "matmul_reduce_scatter", side_effect=gemm_rs
+            ),
+            patch.object(layernorm_sp, "get_parallel", return_value=parallel),
+        ):
+            layernorm_sp.row_parallel_gbar_matmul(
+                linear, torch.zeros(9, 8, dtype=torch.bfloat16), None
+            )
+        self.assertEqual(rows, [9])
+
+
 class TestLayerNormSPValidation(CustomTestCase):
     """``validate_layernorm_sp`` is pure; pass config in directly."""
 
