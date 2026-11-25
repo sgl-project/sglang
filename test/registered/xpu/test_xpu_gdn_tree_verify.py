@@ -26,7 +26,7 @@ TREES = {
     hasattr(torch, "xpu") and torch.xpu.is_available(), "requires an XPU device"
 )
 class TestXpuGdnTreeVerify(CustomTestCase):
-    def _run(self, kernel, parents, seed=0):
+    def _run(self, kernel, parents, seed=0, buffer_steps=None):
         torch.manual_seed(seed)
         dev = "xpu"
         num_req, steps = len(parents), len(parents[0])
@@ -40,7 +40,7 @@ class TestXpuGdnTreeVerify(CustomTestCase):
         A_log = torch.randn(HV, device=dev, dtype=torch.float32)
         dt_bias = torch.randn(HV, device=dev, dtype=torch.bfloat16)
         ssm_states = torch.randn(num_req + 1, HV, V, K, device=dev) * 0.1
-        buffer = torch.zeros(num_req + 1, steps, HV, V, K, device=dev)
+        buffer = torch.zeros(num_req + 1, buffer_steps or steps, HV, V, K, device=dev)
         indices = torch.arange(num_req, device=dev, dtype=torch.int32)
         out = kernel.target_verify(
             A_log,
@@ -74,6 +74,18 @@ class TestXpuGdnTreeVerify(CustomTestCase):
                 torch.testing.assert_close(buf, ref_buf, atol=2e-2, rtol=2e-2)
                 # Verify must not commit state; only the commit step does.
                 torch.testing.assert_close(ssm, ref_ssm, atol=0, rtol=0)
+
+    def test_triton_verify_uses_allocated_buffer_pitch(self):
+        """Adaptive spec verifies fewer drafts than the buffer was sized for; each
+        request's states must still land at its allocated per-request pitch."""
+        parent = TREES["branching"]
+        parents = [parent, parent]
+        steps = len(parent)
+        ref_out, ref_buf, _ = self._run(TritonGDNKernel(), parents)
+        out, buf, _ = self._run(TritonGDNKernel(), parents, buffer_steps=steps + 3)
+        torch.testing.assert_close(out, ref_out, atol=0, rtol=0)
+        torch.testing.assert_close(buf[:, :steps], ref_buf, atol=0, rtol=0)
+        self.assertEqual(torch.count_nonzero(buf[:, steps:]).item(), 0)
 
 
 if __name__ == "__main__":
