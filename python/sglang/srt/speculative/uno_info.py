@@ -138,12 +138,6 @@ class UnoDraftInput(SpecInput):
                 page_size=page_size,
             )
         )
-        row_width = int(batch.req_to_token_pool.req_to_token.shape[1])
-        if max(next_lengths) > row_width:
-            raise RuntimeError(
-                "UNO allocation exceeds the req_to_token row: "
-                f"needed={max(next_lengths)}, available={row_width}."
-            )
 
         current_cpu = torch.tensor(
             current_lengths,

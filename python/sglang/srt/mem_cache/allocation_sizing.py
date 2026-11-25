@@ -157,18 +157,18 @@ def add_spec_decode_headroom_pages(
 
 
 def get_req_to_token_extra_context_len() -> int:
-    """req_to_token row headroom beyond the model context length.
+    """req_to_token row headroom beyond the model context length: how far one
+    decode step writes the row past kv_committed_len, which admission keeps
+    within the context length.
 
-    Sized to hold the decode over-allocation: a spec decode step allocates up to
-    committed + get_alloc_reserve_per_decode() at every page size, which can
-    outgrow the default num_draft_tokens headroom. The row headroom and the pools
-    it sits next to derive from the same bag leaves, so they cannot disagree
-    after a post-publish override.
+    A non-speculative step writes the one slot at kv_committed_len; a paged
+    allocator keeps the rest of that page off the row. A speculative step
+    writes up to kv_committed_len + get_alloc_reserve_per_decode(), rounded up
+    to a page (page_aligned_decode_alloc_lens). alloc_for_spec_decode checks
+    the row holds it. The row headroom and the pools it sits next to derive
+    from the same bag leaves, so they cannot disagree after a post-publish
+    override.
     """
-    # FIXME(lsyin): temporary fix for the context length issue under spec decoding
-    extra = 4 + (max_speculative_num_draft_tokens() or 0)
-    if get_spec().speculative_algorithm is not None:
-        # Larger pages may round the allocation up by page_size - 1.
-        page_size = get_alloc_page_size()
-        extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
-    return extra
+    if get_spec().speculative_algorithm is None:
+        return get_alloc_len_per_decode()
+    return get_alloc_reserve_per_decode() + get_alloc_page_size() - 1

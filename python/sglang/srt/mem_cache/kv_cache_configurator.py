@@ -1314,8 +1314,9 @@ class KVCacheConfigurator:
                 if disagg.disaggregation_mode == "decode"
                 else 0
             )
-            return get_req_to_token_extra_context_len(), pre_alloc_size
-        return get_req_to_token_extra_context_len(), self._req_pool_pre_alloc_size()
+        else:
+            pre_alloc_size = self._req_pool_pre_alloc_size()
+        return get_req_to_token_extra_context_len(), pre_alloc_size
 
     def _unified_swa_head_geometry(self) -> _UnifiedSWAHeadGeometry:
         """Head geometry of a hybrid-SWA host's full and SWA sub-pools."""
