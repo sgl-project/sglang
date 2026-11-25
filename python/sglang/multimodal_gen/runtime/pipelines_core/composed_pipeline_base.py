@@ -200,6 +200,24 @@ class ComposedPipelineBase(ABC):
         self.initialize_pipeline(self.server_args)
 
         logger.info("Creating pipeline stages...")
+        if getattr(self.server_args, "action_stage_graph", None):
+            from sglang.multimodal_gen.runtime.realtime.action_graph import (
+                ActionStageGraph,
+            )
+
+            if (
+                not self.server_args.pipeline_config.task_type.is_action_gen()
+                or self.server_args.num_gpus != 1
+            ):
+                raise ValueError(
+                    "Action stage graphs currently require a single-GPU policy worker"
+                )
+            self.add_stage(
+                ActionStageGraph.load(
+                    self.server_args.action_stage_graph, self.modules, self.server_args
+                ),
+                "action_graph",
+            )
         self.create_pipeline_stages(self.server_args)
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:

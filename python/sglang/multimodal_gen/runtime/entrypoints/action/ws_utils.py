@@ -15,6 +15,10 @@ from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     pack_msgpack,
     unpack_msgpack,
 )
+from sglang.multimodal_gen.runtime.realtime.action_chunk import (
+    ActionChunkConflict,
+    ActionDeadlineExceeded,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -44,6 +48,12 @@ async def run_action_msgpack_ws(
                 response["server_timing"]["prev_total_ms"] = prev_total_time * 1000
             await websocket.send_bytes(pack_msgpack(response))
             prev_total_time = time.monotonic() - start_time
+        except ActionChunkConflict:
+            await websocket.send_bytes(pack_msgpack({"error": "action_chunk_conflict"}))
+        except ActionDeadlineExceeded:
+            await websocket.send_bytes(
+                pack_msgpack({"error": "action_deadline_exceeded"})
+            )
         except WebSocketDisconnect:
             break
         except Exception:

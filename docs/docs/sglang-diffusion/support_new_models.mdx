@@ -32,6 +32,82 @@ utilities, and common action-policy helpers. Model packages may call these
 helpers. Keep ownership in shared runtime folders unless the code is truly
 architecture-specific.
 
+## Design cloud action policies for batching
+
+For cloud S1 and S2 models, implement batching across independent robot sessions
+early. A chunk with 32 time steps still represents one observation from one
+robot. To verify batching, send overlapping requests from different sessions,
+observe the batch dimension at the policy forward, and compare each returned
+trajectory with its batch-one baseline using the same observation and seed.
+Group compatible embodiment, shape, sampling schedule and history lengths.
+Preserve row ownership when one session resets, expires or finishes early.
+
+Measure on-time chunks per second, observation-to-first-usable-action p50/p95/p99,
+queue dwell and deadline misses. Report the action horizon and controller period
+alongside these measurements. A 32-step chunk produced in 142 ms gives about
+225 commands per second but only about seven complete chunks per second.
+Collect measurements at representative concurrency and limit batch waiting
+by the earliest deadline.
+
+For policies that support real-time chunking, specify the coordinate system,
+normalization and time origin of the unexecuted commands. Test the conditioning
+inside the denoiser and the controller's switch at the agreed execution index.
+Inject a delayed reply and verify that the controller keeps advancing through
+its existing buffer, rejects stale replacements, and uses its configured
+behavior once the buffer is exhausted.
+
+For a multi-rate policy, document each stage's trigger, its streamed outputs
+and which session owns its KV, observed frames and executed actions. A policy
+can consume the last completed subgoal while its planner generates the next
+one. A reasoning-conditioned policy needs the particular text, token IDs or
+hidden states used during training. Test both stage ordering and GPU memory
+use with two simultaneous sessions.
+
+### Compose policies with a slower planner
+
+For example, π0.7 combines an asynchronous visual subgoal generator with a faster action policy. Their different update rates map to a periodic producer and a request-triggered policy. [π0.7 technical report](https://arxiv.org/abs/2604.15483)
+
+A trusted `module:factory` passed to `--action-stage-graph` loads additional modules once per diffusion worker. Return an `ActionStageGraph` with nodes in topological order. The policy consumes named outputs. Bind `prompt` to replace the text condition, or bind an observation key that the downstream policy was trained to consume.
+
+```python
+from sglang.multimodal_gen.runtime.realtime.action_graph import ActionNode, ActionStageGraph
+
+def make_graph(modules, server_args):
+    # These callables are supplied by your checkpoint integration.
+    from my_policy import load_subgoal_model, predict_subgoal
+    world = load_subgoal_model(server_args)
+
+    def subgoal(task, observation, state, emit):
+        image, kv = predict_subgoal(world, task, observation, state.get("kv"))
+        state["kv"] = kv
+        emit(image)
+
+    return ActionStageGraph(
+        [ActionNode("goal", ("task", "observation", "state", "emit"), subgoal, period_s=4, repeat_latest=True,
+                    retained_gpu_bytes=64 * 1024**2)],
+        {"subgoal_image": "goal"},
+    )
+```
+
+The fast policy runs on action requests. The slow producer runs on a separate worker thread and CUDA stream. The first request waits for its first output, subject to its deadline. Later requests can use the last published subgoal while the next one is computed. Each session/producer has one update in flight and one slot for newer observations. Inputs arriving within one period coalesce. Set `repeat_latest=True` to keep ticking on the most recent input until the session is released. With the default, a refresh consumes a new input. For a GPU producer, set `retained_gpu_bytes` to its measured worst-case retained inputs, outputs and KV. The worker charges that reservation to the session and checks publications even between action requests. CPU-only ports default to zero bytes. An `emit` port can publish before the producer returns. Store immutable values or replacement tensors under the node's session-local `state` keys. Close the episode to release its ports.
+
+**Autoregressive reasoning and flow matching.** A request-triggered node can call an existing SGLang LLM using `SRTReasoning(engine_url, sampling_params)`. Pass the request deadline into the node to bound the SRT call. The adapter accepts text or an SRT `/generate` request dictionary and returns that engine's response. Bind a following adapter's output to the flow policy's trained condition. For example:
+
+```python
+from sglang.multimodal_gen.runtime.realtime.action_graph import ActionNode, ActionStageGraph, SRTReasoning
+
+def make_reasoning_graph(modules, server_args):
+    reason = SRTReasoning("http://127.0.0.1:30001", {"max_new_tokens": 32})
+    return ActionStageGraph([
+        ActionNode("reasoning", ("task", "deadline_unix_ms"), reason),
+        ActionNode("instruction", ("task", "reasoning"), lambda task, r: task + " " + r["text"]),
+    ], {"prompt": "instruction"})
+```
+
+The client sends one action request. Local node outputs can be GPU tensors or Python objects. The SRT HTTP adapter crosses a serialization boundary. A checkpoint whose trajectory head attends the decoder's KV requires a model-specific KV handoff with matching layer, position and layout semantics. The text example exercises a different conditioning contract. [Alpamayo architecture](https://arxiv.org/abs/2511.00088)
+
+**Budget retained GPU state.** Put KV, encoded frame history and command history in a typed `BaseRealtimeState` obtained from `batch.session`. Implement `tensor_roots()` for opaque containers and `fork()` for mutable state. Replacing retained tensors leaves earlier committed state usable after an expired request. GPU storage shared by views within a session counts once. Use `--session-gpu-budget-mib` to cap retained state per worker and leave headroom for weights and transient activations. Sessions are evicted least-recently-used when the retained limit or session count is exceeded. Start a fresh episode if its required history has been evicted.
+
 ## Place helpers with their owners
 
 Use the narrowest existing owner before adding a utility module:

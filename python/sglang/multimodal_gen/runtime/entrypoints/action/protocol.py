@@ -23,6 +23,12 @@ from sglang.multimodal_gen.runtime.entrypoints.action.cosmos3 import (
     cosmos3_action_metadata,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.realtime.action_chunk import (
+    ActionChunkConflict,
+    ActionDeadlineExceeded,
+    parse_chunk_request,
+    remaining_ms,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -476,14 +482,54 @@ async def infer_action(
     payload: dict[str, Any],
     server_args: ServerArgs,
 ) -> dict[str, Any]:
+    realtime = None
+    if "realtime" in payload:
+        realtime = parse_chunk_request(payload["realtime"], server_args.pipeline_config)
     sp = build_action_sampling_params(payload, server_args)
     req = prepare_request(server_args, sp)
-    response = await async_scheduler_client.forward(req)
+    observation = req.extra.get("vla", {}).get("observation", {})
+    session_id = observation.get("session_id")
+    if realtime is not None:
+        if session_id is not None and session_id != realtime["session_id"]:
+            raise ValueError("Conflicting action session IDs")
+        session_id = realtime["session_id"]
+        req.extra["action_realtime"] = realtime
+    if session_id is not None:
+        req.realtime_session_id = f"action/{session_id}"
+        req.extra["action_session"] = True
+    if realtime is None:
+        response = await async_scheduler_client.forward(req)
+    else:
+        deadline = realtime["deadline_unix_ms"]
+        try:
+            response = await async_scheduler_client.forward(
+                req, timeout_ms=min(2**31 - 1, remaining_ms(deadline))
+            )
+        except TimeoutError as exc:
+            raise ActionDeadlineExceeded("Action deadline elapsed") from exc
+        remaining_ms(deadline)
     if getattr(response, "error", None):
+        if response.error == "action_deadline_exceeded":
+            raise ActionDeadlineExceeded("Action deadline elapsed")
+        if "action_chunk_conflict:" in response.error:
+            raise ActionChunkConflict(
+                "A chunk for this or a later control step already committed"
+            )
+        if response.error.startswith("action_input_rejected:"):
+            raise ValueError(
+                response.error.removeprefix("action_input_rejected:").strip()
+            )
         raise RuntimeError(response.error)
     if response.output is None:
         raise RuntimeError("action policy returned no output")
-    return response.output[0]
+    output = response.output[0]
+    if realtime is not None:
+        output["realtime"] = {
+            key: realtime[key]
+            for key in ("session_id", "start_step", "deadline_unix_ms", "request_id")
+            if realtime[key] is not None
+        }
+    return output
 
 
 def action_generation_response(
@@ -555,6 +601,8 @@ def action_generation_response(
             "prefix_cache_hit": bool(output.get("cache", {}).get("hit", False)),
         },
     }
+    if "realtime" in output:
+        response["realtime"] = output["realtime"]
     if "timings" in output:
         response["timings"] = output["timings"]
     if "cache" in output:

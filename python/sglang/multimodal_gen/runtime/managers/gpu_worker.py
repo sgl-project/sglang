@@ -99,6 +99,10 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
     concat_rollout_trajectory_data,
 )
+from sglang.multimodal_gen.runtime.realtime.action_chunk import (
+    ActionDeadlineExceeded,
+    remaining_ms,
+)
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.realtime.video import (
     RAW_RGB_CONTENT_TYPE,
@@ -325,7 +329,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
-        self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
+        # Video models historically keep one live stream. Action checkpoints serve multiple robots.
+        is_policy = server_args.pipeline_config.task_type.is_action_gen()
+        budget = server_args.session_gpu_budget_mib
+        budget_bytes = None if budget is None else budget * 1024**2
+        if budget_bytes is None and is_policy and current_platform.is_cuda():
+            budget_bytes = torch.cuda.mem_get_info()[0]
+        self._realtime_sessions = RealtimeSessionCache(
+            max_sessions=32 if is_policy else 1, max_bytes=budget_bytes
+        )
         self.memory_occupation: MemoryOccupationController | None = None
         self._async_output_save = (
             server_args.async_output_save
@@ -811,7 +823,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 if execution_start_time is not None
                 else time.monotonic()
             )
-            self._realtime_sessions.attach(req)
+            for item in log_reqs:
+                deadline = item.extra.get("action_realtime", {}).get("deadline_unix_ms")
+                if deadline is not None and len(log_reqs) == 1:
+                    remaining_ms(deadline)
+                self._realtime_sessions.attach(item)
 
             # capture memory baseline for each req in grouped forward on rank-0
             request_metrics = [
@@ -860,6 +876,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
             if return_req and isinstance(result, Req):
+                self._commit_realtime_sessions(log_reqs)
                 return result
 
             output_batch = self._to_output_batch(result)
@@ -893,6 +910,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     output_metrics=output_metrics,
                     deferred=False,
                 )
+            self._commit_realtime_sessions(log_reqs)
         except RequestCancelledError as e:
             if propagate_forward_errors and forward_failed:
                 raise
@@ -939,7 +957,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 logger.warning(OOM_MSG)
             if output_batch is None:
                 output_batch = OutputBatch()
-            output_batch.error = f"Error executing {error_context}: {e}"
+            if isinstance(e, ActionDeadlineExceeded):
+                output_batch.error = "action_deadline_exceeded"
+            elif isinstance(e, ValueError) and all(
+                item.extra.get("action_session") for item in log_reqs
+            ):
+                output_batch.error = f"action_input_rejected: {e}"
+            else:
+                output_batch.error = f"Error executing {error_context}: {e}"
             if isinstance(e, IpcPeerTimeoutError):
                 output_batch.fatal_error = str(e)
             self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
@@ -947,6 +972,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if not current_platform.is_cpu():
                 torch.get_device_module().empty_cache()
         finally:
+            if forward_failed or (output_batch is not None and output_batch.error):
+                for item in log_reqs:
+                    if item.extra.get("action_session"):
+                        self._realtime_sessions.discard(item)
             # also runs on the propagate_forward_errors re-raise: a warmup
             # forward that never completed must still leave a failed record,
             # or the estimator would plan from the remaining partial data
@@ -958,6 +987,21 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     succeeded=output_batch is not None and output_batch.error is None,
                 )
         return output_batch
+
+    def _commit_realtime_sessions(self, log_reqs):
+        live_sessions = []
+        for item in log_reqs:
+            if item.realtime_session_id is None:
+                continue
+            deadline = item.extra.get("action_realtime", {}).get("deadline_unix_ms")
+            if deadline is not None and deadline <= time.time_ns() // 1_000_000:
+                self._realtime_sessions.discard(item)
+                if len(log_reqs) == 1:
+                    remaining_ms(deadline)
+                continue
+            live_sessions.append(item)
+        if live_sessions:
+            self._realtime_sessions.commit_many(live_sessions)
 
     def _finalize_output_batch(
         self,

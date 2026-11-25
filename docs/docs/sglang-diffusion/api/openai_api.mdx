@@ -503,13 +503,51 @@ the observation schema, action layout, and sampling defaults.
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /v1/actions/generations` | Generate an action chunk synchronously using JSON or msgpack. |
+| `DELETE /v1/actions/sessions/{session_id}` | Release retained state for this robot episode on the serving replicas. |
 | `GET /v1/actions/metadata` | Discover the served policy's observation schema, action shape, defaults, and capabilities. |
 | `WS /v1/actions/realtime` | Send successive action requests using the msgpack WebSocket protocol. |
 
-See the [VLA cookbook](/cookbook/vla/intro) for Pi0.5, FLUX 3 Action, and
+See the [VLA cookbook](/cookbook/vla/intro) for Pi0.5, FLUX 3 Action, LingBot-VA and
 Praxis-1 recipes, or [Cosmos3 policy and inverse dynamics](/cookbook/diffusion/Cosmos/Cosmos3#action-generation)
 for world-model action generation. Supported inputs, session behavior, and
 transports depend on the policy; consult its metadata and recipe before use.
+
+#### Real-time action chunks
+
+Supply a top-level `realtime` object in the action request. Keep the client and server wall clocks synchronized. `start_step` is the absolute index of the next control command at request construction. Row zero of the returned chunk refers to that index.
+
+| Field | Meaning |
+| --- | --- |
+| `session_id` | Nonempty episode ID. Send a new ID at reset. Legacy `input.observation.session_id` is accepted and must match when both are present. |
+| `start_step` | Nonnegative integer. Successful timed requests advance the session in strictly increasing step order. |
+| `deadline_unix_ms` | Absolute Unix epoch time in milliseconds, including queueing and inference. |
+| `action_prefix` | Optional matrix of commands the controller is already committed to executing, starting at `start_step`, in the policy's output coordinates. Supply a nonempty prefix only when the checkpoint advertises that capability. |
+| `request_id` | Optional client correlation token. The response echoes it with the session, start step and deadline. |
+
+Past commands and future commands have different roles. For example, LingBot-VA grounds its history on `input.observation.executed_actions` and the associated camera frames. During action denoising, it conditions on the unexecuted rows in `realtime.action_prefix`. Its checkpoints require an observed block at their native feedback cadence. A prefix cannot supply the missing camera frames.
+
+HTTP returns 408 for a missed deadline and 409 for a previously committed step. The WebSocket sends an error object and stays open for the next request. The controller owns its old buffer and continues consuming it while inference is in flight. Reject stale results even if the server produced them on time. After exhausting the buffer, use the controller's own empty-buffer behavior.
+
+The following functions run on the control-loop owner. The network task posts the payload asynchronously and returns the parsed response to that owner.
+
+```python
+import time
+from sglang.multimodal_gen.action_client import ActionChunkBuffer
+
+buffer = ActionChunkBuffer("robot-3-episode-17")
+
+def make_request(observation, task, budget_ms, overlap_steps):
+    now_ms = time.time_ns() // 1_000_000
+    return {"input": {"task": task, "observation": observation},
+            "realtime": buffer.request(now_ms + budget_ms, overlap_steps)}
+
+def control_tick(completed_response=None):
+    if completed_response is not None and "data" in completed_response:
+        buffer.accept(completed_response)
+    return buffer.pop()  # Next unconsumed row, or None when exhausted.
+```
+
+The first request starts with an empty prefix. When accepting a replacement, the buffer skips rows already consumed during inference. If execution has advanced past the agreed overlap, it keeps the old buffer. For a model-specific example, see the [LingBot-VA cookbook](/cookbook/vla/Robbyant/LingBot-VA).
 
 ### LoRA Management
 
