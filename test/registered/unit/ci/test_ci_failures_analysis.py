@@ -74,12 +74,17 @@ FAILED sglang/test/test_nomas.py::test_growing_history
         self.assertEqual(
             summary,
             {
-                "passed": 0,
-                "total": 0,
+                "passed": 1558,
+                "total": 1561,
                 "failed_tests": [
                     {
                         "test_file": "test_nomas.py",
                         "full_path": "sglang/test/test_nomas.py",
+                        "test_ids": [
+                            "test_nomas.py::test_fused_qk_norm",
+                            "test_nomas.py::test_fused_swiglu",
+                            "test_nomas.py::test_growing_history",
+                        ],
                     }
                 ],
             },
@@ -101,14 +106,20 @@ FAILED sglang/test/test_nomas.py::test_growing_history
         ):
             with self.subTest(prefix=prefix):
                 logs = "\n".join(f"{prefix}\x1b[31m{line}\x1b[0m" for line in lines)
+                summary = self.analyzer.parse_test_summary(logs)
                 self.assertEqual(
-                    self._failed_paths(logs),
-                    [
-                        "test/a/test_values.py",
-                        "test/b/test_values.py",
-                        "test/test_collection.py",
-                        "test/test_sub.py",
-                    ],
+                    {t["full_path"]: t["test_ids"] for t in summary["failed_tests"]},
+                    {
+                        "test/a/test_values.py": [
+                            "test_values.py::TestValues::test_shape[32 - 64]",
+                            "test_values.py::TestValues::test_shape[128]",
+                        ],
+                        "test/b/test_values.py": [
+                            "test_values.py::TestValues::test_setup[False]"
+                        ],
+                        "test/test_collection.py": [""],
+                        "test/test_sub.py": ["test_sub.py::TestSub::test_sub"],
+                    },
                 )
 
     def test_retry_replaces_previous_attempt(self):
@@ -124,6 +135,14 @@ FAILED sglang/test/test_nomas.py::test_growing_history
                 ["test/test_new.py"],
             ),
             (initial + _TAIL + _RETRY_MARKER + _PASSED_SESSION, ["test/test_old.py"]),
+            (
+                # A tail that lost its closing rule must not swallow the next run.
+                initial
+                + _TAIL.replace("=" * 52 + "\n", "")
+                + "Starting pytest attempt 1/7: initial pass for 1 assigned item(s)\n"
+                + _failed_session("test/test_new.py"),
+                ["test/test_old.py", "test/test_new.py"],
+            ),
         ):
             with self.subTest(logs=logs):
                 self.assertEqual(self._failed_paths(logs), expected)
@@ -243,19 +262,23 @@ FAILED sglang/test/test_nomas.py::test_growing_history
             + _SERVER_ARGS
             + "PASSED\n"
             + "================ short test summary info ================\n"
-            + "FAILED test/test_nomas.py::test_case\n"
-            + "================ 1 failed, 1 passed in 1.00s ================\n"
+            + "FAILED test/test_nomas.py::test_case[a]\n"
+            + "FAILED test/test_nomas.py::test_case[b]\n"
+            + "================ 2 failed, 1 passed in 1.00s ================\n"
         )
         with mock.patch.multiple(
             bisect,
-            fetch_nvidia_scheduled_runs=lambda token: [{"id": 1}],
+            fetch_scheduled_runs=lambda token, workflow_file: [{"id": 1}],
             fetch_jobs_for_run=lambda run_id, token: [
                 {"name": "unit", "conclusion": "failure", "id": 2}
             ],
             fetch_job_logs=lambda job_id, token: logs,
         ):
             targets, _ = bisect.analyze_scheduled_failures("")
-        self.assertEqual([target.test_file for target in targets], ["test_nomas.py"])
+        self.assertEqual(
+            [target.test_label for target in targets],
+            ["test_nomas.py::test_case[a]", "test_nomas.py::test_case[b]"],
+        )
 
 
 if __name__ == "__main__":

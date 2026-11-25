@@ -61,16 +61,16 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase, NPUGSM8KMixin):
         # The PR pipeline runs eager to shorten startup; the nightly pipeline
         # covers the default decode graph path with FIA + HiCache.
         if _is_pr_pipeline:
-            other_args.append("--disable-cuda-graph")
+            other_args.extend(
+                ["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"]
+            )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env={
                 **os.environ,
-                "PYTORCH_NPU_ALLOC_CONF": (
-                    "expandable_segments:True,pin_memory_expandable_segments:True"
-                ),
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             },
             other_args=other_args,
         )
