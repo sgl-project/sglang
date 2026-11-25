@@ -189,6 +189,8 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
     dp_ranks: int = 1
     # Per scheduler; None is unlimited or not applied.
     max_queued_requests: Optional[int]
+    # Every tokenizer worker runs this warmup at the same time.
+    tokenizer_workers: int = 1
     # None or <= 0: chunked prefill is off.
     chunked_prefill_size: Optional[int]
     context_len: int
@@ -229,6 +231,7 @@ def concurrent_prefill_limits(
             if state.get("disaggregation_mode") == "prefill"
             else state["max_queued_requests"]
         ),
+        tokenizer_workers=state["tokenizer_worker_num"],
         chunked_prefill_size=state["chunked_prefill_size"],
         context_len=context_len,
         max_req_input_len=max_req_input_len,
@@ -266,9 +269,9 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     )
     slots = limits.max_running_requests
     if limits.max_queued_requests is not None:
-        # A rank's share of a round can arrive in one scheduler poll, so it
-        # must fit in that rank's waiting queue.
-        slots = min(slots, limits.max_queued_requests)
+        # A rank's share of a round can arrive in one scheduler poll, so the
+        # shares of all tokenizer workers must fit in that rank's waiting queue.
+        slots = min(slots, limits.max_queued_requests // limits.tokenizer_workers)
     if max_prompt < 1 or slots < 1:
         return ConcurrentPrefillPlan(rounds=[], logprob_sizes=[])
 
