@@ -1,4 +1,4 @@
-"""Single-rank startups keep tuned tactics in FlashInfer's managed store.
+"""Startups keep tuned tactics in FlashInfer's managed store.
 
 The lifecycle cases drive SGLang's autotune context against FlashInfer's real
 AutoTuner and store. Only the GPU timing is replaced, by a table, so each case
@@ -218,6 +218,35 @@ class TestManagedAutotuneCache(_PublishedConfig):
         self.assertEqual([self._choose(OP), self._choose(OTHER_OP)], [1, 2])
         self.assertEqual(self.profiled, [])
 
+    def _two_ranks(self, tp_rank=0, cpu_group=None):
+        """One rank of a two-way tensor-parallel group, attention and MoE alike."""
+        return get_parallel().override(
+            max_world_size=2,
+            tp_size=2,
+            attn_tp_size=2,
+            moe_tp_size=2,
+            tp_rank=tp_rank,
+            attn_tp_rank=tp_rank,
+            tp_group=SimpleNamespace(world_size=2, cpu_group=cpu_group),
+        )
+
+    def test_each_rank_of_a_multi_rank_deployment_has_its_own_store(self):
+        self.assertFalse(self._root().name.startswith("rank_"))
+        roots = []
+        for tp_rank in (0, 1):
+            with self._two_ranks(tp_rank):
+                roots.append(self._root().name)
+        self.assertEqual(roots, ["rank_tp0_pp0_dp0", "rank_tp1_pp0_dp0"])
+
+    def test_managed_tuning_agrees_over_the_tp_group(self):
+        from flashinfer.autotuner import get_autotune_process_group
+
+        group = object()
+        with self._two_ranks(cpu_group=group):
+            with autotune.flashinfer_autotune_context(self.target, run_lm_head=False):
+                self.assertIs(get_autotune_process_group(), group)
+        self.assertIsNone(get_autotune_process_group())
+
     def test_json_and_managed_caches_select_the_same_winners(self):
         tables = [
             TIMES,
@@ -265,9 +294,29 @@ class TestManagedAutotuneCacheEligibility(_PublishedConfig):
         with get_exec().moe.override(moe_runner_backend="flashinfer_megamoe"):
             self.assert_managed(False)
 
-    def test_any_capacity_beyond_one_rank_keeps_the_per_rank_cache(self):
-        # Multi-rank launches, and elastic EP that may grow past one rank.
-        with get_parallel().override(max_world_size=2):
+    def test_fixed_multi_rank_layouts_on_one_node(self):
+        # Tensor and expert parallelism, and data-parallel replicas of them.
+        with get_parallel().override(max_world_size=4):
+            self.assert_managed(True)
+
+    def test_multi_rank_layouts_not_yet_validated_keep_the_per_rank_cache(self):
+        for name, fields in (
+            ("pipeline stages", dict(pp_size=2)),
+            ("more than one node", dict(nnodes=2)),
+            ("DP attention", dict(attn_dp_enabled=True)),
+            ("elastic EP capacity", dict(max_ep_size=4)),
+            ("elastic EP joiner", dict(ep_join_rank_offset=2)),
+        ):
+            with (
+                self.subTest(name),
+                get_parallel().override(max_world_size=2, **fields),
+            ):
+                self.assert_managed(False)
+        with (
+            self.subTest("elastic EP backend"),
+            get_parallel().override(max_world_size=2),
+            get_exec().moe.override(elastic_ep_backend="mooncake"),
+        ):
             self.assert_managed(False)
 
     def test_platforms_without_flashinfer(self):
