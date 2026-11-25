@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import time
@@ -169,6 +170,19 @@ class _ClosingStreamingResponse(StreamingResponse):
             await super().stream_response(send)
         finally:
             await self.body_iterator.aclose()
+
+
+def _cache_salt_key(cache_salt: str | list[str] | None) -> str | None:
+    """The namespace of the chat render and segment caches for a request's
+    cache_salt; None (shared) when unsalted. Equal salts give equal keys. A
+    one-element list is its element, as for a single prompt in the engine;
+    longer lists keep their element boundaries (repr is injective over str and
+    list[str]). The digest keeps a long salt out of the cache keys."""
+    if isinstance(cache_salt, list) and len(cache_salt) == 1:
+        cache_salt = cache_salt[0]
+    if not cache_salt:
+        return None
+    return hashlib.sha256(repr(cache_salt).encode()).hexdigest()
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
@@ -2223,9 +2237,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Like the radix cache, the render and segment caches below share
         # entries only between requests with the same cache_salt: a hit from
         # another tenant's request would show in this request's latency.
-        if isinstance(cache_salt, list):
-            cache_salt = "\0".join(cache_salt)
-        cache_salt = cache_salt or None
+        cache_salt = _cache_salt_key(cache_salt)
         cache_key = None
         if use_cache:
             try:
