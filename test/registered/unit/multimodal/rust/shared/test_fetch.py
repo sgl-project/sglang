@@ -42,7 +42,7 @@ class TestRustMediaSourceLoading(CustomTestCase):
 
     def test_file_sources(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "image.png"
+            path = Path(directory) / "local image.png"
             path.write_bytes(self.DATA)
             for source in (str(path), path.as_uri()):
                 with self.subTest(source=source[:7]):
@@ -72,6 +72,23 @@ class TestRustMediaSourceLoading(CustomTestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def test_local_switch_and_size_are_identical(self):
+        self.addCleanup(configure_media_url_security, *media_url_security_config())
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "ordinary image.png"
+            path.write_bytes(b"x" * (1 << 20))
+            for loader in (FETCH, get_image_bytes):
+                configure_media_url_security(allow_local_files=False)
+                with self.assertRaises(ValueError):
+                    loader(path.as_uri())
+                configure_media_url_security(max_file_size_mb=1)
+                self.assertEqual(len(loader(path.as_uri())), 1 << 20)
+            with path.open("ab") as output:
+                output.write(b"x")
+            for loader in (FETCH, get_image_bytes):
+                with self.assertRaises(ValueError):
+                    loader(path.as_uri())
 
     def test_invalid_sources_fail(self):
         for source in ("not base64!", "/definitely/missing/image.png"):

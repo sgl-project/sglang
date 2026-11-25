@@ -2,12 +2,10 @@
 //!
 //! The MM worker pool is fixed, core-pinned CPU capacity: a slow image host — or
 //! a file on a hanging network mount — must never occupy it, and a request's
-//! images must download concurrently, not in `n * REQUEST_TIMEOUT`. Remote and
-//! inline sources resolve through `sglang-mm`'s `fetch_bytes_budgeted` (one
-//! owner for proxy/timeout/cap semantics); trusted local files skip the remote
-//! per-source cap but share the whole-request budget. An external processor
-//! may check a request's media first, serve sources it already holds, and
-//! resolve URI schemes of its own (see [`MmProcessor::fetch_media`]).
+//! images must download concurrently. Built-in sources use the server's media
+//! policy and one whole-request byte budget. External processors may validate
+//! requests and resolve their own URI schemes.
+//!
 //! Resolved bytes ride out-of-band as
 //! [`crate::message::request::MmData::prefetched`], which
 //! [`crate::multi_modality::payload::resolve_media_work`] swaps back in.
@@ -21,7 +19,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use bytes::Bytes;
-use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_file_budgeted};
+use sglang_mm::common::fetch::{ByteBudget, MediaPolicy, fetch_with_policy};
 use sglang_mm::driver::MAX_REQUEST_BYTES;
 use tokio::sync::Semaphore;
 
@@ -57,6 +55,7 @@ pub async fn prefetch_all(
     requests: &mut [GenerateRequest],
     modality_limits: &[(String, usize)],
     processor: Option<&Arc<dyn MmProcessor>>,
+    policy: &MediaPolicy,
 ) -> Result<(), MediaError> {
     // The per-modality limits and the processor's check reject before a
     // single byte is fetched.
@@ -103,8 +102,14 @@ pub async fn prefetch_all(
         .collect::<Result<Vec<_>, MediaError>>()?;
     let fetches = plans.into_iter().map(|sources| async {
         let started = Instant::now();
-        let fetched =
-            fetch_ordered(sources, MAX_REQUEST_BYTES, processor.cloned(), &PERMITS).await?;
+        let fetched = fetch_ordered(
+            sources,
+            MAX_REQUEST_BYTES,
+            processor.cloned(),
+            &PERMITS,
+            policy,
+        )
+        .await?;
         Ok::<_, MediaError>((fetched, started.elapsed()))
     });
     let fetched = futures::future::try_join_all(fetches).await?;
@@ -137,25 +142,26 @@ fn modality_name(modality: MmModality) -> &'static str {
     }
 }
 
-/// Resolve one request's sources concurrently (blocking fetches bounded by
-/// `permits`), in order. All inputs share `total_bytes`; trusted local files
-/// skip only the remote per-source cap, matching Python's URL-only security
-/// limit. Overflow rejects before or during I/O and `try_join_all` drops the
-/// rest, so queued sources never start. The processor, when there is one,
-/// sees each source first: a source it holds resolves without a permit, and
-/// its deadline fails a fetch that is not done in time, queued or running.
+/// Fetch sources in request order with shared byte and concurrency limits.
+/// A processor's deadline covers both queue time and blocking I/O.
 async fn fetch_ordered(
     sources: Vec<(String, MmModality)>,
     total_bytes: u64,
     processor: Option<Arc<dyn MmProcessor>>,
     permits: &Arc<Semaphore>,
+    policy: &MediaPolicy,
 ) -> Result<Vec<Fetched>, MediaError> {
     let budget = Arc::new(ByteBudget::new(total_bytes));
     futures::future::try_join_all(sources.into_iter().map(|(src, modality)| {
         let budget = Arc::clone(&budget);
+        let builtin = src.starts_with('/')
+            || src.starts_with("file://")
+            || src.starts_with("http://")
+            || src.starts_with("https://");
+        let policy = policy.clone();
         let processor = processor.clone();
         async move {
-            if let Some(processor) = &processor {
+            if !builtin && let Some(processor) = &processor {
                 let started = Instant::now();
                 if let Some(bytes) = processor.cached_media(&src, modality, &budget) {
                     return Ok(Fetched {
@@ -177,7 +183,7 @@ async fn fetch_ordered(
             // core set (see `on_thread_start` in `runtime::start`) — off the
             // CPU-bound stages, and mostly I/O-parked, so sharing is fine.
             let fetch = run_blocking_bounded(Arc::clone(permits), move || {
-                if let Some(processor) = processor {
+                if !builtin && let Some(processor) = processor {
                     let started = Instant::now();
                     if let Some(bytes) = processor.fetch_media(&src, modality, &budget)? {
                         let by_processor = ProcessorFetch {
@@ -191,10 +197,8 @@ async fn fetch_ordered(
                         });
                     }
                 }
-                let fetched = if src.starts_with('/') || src.starts_with("file://") {
-                    fetch_local_file_budgeted(&src, &budget)
-                } else if src.starts_with("http://") || src.starts_with("https://") {
-                    fetch_bytes_budgeted(&src, &budget)
+                let fetched = if builtin {
+                    fetch_with_policy(&src, &budget, &policy)
                 } else {
                     Err(format!("media fetch: unsupported URI: {src}"))
                 };
@@ -257,6 +261,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_policy() -> MediaPolicy {
+        MediaPolicy {
+            domains: vec!["127.0.0.1".into()],
+            ..Default::default()
+        }
+    }
     use crate::message::multimodal::MmItem;
 
     fn src(s: impl Into<String>) -> MmItem {
@@ -271,7 +282,8 @@ mod tests {
             .into_iter()
             .map(|source| (source, MmModality::Image))
             .collect();
-        let fetched = fetch_ordered(sources, total_bytes, None, &PERMITS).await?;
+        let fetched =
+            fetch_ordered(sources, total_bytes, None, &PERMITS, &fixture_policy()).await?;
         Ok(fetched.into_iter().map(|source| source.bytes).collect())
     }
 
@@ -331,7 +343,9 @@ mod tests {
             })),
             ..Default::default()
         }];
-        prefetch_all(&mut requests, &[], None).await.unwrap();
+        prefetch_all(&mut requests, &[], None, &fixture_policy())
+            .await
+            .unwrap();
         std::fs::remove_dir_all(base).ok();
         let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
         assert_eq!(
@@ -356,7 +370,9 @@ mod tests {
             ]),
             GenerateRequest::default(),
         ];
-        prefetch_all(&mut requests, &[], None).await.unwrap();
+        prefetch_all(&mut requests, &[], None, &fixture_policy())
+            .await
+            .unwrap();
         std::fs::remove_file(&path).ok();
         let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
         // The one-shot server answers in accept order, so contents may swap
@@ -370,7 +386,10 @@ mod tests {
     #[tokio::test]
     async fn failed_download_rejects() {
         let mut requests = vec![mm_request(vec![src("http://127.0.0.1:1/nope.png")])];
-        let err = prefetch_all(&mut requests, &[], None).await.err().unwrap();
+        let err = prefetch_all(&mut requests, &[], None, &fixture_policy())
+            .await
+            .err()
+            .unwrap();
         assert!(
             matches!(&err, MediaError::Client(message) if message.contains("media fetch")),
             "{err:?}"
@@ -446,7 +465,7 @@ mod tests {
             })),
             ..Default::default()
         }];
-        prefetch_all(&mut requests, &[], Some(&processor))
+        prefetch_all(&mut requests, &[], Some(&processor), &fixture_policy())
             .await
             .unwrap();
         std::fs::remove_file(&path).ok();
@@ -487,14 +506,14 @@ mod tests {
             ("custom://a", None, unsupported("custom://a")),
         ] {
             let mut requests = vec![mm_request(vec![src(source)])];
-            let err = prefetch_all(&mut requests, &[], processor)
+            let err = prefetch_all(&mut requests, &[], processor, &fixture_policy())
                 .await
                 .err()
                 .unwrap();
             assert_eq!(err, expected, "{source}");
         }
         let mut requests = vec![mm_request(vec![src("custom://panic")])];
-        let err = prefetch_all(&mut requests, &[], Some(&processor))
+        let err = prefetch_all(&mut requests, &[], Some(&processor), &fixture_policy())
             .await
             .err()
             .unwrap();
@@ -512,7 +531,7 @@ mod tests {
             })),
             ..Default::default()
         }];
-        let err = prefetch_all(&mut requests, &[], Some(&processor))
+        let err = prefetch_all(&mut requests, &[], Some(&processor), &fixture_policy())
             .await
             .err()
             .unwrap();
@@ -607,8 +626,14 @@ mod tests {
             let permits = Arc::clone(&permits);
             tokio::spawn(async move {
                 let sources = vec![(source, MmModality::Image)];
-                let fetched =
-                    fetch_ordered(sources, MAX_REQUEST_BYTES, Some(processor), &permits).await?;
+                let fetched = fetch_ordered(
+                    sources,
+                    MAX_REQUEST_BYTES,
+                    Some(processor),
+                    &permits,
+                    &fixture_policy(),
+                )
+                .await?;
                 Ok::<_, MediaError>(fetched.into_iter().map(|f| f.bytes).collect::<Vec<_>>())
             })
         };
@@ -664,7 +689,7 @@ mod tests {
         let mut requests = vec![mm_request(
             (0..n).map(|_| src(path.display().to_string())).collect(),
         )];
-        let fetched = prefetch_all(&mut requests, &[], None).await;
+        let fetched = prefetch_all(&mut requests, &[], None, &fixture_policy()).await;
         std::fs::remove_file(&path).ok();
         fetched.unwrap();
         assert_eq!(requests[0].mm.as_ref().unwrap().prefetched.len(), n);
@@ -703,7 +728,7 @@ mod tests {
             ),
         ] {
             let mut requests = vec![request()];
-            let err = prefetch_all(&mut requests, &limits, None)
+            let err = prefetch_all(&mut requests, &limits, None, &fixture_policy())
                 .await
                 .err()
                 .unwrap();
@@ -713,10 +738,15 @@ mod tests {
 
         // At the limit the request passes the count check and reaches fetching.
         let mut requests = vec![request()];
-        let err = prefetch_all(&mut requests, &owned(&[("image", 2)]), None)
-            .await
-            .err()
-            .unwrap();
+        let err = prefetch_all(
+            &mut requests,
+            &owned(&[("image", 2)]),
+            None,
+            &fixture_policy(),
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(
             matches!(&err, MediaError::Client(message) if message.contains("media fetch")),
             "{err:?}"

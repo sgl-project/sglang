@@ -66,6 +66,7 @@ pub(crate) struct CoreConfig {
 /// depend on the full launch-configuration object.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoreMetadata {
+    pub(super) media_policy: sglang_mm::common::fetch::MediaPolicy,
     pub(super) model_path: String,
     pub(super) served_model_name: String,
     pub(super) tokenizer_path: String,
@@ -112,6 +113,7 @@ impl CoreMetadata {
 impl From<&ServerArgs> for CoreMetadata {
     fn from(args: &ServerArgs) -> Self {
         Self {
+            media_policy: args.media_policy.clone(),
             model_path: args.model_path.clone(),
             served_model_name: args.served_model_name.clone(),
             tokenizer_path: args.public_tokenizer_path.clone(),

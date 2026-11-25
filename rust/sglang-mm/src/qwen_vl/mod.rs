@@ -509,10 +509,11 @@ mod python {
         let input_ids = input_ids
             .ok_or_else(|| PyValueError::new_err("native parity API requires input_ids"))?;
         let input = crate::driver::MmInput { input_ids, images };
+        let policy = crate::common::fetch::python_media_policy(py)?;
         let packed = py
             .detach(move || {
                 let family = crate::registry::pipeline_from_spec(&spec_json)?;
-                let output = crate::driver::process(family.as_ref(), input)?;
+                let output = crate::driver::process_with_policy(family.as_ref(), input, &policy)?;
                 pack_output(output)
             })
             .map_err(PyValueError::new_err)?;

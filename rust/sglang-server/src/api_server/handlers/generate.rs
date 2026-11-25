@@ -405,14 +405,19 @@ impl CoreHandle {
         } else {
             self.inner.mm_processor.get()
         };
-        prefetch::prefetch_all(requests, &self.inner.mm_limits, processor)
-            .await
-            .map_err(|error| {
-                if let (MediaError::Client(message), Some(request)) = (&error, requests.first()) {
-                    tracing::warn!(rid = %request.rid, error = %message, "rejected request");
-                }
-                CoreError::from(error)
-            })
+        prefetch::prefetch_all(
+            requests,
+            &self.inner.mm_limits,
+            processor,
+            &self.inner.metadata.media_policy,
+        )
+        .await
+        .map_err(|error| {
+            if let (MediaError::Client(message), Some(request)) = (&error, requests.first()) {
+                tracing::warn!(rid = %request.rid, error = %message, "rejected request");
+            }
+            CoreError::from(error)
+        })
     }
 }
 
@@ -1344,7 +1349,12 @@ mod tests {
     #[tokio::test]
     async fn explicit_abort_during_batch_preprocessing_preserves_other_items() {
         for aborted in ["A", "B"] {
-            let harness = Harness::unbounded(8);
+            let mut harness = Harness::unbounded(8);
+            Arc::get_mut(&mut harness.handle.inner)
+                .unwrap()
+                .metadata
+                .media_policy
+                .domains = vec!["127.0.0.1".into()];
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let requests = ["A", "B"]

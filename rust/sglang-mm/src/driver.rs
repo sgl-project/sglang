@@ -54,30 +54,19 @@ pub struct Output {
     pub positions: PositionOutput,
 }
 
-/// Resolve one image source to raw encoded bytes, borrowing when the request
-/// already carries them.
-fn resolve(source: &ImageSource) -> Result<std::borrow::Cow<'_, [u8]>, String> {
-    match source {
-        ImageSource::String(source) => Ok(fetch::fetch_bytes(source)?.into()),
-        ImageSource::Bytes(bytes) => Ok(bytes.as_slice().into()),
-    }
-}
-
-fn add_media_bytes(total: u64, next: usize) -> Result<u64, String> {
-    let total = total.saturating_add(next as u64);
-    if total > MAX_REQUEST_BYTES {
-        return Err(format!(
-            "multimodal request exceeds {MAX_REQUEST_BYTES} total media bytes"
-        ));
-    }
-    Ok(total)
-}
-
 /// Run one request through the pipeline. Any `Err` rejects the request back
 /// to the client — including inputs merely outside the pipeline's scope
 /// (video/audio, precomputed features, undecodable images), since there is
 /// no Python fallback path.
 pub fn process(family: &dyn MmFamilyProcessor, input: MmInput) -> Result<Output, String> {
+    process_with_policy(family, input, &fetch::MediaPolicy::default())
+}
+
+pub fn process_with_policy(
+    family: &dyn MmFamilyProcessor,
+    input: MmInput,
+    policy: &fetch::MediaPolicy,
+) -> Result<Output, String> {
     if input.input_ids.is_empty() {
         return Err("multimodal request without input_ids".into());
     }
@@ -90,10 +79,15 @@ pub fn process(family: &dyn MmFamilyProcessor, input: MmInput) -> Result<Output,
     // server) must resolve I/O-backed string sources — URLs and file paths —
     // on their own I/O layer and pass `Bytes`.
     let mut fetched: Vec<std::borrow::Cow<'_, [u8]>> = Vec::with_capacity(input.images.len());
-    let mut total: u64 = 0;
+    let budget = fetch::ByteBudget::new(MAX_REQUEST_BYTES);
     for source in &input.images {
-        let bytes = resolve(source)?;
-        total = add_media_bytes(total, bytes.len())?;
+        let bytes = match source {
+            ImageSource::String(s) => fetch::fetch_with_policy(s, &budget, policy)?.into(),
+            ImageSource::Bytes(b) => {
+                budget.charge_existing(b.len(), "encoded image")?;
+                b.as_slice().into()
+            }
+        };
         fetched.push(bytes);
     }
     let processed: Vec<(ProcessedItem, u64)> =
@@ -206,7 +200,11 @@ mod tests {
                 ImageSource::String(path.display().to_string()),
             ],
         };
-        let out = process(family.as_ref(), input).unwrap();
+        let policy = fetch::MediaPolicy {
+            domains: vec!["127.0.0.1".into()],
+            ..Default::default()
+        };
+        let out = process_with_policy(family.as_ref(), input, &policy).unwrap();
         server.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
@@ -231,9 +229,15 @@ mod tests {
         assert_eq!(out.items.len(), n);
         assert_eq!(out.input_ids.len(), 4 * n);
 
-        let err = add_media_bytes(MAX_REQUEST_BYTES / 2, (MAX_REQUEST_BYTES / 2 + 1) as usize)
-            .unwrap_err();
-        assert!(err.contains("total media bytes"), "{err}");
+        let budget = fetch::ByteBudget::new(MAX_REQUEST_BYTES);
+        budget
+            .charge_existing((MAX_REQUEST_BYTES / 2) as usize, "image")
+            .unwrap();
+        assert!(
+            budget
+                .charge_existing((MAX_REQUEST_BYTES / 2 + 1) as usize, "image")
+                .is_err()
+        );
     }
 
     #[test]

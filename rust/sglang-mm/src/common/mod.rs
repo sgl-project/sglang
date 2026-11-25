@@ -157,8 +157,15 @@ mod python {
 
     #[pyfunction]
     pub fn fetch_bytes<'py>(py: Python<'py>, source: String) -> PyResult<Bound<'py, PyBytes>> {
+        let policy = super::fetch::python_media_policy(py)?;
         let data = py
-            .detach(move || super::fetch::fetch_bytes(&source))
+            .detach(move || {
+                super::fetch::fetch_with_policy(
+                    &source,
+                    &super::fetch::ByteBudget::new(crate::driver::MAX_REQUEST_BYTES),
+                    &policy,
+                )
+            })
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(PyBytes::new(py, &data))
     }

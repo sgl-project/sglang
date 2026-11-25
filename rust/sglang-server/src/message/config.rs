@@ -23,6 +23,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sglang_mm::common::fetch::MediaPolicy;
 
 /// Python's `--grpc-response-timeout-secs` default.
 pub const DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS: u64 = 300;
@@ -229,6 +230,7 @@ pub struct ServerArgs {
     /// configured order: Python checks them in that order and reports the first
     /// one exceeded. Empty means no per-modality limit.
     pub limit_mm_data_per_request: Vec<(String, usize)>,
+    pub media_policy: MediaPolicy,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
@@ -329,6 +331,7 @@ impl ServerArgs {
         lora_ids,
         enable_strict_thinking,
         limit_mm_data_per_request,
+        allowed_media_domains, allow_private_media_hosts, allow_local_media_files, media_max_file_bytes, media_url_timeout,
         allow_auto_truncate,
         enable_return_hidden_states,
         return_hidden_states_mode,
@@ -396,6 +399,11 @@ impl ServerArgs {
         lora_ids: BTreeMap<String, String>,
         enable_strict_thinking: bool,
         limit_mm_data_per_request: Vec<(String, usize)>,
+        allowed_media_domains: Vec<String>,
+        allow_private_media_hosts: bool,
+        allow_local_media_files: bool,
+        media_max_file_bytes: u64,
+        media_url_timeout: Option<std::time::Duration>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
         return_hidden_states_mode: Option<String>,
@@ -461,6 +469,13 @@ impl ServerArgs {
             lora_ids,
             enable_strict_thinking,
             limit_mm_data_per_request,
+            media_policy: MediaPolicy {
+                domains: allowed_media_domains,
+                allow_private: allow_private_media_hosts,
+                allow_local: allow_local_media_files,
+                max_file_bytes: media_max_file_bytes,
+                timeout: media_url_timeout,
+            },
             allow_auto_truncate,
             enable_return_hidden_states,
             return_hidden_states_mode,
@@ -533,6 +548,7 @@ impl Default for ServerArgs {
             lora_ids: BTreeMap::new(),
             enable_strict_thinking: false,
             limit_mm_data_per_request: Vec::new(),
+            media_policy: Default::default(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
             return_hidden_states_mode: None,

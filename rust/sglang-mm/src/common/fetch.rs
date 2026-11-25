@@ -1,22 +1,83 @@
 //! Stage 1 of the server MM pipeline: resolve one media source to raw bytes.
 //!
 //! Mirrors the Python `get_image_bytes` source handling (and its precedence):
-//! raw bytes, `http(s)://` (bounded download, `REQUEST_TIMEOUT` and the proxy
-//! env vars like Python), `file://` / absolute path, `data:` URL, else bare
+//! raw bytes, `http(s)://` (bounded direct download), local files, `data:` URL, else bare
 //! base64.
 
-use std::io::Read;
-use std::sync::OnceLock;
-
 use base64::Engine;
+use std::io::Read;
+use std::net::{IpAddr, ToSocketAddrs};
+use std::time::{Duration, Instant};
+use url::Url;
 
-/// Cap on one remotely fetched payload. Inline base64 and trusted local files
-/// use their caller's whole-request budget instead.
+#[derive(Clone, Debug)]
+pub struct MediaPolicy {
+    pub domains: Vec<String>,
+    pub allow_private: bool,
+    pub allow_local: bool,
+    pub max_file_bytes: u64,
+    pub timeout: Option<Duration>,
+}
+
+impl Default for MediaPolicy {
+    fn default() -> Self {
+        Self {
+            domains: Vec::new(),
+            allow_private: false,
+            allow_local: true,
+            max_file_bytes: MAX_FETCH_BYTES,
+            timeout: None,
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn python_media_policy(py: pyo3::Python<'_>) -> pyo3::PyResult<MediaPolicy> {
+    use pyo3::prelude::*;
+    let config = py
+        .import("sglang.srt.multimodal.media_io")?
+        .call_method0("media_url_security_config")?;
+    let (domains, megabytes, seconds, allow_local, allow_private): (
+        Vec<String>,
+        u64,
+        Option<f64>,
+        bool,
+        bool,
+    ) = config.extract()?;
+    let timeout = seconds
+        .map(Duration::try_from_secs_f64)
+        .transpose()
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("Invalid media timeout"))?;
+    Ok(MediaPolicy {
+        domains,
+        allow_private,
+        allow_local,
+        max_file_bytes: megabytes.saturating_mul(1 << 20),
+        timeout,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct AddressPolicy {
+    exceptions: Vec<ipnet::IpNet>,
+    excluded: Vec<ipnet::IpNet>,
+    unicast: Vec<ipnet::IpNet>,
+}
+
+fn public_address(ip: IpAddr) -> bool {
+    static NETWORKS: std::sync::LazyLock<AddressPolicy> = std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!(
+            "../../../../python/sglang/srt/multimodal/media_networks.json"
+        ))
+        .expect("valid bundled media address policy")
+    });
+    let ip = ip.to_canonical();
+    let matches = |nets: &[ipnet::IpNet]| nets.iter().any(|net| net.contains(&ip));
+    matches(&NETWORKS.exceptions) || (matches(&NETWORKS.unicast) && !matches(&NETWORKS.excluded))
+}
+
+/// Default byte limit for one remote or local media file.
 pub const MAX_FETCH_BYTES: u64 = 64 << 20;
-
-/// Charge granularity of a streaming read: the most an in-flight source can
-/// over-charge a shared [`ByteBudget`] by.
-const CHUNK_BYTES: u64 = 256 << 10;
 
 /// A byte allowance shared by every source of one request, charged *as they
 /// stream*, so concurrent fetches stop at their combined size rather than each
@@ -62,32 +123,52 @@ pub fn fetch_bytes(src: &str) -> Result<Vec<u8>, String> {
     fetch_bytes_budgeted(src, &ByteBudget::new(MAX_FETCH_BYTES))
 }
 
-/// Read a trusted local media path without applying the per-source remote cap.
-///
-/// Python's media security limit is specifically a URL-download limit. Local
-/// video fixtures and mounted production assets are commonly larger than 64
-/// MiB, so applying [`MAX_FETCH_BYTES`] to them breaks requests which the Python
-/// frontend accepts. They still consume the caller's whole-request budget.
-/// Reject non-regular files and charge their size before reading so a request
-/// cannot turn devices or a huge sparse file into an unbounded allocation.
-pub fn fetch_local_file_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
-    let path = src.strip_prefix("file://").unwrap_or(src);
-    let file = std::fs::File::open(path).map_err(|e| format!("media fetch: {path}: {e}"))?;
+fn fetch_local_with_policy(
+    src: &str,
+    budget: &ByteBudget,
+    policy: &MediaPolicy,
+) -> Result<Vec<u8>, String> {
+    if !policy.allow_local {
+        return Err("Local media files are not allowed".into());
+    }
+    let path = if src.starts_with("file://") {
+        Url::parse(src)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .ok_or("Invalid local media URL")?
+    } else {
+        std::path::PathBuf::from(src)
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("media fetch: open local file: {}", e.kind()))?;
     let metadata = file
         .metadata()
-        .map_err(|e| format!("media fetch: stat {path}: {e}"))?;
+        .map_err(|e| format!("media fetch: stat local file: {e}"))?;
     if !metadata.is_file() {
-        return Err(format!("media fetch: {path}: not a regular file"));
+        return Err("media fetch: not a regular file".into());
     }
     let expected = metadata.len();
-    budget.claim(expected).map_err(|()| over_budget(path))?;
+    if policy.max_file_bytes != 0 && expected > policy.max_file_bytes {
+        return Err("Local media exceeds the file size limit".into());
+    }
+    budget
+        .claim(expected)
+        .map_err(|()| over_budget("local file"))?;
     let mut buf = Vec::with_capacity(usize::try_from(expected).unwrap_or(usize::MAX));
     let read = file
         .take(expected.saturating_add(1))
         .read_to_end(&mut buf)
-        .map_err(|e| format!("media fetch: read {path}: {e}"))? as u64;
+        .map_err(|e| format!("media fetch: read local file: {e}"))? as u64;
     if read > expected {
-        return Err(format!("media fetch: {path}: changed size while reading"));
+        return Err("media fetch: local file changed size while reading".into());
     }
     budget.release(expected - read);
     Ok(buf)
@@ -97,14 +178,21 @@ pub fn fetch_local_file_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u
 /// sources under one whole-request bound. [`MAX_FETCH_BYTES`] still caps I/O
 /// streams; already-resident base64 is bounded by `budget`.
 pub fn fetch_bytes_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
+    fetch_with_policy(src, budget, &MediaPolicy::default())
+}
+
+pub fn fetch_with_policy(
+    src: &str,
+    budget: &ByteBudget,
+    policy: &MediaPolicy,
+) -> Result<Vec<u8>, String> {
     if src.starts_with("http://") || src.starts_with("https://") {
-        return http_get(src, budget);
+        return http_get(src, budget, policy);
     }
-    if let Some(path) = src.strip_prefix("file://") {
-        return read_file(path, budget);
-    }
-    if src.starts_with('/') {
-        return read_file(src, budget);
+    if src.starts_with("file://")
+        || src.starts_with('/') && policy.allow_local && std::path::Path::new(src).exists()
+    {
+        return fetch_local_with_policy(src, budget, policy);
     }
     if let Some(rest) = src.strip_prefix("data:") {
         let encoded = rest
@@ -158,78 +246,22 @@ fn over_budget(what: &str) -> String {
     format!("media fetch: {what}: exceeds the request media byte budget")
 }
 
-/// Bounded read: never trusts metadata, so huge and non-regular files
-/// (`/dev/zero`) hit the cap instead of exhausting memory.
-fn read_file(path: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("media fetch: {path}: {e}"))?;
-    read_capped(file, path, budget)
-}
-
-/// Read to EOF, charging `budget` per chunk, so an oversized source stops
-/// mid-stream instead of going fully resident first.
-fn read_capped(mut reader: impl Read, what: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
-    let too_big = || format!("media fetch: {what}: exceeds {MAX_FETCH_BYTES} bytes");
+fn read_capped(mut reader: impl Read, budget: &ByteBudget, limit: u64) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
+    let mut chunk = [0u8; 64 << 10];
     loop {
-        // `+ 1`: read one byte past the cap, so oversized is detected, not truncated.
-        let want = CHUNK_BYTES.min(MAX_FETCH_BYTES + 1 - buf.len() as u64);
-        if want == 0 {
-            return Err(too_big());
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("media fetch: response read: {e}"))?;
+        if n == 0 {
+            return Ok(buf);
         }
-        budget.claim(want).map_err(|()| over_budget(what))?;
-        let read = reader
-            .by_ref()
-            .take(want)
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("media fetch: read {what}: {e}"))? as u64;
-        budget.release(want - read);
-        if buf.len() as u64 > MAX_FETCH_BYTES {
-            return Err(too_big());
+        if limit != 0 && (buf.len() + n) as u64 > limit {
+            return Err(format!("media fetch: response exceeds {limit} bytes"));
         }
-        if read < want {
-            return Ok(buf); // short read == EOF
-        }
+        budget.charge_existing(n, "response")?;
+        buf.extend_from_slice(&chunk[..n]);
     }
-}
-
-/// Shared pooled agent honoring `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, as the
-/// Python `requests` session does.
-fn http_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| ureq::AgentBuilder::new().try_proxy_from_env(true).build())
-}
-
-/// Companion agent that ignores the proxy env vars, for hosts matched by
-/// `NO_PROXY`. ureq has no `NO_PROXY` support of its own, and silently sending
-/// an internal image host through a corporate proxy breaks deployments that
-/// work on the Python path, so the match is applied here.
-fn direct_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| ureq::AgentBuilder::new().build())
-}
-
-/// The host component of an `http(s)://` URL (lowercased, without userinfo)
-/// plus its explicit port, if any — what `NO_PROXY` entries are matched
-/// against.
-fn host_port_of(url: &str) -> Option<(String, Option<u16>)> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    // Bracketed IPv6 literal, else split off a trailing `:port`.
-    let (host, port) = match host.strip_prefix('[') {
-        Some(v6) => match v6.split_once(']') {
-            Some((h, p)) => (h, p.strip_prefix(':')),
-            None => (v6, None),
-        },
-        None => match host.split_once(':') {
-            Some((h, p)) => (h, Some(p)),
-            None => (host, None),
-        },
-    };
-    let port = port.and_then(|p| p.parse().ok());
-    (!host.is_empty()).then(|| (host.to_ascii_lowercase(), port))
 }
 
 fn bypasses_proxy(host: &str, port: Option<u16>) -> bool {
@@ -280,22 +312,84 @@ fn in_ipv4_network(ip: std::net::Ipv4Addr, net: std::net::Ipv4Addr, bits: u32) -
     u32::from(ip) & mask == u32::from(net) & mask
 }
 
-fn http_get(url: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
-    // Python: `int(os.getenv("REQUEST_TIMEOUT", "3"))` seconds per image GET.
-    let timeout = std::env::var("REQUEST_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(3);
-    let agent = match host_port_of(url) {
-        Some((host, port)) if bypasses_proxy(&host, port) => direct_agent(),
-        _ => http_agent(),
-    };
-    let resp = agent
-        .get(url)
-        .timeout(std::time::Duration::from_secs(timeout))
-        .call()
-        .map_err(|e| format!("media fetch: GET {url}: {e}"))?;
-    read_capped(resp.into_reader(), url, budget)
+fn http_get(source: &str, budget: &ByteBudget, policy: &MediaPolicy) -> Result<Vec<u8>, String> {
+    let mut url = Url::parse(source).map_err(|_| "Invalid media URL")?;
+    let timeout = policy.timeout.unwrap_or_else(|| {
+        Duration::from_secs(
+            std::env::var("REQUEST_TIMEOUT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(3),
+        )
+    });
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("Invalid media timeout")?;
+    for _ in 0..=5 {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("Expected an HTTP(S) media URL".into());
+        }
+        let host = url
+            .host_str()
+            .ok_or("Missing media host")?
+            .trim_matches(['[', ']'])
+            .trim_end_matches('.');
+        let listed = policy.domains.iter().any(|d| d == host);
+        if !policy.domains.is_empty() && !listed {
+            return Err("Media URL domain is not allowed".into());
+        }
+        let proxy_key = format!("{}_proxy", url.scheme());
+        if !bypasses_proxy(host, url.port())
+            && [
+                &proxy_key[..],
+                &proxy_key.to_ascii_uppercase(),
+                "all_proxy",
+                "ALL_PROXY",
+            ]
+            .iter()
+            .any(|key| std::env::var(key).is_ok_and(|v| !v.is_empty()))
+        {
+            return Err("Pinned media connections require a direct route; configure NO_PROXY for the media origin".into());
+        }
+        let port = url.port_or_known_default().ok_or("Missing media port")?;
+        let addresses: Vec<_> = (host, port)
+            .to_socket_addrs()
+            .map_err(|_| "Could not resolve media host")?
+            .collect();
+        if addresses.is_empty()
+            || (!listed
+                && !policy.allow_private
+                && addresses.iter().any(|addr| !public_address(addr.ip())))
+        {
+            return Err("Media address is not permitted".into());
+        }
+        // This agent serves exactly one hop. TLS and Host use the original
+        // URL while the connector receives only the approved socket addresses.
+        let agent = ureq::AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .redirects(0)
+            .resolver(move |_: &str| Ok(addresses.clone()))
+            .build();
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("Media fetch timed out")?;
+        let response = agent
+            .get(url.as_str())
+            .timeout(remaining)
+            .call()
+            .map_err(|e| match e {
+                ureq::Error::Status(code, _) => format!("media fetch: HTTP {code}"),
+                ureq::Error::Transport(t) => format!("media fetch: {}", t.kind()),
+            })?;
+        if matches!(response.status(), 301 | 302 | 303 | 307 | 308)
+            && let Some(location) = response.header("Location")
+        {
+            url = url.join(location).map_err(|_| "Invalid media redirect")?;
+            continue;
+        }
+        return read_capped(response.into_reader(), budget, policy.max_file_bytes);
+    }
+    Err("Too many media redirects".into())
 }
 
 #[cfg(test)]
@@ -325,17 +419,10 @@ mod tests {
 
     #[test]
     fn trusted_local_reader_rejects_non_regular_files() {
-        let err = fetch_local_file_budgeted("/dev/zero", &ByteBudget::new(1024))
+        let err = fetch_with_policy("/dev/zero", &ByteBudget::new(1024), &MediaPolicy::default())
             .err()
             .unwrap();
         assert!(err.contains("not a regular file"), "{err}");
-    }
-
-    /// A non-regular file must hit the byte cap, not exhaust memory.
-    #[test]
-    fn unbounded_file_capped() {
-        let err = fetch_bytes("/dev/zero").err().unwrap();
-        assert!(err.contains("exceeds"), "{err}");
     }
 
     /// The convenience API keeps its 64 MiB budget, while a server request may
@@ -373,14 +460,13 @@ mod tests {
         assert!(err.contains("request media byte budget"), "{err}");
     }
 
-    /// Unused claims come back, so small sources fit in a budget their
-    /// worst-case sizes would have exhausted.
+    /// Small local files consume exactly their size.
     #[test]
-    fn short_reads_release_their_claim() {
+    fn exact_local_sizes_share_the_budget() {
         let path = std::env::temp_dir().join(format!("sglang-budget-{}", std::process::id()));
         std::fs::write(&path, [0u8; 1024]).unwrap();
         let src = path.display().to_string();
-        let budget = ByteBudget::new(CHUNK_BYTES + 4096);
+        let budget = ByteBudget::new(4 * 1024);
         for _ in 0..4 {
             assert_eq!(fetch_bytes_budgeted(&src, &budget).unwrap().len(), 1024);
         }
@@ -391,29 +477,10 @@ mod tests {
     #[test]
     fn per_source_cap_survives_a_large_budget() {
         let budget = ByteBudget::new(MAX_FETCH_BYTES * 4);
-        let err = fetch_bytes_budgeted("/dev/zero", &budget).err().unwrap();
+        let err = read_capped(std::io::repeat(0), &budget, MAX_FETCH_BYTES)
+            .err()
+            .unwrap();
         assert!(err.contains(&format!("exceeds {MAX_FETCH_BYTES}")), "{err}");
-    }
-
-    #[test]
-    fn host_parsing_strips_userinfo_and_path() {
-        assert_eq!(
-            host_port_of("http://Example.COM/a/b.png").unwrap(),
-            ("example.com".into(), None)
-        );
-        assert_eq!(
-            host_port_of("https://u:p@images.internal:8443/x").unwrap(),
-            ("images.internal".into(), Some(8443))
-        );
-        assert_eq!(
-            host_port_of("http://[::1]:8080/x.png").unwrap(),
-            ("::1".into(), Some(8080))
-        );
-        assert_eq!(
-            host_port_of("http://host?q=1").unwrap(),
-            ("host".into(), None)
-        );
-        assert!(host_port_of("data:image/png;base64,AAA").is_none());
     }
 
     /// `NO_PROXY` must bypass the proxy for exact hosts and subdomains but not
@@ -488,7 +555,15 @@ mod tests {
 
         let (addr, handle) = serve(b"tiny image".to_vec(), 10);
         assert_eq!(
-            fetch_bytes(&format!("http://{addr}/img.png")).unwrap(),
+            fetch_with_policy(
+                &format!("http://{addr}/img.png"),
+                &ByteBudget::new(MAX_FETCH_BYTES),
+                &MediaPolicy {
+                    allow_private: true,
+                    ..Default::default()
+                }
+            )
+            .unwrap(),
             b"tiny image"
         );
         handle.join().unwrap();
@@ -496,9 +571,16 @@ mod tests {
         // A response over the cap is rejected without buffering it all.
         let over = MAX_FETCH_BYTES + 2;
         let (addr, handle) = serve(vec![0u8; over as usize], over);
-        let err = fetch_bytes(&format!("http://{addr}/big.png"))
-            .err()
-            .unwrap();
+        let err = fetch_with_policy(
+            &format!("http://{addr}/big.png"),
+            &ByteBudget::new(MAX_FETCH_BYTES + 10),
+            &MediaPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap();
         assert!(err.contains("exceeds"), "{err}");
         drop(handle); // server thread may die on the closed socket; don't join
     }
