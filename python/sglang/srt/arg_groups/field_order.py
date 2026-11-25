@@ -588,5 +588,10 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_boundary_decay_start_chunks",
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
+    "prefill_delayer_mode",
+    "prefill_delayer_fill_ratio",
+    "prefill_delayer_stall_ticks",
+    "prefill_delayer_ttft_ticks",
+    "prefill_delayer_kv_high_watermark",
 )
 # fmt: on

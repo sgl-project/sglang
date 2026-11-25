@@ -36,6 +36,7 @@ class TestPrefillDelayerHighWatermark(CustomTestCase):
         delayer.num_dp_ranks = 1
         delayer._metrics_collector = None
         delayer._debug_log_enabled = False
+        delayer.coalesce = False
         delayer._negotiate_should_allow_prefill.return_value = _NegotiateOutput(
             next_state=None,
             input_estimation="all",
