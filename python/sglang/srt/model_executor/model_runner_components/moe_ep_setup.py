@@ -146,7 +146,6 @@ def _get_lplb_allreduce_group(ep_group) -> Optional[torch.distributed.ProcessGro
 
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
-    from sglang.srt.runtime_context import get_parallel
 
     # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
     # don't participate in the EP all-reduce (would deadlock under DP-
