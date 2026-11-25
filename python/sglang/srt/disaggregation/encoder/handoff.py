@@ -368,6 +368,8 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                         if len(layout.identities) > 1
                         else tuple(layout.timestamps)
                     )
+                    if layout.second_per_grid_ts is not None:
+                        timing = (timing, layout.second_per_grid_ts)
                 else:
                     timing = tuple(layout.original_size)
                 cache_identity = structured_digest(

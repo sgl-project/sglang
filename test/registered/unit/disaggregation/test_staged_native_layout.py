@@ -1,6 +1,7 @@
 """CPU coverage of metadata-only P/D reconstruction for native staged models."""
 
 import re
+from array import array
 from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     WaitingStagedImage,
     WaitingStagedNixlImage,
 )
+from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.inkling2.processor import Inkling2MultimodalProcessor
 from sglang.srt.multimodal.modality import Modality
@@ -419,6 +421,69 @@ def test_audio_only_native_layout(model, cls, raw_lens, rows):
         )
 
 
+def qwen3_omni_processor():
+    p = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+    p.model_type = "qwen3_omni_moe"
+    p.hf_config = SimpleNamespace(
+        model_type="qwen3_omni_moe_thinker",
+        audio_token_id=12,
+        position_id_per_seconds=25,
+    )
+    p._spatial_merge_size, p._tokens_per_second = 2, 25
+    p.IM_START_TOKEN_ID, p.IM_END_TOKEN_ID, p.IM_TOKEN_ID, p.VIDEO_TOKEN_ID = (
+        7,
+        9,
+        8,
+        10,
+    )
+    p.vision_start_token_id, p.audio_token_id, p.audio_start_token_id = 7, 12, 11
+    p.mm_tokens = SimpleNamespace(
+        image_token_id=8, video_token_id=10, audio_token_id=12
+    )
+    return p
+
+
+def test_native_video_grid_interval_changes_prefix_cache_key():
+    p = qwen3_omni_processor()
+    audio = torch.ones(2, 2)
+    video = torch.ones(2, 4)
+    prompt = [7, 10, 9, 11, 12, 13]
+    data = descriptor(
+        p.model_type,
+        [],
+        [
+            dict(
+                t=2,
+                h=2,
+                w=2,
+                embedding_rows=2,
+                identities=[identity(Modality.VIDEO, video)],
+            )
+        ],
+    )
+    data.update(version=4, embedding_width=4, audios=[audio_layout(audio, 9)])
+    packed = torch.cat((video.reshape(-1, 1), audio.reshape(-1, 1)))
+
+    def receive(interval):
+        data["videos"][0]["second_per_grid_ts"] = interval
+        handoff = EncoderHandoff.parse(msgspec.json.encode(data), 0, 1, 1)
+        layout = check_audio_receive(handoff, p, prompt, packed, [audio])
+        return layout, pad_mm_tokens(array("q", layout.input_ids), layout)
+
+    first, first_ids = receive(1.0)
+    second, second_ids = receive(2.0)
+    assert first.input_ids == second.input_ids
+    assert not torch.equal(first.mrope_positions, second.mrope_positions)
+    first_video, first_audio = first.mm_items
+    second_video, second_audio = second.mm_items
+    assert first_video.cache_key != second_video.cache_key
+    assert first_audio.cache_key == second_audio.cache_key
+    start, end = first_video.offsets[0]
+    assert first_ids[:start] == second_ids[:start]
+    assert first_ids[start : end + 1] != second_ids[start : end + 1]
+    assert first_ids[end + 1 :] == second_ids[end + 1 :]
+
+
 @pytest.mark.parametrize("model", ["qwen3_omni_moe", "dots3_note"])
 def test_interleaved_audio_vision(model):
     audio = torch.arange(4, dtype=torch.float32).reshape(2, 2)
@@ -434,24 +499,7 @@ def test_interleaved_audio_vision(model):
         audios=[audio_layout(audio, 9 if width == 4 else 2)],
     )
     if model == "qwen3_omni_moe":
-        p = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
-        p.model_type = model
-        p.hf_config = SimpleNamespace(
-            model_type="qwen3_omni_moe_thinker",
-            audio_token_id=12,
-            position_id_per_seconds=25,
-        )
-        p._spatial_merge_size, p._tokens_per_second = 2, 25
-        p.IM_START_TOKEN_ID, p.IM_END_TOKEN_ID, p.IM_TOKEN_ID, p.VIDEO_TOKEN_ID = (
-            7,
-            9,
-            8,
-            10,
-        )
-        p.vision_start_token_id, p.audio_token_id, p.audio_start_token_id = 7, 12, 11
-        p.mm_tokens = SimpleNamespace(
-            image_token_id=8, video_token_id=10, audio_token_id=12
-        )
+        p = qwen3_omni_processor()
     else:
         p = DotsNoteOmniProcessor.__new__(DotsNoteOmniProcessor)
         p.hf_config = SimpleNamespace(model_type=model)
