@@ -51,6 +51,9 @@ or a daily build tag (e.g., `main-cann9.1.0-a3`) if you need the latest developm
 If you have already downloaded model weights to a local path (e.g., `/path/to/model`), mount the path into the container by
 adding `--volume /path/to/model:/path/to/model` to the `docker run` command below.
 
+The command requires [Ascend Docker Runtime](/docs/hardware-platforms/ascend-npus/getting-started/installation#install-ascend-docker-runtime)
+on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
+
 <Tabs>
   <Tab title="A3 Series">
 
@@ -58,17 +61,11 @@ adding `--volume /path/to/model:/path/to/model` to the `docker run` command belo
 export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
-    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
-    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
-    --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
-    --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
-    --device=/dev/davinci_manager \
-    --device=/dev/hisi_hdc \
+    --env ASCEND_VISIBLE_DEVICES=0-15 \
     --volume /usr/local/sbin:/usr/local/sbin \
     --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
-    --volume /var/queue_schedule:/var/queue_schedule \
     --volume ~/.cache/:/root/.cache/ \
     --entrypoint=bash \
     $IMAGE
