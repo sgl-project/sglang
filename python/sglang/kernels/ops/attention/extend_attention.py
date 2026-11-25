@@ -1319,6 +1319,10 @@ def _fwd_kernel_unified(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    LSE=None,
+    stride_lse_bs=0,
+    stride_lse_h=0,
+    STORE_LSE: tl.constexpr = False,
 ):
     """
     Unified 1-stage kernel for deterministic extend attention.
@@ -1593,6 +1597,13 @@ def _fwd_kernel_unified(
         cur_sink = tl.load(sink_ptr + cur_head)
         deno += tl.exp(cur_sink - e_max)
 
+    if STORE_LSE:
+        offs_lse = (
+            cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m
+        ) * stride_lse_bs + cur_head * stride_lse_h
+        lse = tl.where(deno == 0.0, float("-inf"), tl.log(deno) + e_max)
+        tl.store(LSE + offs_lse, lse, mask=mask_m)
+
     # Store output
     offs_o = (
         (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None]) * stride_obs
@@ -1630,6 +1641,7 @@ def extend_attention_fwd_unified(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    lse=None,
 ):
     """
     Unified 1-stage extend attention for deterministic inference.
@@ -1749,6 +1761,10 @@ def extend_attention_fwd_unified(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        LSE=lse,
+        stride_lse_bs=lse.stride(0) if lse is not None else 0,
+        stride_lse_h=lse.stride(1) if lse is not None else 0,
+        STORE_LSE=lse is not None,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,

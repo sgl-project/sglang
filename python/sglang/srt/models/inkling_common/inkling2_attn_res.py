@@ -2,6 +2,8 @@ import msgspec
 import torch
 from torch import nn
 
+from sglang.srt.runtime_context import get_platform
+
 
 def block_attn_res(
     blocks: list[torch.Tensor],
@@ -17,6 +19,20 @@ def block_attn_res(
     partial_addend = None
     if isinstance(partial_block, tuple):
         partial_block, partial_addend = partial_block
+    if get_platform().is_hip and partial_block is not None:
+        from sglang.kernels.ops.layernorm.inkling2_norm_hip import (
+            attn_res as attn_res_hip,
+        )
+
+        sources = [*blocks, partial_block]
+        return attn_res_hip(
+            sources,
+            partial_addend,
+            scaled_queries.view(queries.shape)
+            if scaled_queries is not None
+            else queries.float() * (sources[0].shape[-1] ** -0.5),
+            normalize_values=normalize_values,
+        )
     sources = [*blocks, partial_block] if partial_block is not None else list(blocks)
     hidden_size = sources[0].shape[-1]
     assert queries.shape[-1] == hidden_size
