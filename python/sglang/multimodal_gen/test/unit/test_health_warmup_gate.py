@@ -204,6 +204,8 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
             args = SimpleNamespace(
                 enable_metrics=False,
                 media_gateway_key_file=None,
+                api_key=None,
+                admin_api_key=None,
                 warmup_mode="off",
                 progress_endpoint=None,
                 cancel_endpoint=None,
@@ -242,6 +244,8 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         args = SimpleNamespace(
             enable_metrics=False,
             media_gateway_key_file=None,
+            api_key=None,
+            admin_api_key=None,
             pipeline_config=mock.Mock(
                 supports_action_endpoint=lambda: False,
                 supports_openpi_endpoint=lambda: False,
@@ -276,6 +280,8 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         args = SimpleNamespace(
             enable_metrics=False,
             media_gateway_key_file=None,
+            api_key=None,
+            admin_api_key=None,
             pipeline_config=mock.Mock(
                 supports_action_endpoint=lambda: False,
                 supports_openpi_endpoint=lambda: False,

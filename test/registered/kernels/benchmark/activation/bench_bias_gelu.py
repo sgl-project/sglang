@@ -25,7 +25,7 @@ FN_MAP = {
     [(4096, 13824), (32760, 5120), (32760, 13824)],
     [(4096, 13824)],
 )
-@marker.benchmark("impl", ["jit", "torch"])
+@marker.benchmark("impl", ["jit", "torch"], gate=["jit"])
 def benchmark(rows: int, hidden_dim: int, impl: str):
     input = torch.randn(rows, hidden_dim, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(hidden_dim, dtype=torch.bfloat16, device="cuda")

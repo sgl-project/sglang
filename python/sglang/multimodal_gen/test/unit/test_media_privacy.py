@@ -144,6 +144,8 @@ def test_media_http_ownership_and_private_cache(tmp_path, scoped, gateway_key):
 
     args = SimpleNamespace(
         enable_metrics=False,
+        api_key=None,
+        admin_api_key=None,
         media_gateway_key_file=gateway_key[0] if scoped else None,
         pipeline_config=SimpleNamespace(
             supports_action_endpoint=lambda: False,

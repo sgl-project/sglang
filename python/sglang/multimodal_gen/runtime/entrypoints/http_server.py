@@ -82,6 +82,7 @@ from sglang.srt.observability.http_request_metrics import (
     init_http_request_metrics,
 )
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
+from sglang.srt.utils.auth import add_api_key_middleware
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
@@ -791,6 +792,10 @@ def create_app(
     app.include_router(image_api.router, dependencies=media_dependencies)
     app.include_router(video_api.router, dependencies=media_dependencies)
     app.include_router(mesh_api.router, dependencies=media_dependencies)
+    # Outermost: route levels come from sglang/srt/utils/auth_levels.json.
+    add_api_key_middleware(
+        app, get_keys=lambda: (server_args.api_key, server_args.admin_api_key)
+    )
 
     app.state.server_args = server_args
     app.state.prompt_enhancer = None
