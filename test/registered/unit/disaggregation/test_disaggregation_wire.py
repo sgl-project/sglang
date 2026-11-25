@@ -2373,6 +2373,7 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
             attn_tp_size=prefill_tp,
             attn_cp_size=1,
             pp_size=1,
+            dcp_size=1,
             enable_kv_cache_sharding=False,
         )
         decode._resolve_rank_mapping(info)

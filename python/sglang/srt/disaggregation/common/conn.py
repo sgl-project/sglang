@@ -702,9 +702,7 @@ class CommonKVManager(BaseKVManager):
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:
             if self.dcp_rank != dst_dcp_rank:
-                # Hybrid-MLA can pair a decode rank with a non-matching prefill
-                # DCP rank to fetch its TP-sharded linear-attention state; the
-                # DCP transfer plan emits zero KV rows for that peer.
+                # A hybrid-MLA state-only peer gets no KV rows from the plan.
                 if self.is_hybrid_mla_backend and self.dcp_size > 1:
                     return True
                 raise RuntimeError(
@@ -755,7 +753,7 @@ class CommonKVManager(BaseKVManager):
                 f"prefill entry: src={num_entries} (draft={num_draft}), "
                 f"dst={len(dst_page_item_lens)}"
             )
-        src_draft_collapsed = getattr(self.kv_args, "draft_rows_dcp_collapsed", False)
+        src_draft_collapsed = self.kv_args.draft_rows_dcp_collapsed
         src_token_lens = [
             item_len
             // (
@@ -1750,16 +1748,15 @@ class CommonKVManager(BaseKVManager):
                     f"state types {[st.value for st in block_scale_states]}."
                 )
 
-        prefill_dcp_size = getattr(info, "dcp_size", 1)
-        if self.dcp_size > 1 or prefill_dcp_size > 1:
+        if self.dcp_size > 1 or info.dcp_size > 1:
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):
                 raise RuntimeError("PD DCP requires an MLA or hybrid-MLA KV pool.")
-            if prefill_dcp_size != self.dcp_size and (
-                self.dcp_size % prefill_dcp_size != 0
-                and prefill_dcp_size % self.dcp_size != 0
+            if info.dcp_size != self.dcp_size and (
+                self.dcp_size % info.dcp_size != 0
+                and info.dcp_size % self.dcp_size != 0
             ):
                 raise RuntimeError(
-                    f"Unsupported PD DCP topology: {prefill_dcp_size} -> {self.dcp_size}"
+                    f"Unsupported PD DCP topology: {info.dcp_size} -> {self.dcp_size}"
                 )
             if info.attn_cp_size != 1:
                 raise RuntimeError(
@@ -1863,9 +1860,7 @@ class CommonKVManager(BaseKVManager):
             target_tp_ranks = list(range(info.attn_tp_size))
             required_dst_info_num = self.attn_tp_size
             required_prefill_response_num = info.attn_tp_size
-        elif getattr(info, "dcp_size", 1) > 1 and (
-            self.is_mla_backend or self.is_hybrid_mla_backend
-        ):
+        elif info.dcp_size > 1 and (self.is_mla_backend or self.is_hybrid_mla_backend):
             (
                 target_tp_ranks,
                 real_tp_ranks,
@@ -2927,6 +2922,7 @@ class CommonKVSender(BaseKVSender):
 
 
 class CommonKVReceiver(BaseKVReceiver):
+    prefill_info: Optional[PrefillServerInfo] = None
     _prefill_wait_start: Optional[float] = None
     _owns_bootstrap_room: bool = True
     _lifecycle_lock = nullcontext()
@@ -3092,7 +3088,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            prefill_info = getattr(self, "prefill_info", None)
+                            prefill_info = self.prefill_info
                             if (
                                 prefill_info is not None
                                 and prefill_info.real_tp_ranks is not None

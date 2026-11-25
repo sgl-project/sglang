@@ -1911,9 +1911,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             draft_rows_collapsed=draft_rows_collapsed,
             src_dcp_size=self.dcp_size,
             src_dcp_rank=self.dcp_rank,
-            src_draft_rows_collapsed=getattr(
-                self.kv_args, "draft_rows_dcp_collapsed", False
-            ),
+            src_draft_rows_collapsed=self.kv_args.draft_rows_dcp_collapsed,
         )
         if plan.empty():
             return 0
@@ -2109,7 +2107,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 plan.draft_src_token_indices, plan.draft_dst_token_indices
             )
         )
-        src_draft_collapsed = getattr(self.kv_args, "draft_rows_dcp_collapsed", False)
+        src_draft_collapsed = self.kv_args.draft_rows_dcp_collapsed
         send_replicated = (
             draft_rows_collapsed
             or src_draft_collapsed

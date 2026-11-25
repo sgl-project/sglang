@@ -1936,11 +1936,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                         draft_rows_collapsed=dst_info.dst_draft_rows_dcp_collapsed,
                                         src_dcp_size=self.dcp_size,
                                         src_dcp_rank=self.dcp_rank,
-                                        src_draft_rows_collapsed=getattr(
-                                            self.kv_args,
-                                            "draft_rows_dcp_collapsed",
-                                            False,
-                                        ),
+                                        src_draft_rows_collapsed=self.kv_args.draft_rows_dcp_collapsed,
                                         send_replicated_draft=self._should_send_replicated_dcp_draft(
                                             dst_info.dst_dcp_size,
                                             dst_info.dst_dcp_rank,

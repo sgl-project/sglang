@@ -68,7 +68,12 @@ class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
     def _build_decode_prefix_match(
-        self, req: Req, result: Any, *, max_prefix_len: Optional[int] = None
+        self,
+        req: Req,
+        result: Any,
+        *,
+        max_prefix_len: Optional[int] = None,
+        prefix_align: int = 1,
     ) -> DecodePrefixMatch:
         """Convert a ``match_kv_cache`` result into ``DecodePrefixMatch``.
 
@@ -111,14 +116,27 @@ class DecodeHiCachePreallocMixin:
                     ),
                 )
 
+        if prefix_align > 1:
+            # Floor to prefill's wider virtual DCP page; keep L1+L2 aligned
+            # independently so an L3 decline never leaves an unaligned prefix.
+            l1_l2_excess = (l1_prefix_len + l2_host_hit_length) % prefix_align
+            if l1_l2_excess:
+                trim_l2 = min(l2_host_hit_length, l1_l2_excess)
+                l2_host_hit_length -= trim_l2
+                l1_l2_excess -= trim_l2
+                if l1_l2_excess:
+                    prefix_indices = prefix_indices[: l1_prefix_len - l1_l2_excess]
+                l3_storage_hit_length = 0
+                last_host_node = None
+            else:
+                l3_storage_hit_length -= l3_storage_hit_length % prefix_align
+
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
             l2_host_hit_length=l2_host_hit_length,
             l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
-            last_host_node=(
-                result.last_host_node if l3_storage_hit_length > 0 else None
-            ),
+            last_host_node=(last_host_node if l3_storage_hit_length > 0 else None),
         )
 
     def _start_hicache_prefetch(

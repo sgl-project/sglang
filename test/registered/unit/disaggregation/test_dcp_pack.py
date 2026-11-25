@@ -883,6 +883,52 @@ class TestDcpMToNRelayout(CustomTestCase):
                 is_hybrid_mla=False,
             )
 
+    def test_decode_prefix_floors_to_wider_prefill_dcp_virtual_page(self):
+        from sglang.srt.disaggregation.decode_hicache_mixin import (
+            DecodeHiCachePreallocMixin,
+        )
+
+        # Prefill DCP2 (virtual page 128) -> Decode DCP1 (page 64):
+        # 1. Odd-page L1 hit (192) floors to 128.
+        # 2. Unaligned L1+L2 (64 + 128) trims L2 to 64 and drops L3.
+        # 3. Aligned L1+L2 (128 + 0) keeps L1+L2 and floors L3 (192 -> 128).
+        for l1, l2, l3, exp_l1, exp_l2, exp_l3 in (
+            (192, 0, 0, 128, 0, 0),
+            (64, 128, 64, 64, 64, 0),
+            (128, 0, 192, 128, 0, 128),
+        ):
+            with self.subTest(l1=l1, l2=l2, l3=l3):
+                queue = object.__new__(DecodeHiCachePreallocMixin)
+                queue.scheduler = SimpleNamespace(enable_decode_hicache=l3 > 0)
+                queue.tree_cache = SimpleNamespace(
+                    prefix_device_indices=lambda _req: torch.arange(
+                        l1, dtype=torch.int64
+                    ),
+                    enable_storage=l3 > 0,
+                    is_backuped=lambda _node: True,
+                    is_root=lambda _node: False,
+                    get_last_hash_value=lambda _node: 0,
+                    hicache_storage_pass_prefix_keys=False,
+                    forwards_kv_hint_actions=lambda _hints: False,
+                    query_storage_hit_length=lambda *args, **kwargs: l3,
+                )
+                req = SimpleNamespace(
+                    origin_input_ids=list(range(512)),
+                    extra_key=None,
+                    cache_salt=None,
+                    kv_hints=None,
+                )
+                result = SimpleNamespace(
+                    host_hit_length=l2,
+                    last_device_node="dev",
+                    last_host_node="host",
+                )
+                pm = queue._build_decode_prefix_match(req, result, prefix_align=128)
+                self.assertEqual(pm.l1_prefix_len, exp_l1)
+                self.assertEqual(pm.l2_host_hit_length, exp_l2)
+                self.assertEqual(pm.l3_storage_hit_length, exp_l3)
+                self.assertEqual(pm.decode_prefix_len % 128, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

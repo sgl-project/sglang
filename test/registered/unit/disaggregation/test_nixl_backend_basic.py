@@ -753,6 +753,7 @@ class TestNixlTransferWorker(CustomTestCase):
             kv_data_ptrs=[0x1000],
             page_size=4,
             num_draft_entries=0,
+            draft_rows_dcp_collapsed=False,
             aux_data_ptrs=[0],
             aux_item_lens=[64],
         )
