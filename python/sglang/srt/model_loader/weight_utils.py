@@ -78,6 +78,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.model_loader.gpu_staging import GpuStagingReader
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
@@ -1603,8 +1604,13 @@ def safetensors_weights_iterator(
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
     readers: Optional[CheckpointTensorReaders] = None,
+    gpu_staging: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
+    """Iterate over the weights in the model safetensor files.
+
+    With ``gpu_staging`` (and mmap), tensors are read to the current GPU
+    through pinned buffers and yielded as GPU tensors; see ``gpu_staging.py``.
+    """
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -1618,8 +1624,14 @@ def safetensors_weights_iterator(
             pace=True,
             loader_files=hf_weights_files,
         )
+    stager = None
+    skip = None
+    if readers is not None:
+        skip = lambda name, nbytes: readers.rank_of(name, nbytes) is None
 
     try:
+        if gpu_staging and not disable_mmap:
+            stager = GpuStagingReader()
         for st_file in tqdm(
             hf_weights_files,
             desc="Loading safetensors checkpoint shards",
@@ -1634,6 +1646,8 @@ def safetensors_weights_iterator(
                     result = safetensors.torch.load(f.read())
                     for name in sorted(result.keys()):
                         yield name, result[name]
+            elif stager is not None:
+                yield from stager.read_file(st_file, skip)
             else:
                 yield from _read_tensors(st_file, readers, prefetch_num_threads)
             if drop_cache_after_load:
@@ -1642,6 +1656,9 @@ def safetensors_weights_iterator(
         if prefetch_handle is not None:
             prefetch_handle.cancel()
         raise
+    finally:
+        if stager is not None:
+            stager.close()
     if prefetch_handle is not None:
         prefetch_handle.stop()
 

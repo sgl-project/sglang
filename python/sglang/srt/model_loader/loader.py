@@ -107,7 +107,7 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.device import is_cuda_alike
+from sglang.srt.utils.device import is_cuda, is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -396,6 +396,12 @@ def _validate_default_loader_extra_config(
     ):
         # Only the buffered multithreaded safetensors iterator honors it.
         allowed_keys.add("max_inflight_bytes")
+    if load_format in (LoadFormat.AUTO, LoadFormat.SAFETENSORS):
+        allowed_keys.add("gpu_staging")
+        if not isinstance(extra_config.get("gpu_staging", False), bool):
+            raise ValueError(
+                "gpu_staging in --model-loader-extra-config must be a boolean"
+            )
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
         if "enable_gds" in extra_config and not isinstance(
@@ -422,6 +428,11 @@ def _validate_default_loader_extra_config(
             f"{load_format}: "
             f"{unexpected_keys}"
         )
+
+
+@functools.cache
+def _log_gpu_staging_off(reason: str) -> None:
+    rank0_log(f"gpu_staging in --model-loader-extra-config has no effect: {reason}.")
 
 
 _EXPERT_ID_RE = re.compile(r"\bexperts\.(\d+)\.")
@@ -562,6 +573,34 @@ class DefaultModelLoader(BaseModelLoader):
             extra_config=load_config.model_loader_extra_config,
             load_format=load_config.load_format,
         )
+
+    def _use_gpu_staging(self, source: Source, disable_mmap: bool) -> bool:
+        """Whether to read the safetensors tensors of ``source`` to the GPU
+        before the weight loaders see them (see ``gpu_staging.py``).
+
+        Pays off when the weight loaders slice tensors for tensor parallelism:
+        the slicing then runs on the GPU instead of on mapped CPU views. Only a
+        model's own checkpoint is staged, not sources without a model config
+        (e.g. LoRA adapters) and not a speculative draft model, which uses few
+        of the tensors in the files it iterates (a mapping reads none of the
+        others)."""
+        if not self.load_config.model_loader_extra_config.get("gpu_staging", False):
+            return False
+        model_config = source.model_config
+        if model_config is None or model_config.is_draft_model:
+            return False
+        if not is_cuda():
+            reason = "it needs CUDA"
+        elif disable_mmap:
+            reason = "--weight-loader-disable-mmap is set"
+        elif get_parallel().tp_size == 1:
+            reason = "without tensor parallelism weights are not sliced"
+        elif get_parallel().moe_ep_size > 1:
+            reason = "with expert parallelism ranks read only their own experts"
+        else:
+            return True
+        _log_gpu_staging_off(reason)
+        return False
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
@@ -780,6 +819,7 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_drop_cache_after_load = (
                 get_model().weight_loader_drop_cache_after_load
             )
+            gpu_staging = self._use_gpu_staging(source, weight_loader_disable_mmap)
 
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
@@ -816,7 +856,8 @@ class DefaultModelLoader(BaseModelLoader):
                     enable_gds=enable_gds,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
-            elif use_multithread:
+            elif use_multithread and not gpu_staging:
+                # GPU staging reads with its own threads, one file at a time.
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -842,6 +883,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                     readers=readers,
+                    gpu_staging=gpu_staging,
                 )
 
         else:

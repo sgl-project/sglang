@@ -150,6 +150,12 @@ python -m sglang.launch_server \
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>None (no byte limit; up to <code>num_threads</code> + 1 shards)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code> / <code>safetensors</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>gpu_staging</code> (bool)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Read the model's safetensors tensors to the GPU before the weight loaders see them, so that tensor-parallel slicing runs on the GPU instead of on memory-mapped CPU views. Each rank reads the bytes with <code>pread</code> threads in ranges of up to 64 MiB into 3 pinned buffers and copies them to 3 GPU buffers of the same size on a side stream (the buffers are freed after loading). Tensors over 512 MiB stay memory-mapped. Replaces the multithreaded loader (<code>enable_multithread_load</code>, <code>num_threads</code>, <code>max_inflight_bytes</code> do not apply); combine it with <code>--weight-loader-prefetch-checkpoints</code> on network storage, so that each node reads the files once into the page cache. Has no effect without tensor parallelism, with expert parallelism, with <code>--weight-loader-disable-mmap</code>, and for speculative draft models and LoRA adapters.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>sharded_state</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>pattern</code> (str)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Filename pattern for per-rank shards.</td>
