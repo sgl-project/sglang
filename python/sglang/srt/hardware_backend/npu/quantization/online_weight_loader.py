@@ -182,13 +182,10 @@ class NPUOnlineMoEWeightLoader:
             args = (weight_name, shard_id)
             keys = {None}  # Fused loader writes the entire logical tensor.
         else:
-            current = getattr(self.layer, f"{prefix}_weight")
+            # Only per-expert input scales keep every expert, and these are weights.
             destinations = tuple(
                 self.layer._weight_loader_expert_ids(
-                    expert_id,
-                    require_global_experts=getattr(
-                        current, "_sglang_require_global_experts", False
-                    ),
+                    expert_id, require_global_experts=False
                 )
             )
             if not destinations:

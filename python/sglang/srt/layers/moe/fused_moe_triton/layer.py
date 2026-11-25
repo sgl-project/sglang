@@ -54,6 +54,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_deepep_v2_dispatcher_output_dtype,
     has_per_rank_fused_shared_slots,
+    requires_global_experts,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import (
@@ -1281,9 +1282,7 @@ class FusedMoE(torch.nn.Module):
 
         for local_expert_id in self._weight_loader_expert_ids(
             expert_id,
-            require_global_experts=getattr(
-                param, "_sglang_require_global_experts", False
-            ),
+            require_global_experts=requires_global_experts(param),
         ):
             self._weight_loader_impl(
                 param=param,

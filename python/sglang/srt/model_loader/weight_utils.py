@@ -1154,7 +1154,7 @@ def _safetensors_offsets(path: str) -> Dict[str, Tuple[int, int]]:
 
 _SAFETENSORS_DTYPES = {
     **safetensors.torch._TYPES,
-    "F8_E8M0": getattr(torch, "float8_e8m0fnu", None),
+    "F8_E8M0": torch.float8_e8m0fnu,
 }
 
 
@@ -1389,6 +1389,7 @@ def _prefetch_all_checkpoints(
     num_threads: int = 4,
     readers: Optional[CheckpointTensorReaders] = None,
     pace: bool = False,
+    loader_files: Optional[List[str]] = None,
 ) -> CheckpointFilePrefetchHandle:
     """Start prefetching checkpoint files into page cache in a background thread.
 
@@ -1408,6 +1409,8 @@ def _prefetch_all_checkpoints(
     With ``pace``, on filesystems that drop cached pages of unused files on a
     timer (Lustre), each rank prefetches a file only when its loader nears it;
     the loader reports its position through ``CheckpointFilePrefetchHandle.advance``.
+    ``loader_files`` is the order this rank's loader reads the files in
+    (default: ``sorted_files``); pacing follows that order.
     """
     import time
 
@@ -1461,9 +1464,10 @@ def _prefetch_all_checkpoints(
         and window_gb > 0
         and _statfs_type(sorted_files[0]) == _LUSTRE_SUPER_MAGIC
     ):
+        order = sorted_files if loader_files is None else loader_files
         pacer = _PrefetchPacer(
-            sorted_files,
-            [os.path.getsize(path) for path in sorted_files],
+            order,
+            [os.path.getsize(path) for path in order],
             round(window_gb * (1 << 30)),
             # Always allow a file per prefetch thread on the node.
             min_files=num_threads * local_world_size,
@@ -1474,6 +1478,9 @@ def _prefetch_all_checkpoints(
                 "loader (SGLANG_PREFETCH_PACE_LEAD_GB=0 disables pacing).",
                 window_gb,
             )
+        # Submit in the loader's order, so no thread waits on a file the loader
+        # reaches after one queued behind it.
+        my_files.sort(key=lambda item: pacer.index[item[0]])
     total_for_rank = len(my_files)
     cancel_event = threading.Event()
     succeeded_event = threading.Event()
@@ -1609,6 +1616,7 @@ def safetensors_weights_iterator(
             num_threads=prefetch_num_threads,
             readers=readers,
             pace=True,
+            loader_files=hf_weights_files,
         )
 
     try:
@@ -1855,6 +1863,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
             num_threads=prefetch_num_threads,
             readers=readers,
             pace=True,
+            loader_files=hf_weights_files,
         )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0

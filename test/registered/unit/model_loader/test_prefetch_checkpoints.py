@@ -606,6 +606,43 @@ class TestPrefetchPacing(CustomTestCase):
                 self.assertEqual(read, paths[:5])
 
     @patch("torch.distributed.is_initialized", return_value=False)
+    def test_pacing_follows_an_unsorted_loader_order(self, _):
+        # SGLANG_SORT_WEIGHT_FILES=-1 keeps glob order, and k>0 staggers the
+        # files by TP rank: the loader then reads them out of sorted order.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for i in range(6):
+                paths.append(os.path.join(tmpdir, f"model-{i:05d}.safetensors"))
+                with open(paths[-1], "wb") as f:
+                    f.write(b"\0" * 1000)
+            order = [paths[i] for i in (4, 1, 5, 0, 3, 2)]
+            read = []
+            with (
+                patch(f"{_WU}._statfs_type", return_value=_LUSTRE_SUPER_MAGIC),
+                envs.SGLANG_PREFETCH_PACE_LEAD_GB.override(2000 / (1 << 30)),
+                patch(
+                    f"{_WU}._prefetch_checkpoint_file",
+                    side_effect=lambda path, cancel_event: read.append(path),
+                ),
+            ):
+                handle = _prefetch_all_checkpoints(
+                    paths, num_threads=1, pace=True, loader_files=order
+                )
+                self.assertTrue(_wait_until(lambda: len(read) == 2))
+                time.sleep(0.05)
+                self.assertEqual(read, order[:2])  # 2000 bytes ahead.
+                handle.advance(order[1])
+                self.assertTrue(_wait_until(lambda: len(read) == 3))
+                handle.advance(order[3])
+                self.assertTrue(_wait_until(lambda: len(read) == 5))
+                time.sleep(0.05)
+                self.assertEqual(read, order[:5])
+                handle.advance(order[5])
+                self.assertTrue(_wait_until(lambda: len(read) == 6))
+                handle.stop(timeout=5)
+            self.assertEqual(read, order)  # Every file, in the loader's order.
+
+    @patch("torch.distributed.is_initialized", return_value=False)
     def test_paced_on_lustre_unless_disabled(self, _):
         def pacer(fs_type):
             with (

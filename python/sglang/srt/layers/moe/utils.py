@@ -781,12 +781,18 @@ def get_tbo_token_distribution_threshold() -> float:
     return moe.tbo_token_distribution_threshold
 
 
+def requires_global_experts(param) -> bool:
+    """Whether every rank keeps all experts of this MoE parameter (scales that
+    quantization methods mark with ``_sglang_require_global_experts``)."""
+    return getattr(param, "_sglang_require_global_experts", False)
+
+
 def filter_moe_weight_param_global_expert(name, x, num_local_experts):
     """
     Filter out for MoE expert parameters that requires global expert.
     """
     return (
-        not getattr(x, "_sglang_require_global_experts", False)
+        not requires_global_experts(x)
         and x.data.ndim > 0
         and x.data.shape[0] == num_local_experts
     )
