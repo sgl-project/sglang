@@ -20,8 +20,6 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 from sglang.srt.runtime_context import get_forward, get_memory
 
 _HOPPER = (9, 0)
-# pooler / unpooler gemm_ag GPUs; must match gemm_ag_supported
-SLICED_PROJECTION_CAPS = ((10, 3), _HOPPER)
 # prefill sizes split pooler / unpooler rows over TP (GEMM cost > all-gather)
 PREFILL_SLICE_MIN_TOKENS = 1024
 # the extend kernel packs each key read; below this kv-weighted mean extend (measured break-even) FA3 wins
@@ -40,6 +38,12 @@ def _on_hopper(device=None) -> bool:
 def hopper_kernels_enabled(device=None) -> bool:
     """Gate of every Muse Spark Hopper path; other GPUs keep the stock code."""
     return envs.SGLANG_MUSE_SPARK_HOPPER_KERNELS.get() and _on_hopper(device)
+
+
+def sliced_projection_gpu(device=None) -> bool:
+    """GPUs whose pooler / unpooler take gemm_ag at TP4 / TP8; must match gemm_ag_supported."""
+    cap = torch.cuda.get_device_capability(device)
+    return cap == (10, 3) or (cap == _HOPPER and hopper_kernels_enabled(device))
 
 
 def _row_split_group(x: torch.Tensor):

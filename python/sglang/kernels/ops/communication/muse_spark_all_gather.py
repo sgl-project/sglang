@@ -23,6 +23,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -71,6 +72,7 @@ def gemm_ag_supported(
                 comm.world_size in (4, 8)
                 and n in (2048, 4096, 8192)
                 and current_arch().is_sm(9, 0)
+                and envs.SGLANG_MUSE_SPARK_HOPPER_KERNELS.get()
             )
             or (
                 comm.world_size == 8

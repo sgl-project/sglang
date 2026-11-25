@@ -10,6 +10,8 @@ from sglang.kernels.ops.communication import muse_spark_all_gather as gather
 from sglang.srt.distributed.device_communicators.symm_workspace import (
     WorkspaceLease,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.muse_spark.fused import glue
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -60,6 +62,28 @@ class TestMuseSparkProjectionSupport(CustomTestCase):
         self.comm.world_size = 8
         for capability in ((10, 1), (12, 0)):
             self.assertFalse(self.supported(9, capability=capability))
+
+    def test_sm90_switch_off_keeps_the_stock_projection_dispatch(self):
+        """SGLANG_MUSE_SPARK_HOPPER_KERNELS=0 on SM90: the pooler / unpooler workspace
+        and gemm_ag stay as without the Hopper path (only the small projection)."""
+        self.addCleanup(glue.hopper_kernels_enabled.cache_clear)
+        for on in (True, False):
+            glue.hopper_kernels_enabled.cache_clear()
+            with (
+                self.subTest(on=on),
+                envs.SGLANG_MUSE_SPARK_HOPPER_KERNELS.override(on),
+                patch.object(torch.cuda, "is_available", return_value=True),
+                patch.object(torch.version, "hip", None),
+                patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)),
+            ):
+                self.assertEqual(glue.sliced_projection_gpu(), on)
+                self.assertEqual(self.supported(512, capability=(9, 0)), on)
+                self.assertTrue(self.supported(8, capability=(9, 0)))
+        with (
+            envs.SGLANG_MUSE_SPARK_HOPPER_KERNELS.override(False),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)),
+        ):
+            self.assertTrue(glue.sliced_projection_gpu())
 
     def test_dtype_shape_and_layout_fallbacks(self):
         self.assertFalse(self.supported(x=torch.empty(16, 64, dtype=torch.float16)))

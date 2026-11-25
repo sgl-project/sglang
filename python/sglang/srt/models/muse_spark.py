@@ -837,7 +837,7 @@ class MuseSpark1xMoE(nn.Module):
             and self.tp_size in (4, 8)
             and torch.cuda.is_available()
             and (
-                torch.cuda.get_device_capability() in glue.SLICED_PROJECTION_CAPS
+                glue.sliced_projection_gpu()
                 or (self.tp_size == 8 and torch.cuda.get_device_capability() == (10, 0))
             )
         ):
@@ -1125,8 +1125,7 @@ class MuseSpark1xMoE(nn.Module):
                 self.tp_size in (4, 8)
                 and not sp_active
                 and (
-                    torch.cuda.get_device_capability(hidden_states.device)
-                    in glue.SLICED_PROJECTION_CAPS
+                    glue.sliced_projection_gpu(hidden_states.device)
                     or (
                         self.tp_size == 8
                         and torch.cuda.get_device_capability(hidden_states.device)
