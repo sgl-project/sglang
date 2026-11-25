@@ -389,8 +389,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         self._aiter_cos_sin = None
         if _use_aiter_rope_gfx1250 and not self._force_native:
             self._forward_method = self._forward_aiter_cached
-        elif _is_hip:
-            self._forward_method = self.forward_native
 
     def set_lerope_alpha(self, lerope_alpha: torch.Tensor) -> None:
         """Update in place so existing cache references see the LeRoPE frequencies."""

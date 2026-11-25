@@ -48,6 +48,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     pcg_dsa_indexer_prefill_split,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.ssmax_triton import ssmax_scale_gates
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -794,12 +795,35 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # q_scale; a per-token, per-head positive factor commutes with that product.
         if self.ssmax_scaling_s is None:
             return weights
+        if weights.is_cuda and weights.dtype == torch.float32:
+            out = ssmax_scale_gates(
+                weights, positions, self.ssmax_scaling_s, self.ssmax_scaling_b
+            )
+            if out is not None:
+                return out
         factor = (
             torch.log1p(positions[: weights.shape[0]].to(torch.float32)).unsqueeze(-1)
             * self.ssmax_scaling_s
             + self.ssmax_scaling_b
         )
         return (weights.to(torch.float32) * factor.unsqueeze(-1)).to(weights.dtype)
+
+    def _apply_q_scale_softmax_scale_and_ssmax(
+        self, weights: torch.Tensor, q_scale: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        if self.ssmax_scaling_s is not None and weights.is_cuda:
+            out = ssmax_scale_gates(
+                weights,
+                positions,
+                self.ssmax_scaling_s,
+                self.ssmax_scaling_b,
+                q_scale=q_scale,
+                scale=self.softmax_scale,
+            )
+            if out is not None:
+                return out
+        weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
+        return self._apply_ssmax_to_scaled_gates(weights, positions)
 
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # [key | head gate] output of a merged wk / weights_proj GEMM
@@ -2776,8 +2800,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if self.use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             else:
-                weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
-                weights = self._apply_ssmax_to_scaled_gates(weights, positions)
+                weights = self._apply_q_scale_softmax_scale_and_ssmax(
+                    weights, q_scale, positions
+                )
         else:
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora,
