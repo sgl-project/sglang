@@ -26,7 +26,6 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
@@ -49,7 +48,7 @@ _is_gfx95 = is_gfx95_supported()
 # This scheme runs only on the AITER runner, so on the arches AITER has an MXFP4
 # MoE layout for, that layout is bound whatever SGLANG_USE_AITER says.
 _use_aiter = _is_hip and (
-    get_bool_env_var("SGLANG_USE_AITER") or _is_gfx95 or is_gfx1250_supported()
+    envs.SGLANG_USE_AITER.get() or _is_gfx95 or is_gfx1250_supported()
 )
 _is_shuffle_moe_mxfp4 = _use_aiter and _is_gfx95
 _aiter_k3_opt = _use_aiter and envs.SGLANG_OPT_HIP_K3_AITER.get()
