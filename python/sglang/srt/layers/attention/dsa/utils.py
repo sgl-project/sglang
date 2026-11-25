@@ -24,7 +24,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
 from sglang.srt.utils.common import ceil_div
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
     """
     if not is_hip():
         return False
-    if not get_bool_env_var("SGLANG_USE_AITER"):
+    if not envs.SGLANG_USE_AITER.get():
         return False
     if envs.SGLANG_DSA_HIP_DISABLE_PRESHUFFLE.get():
         return False
@@ -94,7 +94,7 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
     # No hardware term here: gfx950_fused_indexer.supported_hardware() is the
     # hardware half of the gate and runs first, so anything reaching this point
     # is already on gfx950. What is left is what a deployment can get wrong.
-    if not get_bool_env_var("SGLANG_USE_AITER"):
+    if not envs.SGLANG_USE_AITER.get():
         return _refuse("SGLANG_USE_AITER is not set")
     if not aiter_can_use_preshuffle_paged_mqa():
         return _refuse("aiter cannot use preshuffled paged MQA logits")
@@ -312,6 +312,32 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return False
 
 
+def _dsa_split_row_bound(forward_batch: "ForwardBatch") -> Optional[int]:
+    """Row-space broadcast bound: the highest first-row of the batch's
+    request chunks (pool ROWS, not prefix tokens).
+    """
+    bound = getattr(forward_batch, "_dsa_split_row_bound", None)
+    if bound is not None:
+        return bound
+    loc = getattr(forward_batch, "out_cache_loc", None)
+    lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if loc is None or not lens:
+        return None
+    starts = []
+    acc = 0
+    for n in lens:
+        starts.append(acc)
+        acc += int(n)
+    if acc <= 0 or acc > loc.shape[0]:
+        return None
+    bound = int(loc[starts].max())
+    try:
+        forward_batch._dsa_split_row_bound = bound
+    except Exception:
+        pass
+    return bound
+
+
 def maybe_prefetch_next_full_attention_kv(
     forward_batch: "ForwardBatch",
     next_full_attention_layer_id: Optional[int],
@@ -319,16 +345,45 @@ def maybe_prefetch_next_full_attention_kv(
     """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
 
     No-op unless the current batch runs DSA prefill-CP and the active KV pool is
-    a layer-sharded pool exposing ``prefetch_kv_buffer`` (i.e.
-    ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
-    overlaps it with the current layer's attention compute.
+    a layer-sharded pool exposing ``prefetch_kv_buffer``. Kicking the broadcast
+    off one layer ahead overlaps it with the current layer's attention compute.
     """
     if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
         return
 
-    prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
-    if prefetch_kv_buffer is not None:
-        prefetch_kv_buffer(next_full_attention_layer_id)
+    if is_npu():
+        # NPU: no cached prefix -> the set-path store seeds the remote
+        # scratch itself, so a kick would only be discarded by the next
+        # layer's set. With a prefix the broadcast delivers the immutable
+        # prefix rows and the layer's set_kv_buffer(cp_gathered_chunk=True)
+        # appends the CP-gathered new rows on top, letting the get skip the
+        # broadcast entirely. The indexer scratch is patch-written the same
+        # way, so its one-layer-ahead prefix broadcast kicks here too.
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if prefix_lens is not None and all(n == 0 for n in prefix_lens):
+            return
+        # Radix-cache prefixes are inherited from other requests and can live
+        # at arbitrary pool rows, so the row-space slice — which assumes a
+        # contiguous prefix below the new rows — is only valid without radix.
+        # Under radix, fall back to the full-capacity broadcast so every
+        # inherited prefix row is covered.
+        used_bound = (
+            None
+            if not get_memory().disable_radix_cache
+            else _dsa_split_row_bound(forward_batch)
+        )
+        prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
+        if prefetch_kv_buffer is not None:
+            prefetch_kv_buffer(next_full_attention_layer_id, used_bound=used_bound)
+        prefetch_index_k = getattr(
+            get_token_to_kv_pool(), "prefetch_index_k_buffer", None
+        )
+        if prefetch_index_k is not None:
+            prefetch_index_k(next_full_attention_layer_id, used_bound=used_bound)
+    else:
+        prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
+        if prefetch_kv_buffer is not None:
+            prefetch_kv_buffer(next_full_attention_layer_id)
 
 
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:

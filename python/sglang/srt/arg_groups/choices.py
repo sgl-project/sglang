@@ -1,5 +1,10 @@
 """Shared config choices, re-exported by server_args for plugin compatibility."""
 
+import argparse
+from typing import Any, Callable, Optional
+
+from sglang.srt.sampling.watermarking.config import ALGORITHM_CONFIG_FIELDS
+
 LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
@@ -84,7 +89,6 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "dsa",
-    "nsa",  # Deprecated alias for "dsa"
     "qsa",
     "unlimited_ocr_v2",
     "dsv4",
@@ -97,7 +101,6 @@ ATTENTION_BACKEND_CHOICES = [
     "flashmla",
     "trtllm_mla",
     "cutedsl_mla",
-    "tokenspeed_mla",  # Deprecated alias for "cutedsl_mla"
     "trtllm_mha",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     "minicpm_flashattn",
@@ -110,6 +113,50 @@ ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "intel_xpu",
 ]
+
+_REMOVED_ATTENTION_BACKENDS = {
+    "compressed": "dsv4",
+    "nsa": "dsa",
+    "tokenspeed_mla": "cutedsl_mla with --kv-cache-dtype fp8_e4m3 "
+    "(trtllm_mla for prefill), and --speculative-attention-mode decode "
+    "with speculative decoding",
+}
+_REMOVED_MOE_A2A_BACKENDS = {"flashinfer": "flashinfer_nvlink_one_sided"}
+
+# Choice values that were removed, by field, each with what to pass instead:
+# argparse's own "invalid choice" error would not name the replacement. The
+# CLI checks them in `reject_removed_choice`, startup in
+# `validate_removed_options` for the Python API.
+REMOVED_CHOICES = {
+    "attention_backend": _REMOVED_ATTENTION_BACKENDS,
+    "decode_attention_backend": _REMOVED_ATTENTION_BACKENDS,
+    "prefill_attention_backend": _REMOVED_ATTENTION_BACKENDS,
+    "speculative_draft_attention_backend": _REMOVED_ATTENTION_BACKENDS,
+    "moe_a2a_backend": _REMOVED_MOE_A2A_BACKENDS,
+    "speculative_moe_a2a_backend": _REMOVED_MOE_A2A_BACKENDS,
+    "tool_call_parser": {"qwen25": "qwen", "glm45": "glm"},
+}
+
+
+def removed_choice_message(field: str, value: Any) -> Optional[str]:
+    """Why ``value`` of ``field`` no longer works, or None if it still does."""
+    replacement = REMOVED_CHOICES[field].get(value)
+    if replacement is None:
+        return None
+    return f"{value} was removed in SGLang 1.0; use {replacement}"
+
+
+def reject_removed_choice(field: str) -> Callable[[str], str]:
+    """An argparse ``type`` that stops on a removed value of ``field``."""
+
+    def parse(value: str) -> str:
+        message = removed_choice_message(field, value)
+        if message is not None:
+            raise argparse.ArgumentTypeError(message)
+        return value
+
+    return parse
+
 
 # trtllm_mha is valid for decode-only dense-MQA drafts. DFLASH rejects it
 # earlier when its per-layer attention requirements are not met.
@@ -147,6 +194,9 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 BUILT_IN_SAMPLING_BACKENDS = frozenset({"flashinfer", "pytorch", "ascend", "intel_xpu"})
 SAMPLING_BACKEND_CHOICES = set(BUILT_IN_SAMPLING_BACKENDS)
+
+# Each name has an adapter in sampling/watermarking/runtime.py.
+WATERMARK_ALGORITHM_CHOICES = list(ALGORITHM_CONFIG_FIELDS)
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -215,6 +265,15 @@ RADIX_EVICTION_POLICY_CHOICES = [
 ]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+
+LORA_BACKEND_CHOICES = [
+    "triton",
+    "csgmv",
+    "ascend",
+    "torch_native",
+    "triton_v2",
+    "intel_xpu",
+]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",

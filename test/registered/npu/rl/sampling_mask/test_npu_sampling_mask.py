@@ -19,8 +19,8 @@ GLM_5_2_BF16_MODEL_PATH = os.environ.get(
     "GLM_5_2_BF16_MODEL_PATH", "/root/.cache/modelscope/hub/models/ZhipuAI/GLM-5.2"
 )
 
-register_npu_ci(est_time=300, suite="base-b-test-2-npu-a3")
-register_npu_ci(est_time=300, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(est_time=300, suite="extra-b-test-2-npu-a3")
+register_npu_ci(est_time=300, suite="nightly-test-2-npu-a3", nightly=True)
 
 
 @unittest.skipUnless(

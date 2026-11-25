@@ -15,7 +15,7 @@ from packaging.version import Version
 from sglang.srt.hardware_backend.mlx import runtime
 from sglang.test.ci.ci_register import register_mlx_ci
 
-register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=1, suite="extra-unit-test-mlx")
 
 
 def _fake_mlx(version: str | None, *, metal_available: bool = True):

@@ -599,9 +599,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def _init_cuda_graph_metadata(
         self,
         bs: int,
-        num_tokens: int,
         forward_mode: ForwardMode,
-        seq_lens: torch.Tensor,
         device: torch.device,
     ):
         """Allocate persistent metadata buffers for CUDA graph capture."""
@@ -804,13 +802,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         bs = forward_batch.batch_size
         if in_capture:
-            num_tokens = forward_batch.positions.numel()
             self._init_cuda_graph_metadata(
-                bs,
-                num_tokens,
-                forward_mode,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens.device,
+                bs, forward_mode, forward_batch.seq_lens.device
             )
             self._apply_cuda_graph_metadata(
                 plan=forward_batch.iteration_ids,
