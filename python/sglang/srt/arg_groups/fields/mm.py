@@ -102,7 +102,9 @@ class Mm(msgspec.Struct):
         List[str],
         "Restrict client-supplied HTTP(S) image, video, and audio URLs to these "
         "exact hostnames. Redirect destinations are checked against the same "
-        "allowlist. When unset, remote media from any domain is allowed.",
+        "allowlist, and an allowlisted host may resolve to a private address. "
+        "When unset, any host that resolves only to public addresses is allowed "
+        "(see --allow-private-media-hosts).",
     ] = msgspec.field(default_factory=list)
     allow_private_media_hosts: A[
         bool,

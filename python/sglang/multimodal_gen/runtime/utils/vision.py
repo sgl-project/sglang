@@ -4,11 +4,12 @@
 
 import os
 import tempfile
-from collections.abc import Callable
-from contextlib import closing
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from io import BytesIO
 from typing import BinaryIO
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urlparse
+from urllib.request import DataHandler, Request
 
 import imageio
 import numpy as np
@@ -20,8 +21,13 @@ from packaging import version
 
 from sglang.kernels import get_kernel
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.media_io import (
+    download_remote_media,
+)
 from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
-from sglang.srt.multimodal.media_io import validate_remote_media_url
+from sglang.srt.multimodal.media_io import (
+    media_url_timeout,
+)
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -138,7 +144,9 @@ def preprocess_image(
     return pixels.unsqueeze(0).permute(0, 3, 1, 2)
 
 
-def _read_media_source(read: Callable, *args, invalid_input: str | None = None):
+def call_with_sanitized_media_errors(
+    read: Callable, *args, invalid_input: str | None = None
+):
     try:
         return read(*args)
     except requests.RequestException as exc:
@@ -189,7 +197,7 @@ def load_image(
             image = PIL.Image.open(image)
         else:
             # in-memory loading path
-            data = _read_media_source(
+            data = call_with_sanitized_media_errors(
                 srt_get_image_bytes,
                 image,
                 invalid_input="Invalid or disallowed image source.",
@@ -213,60 +221,41 @@ def load_image(
 _VIDEO_DOWNLOAD_TIMEOUT_S = 60
 
 
-# Upper bound for one client-supplied video download. Videos are much larger
-# than the 64 MiB default cap for still media, so remote videos get their own
-# cap instead of sharing it; the bound still stops a hostile URL from filling
-# server disk or memory.
-_VIDEO_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024
-
-_VIDEO_DOWNLOAD_MAX_REDIRECTS = 5
-
-_VIDEO_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+def download_video(url: str) -> bytes:
+    """Download a client-supplied video URL under the media URL policy."""
+    return download_remote_media(url, media_url_timeout(_VIDEO_DOWNLOAD_TIMEOUT_S))
 
 
-def download_video_to_stream(video: str, output: BinaryIO) -> None:
-    """Fetch a remote video into a caller-owned stream under the media URL policy.
+@contextmanager
+def open_video_source(video: str) -> Iterator[BinaryIO]:
+    """A seekable stream over a client-supplied video, for PyAV to open.
 
-    Redirects are followed manually so every hop is validated (scheme and
-    resolved IP) before a connection is made, and the body is streamed to
-    disk under a size cap instead of being buffered in memory.
+    FFmpeg never sees the client string, so it cannot pick a protocol
+    (``file:``, ``concat:``, ...) from it. Open the stream with
+    ``options={"protocol_whitelist": "data"}`` so a demuxer cannot fetch the
+    URLs a playlist names.
     """
-    current_url = video
-    for redirect_count in range(_VIDEO_DOWNLOAD_MAX_REDIRECTS + 1):
-        prepared_url = validate_remote_media_url(current_url)
-        with closing(
-            requests.get(
-                prepared_url,
-                stream=True,
-                allow_redirects=False,
-                timeout=_VIDEO_DOWNLOAD_TIMEOUT_S,
-            )
-        ) as response:
-            location = response.headers.get("Location")
-            if response.status_code in _VIDEO_REDIRECT_STATUS_CODES and location:
-                if redirect_count == _VIDEO_DOWNLOAD_MAX_REDIRECTS:
-                    raise requests.exceptions.TooManyRedirects(
-                        f"Video URL exceeded {_VIDEO_DOWNLOAD_MAX_REDIRECTS} redirects"
-                    )
-                current_url = urljoin(response.url, location)
-                continue
-            if response.status_code != 200:
-                raise ValueError(
-                    f"Failed to download video. Status code: {response.status_code}"
-                )
-            total_bytes = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                total_bytes += len(chunk)
-                if total_bytes > _VIDEO_DOWNLOAD_MAX_BYTES:
-                    raise ValueError(
-                        "Video exceeds the "
-                        f"{_VIDEO_DOWNLOAD_MAX_BYTES} byte download limit"
-                    )
-                output.write(chunk)
+    with ExitStack() as files:
+        try:
+            scheme = urlparse(video).scheme.lower()
+            if scheme in ("http", "https"):
+                stream = BytesIO(download_video(video))
+            elif scheme == "data":
+                # DataHandler only reads inline bytes; it does not dispatch URLs.
+                stream = files.enter_context(DataHandler().data_open(Request(video)))
+            elif not scheme or len(scheme) == 1:
+                stream = files.enter_context(open(video, "rb"))
+            else:
+                stream = None
+        except (ValueError, OSError) as exc:
+            # Both HTTP and filesystem exceptions may retain the original source.
+            category = type(exc).__name__
+        else:
+            if stream is None:
+                raise ValueError("Unsupported video path scheme")
+            yield stream
             return
-    raise AssertionError("unreachable")
+        raise ValueError(f"Could not open video source ({category}).")
 
 
 # adapted from diffusers.utils import load_video
@@ -294,7 +283,7 @@ def load_video(
     """
     if max_frames is not None and max_frames <= 0:
         raise ValueError(f"max_frames must be positive, got {max_frames}.")
-    pil_images = _read_media_source(_read_video_source, video, max_frames)
+    pil_images = call_with_sanitized_media_errors(_read_video_source, video, max_frames)
     return convert_method(pil_images) if convert_method is not None else pil_images
 
 
@@ -304,16 +293,18 @@ def _read_video_source(video: str, max_frames: int | None) -> list[PIL.Image.Ima
         raise ValueError("Expected an existing video file or an HTTP(S) URL.")
 
     if is_url:
-        parsed_url = _read_media_source(
+        parsed_url = call_with_sanitized_media_errors(
             urlparse, video, invalid_input="Invalid video URL."
         )
         file_name = os.path.basename(unquote(parsed_url.path))
 
-        suffix = os.path.splitext(file_name)[1] or ".mp4"
+        # FFmpeg probes the content; a client-chosen suffix such as .m3u8
+        # would let it read the file as a playlist of further URLs.
+        suffix = ".gif" if file_name.lower().endswith(".gif") else ".mp4"
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = os.path.join(temp_dir, f"video{suffix}")
             with open(video_path, "wb") as output:
-                download_video_to_stream(video, output)
+                output.write(download_video(video))
             return _read_video_frames(video_path, max_frames)
     return _read_video_frames(video, max_frames)
 

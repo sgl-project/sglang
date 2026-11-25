@@ -4,8 +4,6 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
-from urllib.parse import urlparse
-from urllib.request import urlopen
 
 import PIL.Image
 import torch
@@ -41,11 +39,11 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_component_precision,
     resolve_component_precision_override,
 )
+from sglang.srt.multimodal.media_io import download_remote_media, media_url_timeout
 
 logger = init_logger(__name__)
 V = StageValidators
 
-# Per blocking socket operation, as urlopen applies it; matches vision.py's video download.
 _REMOTE_INPUT_TIMEOUT_S = 60
 
 
@@ -101,10 +99,8 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         return value
 
     def _download_remote_input(self, url: str, field_name: str) -> str:
-        parsed = urlparse(url)
-        ext = os.path.splitext(parsed.path)[1] or (
-            ".wav" if field_name == "audio_path" else ".jpg"
-        )
+        # Loaders probe the content; a client-chosen suffix must not steer them.
+        ext = ".wav" if field_name == "audio_path" else ".jpg"
         cache_dir = os.path.join(tempfile.gettempdir(), "sglang_wan_s2v_remote_inputs")
         os.makedirs(cache_dir, exist_ok=True)
         target_path = os.path.join(
@@ -116,11 +112,9 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         # Renamed in only when complete, so a failed download never leaves a truncated
         # file for the cache check above to return.
         partial_path = f"{target_path}.partial"
-        with (
-            urlopen(url, timeout=_REMOTE_INPUT_TIMEOUT_S) as response,
-            open(partial_path, "wb") as fout,
-        ):
-            fout.write(response.read())
+        content = download_remote_media(url, media_url_timeout(_REMOTE_INPUT_TIMEOUT_S))
+        with open(partial_path, "wb") as fout:
+            fout.write(content)
         os.replace(partial_path, target_path)
         return target_path
 

@@ -1,6 +1,8 @@
 """Security tests for client-supplied remote multimodal media URLs."""
 
 import http.server
+import os
+import socket
 import threading
 import unittest
 from unittest.mock import patch
@@ -116,7 +118,6 @@ class TestMediaURLSecurity(unittest.TestCase):
             with self.subTest(url=url):
                 with self.assertRaisesRegex(ValueError, "non-public IP"):
                     download_remote_media(url, timeout=5)
-        # Validation happens before any connection is made.
         self.assertEqual(self.server.media_hits, 0)
 
     def test_allow_private_media_hosts_opt_in_restores_local_downloads(self):
@@ -143,19 +144,61 @@ class TestMediaURLSecurity(unittest.TestCase):
         for host in ("0x7f.0.0.1", "2130706433", "0177.0.0.1"):
             with self.subTest(host=host):
                 with self.assertRaisesRegex(ValueError, "non-public IP"):
-                    _assert_media_url_allowed(f"http://{host}/media")
+                    download_remote_media(f"http://{host}:{self.port}/media", timeout=5)
+        self.assertEqual(self.server.media_hits, 0)
 
-    def test_public_literal_ip_is_allowed(self):
-        # A literal public IP needs no DNS lookup, so this needs no network.
-        _assert_media_url_allowed("http://93.184.216.34/media")
+    def test_connection_goes_to_the_checked_address(self):
+        # A rebinding resolver: public when first asked, loopback afterwards.
+        answers = iter(["93.184.216.34", "127.0.0.1", "127.0.0.1"])
+        looked_up = []
+        real_getaddrinfo = socket.getaddrinfo
+
+        def getaddrinfo(host, port, *args, **kwargs):
+            looked_up.append(host)
+            if host == "rebind.test":
+                address = (next(answers), port or 0)
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", address)]
+            if host == "93.184.216.34":
+                # Stands in for an unreachable public host, without network.
+                raise socket.gaierror(socket.EAI_NONAME, "unreachable in this test")
+            return real_getaddrinfo(host, port, *args, **kwargs)
+
+        with (
+            patch.dict(os.environ, {"no_proxy": "*"}),
+            patch("socket.getaddrinfo", getaddrinfo),
+        ):
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                download_remote_media(
+                    f"http://rebind.test:{self.port}/media", timeout=5
+                )
+        self.assertEqual(self.server.media_hits, 0)
+        self.assertEqual(looked_up, ["rebind.test", "93.184.216.34"])
+
+    def test_proxied_download_still_checks_the_host(self):
+        real_getaddrinfo = socket.getaddrinfo
+
+        def getaddrinfo(host, port, *args, **kwargs):
+            if host == "internal.test":
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0))]
+            return real_getaddrinfo(host, port, *args, **kwargs)
+
+        # The test server stands in for the proxy; it must not be asked.
+        proxy = self._url("")
+        with (
+            patch.dict(os.environ, {"http_proxy": proxy, "no_proxy": ""}),
+            patch("socket.getaddrinfo", getaddrinfo),
+        ):
+            with self.assertRaisesRegex(ValueError, "non-public IP"):
+                download_remote_media("http://internal.test/media", timeout=5)
 
     def test_exact_domain_allowlist(self):
         configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
         self.assertEqual(
             download_remote_media(self._url("/media"), timeout=5), b"remote-media"
         )
-        with self.assertRaisesRegex(ValueError, "not allowed"):
+        with self.assertRaisesRegex(ValueError, "not allowed") as blocked:
             download_remote_media(self._url("/media", host="localhost"), timeout=5)
+        self.assertNotIn("127.0.0.1", str(blocked.exception))
         with self.assertRaisesRegex(ValueError, "not allowed"):
             download_remote_media("http://169.254.169.254/latest/meta-data", timeout=5)
 

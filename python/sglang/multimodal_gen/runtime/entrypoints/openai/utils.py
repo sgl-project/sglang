@@ -8,12 +8,14 @@ import re
 import shutil
 import tempfile
 import time
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from functools import cache
+from io import BytesIO
 from typing import Any, Generator, List, Literal, Optional, Union
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-import httpx
+import PIL.Image
+import requests
 from fastapi import HTTPException, UploadFile
 from pydantic import BaseModel
 
@@ -38,7 +40,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_generation_timer,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
-from sglang.srt.multimodal.media_io import validate_remote_media_url
+from sglang.multimodal_gen.runtime.utils.vision import call_with_sanitized_media_errors
+from sglang.srt.multimodal.media_io import (
+    download_remote_media,
+    media_url_timeout,
+    validate_remote_media_url,
+)
 
 logger = init_logger(__name__)
 
@@ -256,9 +263,8 @@ def _reject_remote_model_paths(kwargs: dict[str, Any]) -> None:
             )
 
 
-# Request fields that name client-supplied media. Their values flow to media
-# loaders (``load_video`` / ``load_image`` / ``av.open``), so every URL among
-# them is validated at the entry point, before any fetch happens.
+# Request fields that name client-supplied media; every URL among them is
+# validated at the entry point, before any loader fetches.
 _MEDIA_URL_FIELDS = (
     "video_path",
     "video_url",
@@ -269,28 +275,31 @@ _MEDIA_URL_FIELDS = (
 )
 
 
-def _validate_remote_media_value(field_name: str, value: str) -> None:
-    """Reject a media field value that would make a loader fetch remotely.
+def _media_value_error(field_name: str, value: str) -> str | None:
+    """Why a loader must not fetch this media field value; None when it may.
 
-    http(s) URLs must pass the shared media URL policy (public hosts only);
-    ``data:`` URLs are self-contained and allowed; local paths and base64
-    payloads have no scheme and are allowed. Any other scheme-like prefix
-    (``file:``, ``concat:``, ``ftp:``, ...) is rejected: loaders such as
-    PyAV/FFmpeg would interpret it as a fetch protocol.
+    http(s) URLs must pass the shared media URL policy; ``data:`` URLs, local
+    paths and base64 payloads are allowed. Any other scheme is rejected, and so
+    is a value whose text before the first ``/`` holds ``:`` other than a
+    one-letter drive: ``subfile,,start,0,end,9,,:http:h/x`` is an FFmpeg
+    protocol string with no URL scheme. No DNS lookup here; a hostname's
+    addresses are checked when the loader connects.
     """
     try:
         scheme = urlparse(value).scheme.lower()
         if scheme in ("http", "https"):
             validate_remote_media_url(value)
-        elif scheme != "data" and ("://" in value or len(scheme) > 1):
-            raise _bad_request(
-                f"{field_name} must be a local path, a base64 payload, or an http(s) media URL"
-            )
-        return
     except ValueError:
-        pass
-    # Parser and policy diagnostics can include request data or operator configuration.
-    raise _bad_request(f"{field_name} points to a disallowed media URL")
+        # Parser and policy diagnostics can include request data or operator configuration.
+        return f"{field_name} points to a disallowed media URL"
+    if scheme not in ("http", "https", "data") and ("://" in value or len(scheme) > 1):
+        return f"{field_name} must be a local path, a base64 payload, or an http(s) media URL"
+    if scheme not in ("http", "https", "data"):
+        head = value.split("/", 1)[0]
+        colon = head.find(":")
+        if colon >= 0 and not (colon == 1 and head[0].isalpha()):
+            return f"{field_name} must be a local path, a base64 payload, or an http(s) media URL"
+    return None
 
 
 def _validate_remote_media_paths(kwargs: dict[str, Any]) -> None:
@@ -301,8 +310,8 @@ def _validate_remote_media_paths(kwargs: dict[str, Any]) -> None:
             continue
         values = value if isinstance(value, (list, tuple)) else [value]
         for item in values:
-            if isinstance(item, str) and item:
-                _validate_remote_media_value(name, item)
+            if isinstance(item, str) and (error := _media_value_error(name, item)):
+                raise _bad_request(error)
 
 
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
@@ -501,6 +510,8 @@ async def _maybe_url_image(
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
+        if error := _media_value_error("image", img_url):
+            raise ValueError(error)
         # Only bypass persistence when the caller explicitly disables input saves.
         # Otherwise keep the prefetch outside the measured server stages.
         if prefer_remote_source:
@@ -522,164 +533,77 @@ async def _maybe_url_image(
         raise ValueError("Unsupported image url format")
 
 
-# Arbitrary cap; keeps a hostile or mistaken URL from filling server memory.
-_MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
+_IMAGE_DOWNLOAD_TIMEOUT_S = 10
 
 
-_MAX_IMAGE_DOWNLOAD_REDIRECTS = 5
+_IMAGE_DOWNLOAD_ATTEMPTS = 3
 
 
-_IMAGE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+_IMAGE_URL_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
 
 
-async def _download_capped_to_temp_file(
-    response: httpx.Response, directory: str
-) -> str:
-    too_large = f"Image exceeds the {_MAX_IMAGE_DOWNLOAD_BYTES} byte download limit"
-    declared = response.headers.get("content-length")
-    if declared and declared.isdigit() and int(declared) > _MAX_IMAGE_DOWNLOAD_BYTES:
-        raise ValueError(too_large)
-    fd, part_path = tempfile.mkstemp(dir=directory)
+def _download_image(image_url: str) -> bytes:
+    """Download an image URL, retrying rate limits and transient failures."""
+    # All attempts share one deadline: the configured media timeout.
+    total_s = media_url_timeout(_IMAGE_DOWNLOAD_TIMEOUT_S)
+    deadline = time.monotonic() + total_s
+    for attempt in range(1, _IMAGE_DOWNLOAD_ATTEMPTS + 1):
+        try:
+            return download_remote_media(
+                image_url, max(deadline - time.monotonic(), 0.1)
+            )
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+            status = e.response.status_code if e.response is not None else None
+            transient = status is None or status == 429 or 500 <= status < 600
+            wait_s = 0.2 * 2 ** (attempt - 1)
+            if (
+                attempt == _IMAGE_DOWNLOAD_ATTEMPTS
+                or not transient
+                or time.monotonic() + wait_s >= deadline
+            ):
+                raise
+            logger.warning(
+                "Retrying image download (%s/%s) after %.1fs due to %s",
+                attempt,
+                _IMAGE_DOWNLOAD_ATTEMPTS,
+                wait_s,
+                type(e).__name__,
+            )
+            time.sleep(wait_s)
+    raise AssertionError("unreachable")
+
+
+def _image_extension(image_url: str, content: bytes) -> str:
+    url_ext = os.path.splitext(urlparse(image_url).path)[1].lower()
+    if url_ext in _IMAGE_URL_EXTENSIONS:
+        return ".jpg" if url_ext == ".jpeg" else url_ext
     try:
-        with os.fdopen(fd, "wb") as f:
-            total = 0
-            async for chunk in response.aiter_bytes():
-                total += len(chunk)
-                if total > _MAX_IMAGE_DOWNLOAD_BYTES:
-                    raise ValueError(too_large)
-                await asyncio.to_thread(f.write, chunk)
-    except BaseException:
-        os.remove(part_path)
-        raise
-    return part_path
+        with PIL.Image.open(BytesIO(content)) as image:
+            image_format = image.format
+    except PIL.UnidentifiedImageError:
+        raise ValueError("URL does not point to an image") from None
+    return ".jpg" if image_format == "JPEG" else f".{image_format.lower()}"
 
 
 async def _save_url_image_to_path(
     image_url: str, target_path: str, *, uploads_root: str | None = None
 ) -> str:
-    """Download image from URL and save to target path.
+    """Download image from URL and save to target path."""
 
-    Redirects are followed manually so every destination is validated
-    against the media URL policy before a connection is made.
-    """
-
-    def _is_retryable_download_error(error: Exception) -> bool:
-        if isinstance(error, httpx.HTTPStatusError):
-            status_code = error.response.status_code
-            # Retry on rate limit and transient server-side failures.
-            return status_code == 429 or 500 <= status_code < 600
-        # Retry on transient network/protocol issues.
-        return isinstance(
-            error,
-            (
-                httpx.TimeoutException,
-                httpx.NetworkError,
-                httpx.RemoteProtocolError,
-            ),
+    def download_and_save() -> str:
+        content = call_with_sanitized_media_errors(
+            _download_image,
+            image_url,
+            invalid_input="Invalid or disallowed image source.",
         )
+        path = target_path
+        if not os.path.splitext(path)[1]:
+            path += _image_extension(image_url, content)
+        if uploads_root is not None:
+            path = ensure_path_within_root(path, uploads_root)
+        return save_image_bytes_to_path(content, path)
 
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
-    max_attempts = 3
-    backoff_seconds = 0.2
-
-    try:
-        async with httpx.AsyncClient(follow_redirects=False) as client:
-            for attempt in range(1, max_attempts + 1):
-                part_path = None
-                try:
-                    current_url = validate_remote_media_url(image_url)
-                    downloaded = False
-                    for redirect_count in range(_MAX_IMAGE_DOWNLOAD_REDIRECTS + 1):
-                        async with client.stream(
-                            "GET", current_url, timeout=10.0
-                        ) as response:
-                            location = response.headers.get("Location")
-                            if (
-                                response.status_code in _IMAGE_REDIRECT_STATUS_CODES
-                                and location
-                            ):
-                                if redirect_count == _MAX_IMAGE_DOWNLOAD_REDIRECTS:
-                                    raise httpx.TooManyRedirects(
-                                        "Image URL exceeded "
-                                        f"{_MAX_IMAGE_DOWNLOAD_REDIRECTS} "
-                                        f"redirects: {image_url}"
-                                    )
-                                current_url = validate_remote_media_url(
-                                    urljoin(str(response.url), location)
-                                )
-                                continue
-                            response.raise_for_status()
-                            part_path = await _download_capped_to_temp_file(
-                                response, os.path.dirname(target_path)
-                            )
-
-                            # Determine file extension from content type or URL after downloading
-                            if not os.path.splitext(target_path)[1]:
-                                content_type = response.headers.get(
-                                    "content-type", ""
-                                ).lower()
-
-                                url_path = image_url.split("?")[0]
-                                _, url_ext = os.path.splitext(url_path)
-                                url_ext = url_ext.lower()
-
-                                if url_ext in {
-                                    ".jpg",
-                                    ".jpeg",
-                                    ".png",
-                                    ".webp",
-                                    ".gif",
-                                    ".bmp",
-                                }:
-                                    ext = ".jpg" if url_ext == ".jpeg" else url_ext
-                                elif content_type.startswith("image/"):
-                                    if "jpeg" in content_type or "jpg" in content_type:
-                                        ext = ".jpg"
-                                    elif "png" in content_type:
-                                        ext = ".png"
-                                    elif "webp" in content_type:
-                                        ext = ".webp"
-                                    else:
-                                        ext = ".jpg"  # Default to jpg
-                                elif content_type == "application/octet-stream":
-                                    # for octet-stream, if we couldn't get it from URL, default to jpg
-                                    ext = ".jpg"
-                                else:
-                                    raise ValueError(
-                                        f"URL does not point to an image. Content-Type: {content_type}"
-                                    )
-                                target_path = f"{target_path}{ext}"
-
-                            if uploads_root is not None:
-                                target_path = ensure_path_within_root(
-                                    target_path, uploads_root
-                                )
-                            # same-filesystem rename publishes only a complete download
-                            os.replace(part_path, target_path)
-                            downloaded = True
-                        if downloaded:
-                            return target_path
-                    raise AssertionError("unreachable")
-                except Exception as e:
-                    if attempt == max_attempts or not _is_retryable_download_error(e):
-                        raise
-                    wait_s = backoff_seconds * (2 ** (attempt - 1))
-                    logger.warning(
-                        "Retrying image download (%s/%s) for %s after %.1fs due to: %s",
-                        attempt,
-                        max_attempts,
-                        image_url,
-                        wait_s,
-                        e,
-                    )
-                    await asyncio.sleep(wait_s)
-                finally:
-                    if part_path is not None:
-                        with suppress(FileNotFoundError):
-                            os.remove(part_path)
-    except Exception as e:
-        raise Exception(f"Failed to download image from URL {image_url}: {e}")
+    return await asyncio.to_thread(download_and_save)
 
 
 async def process_generation_batch(

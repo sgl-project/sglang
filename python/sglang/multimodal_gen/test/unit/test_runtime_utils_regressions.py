@@ -1,7 +1,6 @@
 import base64
 import io
 import traceback
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -26,8 +25,8 @@ def _gif_bytes() -> bytes:
     "loader, dependency, category",
     [
         (vision.load_image, "srt_get_image_bytes", requests.HTTPError),
-        (vision.load_video, "requests.get", requests.Timeout),
-        (vision.load_video, "requests.get", requests.TooManyRedirects),
+        (vision.load_video, "download_remote_media", requests.Timeout),
+        (vision.load_video, "download_remote_media", requests.TooManyRedirects),
     ],
 )
 def test_media_download_errors_keep_category_not_request(loader, dependency, category):
@@ -65,26 +64,16 @@ def test_invalid_media_source_does_not_echo_user_input():
 
 
 @pytest.mark.parametrize(
-    "status_code, payload, error",
+    "payload, error",
     [
-        (200, _gif_bytes(), None),
-        (200, b"not a gif", UnidentifiedImageError),
-        (404, b"", ValueError),
+        (_gif_bytes(), None),
+        (b"not a gif", UnidentifiedImageError),
     ],
 )
-def test_load_video_removes_downloaded_temp_file(
-    monkeypatch, tmp_path, status_code, payload, error
-):
+def test_load_video_removes_downloaded_temp_file(monkeypatch, tmp_path, payload, error):
     """A downloaded URL video must not outlive load_video, on success or failure."""
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
-    closed = []
-    response = SimpleNamespace(
-        headers={},
-        status_code=status_code,
-        iter_content=lambda chunk_size: iter([payload]),
-        close=lambda: closed.append(True),
-    )
-    monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
+    monkeypatch.setattr(vision, "download_remote_media", lambda url, timeout: payload)
 
     if error is None:
         frames = vision.load_video(_GIF_URL)
@@ -97,7 +86,6 @@ def test_load_video_removes_downloaded_temp_file(
             vision.load_video(_GIF_URL)
 
     assert list(tmp_path.iterdir()) == []
-    assert closed == [True]
 
 
 def test_line_wrapped_base64_image_is_saved_in_full(tmp_path):

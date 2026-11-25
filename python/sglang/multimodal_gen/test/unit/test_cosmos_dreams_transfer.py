@@ -47,6 +47,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     check_direct_distortion,
     direct_resize_control,
     format_transfer_prompt,
+    local_control_path,
     normalize_control_pixels,
     read_video_fps,
     resize_center_crop_uint8,
@@ -350,6 +351,23 @@ class TestTransferFramesAndHistory(unittest.TestCase):
 
     def test_missing_video_has_no_fps(self):
         self.assertIsNone(read_video_fps("/nonexistent/control.mp4"))
+
+    def test_url_is_never_probed_for_fps(self):
+        with mock.patch("imageio.v3.immeta") as immeta:
+            self.assertIsNone(read_video_fps("https://example.com/control.mp4"))
+        immeta.assert_not_called()
+
+    def test_url_control_is_downloaded_once(self):
+        url = "https://example.com/control.mp4"
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+            "cosmos3_simulation.transfer.download_video",
+            return_value=b"video-bytes",
+        ) as download:
+            with local_control_path(url) as local:
+                self.assertTrue(os.path.isfile(local))
+                self.assertTrue(local.endswith("control.mp4"))
+        download.assert_called_once_with(url)
 
     def test_synthetic_control_matches_warmup_request(self):
         frames = synthetic_control_frames(num_frames=17, height=480, width=832)

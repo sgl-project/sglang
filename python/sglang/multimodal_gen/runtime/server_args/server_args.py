@@ -97,6 +97,7 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
+from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
@@ -597,6 +598,13 @@ class ServerArgs(DisaggServerArgsMixin):
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
+
+    # Client-supplied media URL policy, as in the LLM server; the default size
+    # limit is larger because requests carry videos.
+    allowed_media_domains: list[str] = field(default_factory=list)
+    allow_private_media_hosts: bool = False
+    media_url_max_file_size_mb: int = 512
+    media_url_timeout: float | None = None
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -3267,6 +3275,42 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.input_save_path,
             help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
         )
+        parser.add_argument(
+            "--allowed-media-domains",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Restrict client-supplied HTTP(S) image, video, and audio URLs to "
+            "these exact hostnames. Redirect destinations are checked against the "
+            "same allowlist, and an allowlisted host may resolve to a private "
+            "address. When unset, any host that resolves only to public addresses "
+            "is allowed (see --allow-private-media-hosts).",
+        )
+        parser.add_argument(
+            "--allow-private-media-hosts",
+            action=StoreBoolean,
+            default=ServerArgs.allow_private_media_hosts,
+            help="Allow client-supplied HTTP(S) media URLs to resolve to private, "
+            "loopback, or link-local IP addresses (including cloud metadata "
+            "endpoints such as 169.254.169.254). Disabled by default; enable only "
+            "when the server intentionally fetches media from a private network. "
+            "An explicitly allowlisted domain is exempt regardless.",
+        )
+        parser.add_argument(
+            "--media-url-max-file-size-mb",
+            type=int,
+            default=ServerArgs.media_url_max_file_size_mb,
+            help="Maximum size in MiB for one client-supplied remote media download. "
+            "The limit is enforced while streaming; set to 0 to disable it.",
+        )
+        parser.add_argument(
+            "--media-url-timeout",
+            type=float,
+            default=ServerArgs.media_url_timeout,
+            help="Seconds to download one client-supplied media URL, redirects and "
+            "body included, for every media type. When unset, REQUEST_TIMEOUT "
+            "applies, else each loader's default.",
+        )
 
         # LoRA
         parser.add_argument(
@@ -4339,6 +4383,16 @@ def set_global_server_args(server_args: ServerArgs):
     """
     global _global_server_args
     _global_server_args = server_args
+
+
+def configure_media_url_policy(server_args: ServerArgs) -> None:
+    """Apply the client media URL policy to this process's media loaders."""
+    configure_media_url_security(
+        server_args.allowed_media_domains,
+        server_args.media_url_max_file_size_mb,
+        server_args.media_url_timeout,
+        allow_private_media_hosts=server_args.allow_private_media_hosts,
+    )
 
 
 def get_global_server_args() -> ServerArgs:
