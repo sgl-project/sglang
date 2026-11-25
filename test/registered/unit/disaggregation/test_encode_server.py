@@ -356,7 +356,7 @@ class TestStagedNativeTransfer(CustomTestCase):
         grids = [[1, 2, 2], [1, 4, 2]]
         if model_type == "kimi_vl":
             grids = [[2, 2], [4, 2]]
-        elif model_type in {"inkling2", "muse_spark"}:
+        elif model_type == "muse_spark":
             grids = [[1, 1, 1], [1, 2, 1]]
         tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         enc = MMEncoder.__new__(MMEncoder)
@@ -863,7 +863,6 @@ class TestStagedNativeTransfer(CustomTestCase):
             "kimi_k25",
             "kimi_k3",
             "kimi_k31",
-            "inkling2",
         }
 
         async def run(model, backend):

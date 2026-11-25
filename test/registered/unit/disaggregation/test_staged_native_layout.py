@@ -22,7 +22,6 @@ from sglang.srt.disaggregation.encoder.receiver import (
 )
 from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.multimodal.inkling2.processor import Inkling2MultimodalProcessor
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.dots_note_omni import DotsNoteOmniProcessor
 from sglang.srt.multimodal.processors.glm4v import Glm4vImageProcessor
@@ -73,7 +72,6 @@ def descriptor(model, images, videos=()):
         ("kimi_k25", KimiK2_5VLImageProcessor),
         ("kimi_k3", KimiK3ImageProcessor),
         ("kimi_k31", KimiK3ImageProcessor),
-        ("inkling2", Inkling2MultimodalProcessor),
         ("dots3_note", DotsNoteOmniProcessor),
     ],
 )
@@ -89,7 +87,7 @@ def test_native_image_layout_and_identity(model, cls):
     p._tokenizer = SimpleNamespace(
         encode=lambda text, **kwargs: [51] if "640x480" in text else [52]
     )
-    h, w = (1, 2) if model == "inkling2" else (2, 4)
+    h, w = 2, 4
     rows = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     image = dict(
         t=1, h=h, w=w, embedding_rows=2, identity=identity(Modality.IMAGE, rows)
