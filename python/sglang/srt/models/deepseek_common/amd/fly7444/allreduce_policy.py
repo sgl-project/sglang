@@ -55,11 +55,11 @@ import functools
 import logging
 import os
 
-from .kernels.comm.allreduce_shared import (
+from .kernels.comm.allreduce_shared import (  # noqa: F401  -- re-exported for the dispatchers
     BLOCK,
     LINKS,
-    MAX_PAYLOAD_BYTES,  # noqa: F401  -- re-exported for the dispatchers
-    SUPPORTED_ARCHS,  # noqa: F401  -- re-exported for the dispatchers
+    MAX_PAYLOAD_BYTES,
+    SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
     AllReduceAlgorithm,
     FamilyPolicy,

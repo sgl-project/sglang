@@ -18,9 +18,9 @@ from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 LOG2E = 1.4426950408889634
 
 
-def ceildiv(numer, denom):
+def ceildiv(numerator, denom):
     """Ceiling division preserving Python-int or DSL-scalar operand types."""
-    return (numer + denom - 1) // denom
+    return (numerator + denom - 1) // denom
 
 
 def format_kernel_name(name: str) -> str:

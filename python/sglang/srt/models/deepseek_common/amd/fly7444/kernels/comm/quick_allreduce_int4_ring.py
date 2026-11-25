@@ -32,17 +32,18 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
-from .allreduce_shared import (
+from .allreduce_shared import (  # noqa: F401  -- re-exported for host symmetry
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
     ATOMS,
     BLOCK,
-    DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
+    DEFAULT_GRID_CAP,
     FLAG_I32_PER_LANE,
     FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
+    SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
     _acquire_inbox,
     _buffer_load,
@@ -61,7 +62,6 @@ from .allreduce_shared import (
 from .quick_allreduce_codec import (
     GROUP,
     SCALE_CODEC_TAG,
-    SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,

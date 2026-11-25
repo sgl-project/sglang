@@ -56,8 +56,9 @@ left unchanged. Only a codec with a scale plane (INT4) uses it.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu
 from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import (
     Float32,
     Int32,
@@ -80,6 +81,7 @@ from .allreduce_shared import (
     QUAD_LANES,
     QUADS_PER_WAVE,
     SUPPORTED_ARCHS,
+    SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WAVE,
@@ -103,7 +105,6 @@ from .allreduce_shared import (
 from .quick_allreduce_codec import (
     SCALE_CODEC_TAG,
     SUPER_TILES,
-    SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
@@ -527,7 +528,9 @@ def make_quick_allreduce_int4_kernel(
         NORM_GROUP = (
             tile_atoms
             if NORM_LATENCY
-            else 2 if (world_size, super_tile) == (8, 1) else 1
+            else 2
+            if (world_size, super_tile) == (8, 1)
+            else 1
         )
     else:
         PackStorage = make_pack_storage(pack_i32)
