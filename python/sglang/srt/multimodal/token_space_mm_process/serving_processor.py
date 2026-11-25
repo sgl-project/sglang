@@ -81,9 +81,6 @@ class TokenSpaceSGLangProcessor:
         self._serving_spec = self._serving_spec_class(hf_config)
         self._server_args = server_args
         mm = get_mm()
-        self._video_preprocessing_device = (mm.mm_process_config or {}).get(
-            "video_preprocessing_device", self._serving_spec.video_preprocessing_device
-        )
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
         self._feature_transport = MultimodalFeatureTransport(
             mm.mm_feature_transport,
@@ -179,18 +176,13 @@ class TokenSpaceSGLangProcessor:
             video_data = request_obj.video_data
         if audio_data is None and request_obj is not None:
             audio_data = request_obj.audio_data
-        image_device, video_device = self._image_device, None
-        # As legacy: a video request preprocesses all its media on the video device.
-        if video_data and self._video_preprocessing_device is not None:
-            image_device = video_device = self._video_preprocessing_device
         return await self._core.process(
             image_data,
             video_data,
             audio_data,
             input_ids=input_ids,
             mm_token_expansion_start_len=mm_token_expansion_start_len,
-            image_device=image_device,
-            video_device=video_device,
+            image_device=self._image_device,
             compute_mrope_positions=True,
             package_output=self._package_output,
         )
@@ -206,15 +198,25 @@ class TokenSpaceSGLangProcessor:
         """
         input_ids = output["input_ids"].flatten()
         # Offsets are where locate_media put each media, inclusive, in list order.
-        offsets = {}
+        media_offsets = {}
         for modality, spans in zip(output["mm_modalities"], output["mm_spans"]):
-            offsets.setdefault(modality, []).extend(
-                (start, end - 1) for start, end in spans
+            media_offsets.setdefault(modality, []).append(
+                [(start, end - 1) for start, end in spans]
             )
         mm_items = self._collect_mm_items(output)
         for item in mm_items:
-            item.offsets = offsets[item.modality]
+            item.offsets = [
+                offset for offsets in media_offsets[item.modality] for offset in offsets
+            ]
         mm_items = self._serving_spec.split_mm_items(mm_items)
+        items_by_modality = {}
+        for item in mm_items:
+            items_by_modality.setdefault(item.modality, []).append(item)
+        for modality, items in items_by_modality.items():
+            # A modality the split left bundled keeps all its media's offsets.
+            if len(items) == len(media_offsets[modality]):
+                for item, offsets in zip(items, media_offsets[modality]):
+                    item.offsets = offsets
         # Hash the feature tensors themselves: transport may swap them for CUDA IPC handles.
         self._bind_cache_namespaces(mm_items)
         for item in mm_items:

@@ -109,7 +109,6 @@ def test_sglang_entry_forwards_the_request_to_its_core(media_source):
     wrapper = object.__new__(TokenSpaceSGLangProcessor)
     wrapper._core = SimpleNamespace(process=AsyncMock(return_value=object()))
     wrapper._image_device = "image device"
-    wrapper._video_preprocessing_device = None
     from sglang.srt.managers.io_struct import GenerateReqInput
 
     request_obj = GenerateReqInput(
@@ -142,7 +141,6 @@ def test_sglang_entry_forwards_the_request_to_its_core(media_source):
         mm_token_expansion_start_len=1,
         package_output=wrapper._package_output,
         image_device="image device",
-        video_device=None,
         compute_mrope_positions=True,
     )
 
