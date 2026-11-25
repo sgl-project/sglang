@@ -615,7 +615,6 @@ def _ernie_geglu(gate_up: torch.Tensor) -> torch.Tensor:
 class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """ErnieImage DiT: Single-stream transformer with Shared AdaLN."""
 
-    _supports_gradient_checkpointing = True
     _no_split_modules = ["ErnieImageSharedAdaLNBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
 

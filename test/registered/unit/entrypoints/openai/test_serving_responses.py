@@ -16,7 +16,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from openai_harmony import Conversation, Message, Role, ToolNamespaceConfig
+from openai_harmony import Author, Conversation, Message, Role, ToolNamespaceConfig
 from utils import (
     MockTemplateManager,
     MockTokenizerManager,
@@ -31,6 +31,7 @@ from xgrammar.testing import _is_grammar_accept_string
 from sglang.srt.entrypoints.context import (
     HarmonyContext,
     SimpleContext,
+    StreamingHarmonyContext,
 )
 from sglang.srt.entrypoints.harmony_utils import get_encoding
 from sglang.srt.entrypoints.openai.protocol import (
@@ -2571,7 +2572,8 @@ def test_pd_builtin_tool_admission(response_serving):
     serving.tokenizer_manager.generate_request.assert_not_called()
 
 
-def test_standalone_builtin_tools_without_storage(response_serving):
+@pytest.mark.parametrize("stream", [False, True])
+def test_standalone_builtin_tools_without_storage(response_serving, stream):
     serving = response_serving(harmony=True)
     tool_session = Mock()
     tool_session.call_tool = AsyncMock(
@@ -2598,7 +2600,7 @@ def test_standalone_builtin_tools_without_storage(response_serving):
         chunk["output_ids"] = get_encoding().render_conversation(
             Conversation.from_messages([next(turns)])
         )
-        if serving.tokenizer_manager.generate_request.call_count == 1:
+        if stream or serving.tokenizer_manager.generate_request.call_count == 1:
             # The parser starts inside the prompt's open assistant header.
             chunk["output_ids"] = chunk["output_ids"][2:]
         chunk["meta_info"]["completion_tokens"] = len(chunk["output_ids"])
@@ -2611,7 +2613,13 @@ def test_standalone_builtin_tools_without_storage(response_serving):
         name="browser", description="Browser", tools=[]
     )
     serving.supports_browsing = True
-    request = ResponsesRequest(model="x", input="hi", tools=[{"type": "web_search"}])
+    request = ResponsesRequest(
+        model="x",
+        instructions="Use the search tool.",
+        input="What is the answer?",
+        tools=[{"type": "web_search"}],
+        stream=stream,
+    )
     response = asyncio.run(create_response_result(serving, request))
     assert isinstance(response, ResponsesResponse), response.body
     tool_session.call_tool.assert_awaited_once_with("search", {"query": "answer"})
@@ -2619,8 +2627,75 @@ def test_standalone_builtin_tools_without_storage(response_serving):
     assert response.output[-1].content[0].text == "The answer is 42."
     assert serving.tokenizer_manager.generate_request.call_count == 2
     continuation = serving.tokenizer_manager.generate_request.call_args_list[1].args[0]
-    assert "Search result: 42" in get_encoding().decode(continuation.input_ids)
+    prompt = get_encoding().decode(continuation.input_ids)
+    assert request.instructions in prompt
+    assert request.input in prompt
+    assert "Search result: 42" in prompt
     assert not serving.msg_store and not serving.response_store
+
+
+def _harmony_turn_ids(message):
+    # The parser starts inside the prompt's open assistant header.
+    return get_encoding().render_conversation(Conversation.from_messages([message]))[2:]
+
+
+def _harmony_turn_chunks(output_ids, *, stream, prompt_tokens=5, cached_tokens=0):
+    # A stream delivers cumulative output_ids; a full response delivers one chunk.
+    sizes = range(1, len(output_ids) + 1) if stream else [len(output_ids)]
+    for size in sizes:
+        chunk = engine_chunk(None, size, finish=size == len(output_ids))
+        chunk["output_ids"] = output_ids[:size]
+        chunk["meta_info"].update(
+            prompt_tokens=prompt_tokens, cached_tokens=cached_tokens
+        )
+        yield chunk
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_harmony_context_usage_from_meta_info(stream):
+    """Harmony usage reports the prompt, cached and output token counts the
+    engine returns, for full and streamed output."""
+    output_ids = _harmony_turn_ids(
+        Message.from_role_and_content(Role.ASSISTANT, "ok").with_channel("final")
+    )
+    context = (StreamingHarmonyContext if stream else HarmonyContext)([], {})
+    for chunk in _harmony_turn_chunks(
+        output_ids, stream=stream, prompt_tokens=7, cached_tokens=3
+    ):
+        context.append_output(chunk)
+
+    assert context.num_prompt_tokens == 7
+    assert context.num_cached_tokens == 3
+    assert context.num_output_tokens == len(output_ids)
+
+
+def test_streaming_harmony_context_continues_after_tool_output():
+    """A streamed turn that follows a builtin tool result is parsed from its
+    first token, and usage sums the output tokens of both turns."""
+    call_ids = _harmony_turn_ids(
+        Message.from_role_and_content(Role.ASSISTANT, "print(1)")
+        .with_channel("commentary")
+        .with_recipient("python")
+    )
+    final_ids = _harmony_turn_ids(
+        Message.from_role_and_content(Role.ASSISTANT, "ok").with_channel("final")
+    )
+    tool_output = Message.from_author_and_content(
+        Author.new(Role.TOOL, "python"), "1"
+    ).with_recipient("assistant")
+
+    context = StreamingHarmonyContext([], {})
+    for chunk in _harmony_turn_chunks(call_ids, stream=True):
+        context.append_output(chunk)
+    context.append_output([tool_output])
+    context.render_for_completion()
+    for chunk in _harmony_turn_chunks(final_ids, stream=True):
+        context.append_output(chunk)
+
+    final = context.messages[-1]
+    assert final.channel == "final"
+    assert final.content[0].text == "ok"
+    assert context.num_output_tokens == len(call_ids) + len(final_ids)
 
 
 def test_pd_tool_continuation_stops_before_side_effect(response_serving):
