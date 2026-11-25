@@ -41,14 +41,18 @@ def build_module(name, src, opts):
         nvrtc.nvrtcCreateProgram(expand(src).encode(), name.encode(), 0, [], []),
         "nvrtcCreateProgram",
     )
-    (err,) = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
-    if err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-        log = b" " * nvrtc.nvrtcGetProgramLogSize(prog)[1]
-        nvrtc.nvrtcGetProgramLog(prog, log)
-        raise RuntimeError(f"NVRTC failed on {name}:\n" + log.decode(errors="replace"))
-    cubin = b" " * check(nvrtc.nvrtcGetCUBINSize(prog), "nvrtcGetCUBINSize")
-    check(nvrtc.nvrtcGetCUBIN(prog, cubin), "nvrtcGetCUBIN")
-    nvrtc.nvrtcDestroyProgram(prog)
+    try:
+        (err,) = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
+        if err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+            log = b" " * nvrtc.nvrtcGetProgramLogSize(prog)[1]
+            nvrtc.nvrtcGetProgramLog(prog, log)
+            raise RuntimeError(
+                f"NVRTC failed on {name}:\n" + log.decode(errors="replace")
+            )
+        cubin = b" " * check(nvrtc.nvrtcGetCUBINSize(prog), "nvrtcGetCUBINSize")
+        check(nvrtc.nvrtcGetCUBIN(prog, cubin), "nvrtcGetCUBIN")
+    finally:
+        nvrtc.nvrtcDestroyProgram(prog)
     return check(driver().cuModuleLoadData(cubin), "cuModuleLoadData")
 
 
