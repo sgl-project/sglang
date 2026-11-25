@@ -16,7 +16,7 @@ from unittest import mock
 
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
@@ -79,6 +79,10 @@ class TestResolveRocmForwardMethod(CustomTestCase):
             self.assertEqual(
                 abh.resolve_rocm_forward_method(AttnForwardMethod.MHA_ONE_SHOT),
                 AttnForwardMethod.MHA_ONE_SHOT_ROCM,
+            )
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(AttnForwardMethod.MHA_CHUNKED_KV),
+                AttnForwardMethod.MHA_CHUNKED_KV_ROCM,
             )
             self.assertEqual(
                 abh.resolve_rocm_forward_method(AttnForwardMethod.MLA),

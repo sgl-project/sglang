@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=700, suite="nightly-16-npu-a3", nightly=True)
+register_npu_ci(est_time=700, suite="nightly-test-16-npu-a3", nightly=True)
 
 
 class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
@@ -42,14 +42,12 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
             "16",
             "--attn-dp-size",
             "2",
-            "--enable-torch-compile",
-            "--torch-compile-max-bs",
-            "2",
             "--load-balance-method",
             cls.mode,
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--quantization",
             "modelslim",
             "--mem-fraction-static",

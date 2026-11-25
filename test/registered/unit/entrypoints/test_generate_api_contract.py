@@ -1,7 +1,8 @@
 """The `/generate` schema gate (`entrypoints/api_contract.py`): the typed media
 contract that replaced the raw_json passthrough, checked without a server, and
-where the route applies it."""
+where the route applies it. Also how `serve_generate_request` writes a stream."""
 
+import asyncio
 import unittest
 from types import SimpleNamespace
 
@@ -11,10 +12,11 @@ from fastapi.testclient import TestClient
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.api_contract import generate_contract_error
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.utils.json_response import dumps_json
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestGenerateContract(CustomTestCase):
@@ -52,6 +54,29 @@ class TestGenerateContract(CustomTestCase):
         )
         self.assertIsNotNone(error)
         self.assertIn("unknown field", error)
+
+    def test_glm_external_ar_grid_payload_is_accepted(self):
+        """GLM external AR sends grid metadata with pre-tokenized inputs."""
+        for image_data in (
+            # generate_prior_tokens: one request, one grid list
+            [{"image_grid_thw": [[1, 32, 32], [1, 64, 64]]}],
+            # generate_prior_tokens_batch: one grid list per batch entry
+            [
+                [{"image_grid_thw": [[1, 32, 32], [1, 64, 64]]}],
+                [{"image_grid_thw": [[1, 32, 32], [1, 16, 16]]}],
+            ],
+        ):
+            with self.subTest(image_data=image_data):
+                self.assertIsNone(
+                    generate_contract_error(
+                        {"input_ids": [1, 2, 3], "image_data": image_data}
+                    )
+                )
+        # A grid row of the wrong scalar type is still a contract error.
+        error = generate_contract_error(
+            {"input_ids": [1], "image_data": [{"image_grid_thw": [[1, "h", 32]]}]}
+        )
+        self.assertIsNotNone(error)
 
     def test_preprocessed_inputs_are_not_an_http_shape(self):
         """processor_output / precomputed_embedding carry tensors: Engine-only."""
@@ -113,6 +138,147 @@ class TestGenerateRouteGate(CustomTestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json(), {"text": "ok"})
             self.assertEqual(len(served), 1)
+        finally:
+            http_server._global_state = prior_state
+
+    def test_route_drops_the_parsed_body_before_serving(self):
+        """The stream holds `request` to the end; its cached body must not
+        keep the prompt list alive."""
+        cached = []
+
+        class FakeTokenizerManager:
+            async def generate_request(self, obj, request):
+                cached.append("_json" in request.__dict__)
+                yield {"text": "ok"}
+
+        app = FastAPI()
+        app.add_api_route("/generate", http_server.generate_request, methods=["POST"])
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(
+            SimpleNamespace(tokenizer_manager=FakeTokenizerManager())
+        )
+        try:
+            response = TestClient(app).post("/generate", json={"input_ids": [1, 2]})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(cached, [False])
+        finally:
+            http_server._global_state = prior_state
+
+
+class TestGenerateStreamWrites(CustomTestCase):
+    def test_last_event_of_a_single_request_carries_done(self):
+        """A client may stop reading at a request's finishing event, so a single
+        request's last event, and an error event, are written with [DONE]."""
+
+        def out(text, finish_reason=None):
+            return {"text": text, "meta_info": {"finish_reason": finish_reason}}
+
+        def event(item):
+            return b"data: " + dumps_json(item) + b"\n\n"
+
+        done = b"data: [DONE]\n\n"
+        token = out("a")
+        finish = out("ab", {"type": "stop", "matched": 2})
+        abort = out("a", {"type": "abort", "message": "aborted"})
+        error = {
+            "error": {
+                "message": "bad",
+                "type": "invalid_request_error",
+                "code": 400,
+                "retryable": False,
+            }
+        }
+
+        class Request:
+            headers = {}
+
+            def __init__(self, disconnected):
+                self.disconnected = disconnected
+
+            async def is_disconnected(self):
+                return self.disconnected
+
+        class TokenizerManager:
+            def __init__(self, outs, normalize):
+                self.outs = outs
+                self.normalize = normalize
+
+            async def generate_request(self, obj, request):
+                if self.normalize:
+                    obj.normalize_batch_and_arguments()
+                for item in self.outs:
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+
+            def create_abort_task(self, obj):
+                return None
+
+        async def writes(obj, outs, normalize=True, disconnected=False):
+            http_server.set_global_state(
+                SimpleNamespace(tokenizer_manager=TokenizerManager(outs, normalize))
+            )
+            response = await http_server.serve_generate_request(
+                obj, Request(disconnected)
+            )
+            sent = []
+
+            async def send(message):
+                if message.get("body"):
+                    sent.append(message["body"])
+
+            await response.stream_response(send)
+            return sent
+
+        single = {"text": "hi", "stream": True}
+        batch = {"text": ["hi", "yo"], "stream": True}
+        n2 = {"text": "hi", "stream": True, "sampling_params": {"n": 2}}
+        cases = [
+            (
+                "single",
+                single,
+                [token, token, finish],
+                {},
+                [event(token), event(token), event(finish) + done],
+            ),
+            ("abort", single, [token, abort], {}, [event(token), event(abort) + done]),
+            (
+                "batch",
+                batch,
+                [token, finish, finish],
+                {},
+                [event(token), event(finish), event(finish), done],
+            ),
+            ("n > 1", n2, [finish, finish], {}, [event(finish), event(finish), done]),
+            # A tokenizer manager that normalizes a copy leaves is_single unset.
+            (
+                "unnormalized",
+                single,
+                [finish],
+                {"normalize": False},
+                [event(finish), done],
+            ),
+            (
+                "error",
+                single,
+                [token, ValueError("bad")],
+                {},
+                [event(token), event(error) + done],
+            ),
+            (
+                "disconnect",
+                single,
+                [token, ValueError("disconnected")],
+                {"disconnected": True},
+                [event(token)],
+            ),
+        ]
+        prior_state = http_server.get_global_state()
+        try:
+            for name, body, outs, kwargs, expected in cases:
+                with self.subTest(name):
+                    obj = GenerateReqInput(**body)
+                    self.assertEqual(asyncio.run(writes(obj, outs, **kwargs)), expected)
         finally:
             http_server._global_state = prior_state
 

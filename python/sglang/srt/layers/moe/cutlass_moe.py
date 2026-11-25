@@ -10,19 +10,21 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import (
-        apply_shuffle_mul_sum,
         es_fp8_blockwise_scaled_grouped_mm,
         es_sm100_mxfp8_blockscaled_grouped_mm,
         es_sm100_mxfp8_blockscaled_grouped_quant,
         fp8_blockwise_scaled_grouped_mm,
-        prepare_moe_input,
         shuffle_rows,
     )
 
     from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.moe.cutlass_prepare_moe_input import (
+        cutlass_prepare_moe_input,
+    )
     from sglang.kernels.ops.moe.shuffle_rows_with_scales import (
         shuffle_rows_with_scales,
     )
+    from sglang.kernels.ops.moe.shuffle_weighted_sum import shuffle_weighted_sum
 
 
 def cutlass_fused_experts_fp8(
@@ -123,15 +125,14 @@ def cutlass_fused_experts_fp8(
     assert a.shape[1] == w1_q.shape[1], "Hidden size mismatch w1"
     assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
-    assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
     assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
-    if is_cuda:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
     es_up, es_down = enable_es
     out_dtype = a.dtype
     num_experts = w1_q.size(0)
@@ -141,9 +142,6 @@ def cutlass_fused_experts_fp8(
 
     topk = topk_ids.size(1)
     device = a.device
-
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
 
     if use_mxfp8:
         assert es_up and es_down, "MXFP8 requires expert-specialization for both GEMMs"
@@ -177,13 +175,23 @@ def cutlass_fused_experts_fp8(
             (max_total + mxfp8_blockscale_align - 1) // mxfp8_blockscale_align
         ) * mxfp8_blockscale_align
 
+    if m == 0 or topk == 0:
+        if output is None:
+            output = torch.empty((m, k), dtype=out_dtype, device=device)
+        if m != 0:
+            output.zero_()
+        return output
+
+    a_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
+
     blockscale_offsets = None
     if use_mxfp8 and (es_up or es_down):
         blockscale_offsets = torch.empty(
             (num_experts + 1,), dtype=torch.int32, device=device
         )
 
-    prepare_moe_input(
+    cutlass_prepare_moe_input(
         topk_ids,
         expert_offsets,
         problem_sizes1,
@@ -275,7 +283,7 @@ def cutlass_fused_experts_fp8(
     if swiglu_limit is None:
         silu_and_mul(c1, intermediate)
     else:
-        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
+        from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
 
         silu_and_mul_clamp(c1, intermediate, swiglu_limit)
 
@@ -345,5 +353,7 @@ def cutlass_fused_experts_fp8(
     if output is None:
         output = torch.empty((m, k), device=device, dtype=out_dtype)
 
-    apply_shuffle_mul_sum(c2, output, c_map, topk_weights.to(out_dtype))
+    shuffle_weighted_sum(
+        c2, output, c_map, topk_weights, cast_weights_to_input_dtype=True
+    )
     return output

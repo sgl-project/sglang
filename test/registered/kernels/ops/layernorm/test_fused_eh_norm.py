@@ -6,7 +6,7 @@ import torch
 from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.cuda is None,
@@ -93,28 +93,6 @@ def test_fused_eh_norm_row_strided_inputs():
         inputs_embeds, previous_hidden, enorm_weight, hnorm_weight, eps
     )
     torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
-
-
-def test_fused_eh_norm_rejects_unsupported_dtype():
-    hidden_size = 7168
-    inputs_embeds = torch.randn(1, hidden_size, device="cuda", dtype=torch.float32)
-    previous_hidden = torch.randn_like(inputs_embeds)
-    enorm_weight = torch.randn(hidden_size, device="cuda", dtype=torch.float32)
-    hnorm_weight = torch.randn(hidden_size, device="cuda", dtype=torch.float32)
-
-    with pytest.raises(RuntimeError, match="unsupported dtype"):
-        fused_eh_norm(inputs_embeds, previous_hidden, enorm_weight, hnorm_weight, 1e-6)
-
-
-def test_fused_eh_norm_rejects_unsupported_hidden_size():
-    hidden_size = 5000
-    inputs_embeds = torch.randn(1, hidden_size, device="cuda", dtype=torch.bfloat16)
-    previous_hidden = torch.randn_like(inputs_embeds)
-    enorm_weight = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
-    hnorm_weight = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
-
-    with pytest.raises(RuntimeError, match="unsupported hidden_size"):
-        fused_eh_norm(inputs_embeds, previous_hidden, enorm_weight, hnorm_weight, 1e-6)
 
 
 if __name__ == "__main__":

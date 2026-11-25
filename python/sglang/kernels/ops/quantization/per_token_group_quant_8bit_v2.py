@@ -1,7 +1,10 @@
-"""DEPRECATED: superseded by ``sglang.kernels.ops.quantization.per_token_group_quant`` (the
-default CUDA path). No sglang runtime code may call this kernel; it is kept
-only as the perf baseline for the per_token_group_quant benchmarks and its own
-bit-parity tests, and will be deleted once those move to torch references.
+"""JIT port of ``sgl_per_token_group_quant_8bit_v2``.
+
+``sglang.kernels.ops.quantization.per_token_group_quant`` is the default CUDA
+path. This kernel still serves the row-major UE8M0 layout stored as fp32
+power-of-two scales outside the Hopper BF16 group32 fast path (see
+``fp8_kernel._run_per_token_group_quant_8bit_kernel``), and is the perf baseline
+for the per_token_group_quant benchmarks.
 """
 
 from __future__ import annotations
@@ -51,9 +54,6 @@ def _per_token_group_quant_8bit_v2_custom_op(
     output_q: torch.Tensor,
     output_s: torch.Tensor,
     group_size: int,
-    eps: float,
-    min_8bit: float,
-    max_8bit: float,
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
@@ -110,26 +110,22 @@ def per_token_group_quant_8bit_v2(
     output_q: torch.Tensor,
     output_s: torch.Tensor,
     group_size: int,
-    eps: float,
-    min_8bit: float,
-    max_8bit: float,
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
 ) -> None:
-    """JIT port of sgl_per_token_group_quant_8bit_v2 (full feature parity).
+    """JIT port of sgl_per_token_group_quant_8bit_v2.
 
     Wraps the registered custom op so torch.compile / piecewise CUDA graph treat
-    the tvm-ffi kernel call as an opaque boundary.
+    the tvm-ffi kernel call as an opaque boundary. The kernel uses a fixed absmax
+    floor of 1e-10 and the output dtype's quantization range: [-448, 448] for
+    FP8 E4M3 or [-128, 127] for INT8.
     """
     _per_token_group_quant_8bit_v2_custom_op(
         input=input,
         output_q=output_q,
         output_s=output_s,
         group_size=group_size,
-        eps=eps,
-        min_8bit=min_8bit,
-        max_8bit=max_8bit,
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,

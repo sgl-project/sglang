@@ -30,6 +30,7 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
 from sglang.kernels.numerics import round_bf16_to_fp32
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -96,6 +97,7 @@ def _fake_rope_rotate_half(
     mutates_args=[],
     fake_impl=_fake_rope_rotate_half,
 )
+@replay_launches
 def fused_rope_rotate_half_bitexact(
     x: torch.Tensor,
     cos: torch.Tensor,

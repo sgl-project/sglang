@@ -139,9 +139,9 @@ def _grouped_gemm_mxfp8(
     M_routed = num_valid_tokens
     E, N, K = w.shape
     assert K % 128 == 0, f"MXFP8 native MoE requires K%128==0, got K={K}"
-    # Keep zero-fill: moe_align_block_size reserves an extra expert bucket for
-    # filtered routes, which should contribute zeros if present.
-    out = torch.zeros((M_routed, N), dtype=out_dtype, device=a_q.device)
+    # Every route is stored, including zeros for EP-filtered experts. Padding
+    # token ids fail token_mask, so they cannot leave valid output rows unwritten.
+    out = torch.empty((M_routed, N), dtype=out_dtype, device=a_q.device)
     if a_div == top_k and M_routed <= 32 and K >= 3072:
         BLOCK_N = 64
         num_warps = 4
@@ -262,7 +262,7 @@ def fused_moe_mxfp8_native(
 ) -> torch.Tensor:
     # Lazy import: the jit_kernel package pulls in Triton at first use; importing
     # at call time avoids any import-time cycle with the moe runner package.
-    from sglang.kernels.ops.moe.minimax_m3_swiglu import (
+    from sglang.kernels.ops.activation.minimax_m3_swiglu import (
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
     )

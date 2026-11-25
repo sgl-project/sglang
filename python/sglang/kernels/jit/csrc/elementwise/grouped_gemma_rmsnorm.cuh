@@ -141,7 +141,7 @@ struct GroupedGemmaRMSNormKernel {
     auto M = SymbolicSize{"num_tokens"};
     auto H = SymbolicSize{"hidden_size"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, H})  // input
         .with_dtype<DType>()
@@ -170,6 +170,7 @@ struct GroupedGemmaRMSNormKernel {
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
     const uint32_t num_blocks = num_tokens * params.num_groups;
+    if (num_blocks == 0) return;
     LaunchKernel(num_blocks, kBlockSize, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }

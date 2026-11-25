@@ -25,11 +25,9 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     duplicate_pad_mm_input_ids,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.multimodal.modality import Modality
 
 
 def load_baseline(ref):
