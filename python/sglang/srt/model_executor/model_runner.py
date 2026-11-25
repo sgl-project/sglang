@@ -737,11 +737,28 @@ class ModelRunner:
             )
 
     def initialize(self):
+        create_recorder = ExpertDistributionRecorder.init_new
+        create_eplb_manager = EPLBManager
+        async_eplb = (
+            self.device == "npu"
+            and not self.is_draft_worker
+            and get_exec().moe.eplb_async_rebalance
+        )
+        if async_eplb:
+            from sglang.srt.hardware_backend.npu.eplb_manager import (
+                AsyncEplbRecorder,
+                NpuAsyncEPLBManager,
+            )
+
+            create_recorder, create_eplb_manager = (
+                AsyncEplbRecorder,
+                NpuAsyncEPLBManager,
+            )
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
-        self.maybe_init_expert_location_metadata()
+        self.maybe_init_expert_location_metadata(create_recorder)
         self.maybe_init_lplb_solvers()
-        self.maybe_init_eplb_manager()
+        self.maybe_init_eplb_manager(create_eplb_manager)
         self.expert_location_updater = ExpertLocationUpdater()
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
@@ -786,11 +803,7 @@ class ModelRunner:
             is_draft=self.is_draft_worker,
         )
         allocate_mega_moe_buffers(self.model)
-        if (
-            self.device == "npu"
-            and self.eplb_manager is not None
-            and get_exec().moe.eplb_async_rebalance
-        ):
+        if async_eplb and self.eplb_manager is not None:
             self.eplb_manager.init_after_model_load(self.startup_weight_load)
 
     def init_memory_saver_adapter(self):
@@ -802,7 +815,9 @@ class ModelRunner:
         if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
             self.remote_instance_weight_transporter.init_engine()
 
-    def maybe_init_expert_location_metadata(self):
+    def maybe_init_expert_location_metadata(
+        self, create_recorder=ExpertDistributionRecorder.init_new
+    ):
         if self.is_draft_worker:
             return
         expert_rank = get_parallel().moe_ep_rank + (
@@ -824,11 +839,6 @@ class ModelRunner:
                 "Initial expert_location_metadata:\n%s",
                 format_expert_location_layout(get_global_expert_location_metadata()),
             )
-        create_recorder = ExpertDistributionRecorder.init_new
-        if self.device == "npu" and get_exec().moe.eplb_async_rebalance:
-            from sglang.srt.hardware_backend.npu.eplb_manager import AsyncEplbRecorder
-
-            create_recorder = AsyncEplbRecorder
         set_global_expert_distribution_recorder(
             create_recorder(get_global_expert_location_metadata(), rank=expert_rank)
         )
@@ -837,16 +847,7 @@ class ModelRunner:
         if get_exec().moe.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
             init_lplb_solvers(model_config=self.model_config)
 
-    def maybe_init_eplb_manager(self):
-        manager_cls = EPLBManager
-        if (
-            self.device == "npu"
-            and not self.is_draft_worker
-            and get_exec().moe.eplb_async_rebalance
-        ):
-            from sglang.srt.hardware_backend.npu.eplb_manager import NpuAsyncEPLBManager
-
-            manager_cls = NpuAsyncEPLBManager
+    def maybe_init_eplb_manager(self, manager_cls=EPLBManager):
         self.eplb_manager = (
             manager_cls(
                 model_config=self.model_config,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import timedelta
@@ -20,6 +21,10 @@ from sglang.srt.eplb.expert_location import (
     get_eplb_group,
 )
 from sglang.srt.eplb.expert_location_updater import update_expert_weights_single_layer
+from sglang.srt.hardware_backend.npu.distributed import (
+    eplb_hccl_options,
+    eplb_reuses_world_group,
+)
 from sglang.srt.hardware_backend.npu.eplb import (
     _ExpertWeightAdapter,
     _validate_migration_topology,
@@ -129,6 +134,45 @@ def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
             destination.copy_(source)
 
     return writeback
+
+
+def _make_comm_rank_lookup(old_layout, new_layout, local_experts):
+    def index_ranks(layout):
+        by_expert = defaultdict(list)
+        for slot, expert in enumerate(layout):
+            rank = slot // local_experts
+            ranks = by_expert[expert]
+            # Preserve rank order for the shared source assignment.
+            if not ranks or ranks[-1] != rank:
+                ranks.append(rank)
+        return by_expert
+
+    old_ranks = index_ranks(old_layout)
+    new_ranks = index_ranks(new_layout)
+
+    def lookup(expert):
+        sources = old_ranks[expert]
+        source_ranks = set(sources)
+        return sources, [rank for rank in new_ranks[expert] if rank not in source_ranks]
+
+    return lookup
+
+
+def _submit_hccl_batches(p2p_op_infos, expert_order, batch_size, pending_work):
+    ops_by_expert = dict(p2p_op_infos)
+    if not any(ops_by_expert.values()):
+        return
+    for start in range(0, len(expert_order), batch_size):
+        batch_ops = [
+            op
+            for expert in expert_order[start : start + batch_size]
+            for op in ops_by_expert.get(expert, ())
+        ]
+        if batch_ops:
+            work = dist.batch_isend_irecv(batch_ops)
+            pending_work.extend(work)
+            for request in work:
+                request.wait()
 
 
 def _hccl_expert_order(old_layout, new_layout, num_logical, world_size, batch_size):
@@ -460,6 +504,10 @@ class NpuEplbRuntime:
         pending_work = []
         old_layout = self.metadata.physical_to_logical_map_cpu[layer].tolist()
         new_layout = self._planned_rows["physical_to_logical_map"][layer].tolist()
+        batch_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
+        get_comm_ranks = _make_comm_rank_lookup(
+            old_layout, new_layout, self.spec.local_experts
+        )
         p2p_expert_order = None
         if self.world_size == self.ranks_per_node:
             p2p_expert_order = _hccl_expert_order(
@@ -467,14 +515,14 @@ class NpuEplbRuntime:
                 new_layout,
                 self.metadata.num_logical_experts,
                 self.world_size,
-                envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get(),
+                batch_size,
             )
         self.interleaved_layers += p2p_expert_order is not None
+        expert_order = p2p_expert_order or range(len(old_layout))
 
-        def submit_p2p_batch(ops):
-            work = dist.batch_isend_irecv(ops)
-            pending_work.extend(work)
-            return work
+        def stage_transfers(p2p_op_infos, rows):
+            staged_rows.extend(rows)
+            _submit_hccl_batches(p2p_op_infos, expert_order, batch_size, pending_work)
 
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
@@ -496,9 +544,8 @@ class NpuEplbRuntime:
                 world_size=self.world_size,
                 log_metrics=self.log_metrics,
                 group=self.p2p_group,
-                staged_rows=staged_rows,
-                submit_p2p_batch=submit_p2p_batch,
-                p2p_expert_order=p2p_expert_order,
+                get_comm_ranks=get_comm_ranks,
+                stage_transfers=stage_transfers,
             )
             writeback = _make_weight_writeback(weights, staging, staged_rows)
             if self._submitted is not None:
@@ -530,10 +577,6 @@ class NpuEplbRuntime:
 
 
 def create_npu_async_eplb(model_config, weights, metadata):
-    from sglang.srt.distributed.parallel_state import (
-        npu_eplb_hccl_options,
-        npu_eplb_reuses_world_group,
-    )
     from sglang.srt.eplb.eplb_algorithms import compute_algorithm
     from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 
@@ -559,9 +602,9 @@ def create_npu_async_eplb(model_config, weights, metadata):
     timeout = timedelta(seconds=90)
     control_group = dist.new_group(backend="gloo", timeout=timeout)
     plan_group = dist.new_group(backend="gloo", timeout=timeout)
-    p2p_options = npu_eplb_hccl_options()
+    p2p_options = eplb_hccl_options()
     p2p_buffer_mib = p2p_options.hccl_config["hccl_buffer_size"]
-    borrow_world_group = npu_eplb_reuses_world_group()
+    borrow_world_group = eplb_reuses_world_group()
     if borrow_world_group:
         p2p_group = parallel.world_group.device_group
     else:

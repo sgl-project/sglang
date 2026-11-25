@@ -2254,6 +2254,13 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        should_process_early = self.should_process_last_batch_early
+        if _is_npu and get_exec().moe.eplb_async_rebalance:
+            from sglang.srt.hardware_backend.npu.eplb_manager import (
+                make_prefill_release_policy,
+            )
+
+            should_process_early = make_prefill_release_policy(self)
         self.enable_skip_finishing_decode = True
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
@@ -2275,9 +2282,7 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
-            process_last_batch_early = self.should_process_last_batch_early(
-                self.last_batch
-            )
+            process_last_batch_early = should_process_early(self.last_batch)
             if process_last_batch_early:
                 pop_and_process()
                 # Opportunistic flush at the early-processing sync boundary:
@@ -2334,27 +2339,13 @@ class Scheduler(
 
         # A prefill's result goes early, for its TTFT. Under DP, is_extend_in_batch is
         # synced, so all ranks decide the same (no deadlock).
-        early_prefill = envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
-        npu_async_eplb = (
-            _is_npu
-            and self.disaggregation_mode == DisaggregationMode.NULL
-            and get_exec().moe.eplb_async_rebalance
-        )
-        if early_prefill or npu_async_eplb:
+        if envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get():
             if self.require_mlp_sync:
                 last_batch_is_extend = last_batch.is_extend_in_batch
             else:
                 last_batch_is_extend = last_batch.forward_mode.is_extend()
             if last_batch_is_extend:
-                if early_prefill:
-                    return True
-                manager = self.tp_worker.model_runner.eplb_manager
-                if manager is not None and manager.should_release_first_prefill(
-                    has_pending_prefill=(
-                        self.chunked_req is not None or bool(self.waiting_queue)
-                    )
-                ):
-                    return True
+                return True
 
         # The next batch's grammar bitmask needs this result's FSM advance.
         return last_batch.grammar_needs_sync()

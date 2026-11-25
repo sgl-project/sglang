@@ -5,6 +5,7 @@ import time
 
 from torch.profiler import record_function
 
+from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderReal,
@@ -37,14 +38,41 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
         super()._reset()
         self.window_samples = 0
 
+    def mark_statistics_group_warmed(self):
+        # NPU startup already warmed TP and emptied the allocator cache.
+        self._accumulator._first_dump = False
+
     def snapshot_for_rebalance(self):
-        # Startup warms the statistics group and releases cached memory.
         with record_function("npu_eplb.snapshot"):
-            snapshot = self._accumulator.dump(
-                output_mode="object", empty_cache_on_first_dump=False
+            return self.dump_record(output_mode="object")
+
+
+def make_prefill_release_policy(scheduler):
+    """Select early result processing for the first unified EPLB epoch."""
+    fallback = scheduler.should_process_last_batch_early
+    manager = scheduler.tp_worker.model_runner.eplb_manager
+    if manager is None:
+        return fallback
+
+    def should_process(last_batch):
+        if (
+            last_batch is not None
+            and not envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
+        ):
+            is_extend = (
+                last_batch.is_extend_in_batch
+                if scheduler.require_mlp_sync
+                else last_batch.forward_mode.is_extend()
             )
-            self._reset()
-        return snapshot
+            if is_extend and manager.should_release_first_prefill(
+                has_pending_prefill=(
+                    scheduler.chunked_req is not None or bool(scheduler.waiting_queue)
+                ),
+            ):
+                return True
+        return fallback(last_batch)
+
+    return should_process
 
 
 class NpuAsyncEPLBManager(EPLBManager):
@@ -63,6 +91,7 @@ class NpuAsyncEPLBManager(EPLBManager):
             model.routed_experts_weights_of_layer,
             get_global_expert_location_metadata(),
         )
+        get_global_expert_distribution_recorder().mark_statistics_group_warmed()
         if getattr(model, "_derived_weight_cache_error", None) is None:
             model._derived_weight_cache_error = (
                 "Online weight updates are unsupported with async EPLB: "

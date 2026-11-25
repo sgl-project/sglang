@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import einops
 import torch
@@ -243,19 +243,16 @@ def update_expert_weights_single_layer(
     log_metrics: bool = False,
     group: Optional[torch.distributed.ProcessGroup] = None,
     *,
-    staged_rows: Optional[List[Tuple[int, int]]] = None,
-    submit_p2p_batch: Optional[
-        Callable[[List[P2POp]], List[torch.distributed.Work]]
+    get_comm_ranks: Optional[Callable[[int], Tuple[List[int], List[int]]]] = None,
+    stage_transfers: Optional[
+        Callable[[List[Tuple[int, List[P2POp]]], List[Tuple[int, int]]], None]
     ] = None,
-    p2p_expert_order: Optional[Sequence[int]] = None,
 ):
-    """Move expert weights, optionally leaving writeback to the caller.
+    """Move expert weights using the shared source and destination selection.
 
-    When `staged_rows` is provided, fill it with local (buffer, weight) row
-    pairs. A custom `submit_p2p_batch` may retain the work handles. The
-    updater still calls wait on every handle before returning.
-    A custom expert order must be identical across ranks and include every
-    expert participating in P2P once.
+    A backend can supply the ordered source ranks and remote destination ranks
+    for each expert. If it supplies `stage_transfers`, it owns submission and
+    writeback, receiving the P2P operations and local (buffer, weight) row pairs.
     """
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -278,8 +275,6 @@ def update_expert_weights_single_layer(
         )
 
     output_logs = [] if debug else None
-    if submit_p2p_batch is None:
-        submit_p2p_batch = torch.distributed.batch_isend_irecv
 
     num_physical_experts = len(old_physical_to_logical_map)
     num_tensors = len(routed_experts_weights)
@@ -305,20 +300,6 @@ def update_expert_weights_single_layer(
         (rank + 1) * num_local_physical_experts,
     )
 
-    def _ranks_by_expert(layout):
-        # Keep each rank once in physical-slot order. Source assignment depends
-        # on this order when an expert has replicas on multiple ranks.
-        ranks_by_expert = defaultdict(list)
-        for location in range(num_physical_experts):
-            expert_rank = location // num_local_physical_experts
-            ranks = ranks_by_expert[layout[location]]
-            if not ranks or ranks[-1] != expert_rank:
-                ranks.append(expert_rank)
-        return ranks_by_expert
-
-    old_ranks = _ranks_by_expert(old_physical_to_logical_map)
-    new_ranks = _ranks_by_expert(new_physical_to_logical_map)
-
     def _entrypoint():
         # List[Tuple[logical_expert_id, List[P2POp]]]
         p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
@@ -328,13 +309,16 @@ def update_expert_weights_single_layer(
         _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
         _create_isend_ops(p2p_op_infos)
         _filter_p2p_ops(p2p_op_infos)
-        _execute_p2p_ops(p2p_op_infos)
-        if staged_rows is None:
+        if stage_transfers is None:
+            _execute_p2p_ops(p2p_op_infos)
             _execute_buffer2weight_copies(buffer2weight_copy_infos)
         else:
-            staged_rows.extend(
-                (_get_local_expert_location(src), _get_local_expert_location(dst))
-                for src, dst in buffer2weight_copy_infos
+            stage_transfers(
+                p2p_op_infos,
+                [
+                    (_get_local_expert_location(src), _get_local_expert_location(dst))
+                    for src, dst in buffer2weight_copy_infos
+                ],
             )
 
         if log_metrics:
@@ -512,16 +496,29 @@ def update_expert_weights_single_layer(
         )
 
     def _compute_comm_info(logical_expert_id: int):
-        all_src_ranks = old_ranks[logical_expert_id]
-        source_ranks = set(all_src_ranks)
-        all_src_nodes = {x // num_gpu_per_node for x in all_src_ranks}
+        if get_comm_ranks is None:
+            all_src_ranks = _deduplicate_ordered(
+                [
+                    x // num_local_physical_experts
+                    for x in range(num_physical_experts)
+                    if old_physical_to_logical_map[x] == logical_expert_id
+                ]
+            )
+            need_comm_dst_ranks = _deduplicate_ordered(
+                [
+                    x // num_local_physical_experts
+                    for x in range(num_physical_experts)
+                    if new_physical_to_logical_map[x] == logical_expert_id
+                    and x // num_local_physical_experts not in all_src_ranks
+                ]
+            )
+        else:
+            all_src_ranks, need_comm_dst_ranks = get_comm_ranks(logical_expert_id)
+        all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
         self_node_src_ranks = [
             x for x in all_src_ranks if x // num_gpu_per_node == self_node_id
         ]
 
-        need_comm_dst_ranks = [
-            x for x in new_ranks[logical_expert_id] if x not in source_ranks
-        ]
         need_comm_self_node_dst_ranks = (
             [x for x in need_comm_dst_ranks if x // num_gpu_per_node == self_node_id]
             if len(self_node_src_ranks) > 0
@@ -580,18 +577,15 @@ def update_expert_weights_single_layer(
         # the same batch. Set batch_chunk_size >= num_physical_experts to disable.
         batch_chunk_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
         ops_by_expert = {eid: ops for eid, ops in sorted_infos}
-        expert_order = (
-            range(num_physical_experts)
-            if p2p_expert_order is None
-            else p2p_expert_order
-        )
-        for start in range(0, len(expert_order), batch_chunk_size):
+        for start in range(0, num_physical_experts, batch_chunk_size):
             batch_ops = []
-            for eid in expert_order[start : start + batch_chunk_size]:
+            for eid in range(
+                start, min(start + batch_chunk_size, num_physical_experts)
+            ):
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
-                reqs = submit_p2p_batch(batch_ops)
+                reqs = torch.distributed.batch_isend_irecv(batch_ops)
                 for req in reqs:
                     req.wait()
 
@@ -666,6 +660,14 @@ class _ChunkUtils:
         start = chunk_index * short_chunk_size + min(chunk_index, num_long_chunks)
         end = start + short_chunk_size + int(chunk_index < num_long_chunks)
         return slice(start, end)
+
+
+def _deduplicate_ordered(arr: List[int]):
+    output = []
+    for item in arr:
+        if len(output) == 0 or item != output[-1]:
+            output.append(item)
+    return output
 
 
 def _log_p2p_op_metrics(

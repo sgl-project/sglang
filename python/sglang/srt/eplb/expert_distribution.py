@@ -1008,7 +1008,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
 
-    def dump(self, output_mode: _OutputMode, *, empty_cache_on_first_dump: bool = True):
+    def dump(self, output_mode: _OutputMode):
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
             self._global_physical_count_of_buffered_step.get_all(),
             num_layers=self._expert_location_metadata.num_layers,
@@ -1018,8 +1018,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
         if self._first_dump:
             self._first_dump = False
-            if empty_cache_on_first_dump:
-                torch.get_device_module().empty_cache()
+            torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
             logical_count_of_buffered_step,
