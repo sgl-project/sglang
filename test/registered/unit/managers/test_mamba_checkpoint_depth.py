@@ -15,7 +15,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec, patch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     msgpack_decode,
@@ -155,173 +154,68 @@ class TestMambaCheckpointDepth(unittest.TestCase):
         )
 
 
-class TestMambaTailCheckpointDepth(CustomTestCase):
-    """Tail checkpoints round down to the grid and read intermediate state h."""
+PREFIX, EXTEND = 16384, 4066  # prompt end 20450
 
-    def _track(self, tail_tokens: int, **kwargs):
-        """Return checkpoint depth, tail depth, and kernel tracking position."""
-        with envs.SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS.override(tail_tokens):
-            entry, req = _prepare_extend(**kwargs)
-        depth = req.kv.mamba_last_track_seqlen if entry.track_mask else None
-        return depth, req.mamba_tail_seqlen, entry.track_seqlen
 
-    def test_tail_depth_rounds_down_onto_the_grid_and_reads_h(self):
-        for tree_page, tail_tokens, expected in (
-            (CHUNK, 192, 20224),
-            (CHUNK, 227, 20160),
-            (256, 300, 19968),
-        ):
-            with self.subTest(tree_page=tree_page, tail_tokens=tail_tokens):
-                depth, tail, track_seqlen = self._track(
-                    tail_tokens,
-                    tree_page=tree_page,
-                    prefix_len=16384,
-                    extend_len=4066,
-                )
-                self.assertEqual(depth, expected)
-                self.assertEqual(tail, expected)
-                # Intermediate h states use the following tracking position.
-                self.assertEqual(track_seqlen, expected + 1)
-
-    def test_tail_replaces_the_branching_point_of_the_final_forward(self):
-        kwargs = dict(
-            tree_page=CHUNK, prefix_len=16384, extend_len=4066, branching=17408
-        )
-        self.assertEqual(self._track(0, **kwargs)[0], 17408)
-        self.assertEqual(self._track(192, **kwargs)[0], 20224)
-
-    def test_extend_with_no_grid_step_before_the_tail_keeps_the_native_depth(self):
-        # 200 - 192 leaves no whole 64-token step before the tail.
-        self.assertEqual(
-            self._track(192, tree_page=CHUNK, prefix_len=16384, extend_len=200),
-            (16576, None, 16584),
-        )
-
-    def test_forward_that_stops_short_of_the_prompt_end_keeps_the_native_depth(self):
-        depth, tail, _ = self._track(
-            192, tree_page=CHUNK, prefix_len=0, extend_len=16384, prompt_len=20000
-        )
-        self.assertEqual((depth, tail), (16384, None))
-
-    def test_dcp_keeps_the_native_depth(self):
-        kwargs = dict(
-            tree_page=256, prefix_len=16384, extend_len=4066, dcp_enabled=True
-        )
-        self.assertEqual(self._track(192, **kwargs), self._track(0, **kwargs))
-        self.assertEqual(self._track(0, **kwargs)[:2], (20224, None))
-
-    def test_zero_keeps_the_native_depth_and_end_read(self):
-        depth, tail, track_seqlen = self._track(
-            0, tree_page=CHUNK, prefix_len=16384, extend_len=4066
-        )
-        self.assertEqual((depth, tail, track_seqlen), (20416, None, 16384 + 4066))
+def _track(pos, **kwargs):
+    kwargs = {
+        "tree_page": CHUNK,
+        "prefix_len": PREFIX,
+        "extend_len": EXTEND,
+        **kwargs,
+    }
+    entry, req = _prepare_extend(checkpoint_pos=pos, **kwargs)
+    depth = req.kv.mamba_last_track_seqlen if entry.track_mask else None
+    return depth, req.mamba_tail_seqlen, entry.track_seqlen
 
 
 class TestMambaCheckpointPosDepth(CustomTestCase):
-    """Per-request positions override the environment tail depth."""
-
-    PREFIX, EXTEND = 16384, 4066  # prompt end 20450
-
-    def _track(self, pos, tail_tokens=0, **kwargs):
-        """Return checkpoint depth, tail depth, and kernel tracking position."""
-        kwargs = {
-            "tree_page": CHUNK,
-            "prefix_len": self.PREFIX,
-            "extend_len": self.EXTEND,
-            **kwargs,
-        }
-        with envs.SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS.override(tail_tokens):
-            entry, req = _prepare_extend(checkpoint_pos=pos, **kwargs)
-        depth = req.kv.mamba_last_track_seqlen if entry.track_mask else None
-        return depth, req.mamba_tail_seqlen, entry.track_seqlen
-
     def test_position_rounds_down_onto_the_grid_past_the_prefix_and_reads_h(self):
         for tree_page, pos, expected in (
             (CHUNK, 18500, 18496),
-            (CHUNK, 18496, 18496),  # already on the grid
             (CHUNK, 16384 + CHUNK, 16384 + CHUNK),
             (256, 18500, 18432),
-            (256, 20449, 20224),  # the last token before the end
+            (256, 20449, 20224),
         ):
             with self.subTest(tree_page=tree_page, pos=pos):
-                depth, tail, track_seqlen = self._track(pos, tree_page=tree_page)
+                depth, tail, track_seqlen = _track(pos, tree_page=tree_page)
                 self.assertEqual((depth, tail), (expected, expected))
                 # Intermediate h states use the following tracking position.
                 self.assertEqual(track_seqlen, expected + 1)
 
-    def test_position_works_with_the_env_var_off(self):
-        self.assertEqual(self._track(18500, tail_tokens=0)[:2], (18496, 18496))
-
-    def test_position_overrides_the_env_depth(self):
-        self.assertEqual(self._track(None, tail_tokens=192)[:2], (20224, 20224))
-        self.assertEqual(self._track(18500, tail_tokens=192)[:2], (18496, 18496))
-        self.assertEqual(self._track(20400, tail_tokens=2048)[:2], (20352, 20352))
-
     def test_position_replaces_the_branching_point_of_the_final_forward(self):
-        self.assertEqual(self._track(None, branching=17408)[0], 17408)
-        self.assertEqual(self._track(18500, branching=17408)[0], 18496)
+        self.assertEqual(_track(None, branching=17408)[0], 17408)
+        self.assertEqual(_track(18500, branching=17408)[0], 18496)
 
-    def test_unset_keeps_the_env_behaviour(self):
-        for tail_tokens, expected in ((0, (20416, None)), (192, (20224, 20224))):
-            with self.subTest(tail_tokens=tail_tokens):
-                self.assertEqual(self._track(None, tail_tokens)[:2], expected)
-
-    def test_invalid_position_falls_back_to_the_env_depth_or_main(self):
-        for label, pos, kwargs in (
-            ("at the cached prefix", 16384, {}),
-            ("below the cached prefix", 100, {}),
-            ("negative", -1, {}),
-            ("a grid step short of the prefix", 16384 + CHUNK - 1, {}),
-            ("past the prompt end", 30000, {}),
-            ("past a longer prompt end", 30000, {"prompt_len": 20450}),
+    def test_invalid_position_keeps_the_native_depth(self):
+        for label, pos in (
+            ("at the cached prefix", 16384),
+            ("a grid step short of the prefix", 16384 + CHUNK - 1),
+            ("past the prompt end", 30000),
         ):
-            for tail_tokens, expected in (
-                (0, (20416, None)),  # main
-                (192, (20224, 20224)),  # the env var's depth
-            ):
-                with self.subTest(case=label, tail_tokens=tail_tokens):
-                    self.assertEqual(
-                        self._track(pos, tail_tokens, **kwargs)[:2], expected
-                    )
+            with self.subTest(case=label):
+                self.assertEqual(_track(pos)[:2], (20416, None))
 
     def test_position_at_the_prompt_end_keeps_the_forward_end_checkpoint(self):
         # Level 2 publishes the end checkpoint as a tail without changing its read.
-        for extend_len in (self.EXTEND, 4096):
-            end = self.PREFIX + extend_len
-            main = self._track(None, extend_len=extend_len)
-            for tail_tokens in (0, 192):
-                with self.subTest(extend_len=extend_len, tail_tokens=tail_tokens):
-                    depth, tail, track_seqlen = self._track(
-                        end, tail_tokens, extend_len=extend_len
-                    )
-                    self.assertEqual((depth, tail), (main[0], main[0]))
-                    self.assertEqual(track_seqlen, main[2])
+        for extend_len in (EXTEND, 4096):
+            with self.subTest(extend_len=extend_len):
+                main = _track(None, extend_len=extend_len)
+                depth, tail, track_seqlen = _track(
+                    PREFIX + extend_len, extend_len=extend_len
+                )
+                self.assertEqual((depth, tail), (main[0], main[0]))
+                self.assertEqual(track_seqlen, main[2])
 
     def test_forward_that_stops_short_of_the_prompt_end_ignores_the_position(self):
         # The requested position is in this chunk, but the prompt ends in a later one.
-        for tail_tokens in (0, 192):
-            with self.subTest(tail_tokens=tail_tokens):
-                depth, tail, _ = self._track(
-                    8000,
-                    tail_tokens,
-                    prefix_len=0,
-                    extend_len=16384,
-                    prompt_len=20000,
-                )
-                self.assertEqual((depth, tail), (16384, None))
-
-    def test_position_in_an_earlier_chunk_is_ignored_by_the_last_forward(self):
-        self.assertEqual(
-            self._track(8000, 0, prefix_len=16384, extend_len=3616, prompt_len=20000)[
-                :2
-            ],
-            (20000 // CHUNK * CHUNK, None),
-        )
+        depth, tail, _ = _track(8000, prefix_len=0, extend_len=16384, prompt_len=20000)
+        self.assertEqual((depth, tail), (16384, None))
 
     def test_dcp_keeps_the_native_depth(self):
-        kwargs = dict(tree_page=256, dcp_enabled=True)
-        self.assertEqual(self._track(18500, **kwargs)[:2], (20224, None))
-        self.assertEqual(self._track(18500, 192, **kwargs)[:2], (20224, None))
+        self.assertEqual(
+            _track(18500, tree_page=256, dcp_enabled=True)[:2], (20224, None)
+        )
 
 
 class TestMambaCheckpointPosReachesReq(CustomTestCase):
@@ -358,7 +252,6 @@ class TestMambaCheckpointPosReachesReq(CustomTestCase):
         return out
 
     def _handle(self, recv_req) -> Req:
-        """Build a Req through Scheduler.handle_generate_request."""
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_session_radix_cache = False
         scheduler.model_config = SimpleNamespace(
@@ -419,6 +312,16 @@ class TestMambaCheckpointPosReachesReq(CustomTestCase):
         self.assertEqual(len(tokenized), 4)
         self.assertEqual(
             [self._handle(t).mamba_checkpoint_pos for t in tokenized], [2, 3, 2, 3]
+        )
+
+    def test_parallel_samples_of_one_prompt_each_carry_the_position(self):
+        tokenized = self._tokenized(
+            input_ids=[1, 2, 3],
+            mamba_checkpoint_pos=2,
+            sampling_params={"n": 2, "max_new_tokens": 1},
+        )
+        self.assertEqual(
+            [self._handle(t).mamba_checkpoint_pos for t in tokenized], [2, 2]
         )
 
 

@@ -1993,27 +1993,13 @@ def prefill_checkpoint_boundary(
 
 
 def tail_checkpoint_boundary(
-    prefix_len: int,
-    extend_len: int,
-    checkpoint_grid: int,
-    tail_tokens: int,
-    request_pos: Optional[int] = None,
+    *, prefix_len: int, extend_len: int, checkpoint_grid: int, request_pos: int
 ) -> Optional[int]:
-    """Round a tail checkpoint down to the grid past the prefix.
-
-    A usable request_pos overrides tail_tokens; return None if neither gives
-    a checkpoint past the prefix.
-    """
-    if request_pos is not None and prefix_len < request_pos <= prefix_len + extend_len:
-        boundary = (
-            prefix_len + (request_pos - prefix_len) // checkpoint_grid * checkpoint_grid
-        )
-        if boundary > prefix_len:
-            return boundary
-    if tail_tokens <= 0:
+    """Round request_pos down to the grid; None unless it lands past the prefix."""
+    if not prefix_len < request_pos <= prefix_len + extend_len:
         return None
     boundary = (
-        prefix_len + (extend_len - tail_tokens) // checkpoint_grid * checkpoint_grid
+        prefix_len + (request_pos - prefix_len) // checkpoint_grid * checkpoint_grid
     )
     return boundary if boundary > prefix_len else None
 
@@ -2826,18 +2812,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_seqlen_aligned = branch
 
             # The final prefill forward can track a reusable tail checkpoint.
-            tail_tokens = envs.SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS.get()
             if (
-                (tail_tokens > 0 or req.mamba_checkpoint_pos is not None)
+                req.mamba_checkpoint_pos is not None
                 and not get_parallel().dcp_enabled
                 and seq_end == len(req.full_untruncated_fill_ids)
             ):
                 tail = tail_checkpoint_boundary(
-                    prefix_len,
-                    req.extend_len,
-                    checkpoint_grid,
-                    tail_tokens,
-                    req.mamba_checkpoint_pos,
+                    prefix_len=prefix_len,
+                    extend_len=req.extend_len,
+                    checkpoint_grid=checkpoint_grid,
+                    request_pos=req.mamba_checkpoint_pos,
                 )
                 if tail is not None:
                     req.mamba_tail_seqlen = tail

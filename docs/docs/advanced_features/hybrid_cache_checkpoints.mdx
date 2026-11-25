@@ -23,13 +23,11 @@ The resume-point checkpoint makes the prefill forward that reaches the prompt en
 
 1. `mamba_checkpoint_pos` on the request (`/generate`, `/v1/completions` as an int or a per-prompt list, `/v1/chat/completions`): an absolute token index into the prompt. It is ignored unless it lies inside the forward that reaches the prompt end.
 2. `SGLANG_OPT_MAMBA_CHAT_RESUME_CHECKPOINT=1` (default off), on the chat endpoint, for a request whose output carries reasoning (a reasoning parser is set and thinking is not turned off). The server probes the chat template once per template kwargs and sets `R` where the next turn will diverge, for a finished turn or one cut off inside its reasoning. A template that keeps the output, rewrites earlier history, or fails to render sets no `R`.
-3. `SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS=N` (default `0`, off): `R` is `N` tokens before the prompt end.
 
-None of them is used with DCP. With none set, the behavior is unchanged.
+Neither is used with DCP. With neither set, the behavior is unchanged.
 
 - The resume-point state is exempt from level 2's deferral like a fork point. A fork point inside the prompt's final forward yields to it, so shared-prefix traffic whose fork falls in that forward loses the fork checkpoint.
 - A request keeps its matched state locked until it ends, so a running multi-turn path holds up to three states (matched, resume point, finish) instead of two. Size the state pool for one extra state per concurrent conversation.
-- With the fixed depth, a client rewrite longer than `N` puts `R` inside the rewritten span, and the request-end state the next turn would have used is displaced. Compare new prefill tokens with it on and off on your traffic.
 
 ## What level 2 changes
 

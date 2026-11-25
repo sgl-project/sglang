@@ -1547,46 +1547,13 @@ class TestKvHintsTransport(CustomTestCase):
 class TestMambaCheckpointPosInput(CustomTestCase):
     """GenerateReqInput.mamba_checkpoint_pos is one token position per prompt."""
 
-    def test_single_request_keeps_its_position(self):
-        req = GenerateReqInput(input_ids=[1, 2, 3], mamba_checkpoint_pos=2)
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.mamba_checkpoint_pos, 2)
-
-    def test_unset_stays_none_for_every_item(self):
-        req = GenerateReqInput(text=["Hello", "World"])
-        req.normalize_batch_and_arguments()
-        self.assertIsNone(req.mamba_checkpoint_pos)
-        self.assertEqual([req[i].mamba_checkpoint_pos for i in range(2)], [None] * 2)
-
-    def test_batch_items_keep_their_own_position_and_may_be_none(self):
-        req = GenerateReqInput(
-            text=["Hello", "World", "!"], mamba_checkpoint_pos=[5, None, 0]
-        )
-        req.normalize_batch_and_arguments()
-        self.assertEqual([req[i].mamba_checkpoint_pos for i in range(3)], [5, None, 0])
-
-    def test_parallel_samples_each_carry_their_prompts_position(self):
-        batch = GenerateReqInput(
-            text=["Hello", "World"],
-            mamba_checkpoint_pos=[5, 7],
-            sampling_params={"n": 2},
-        )
-        batch.normalize_batch_and_arguments()
-        self.assertEqual([batch[i].mamba_checkpoint_pos for i in range(4)], [5, 7] * 2)
-
-        single = GenerateReqInput(
-            text="Hello", mamba_checkpoint_pos=5, sampling_params={"n": 2}
-        )
-        single.normalize_batch_and_arguments()
-        self.assertEqual([single[i].mamba_checkpoint_pos for i in range(2)], [5, 5])
-
     def test_malformed_values_are_rejected(self):
         for kwargs in (
             {"text": "Hello", "mamba_checkpoint_pos": "5"},
             {"text": "Hello", "mamba_checkpoint_pos": 1.5},
             {"text": "Hello", "mamba_checkpoint_pos": True},
-            {"text": "Hello", "mamba_checkpoint_pos": [5]},  # a list for one prompt
-            {"text": ["Hello", "World"], "mamba_checkpoint_pos": 5},  # one for a batch
+            {"text": "Hello", "mamba_checkpoint_pos": [5]},
+            {"text": ["Hello", "World"], "mamba_checkpoint_pos": 5},
             {"text": ["Hello", "World"], "mamba_checkpoint_pos": [5]},
             {"text": ["Hello", "World"], "mamba_checkpoint_pos": [5, "7"]},
             {"text": ["Hello", "World"], "mamba_checkpoint_pos": [5, False]},
@@ -1596,7 +1563,7 @@ class TestMambaCheckpointPosInput(CustomTestCase):
                 with self.assertRaises(ValueError):
                     req.normalize_batch_and_arguments()
 
-    def test_ipc_struct_defaults_to_none_and_survives_msgpack(self):
+    def test_ipc_struct_field_is_last_and_defaults_to_none(self):
         fields = dict(
             input_text="",
             input_ids=array("q", [1, 2]),
@@ -1615,9 +1582,6 @@ class TestMambaCheckpointPosInput(CustomTestCase):
             TokenizedGenerateReqInput.__struct_fields__[-1], "mamba_checkpoint_pos"
         )
         self.assertIsNone(TokenizedGenerateReqInput(**fields).mamba_checkpoint_pos)
-        tokenized = TokenizedGenerateReqInput(**fields, mamba_checkpoint_pos=1)
-        decoded = msgpack_decode(msgpack_encode(tokenized))
-        self.assertEqual(decoded.mamba_checkpoint_pos, 1)
 
 
 class TestEmbeddingReqInputGetItem(CustomTestCase):

@@ -18,7 +18,7 @@ A hybrid model can resume a prefix only from a position where the tree holds a r
 
 - `MambaComponent._defers_checkpoint` / `prepare_for_caching_req` (`mem_cache/unified_cache/components/mamba.py`): below level 3 a running request's checkpoint donates nothing and inserts nothing, except at its fork point or a PD prefill worker's complete prompt. `InsertParams.mamba_checkpoint_deferred` tells `cleanup_after_caching_req` to keep `mamba_last_track_seqlen`, so the finished insert still lands the prompt-end state.
 - `exec.mamba.mamba_path_state_cap` (derived, `arg_groups/overrides.py::mamba_path_state_cap_of`) feeds the cap to both tree cores.
-- Resume-point checkpoint (opt-in; `tail_checkpoint_boundary` and `Req.mamba_tail_seqlen` in `managers/schedule_batch.py`): the prefill forward that reaches the prompt end tracks its one state at `R` through the fork-point path (`_force_track_h`, `prefill_checkpoint_boundary`), and `_defers_checkpoint` exempts it. `R` comes from the request's `mamba_checkpoint_pos`, else `SGLANG_OPT_MAMBA_CHAT_RESUME_CHECKPOINT` (`OpenAIServingChat._resume_checkpoint_pos` probes the template's divergence depth), else `SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS`. `Req.mamba_hit_lock` keeps the matched node locked until `release_kv_cache`. Not used with DCP.
+- Resume-point checkpoint (opt-in; `tail_checkpoint_boundary` and `Req.mamba_tail_seqlen` in `managers/schedule_batch.py`): the prefill forward that reaches the prompt end tracks its one state at `R` through the fork-point path (`_force_track_h`, `prefill_checkpoint_boundary`), and `_defers_checkpoint` exempts it. `R` comes from the request's `mamba_checkpoint_pos`, else `SGLANG_OPT_MAMBA_CHAT_RESUME_CHECKPOINT` (`OpenAIServingChat._resume_checkpoint_pos` probes the template's divergence depth). `Req.mamba_hit_lock` keeps the matched node locked until `release_kv_cache`. Not used with DCP.
 - A tree with sliding-window slots keeps checkpointing every chunk at level 2: prefill frees window rows only behind a checkpoint the tree takes.
 
 ## Choosing a level
@@ -53,5 +53,5 @@ Prefix-cache claims need path evidence, not just a hit rate.
 
 - `--mamba-max-states-per-path -1` is an explicit "unlimited", not "unset"; it overrides level 2's soft cap of 1.
 - The PD prefill exception keys on `len(origin_input_ids)`: the insert that covers the whole prompt keeps its state.
-- The resume-point checkpoint costs one more pinned state per running multi-turn path (the hit lock), and with the fixed depth a rewrite longer than `N` displaces the request-end state. Compare new prefill and state-pool occupancy on and off on the real traffic.
+- The resume-point checkpoint costs one more pinned state per running multi-turn path (the hit lock). Compare new prefill and state-pool occupancy on and off on the real traffic.
 - Pool splits tuned on AgentX (see the `compute-mamba-ratio` skill) depend on the workload and checkpoint configuration. Recheck both state and KV residency when changing levels; do not copy a tuned split without validation.

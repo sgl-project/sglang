@@ -1,7 +1,6 @@
 """Chat-template probes for Mamba resume checkpoints."""
 
 import threading
-import time
 import unittest
 from collections import OrderedDict
 from types import SimpleNamespace
@@ -12,6 +11,7 @@ from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -41,8 +41,6 @@ DROPS_EMPTY = STRIPS.replace(
 
 
 class CharTokenizer:
-    """Character tokenizer with Jinja chat templates."""
-
     def __init__(self, template):
         self._template = jinja2.Template(template.replace("\\n", "\n"))
         self.renders = 0
@@ -94,9 +92,8 @@ def _server(template, parsed=True):
     return server
 
 
-class TestResumeDepth(unittest.TestCase):
+class TestResumeDepth(CustomTestCase):
     def test_stripping_template_diverges_where_the_generation_prompt_opens(self):
-        # The old answer replaces <think>\n in both parsed and raw messages.
         for parsed in (True, False):
             with self.subTest(parsed=parsed):
                 server = _server(STRIPS, parsed)
@@ -129,10 +126,12 @@ class TestResumeDepth(unittest.TestCase):
     def test_concurrent_first_requests_probe_once(self):
         # Request conversion can probe the same template from multiple threads.
         server = _server(STRIPS)
-        probe, calls, release = server._probe_resume_depth, [], threading.Event()
+        probe, calls, entered = server._probe_resume_depth, [], threading.Event()
+        release = threading.Event()
 
         def slow_probe(*args):
             calls.append(1)
+            entered.set()
             release.wait(5)
             return probe(*args)
 
@@ -142,12 +141,11 @@ class TestResumeDepth(unittest.TestCase):
             for _ in range(2)
         ]
         threads[0].start()
-        while not calls:
-            time.sleep(0.01)
+        self.assertTrue(entered.wait(5))
+        entered.clear()
         threads[1].start()
-        deadline = time.monotonic() + 1
-        while len(calls) < 2 and time.monotonic() < deadline:
-            time.sleep(0.01)
+        # A second probe would set the event; the lock must keep it waiting.
+        entered.wait(1)
         release.set()
         for thread in threads:
             thread.join()
@@ -164,7 +162,7 @@ class TestResumeDepth(unittest.TestCase):
         self.assertIsNone(_server(STRIPS)._resume_depth({"x": object()}, {}))
 
 
-class TestResumeCheckpointPos(unittest.TestCase):
+class TestResumeCheckpointPos(CustomTestCase):
     def _pos(self, server, **request_kwargs):
         request = ChatCompletionRequest(
             model="m", messages=[{"role": "user", "content": "Hi"}], **request_kwargs

@@ -449,8 +449,7 @@ class GenerateReqInput:
 
     # Absolute prompt position for the hybrid model's tail state checkpoint.
     # Rounded down to the checkpoint grid in the final prefill forward; ignored
-    # outside that forward. Overrides SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS.
-    # Batched requests carry one int or None per prompt.
+    # outside that forward. Batched requests carry one int or None per prompt.
     mamba_checkpoint_pos: Optional[Union[List[Optional[int]], int]] = None
 
     def regenerate_rid(self):
