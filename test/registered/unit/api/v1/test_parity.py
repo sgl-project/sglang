@@ -124,8 +124,9 @@ def codec(type_name):
 
 
 # Schema-only sampling inputs the Rust server lowers before the scheduler
-# (choice -> regex); Python's SamplingParams never receives them.
-SCHEMA_ONLY_SAMPLING_FIELDS = frozenset({"choice"})
+# (choice -> regex, use_remaining_context -> no max_new_tokens); Python's
+# SamplingParams never receives them.
+SCHEMA_ONLY_SAMPLING_FIELDS = frozenset({"choice", "use_remaining_context"})
 
 
 class TestCrossLanguageFixtures(CustomTestCase):

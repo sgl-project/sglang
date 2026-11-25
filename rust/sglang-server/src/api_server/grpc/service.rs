@@ -228,6 +228,7 @@ impl SglangService for GrpcService {
         // Protobuf has no null: a field the client left unset takes the
         // schema default, as an absent JSON key does.
         request.apply_absent_defaults();
+        client_max_new_tokens.clear_remaining_context(request.sampling_params.as_mut());
         let stream = request.stream.unwrap_or(false);
         let (mut payloads, is_batch) = into_requests(request, &self.config.generation_policy)
             .map_err(|error| {
@@ -2003,6 +2004,50 @@ mod tests {
                     intake.request.max_new_tokens_defaulted,
                 ),
                 expected
+            );
+        }
+    }
+
+    /// `use_remaining_context` is protobuf's explicit null: an unset limit stays
+    /// unset past the preferred and schema fills, and a set one still wins.
+    #[tokio::test]
+    async fn use_remaining_context_leaves_an_unset_limit_unbounded() {
+        let preferred = PreferredSamplingParams(serde_json::json!({"max_new_tokens": 32}));
+        let harness = Harness::build(
+            1,
+            false,
+            Duration::from_secs(1),
+            true,
+            Some(preferred),
+            test_server_args(),
+        );
+        for (max_new_tokens, expected) in [(None, None), (Some(100), Some(100))] {
+            let mut request = ids_request(&[1], None);
+            request.sampling_params = Some(api::SamplingParamsOrList {
+                value: Some(api::sampling_params_or_list::Value::One(
+                    api::SamplingParams {
+                        max_new_tokens,
+                        // Above the preferred 32: verifying a filled limit would reject it.
+                        min_new_tokens: Some(64),
+                        use_remaining_context: Some(true),
+                        ..Default::default()
+                    },
+                )),
+            });
+            let _stream = harness
+                .service
+                .generate(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner();
+
+            let intake = harness.next_generation().await;
+            assert_eq!(
+                (
+                    intake.request.sampling_params.max_new_tokens,
+                    intake.request.max_new_tokens_defaulted,
+                ),
+                (expected, false)
             );
         }
     }
