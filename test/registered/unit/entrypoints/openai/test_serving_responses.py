@@ -534,6 +534,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
             seen["tools"] = chat_request.tools
             seen["tool_choice"] = chat_request.tool_choice
             seen["parallel_tool_calls"] = chat_request.parallel_tool_calls
+            seen["cache_salt"] = chat_request.cache_salt
             return MessageProcessingResult(
                 prompt="prompt",
                 prompt_ids=[1, 2, 3],
@@ -558,6 +559,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
             ],
             tool_choice="required",
             parallel_tool_calls=False,
+            cache_salt="tenant-a",
             store=False,
         )
 
@@ -571,6 +573,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(seen["tools"][0].function.name, "lookup")
         self.assertEqual(seen["tool_choice"], "required")
         self.assertFalse(seen["parallel_tool_calls"])
+        self.assertEqual(seen["cache_salt"], "tenant-a")
         self.assertEqual(processed.tool_call_constraint[0], "json_schema")
 
     def test_harmony_forced_choices_explain_missing_routing_constraints(self):

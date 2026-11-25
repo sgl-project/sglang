@@ -761,6 +761,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             stop=request.stop,
             reasoning_effort=(request.reasoning.effort if request.reasoning else None),
             chat_template_kwargs=request.chat_template_kwargs,
+            # The chat render and segment caches are namespaced by this salt.
+            cache_salt=request.cache_salt,
         )
         chat_request._template_tools = self._response_tools_to_template_tools(request)
 
