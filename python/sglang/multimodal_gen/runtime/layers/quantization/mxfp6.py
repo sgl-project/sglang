@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.aiter_packed_mx import (
     PackedMXLinearMethod,
     aiter_import_error,
 )
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 _IMPORT_ERROR = aiter_import_error("aiter.ops.gemm_op_a6w6")
 
