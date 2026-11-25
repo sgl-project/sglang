@@ -277,11 +277,19 @@ def test_copy_engine_sets_up_again_for_another_group(fresh_state, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "hip, ready",
-    [(None, True), ("7.0", False), ("7.0", True)],
-    ids=["cuda", "rocm_not_ready", "rocm"],
+    "hip, ready, capturing",
+    [
+        (None, True, False),
+        ("7.0", False, False),
+        ("7.0", True, False),
+        ("7.0", True, True),
+    ],
+    ids=["cuda", "rocm_not_ready", "rocm", "rocm_capturing"],
 )
-def test_usp_pipeline_takes_the_copy_engines_only_when_ready_on_rocm(hip, ready):
+def test_usp_pipeline_takes_the_copy_engines_only_when_ready_on_rocm(
+    hip, ready, capturing
+):
+    takes = hip is not None and ready and not capturing
     rows, groups = 3, 2
     q = MagicMock(
         shape=(rows, HEADS, HEAD_SIZE),
@@ -296,6 +304,7 @@ def test_usp_pipeline_takes_the_copy_engines_only_when_ready_on_rocm(hip, ready)
 
     with (
         patch.object(torch.version, "hip", hip),
+        patch.object(torch.cuda, "is_current_stream_capturing", return_value=capturing),
         patch.object(
             usp, "get_sp_group", return_value=SimpleNamespace(ulysses_group=group)
         ),
@@ -304,7 +313,7 @@ def test_usp_pipeline_takes_the_copy_engines_only_when_ready_on_rocm(hip, ready)
         patch.object(ce.IPC_A2A_ROCM, "pipelined_attention", return_value="ce") as run,
         patch.object(usp, "pack_qkv_destination_major", side_effect=Collective),
     ):
-        if hip is not None and ready:
+        if takes:
             assert (
                 usp.ulysses_head_group_pipelined_attention(q, q, q, _attend, groups)
                 == "ce"
@@ -312,11 +321,11 @@ def test_usp_pipeline_takes_the_copy_engines_only_when_ready_on_rocm(hip, ready)
         else:
             with pytest.raises(Collective):
                 usp.ulysses_head_group_pipelined_attention(q, q, q, _attend, groups)
-    if hip is None:
+    if hip is None or capturing:
         ready_check.assert_not_called()
     else:
         ready_check.assert_called_once_with(group)
-    assert run.called == (hip is not None and ready)
+    assert run.called == takes
     if not run.called:
         return
     # the pack handed over is the collective path's destination-major kernel

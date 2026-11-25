@@ -502,7 +502,8 @@ def ulysses_head_group_pipelined_attention(
             rocm_ce_ready,
         )
 
-        if rocm_ce_ready(group):
+        # flag waits and SDMA copies cannot be captured into a graph
+        if not torch.cuda.is_current_stream_capturing() and rocm_ce_ready(group):
 
             def pack(q_, k_, v_, n):
                 return pack_qkv_destination_major(
