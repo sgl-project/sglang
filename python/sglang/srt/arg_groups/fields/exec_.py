@@ -1289,7 +1289,8 @@ class ExecOffload(msgspec.Struct):
             "'placement' gpu|cpu, 'replication' none|per_node|group_shards, 'lookup' "
             "auto|all_reduce|reduce_scatter|all_to_all|peer_read; an omitted key "
             "takes the first value. 'group_shards' also takes 'group_size' and "
-            "'group_store'. "
+            "'group_store'. Optional 'host_backend' names an installed per-rank "
+            "host table provider; 'host_backend_config' passes its options. "
             "See docs/advanced_features/engram.",
             type_parser=json.loads,
         ),

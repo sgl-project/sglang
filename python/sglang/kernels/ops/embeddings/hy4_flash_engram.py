@@ -34,20 +34,65 @@ def _engram_lookup_kernel(
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HAS_SCALE: tl.constexpr,
+    TABLE_IS_INT_PTR: tl.constexpr = False,
 ):
     t = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
     d = tl.arange(0, BLOCK_D)
     mask = d < D
     idx = tl.load(hash_ptr + t * hash_stride + head_start + h).to(tl.int64)
-    row = tl.minimum(tl.maximum(idx - vocab_start, 0), rows - 1)
-    x = tl.load(table_ptr + row * D + d, mask=mask, other=0.0).to(tl.float32)
+    local = idx - vocab_start
+    owned = (local >= 0) & (local < rows)
+    row = tl.where(owned, local, 0)
+    base_ptr = (
+        table_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+        if TABLE_IS_INT_PTR
+        else table_ptr
+    )
+    x = tl.load(base_ptr + row * D + d, mask=mask & owned, other=0.0).to(tl.float32)
     if HAS_SCALE:
-        x = x * tl.load(scale_ptr + row).to(tl.float32)
-    x = tl.where(idx < 0, 0.0, x)
+        x = x * tl.load(scale_ptr + row, mask=owned, other=0.0).to(tl.float32)
+    x = tl.where(owned, x, 0.0)
     gamma = tl.load(gamma_ptr + h * D + d, mask=mask, other=0.0).to(tl.float32)
     y = x * tl.rsqrt(tl.sum(x * x, axis=0) / D + eps) * gamma
     tl.store(out_ptr + t * HEADS * D + h * D + d, y.to(tl.bfloat16), mask=mask)
+
+
+def hy4_flash_engram_lookup_uva(
+    hashes: torch.Tensor,
+    head_start: int,
+    heads: int,
+    vocab_start: int,
+    table_ptr: int,
+    rows: int,
+    dim: int,
+    gamma: torch.Tensor,
+) -> torch.Tensor:
+    """[T, heads * D] bf16 from a UVA-mapped pinned host BF16 table pointer."""
+    tokens = hashes.shape[0]
+    out = torch.empty((tokens, heads * dim), dtype=torch.bfloat16, device=hashes.device)
+    if tokens == 0 or heads == 0:
+        return out
+    assert rows > 0 and hashes.stride(1) == 1 and gamma.is_contiguous()
+    _engram_lookup_kernel[(tokens, heads)](
+        hashes,
+        hashes.stride(0),
+        table_ptr,
+        gamma,
+        gamma,
+        out,
+        head_start,
+        vocab_start,
+        rows,
+        _FP32_EPS,
+        HEADS=heads,
+        D=dim,
+        BLOCK_D=triton.next_power_of_2(dim),
+        HAS_SCALE=False,
+        TABLE_IS_INT_PTR=True,
+        num_warps=1,
+    )
+    return out
 
 
 def hy4_flash_engram_lookup(

@@ -17,6 +17,7 @@ import mmap
 import os
 import re
 import time
+import weakref
 from typing import Optional
 
 import msgspec
@@ -61,7 +62,9 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_cuda_graph_max_batch_size,
     get_dp_global_num_tokens,
+    get_eager_max_batch_size,
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
     world_dp_gather_enabled,
@@ -70,6 +73,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
@@ -85,7 +89,10 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_schedule,
     get_serving,
+    get_spec,
+    max_prefill_buffer_tokens,
 )
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu
 
@@ -1322,10 +1329,15 @@ class EngramEmbedding(nn.Module):
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
+        self._host_backend = None
+        self.host_issue = "inline"
+        self.split_host_lookup = False
         config = resolve_engram_config(len(column_bounds) - 1)
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
-        if config.replication == EngramReplication.GROUP_SHARDS:
+        if config.host_backend:
+            self._init_host_backend(config, num_embeddings, layer_id)
+        elif config.replication == EngramReplication.GROUP_SHARDS:
             self.peer = _GroupShards(
                 num_embeddings,
                 dim,
@@ -1365,6 +1377,133 @@ class EngramEmbedding(nn.Module):
             )
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
+
+    def _init_host_backend(
+        self, config: EngramConfig, num_embeddings: int, layer_id: int
+    ) -> None:
+        from sglang.srt.layers.engram_host_table import (
+            EngramHostTableBackend,
+            EngramTableSpec,
+            load_backend,
+        )
+
+        parallel = get_parallel()
+        if not is_cuda() or self.mxfp4:
+            raise ValueError("Engram host table backends require CUDA and FP8 tables.")
+        if (
+            parallel.pp_size,
+            parallel.dp_size,
+            parallel.attn_dp_size,
+            parallel.attn_cp_size,
+            parallel.dcp_size,
+        ) != (1, 1, 1, 1, 1):
+            raise ValueError("Engram host table backends currently support TP only.")
+        if (
+            get_exec().overlap.enable_two_batch_overlap
+            or get_spec().speculative_algorithm is not None
+        ):
+            raise ValueError(
+                "Engram host table backends require two-batch overlap and "
+                "speculative decoding to be disabled."
+            )
+        model, schedule = get_model(), get_schedule()
+        if model.load_format not in ("auto", "safetensors"):
+            raise ValueError(
+                "Engram host table backends require --load-format auto or safetensors."
+            )
+        if (schedule.chunked_prefill_size or 0) <= 0:
+            raise ValueError(
+                "Engram host table backends require --chunked-prefill-size > 0 "
+                "to bound the eager prefill buffer."
+            )
+        graph = get_exec().graph.cuda_graph_config
+        capture_tokens = max(
+            (
+                max(phase.bs or (), default=phase.max_bs or 0)
+                for phase in (graph.prefill, graph.decode)
+                if phase.backend != Backend.DISABLED
+            ),
+            default=0,
+        )
+        eager_tokens = max(
+            max_prefill_buffer_tokens(), schedule.max_running_requests or 0
+        )
+        spec = EngramTableSpec(
+            layer_id=layer_id,
+            num_embeddings=num_embeddings,
+            dim=self.dim,
+            block_size=FP8_BLOCK_SIZE,
+            tp_rank=parallel.tp_rank,
+            tp_size=self.tp_size,
+            pp_size=parallel.pp_size,
+            dp_size=parallel.dp_size,
+            cp_size=parallel.attn_cp_size,
+            max_num_tokens=max(
+                get_eager_max_batch_size(eager_tokens),
+                get_cuda_graph_max_batch_size(capture_tokens),
+            ),
+            model_path=model.model_path,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        provider = load_backend(config.host_backend)
+        options = config.host_backend_config or {}
+        begins = provider.begin_lookup is not EngramHostTableBackend.begin_lookup
+        finishes = provider.finish_lookup is not EngramHostTableBackend.finish_lookup
+        if begins != finishes:
+            raise ValueError(
+                "Engram host table backends using in-forward prefetch must "
+                "implement both begin_lookup and finish_lookup."
+            )
+        if begins:
+            self.host_issue = options.get("issue", "relay")
+            if self.host_issue not in ("early", "relay", "inline"):
+                raise ValueError(
+                    f"Unknown Engram host table issue mode {self.host_issue!r}; "
+                    "expected 'early', 'relay', or 'inline'."
+                )
+            if (
+                self.host_issue != "inline"
+                and graph.prefill.backend != Backend.DISABLED
+            ):
+                raise ValueError(
+                    "In-forward Engram host table prefetch requires prefill "
+                    "CUDA graphs to be disabled."
+                )
+        backend = provider(spec, options)
+        release = weakref.finalize(self, backend.close)
+        try:
+            expected = (self.row_start, self.row_start + self.rows)
+            actual = backend.row_range
+            if (
+                not isinstance(actual, tuple)
+                or actual != expected
+                or not all(type(row) is int for row in actual)
+            ):
+                raise ValueError(
+                    f"Engram host table backend declared {actual!r}; "
+                    f"expected rank {parallel.tp_rank}'s rows {expected}."
+                )
+            # Checkpoint loaders still see the tensor shapes without storage for
+            # the original table. The provider has already opened its own shard.
+            self.weight = nn.Parameter(
+                torch.empty(1, dtype=_table_dtype(False), device="cpu").as_strided(
+                    (self.rows, self.dim), (0, 0)
+                ),
+                requires_grad=False,
+            )
+            self.scale = nn.Parameter(
+                torch.empty(1, dtype=torch.float8_e8m0fnu, device="cpu").as_strided(
+                    (self.rows, self.dim // FP8_BLOCK_SIZE), (0, 0)
+                ),
+                requires_grad=False,
+            )
+        except BaseException:
+            release()
+            raise
+        self._host_backend = backend
+        self._derived_weight_cache_error = (
+            "Online weight updates are not supported with an Engram host table backend."
+        )
 
     def _init_host_table(
         self, num_embeddings: int, dim: int, layer_id: int, replication: str
@@ -1410,6 +1549,8 @@ class EngramEmbedding(nn.Module):
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self._host_backend is not None:
+            return
         rows = slice(self.row_start, self.row_start + self.rows)
         dst = param.data[rows] if self._shared else param.data
         src = loaded_weight[rows]
@@ -1503,6 +1644,10 @@ class EngramEmbedding(nn.Module):
         )
         return out
 
+    def begin_lookup(self, indices: torch.Tensor) -> None:
+        if self.split_host_lookup and indices.shape[0]:
+            self._host_backend.begin_lookup(indices)
+
     def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
         """Lookup when every TP rank holds the same indices: the device and
         per-rank host shards zero unowned rows and the all-reduce reassembles."""
@@ -1530,6 +1675,13 @@ class EngramEmbedding(nn.Module):
 
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
+        if self._host_backend is not None:
+            out = self.new_rows(indices)
+            if self.split_host_lookup:
+                self._host_backend.finish_lookup(indices, out)
+            else:
+                self._host_backend.lookup(indices, out)
+            return out
         if self.rows == 0:
             return self.new_rows(indices).zero_()
         if self.host_table is None and not _cuda_kernels(indices):
@@ -1745,6 +1897,29 @@ def engram_gate(
     if input_ids is not None:
         out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
     return out
+
+
+def host_lookup_schedule(layers):
+    """Build the in-forward lookup schedule ordered by layer ID.
+
+    A key of ``None`` runs right after hashing; an integer layer ID runs right
+    after that Engram layer consumes its rows.
+    """
+    schedule = {}
+    previous = None
+    for layer_id, target in layers:
+        mode = target.embed.host_issue
+        if mode in ("early", "relay"):
+            after = None if mode == "early" else previous
+            schedule.setdefault(after, []).append(target)
+            target.embed.split_host_lookup = True
+        previous = layer_id
+    return schedule
+
+
+def begin_host_lookups(schedule, after, hash_ids):
+    for target in schedule.get(after, ()):
+        target.embed.begin_lookup(hash_ids[:, target.layer_hash_index])
 
 
 class Engram(nn.Module):

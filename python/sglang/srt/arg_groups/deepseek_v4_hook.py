@@ -72,11 +72,26 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
     parallel layout and the GPUs are known."""
     cfg = resolving_view(server_args)
     raw = cfg.engram_config
-    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+    model_type = model_config_of(server_args).hf_config.model_type
+    if model_type not in ("deepseek_v41", "hy_v4_flash", "hy_v4_flash_text"):
         if raw is not None:
-            raise ValueError("--engram-config applies to DeepSeek-V4.1 only.")
+            raise ValueError(
+                "--engram-config applies to DeepSeek-V4.1 and Hy4-Flash only."
+            )
         return
     config = EngramConfig() if raw is None else EngramConfig.from_dict(raw)
+    if model_type in ("hy_v4_flash", "hy_v4_flash_text"):
+        if config.replication != EngramReplication.NONE or config.lookup not in (
+            EngramLookup.AUTO,
+            EngramLookup.ALL_REDUCE,
+        ):
+            raise ValueError(
+                "--engram-config on Hy4-Flash currently requires replication 'none' "
+                "and lookup 'auto' or 'all_reduce'."
+            )
+        declare_resolution(server_args, "_resolve_engram_config", engram_config=config)
+        logger.info("Hy4-Flash Engram tables: %s", config)
+        return
     if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
         raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
     if config.lookup in (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL) and (
