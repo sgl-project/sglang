@@ -3245,9 +3245,11 @@ def get_moe_tensor_parallel_rank():
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     from sglang.srt.distributed.bootstrap import reset_parallel_initialised
+    from sglang.srt.runtime_context import get_resources
 
     reset_parallel_initialised()
     get_parallel().clear_stamp()
+    get_resources().attn_tp_push_comm = None
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()
