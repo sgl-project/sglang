@@ -6,6 +6,7 @@ from collections import Counter
 from types import SimpleNamespace
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.mamba_storage_retention import (
     MambaStateRemover,
     MambaStorageRetention,
@@ -107,6 +108,24 @@ class TestMambaStorageRetention(unittest.TestCase):
                 "mamba_remove_failed": 3,
             },
         )
+
+    def test_store_without_batch_remove_leaves_states_to_eviction(self):
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.store = SimpleNamespace()
+        self.assertIsNone(store.batch_remove_pool_keys(PoolName.MAMBA, ["a"]))
+
+        storage = _Storage(None, None)
+        stats = Counter()
+        remover = MambaStateRemover(stats, retry_delay_s=0.01)
+        with self.assertLogs(
+            "sglang.srt.mem_cache.unified_cache.mamba_storage_retention", "INFO"
+        ) as logs:
+            remover.submit(storage, ["a"])
+            remover.submit(storage, ["b"])
+            self.assertTrue(_wait_for(lambda: len(storage.calls) == 2))
+            time.sleep(0.05)
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(stats, Counter())
 
 
 if __name__ == "__main__":

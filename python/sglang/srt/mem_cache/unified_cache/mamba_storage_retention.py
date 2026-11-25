@@ -96,6 +96,7 @@ class MambaStateRemover:
         )
         self._tasks: queue.Queue[tuple[HiCacheStorage, list[str]]] = queue.Queue()
         self._thread: threading.Thread | None = None
+        self._unsupported_logged = False
 
     def submit(self, storage: HiCacheStorage, keys: list[str]) -> None:
         if self._thread is None:
@@ -120,10 +121,20 @@ class MambaStateRemover:
 
     def _remove(self, storage, keys, deferred) -> None:
         try:
-            codes = list(storage.batch_remove_pool_keys(PoolName.MAMBA, keys) or ())
+            codes = storage.batch_remove_pool_keys(PoolName.MAMBA, keys)
         except Exception:
             logger.warning("Removing superseded Mamba states failed", exc_info=True)
             codes = [None] * len(keys)
+        if codes is None:
+            if not self._unsupported_logged:
+                self._unsupported_logged = True
+                logger.info(
+                    "%s cannot remove objects; superseded Mamba states are left "
+                    "to storage eviction.",
+                    type(storage).__name__,
+                )
+            return
+        codes = list(codes)
         if not codes:
             return
         # Each page key expands to the same number of objects, page by page.

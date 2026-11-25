@@ -1305,9 +1305,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def batch_remove_pool_keys(
         self, pool_name: PoolName, page_keys: List[str]
     ) -> Optional[List[int]]:
+        # Mooncake < 0.3.11 has no batch_remove.
+        remove = getattr(self.store, "batch_remove", None)
+        if remove is None:
+            return None
         transfer = PoolTransfer(name=pool_name, keys=list(page_keys))
         key_strs, _ = self._get_hybrid_page_component_keys(list(page_keys), transfer)
-        return list(self.store.batch_remove(self._tag_keys(key_strs), False))
+        return list(remove(self._tag_keys(key_strs), False))
 
     def _batch_io_v2(
         self,
