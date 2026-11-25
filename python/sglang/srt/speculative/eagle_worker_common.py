@@ -40,10 +40,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
 )
 from sglang.srt.utils import is_cpu
-from sglang.srt.utils.async_probe import (
-    maybe_detect_inf,
-    maybe_detect_oob,
-)
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
 
 _is_cpu = is_cpu()
@@ -100,8 +97,19 @@ def bind_eagle_runtime_hooks(
     return hooks
 
 
+class PostVerifyGraphAccept(VerifyAccept, frozen=True, kw_only=True):
+    """A tree accept the post-verify graphs made, with the commit outputs they
+    also computed."""
+
+    new_seq_lens: torch.Tensor
+    bonus_tokens: torch.Tensor
+    prepared_draft_extend_inputs: Optional[tuple]
+
+
 def accept_draft_tree(
     verify: VerifyStep,
+    logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
     *,
     verify_input: Any,
     logits_output: Any,
@@ -111,10 +119,10 @@ def accept_draft_tree(
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
 ) -> VerifyAccept:
-    """The tree accept core of EAGLE and NGRAM: eagle_sample, with the runtime
-    hooks' local keys under the NV mega runtime."""
+    """The tree accept core of EAGLE and NGRAM, which `VerifyStep.run` calls
+    with the logits and sampling info after the stages: eagle_sample, with the
+    runtime hooks' local keys under the NV mega runtime."""
     batch = verify.batch
-    maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
     local_keys = None
     simulated_acc_len = None
     # A custom logit processor edits the logits, so verify keeps the stock gathered
@@ -134,13 +142,14 @@ def accept_draft_tree(
         verify_input,
         verify,
         logits_output,
+        logits,
+        sampling_info,
         uno_target_max_top_k=uno_target_max_top_k,
         simulated_acc_len=simulated_acc_len,
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
         local_keys=local_keys,
     )
-    verify.cap_tree_accept(accept_lens, accept_index)
     return VerifyAccept(
         tokens=predict, accept_lens=accept_lens, accept_index=accept_index
     )
@@ -153,6 +162,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_pipeline import VerifyStep
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
@@ -767,66 +777,70 @@ def run_eagle_verify(
     )
     logits_output = forward_batch_output.logits_output
 
-    verify.build_row_inputs(logits_output, tree=host_tree, barrier=grammar_barrier)
     kvcache = token_to_kv_pool_allocator.get_kvcache()
     clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
-    # SGLang's post-verify graphs when they are on, for a batch they can replay;
-    # they skip the c128 cleanup below, so not for a KV pool that needs it.
-    post = (
-        None
-        if post_verify_graphs is None or clears_c128
-        else post_verify_graphs.run(
-            batch=batch,
-            route=verify.route,
+
+    def accept_tree(
+        logits: torch.Tensor, sampling_info: SamplingBatchInfo
+    ) -> VerifyAccept:
+        # SGLang's post-verify graphs when they are on, for a batch they can replay;
+        # they skip the c128 cleanup below, so not for a KV pool that needs it.
+        if post_verify_graphs is not None and not clears_c128:
+            post = post_verify_graphs.run(
+                batch=batch,
+                route=verify.route,
+                verify_input=verify_input,
+                logits_output=logits_output,
+                can_run_cuda_graph=can_run_cuda_graph,
+                max_top_k=uno_target_max_top_k,
+            )
+            if post is not None:
+                if (c := target_worker.model_runner.canary_manager) is not None:
+                    c.on_verify_accept(
+                        logits_output=logits_output,
+                        verify_forward_batch=verify_forward_batch,
+                        predict=post.tokens,
+                        accept_lens=post.accept_lens,
+                        num_draft_tokens=num_draft_tokens,
+                    )
+                return post
+        return accept_draft_tree(
+            verify,
+            logits,
+            sampling_info,
             verify_input=verify_input,
             logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
-            max_top_k=uno_target_max_top_k,
+            speculative_runtime_hooks=speculative_runtime_hooks,
+            post_verify_graphs=post_verify_graphs,
+            uno_target_max_top_k=uno_target_max_top_k,
+            simulated_acc_len_rng=simulated_acc_len_rng,
+            sparse_bonus_argmax=sparse_bonus_argmax,
         )
+
+    accept = verify.run(
+        logits_output,
+        tree=verify_input,
+        host_tree=host_tree,
+        barrier=grammar_barrier,
+        accept_core=accept_tree,
     )
-    if post is not None:
-        predict, accept_lens, accept_index, new_seq_lens, bonus_tokens = post[:5]
-        if (c := target_worker.model_runner.canary_manager) is not None:
-            c.on_verify_accept(
-                logits_output=logits_output,
-                verify_forward_batch=verify_forward_batch,
-                predict=predict,
-                accept_lens=accept_lens,
-                num_draft_tokens=num_draft_tokens,
-            )
-        verify.commit(
-            VerifyAccept(
-                tokens=predict, accept_lens=accept_lens, accept_index=accept_index
-            ),
-            logits_output=logits_output,
-        )
+    if isinstance(accept, PostVerifyGraphAccept):
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=accept.tokens,
             can_run_cuda_graph=can_run_cuda_graph,
             speculative_num_draft_tokens=num_draft_tokens,
-            next_draft_input=EagleDraftInput(bonus_tokens=bonus_tokens),
-            accept_lens=accept_lens,
-            accept_index=accept_index,
-            new_seq_lens=new_seq_lens,
+            next_draft_input=EagleDraftInput(bonus_tokens=accept.bonus_tokens),
+            accept_lens=accept.accept_lens,
+            accept_index=accept.accept_index,
+            new_seq_lens=accept.new_seq_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             kv_weight_version_record=forward_batch_output.kv_weight_version_record,
             extra_keep_alive_refs=[verify_forward_batch],
-            prepared_draft_extend_inputs=post[5],
+            prepared_draft_extend_inputs=accept.prepared_draft_extend_inputs,
         )
 
-    accept = accept_draft_tree(
-        verify,
-        verify_input=verify_input,
-        logits_output=logits_output,
-        speculative_runtime_hooks=speculative_runtime_hooks,
-        post_verify_graphs=post_verify_graphs,
-        uno_target_max_top_k=uno_target_max_top_k,
-        simulated_acc_len_rng=simulated_acc_len_rng,
-        sparse_bonus_argmax=sparse_bonus_argmax,
-    )
-    verify.commit(accept, logits_output=logits_output)
     predict, accept_lens, accept_index = (
         accept.tokens,
         accept.accept_lens,

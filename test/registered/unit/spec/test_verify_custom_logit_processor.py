@@ -12,6 +12,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -137,13 +138,17 @@ def _batch(processor, *, greedy, device):
     )
 
 
-def _bound_verify(batch, layout, barrier=None):
-    verify = VerifyStep(
+def _verify(batch):
+    return VerifyStep(
         batch=batch,
         route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
         watermark=None,
         watermark_full_mask=True,
     )
+
+
+def _bound_verify(batch, layout, barrier=None):
+    verify = _verify(batch)
     verify.build_row_inputs(
         SimpleNamespace(next_token_logits=None),
         tree=_host_tree(layout, 2),
@@ -449,16 +454,25 @@ class TestTreeVerifyCustomLogitProcessor(CustomTestCase):
                 patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
             ):
                 batch = _batch(processor, greedy=greedy, device="cuda")
-                logits_output = SimpleNamespace(
-                    # peaked so that temperature sampling is deterministic
-                    next_token_logits=_logits(layout, 2, peak=50.0),
-                    next_token_logits_vocab_shard=None,
+                # peaked so that temperature sampling is deterministic
+                logits_output = LogitsProcessorOutput(
+                    next_token_logits=_logits(layout, 2, peak=50.0)
                 )
-                result = accept_draft_tree(
-                    _bound_verify(batch, layout),
-                    verify_input=_verify_input(layout, kind=kind, bs=2),
-                    logits_output=logits_output,
-                    speculative_runtime_hooks=None,
+                verify = _verify(batch)
+                verify_input = _verify_input(layout, kind=kind, bs=2)
+                result = verify.run(
+                    logits_output,
+                    tree=verify_input,
+                    host_tree=_host_tree(layout, 2),
+                    barrier=None,
+                    accept_core=lambda logits, info: accept_draft_tree(
+                        verify,
+                        logits,
+                        info,
+                        verify_input=verify_input,
+                        logits_output=logits_output,
+                        speculative_runtime_hooks=None,
+                    ),
                 )
                 tokens = result.accept_tokens()
                 self.assertEqual(

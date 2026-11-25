@@ -223,7 +223,11 @@ class TestGraphPoolBorrow(CustomTestCase):
             ),
         ):
             predict, accept_lens, accept_index = eagle_utils.eagle_sample(
-                verify_input, verify, logits_output
+                verify_input,
+                verify,
+                logits_output,
+                logits_output.next_token_logits,
+                sampling_info,
             )
 
         borrow_graph_pool.assert_not_called()

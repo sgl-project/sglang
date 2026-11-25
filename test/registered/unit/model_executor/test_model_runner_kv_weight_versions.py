@@ -163,7 +163,14 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
             ),
         )
         tokens = torch.tensor([1])
-        post = (tokens, tokens, tokens, tokens, tokens, None)
+        post = eagle_worker_common.PostVerifyGraphAccept(
+            tokens=tokens,
+            accept_lens=tokens,
+            accept_index=tokens,
+            new_seq_lens=tokens,
+            bonus_tokens=tokens,
+            prepared_draft_extend_inputs=None,
+        )
         target_worker = SimpleNamespace(
             forward_batch_generation=lambda **_: output,
             model_runner=SimpleNamespace(

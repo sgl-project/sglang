@@ -182,14 +182,15 @@ def _eager(batch, verify_input, logits, sim_rng, graphs=None):
             max_tree_depth=verify_input.max_tree_depth, device=logits.device
         )
     )
+    logits = logits.clone()
     predict, accept_lens, accept_index = eagle_sample(
         verify_input,
         SamplingPipeline(sampler=None, watermark=None).plan_verify(
             batch, watermark_full_mask=True
         ),
-        SimpleNamespace(
-            next_token_logits=logits.clone(), next_token_logits_vocab_shard=None
-        ),
+        SimpleNamespace(next_token_logits=logits, next_token_logits_vocab_shard=None),
+        logits,
+        batch.sampling_info,
         simulated_acc_len=sim_len,
         simulated_acc_len_rng=sim_rng,
     )
@@ -633,6 +634,13 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                     graphs.join()
                     if graphed:
                         self.assertIsNotNone(got)
+                        got = (
+                            got.tokens,
+                            got.accept_lens,
+                            got.accept_index,
+                            got.new_seq_lens,
+                            got.bonus_tokens,
+                        )
                     else:
                         self.assertIsNone(got)
                         got = _eager(batch, verify_input, logits, worker_rng, graphs)

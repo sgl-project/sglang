@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers import logits_processor
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils, sharded_verify
 from sglang.srt.speculative.sharded_verify import (
@@ -106,7 +108,7 @@ class TestShardedPolicy(CustomTestCase):
     def test_temperature_decline_gathers_then_enters_stock_without_early_rng(self):
         sampling = _sampling_info(greedy=False)
         shard = VocabShard(start=0, valid=5, vocab_size=5)
-        logits = SimpleNamespace(
+        logits = LogitsProcessorOutput(
             next_token_logits=_verify_logits().clone(),
             next_token_logits_vocab_shard=shard,
         )
@@ -122,7 +124,7 @@ class TestShardedPolicy(CustomTestCase):
             self.assertTrue(torch.equal(torch.random.get_rng_state(), state_before))
             return None
 
-        original_gather = eagle_utils.gather_full_logits
+        original_gather = sharded_verify.gather_full_logits
 
         def gather(*args, **kwargs):
             events.append("gather")
@@ -141,7 +143,8 @@ class TestShardedPolicy(CustomTestCase):
             patch.object(eagle_utils, "_is_hip", False),
             patch.object(eagle_utils, "_is_xpu", False),
             patch.object(eagle_utils, "get_spec", return_value=_runtime_spec()),
-            patch.object(eagle_utils, "gather_full_logits", side_effect=gather),
+            patch.object(sharded_verify, "gather_full_logits", side_effect=gather),
+            patch.object(logits_processor, "get_parallel", return_value=parallel),
             patch.object(
                 eagle_utils,
                 "tree_speculative_sampling_target_only",
@@ -164,6 +167,8 @@ class TestShardedPolicy(CustomTestCase):
                     watermark_full_mask=True,
                 ),
                 logits,
+                logits.next_token_logits,
+                sampling,
                 local_keys=local_keys,
             )
 

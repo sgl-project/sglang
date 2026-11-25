@@ -44,6 +44,7 @@ class TestNativeEagerVerify(CustomTestCase):
                     )
                     verify_input = object()
                     logits_output = SimpleNamespace(next_token_logits=None)
+                    logits, sampling_info = object(), object()
                     outputs = (object(), object(), object())
                     hooks = SimpleNamespace(local_keys=object())
                     sample = Mock(return_value=outputs)
@@ -55,6 +56,8 @@ class TestNativeEagerVerify(CustomTestCase):
                     ):
                         accept = eagle_worker_common.accept_draft_tree(
                             verify,
+                            logits,
+                            sampling_info,
                             verify_input=verify_input,
                             logits_output=logits_output,
                             speculative_runtime_hooks=hooks,
@@ -68,6 +71,8 @@ class TestNativeEagerVerify(CustomTestCase):
                         verify_input,
                         verify,
                         logits_output,
+                        logits,
+                        sampling_info,
                         uno_target_max_top_k=options.get("uno_target_max_top_k"),
                         simulated_acc_len=None,
                         simulated_acc_len_rng=options.get("simulated_acc_len_rng"),
