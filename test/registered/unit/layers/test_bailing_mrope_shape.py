@@ -8,6 +8,15 @@ import torch
 
 from sglang.srt.configs.bailing_hybrid import BailingMoeV3VLConfig
 from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    compute_spec_mrope_positions,
+)
+from sglang.srt.multimodal.processors.bailing_mm import BailingMMMultimodalProcessor
+from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+    PrefillPlacement,
+    TargetHiddenKvInjector,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -206,6 +215,224 @@ class TestBailingMRotaryEmbedding(CustomTestCase):
         )
         self.assertTrue(config.text_config.rope_parameters["video_rope"])
         self.assertTrue(config.vision_config.disable_merger_proj)
+
+
+class TestBailingVLConfigNormalization(CustomTestCase):
+    """Nested and top-level checkpoint forms must resolve to the same roles."""
+
+    _NESTED_TOKENS = {
+        "image_patch_token": 11,
+        "video_patch_token": 12,
+        "image_start_token": 10,
+        "video_start_token": 13,
+    }
+    _INPUT_IDS = torch.tensor([10, 11, 11, 11, 11, 7, 13, 12, 12, 12, 12, 8])
+    _GRIDS = {
+        "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        "video_grid_thw": torch.tensor([[1, 4, 4]]),
+    }
+
+    def _positions(self, config):
+        positions, _ = (
+            BailingMRotaryEmbedding.bailing_3drope_get_input_positions_tensor(
+                self._INPUT_IDS, config, **self._GRIDS
+            )
+        )
+        return positions
+
+    def _assert_processor_and_mrope_agree(self, config):
+        resolve = BailingMMMultimodalProcessor._resolve_token_id
+        self.assertEqual(
+            resolve(config, None, "image_token_id", "image_patch_token", ""), 11
+        )
+        self.assertEqual(
+            resolve(config, None, "video_token_id", "video_patch_token", ""), 12
+        )
+        expected = self._positions(_position_config())
+        self.assertFalse(
+            torch.equal(expected[0, 0], torch.arange(self._INPUT_IDS.numel()))
+        )
+        torch.testing.assert_close(self._positions(config), expected)
+
+    def test_legacy_nested_tokens_and_mrope_section(self):
+        config = BailingMoeV3VLConfig(
+            text_config={
+                "max_position_embeddings": 131072,
+                "mrope_section": [16, 8, 8],
+                **self._NESTED_TOKENS,
+            },
+            vision_config={},
+        )
+
+        self.assertEqual(config.mrope_section, [16, 8, 8])
+        self.assertEqual(
+            config.text_config.rope_parameters["mrope_section"], [16, 8, 8]
+        )
+        self._assert_processor_and_mrope_agree(config)
+
+    def test_top_level_tokens_without_nested_aliases(self):
+        config = BailingMoeV3VLConfig(
+            image_token_id=11,
+            video_token_id=12,
+            vision_start_token_id=10,
+            video_start_token_id=13,
+            text_config={"max_position_embeddings": 131072},
+            vision_config={},
+        )
+
+        self.assertEqual(
+            config.text_config.rope_parameters["mrope_section"], [8, 12, 12]
+        )
+        self._assert_processor_and_mrope_agree(config)
+
+    def test_explicit_top_level_values_override_nested_values(self):
+        config = BailingMoeV3VLConfig(
+            image_token_id=11,
+            mrope_section=[8, 12, 12],
+            text_config={
+                "max_position_embeddings": 131072,
+                "mrope_section": [16, 8, 8],
+                **self._NESTED_TOKENS,
+                "image_patch_token": 99,
+            },
+            vision_config={},
+        )
+
+        self.assertEqual(
+            config.text_config.rope_parameters["mrope_section"], [8, 12, 12]
+        )
+        self._assert_processor_and_mrope_agree(config)
+
+    def test_positional_arguments_keep_their_slots(self):
+        config = BailingMoeV3VLConfig(
+            {"max_position_embeddings": 131072},
+            {},
+            11,
+            12,
+            10,
+            14,
+            False,
+            [16, 8, 8],
+        )
+
+        self.assertEqual(
+            (
+                config.image_token_id,
+                config.video_token_id,
+                config.vision_start_token_id,
+                config.vision_end_token_id,
+                config.video_start_token_id,
+                config.video_end_token_id,
+            ),
+            (11, 12, 10, 14, 157160, 157161),
+        )
+        self.assertEqual(config.mrope_section, [16, 8, 8])
+
+
+class TestDSparkMropePositions(CustomTestCase):
+    def test_prefill_placement_matches_target_extend_positions(self):
+        """Draft KV rotary positions must be the target extend positions."""
+        image = SimpleNamespace(
+            mrope_positions=torch.tensor(
+                [[0, 1, 1, 1, 1, 3], [0, 1, 1, 2, 2, 3], [0, 1, 2, 1, 2, 3]]
+            ),
+            mrope_position_delta=torch.tensor([[-2]]),
+            mrope_position_delta_repeated_cache=None,
+        )
+        cases = (
+            ("text", None, 0, 3, None),
+            ("image", image, 0, 6, None),
+            ("chunked", image, 2, 3, None),
+            ("retracted", image, 7, 1, None),
+            ("session", image, 4, 5, object()),
+        )
+        batch = SimpleNamespace(
+            multimodal_inputs=[case[1] for case in cases],
+            prefix_lens=[case[2] for case in cases],
+            extend_lens=[case[3] for case in cases],
+            seq_lens_cpu=torch.tensor([case[2] + case[3] for case in cases]),
+            reqs=[SimpleNamespace(session=case[4]) for case in cases],
+            out_cache_loc=torch.arange(sum(case[3] for case in cases)),
+            req_pool_indices=torch.arange(len(cases)),
+        )
+        cpu = torch.device("cpu")
+        injector = TargetHiddenKvInjector(
+            draft_model=SimpleNamespace(is_mrope_enabled=True),
+            draft_model_runner=SimpleNamespace(
+                token_to_kv_pool=SimpleNamespace(), runner_ids=None
+            ),
+            model_runner=SimpleNamespace(
+                device=cpu,
+                prefill_attention_backend_str="torch_native",
+                runner_ids=SimpleNamespace(
+                    own_plan=lambda batch: SimpleNamespace(
+                        write_ids=lambda _ids, cols=None, kind=None: batch.out_cache_loc
+                    )
+                ),
+            ),
+            device=cpu,
+            verify_num_draft_tokens=2,
+            block_pos_offsets=torch.arange(2),
+        )
+
+        for rl_on_policy_target in (None, "fsdp"):
+            with (
+                self.subTest(rl_on_policy_target=rl_on_policy_target),
+                mock.patch(
+                    "sglang.srt.model_executor.forward_batch_info.get_exec",
+                    return_value=SimpleNamespace(
+                        deterministic=SimpleNamespace(
+                            rl_on_policy_target=rl_on_policy_target
+                        )
+                    ),
+                ),
+            ):
+                target = SimpleNamespace(seq_lens_cpu=batch.seq_lens_cpu)
+                ForwardBatch._compute_mrope_positions_extend(
+                    target, SimpleNamespace(device=cpu), batch
+                )
+                placement = injector.place_prefill(batch)
+
+                torch.testing.assert_close(
+                    placement.mrope_positions, target.mrope_positions
+                )
+                self.assertEqual(
+                    placement.mrope_positions.shape[-1], placement.positions.numel()
+                )
+
+    def test_spec_positions_mix_text_and_media_without_mutating_kv_positions(self):
+        seq_positions = torch.tensor([[4, 5], [7, 8]])
+        mm_inputs = [
+            None,
+            SimpleNamespace(mrope_position_delta=torch.tensor([3])),
+        ]
+
+        positions = compute_spec_mrope_positions(
+            seq_positions, mm_inputs, batch_size=2, device=torch.device("cpu")
+        )
+
+        expected = torch.tensor([4, 5, 10, 11])
+        torch.testing.assert_close(positions, expected.expand(3, -1))
+        torch.testing.assert_close(seq_positions, torch.tensor([[4, 5], [7, 8]]))
+
+    def test_prefill_selection_slices_mrope_on_the_token_axis(self):
+        placement = PrefillPlacement(
+            cache_loc=torch.tensor([10, 11, 12, 13]),
+            positions=torch.tensor([4, 5, 6, 7]),
+            state_slot=None,
+            final_pos=None,
+            swa_loc=None,
+            mrope_positions=torch.arange(12).reshape(3, 4),
+        )
+
+        selected = placement.select(torch.tensor([3, 1]))
+
+        torch.testing.assert_close(selected.cache_loc, torch.tensor([13, 11]))
+        torch.testing.assert_close(selected.positions, torch.tensor([7, 5]))
+        torch.testing.assert_close(
+            selected.mrope_positions,
+            torch.arange(12).reshape(3, 4)[:, [3, 1]],
+        )
 
 
 if __name__ == "__main__":

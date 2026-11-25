@@ -93,16 +93,36 @@ def _resolve_speculative_algorithm_alias(
     speculative_draft_model_path: Optional[str],
     trust_remote_code: bool = False,
     kwargs: Optional[dict] = {},
+    target_model_path: Optional[str] = None,
+    target_revision: Optional[str] = None,
+    model_config_parser: str = "auto",
 ) -> Optional[str]:
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
     is_gemma4_draft = False
     if speculative_draft_model_path:
-        from sglang.srt.hf_transformers import get_config
+        if speculative_algorithm == "DSPARK" and not kwargs:
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                load_dspark_hf_config,
+            )
 
-        cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
-        )
+            cfg = load_dspark_hf_config(
+                speculative_draft_model_path,
+                trust_remote_code=trust_remote_code,
+                revision=kwargs.get("revision"),
+                model_override_args={},
+                model_config_parser=model_config_parser,
+                target_model_path=target_model_path,
+                target_revision=target_revision,
+            )
+        else:
+            from sglang.srt.hf_transformers import get_config
+
+            cfg = get_config(
+                speculative_draft_model_path,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            )
         draft_archs = getattr(cfg, "architectures", None) or []
         is_gemma4_draft = any(
             arch in ("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
@@ -166,6 +186,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             cfg.speculative_draft_model_path,
             trust_remote_code=cfg.trust_remote_code,
             kwargs=kwargs,
+            target_model_path=cfg.model_path,
+            target_revision=cfg.revision,
+            model_config_parser=cfg.model_config_parser,
         ),
     )
 
@@ -698,6 +721,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"{', '.join(map(repr, allowed_a2a_backends))} for this model, got "
                 f"{cfg.moe_a2a_backend!r}."
             )
+        cuda_deepep = cfg.device.startswith("cuda") and cfg.moe_a2a_backend == "deepep"
+        if cuda_deepep and not get_platform().is_sm90:
+            raise ValueError(
+                "DSpark with dp attention and moe_a2a_backend 'deepep' is only "
+                "validated on Hopper (SM90); use 'none', 'megamoe', or 'mori'."
+            )
         if not _is_npu and (
             cfg.moe_a2a_backend != "none"
             or envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
@@ -712,7 +741,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                     "DSpark DP MoE or prefill coordination requires "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-
+        if cuda_deepep and envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+            raise ValueError(
+                "DSpark DP with CUDA DeepEP requires "
+                "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION to remain disabled."
+            )
         if not _is_npu and cfg.attn_cp_size > 1:
             raise ValueError(
                 "DSpark with dp attention does not support context parallel "
@@ -1321,6 +1354,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "BailingMoeV2_5ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",

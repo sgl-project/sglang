@@ -90,17 +90,22 @@ class TestFlashInferKDAPrefillDtBias(CustomTestCase):
         dt_bias = torch.arange(H * K, dtype=torch.float32).view(H, K)
         inputs = _make_inputs(num_tokens=6, seq_lens=[6])
 
-        out = kernel.extend(
-            inputs.pop("q"),
-            inputs.pop("k"),
-            inputs.pop("v"),
-            inputs.pop("g"),
-            inputs.pop("beta"),
-            A_log=torch.zeros(H),
-            dt_bias=dt_bias,
-            lower_bound=-5.0,
-            **inputs,
-        )
+        with patch(
+            "sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill"
+            ".flashinfer_kda_min_engine_seqs",
+            return_value=1,
+        ):
+            out = kernel.extend(
+                inputs.pop("q"),
+                inputs.pop("k"),
+                inputs.pop("v"),
+                inputs.pop("g"),
+                inputs.pop("beta"),
+                A_log=torch.zeros(H),
+                dt_bias=dt_bias,
+                lower_bound=-5.0,
+                **inputs,
+            )
 
         self.assertEqual(out.shape, (1, 6, H, V))
         self.assertEqual(fake.dt_bias.shape, (H * K,))

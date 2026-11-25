@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -242,6 +243,7 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
 
     def test_empty_cpu_sequence_lengths_use_static_bound(self):
         backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        backend.use_mla = False
         backend.max_context_len = 16
         backend.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.zeros((1, 16), dtype=torch.int32)
@@ -275,6 +277,87 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend.init_forward_metadata(forward_batch)
 
         self.assertEqual(backend.forward_metadata.max_seq_len_k, 16)
+
+
+class TestFlashAttentionMlaDcpMetadata(CustomTestCase):
+    @staticmethod
+    def _backend():
+        backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        backend.device = "cpu"
+        backend.use_mla = True
+        backend.fa_impl_ver = 3
+        backend.max_context_len = 16
+        backend.page_size = 1
+        backend._get_scheduler_metadata = None
+        backend.local_attn_builder = None
+        backend.use_sliding_window_kv_pool = False
+        backend.topk = 1
+        backend.speculative_num_draft_tokens = None
+        backend.is_encoder_decoder = False
+        backend.init_cuda_graph_state(max_bs=4, max_num_tokens=4)
+        return backend
+
+    @staticmethod
+    def _decode_batch(seq_lens):
+        return SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=len(seq_lens),
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int64),
+            req_pool_indices=torch.arange(len(seq_lens), dtype=torch.int64),
+            spec_info=None,
+            encoder_lens=None,
+        )
+
+    def test_graph_decode_metadata_views_the_max_bs_buffers(self):
+        """Each captured batch size must not allocate its own DCP page table."""
+        backend = self._backend()
+        buffers = backend.decode_cuda_graph_metadata
+        fills = []
+        backend._fill_mla_dcp_decode_page_table = lambda page_table, _indices, lens: (
+            fills.append((page_table, lens))
+        )
+        with get_parallel().override(
+            dcp_enabled=True, attn_dcp_size=2, attn_dcp_rank=1
+        ):
+            for seq_lens, local_lens in (
+                ([0, 1, 3, 4], [0, 0, 1, 2]),
+                ([5, 2], [2, 1]),
+                ([6, 0, 1, 2], [3, 0, 0, 1]),
+            ):
+                bs = len(seq_lens)
+                captured = buffers.get(bs)
+                backend.init_forward_metadata_out_graph(
+                    self._decode_batch(seq_lens), in_capture=captured is None
+                )
+                metadata = backend.forward_metadata
+                if captured is not None:
+                    self.assertIs(metadata, captured)
+                self.assertEqual(
+                    metadata.page_table.data_ptr(), buffers["page_table"].data_ptr()
+                )
+                self.assertEqual(tuple(metadata.page_table.shape), (bs, 8))
+                self.assertEqual(metadata.max_seq_len_k, 8)
+                self.assertEqual(metadata.cache_seqlens_int32.tolist(), local_lens)
+                self.assertEqual(
+                    metadata.cu_seqlens_k.tolist(),
+                    [0] + torch.tensor(local_lens).cumsum(0).tolist(),
+                )
+                self.assertEqual(metadata.cu_seqlens_q.tolist(), list(range(bs + 1)))
+                self.assertIs(fills[-1][0], metadata.page_table)
+
+    def test_empty_local_rows_are_neutral_for_the_lse_merge(self):
+        o = torch.ones(3, 2, 4)
+        o[0] = o[2] = torch.nan
+        softmax_lse = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+        masked_o, lse = flashattention_module._mask_empty_dcp_decode_rows(
+            o, softmax_lse, torch.tensor([0, 5, 0], dtype=torch.int32)
+        )
+
+        self.assertTrue(torch.equal(masked_o[[0, 2]], torch.zeros(2, 2, 4)))
+        self.assertTrue(torch.equal(masked_o[1], o[1]))
+        self.assertTrue(torch.isneginf(lse[[0, 2]]).all())
+        self.assertTrue(torch.equal(lse[1], softmax_lse[:, 1]))
 
 
 class TestSpecReadSeqLenDelta(CustomTestCase):
@@ -349,6 +432,7 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
         bs, pages, delta = 3, 6, 3
         b = FlashAttentionBackend.__new__(FlashAttentionBackend)
         b.fa_impl_ver = 4
+        b.use_mla = False
         b.topk = 1
         b.page_size = ps
         b.max_num_pages = pages

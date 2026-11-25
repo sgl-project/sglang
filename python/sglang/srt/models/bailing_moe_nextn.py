@@ -275,6 +275,8 @@ class BailingMoeForCausalLMNextN(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if getattr(self.config, "is_vl_nextn", False):
+            positions = forward_batch.mrope_positions
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

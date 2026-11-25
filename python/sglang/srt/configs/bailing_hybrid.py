@@ -14,6 +14,7 @@
 # limitations under the License.
 """BailingHybrid model configuration"""
 
+import copy
 import enum
 from typing import Union
 
@@ -47,6 +48,7 @@ class HybridLayerType(enum.Enum):
 
 class BailingHybridConfig(PretrainedConfig):
     model_type = "bailing_hybrid"
+    ignore_keys_at_rope_validation = {"mrope_section", "video_rope"}
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -236,19 +238,29 @@ class BailingHybridConfig(PretrainedConfig):
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
 
 
+def _resolve_vl_token_id(value, text_config, legacy_name: str, default: int) -> int:
+    if value is not None:
+        return value
+    legacy_value = getattr(text_config, legacy_name, None)
+    return default if legacy_value is None else legacy_value
+
+
 class BailingMoeV3VLConfig(PretrainedConfig):
     model_type = "bailing_moe_v3_vl"
+    ignore_keys_at_rope_validation = {"mrope_section", "video_rope"}
 
     def __init__(
         self,
         text_config=None,
         vision_config=None,
-        image_token_id=157157,
-        video_token_id=156909,
-        vision_start_token_id=157158,
+        image_token_id=None,
+        video_token_id=None,
+        vision_start_token_id=None,
         vision_end_token_id=157159,
         tie_word_embeddings=False,
         mrope_section=None,
+        video_start_token_id=None,
+        video_end_token_id=157161,
         **kwargs,
     ):
         if isinstance(vision_config, dict):
@@ -267,18 +279,31 @@ class BailingMoeV3VLConfig(PretrainedConfig):
 
         self.vision_config = vision_config
         self.text_config = text_config
-        self.image_token_id = image_token_id
-        self.video_token_id = video_token_id
-        self.vision_start_token_id = vision_start_token_id
+        # Resolve once so the processor and mRoPE read the same token ids.
+        self.image_token_id = _resolve_vl_token_id(
+            image_token_id, text_config, "image_patch_token", 157157
+        )
+        self.video_token_id = _resolve_vl_token_id(
+            video_token_id, text_config, "video_patch_token", 156909
+        )
+        self.vision_start_token_id = _resolve_vl_token_id(
+            vision_start_token_id, text_config, "image_start_token", 157158
+        )
+        self.video_start_token_id = _resolve_vl_token_id(
+            video_start_token_id, text_config, "video_start_token", 157160
+        )
         self.vision_end_token_id = vision_end_token_id
+        self.video_end_token_id = video_end_token_id
 
+        if mrope_section is None:
+            mrope_section = getattr(text_config, "mrope_section", None)
         if mrope_section is None:
             mrope_section = text_config.rope_parameters.get(
                 "mrope_section", [8, 12, 12]
             )
         self.mrope_section = mrope_section
+        text_config.rope_parameters.setdefault("rope_type", "default")
         text_config.rope_parameters.update(
-            rope_type="default",
             mrope_section=mrope_section,
             video_rope=True,
         )
@@ -287,6 +312,40 @@ class BailingMoeV3VLConfig(PretrainedConfig):
             self.text_config.architectures = ["BailingMoeV3ForCausalLM"]
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+    def get_nextn_config(self):
+        config = copy.deepcopy(self.text_config)
+        config.architectures = ["BailingMoeForCausalLMNextN"]
+        config.for_nextn_model = True
+        config.is_vl_nextn = True
+        config.quantization_config = copy.deepcopy(self.quantization_config)
+        config.quantization_config.setdefault("modules_to_not_convert", []).append(
+            f"model.layers.{config.num_hidden_layers}.eh_proj"
+        )
+        config.expert_swiglu_limit_list = config.expert_swiglu_limit_list[
+            config.num_hidden_layers :
+        ]
+        config.share_expert_swiglu_limit_list = config.share_expert_swiglu_limit_list[
+            config.num_hidden_layers :
+        ]
+        return config
+
+    @property
+    def max_position_embeddings(self):
+        return self.text_config.max_position_embeddings
+
+    @max_position_embeddings.setter
+    def max_position_embeddings(self, value):
+        self.text_config.max_position_embeddings = value
+
+    @property
+    def rope_parameters(self):
+        return self.text_config.rope_parameters
+
+    @rope_parameters.setter
+    def rope_parameters(self, value):
+        if value is not None:
+            self.text_config.rope_parameters.update(value)
 
     @property
     def rope_scaling(self):

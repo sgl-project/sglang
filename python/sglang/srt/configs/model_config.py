@@ -49,7 +49,7 @@ from sglang.srt.hf_transformers import (
     get_hf_text_config,
 )
 from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_model, get_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, retry
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
@@ -330,7 +330,11 @@ def uses_kda_attention(config) -> bool:
 
 
 def is_dspark_draft(config) -> bool:
-    return _hf_arch(config) in ("DSparkDraftModel", "DSparkMiniMaxDraftModel")
+    return _hf_arch(config) in (
+        "DSparkDraftModel",
+        "DSparkMiniMaxDraftModel",
+        "LingV3ForCausalLMDSparkMLA",
+    )
 
 
 # The decision_config.json attention mode whose full-attention layers read the whole prompt.
@@ -748,14 +752,26 @@ class ModelConfig:
         # get_config() is cached. ModelConfig mutates hf_config for draft-model
         # remapping and architecture-specific normalization, so each instance
         # must own an isolated copy.
+        config_reader = get_config
+        config_kwargs = dict(kwargs)
+        if is_draft_model and speculative_algorithm == "DSPARK" and not kwargs:
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                load_dspark_hf_config,
+            )
+
+            config_reader = load_dspark_hf_config
+            config_kwargs.update(
+                target_model_path=get_model().model_path,
+                target_revision=get_model().revision,
+            )
         self.hf_config = copy.deepcopy(
-            get_config(
+            config_reader(
                 self.model_path,
                 trust_remote_code=trust_remote_code,
                 revision=revision,
                 model_override_args=self.model_override_args,
                 model_config_parser=model_config_parser,
-                **kwargs,
+                **config_kwargs,
             )
         )
         if (
@@ -1171,6 +1187,35 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
+        if is_draft_model and self.speculative_algorithm in (None, "DSPARK"):
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                resolve_namespaced_dspark_draft_config,
+            )
+
+            projected = resolve_namespaced_dspark_draft_config(self.hf_config)
+            if projected is not None:
+                self.hf_config = self.hf_text_config = projected
+                draft_quantized = bool(
+                    projected.dspark_config.get("quantization_config")
+                )
+                if self.is_draft_quantization_explicit and self.quantization is None:
+                    if draft_quantized:
+                        raise ValueError(
+                            "Explicit unquant cannot override a quantized DSpark draft."
+                        )
+                    # Only the inherited target metadata is discarded. The
+                    # target's config remains isolated from this draft copy.
+                    projected.quantization_config = None
+                elif (
+                    not self.is_draft_quantization_explicit
+                    and not draft_quantized
+                    and _hf_arch(projected) == "LingV3ForCausalLMDSparkMLA"
+                ):
+                    # The native Ling draft has no quantized form; target
+                    # quantization reaches it only by inheritance.
+                    projected.quantization_config = None
+                    self.quantization = None
+
         from sglang.srt.configs.dots3 import Dots3Config
 
         if is_draft_model and isinstance(self.hf_text_config, Dots3Config):
@@ -1311,6 +1356,12 @@ class ModelConfig:
             "BailingMoeV3ForCausalLM",
         ]:
             self.hf_config.architectures[0] = "BailingMoeForCausalLMNextN"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0]
+            == "BailingMoeV3VLForConditionalGeneration"
+        ):
+            self.hf_config = self.hf_text_config = self.hf_config.get_nextn_config()
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "Ernie4_5_MoeForCausalLM"
@@ -1709,6 +1760,7 @@ class ModelConfig:
         elif (
             "BailingMoeV3ForCausalLM" in self.hf_config.architectures
             or "BailingMoeV3VLForConditionalGeneration" in self.hf_config.architectures
+            or "LingV3ForCausalLMDSparkMLA" in self.hf_config.architectures
         ):
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -2787,6 +2839,7 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 # generic multimodal rule disabled prefill CG for them despite the LM prefill
 # capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
+    "BailingMoeV3VLForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
     "Cohere2VisionForConditionalGeneration",
     "Glm5NextForConditionalGeneration",

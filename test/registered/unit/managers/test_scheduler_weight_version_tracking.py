@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import DEFAULT, MagicMock, Mock, patch
 
 import torch
+from torch import nn
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
@@ -271,7 +272,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
 
 def _runner(result=(True, "ok")):
     runner = Mock()
-    runner.weight_updater.get_model.return_value = torch.nn.Module()
+    runner.weight_updater.get_model.return_value = nn.Module()
     for method in (
         "update_weights_from_disk",
         "update_weights_from_tensor",
@@ -330,6 +331,12 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         override = get_parallel().override(tp_rank=0, tp_size=1)
         override.__enter__()
         self.addCleanup(override.__exit__, None, None, None)
+        cache_patcher = patch(
+            "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
+            return_value=False,
+        )
+        cache_patcher.start()
+        self.addCleanup(cache_patcher.stop)
         self.recorded = []
 
     def _build_manager(self, target, draft):
@@ -466,6 +473,71 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertIsNone(manager._session)
         target.weight_updater.begin_weight_update.assert_not_called()
         draft.weight_updater.begin_weight_update.assert_not_called()
+
+    def test_native_draft_constraint_rejects_every_update_before_target_mutation(self):
+        operations = (
+            "update_weights_from_disk",
+            "update_weights_from_ipc",
+            "begin_weight_update",
+            "update_weights_from_distributed",
+            "update_weights_from_tensor",
+        )
+        mutations = operations + ("load_weights_from_distributed",)
+        for selector in ("all", "target", "draft"):
+            for operation in operations:
+                with self.subTest(selector=selector, operation=operation):
+                    target, draft = _runner(), _runner()
+                    draft.weight_updater.get_model.return_value._derived_weight_cache_error = "Native draft shared weights require restart"
+                    shared = nn.Embedding(3, 2)
+                    shared._derived_weight_cache_error = (
+                        "Native draft shared weights require restart"
+                    )
+                    target.weight_updater.get_model.return_value.embed_tokens = shared
+                    draft.weight_updater.get_model.return_value.embed_tokens = shared
+                    manager = self._manager(
+                        target, draft, session=operation != "begin_weight_update"
+                    )
+                    manager.tp_worker.deserialize_own_rank = Mock(return_value=[])
+                    session = manager._session
+                    request = (
+                        BeginWeightUpdateReqInput(selector=selector)
+                        if operation == "begin_weight_update"
+                        else _request(selector=selector)
+                    )
+                    output = getattr(manager, operation)(request)
+                    self.assertFalse(output.success)
+                    self.assertIn("require restart", output.message)
+                    self.assertIs(manager._session, session)
+                    self.assertEqual(self.recorded, [])
+                    manager.tp_worker.deserialize_own_rank.assert_not_called()
+                    target.weight_updater.receive_weights_from_distributed.assert_not_called()
+                    for runner in (target, draft):
+                        for mutation in mutations:
+                            getattr(runner.weight_updater, mutation).assert_not_called()
+
+    def test_unselected_draft_cache_does_not_block_target_updates(self):
+        for operation in (
+            "begin_weight_update",
+            "update_weights_from_distributed",
+            "update_weights_from_tensor",
+        ):
+            with self.subTest(operation=operation):
+                target, draft = _runner(), _runner()
+                draft.weight_updater.get_model.return_value._derived_weight_cache_error = "Independent draft cache requires restart"
+                manager = self._manager(
+                    target, draft, session=operation != "begin_weight_update"
+                )
+                request = (
+                    BeginWeightUpdateReqInput(selector="target")
+                    if operation == "begin_weight_update"
+                    else _request(selector="target")
+                )
+                output = getattr(manager, operation)(request)
+                self.assertTrue(output.success)
+                draft.weight_updater.get_model.assert_not_called()
+                draft.weight_updater.begin_weight_update.assert_not_called()
+                draft.weight_updater.load_weights_from_distributed.assert_not_called()
+                draft.weight_updater.update_weights_from_tensor.assert_not_called()
 
     def test_distributed_update_receives_once_on_target_loads_into_each(self):
         """A draft runner that received its own broadcast would deadlock the update group."""

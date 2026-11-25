@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -54,17 +55,18 @@ def builds_confidence_head(draft_hf_config: Any) -> bool:
 
 def draft_uses_compressed_kv_attention() -> bool:
     from sglang.srt.configs.model_config import uses_compressed_kv_attention
-    from sglang.srt.hf_transformers import get_config
 
     draft_model_path = get_spec().speculative_draft_model_path
     if not draft_model_path:
         return False
-    draft_hf_config = get_config(
+    draft_hf_config = load_dspark_hf_config(
         draft_model_path,
         trust_remote_code=get_model().trust_remote_code,
         revision=get_spec().speculative_draft_model_revision,
         model_override_args=json.loads(get_model().json_model_override_args),
         model_config_parser=get_model().model_config_parser,
+        target_model_path=get_model().model_path,
+        target_revision=get_model().revision,
     )
     return draft_hf_config is not None and uses_compressed_kv_attention(draft_hf_config)
 
@@ -165,14 +167,16 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
     silently drops the checkpoint's gamma and the cross-check with
     `--speculative-num-draft-tokens` along with it.
     """
-    from sglang.srt.hf_transformers import get_config
 
     resolving = resolved_view(server_args)
-    draft_hf_config = get_config(
+    draft_hf_config = load_dspark_hf_config(
         resolving.speculative_draft_model_path,
         trust_remote_code=resolving.trust_remote_code,
         revision=resolving.speculative_draft_model_revision,
         model_override_args=json.loads(resolving.json_model_override_args),
+        model_config_parser=resolving.model_config_parser,
+        target_model_path=resolving.model_path,
+        target_revision=resolving.revision,
     )
     if _cfg_get(draft_hf_config, "architectures", []) == ["DSparkMiniMaxDraftModel"]:
         from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark
@@ -189,7 +193,7 @@ def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
         "Inkling2ForConditionalGeneration"
     ]:
         return _cfg_get(hf_config, "mtp_config", None) is not None
-    return any(
+    return is_namespaced_dspark_bundle(hf_config) or any(
         _cfg_get(hf_config, key, None) is not None
         for key in (
             "dspark_block_size",
@@ -237,6 +241,92 @@ def _get_dspark_config(config: Any) -> dict:
     }
 
 
+def is_namespaced_dspark_bundle(config: Any) -> bool:
+    return (
+        _cfg_get(config, "dspark_bundle_format") == "namespaced_safetensors"
+        and _cfg_get(config, "dspark_bundle_version") == 1
+        and bool(_get_nested_config(config, "dspark_config"))
+    )
+
+
+def load_dspark_hf_config(
+    model_path: str,
+    *,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    model_override_args: dict,
+    model_config_parser: str = "auto",
+    target_model_path: Optional[str] = None,
+    target_revision: Optional[str] = None,
+) -> Any:
+    from transformers.utils import cached_file
+
+    from sglang.srt.hf_transformers import get_config
+
+    try:
+        sidecar = cached_file(model_path, "dspark_config.json", revision=revision)
+    except (OSError, ValueError):
+        sidecar = None
+    if sidecar is not None:
+        with open(sidecar) as source:
+            metadata = json.load(source)
+        if (
+            metadata.get("dspark_bundle_format") == "namespaced_safetensors"
+            and metadata.get("dspark_bundle_version") == 1
+            and metadata.get("dspark_config")
+        ):
+            if target_model_path is None:
+                raise ValueError(
+                    "A separate namespaced DSpark draft requires its target config."
+                )
+            config = copy.deepcopy(
+                get_config(
+                    target_model_path,
+                    trust_remote_code=trust_remote_code,
+                    revision=target_revision,
+                    model_override_args=model_override_args,
+                    model_config_parser=model_config_parser,
+                )
+            )
+            for key, value in metadata.items():
+                setattr(config, key, value)
+            return config
+    return get_config(
+        model_path,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        model_override_args=model_override_args,
+        model_config_parser=model_config_parser,
+    )
+
+
+def resolve_namespaced_dspark_draft_config(config: Any) -> Optional[Any]:
+    """Build the draft's language config without mutating the cached target."""
+    if not is_namespaced_dspark_bundle(config):
+        return None
+    from sglang.srt.hf_transformers.common import get_hf_text_config
+
+    isolated = copy.deepcopy(config)
+    draft_fields = _get_nested_config(isolated, "dspark_config")
+    if not draft_fields.get("architectures"):
+        raise ValueError("Namespaced DSpark requires dspark_config.architectures.")
+    text = get_hf_text_config(isolated)
+    # The wrapper can carry the target's quantization metadata while its text
+    # config does not. Keep that provenance until ModelConfig resolves an
+    # explicit draft quantization override.
+    if getattr(text, "quantization_config", None) is None:
+        text.quantization_config = getattr(isolated, "quantization_config", None)
+    for key, value in draft_fields.items():
+        setattr(text, key, value)
+    if isinstance(draft_fields.get("attention_type"), str):
+        text.full_attention_type = draft_fields["attention_type"]
+        text.attention_type = 1
+    text.dspark_bundle_format = isolated.dspark_bundle_format
+    text.dspark_bundle_version = isolated.dspark_bundle_version
+    text.dspark_config = draft_fields
+    return text
+
+
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     if _cfg_get(draft_hf_config, "architectures", None) == [
         "Inkling2ForConditionalGeneration"
@@ -246,6 +336,9 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         if isinstance(draft_hf_config, dict):
             draft_hf_config = Inkling2MMConfig(**draft_hf_config)
         draft_hf_config = Inkling2MTPConfig.from_target(draft_hf_config)
+    projected = resolve_namespaced_dspark_draft_config(draft_hf_config)
+    if projected is not None:
+        draft_hf_config = projected
     base = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
 
     dspark_cfg = _get_dspark_config(draft_hf_config)
@@ -353,5 +446,10 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
-        is_mla=base.is_mla,
+        is_mla=base.is_mla
+        or (
+            "LingV3ForCausalLMDSparkMLA"
+            in (_cfg_get(draft_hf_config, "architectures", []) or [])
+            and _cfg_get(draft_hf_config, "full_attention_type") == "mla"
+        ),
     )

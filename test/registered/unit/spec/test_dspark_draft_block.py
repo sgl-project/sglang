@@ -18,7 +18,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     sample_draft_block,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -223,6 +223,7 @@ class TestMegakernelDraftSampler(CustomTestCase):
         declined = Mock(return_value=lambda bs: None)
         tokens = torch.full((BS, GAMMA), 7)
         with (
+            published_topology(),
             patch.object(
                 ds, "draft_markov_block", return_value=(tokens, None)
             ) as stock,
@@ -238,9 +239,12 @@ class TestMegakernelDraftSampler(CustomTestCase):
     def test_absent_provider_uses_the_always_present_stock_strategy(self):
         tokens = torch.full((BS, GAMMA), 11)
         input_ids = torch.arange(BS * GAMMA)
-        with patch.object(
-            ds, "draft_markov_block", return_value=(tokens, None)
-        ) as stock:
+        with (
+            published_topology(),
+            patch.object(
+                ds, "draft_markov_block", return_value=(tokens, None)
+            ) as stock,
+        ):
             sampler = _build(_folded_draft_model(), greedy_draft=True)
             sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids)
         stock.assert_called_once()

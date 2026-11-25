@@ -10,7 +10,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
-from sglang.srt.model_executor.forward_batch_info import compute_position
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    compute_position,
+    compute_spec_mrope_positions,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import is_pin_memory_available
 
@@ -23,10 +27,20 @@ class PrefillPlacement(NamedTuple):
     state_slot: Optional[torch.Tensor]  # draft req slot, for a SWA ring
     final_pos: Optional[torch.Tensor]  # the request's last position, for a ring
     swa_loc: Optional[torch.Tensor]  # SWA rows, for a pool that takes them
+    mrope_positions: Optional[torch.Tensor] = (
+        None  # rotary axes, separate from cache ids
+    )
 
     def select(self, token_indices: torch.Tensor) -> "PrefillPlacement":
         return PrefillPlacement(
-            *(None if t is None else t[token_indices] for t in self)
+            *(
+                None
+                if tensor is None
+                else tensor[..., token_indices]
+                if name == "mrope_positions"
+                else tensor[token_indices]
+                for name, tensor in zip(self._fields, self)
+            )
         )
 
 
@@ -122,7 +136,18 @@ class TargetHiddenKvInjector:
             swa_loc = iteration_ids.write_ids(
                 self.draft_model_runner.runner_ids, kind=IdSpaceKind.SLIDING_WINDOW
             )
-        return PrefillPlacement(cache_loc, positions, state_slot, final_pos, swa_loc)
+        mrope_positions = None
+        if getattr(self.draft_model, "is_mrope_enabled", False):
+            # The target extend's own host positions, staged for one async copy.
+            host = ForwardBatch.extend_mrope_positions_cpu(
+                batch, batch.seq_lens_cpu
+            ).to(torch.int64)
+            if pin_memory:
+                host = host.pin_memory()
+            mrope_positions = host.to(device, non_blocking=pin_memory)
+        return PrefillPlacement(
+            cache_loc, positions, state_slot, final_pos, swa_loc, mrope_positions
+        )
 
     def inject_prefill(
         self,
@@ -137,7 +162,11 @@ class TargetHiddenKvInjector:
         self._inject(
             target_hidden=target_hidden,
             cache_loc=placement.cache_loc,
-            positions=placement.positions,
+            positions=(
+                placement.positions
+                if placement.mrope_positions is None
+                else placement.mrope_positions
+            ),
             state_slot=placement.state_slot,
             final_pos=placement.final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
@@ -156,7 +185,15 @@ class TargetHiddenKvInjector:
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
         iteration_ids: Optional[IterationIds] = None,
+        batch: Optional[ScheduleBatch] = None,
     ) -> None:
+        if batch is not None and getattr(self.draft_model, "is_mrope_enabled", False):
+            positions = compute_spec_mrope_positions(
+                positions,
+                batch.multimodal_inputs,
+                batch.seq_lens.shape[0],
+                self.model_runner.device,
+            )
         self._inject(
             target_hidden=target_hidden,
             cache_loc=cache_loc,
@@ -189,7 +226,7 @@ class TargetHiddenKvInjector:
         cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
         positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
         target_hidden = target_hidden.to(device=device, non_blocking=True)
-        n_real = positions.shape[0]
+        n_real = positions.shape[-1]
         if target_hidden.shape[0] > n_real:
             target_hidden = target_hidden[:n_real]
         if cache_loc_2d is not None:
@@ -427,4 +464,5 @@ class TargetHiddenKvInjector:
             positions=positions_2d.reshape(-1),
             commit_lens=commit_lens,
             iteration_ids=iteration_ids,
+            batch=batch,
         )

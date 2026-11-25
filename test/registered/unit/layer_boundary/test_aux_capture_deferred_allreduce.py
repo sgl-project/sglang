@@ -131,6 +131,9 @@ class DeferringLayer(nn.Module):
         capture = kwargs.get("capture_output")
         if capture is not None:
             capture(residual.clone())
+        captured_last_layer_outputs = kwargs.get("captured_last_layer_outputs")
+        if captured_last_layer_outputs is not None:
+            captured_last_layer_outputs.capture(residual)
         with self.layer_communicator.output.ffn_exit(
             forward_batch, stream=ResidualStream()
         ) as ffn_exit:

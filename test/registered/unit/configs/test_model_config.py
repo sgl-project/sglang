@@ -221,6 +221,48 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertEqual(config.hf_config.architectures, ["NemotronHForCausalLMMTP"])
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
 
+    def test_native_ling_dspark_draft_does_not_inherit_target_quantization(self):
+        """Without a draft quantization flag, only the native Ling draft drops
+        the target quantization it inherits; other DSpark drafts keep it."""
+        for draft_arch, keeps_target_quantization in (
+            ("LingV3ForCausalLMDSparkMLA", False),
+            ("DSparkDraftModel", True),
+        ):
+            with self.subTest(draft_arch=draft_arch):
+                config = object.__new__(ModelConfig)
+                config.is_draft_model = True
+                config.speculative_algorithm = "DSPARK"
+                config.is_draft_quantization_explicit = False
+                config.quantization = "fp8"
+                config.hf_config = SimpleNamespace(
+                    architectures=["BailingMoeV3VLForConditionalGeneration"],
+                    text_config=SimpleNamespace(
+                        architectures=["BailingMoeV3ForCausalLM"],
+                        num_attention_heads=64,
+                        quantization_config=None,
+                    ),
+                    quantization_config={"quant_method": "fp8"},
+                    dspark_bundle_format="namespaced_safetensors",
+                    dspark_bundle_version=1,
+                    dspark_config={
+                        "architectures": [draft_arch],
+                        "attention_type": "mla",
+                    },
+                )
+                config.hf_text_config = config.hf_config.text_config
+
+                config._config_draft_model()
+
+                self.assertEqual(config.hf_config.architectures, [draft_arch])
+                if keeps_target_quantization:
+                    self.assertEqual(config.quantization, "fp8")
+                    self.assertEqual(
+                        config.hf_config.quantization_config, {"quant_method": "fp8"}
+                    )
+                else:
+                    self.assertIsNone(config.quantization)
+                    self.assertIsNone(config.hf_config.quantization_config)
+
     def test_qwen4_exp_spec_hidden_size_keeps_hc_width(self):
         """Qwen4-Exp's MTP draft consumes the hc-flattened target stream,
         so spec_hidden_size must stay hidden_size * hc_mult; hy_v4 collapses first."""

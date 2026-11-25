@@ -1447,7 +1447,7 @@ def _compact_inline_tensors(value, memo=None):
     """
     if memo is None:
         memo = {}
-    if isinstance(value, torch.Tensor):
+    if type(value) is torch.Tensor:
         if (
             value.is_cpu
             and value.layout == torch.strided

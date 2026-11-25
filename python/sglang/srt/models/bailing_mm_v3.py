@@ -59,6 +59,24 @@ _NON_TEXT_PREFIX_MAPPING = (
 class BailingMoeV3VLForConditionalGeneration(nn.Module):
     """Bailing MoE V3 language model with Qwen3 vision encoding."""
 
+    @property
+    def lm_head(self):
+        return self.model.lm_head
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        self.model.set_dspark_layers_to_capture(layer_ids)
+
+    @staticmethod
+    def get_quantized_moe_intermediate_size(
+        model_config, *, tp_size, moe_ep_size, moe_dp_size
+    ) -> Optional[int]:
+        return BailingMoeV3ForCausalLM.get_quantized_moe_intermediate_size(
+            model_config,
+            tp_size=tp_size,
+            moe_ep_size=moe_ep_size,
+            moe_dp_size=moe_dp_size,
+        )
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return BailingMoeV3ForCausalLM.shared_experts_fusion_disable_reason(
@@ -128,6 +146,45 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
+
+    def get_embed_and_head(self):
+        return self.model.get_embed_and_head()
+
+    @property
+    def start_layer(self) -> int:
+        return self.model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.model.end_layer
+
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens,
+        extend_prefix_lens,
+        extend_prefix_lens_cpu,
+        extend_seq_lens,
+        req_pool_indices,
+        req_to_token,
+        seq_lens_sum,
+        kv_buffer_shape,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        return self.model.prepare_context_parallel_metadata_for_dcp(
+            seq_lens,
+            extend_prefix_lens,
+            extend_prefix_lens_cpu,
+            extend_seq_lens,
+            req_pool_indices,
+            req_to_token,
+            seq_lens_sum,
+            kv_buffer_shape,
+            kv_cache_dtype,
+            kv_cache_device,
+            create_chunked_prefix_cache_kv_indices_fn,
+        )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)

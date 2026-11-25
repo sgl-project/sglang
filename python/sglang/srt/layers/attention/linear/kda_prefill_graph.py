@@ -116,7 +116,15 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
         cache_index_dtype: torch.dtype,
         device: torch.device,
         flashinfer_wrapper_cls=None,
+        flashinfer_num_heads: Optional[int] = None,
     ) -> KDAPrefillGraphMetadata:
+        if flashinfer_wrapper_cls is not None and (
+            flashinfer_num_heads is None or flashinfer_num_heads <= 0
+        ):
+            raise ValueError(
+                "FlashInfer KDA prefill graph requires a positive head count, "
+                f"got {flashinfer_num_heads!r}"
+            )
         max_seqs = max(1, min(num_tokens, max_seqs_cap))
         max_chunks = triton.cdiv(num_tokens, KDA_CHUNK_SIZE) + max_seqs
         max_conv_blocks = triton.cdiv(num_tokens, CAUSAL_CONV1D_FWD_BLOCK_M) + max_seqs
@@ -159,6 +167,7 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
                     wrapper_cls=flashinfer_wrapper_cls,
                     num_tokens=num_tokens,
                     max_seqs=max_seqs,
+                    num_heads=flashinfer_num_heads,
                     track=track,
                     device=device,
                 )

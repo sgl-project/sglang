@@ -658,6 +658,53 @@ Draft execution stays eager; eligible target verify batches can use CUDA graphs.
 The scheduler separates prefill and verify rounds across DP ranks. Keep the
 experimental `SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION` setting disabled.
 
+### DSpark with DP attention and DeepEP
+
+On NVIDIA Hopper (SM90), DSpark can use attention DP with DeepEP when the draft
+model declares DeepEP support, as native Ling DSpark drafts do. This is validated
+with a native Ling DSpark draft on H200 with TP8 / attention DP8 / EP8 and the
+DeepGEMM MoE runner. Other drafts keep `--moe-a2a-backend none`, `megamoe`, or
+`mori`, and startup rejects DeepEP for them. Other GPUs also reject DeepEP here. On
+Blackwell, the validated native Ling DSpark DP setup uses
+`--moe-a2a-backend none --moe-runner-backend triton`; Bailing MoE layers with
+128x128 block-FP8 experts whose per-rank width is not a multiple of 512, as in this
+Ling target, reject the DeepGEMM runner at startup.
+
+Use `--enable-dp-lm-head` and `SGLANG_RAGGED_VERIFY_MODE=static`.
+DP combined with context parallelism is not supported. If you set
+`--speculative-moe-a2a-backend`, it must match the target backend.
+
+For example, on 8x H200 with TP8 / attention DP8 / EP8, replace `TARGET_MODEL` and
+`MATCHING_DSPARK_DRAFT` with local checkpoint directories or Hugging Face model IDs:
+
+```bash Command
+SGLANG_RAGGED_VERIFY_MODE=static \
+SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=0 \
+python3 -m sglang.launch_server \
+    --model-path TARGET_MODEL \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path MATCHING_DSPARK_DRAFT \
+    --tp-size 8 --ep-size 8 --attn-dp-size 8 \
+    --enable-dp-lm-head \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --moe-runner-backend deep_gemm \
+    --disable-shared-experts-fusion
+```
+
+Keep the draft quantization consistent with its checkpoint. A native Ling DSpark
+draft is unquantized by default; for other unquantized drafts paired with a
+quantized target, set
+`--speculative-draft-model-quantization unquant` explicitly.
+DeepEP `auto` can use decode CUDA graphs on eligible batches. DeepEP `normal`
+disables CUDA graphs and runs eagerly. Keep experimental
+`SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION` disabled with DP DeepEP; this
+combination schedules prefill and verify rounds separately.
+
+Native Ling DSpark drafts share the target embedding and LM head and cache absorbed
+MLA weights. Restart the server to change their weights; online updates to the target,
+draft, or both are rejected before loading begins. An FP32 draft-head setting applies
+only to unquantized heads; quantized heads retain their quantization method and scales.
+
 ### LiLiCorr: reranked DFlash drafts
 
 A DFlash drafter is trained on per-position marginals rather than on the joint block distribution, so its drafted tokens are individually plausible yet jointly incoherent. **LiLiCorr** ([arXiv:2608.20530](https://arxiv.org/abs/2608.20530)) keeps the top-`k` candidates per block position, scores the whole lattice jointly with a small two-layer transformer, and commits a path through it greedily instead of taking the per-slot argmax. Verify is unchanged, so outputs remain distributionally identical to the target model's and only acceptance length moves.

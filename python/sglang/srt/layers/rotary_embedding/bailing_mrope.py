@@ -1,3 +1,4 @@
+import math
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -6,17 +7,23 @@ from transformers.configuration_utils import PretrainedConfig
 from sglang.kernels.ops.attention.rotary_triton import (
     triton_ernie45_rope_fused_inplace,
 )
+from sglang.srt.configs.bailing_hybrid import BailingMoeV3VLConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.yarn import (
+    deepseek_yarn_inv_freq,
+    deepseek_yarn_mscale,
     yarn_find_correction_range,
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
+from sglang.srt.utils import get_device
 
 
 class BailingMRotaryEmbedding(RotaryEmbedding):
     """Bailing multimodal RoPE with centered height and width positions."""
+
+    _match_cuda_rope = False
 
     def __init__(
         self,
@@ -45,18 +52,15 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
         self.original_max_position_embeddings = (
             original_max_position_embeddings or max_position_embeddings
         )
-        self.mscale = (
-            float(yarn_get_mscale_simple(scaling_factor) * attn_factor)
-            if scaling_factor > 1
-            else 1.0
-        )
+        self.mscale = self._compute_mscale()
         # Bailing positions are bounded by the checkpoint context on both sides:
         # text/time grow positive while centered height/width can be negative.
-        # YaRN only stretches the positive side; the negative side holds small
-        # centered media coordinates and stays at the checkpoint bound.
+        # Keep the negative side at the configured context bound, independently
+        # of YaRN's original window, to cover centered media coordinates.
         position_start = -max_position_embeddings if video_rope else 0
-        cache_length = (max_position_embeddings if video_rope else 0) + int(
-            self.original_max_position_embeddings * scaling_factor
+        cache_length = -position_start + max(
+            max_position_embeddings,
+            math.ceil(self.original_max_position_embeddings * scaling_factor),
         )
         super().__init__(
             head_size,
@@ -78,6 +82,13 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
             # Ernie4.5 kernel consumes [height, width, time].
             mrope_section = [mrope_section[1], mrope_section[2], mrope_section[0]]
         self.mrope_section = mrope_section
+
+    def _compute_mscale(self) -> float:
+        return (
+            float(yarn_get_mscale_simple(self.scaling_factor) * self.attn_factor)
+            if self.scaling_factor > 1
+            else 1.0
+        )
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         if self.scaling_factor <= 1:
@@ -159,6 +170,7 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
                 self.head_size,
                 self.rotary_dim,
                 self.is_neox_style,
+                match_cuda_rope=self._match_cuda_rope,
             )
             if query_shape != query.shape:
                 query = query.view(query_shape)
@@ -216,10 +228,16 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
         second_per_grid_ts = None
         spatial_merge_size = hf_config.vision_config.spatial_merge_size
         text_config = cls._text_config(hf_config)
-        image_patch_id = text_config.image_patch_token
-        video_patch_id = text_config.video_patch_token
-        image_start_token_id = text_config.image_start_token
-        video_start_token_id = text_config.video_start_token
+        if isinstance(hf_config, BailingMoeV3VLConfig):
+            image_patch_id = hf_config.image_token_id
+            video_patch_id = hf_config.video_token_id
+            image_start_token_id = hf_config.vision_start_token_id
+            video_start_token_id = hf_config.video_start_token_id
+        else:
+            image_patch_id = text_config.image_patch_token
+            video_patch_id = text_config.video_patch_token
+            image_start_token_id = text_config.image_start_token
+            video_start_token_id = text_config.video_start_token
         use_interleaved_frame_timestamp = getattr(
             text_config, "use_interleaved_frame_timestamp", False
         )
@@ -364,3 +382,108 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
             .to(dtype=input_ids.dtype)
         )
         return positions.unsqueeze(1).to(dtype=input_ids.dtype), position_delta
+
+
+class YaRNScalingBailingMRotaryEmbedding(BailingMRotaryEmbedding):
+    """Bailing MRoPE with the frequencies and magnitude of MLA deepseek_yarn."""
+
+    _match_cuda_rope = True
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        scaling_factor: float,
+        dtype: torch.dtype,
+        *,
+        mrope_section: Optional[List[int]] = None,
+        video_rope: bool = False,
+        extrapolation_factor: float = 1,
+        attn_factor: float = 1,
+        beta_fast: int = 32,
+        beta_slow: int = 1,
+        mscale: float = 1,
+        mscale_all_dim: float = 0,
+        cache_max_position_embeddings: Optional[int] = None,
+    ) -> None:
+        self.yarn_mscale = mscale
+        self.mscale_all_dim = mscale_all_dim
+        self.device = get_device()
+        # The ramp uses the original window; cache bounds must also cover the
+        # serving context, which can exceed original_max_position * factor.
+        cache_bound = max(
+            cache_max_position_embeddings or 0,
+            math.ceil(max_position_embeddings * scaling_factor),
+            1,
+        )
+        super().__init__(
+            head_size,
+            rotary_dim,
+            cache_bound,
+            base,
+            is_neox_style,
+            dtype,
+            mrope_section=mrope_section,
+            video_rope=video_rope,
+            scaling_factor=scaling_factor,
+            original_max_position_embeddings=max_position_embeddings,
+            extrapolation_factor=extrapolation_factor,
+            attn_factor=attn_factor,
+            beta_fast=beta_fast,
+            beta_slow=beta_slow,
+        )
+
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        # The caller bounds token positions. Video time advances by two per
+        # frame group, and cache indices include the negative-origin offset.
+        cur_len = int(self.cos_sin_cache.shape[0])
+        needed_len = 2 * needed_max_pos - self.position_start + 1
+        if needed_len <= cur_len:
+            return
+        align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+        new_len = (needed_len + align - 1) // align * align
+        positions = torch.arange(
+            cur_len + self.position_start,
+            new_len + self.position_start,
+            dtype=torch.float32,
+            device=self.cos_sin_cache.device,
+        )
+        rows = self._compute_cos_sin_rows(positions).to(self.cos_sin_cache.dtype)
+        self.cos_sin_cache = torch.cat((self.cos_sin_cache, rows), dim=0)
+
+    def _compute_cos_sin_rows(self, positions: torch.Tensor) -> torch.Tensor:
+        inv_freq = self._compute_inv_freq(self.base).to(positions.device)
+        freqs = torch.einsum("i,j -> ij", positions, inv_freq)
+        return torch.cat((freqs.cos(), freqs.sin()), dim=-1) * self.mscale
+
+    def _compute_mscale(self) -> float:
+        return deepseek_yarn_mscale(
+            self.scaling_factor,
+            self.yarn_mscale,
+            self.mscale_all_dim,
+            self.attn_factor,
+        )
+
+    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+        return deepseek_yarn_inv_freq(
+            base=base,
+            rotary_dim=self.rotary_dim,
+            max_position_embeddings=self.original_max_position_embeddings,
+            scaling_factor=self.scaling_factor,
+            beta_fast=self.beta_fast,
+            beta_slow=self.beta_slow,
+            extrapolation_factor=self.extrapolation_factor,
+            device=self.device,
+        )
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        positions = torch.arange(
+            self.position_start,
+            self.position_start + self.max_position_embeddings,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        return self._compute_cos_sin_rows(positions)

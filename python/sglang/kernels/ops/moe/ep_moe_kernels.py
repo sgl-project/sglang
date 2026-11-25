@@ -386,6 +386,7 @@ def _silu_and_mul_post_quant_kernel(
     SCALE_UE8M0: tl.constexpr,
     GEMM1_ALPHA: tl.constexpr,
     GEMM1_CLAMP_LIMIT: tl.constexpr,
+    HAS_GEMM1_CLAMP_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -430,6 +431,9 @@ def _silu_and_mul_post_quant_kernel(
             gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
         else:
             gate = gate / (1 + tl.exp(-gate))
+            if HAS_GEMM1_CLAMP_LIMIT:
+                gate = tl.minimum(gate, GEMM1_CLAMP_LIMIT)
+                up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT)
             gate = gate.to(input_ptr.dtype.element_ty)
             gate_up = up * gate
 
@@ -464,10 +468,11 @@ def silu_and_mul_masked_post_quant_fwd(
     quant_group_size: int,
     masked_m: torch.Tensor,
     scale_ue8m0: bool = False,
-    gemm1_alpha: float = 0.0,
-    gemm1_clamp_limit: float = 0.0,
+    gemm1_alpha: Optional[float] = 0.0,
+    gemm1_clamp_limit: Optional[float] = None,
     num_real_tokens: Optional[int] = None,
     topk: Optional[int] = None,
+    post_silu_clamp: bool = False,
 ):
     """Masked (EP-MoE) fused silu_and_mul + per-token-group fp8 quant.
 
@@ -485,6 +490,9 @@ def silu_and_mul_masked_post_quant_fwd(
 
     ``gemm1_alpha > 0`` switches the activation to the gpt-oss swiglu
     ``min(gate, limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)``.
+    ``post_silu_clamp`` opts plain SiLU into clamping the activated gate
+    and the up projection before multiplication. Explicit nonpositive alpha
+    values retain their existing unclamped SiLU behavior by default.
     """
 
     assert input.is_contiguous()
@@ -500,6 +508,7 @@ def silu_and_mul_masked_post_quant_fwd(
     finfo = torch.finfo(torch.float8_e4m3fn)
     fp8_max = finfo.max
     fp8_min = -fp8_max
+    has_gemm1_clamp_limit = post_silu_clamp and gemm1_clamp_limit is not None
     gemm1_alpha = gemm1_alpha if gemm1_alpha is not None else 0.0
     gemm1_clamp_limit = gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0
 
@@ -535,6 +544,7 @@ def silu_and_mul_masked_post_quant_fwd(
             BLOCK_N=BLOCK_N,
             GEMM1_ALPHA=gemm1_alpha,
             GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
+            HAS_GEMM1_CLAMP_LIMIT=has_gemm1_clamp_limit,
             E_PADDED=triton.next_power_of_2(E),
             num_warps=1,
         )
@@ -584,6 +594,7 @@ def silu_and_mul_masked_post_quant_fwd(
         SCALE_UE8M0=scale_ue8m0,
         GEMM1_ALPHA=gemm1_alpha,
         GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
+        HAS_GEMM1_CLAMP_LIMIT=has_gemm1_clamp_limit,
     )
     return
 
@@ -611,6 +622,7 @@ def _silu_and_mul_post_quant_packed_kernel(
     BLOCK_N: tl.constexpr,  # == 4 * QUANT_GROUP_SIZE (one packed int32 per block)
     GEMM1_ALPHA: tl.constexpr,
     GEMM1_CLAMP_LIMIT: tl.constexpr,
+    HAS_GEMM1_CLAMP_LIMIT: tl.constexpr,
     E_PADDED: tl.constexpr,
 ):
     # Flat work dim rides axis 0 (x): num_real_tokens*topk can exceed the 65535 grid.y/z limit.
@@ -648,6 +660,9 @@ def _silu_and_mul_post_quant_packed_kernel(
         gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
     else:
         gate = gate / (1 + tl.exp(-gate))
+        if HAS_GEMM1_CLAMP_LIMIT:
+            gate = tl.minimum(gate, GEMM1_CLAMP_LIMIT)
+            up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT)
         gate = gate.to(input_ptr.dtype.element_ty)
         gate_up = up * gate
 

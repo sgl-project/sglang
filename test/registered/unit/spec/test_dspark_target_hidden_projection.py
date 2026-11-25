@@ -7,6 +7,7 @@ import torch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.models.dspark import DSparkDraftMixin
+from sglang.srt.models.ling_v3_dspark import LingV3ForCausalLMDSparkMLA
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -114,6 +115,35 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
 
         draft_model.project_target_hidden.assert_not_called()
         self.assertIs(attention.input, projected_hidden)
+
+    def test_ling_mla_write_accepts_the_swa_sidecar_location(self) -> None:
+        attention = SimpleNamespace(
+            q_lora_rank=1,
+            kv_lora_rank=2,
+            num_local_heads=1,
+            qk_rope_head_dim=1,
+            attn_mqa=object(),
+            fused_qkv_a_proj_with_mqa=lambda hidden: (hidden, None),
+            kv_a_layernorm=lambda hidden: hidden,
+            rotary_emb=lambda positions, query, key: (query, key),
+        )
+        model = object.__new__(LingV3ForCausalLMDSparkMLA)
+        model.layers = [SimpleNamespace(attention=attention)]
+        model.project_target_hidden = lambda hidden: hidden
+        pool = SimpleNamespace(set_mla_kv_buffer=mock.Mock())
+
+        model.write_target_hidden_kv(
+            target_hidden=torch.arange(8, dtype=torch.float32).reshape(2, 4),
+            pool=pool,
+            positions=torch.arange(2),
+            cache_loc=torch.tensor([3, 4]),
+            swa_loc=torch.tensor([9, 10]),
+        )
+
+        pool.set_mla_kv_buffer.assert_called_once()
+        _, k_nope, k_rope = pool.set_mla_kv_buffer.call_args.args[1:]
+        self.assertEqual(k_nope.shape, (2, 1, 2))
+        self.assertEqual(k_rope.shape, (2, 1, 1))
 
 
 if __name__ == "__main__":

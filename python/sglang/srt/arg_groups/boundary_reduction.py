@@ -74,18 +74,33 @@ def resolve_boundary_reduction(view):
             and draft_path is not None
             and draft_path != view.model_path
         ):
-            from sglang.srt.hf_transformers import get_config
-
             kwargs = {}
             if view.decrypted_draft_config_file:
                 kwargs["_configuration_file"] = view.decrypted_draft_config_file
-            config = get_config(
-                draft_path,
-                trust_remote_code=view.trust_remote_code,
-                revision=view.speculative_draft_model_revision,
-                model_override_args=json.loads(view.json_model_override_args),
-                **kwargs,
-            )
+            if view.speculative_algorithm == "DSPARK" and not kwargs:
+                from sglang.srt.speculative.dspark_components.dspark_config import (
+                    load_dspark_hf_config,
+                )
+
+                config = load_dspark_hf_config(
+                    draft_path,
+                    trust_remote_code=view.trust_remote_code,
+                    revision=view.speculative_draft_model_revision,
+                    model_override_args=json.loads(view.json_model_override_args),
+                    model_config_parser=view.model_config_parser,
+                    target_model_path=view.model_path,
+                    target_revision=view.revision,
+                )
+            else:
+                from sglang.srt.hf_transformers import get_config
+
+                config = get_config(
+                    draft_path,
+                    trust_remote_code=view.trust_remote_code,
+                    revision=view.speculative_draft_model_revision,
+                    model_override_args=json.loads(view.json_model_override_args),
+                    **kwargs,
+                )
             draft = model_boundary_reduction(config)
     return {
         "boundary_reduction": target,

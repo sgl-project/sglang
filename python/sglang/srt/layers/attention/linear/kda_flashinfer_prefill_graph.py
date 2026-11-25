@@ -5,15 +5,26 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.kda_input_pack import contiguous_kda_inputs
+from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+    flashinfer_kda_min_engine_seqs,
+)
 
 
 class FlashInferKDAPrefillGraph:
-    def __init__(self, *, wrapper_cls, num_tokens, max_seqs, track, device):
+    def __init__(self, *, wrapper_cls, num_tokens, max_seqs, num_heads, track, device):
         self.wrapper_cls = wrapper_cls
         # A workspace can be captured only once: each layer owns its plan.
         self.wrappers = {}
-        self.cu_seqlens = torch.empty(max_seqs + 1, dtype=torch.int64, device=device)
-        self.cache_indices = torch.empty(max_seqs, dtype=torch.int32, device=device)
+        self.route_seqs = max(
+            max_seqs,
+            min(num_tokens, flashinfer_kda_min_engine_seqs(num_heads, device)),
+        )
+        self.cu_seqlens = torch.empty(
+            self.route_seqs + 1, dtype=torch.int64, device=device
+        )
+        self.cache_indices = torch.empty(
+            self.route_seqs, dtype=torch.int32, device=device
+        )
         self.track = track
         if track:
             self.checkpoint_cu_starts = torch.empty_like(self.cu_seqlens)
@@ -22,10 +33,12 @@ class FlashInferKDAPrefillGraph:
             )
 
     def fill(self, meta, extend_seq_lens, track_rows):
-        self.cu_seqlens.copy_(meta.cu_seqlens)
-        # Empty padded sequences may read their initial state, but do not write
-        # it. FlashInfer does not accept Triton's negative state-slot sentinel.
-        self.cache_indices.copy_(meta.cache_indices.clamp_min(0))
+        self.cu_seqlens[: meta.max_seqs + 1].copy_(meta.cu_seqlens)
+        self.cu_seqlens[meta.max_seqs + 1 :].fill_(sum(extend_seq_lens))
+        # Empty rows may read and write slot 0, SGLang's reserved dummy write
+        # sink. FlashInfer does not accept Triton's negative state-slot sentinel.
+        self.cache_indices[: meta.max_seqs].copy_(meta.cache_indices.clamp_min(0))
+        self.cache_indices[meta.max_seqs :].zero_()
         if self.track:
             counts = np.asarray(extend_seq_lens, dtype=np.int64) // 64
             starts = np.empty(self.cu_seqlens.numel(), dtype=np.int64)
@@ -49,11 +62,9 @@ class FlashInferKDAPrefillGraph:
 
     def run(self, *, layer, q, k, v, g, beta, ssm_states, h_track):
         num_tokens = q.shape[1]
-        if num_tokens <= self.cache_indices.numel():
-            # FlashInfer selects prefill only when T > number of sequence slots.
-            # Small buckets have one slot per token, including empty sequences.
-            # An unused trailing token keeps the prefill dispatch; cu_seqlens
-            # excludes it, so it cannot read or update any request state.
+        if num_tokens <= self.route_seqs:
+            # Plain prefill requires T > route_seqs; the trailing token is
+            # outside every cu_seqlens row.
             q, k, v, g, beta = (
                 F.pad(x, (0, 0) * (x.ndim - 2) + (0, 1)) for x in (q, k, v, g, beta)
             )

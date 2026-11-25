@@ -40,7 +40,7 @@ def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     if attention_backend == "dsa":
         # trtllm-gen partials carry a base-2 LSE.
         return dsa_shards_index_k() and get_exec().kernel.dsa_decode_backend != "trtllm"
-    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
+    return attention_backend in {"flashmla", "cutedsl_mla", "aiter", "fa3"}
 
 
 def dsa_index_k_page_tokens(page_size: int) -> int:

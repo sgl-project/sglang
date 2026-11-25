@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.kernels.ops.attention.metadata import (
     draft_extend_set_metadata,
     normal_decode_set_metadata,
@@ -43,6 +44,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_cache_transfer_indices,
     is_cp_active,
 )
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
@@ -106,6 +108,16 @@ def _load_fa4_kernels(device_capability):
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
     return bool(get_parallel().enable_prefill_cp or get_parallel().attn_dp_enabled)
+
+
+def _mask_empty_dcp_decode_rows(
+    o: torch.Tensor, softmax_lse: torch.Tensor, cache_seqlens: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # A rank holding no KV for a request must be neutral in the DCP LSE merge.
+    empty = cache_seqlens == 0
+    o = torch.where(empty[:, None, None], torch.zeros_like(o), o)
+    lse = torch.where(empty[:, None], -torch.inf, softmax_lse.T.contiguous())
+    return o, lse
 
 
 @dataclass
@@ -670,6 +682,13 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         """Dispatch full-CG metadata: plain EXTEND (prefill) vs decode modes."""
         forward_mode = forward_batch.forward_mode
+        if self._use_mla_dcp():
+            if not forward_mode.is_decode_or_idle():
+                raise NotImplementedError(
+                    "FA3 MLA DCP requires eager prefill and does not support speculative decoding."
+                )
+            self._init_mla_dcp_metadata(forward_batch, in_graph=True)
+            return
         if forward_mode.is_extend() and not (
             forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
@@ -1037,8 +1056,153 @@ class FlashAttentionBackend(AttentionBackend):
             return self.speculative_step_id + 1
         return 0
 
+    def _use_mla_dcp(self) -> bool:
+        return self.use_mla and self.fa_impl_ver == 3 and get_parallel().dcp_enabled
+
+    def _fill_mla_dcp_decode_page_table(
+        self, page_table, req_pool_indices, local_seq_lens
+    ):
+        parallel = get_parallel()
+        pages_per_block = 128
+        blocks = max(1, (page_table.shape[1] + pages_per_block - 1) // pages_per_block)
+        runner_ids = self.runner_ids
+        v2p = (
+            runner_ids.space(IdSpaceKind.FULL).read_v2p
+            if runner_ids.is_translating
+            else None
+        )
+        create_mla_kv_page_table_for_dcp[(page_table.shape[0], blocks)](
+            self.req_to_token,
+            req_pool_indices,
+            local_seq_lens,
+            page_table,
+            v2p,
+            self.req_to_token.stride(0),
+            page_table.stride(0),
+            PHYSICAL_PAGE_SIZE=self.page_size,
+            DCP_SIZE=parallel.attn_dcp_size,
+            DCP_RANK=parallel.attn_dcp_rank,
+            PAGES_PER_BLOCK=pages_per_block,
+            HAS_V2P=v2p is not None,
+        )
+
+    def _mla_dcp_decode_graph_metadata(
+        self, bs: int, *, pages: int, max_local: int
+    ) -> FlashAttentionMetadata:
+        metadata = self.decode_cuda_graph_metadata.get(bs)
+        if metadata is None:
+            # Views of the max_bs decode buffers; DCP never runs the plain
+            # decode graph path that also uses them.
+            buffers = self.decode_cuda_graph_metadata
+            metadata = FlashAttentionMetadata(
+                cache_seqlens_int32=buffers["cache_seqlens"][:bs],
+                cu_seqlens_q=buffers["cu_seqlens_q"][: bs + 1],
+                cu_seqlens_k=buffers["cu_seqlens_k"][: bs + 1],
+                page_table=buffers["page_table"][:bs, :pages],
+                max_seq_len_q=1,
+                max_seq_len_k=max_local,
+            )
+            buffers[bs] = metadata
+        return metadata
+
+    def _init_mla_dcp_metadata(self, forward_batch: ForwardBatch, *, in_graph=False):
+        """FA3 reads local physical pages in decode and gathered token rows in prefill."""
+        if forward_batch.spec_info is not None:
+            raise NotImplementedError(
+                "FA3 MLA DCP does not support speculative decoding."
+            )
+        if forward_batch.encoder_lens is not None:
+            raise NotImplementedError("FA3 MLA DCP does not support cross attention.")
+        parallel = get_parallel()
+        bs = forward_batch.batch_size
+        lengths = forward_batch.seq_lens[:bs]
+        device = lengths.device
+        metadata = FlashAttentionMetadata()
+        if forward_batch.forward_mode.is_decode_or_idle():
+            max_local = max(
+                1,
+                (self.max_context_len + parallel.attn_dcp_size - 1)
+                // parallel.attn_dcp_size,
+            )
+            pages = (max_local + self.page_size - 1) // self.page_size
+            if in_graph:
+                metadata = self._mla_dcp_decode_graph_metadata(
+                    bs, pages=pages, max_local=max_local
+                )
+            else:
+                metadata = FlashAttentionMetadata(
+                    cache_seqlens_int32=torch.empty(
+                        bs, dtype=torch.int32, device=device
+                    ),
+                    cu_seqlens_q=torch.arange(bs + 1, dtype=torch.int32, device=device),
+                    cu_seqlens_k=torch.zeros(bs + 1, dtype=torch.int32, device=device),
+                    page_table=torch.zeros(
+                        (bs, pages), dtype=torch.int32, device=device
+                    ),
+                    max_seq_len_q=1,
+                    max_seq_len_k=max_local,
+                )
+            metadata.cache_seqlens_int32.copy_(
+                get_dcp_lens(
+                    lengths, parallel.attn_dcp_size, parallel.attn_dcp_rank
+                ).to(torch.int32)
+            )
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0)
+            )
+            if bs:
+                self._fill_mla_dcp_decode_page_table(
+                    metadata.page_table,
+                    forward_batch.req_pool_indices[:bs],
+                    metadata.cache_seqlens_int32,
+                )
+        elif forward_batch.forward_mode.is_extend():
+            dcp = forward_batch.attn_dcp_metadata
+            if dcp is None:
+                raise RuntimeError(
+                    "FA3 MLA DCP prefill requires the model's DCP metadata hook."
+                )
+            metadata.cache_seqlens_int32 = lengths.to(torch.int32)
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(lengths, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.cu_seqlens_q = torch.nn.functional.pad(
+                torch.cumsum(
+                    forward_batch.extend_seq_lens[:bs], dim=0, dtype=torch.int32
+                ),
+                (1, 0),
+            )
+            metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu, default=0)
+            host_lengths = forward_batch.seq_lens_cpu
+            metadata.max_seq_len_k = (
+                int(host_lengths[:bs].max().item())
+                if bs and host_lengths is not None
+                else (self.max_context_len if bs else 0)
+            )
+            width = metadata.max_seq_len_k
+            positions = torch.arange(width, dtype=torch.int32, device=device)[None, :]
+            lens = dcp.dcp_kv_indptr[1 : bs + 1] - dcp.dcp_kv_indptr[:bs]
+            offsets = dcp.dcp_kv_indptr[:bs, None] + positions
+            metadata.page_table = torch.zeros(
+                (bs, width), dtype=torch.int32, device=device
+            )
+            if dcp.dcp_kv_indices.numel():
+                safe = offsets.clamp(max=dcp.dcp_kv_indices.numel() - 1).long()
+                metadata.page_table.copy_(
+                    torch.where(positions < lens[:, None], dcp.dcp_kv_indices[safe], 0)
+                )
+        else:
+            raise NotImplementedError(
+                f"FA3 MLA DCP does not support {forward_batch.forward_mode}."
+            )
+        self.forward_metadata = metadata
+        self.forward_metadata_spec_decode_expand = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        if self._use_mla_dcp():
+            self._init_mla_dcp_metadata(forward_batch)
+            return
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -2227,11 +2391,17 @@ class FlashAttentionBackend(AttentionBackend):
                 # call takes the same qv/ver arguments as this extend path.
                 assert self.fa_impl_ver in (3, 4), "Only FA3/FA4 support here"
                 # Do absorbed multi-latent attention
-                kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
+                dcp = forward_batch.attn_dcp_metadata if self._use_mla_dcp() else None
+                kv_cache = (
+                    dcp.dcp_kv_buffer
+                    if dcp is not None
+                    else self.kv_layers.read(layer.layer_id).key()
+                ).to(q.dtype)
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
-                k_rope_cache = paged_view(k_rope, self.page_size)
-                c_kv_cache = paged_view(c_kv, self.page_size)
+                kv_page_size = 1 if dcp is not None else self.page_size
+                k_rope_cache = paged_view(k_rope, kv_page_size)
+                c_kv_cache = paged_view(c_kv, kv_page_size)
                 if q_rope is not None:
                     q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
                     q_rope = q_rope.view(
@@ -2375,7 +2545,12 @@ class FlashAttentionBackend(AttentionBackend):
         ver = self._ver_for(layer)
         if score_mod is not None and ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
-        if return_lse and self.use_mla:
+        # The generic MLA DCP caller expects (output, LSE) without an explicit
+        # return_lse keyword. FA3 uses this tuple for the ag_rs correction.
+        return_lse = return_lse or (
+            self._use_mla_dcp() and forward_batch.forward_mode.is_decode_or_idle()
+        )
+        if return_lse and self.use_mla and not self._use_mla_dcp():
             raise NotImplementedError("MLA decode does not return an LSE.")
         num_splits = self.num_splits if layer.num_splits is None else layer.num_splits
         decode_num_splits = (
@@ -2702,10 +2877,15 @@ class FlashAttentionBackend(AttentionBackend):
                 softcap=layer.logit_cap,
                 k_descale=fa_k_descale,
                 v_descale=fa_v_descale,
-                return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
+                return_softmax_lse=use_cascade_attn or return_lse,
                 num_splits=num_splits,
                 ver=ver,
             )
+            if return_lse and not use_cascade_attn:
+                o, softmax_lse, *_ = result
+                result, decode_lse = _mask_empty_dcp_decode_rows(
+                    o, softmax_lse, metadata.cache_seqlens_int32
+                )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = (

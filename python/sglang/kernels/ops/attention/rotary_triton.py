@@ -171,6 +171,7 @@ def _triton_ernie45_rope_qk_fused(
     pad_hd: tl.constexpr,
     section_hw: tl.constexpr,
     is_neox_style: tl.constexpr,
+    match_cuda_rope: tl.constexpr,
 ):
     pid = tl.program_id(0)
     q_ptr = q_ptr + pid * q_stride0
@@ -204,10 +205,18 @@ def _triton_ernie45_rope_qk_fused(
         k1 = tl.load(k_ptr + ko1, mask=km, other=0.0).to(cos.dtype)
         cb = cos[None, :]
         sb = sin[None, :]
-        tl.store(q_ptr + qo0, q0 * cb - q1 * sb, mask=qm)
-        tl.store(q_ptr + qo1, q1 * cb + q0 * sb, mask=qm)
-        tl.store(k_ptr + ko0, k0 * cb - k1 * sb, mask=km)
-        tl.store(k_ptr + ko1, k1 * cb + k0 * sb, mask=km)
+        if match_cuda_rope:
+            # Contract like the CUDA rope kernel: fma(x, cos, -(y*sin)) and
+            # fma(y, cos, x*sin); other orders can cross a BF16 rounding boundary.
+            tl.store(q_ptr + qo0, tl.fma(q0, cb, -(q1 * sb)), mask=qm)
+            tl.store(q_ptr + qo1, tl.fma(q1, cb, q0 * sb), mask=qm)
+            tl.store(k_ptr + ko0, tl.fma(k0, cb, -(k1 * sb)), mask=km)
+            tl.store(k_ptr + ko1, tl.fma(k1, cb, k0 * sb), mask=km)
+        else:
+            tl.store(q_ptr + qo0, q0 * cb - q1 * sb, mask=qm)
+            tl.store(q_ptr + qo1, q1 * cb + q0 * sb, mask=qm)
+            tl.store(k_ptr + ko0, k0 * cb - k1 * sb, mask=km)
+            tl.store(k_ptr + ko1, k1 * cb + k0 * sb, mask=km)
     else:
         qh = tl.arange(0, pad_n_qh)[:, None]
         kh = tl.arange(0, pad_n_kh)[:, None]
@@ -222,10 +231,16 @@ def _triton_ernie45_rope_qk_fused(
         ko = tl.load(k_ptr + kh * hd + odd, mask=km, other=0.0).to(cos.dtype)
         cb = cos[None, :]
         sb = sin[None, :]
-        tl.store(q_ptr + qh * hd + even, qe * cb - qo * sb, mask=qm)
-        tl.store(q_ptr + qh * hd + odd, qo * cb + qe * sb, mask=qm)
-        tl.store(k_ptr + kh * hd + even, ke * cb - ko * sb, mask=km)
-        tl.store(k_ptr + kh * hd + odd, ko * cb + ke * sb, mask=km)
+        if match_cuda_rope:
+            tl.store(q_ptr + qh * hd + even, tl.fma(qe, cb, -(qo * sb)), mask=qm)
+            tl.store(q_ptr + qh * hd + odd, tl.fma(qo, cb, qe * sb), mask=qm)
+            tl.store(k_ptr + kh * hd + even, tl.fma(ke, cb, -(ko * sb)), mask=km)
+            tl.store(k_ptr + kh * hd + odd, tl.fma(ko, cb, ke * sb), mask=km)
+        else:
+            tl.store(q_ptr + qh * hd + even, qe * cb - qo * sb, mask=qm)
+            tl.store(q_ptr + qh * hd + odd, qo * cb + qe * sb, mask=qm)
+            tl.store(k_ptr + kh * hd + even, ke * cb - ko * sb, mask=km)
+            tl.store(k_ptr + kh * hd + odd, ko * cb + ke * sb, mask=km)
 
 
 def triton_ernie45_rope_fused_inplace(
@@ -237,6 +252,7 @@ def triton_ernie45_rope_fused_inplace(
     head_size: int,
     rotary_dim: int,
     is_neox_style: bool,
+    match_cuda_rope: bool = False,
 ) -> None:
     num_tokens = q.shape[0]
     n_qh = q.shape[1] // head_size
@@ -268,5 +284,6 @@ def triton_ernie45_rope_fused_inplace(
         pad_hd=pad_hd,
         section_hw=section_h + section_w,
         is_neox_style=is_neox_style,
+        match_cuda_rope=match_cuda_rope,
         num_warps=num_warps,
     )
