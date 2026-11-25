@@ -150,7 +150,8 @@ def _retired_peak(
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(interval),
         envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
         patch(
-            "sglang.srt.managers.schedule_batch.get_schedule",
+            # maybe_evict_swa reads the chunk through prefill_window_frontier.
+            "sglang.srt.mem_cache.allocation.get_schedule",
             return_value=SimpleNamespace(chunked_prefill_size=chunk),
         ),
     ):
