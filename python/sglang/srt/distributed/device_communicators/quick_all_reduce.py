@@ -233,7 +233,7 @@ class QuickAllReduce:
             AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB=qr_max_size // MB,
             AITER_FLY_AR=1,
         ):
-            # No ImportError fallback: an opted-in AITER without it must fail loudly.
+            # No ImportError fallback: GroupCoordinator logs the error and runs without QuickReduce.
             from aiter.dist.device_communicators.quick_all_reduce import (
                 QuickAllReduce as AiterQuickAllReduce,
             )
