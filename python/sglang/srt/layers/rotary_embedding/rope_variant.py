@@ -1,5 +1,5 @@
 """RoPE scaling variants: Phi3LongRoPE, FourierRoPE, DeepseekScaling, Llama3,
-Llama4Vision, DynamicNTK, DynamicNTKAlpha."""
+DynamicNTK, DynamicNTKAlpha."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding, _use_aiter
 from sglang.srt.layers.rotary_embedding.utils import (
     apply_rotary_pos_emb_native,
     rotary_embedding_cpu,
@@ -23,12 +23,23 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_device,
+    is_cuda,
+    is_gfx1250_supported,
+    is_hip,
+    is_npu,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_use_aiter_rope_gfx1250 = _use_aiter and is_gfx1250_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
+
+if _use_aiter_rope_gfx1250:
+    import aiter
 
 if _is_npu:
     import torch_npu
@@ -374,8 +385,58 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
-        if _is_hip:
+        self._aiter_cos_sin = None
+        if _use_aiter_rope_gfx1250 and not self._force_native:
+            self._forward_method = self._forward_aiter_cached
+        elif _is_hip:
             self._forward_method = self.forward_native
+
+    def _build_aiter_cos_sin(self, dtype: torch.dtype) -> None:
+        # The kernel indexes cos/sin as contiguous [max_pos, rotary_dim / 2]
+        # without strides, so chunked views of cos_sin_cache cannot be passed.
+        cache = self.cos_sin_cache
+        cos, sin = cache.chunk(2, dim=-1)
+        shape = (cache.shape[0], 1, 1, cos.shape[-1])
+        self._aiter_cos_sin = (
+            cache,
+            cos.to(dtype).reshape(shape).contiguous(),
+            sin.to(dtype).reshape(shape).contiguous(),
+        )
+
+    def _forward_aiter_cached(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if offsets is not None:
+            # The cached-positions kernel takes no offsets.
+            return self.forward_native(positions, query, key, offsets)
+
+        cached = self._aiter_cos_sin
+        if (
+            cached is None
+            or cached[0] is not self.cos_sin_cache
+            or cached[1].dtype != query.dtype
+        ):
+            self._build_aiter_cos_sin(query.dtype)
+        _, cos, sin = self._aiter_cos_sin
+        num_tokens = positions.numel()
+        query_shape, key_shape = query.shape, key.shape
+        query = query.view(1, num_tokens, -1, self.head_size)
+        key = key.view(1, num_tokens, -1, self.head_size)
+        aiter.rope_cached_positions_2c_fwd_inplace(
+            query[..., : self.rotary_dim],
+            key[..., : self.rotary_dim],
+            cos,
+            sin,
+            positions.view(1, num_tokens),
+            0 if self.is_neox_style else 1,
+            reuse_freqs_front_part=True,
+            nope_first=False,
+        )
+        return query.view(query_shape), key.view(key_shape)
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
@@ -597,65 +658,6 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
             ),
         )
         return new_freqs
-
-
-class Llama4VisionRotaryEmbedding(RotaryEmbedding):
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: int,
-        is_neox_style: bool,
-        dtype: torch.dtype,
-    ):
-        super().__init__(
-            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
-        )
-
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
-        inv_freqs = super()._compute_inv_freq(base)
-        inv_freqs = inv_freqs[: (self.rotary_dim // 2)]
-        return inv_freqs
-
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
-        inv_freq = self._compute_inv_freq(self.base)
-        num_patches = self.max_position_embeddings
-        img_idx = torch.arange(num_patches, dtype=torch.int32).reshape(num_patches, 1)
-        img_idx = torch.cat([img_idx, img_idx[:1]], dim=0)
-        img_idx[-1, -1] = -2  # set to ID_CLS_TOKEN
-        num_patches_single_dim = int(math.sqrt(num_patches))
-        frequencies_x = img_idx % num_patches_single_dim
-        frequencies_y = img_idx // num_patches_single_dim
-        freqs_x = (
-            (frequencies_x + 1)[..., None] * inv_freq[None, None, :]
-        ).repeat_interleave(2, dim=-1)
-        freqs_y = (
-            (frequencies_y + 1)[..., None] * inv_freq[None, None, :]
-        ).repeat_interleave(2, dim=-1)
-        freqs = torch.cat([freqs_x, freqs_y], dim=-1).float().contiguous()[..., ::2]
-        freqs = freqs.masked_fill(img_idx.reshape(-1, 1, 1) < 0, 0)
-        cache = torch.view_as_complex(
-            torch.stack([torch.cos(freqs), torch.sin(freqs)], dim=-1)
-        )
-        return cache
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(query.device)
-        query_ = torch.view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
-        key_ = torch.view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
-        broadcast_shape = [
-            d if i == 1 or i == (query_.ndim - 1) else 1
-            for i, d in enumerate(query_.shape)
-        ]
-        freqs_ci = self.cos_sin_cache.view(*broadcast_shape)
-        query_out = torch.view_as_real(query_ * freqs_ci).flatten(3)
-        key_out = torch.view_as_real(key_ * freqs_ci).flatten(3)
-        return query_out.type_as(query), key_out.type_as(key)
 
 
 class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
