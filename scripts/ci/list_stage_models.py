@@ -19,9 +19,8 @@ How `file -> models` is resolved (best effort, recall-favoring)
     modules. A file it finds no model in is reported per suite as
     `unresolved_files`, and any file it cannot parse is reported in
     `parse_failures`, so recall gaps are visible rather than silent. A test
-    file's `declare_models(...)` call adds models for dynamic cases and drops
-    ones it names but does not load; the `--overrides` JSON file adds models
-    per suite and trims false positives.
+    file's `declare_models(skip_models=...)` call drops models it names but
+    does not load; the `--overrides` JSON file adds models per suite.
 
 How `runner label -> models` is aggregated
     Registration/prewarm decisions are made per GH runner *label* (a runner's
@@ -45,7 +44,7 @@ import subprocess
 import sys
 from typing import Dict, List, Optional, Set, Tuple
 
-from hf_repo_scan import RepoIdScanner, load_ci_register, load_overrides
+from hf_repo_scan import RepoIdScanner, load_ci_register
 
 
 def collect_suite_files(
@@ -113,6 +112,28 @@ def collect_suite_files(
     return suite_files, suite_nightly, errors, suite_runner_config
 
 
+def load_overrides(path: Optional[str]) -> Dict[str, object]:
+    """Read the overrides JSON: ``by_suite`` and ``suite_labels`` (both
+    optional).
+
+    ``suite_labels`` maps a legacy ``suite=`` registration (which carries no
+    runner_config) to the GH runner label(s) its dispatching workflow
+    hardcodes in ``runs-on`` -- a LIST, since one suite can run on several
+    labels. A present-but-null key is treated as its default.
+    """
+    overrides: Dict[str, object] = {"by_suite": {}, "suite_labels": {}}
+    if not path:
+        return overrides
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"overrides file not found: {path}")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    for key in overrides:
+        if data.get(key) is not None:
+            overrides[key] = data[key]
+    return overrides
+
+
 # One runner_config entry in runner_configs.yml: a two-space-indented key with
 # a flow-style (inline `{...}`) mapping. This is the file's documented shape;
 # entries are matched line-by-line so the tool stays stdlib-only (the workflow
@@ -175,7 +196,7 @@ def build_inventory(
 ) -> Dict[str, object]:
     suite_labels_override: Dict[str, List[str]] = overrides.get("suite_labels", {})  # type: ignore[assignment]
 
-    scanner = RepoIdScanner(repo_root, overrides)
+    scanner = RepoIdScanner(repo_root)
     suite_files, suite_nightly, registry_errors, suite_runner_config = (
         collect_suite_files(repo_root, backend_name, include_disabled)
     )
@@ -201,7 +222,7 @@ def build_inventory(
     suites: Dict[str, object] = {}
     all_models: Set[str] = set()
     for suite in sorted(suite_files):
-        models: Set[str] = set(scanner.by_suite.get(suite, []))
+        models: Set[str] = set(overrides["by_suite"].get(suite, []))
         unresolved: List[str] = []
         for rel in suite_files[suite]:
             resolved = file_models.get(rel, set())
@@ -284,9 +305,7 @@ def render_markdown(inventory: Dict[str, object]) -> str:
         f"runner labels: **{inventory.get('runner_label_count', 0)}**",
     ]
     if failures:
-        lines.append(
-            f"- ⚠️ Unparsable files: **{len(failures)}** (see `parse_failures`)"
-        )
+        lines.append(f"- ⚠️ Scan errors: **{len(failures)}** (see `parse_failures`)")
     if unmapped:
         lines.append(
             f"- ⚠️ Suites with no runner label: **{len(unmapped)}** "

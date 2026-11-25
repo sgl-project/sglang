@@ -201,17 +201,10 @@ def register_mlu_ci(
     return None
 
 
-def declare_models(
-    *, models: Sequence[str] = (), skip_models: Sequence[str] = ()
-) -> None:
-    """Correct the Hugging Face repos CI prefetches for this test file (parsed
-    via AST by scripts/ci/hf_repo_scan.py; runtime no-op).
-
-    ``models`` are repos the file loads that the scan cannot see, such as an
-    id built at runtime; ``skip_models`` are repos the file names but does not
-    load on CUDA. Each item is a repo id literal or a module-level name bound
-    to one, such as an imported ``DEFAULT_*`` model constant.
-    """
+def declare_models(*, skip_models: Sequence[str] = ()) -> None:
+    """Repo ids this test file names but does not load on CUDA, so CI does not
+    prefetch them. Read statically by scripts/ci/hf_repo_scan.py from a
+    top-level call (literals or module-level names); no-op at runtime."""
     return None
 
 

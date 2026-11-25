@@ -86,8 +86,8 @@ jobs:
           # commit first and the checkout keeps no credentials (persist-credentials: false).
           allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
-      # HF_TOKEN reaches only the prefetch action, run from this checkout of the
-      # workflow's own commit before any step runs PR code: the tests hold no token.
+      # Under pull_request_target, HF_TOKEN reaches only the prefetch action, run
+      # from this checkout of the workflow's own commit before any step runs PR code.
       - name: Check out the prefetch scripts
         id: prefetch_scripts
         if: inputs.partition_plan != ''

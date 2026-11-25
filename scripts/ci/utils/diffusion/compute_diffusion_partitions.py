@@ -25,7 +25,7 @@ from diffusion_case_parser import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from hf_repo_scan import OVERRIDES_PATH, RepoIdScanner, load_overrides  # noqa: E402
+from hf_repo_scan import RepoIdScanner  # noqa: E402
 
 
 def _load_partitioning_helpers():
@@ -135,9 +135,7 @@ def item_repo_ids(
 ) -> dict[str, set[str]]:
     """`item_id -> Hugging Face repo ids` for the cases ``case_config_path``
     builds and for ``standalone_files``."""
-    scanner = RepoIdScanner(
-        str(repo_root), load_overrides(str(repo_root / OVERRIDES_PATH))
-    )
+    scanner = RepoIdScanner(str(repo_root))
     tree = ast.parse(case_config_path.read_text(encoding="utf-8"))
     visitor = DiffusionTestCaseVisitor()
     visitor.visit(tree)

@@ -2,21 +2,15 @@
 """Find the Hugging Face repo ids CI test files name, by static analysis.
 
 Test sources are read as data, never imported, so the scan runs on a plain
-runner with no sglang install. A file's ids are its string literals shaped
-like a repo id, plus the ids behind the names it uses: names it defines, and
-names it imports from test-support modules of the checkout, followed through
-their own imports. A name resolves through its import, never by a bare-name
-match across modules: one module's `MODEL` is not another's.
-A test file corrects its own ids with a top-level `declare_models(models=...,
-skip_models=...)` call (ci_register.py): `models` adds ids the scan cannot
-see, `skip_models` drops ids the file names but never loads on CUDA.
-stage_models_overrides.json corrects the rest: `by_suite` adds ids per suite,
-`deny` lists strings that are not repo ids, and `datasets` lists Hub dataset
-ids, which tests read but which are not models.
+runner with no sglang install. Names resolve through imports into test-support
+code only, never by a bare-name match across modules, and a top-level
+`declare_models(skip_models=[...])` call drops ids a file names but does not
+load. Id-shaped strings that are not models are kept; the prefetch skips
+whatever the Hub does not have as a public model.
 
 As a script, it prints for $GITHUB_OUTPUT the repos each partition of each
-CUDA suite in check-changes' `partitions` needs, with the files
-test/run_suite.py selects for that partition:
+CUDA suite in check-changes' `partitions` needs, for the files
+`ci_register.auto_partition` assigns to that partition:
 
     python3 scripts/ci/hf_repo_scan.py --partitions "$PARTITIONS" \\
         --partition-model-file /tmp/partition-model.json
@@ -33,7 +27,6 @@ import sys
 from typing import Dict, List, Optional, Set
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-OVERRIDES_PATH = os.path.join("scripts", "ci", "stage_models_overrides.json")
 
 # A HuggingFace repo id is `namespace/name`: exactly one slash, each side
 # starting alphanumeric and made of alnum plus `.`, `_`, `-`. Note `.` is kept
@@ -90,14 +83,12 @@ _FILE_EXTENSIONS = (
 )
 
 
-def looks_like_model_id(value: str, deny: Optional[Set[str]] = None) -> bool:
+def looks_like_model_id(value: str) -> bool:
     """Heuristic: does ``value`` look like a HuggingFace repo id?
 
     Recall-favoring (a few false positives are cheap for cache-warming) but
     drops the obvious non-models: MIME types, file paths, numeric ratios.
     """
-    if deny and value in deny:
-        return False
     if not MODEL_ID_RE.match(value):
         return False
     if not any(c.isalpha() for c in value):  # e.g. "2/3"
@@ -112,29 +103,6 @@ def looks_like_model_id(value: str, deny: Optional[Set[str]] = None) -> bool:
     return True
 
 
-def load_overrides(path: Optional[str]) -> Dict[str, object]:
-    """Read the overrides JSON (every key optional). ``suite_labels`` is read
-    by list_stage_models.py only. A present-but-null key is treated as its
-    default, so a hand-edit like ``"deny": null`` does not blow up downstream
-    iteration."""
-    overrides: Dict[str, object] = {
-        "by_suite": {},
-        "deny": [],
-        "datasets": [],
-        "suite_labels": {},
-    }
-    if not path:
-        return overrides
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"overrides file not found: {path}")
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    for key in overrides:
-        if data.get(key) is not None:
-            overrides[key] = data[key]
-    return overrides
-
-
 def load_ci_register(repo_root: str):
     """Import ci_register.py by path, sidestepping the heavy `sglang` package."""
     spec = importlib.util.spec_from_file_location(
@@ -147,13 +115,12 @@ def load_ci_register(repo_root: str):
 
 
 class RepoIdScanner:
-    def __init__(self, repo_root: str, overrides: Dict[str, object]):
+    def __init__(self, repo_root: str):
         self.repo_root = repo_root
-        self.by_suite: Dict[str, List[str]] = overrides["by_suite"]
-        self.not_models = set(overrides["deny"]) | set(overrides["datasets"])
         # `{path: {name: repo ids}}` per scanned module.
         self.modules: Dict[str, Dict[str, Set[str]]] = {}
-        # `{repo-relative path: error}` per file the scan could not read.
+        # `{repo-relative path: error}` per file the scan could not read, or
+        # whose `declare_models` is wrong.
         self.errors: Dict[str, str] = {}
         self._test_dirs = tuple(
             os.path.join(repo_root, *parts, "")
@@ -165,7 +132,8 @@ class RepoIdScanner:
         )
 
     def file_repo_ids(self, rel: str) -> Set[str]:
-        """Repo ids the test file ``rel`` (repo-relative) needs."""
+        """Repo ids the test file ``rel`` (repo-relative) needs: the ids it
+        names, minus its top-level `declare_models(skip_models=[...])`."""
         path = os.path.join(self.repo_root, rel)
         tree = self._parse(path)
         if tree is None:
@@ -174,48 +142,32 @@ class RepoIdScanner:
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 table.update(self._imported_repo_ids(path, node))
-        declared = self._declared_repo_ids(rel, tree, table)
-        ids = self.node_repo_ids(tree, table) | declared["models"]
-        ids -= declared["skip_models"]
-        # An id-shaped path of the checkout is a local directory, not a repo.
-        return {i for i in ids if not os.path.exists(os.path.join(self.repo_root, i))}
-
-    def _declared_repo_ids(
-        self, rel: str, tree: ast.Module, table: Dict[str, Set[str]]
-    ) -> Dict[str, Set[str]]:
-        """`{"models": ids, "skip_models": ids}` from the top-level
-        `declare_models(...)` calls of the test file ``rel``. An item that
-        resolves to no repo id is an error, so a typo fails the scan instead
-        of silently declaring nothing."""
-        declared: Dict[str, Set[str]] = {"models": set(), "skip_models": set()}
+        skips, ids = [], set()
         for stmt in tree.body:
             call = stmt.value if isinstance(stmt, ast.Expr) else None
-            if not (
+            if (
                 isinstance(call, ast.Call)
                 and isinstance(call.func, ast.Name)
                 and call.func.id == "declare_models"
             ):
-                continue
-            if call.args:
-                raise ValueError(f"{rel}: declare_models() takes keywords only")
-            for kw in call.keywords:
-                key, value = kw.arg, kw.value
-                if key not in declared:
-                    raise ValueError(
-                        f"{rel}: unknown argument {key!r} in declare_models()"
+                skips += [kw.value for kw in call.keywords if kw.arg == "skip_models"]
+            else:
+                ids |= self.node_repo_ids(stmt, table)
+        named = set(ids)
+        for value in skips:
+            items = value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
+            for item in items:
+                skipped = self.node_repo_ids(item, table)
+                if skipped and skipped <= named:
+                    ids -= skipped
+                else:
+                    self._record_error(
+                        rel,
+                        f"skip_models item {ast.unparse(item)} names no repo id "
+                        "the rest of the file uses",
                     )
-                items = (
-                    value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
-                )
-                for item in items:
-                    ids = self.node_repo_ids(item, table)
-                    if not ids:
-                        raise ValueError(
-                            f"{rel}: declare_models({key}=...) item "
-                            f"{ast.unparse(item)} names no repo id"
-                        )
-                    declared[key] |= ids
-        return declared
+        # An id-shaped path of the checkout is a local directory, not a repo.
+        return {i for i in ids if not os.path.exists(os.path.join(self.repo_root, i))}
 
     def module_repo_ids(
         self, path: str, tree: Optional[ast.Module] = None
@@ -267,9 +219,7 @@ class RepoIdScanner:
         ids: Set[str] = set()
         for child in ast.walk(node):
             if isinstance(child, ast.Constant) and isinstance(child.value, str):
-                if id(child) not in fragments and looks_like_model_id(
-                    child.value, self.not_models
-                ):
+                if id(child) not in fragments and looks_like_model_id(child.value):
                     ids.add(child.value)
             elif isinstance(child, ast.Name):
                 ids |= table.get(child.id, set())
@@ -320,28 +270,26 @@ class RepoIdScanner:
             with open(path, encoding="utf-8") as f:
                 return ast.parse(f.read())
         except (OSError, SyntaxError) as exc:
-            rel = os.path.relpath(path, self.repo_root)
-            self.errors[rel] = f"{type(exc).__name__}: {exc}"
-            print(
-                f"WARNING: cannot scan {rel}; its repo ids are missing: "
-                f"{self.errors[rel]}",
-                file=sys.stderr,
+            self._record_error(
+                os.path.relpath(path, self.repo_root), f"{type(exc).__name__}: {exc}"
             )
             return None
+
+    def _record_error(self, rel: str, message: str) -> None:
+        self.errors[rel] = message
+        print(f"WARNING: {rel}: {message}", file=sys.stderr)
 
 
 def partition_repo_ids(
     repo_root: str, partitions: Dict[str, Dict], partition_model_file: Optional[str]
 ) -> Dict[str, List[List[str]]]:
     """`suite -> [repo ids of partition i]` for each CUDA suite of
-    ``partitions`` (compute_partitions.py's output)."""
+    ``partitions`` (scripts/ci/utils/compute_partitions.py's output)."""
     ci_register = load_ci_register(repo_root)
     tests = ci_register.collect_tests(
         ci_register.registered_test_files(repo_root), sanity_check=False
     )
-    scanner = RepoIdScanner(
-        repo_root, load_overrides(os.path.join(repo_root, OVERRIDES_PATH))
-    )
+    scanner = RepoIdScanner(repo_root)
     result: Dict[str, List[List[str]]] = {}
     for suite, info in sorted(partitions.items()):
         suite_tests, _ = ci_register.filter_tests(
@@ -350,10 +298,9 @@ def partition_repo_ids(
         if not suite_tests:
             continue
         live_est = ci_register.load_live_est(partition_model_file, [suite], repo_root)
-        suite_ids = set(scanner.by_suite.get(suite, []))
         result[suite] = []
         for partition_id in range(info["size"]):
-            ids = set(suite_ids)
+            ids = set()
             for test in ci_register.auto_partition(
                 suite_tests, partition_id, info["size"], live_est=live_est
             ):
@@ -364,9 +311,10 @@ def partition_repo_ids(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo-root", default=REPO_ROOT)
     parser.add_argument(
-        "--partitions", required=True, help="compute_partitions.py's JSON output."
+        "--partitions",
+        required=True,
+        help="scripts/ci/utils/compute_partitions.py's JSON output.",
     )
     parser.add_argument("--partition-model-file", default=None)
     args = parser.parse_args()
@@ -374,7 +322,7 @@ def main() -> int:
     # list, and a test needing a gated repo fails the way it would without one.
     try:
         result = partition_repo_ids(
-            os.path.abspath(args.repo_root),
+            REPO_ROOT,
             json.loads(args.partitions),
             args.partition_model_file,
         )

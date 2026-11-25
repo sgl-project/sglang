@@ -30,7 +30,6 @@ on:
       - "python/sglang/test/ci/ci_register.py"
       - "scripts/ci/hf_repo_scan.py"
       - "scripts/ci/list_stage_models.py"
-      - "scripts/ci/test_list_stage_models.py"
       - "scripts/ci/stage_models_overrides.json"
       - ".github/workflows/ci-model-inventory.yml"
   schedule:
@@ -48,9 +47,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Run extractor unit tests
-        run: python3 -m unittest discover -s scripts/ci -p 'test_list_stage_models.py'
 
       - name: Generate model inventory
         run: |

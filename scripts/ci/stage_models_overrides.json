@@ -1,27 +1,7 @@
 {
-  "_comment": "Manual overrides for hf_repo_scan.py, which list_stage_models.py and check-changes' prefetch lists both use. by_suite ADDS models the static scan cannot see to a whole suite. A test file corrects its own models with declare_models(models=..., skip_models=...) next to its register_cuda_ci call, not here. deny lists strings the heuristic mistakes for repo ids; datasets lists Hub dataset ids tests read, which are not models. suite_labels maps legacy suite= registrations (no runner_config) to the GH runner label(s) their dispatching workflow hardcodes in runs-on -- a list, because one suite can run on several labels. $b200_runner is the dynamic-b200 placeholder from runner_configs.yml. Suites registered with stage=/runner_config= need no entry: their label resolves through runner_configs.yml. Anything unmappable stays visible in unmapped_suites.",
+  "_comment": "Manual overrides read by list_stage_models.py. by_suite ADDS models the static scan cannot see to a whole suite. A test file drops models it names but does not load with declare_models(skip_models=...) next to its register_cuda_ci call, not here. suite_labels maps legacy suite= registrations (no runner_config) to the GH runner label(s) their dispatching workflow hardcodes in runs-on -- a list, because one suite can run on several labels. $b200_runner is the dynamic-b200 placeholder from runner_configs.yml. Suites registered with stage=/runner_config= need no entry: their label resolves through runner_configs.yml. Anything unmappable stays visible in unmapped_suites.",
   "by_suite": {},
   "suite_labels": {
     "stress": ["8-gpu-h200"]
-  },
-  "deny": [
-    "tok/req",
-    "qwen/qwen3",
-    "qwen/qwen3-vl",
-    "collect_full_device_indices/from",
-    "collect_full_device_indices/until",
-    "mark_external_cache_stored_path/from",
-    "mark_external_cache_stored_path/until",
-    "remote/model",
-    "triton/disabled",
-    "Qwen3-8B/Llama-3.1-8B",
-    "LLM-Research/Llama-3.2-1B-Instruct",
-    "sgl-project/ci-data-diffusion"
-  ],
-  "datasets": [
-    "MMMU/MMMU",
-    "THUDM/LongBench-v2",
-    "xai-org/RealworldQA",
-    "anon8231489123/ShareGPT_Vicuna_unfiltered"
-  ]
+  }
 }

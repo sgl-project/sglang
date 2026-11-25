@@ -2,7 +2,7 @@ name: Prefetch Hugging Face models
 description: >-
   Download the given Hugging Face repos into the runner's cache. Use it only
   from the trusted checkout (.ci-prefetch) of the workflow's own commit, never
-  from the PR checkout: it is the one step holding the token.
+  from the PR checkout: it is where the token is used.
 
 inputs:
   hf-token:

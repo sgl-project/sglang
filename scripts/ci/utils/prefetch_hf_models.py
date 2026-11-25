@@ -3,8 +3,8 @@
 PR test jobs run PR code on persistent runners, so the tests hold no HF token.
 This script runs first in the job, from a checkout of the workflow's own
 commit, with the token in its own step only. The repo ids come from the PR's
-check-changes job (scripts/ci/hf_repo_scan.py), so each must be a well-formed
-id of a public repo on the Hub.
+check-changes job (scripts/ci/hf_repo_scan.py), so each is checked to be a
+well-formed id of a public model on the Hub and skipped otherwise.
 
     REPO_IDS="org/model-a org/model-b" python3 -S prefetch_hf_models.py
 
@@ -30,8 +30,9 @@ REPO_ID_RE = re.compile(
     r"^(?!.*(--|\.\.))[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$"
 )
 
-# Weights in formats no test loads: Meta's original checkpoints, GGUF, and
-# the ONNX / TF / Flax exports some repos carry next to the PyTorch ones.
+# Formats no test loads: Meta's original/ checkpoints, GGUF, and ONNX / OpenVINO
+# / TF / Flax / TFLite exports. A repo's `patterns` in prefetch_policy.json
+# replace this filter.
 _SKIPPED_DIRS = ("original/", "onnx/", "openvino/")
 _SKIPPED_SUFFIXES = (".pth", ".gguf", ".onnx", ".h5", ".msgpack", ".tflite")
 
@@ -63,22 +64,20 @@ def files_to_download(
 def fetch_repo(api, repo_id: str, revision: str, patterns: Optional[List[str]]) -> None:
     from filelock import FileLock
     from huggingface_hub import constants, snapshot_download
+    from huggingface_hub.errors import RepositoryNotFoundError
 
     try:
         info = api.model_info(repo_id, revision=revision)
-    except Exception as exc:
-        warn(f"skip {repo_id}@{revision}: no such model ({type(exc).__name__})")
+    except RepositoryNotFoundError:
+        # The scan also yields id-shaped strings that are not models.
+        print(f"skip {repo_id}: not a public model on the Hub", flush=True)
         return
     # ModelInfo.private is None when the Hub does not say: only an explicit
     # False is public.
     if info.private is not False:
         warn(f"skip {repo_id}: not confirmed public")
         return
-    try:
-        files = files_to_download([s.rfilename for s in info.siblings], patterns)
-    except (TypeError, AttributeError) as exc:
-        warn(f"skip {repo_id}@{revision}: unexpected Hub response ({exc})")
-        return
+    files = files_to_download([s.rfilename for s in info.siblings], patterns)
     print(f"{repo_id}@{revision}: {len(files)} file(s)", flush=True)
     # The lock sglang's CI loader holds while it downloads a repo into this
     # cache (_get_lock_file_path in ci_weight_validation.py): its cleanup
@@ -87,19 +86,16 @@ def fetch_repo(api, repo_id: str, revision: str, patterns: Optional[List[str]]) 
     lock_path = os.path.join(
         constants.HF_HUB_CACHE, ".sglang_locks", f"download_{key_hash}.lock"
     )
-    try:
-        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-        with FileLock(lock_path, mode=0o666):
-            snapshot_download(
-                repo_id,
-                revision=revision,
-                allow_patterns=[glob.escape(f) for f in files],
-                # sglang's CI loader downloads single-threaded too: parallel
-                # writers raced on .incomplete files in the shared cache.
-                max_workers=1,
-            )
-    except Exception as exc:
-        warn(f"download of {repo_id}@{revision} failed: {type(exc).__name__}: {exc}")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with FileLock(lock_path, mode=0o666):
+        snapshot_download(
+            repo_id,
+            revision=revision,
+            allow_patterns=[glob.escape(f) for f in files],
+            # sglang's CI loader downloads single-threaded too: parallel
+            # writers raced on .incomplete files in the shared cache.
+            max_workers=1,
+        )
 
 
 def main() -> int:
@@ -117,7 +113,10 @@ def main() -> int:
             print(f"skip {repo_id}: {entry['skip']}", flush=True)
             continue
         for revision in entry.get("revisions", ["main"]):
-            fetch_repo(api, repo_id, revision, entry.get("patterns"))
+            try:
+                fetch_repo(api, repo_id, revision, entry.get("patterns"))
+            except Exception as exc:
+                warn(f"{repo_id}@{revision}: {type(exc).__name__}: {exc}")
     return 0
 
 
