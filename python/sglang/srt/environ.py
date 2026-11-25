@@ -2121,7 +2121,7 @@ class Envs:
     # ROCm breakable prefill graphs keep the decoder SWA tail as on CUDA: captured as
     # the tail block below the threshold above, and at or above it run in a break over
     # each request's exact tail rows from the tail graphs. Off: they keep no tail.
-    SGLANG_OPT_HIP_PREFILL_GRAPH_EXACT_TAIL = EnvBool(False)
+    SGLANG_OPT_HIP_PREFILL_GRAPH_EXACT_TAIL = EnvBool(True)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches), "v41_new" (the same bytes interleaved per token, for
