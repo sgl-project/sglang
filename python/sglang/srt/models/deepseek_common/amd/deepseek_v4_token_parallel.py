@@ -54,13 +54,13 @@ ENV_RS = "SGLANG_DSV4_TP_RS"
 ENV_MOE_INPUT = "SGLANG_DSV4_TP_MOE_INPUT"
 # Equivalence check: a directory; every EXTEND forward writes its last-token final hidden
 # states there (rank 0).
-ENV_G3_DUMP = "SGLANG_DSV4_TP_G3_DUMP"
+ENV_HIDDEN_DUMP = "SGLANG_DSV4_TP_HIDDEN_DUMP"
 # Equivalence check: a file holding 1 or 0; with ENV_ON=1, eligible forwards run
 # token-parallel only while it holds 1 on every rank (the ranks agree on each forward
 # over the TP CPU group).
 ENV_TOGGLE = "SGLANG_DSV4_TP_TOGGLE_FILE"
 
-LOG_PREFIX = "[dsv4-tp-v5]"
+LOG_PREFIX = "[dsv4-token-parallel]"
 # #7444's reduce-scatter takes whole 32 KiB tiles per rank: 16 rows of 5120 bf16.
 ROW_ALIGN = 16
 # Byte alignment of every piece in a packed gather row (AITER's custom all-gather
@@ -72,7 +72,7 @@ _ACTIVE: Optional[TokenParallelState] = None
 _DISABLED_REASON: Optional[str] = None
 _LOGGED: set = set()
 
-G3_DUMP_DIR = os.environ.get(ENV_G3_DUMP, "")
+HIDDEN_DUMP_DIR = os.environ.get(ENV_HIDDEN_DUMP, "")
 
 
 def _env_on(name: str) -> bool:
@@ -1448,16 +1448,16 @@ def write_source_kv_and_gather_tail(
 # Equivalence check: final hidden states of the last token of each request
 # ---------------------------------------------------------------------------
 
-_G3_SEQ = [0]
+_HIDDEN_DUMP_SEQ = [0]
 
 
-def g3_dump(hidden_states: torch.Tensor, tail, forward_batch) -> None:
-    """With SGLANG_DSV4_TP_G3_DUMP set (both arms of the check), save the final normed
+def dump_last_hidden(hidden_states: torch.Tensor, tail, forward_batch) -> None:
+    """With SGLANG_DSV4_TP_HIDDEN_DUMP set (both arms of the check), save the final normed
     hidden state of every request's last extend row of each EXTEND forward, on TP
     rank 0. Off when unset. Prefill-graph capture is skipped (it cannot copy host
     indices, and graph replays never run this Python code)."""
     if (
-        not G3_DUMP_DIR
+        not HIDDEN_DUMP_DIR
         or not forward_batch.forward_mode.is_extend_without_speculative()
     ):
         return
@@ -1493,6 +1493,6 @@ def g3_dump(hidden_states: torch.Tensor, tail, forward_batch) -> None:
         if _LAST_FORWARD_TP[0]
         else None,
     }
-    os.makedirs(G3_DUMP_DIR, exist_ok=True)
-    torch.save(out, os.path.join(G3_DUMP_DIR, f"fwd{_G3_SEQ[0]:06d}.pt"))
-    _G3_SEQ[0] += 1
+    os.makedirs(HIDDEN_DUMP_DIR, exist_ok=True)
+    torch.save(out, os.path.join(HIDDEN_DUMP_DIR, f"fwd{_HIDDEN_DUMP_SEQ[0]:06d}.pt"))
+    _HIDDEN_DUMP_SEQ[0] += 1

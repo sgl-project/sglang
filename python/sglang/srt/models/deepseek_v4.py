@@ -4862,8 +4862,8 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
             )
         hidden_states = self.norm(hidden_states)
-        if token_parallel.G3_DUMP_DIR:
-            token_parallel.g3_dump(hidden_states, tail, forward_batch)
+        if token_parallel.HIDDEN_DUMP_DIR:
+            token_parallel.dump_last_hidden(hidden_states, tail, forward_batch)
 
         # DSpark's model-boundary hook gathers compact tail rows. Other CP
         # outputs are gathered with this rank's full shard layout.
