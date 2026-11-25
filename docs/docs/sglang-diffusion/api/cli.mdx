@@ -76,7 +76,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 - `--model-path {MODEL}`: model path or Hugging Face model ID
 - `--served-model-name {NAME}`: stable model name exposed by serving APIs. Defaults to `--model-id` when set, otherwise `--model-path`.
-- `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`, or `hybrid` with explicit merged transformer weights to serve all three tasks (see the [H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#singularity-hybrid-weights)). This is a server/load-time choice, unlike a request's `task`.
+- `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`, `fl2va+ref2va` to keep both transformers in one server and run each request on the one for its task (see [One server for both partitions](/cookbook/diffusion/MiniMax/MiniMax-H3#one-server-for-both-partitions)), or `hybrid` with explicit merged transformer weights to serve all three tasks (see the [H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#singularity-hybrid-weights)). This is a server/load-time choice, unlike a request's `task`.
 - `--minimax-h3-adaln-cache-path {FILE}`: advanced MiniMax-H3-only inference cache. It replaces the checkpoint's AdaLN projection weights with precomputed outputs and only accepts requests whose exact FP32 timestep plan is included in the cache. It requires unquantized weights and the matching model variant.
 - `--minimax-h3-adaln-online {true,false}`: rebuild MiniMax-H3 AdaLN outputs from the checkpoint on demand instead of keeping the 24.2 GiB of `adaln_proj` weights resident. Video schedules may vary; image releases retain their fixed PDD schedule. Requires the unquantized native-layout checkpoint. Built plans live in a GPU slab with per-plan LRU eviction; the optional pinned-host cache lets evicted schedules swap back in over PCIe instead of re-reading the checkpoint.
 - `--minimax-h3-adaln-plan-width {N}`: widest timestep plan the online slab is sized for (Auto: 4 for video, 2 for image; t2va needs 2, fl2va 3).
@@ -119,7 +119,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--otlp-service-name {NAME}`: `service.name` attached to exported traces. Resolution order is this flag, `OTEL_SERVICE_NAME`, then `sglang-diffusion`.
 - `--enable-metrics`: expose Prometheus metrics at `/metrics` (default: disabled). Includes request counts, queue time, host-side stage timing and LoRA state, separated by role and DP replica. See [Production metrics](/docs/sglang-diffusion/production_metrics) for metric semantics and disaggregated scraping.
 - `--api-key {KEY}`: require `Authorization: Bearer {KEY}` on the inference HTTP and WebSocket endpoints (default: no key, inference endpoints are open). See [API key authentication](#api-key-authentication) for management endpoint rules.
-- `--admin-api-key {KEY}`: key for the management endpoints; weight update, memory release/resume, and profiling endpoints are refused unless it is set. Defaults to the `SGLANG_ADMIN_API_KEY` environment variable.
+- `--admin-api-key {KEY}`: unlock the admin endpoints (`/update_weights_from_*`, `/get_weights_checksum`, `/release_memory_occupation`, `/resume_memory_occupation`, `/v1/set_lora`, `/v1/merge_lora_weights`, `/v1/unmerge_lora_weights`, `/start_profile`, `/stop_profile`). They answer HTTP 403 until it is set, and `--api-key` does not unlock them. Defaults to `SGLANG_ADMIN_API_KEY`.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 - `--prompt-enhancer-config {JSON_FILE}`: configure an independent SRT LLM/VLM for opt-in HTTP prompt rewriting. Requests use `enhance_prompt=true`; no enhancer runs by default. See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).
 
@@ -529,6 +529,9 @@ check; it only validates its own routing loop and broker.
 Do not use `/health` as a liveness probe: a long server warmup can legitimately
 keep it at `503` for several minutes.
 
+`/liveness`, `/health`, `/health_generate`, and `/metrics` never need a key, so
+probes work unchanged with `--api-key`.
+
 ### Request time limit
 
 A hung kernel or collective blocks the workers without logging anything, and the
@@ -575,7 +578,7 @@ The key an endpoint requires depends on which keys the server has:
 | Endpoints | No key | `--api-key` only | Admin key only | Both keys |
 | --- | --- | --- | --- | --- |
 | Generation, model, job, and WebSocket endpoints | Open | API key | Open | API key |
-| `/v1/set_lora`, `/v1/merge_lora_weights`, `/v1/unmerge_lora_weights`, `/get_weights_checksum`, `/update_weights_from_tensor_checker` | Open | API key | Admin key | Admin key |
+| `/v1/set_lora`, `/v1/merge_lora_weights`, `/v1/unmerge_lora_weights`, `/get_weights_checksum`, `/update_weights_from_tensor_checker` | `403` | `403` | Admin key | Admin key |
 | `/update_weights_from_disk`, `/update_weights_from_tensor`, `/release_memory_occupation`, `/resume_memory_occupation`, `/start_profile`, `/stop_profile` | `403` | `403` | Admin key | Admin key |
 
 A missing or wrong key returns `401`. An unauthorized WebSocket handshake is

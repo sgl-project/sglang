@@ -128,7 +128,6 @@ import threading
 from collections.abc import Callable
 
 import pytest
-import requests
 from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -151,7 +150,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     is_in_ci,
 )
-from sglang.srt.utils.auth import admin_auth_headers
+from sglang.test.test_utils import admin_post
 
 logger = init_logger(__name__)
 
@@ -181,7 +180,6 @@ _CI_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
 _CI_MODEL_PAIR_IDS = ("FLUX.2-klein-base-4B",)
 _UPDATE_TIMEOUT_SECONDS = 900
 _CHECKSUM_TIMEOUT_SECONDS = 600
-_ADMIN_API_KEY = "test-update-weights-admin"
 
 
 def _resolve_active_model_pairs() -> list[tuple[str, str]]:
@@ -304,10 +302,9 @@ class _UpdateWeightsApiMixin:
         payload = {"model_path": model_path, "flush_cache": flush_cache}
         if target_modules is not None:
             payload["target_modules"] = target_modules
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/update_weights_from_disk",
             json=payload,
-            headers=admin_auth_headers(_ADMIN_API_KEY),
             timeout=timeout,
         )
         return response.json(), response.status_code
@@ -321,10 +318,9 @@ class _UpdateWeightsApiMixin:
         payload = {}
         if module_names is not None:
             payload["module_names"] = module_names
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/get_weights_checksum",
             json=payload,
-            headers=admin_auth_headers(_ADMIN_API_KEY),
             timeout=timeout,
         )
         assert response.status_code == 200, (
@@ -364,7 +360,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
             model=default_model,
             port=port,
             wait_deadline=wait_deadline,
-            extra_args=f"--num-gpus 1 --admin-api-key {_ADMIN_API_KEY}",
+            extra_args="--num-gpus 1",
         )
 
         # Ensure models are local before spawning threads that need the paths.
@@ -498,10 +494,9 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         assert status_code == 400, f"Expected 400, got {status_code}"
         assert not result.get("success", True), "Should fail for nonexistent model"
 
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/update_weights_from_disk",
             json={},
-            headers=admin_auth_headers(_ADMIN_API_KEY),
             timeout=30,
         )
 
@@ -623,7 +618,7 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
             model=default_model,
             port=port,
             wait_deadline=wait_deadline,
-            extra_args=f"--num-gpus 1 --dit-layerwise-offload true --admin-api-key {_ADMIN_API_KEY}",
+            extra_args="--num-gpus 1 --dit-layerwise-offload true",
         )
 
         ctx = manager.start()

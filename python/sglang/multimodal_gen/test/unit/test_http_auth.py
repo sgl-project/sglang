@@ -29,36 +29,32 @@ from sglang.srt.utils.auth import (
 
 # The management routes, with a body their handlers accept.
 _MANAGEMENT_ROUTES = [
-    ("/v1/set_lora", {"lora_nickname": "default"}, AuthLevel.ADMIN_OPTIONAL),
-    ("/v1/merge_lora_weights", {}, AuthLevel.ADMIN_OPTIONAL),
-    ("/v1/unmerge_lora_weights", {}, AuthLevel.ADMIN_OPTIONAL),
+    ("/v1/set_lora", {"lora_nickname": "default"}),
+    ("/v1/merge_lora_weights", {}),
+    ("/v1/unmerge_lora_weights", {}),
     (
         "/update_weights_from_tensor_checker",
         {
             "target_module": "transformer",
             "expected_named_tensors_sha256": {"fake.weight": "0" * 64},
         },
-        AuthLevel.ADMIN_OPTIONAL,
     ),
     (
         "/get_weights_checksum",
         {"module_names": ["transformer"]},
-        AuthLevel.ADMIN_OPTIONAL,
     ),
-    ("/update_weights_from_disk", {"model_path": "/fake"}, AuthLevel.ADMIN_FORCE),
+    ("/update_weights_from_disk", {"model_path": "/fake"}),
     (
         "/update_weights_from_tensor",
         {"serialized_named_tensors": ["fake"]},
-        AuthLevel.ADMIN_FORCE,
     ),
-    ("/release_memory_occupation", {}, AuthLevel.ADMIN_FORCE),
-    ("/resume_memory_occupation", {}, AuthLevel.ADMIN_FORCE),
+    ("/release_memory_occupation", {}),
+    ("/resume_memory_occupation", {}),
 ]
 _PROFILE_ROUTES = ["/start_profile", "/stop_profile"]
 
-# The routes `auth_levels.json` does not declare, which are NORMAL. A new route
-# joins this set, or is declared with its level, before the inventory test passes.
-_UNDECLARED_NORMAL_ROUTES = {
+# Diffusion routes that use the normal API key policy.
+_NORMAL_ROUTES = {
     "/liveness",
     "/models",
     "/openpi/policy",
@@ -113,14 +109,16 @@ def test_every_route_has_a_reviewed_auth_level():
     server_args.pipeline_config.supports_action_endpoint = lambda: True
     server_args.pipeline_config.supports_openpi_endpoint = lambda: True
     app = create_app(server_args)
-    assert set(undeclared_routes(app)) == _UNDECLARED_NORMAL_ROUTES
+    assert not undeclared_routes(app)
+    assert _NORMAL_ROUTES <= _served_paths(app)
+    assert all(AUTH_LEVELS[path] == AuthLevel.NORMAL for path in _NORMAL_ROUTES)
     protected = {
         path: AUTH_LEVELS[path]
         for path in _served_paths(app) & set(AUTH_LEVELS)
         if AUTH_LEVELS[path] != AuthLevel.NORMAL
     }
     assert protected == {
-        **{path: level for path, _, level in _MANAGEMENT_ROUTES},
+        **{path: AuthLevel.ADMIN_FORCE for path, _ in _MANAGEMENT_ROUTES},
         **dict.fromkeys(_PROFILE_ROUTES, AuthLevel.ADMIN_FORCE),
     }
 
@@ -313,47 +311,44 @@ def test_cli_parser_accepts_api_keys_without_exposing_them_in_repr():
     "missing_fields",
     [(), ("api_key",), ("admin_api_key",), ("api_key", "admin_api_key")],
 )
-def test_normal_routes_remain_open_when_no_key_is_configured(missing_fields):
+def test_routes_when_no_key_is_configured(missing_fields):
     server_args = _server_args()
     for name in missing_fields:
         delattr(server_args, name)
     client = TestClient(create_app(server_args))
 
     assert client.get("/openapi.json").status_code == 200
-    assert client.post("/v1/set_lora").status_code == 422
+    assert client.post("/v1/set_lora").status_code == 403
 
 
-@pytest.mark.parametrize("path,payload,level", _MANAGEMENT_ROUTES)
+@pytest.mark.parametrize("path,payload", _MANAGEMENT_ROUTES)
 @pytest.mark.parametrize(
-    "api_key,admin_api_key,token,optional_status,forced_status",
+    "api_key,admin_api_key,token,status",
     [
-        (None, None, None, 200, 403),
-        ("user-secret", None, None, 401, 403),
-        ("user-secret", None, "user-secret", 200, 403),
-        (None, "admin-secret", None, 401, 401),
-        (None, "admin-secret", "admin-secret", 200, 200),
-        ("user-secret", "admin-secret", "user-secret", 401, 401),
-        ("user-secret", "admin-secret", "admin-secret", 200, 200),
+        (None, None, None, 403),
+        ("user-secret", None, None, 403),
+        ("user-secret", None, "user-secret", 403),
+        (None, "admin-secret", None, 401),
+        (None, "admin-secret", "admin-secret", 200),
+        ("user-secret", "admin-secret", "user-secret", 401),
+        ("user-secret", "admin-secret", "admin-secret", 200),
     ],
 )
 def test_management_routes_follow_srt_auth_policy(
     monkeypatch,
     path,
     payload,
-    level,
     api_key,
     admin_api_key,
     token,
-    optional_status,
-    forced_status,
+    status,
 ):
     forward = AsyncMock(
         return_value=SimpleNamespace(error=None, output={"success": True})
     )
     monkeypatch.setattr(async_scheduler_client, "forward", forward)
     app = create_app(_server_args(api_key, admin_api_key))
-    assert _route_auth_level(app, path) == level
-    status = forced_status if level == AuthLevel.ADMIN_FORCE else optional_status
+    assert _route_auth_level(app, path) == AuthLevel.ADMIN_FORCE
     client = TestClient(app)
 
     headers = {} if token is None else {"Authorization": f"Bearer {token}"}
@@ -445,7 +440,7 @@ def test_api_key_protects_normal_routes_and_keeps_probes_public():
         client.post(
             "/v1/set_lora", headers={"Authorization": "Bearer user-secret"}
         ).status_code
-        == 422
+        == 403
     )
 
 

@@ -747,10 +747,14 @@ def create_app(
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
-
-    api_key = getattr(server_args, "api_key", None)
-    admin_api_key = getattr(server_args, "admin_api_key", None)
-    add_api_key_middleware(app, get_keys=lambda: (api_key, admin_api_key))
+    # Apply route authentication inside CORS so browsers can read auth errors.
+    add_api_key_middleware(
+        app,
+        get_keys=lambda: (
+            getattr(server_args, "api_key", None),
+            getattr(server_args, "admin_api_key", None),
+        ),
+    )
 
     app.add_middleware(
         CORSMiddleware,

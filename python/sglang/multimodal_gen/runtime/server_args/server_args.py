@@ -98,6 +98,7 @@ from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
 from sglang.srt.environ import envs as srt_envs
+from sglang.srt.environ import validate_env_values
 from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
@@ -577,8 +578,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # entries; a request executing longer turns /health unhealthy. Unset: off.
     request_time_limit: list[str] | None = None
     enable_metrics: bool = False
-
-    # API key authentication
+    # HTTP auth, as the LLM server's --api-key / --admin-api-key; kept out of logs.
     api_key: str | None = field(default=None, repr=False)
     admin_api_key: str | None = field(default=None, repr=False)
 
@@ -707,14 +707,15 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
             auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
+            auto_tuner.maybe_plan_extra_dit_residency()
         self._adjust_path()
         if self.served_model_name is None:
             self.served_model_name = self.model_id or self.model_path
+        self._adjust_admin_api_key()
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
         self._adjust_network_ports()
-        self._adjust_admin_api_key()
         # adjust parallelism before attention backend
         self._adjust_parallelism()
         self._adjust_attention_backend()
@@ -726,6 +727,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        validate_env_values()
         self._validate_scheduler_rpc_timeout()
         timeout = self.http_graceful_shutdown_timeout
         if timeout is not None and (
@@ -1654,6 +1656,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"Either use a different port or disable --strict-ports."
             )
 
+    def _adjust_admin_api_key(self):
+        if self.admin_api_key is None:
+            # --admin-api-key wins; without it the server takes SGLANG_ADMIN_API_KEY.
+            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get() or None
+
     def _adjust_network_ports(self):
         # standalone roles only need an HTTP port when exposing metrics
         needs_http = self.enable_metrics or self.disagg_role in (
@@ -1703,11 +1710,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.master_port = self.settle_port(
                     self.master_port, 37, avoid=settled_ports
                 )
-
-    def _adjust_admin_api_key(self):
-        """`--admin-api-key` wins; without it the server takes `SGLANG_ADMIN_API_KEY`."""
-        if self.admin_api_key is None:
-            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get()
 
     def _adjust_parallelism(self):
         sp_unspecified = self.sp_degree is None
@@ -2349,7 +2351,10 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Semantic checkpoint variant to serve. Models with partitioned "
                 "checkpoints use this value to select the compatible weights "
-                "without exposing repository subfolder layout."
+                "without exposing repository subfolder layout. MiniMax H3: "
+                "fl2va, ref2va, or fl2va+ref2va (both transformers in one "
+                "server, each request on its task's; the automatic memory "
+                "policy keeps both resident when they fit)."
             ),
         )
         parser.add_argument(
@@ -3244,12 +3249,6 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Expose Prometheus metrics at /metrics.",
         )
         parser.add_argument(
-            "--strict-ports",
-            action=StoreBoolean,
-            default=ServerArgs.strict_ports,
-            help="If enabled, fail when requested ports are unavailable instead of auto-selecting.",
-        )
-        parser.add_argument(
             "--api-key",
             type=str,
             default=ServerArgs.api_key,
@@ -3259,13 +3258,16 @@ class ServerArgs(DisaggServerArgsMixin):
             "--admin-api-key",
             type=str,
             default=ServerArgs.admin_api_key,
-            help=(
-                "Set admin API key for management endpoints. Sensitive ones "
-                "(weight updates, memory release/resume, profiling) are refused "
-                "unless it is set. When set, admin endpoints require this key and "
-                "do NOT accept --api-key. Defaults to SGLANG_ADMIN_API_KEY, which "
-                "the bundled clients also read."
-            ),
+            help="Set admin API key for management endpoints. Sensitive ones (e.g. weight "
+            "updates, LoRA loading, memory release, profiling) are refused unless it is "
+            "set. When set, admin endpoints require this key and do NOT accept --api-key. "
+            "Defaults to SGLANG_ADMIN_API_KEY.",
+        )
+        parser.add_argument(
+            "--strict-ports",
+            action=StoreBoolean,
+            default=ServerArgs.strict_ports,
+            help="If enabled, fail when requested ports are unavailable instead of auto-selecting.",
         )
         parser.add_argument(
             "--webui",

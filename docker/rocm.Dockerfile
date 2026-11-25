@@ -361,9 +361,11 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 # gfx1250 is promoted to its own AITER pin here, ahead of the gfx942/gfx950
-# shared pin. Validated by the manual gfx1250 AITER Scout #173 A/B (no automated
-# gfx1250 Scout): gpt-oss, Flux.2, Wan2.2 and Kimi-K2 all NO_NEW_REGRESSION.
-ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
+# shared pin. Validated by a manual gfx1250 AITER Scout A/B (no automated gfx1250
+# Scout) against the previous pin 07ff5f318: gpt-oss-120B TP1, Kimi-K2 TP8,
+# Flux.2 and Wan2.2 all NO_NEW_REGRESSION. This pin additionally carries the
+# a16w16 FlyDSL kernel update (aiter ROCm/aiter#7851) that Flux.2 depends on.
+ENV AITER_COMMIT_DEFAULT="58b435276ffe1400fe86f108b577b6f26107f3b1"
 # The upstream Triton the gfx1250 bring-up was validated against, carried over
 # from the ROCm 7.14 flavor this image replaced. Built from source below.
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
@@ -386,7 +388,7 @@ ENV TRITON_REVERT_COMMITS_DEFAULT="9debefe44117a44c274b05033cfe9e4858883b86"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
+ENV AITER_COMMIT_DEFAULT="58b435276ffe1400fe86f108b577b6f26107f3b1"
 ENV BUILD_RCCL="1"
 # rocm-systems develop. The fix for the hang in the first all-reduce on gfx1250
 # (ROCm/rocm-systems#14254) has landed on the mainline, so pin develop instead
@@ -921,25 +923,40 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PIP" cache purge || true; \
   \
   # TVM Python bits need Cython + z3 before configure.
+  # Pin apache-tvm-ffi==0.1.11: preserves the ROCm DLPack fix and provides the
+  # extra_lib_paths loader argument required by xgrammar>=0.2.8 within TileLang 0.1.x.
   # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
-  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" "z3-solver==4.15.4.0"; \
+  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi==0.1.11" "z3-solver==4.15.4.0"; \
   \
   # Clone + pin TileLang (bundled TVM), then build
-  git clone --recursive "${TILELANG_REPO}" /opt/tilelang && \
-  cd /opt/tilelang && \
-  git fetch --depth=1 origin "${TILELANG_COMMIT}" || true && \
-  git checkout -f "${TILELANG_COMMIT}" && \
-  git submodule update --init --recursive && \
+  git clone --recursive "${TILELANG_REPO}" /opt/tilelang; \
+  cd /opt/tilelang; \
+  if ! git cat-file -e "${TILELANG_COMMIT}^{commit}" 2>/dev/null; then \
+    git fetch origin "${TILELANG_COMMIT}"; \
+  fi; \
+  git checkout -f "${TILELANG_COMMIT}"; \
+  git submodule update --init --recursive; \
+  # Backport TileLang/tvm #32 and #33: apache-tvm-ffi 0.1.11 requires explicit slots on derived objects.
+  for tvm_commit in \
+    329056d80424f88cfff65ad9e74c0ef7e1c6c96f \
+    0e15b274bce8b46f971abf5ac390e844aa6acee5; do \
+    if ! git -C 3rdparty/tvm cat-file -e "${tvm_commit}^{commit}" 2>/dev/null; then \
+      git -C 3rdparty/tvm fetch origin "${tvm_commit}"; \
+    fi; \
+  done; \
+  git -C 3rdparty/tvm cherry-pick --no-commit \
+    329056d80424f88cfff65ad9e74c0ef7e1c6c96f \
+    0e15b274bce8b46f971abf5ac390e844aa6acee5; \
   if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
     export ROCM_PATH=${ROCM_HOME}; \
   else \
     export ROCM_PATH=/opt/rocm; \
   fi; \
-  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
+  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}"; \
   "$VENV_PIP" install -e . -v --no-build-isolation --no-deps; \
   if [ -f pyproject.toml ]; then sed -i "/^[[:space:]]*\"torch/d" pyproject.toml || true; fi; \
   "$VENV_PIP" cache purge || true; \
-  "$VENV_PY" -c "import tilelang; print(tilelang.__version__)"'
+  "$VENV_PY" -c "import tilelang, xgrammar; print(tilelang.__version__)"'
 
 # -----------------------
 # Hadamard-transform (HIP build)
