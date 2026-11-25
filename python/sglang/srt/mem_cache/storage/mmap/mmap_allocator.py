@@ -276,9 +276,10 @@ def tensor_uses_hugepage(tensor) -> bool:
 def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     """Allocate a host tensor via anonymous mmap.
 
-    MAP_SHARED + MAP_POPULATE are both required so cudaHostRegister pins real,
-    pre-faulted physical pages (otherwise pinning can race with COW or page
-    faults and the device ends up reading stale data).
+    cudaHostRegister must pin real, pre-faulted physical pages that COW never
+    moves (otherwise pinning can race with COW or page faults and the device
+    ends up reading stale data): see ``_mmap_prefaulted`` for the shared
+    mapping and ``_mmap_private_parallel_prefaulted`` for the private one.
 
     ``SGLANG_HUGEPAGE_MODE=prefer`` falls back to normal pages when hugetlb
     allocation fails. ``required`` raises instead of falling back.

@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.encoders.text_encoder_graphs import (
+    TextEncoderGraphs,
+)
 
 
 def parse_weight_spec(spec: str) -> tuple[str, str | None, str | None]:
@@ -113,6 +116,11 @@ class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
         self.output_layers = tuple(output_layers)
         self.pad_multiple = pad_multiple
         self.max_length = max_length
+        # the eager forward is host-bound at prompt lengths; None where the
+        # forward is not the plain eager one
+        self._forward_graphs = (
+            None if weight_only_fp8 or compile_language_model else TextEncoderGraphs()
+        )
         if weight_only_fp8:
             _quantize_linears_to_weight_only_fp8(self.model)
         elif compile_language_model:
@@ -172,6 +180,24 @@ class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
                 results[i] = stacked[j : j + 1]
         return results
 
+    def _forward_context(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Token ids and mask ``(rows, tokens)`` -> stacked hidden states."""
+        mask = inputs["attention_mask"]
+        positions = (mask.long().cumsum(-1) - 1).masked_fill(mask == 0, 1)
+        # Reference numerics: PyTorch's default SDPA backend choice.
+        with torch_default_sdpa_backends():
+            out = self.model(
+                input_ids=inputs["input_ids"],
+                attention_mask=mask,
+                # Qwen3-VL M-RoPE: the text position plus three vision axes.
+                position_ids=positions[None].expand(4, -1, -1),
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        return torch.cat([out.hidden_states[k] for k in self.output_layers], dim=-1).to(
+            self.embed_dtype
+        )
+
     @torch.no_grad()
     def encode_batch(self, texts: list[str]) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Prompts -> tokens and IDs, with one forward per unique length bucket.
@@ -205,21 +231,17 @@ class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
                 max_length=length,
                 padding_side="right",
             )
-            mask = toks["attention_mask"].to(self.device, non_blocking=True)
-            positions = (mask.long().cumsum(-1) - 1).masked_fill(mask == 0, 1)
-            # Reference numerics: PyTorch's default SDPA backend choice.
-            with torch_default_sdpa_backends():
-                out = self.model(
-                    input_ids=toks["input_ids"].to(self.device, non_blocking=True),
-                    attention_mask=mask,
-                    # Qwen3-VL M-RoPE: the text position plus three vision axes.
-                    position_ids=positions[None].expand(4, -1, -1),
-                    output_hidden_states=True,
-                    use_cache=False,
-                )
-            tokens = torch.cat(
-                [out.hidden_states[k] for k in self.output_layers], dim=-1
-            ).to(self.embed_dtype)
+            inputs = {
+                name: toks[name].to(self.device, non_blocking=True)
+                for name in ("input_ids", "attention_mask")
+            }
+            if self._forward_graphs is None:
+                tokens = self._forward_context(inputs)
+            else:
+                # a replay writes into the graph's own output
+                tokens = self._forward_graphs(
+                    self.model, inputs, self._forward_context
+                ).clone()
             positions = torch.arange(length, device=tokens.device)
             zeros = torch.zeros_like(positions)
             ids = torch.stack([zeros, zeros, zeros, positions], -1)
