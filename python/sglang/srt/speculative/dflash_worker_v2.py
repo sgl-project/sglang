@@ -68,7 +68,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import VerifyStep
-from sglang.srt.sampling.verify_accept import ChainAccept, VerifyAccept
+from sglang.srt.sampling.verify_accept import ChainAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
@@ -3627,46 +3627,50 @@ class DFlashWorkerV2(BaseSpecWorker):
             indexer_topk_output = target_out.indexer_topk_output
             kv_weight_version_record = target_out.kv_weight_version_record
         logits_output = target_out.logits_output
-        # Before the deferred-shard block, which may drop the logits: the NaN
-        # probe reads the vocab shard.
-        verify.build_row_inputs(logits_output, tree=host_tree, barrier=grammar_barrier)
         can_run_cuda_graph = target_out.can_run_cuda_graph
-        target_predict = None
         target_lp = self._target_logits_processor
+        # A vocab shard left by the deferred gather: the accept reads only its
+        # argmax, or the gather completes here.
+        argmax_on_shard = False
         if target_lp is not None and target_lp.is_deferred_shard(
             logits_output.next_token_logits
         ):
-            if self._can_skip_verify_logits(verify):
-                target_predict = target_lp.deferred_argmax(
-                    logits_output.next_token_logits
-                )
-                logits_output.next_token_logits = None
-            else:
+            argmax_on_shard = self._can_skip_verify_logits(verify)
+            if not argmax_on_shard:
                 logits_output.next_token_logits = target_lp.finish_deferred_gather(
                     logits_output.next_token_logits
                 )
 
-        if sampling_info is not None and target_predict is None:
-            # In place: DFlash refuses the watermark, the one stage that returns
-            # new logits.
-            verify.adjust(logits_output.next_token_logits, draft_tokens)
+        def accept_core(logits, info):
+            # No stage ran on the shard, and commit reads no logits: the skip
+            # requires a route that adjusts nothing and no logprobs.
+            target_predict = None
+            if argmax_on_shard:
+                target_predict, logits = target_lp.deferred_argmax(logits), None
+                logits_output.next_token_logits = None
+            accept = self._accept_block(
+                candidates=draft_tokens,
+                next_token_logits=logits,
+                sampling_info=info,
+                draft_input=draft_input,
+                prefix_lens=prefix_lens,
+                bs=bs,
+                target_predict=target_predict,
+                cutoff_verify_lens=None if layout is None else layout.verify_lens,
+            )
+            if accept.new_seq_lens is None:
+                accept.new_seq_lens = prefix_lens + accept.commit_lens.to(
+                    prefix_lens.dtype
+                )
+            return accept
 
-        accept = self._accept_block(
-            candidates=draft_tokens,
-            next_token_logits=logits_output.next_token_logits,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
+        accept = verify.run(
+            logits_output,
+            draft_tokens=draft_tokens,
             prefix_lens=prefix_lens,
-            bs=bs,
-            target_predict=target_predict,
-            cutoff_verify_lens=None if layout is None else layout.verify_lens,
-        )
-        verify.cap_chain_accept(accept, prefix_lens=prefix_lens)
-        if accept.new_seq_lens is None:
-            accept.new_seq_lens = prefix_lens + accept.commit_lens.to(prefix_lens.dtype)
-        verify.commit(
-            VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
-            logits_output=logits_output,
+            host_tree=host_tree,
+            barrier=grammar_barrier,
+            accept_core=accept_core,
         )
         if self._acceptance_estimator is not None and SIMULATE_ACC_LEN <= 0:
             self._observe_acceptance(
