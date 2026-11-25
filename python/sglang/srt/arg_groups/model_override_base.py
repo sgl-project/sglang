@@ -355,6 +355,10 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             return "trtllm_mha"
         elif get_platform().is_hip:
             return "aiter"
+        elif get_platform().is_xpu and cfg.speculative_algorithm is None:
+            # Spec decode keeps triton: intel_xpu moves page_size to 128, which
+            # eagle topk > 1 rejects, and topk is only resolved after this pass.
+            return "intel_xpu"
         elif is_mps():
             return "torch_native"
         else:
