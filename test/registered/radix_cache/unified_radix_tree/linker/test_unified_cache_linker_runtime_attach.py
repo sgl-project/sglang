@@ -99,7 +99,7 @@ class TestUnifiedCacheLinkerRuntimeAttach(CustomTestCase):
         )
         response.raise_for_status()
         details = response.json()["meta_info"].get("cached_tokens_details") or {}
-        return int(details.get("host", 0))
+        return int(details.get("storage", 0))
 
     def test_detach_and_reattach(self):
         num_tokens = 8 * PAGE_SIZE

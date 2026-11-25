@@ -1246,20 +1246,12 @@ async def hicache_storage_backend_status():
     }
 
 
-@app.put("/unified-cache/external-linker")
-async def attach_cache_linker():
-    """Re-attach the launch-time external linker while all schedulers are idle."""
-    ret = await _global_state.tokenizer_manager.attach_cache_linker()
-    return ORJSONResponse(
-        msgspec_to_builtins(ret),
-        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+@app.api_route("/unified-cache/external-linker", methods=["PUT", "DELETE"])
+async def update_cache_linker(request: Request):
+    """Re-attach (PUT) or detach (DELETE) the launch-time external linker while all schedulers are idle."""
+    ret = await _global_state.tokenizer_manager.update_cache_linker(
+        attach=request.method == "PUT"
     )
-
-
-@app.delete("/unified-cache/external-linker")
-async def detach_cache_linker():
-    """Detach the external linker while all schedulers are idle."""
-    ret = await _global_state.tokenizer_manager.detach_cache_linker()
     return ORJSONResponse(
         msgspec_to_builtins(ret),
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,

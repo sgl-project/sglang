@@ -16,8 +16,6 @@ from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
-    AttachCacheLinkerReqInput,
-    AttachCacheLinkerReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BeginWeightUpdateReqInput,
@@ -30,8 +28,6 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
-    DetachCacheLinkerReqInput,
-    DetachCacheLinkerReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
@@ -86,6 +82,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateCacheLinkerReqInput,
+    UpdateCacheLinkerReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -143,8 +141,7 @@ _COMMUNICATOR_SPECS = [
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
     ("clear_hicache_storage", ClearHiCacheReqOutput),
-    ("attach_cache_linker", AttachCacheLinkerReqOutput),
-    ("detach_cache_linker", DetachCacheLinkerReqOutput),
+    ("update_cache_linker", UpdateCacheLinkerReqOutput),
     ("attach_hicache_storage", AttachHiCacheStorageReqOutput),
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
     ("profile", ProfileReqOutput),
@@ -410,25 +407,15 @@ class TokenizerControlMixin:
             )
         return out
 
-    async def attach_cache_linker(
-        self: TokenizerManager,
-    ) -> AttachCacheLinkerReqOutput:
+    async def update_cache_linker(
+        self: TokenizerManager, attach: bool
+    ) -> UpdateCacheLinkerReqOutput:
         self.auto_create_handle_loop()
-        results = await self.attach_cache_linker_communicator(
-            AttachCacheLinkerReqInput()
+        results = await self.update_cache_linker_communicator(
+            UpdateCacheLinkerReqInput(attach=attach)
         )
         success, message = FanOutCommunicator.merge_results(results)
-        return AttachCacheLinkerReqOutput(success=success, message=message)
-
-    async def detach_cache_linker(
-        self: TokenizerManager,
-    ) -> DetachCacheLinkerReqOutput:
-        self.auto_create_handle_loop()
-        results = await self.detach_cache_linker_communicator(
-            DetachCacheLinkerReqInput()
-        )
-        success, message = FanOutCommunicator.merge_results(results)
-        return DetachCacheLinkerReqOutput(success=success, message=message)
+        return UpdateCacheLinkerReqOutput(success=success, message=message)
 
     async def start_profile(
         self: TokenizerManager,

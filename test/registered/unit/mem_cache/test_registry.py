@@ -263,9 +263,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         )
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.tree_core = SimpleNamespace(
-            enable_external_cache_linker=False,
-            write_through_threshold=256,
-            backfill_missing_hash_values=lambda: 0,
+            enable_external_cache_linker=False, write_through_threshold=256
         )
         cache.tree_components = (ComponentType.FULL,) + (
             (ComponentType.MAMBA,) if has_state else ()
@@ -273,8 +271,6 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         index_slots(cache, cache.tree_components)
         cache.components = {component: object() for component in cache.tree_components}
         cache._components_tuple = tuple(cache.components.values())
-        cache._all_reduce_attn_groups = lambda tensor, op: None
-        cache.linker = None
         counter = MagicMock(name="layer_done_counter")
         linker = SimpleNamespace(pools=linker_pools, layer_done_counter=counter)
         linker.draft_layer_counter = lambda: UnifiedCacheLinker.draft_layer_counter(

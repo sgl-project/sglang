@@ -2141,20 +2141,11 @@ class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
-class AttachCacheLinkerReqInput(BaseReq, kw_only=True):
-    pass
+class UpdateCacheLinkerReqInput(BaseReq, kw_only=True):
+    attach: bool
 
 
-class AttachCacheLinkerReqOutput(BaseReq, kw_only=True):
-    success: bool
-    message: str = ""
-
-
-class DetachCacheLinkerReqInput(BaseReq, kw_only=True):
-    pass
-
-
-class DetachCacheLinkerReqOutput(BaseReq, kw_only=True):
+class UpdateCacheLinkerReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
 

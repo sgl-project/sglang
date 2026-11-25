@@ -260,7 +260,7 @@ def create_unified_radix_cache(
                 draft_pool.register_layer_transfer_counter(draft_counter)
             ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
 
-        cache.init_linker_attachment(
+        cache.init_linker_lifecycle(
             build_linker=functools.partial(
                 create_unified_cache_linker,
                 server_args,
