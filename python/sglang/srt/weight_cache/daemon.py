@@ -62,17 +62,15 @@ from sglang.srt.runtime_context import (
     spawn_world_rank,
 )
 
+from .config import build_cache_config, resolve_cache_quantization
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
-    compute_env_stamp,
     compute_global_rank,
     compute_local_gpu_id,
-    get_quant_method_name,
     get_ready_path,
     get_socket_path,
-    hash_quant_config,
     recv_msg,
     send_msg,
 )
@@ -174,10 +172,6 @@ class WeightCacheDaemon:
         self.pp_size = cfg.pp_size
         self.pp_rank = pp_rank
         self.ep_size = cfg.ep_size
-        self.moe_dp_size = cfg.moe_dp_size
-        self.enable_dp_lm_head = cfg.enable_dp_lm_head
-        self.attn_cp_size = cfg.attn_cp_size
-        self.moe_dense_tp_size = cfg.moe_dense_tp_size
         self.moe_a2a_backend = cfg.moe_a2a_backend
         self.deepep_mode = cfg.deepep_mode
         self.load_format = cfg.load_format
@@ -329,12 +323,9 @@ class WeightCacheDaemon:
         # hash than what the engine computes from the original config.
         # ModelConfig always exposes hf_config/quantization directly;
         # quantization_config is the only genuinely-optional attribute.
-        quant_config = getattr(model_config.hf_config, "quantization_config", None)
-        quant_method = get_quant_method_name(
-            self.quantization or model_config.quantization
+        quant_method, quant_config = resolve_cache_quantization(
+            model_config, self.quantization
         )
-        if not quant_method and quant_config is not None:
-            quant_method = get_quant_method_name(quant_config)
 
         # Refuse unsupported quant methods before creating distributed groups
         # or touching model weights.
@@ -344,34 +335,13 @@ class WeightCacheDaemon:
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
         self._initialize_eplb_expert_location_metadata(model_config)
-        moe_dp_rank = get_parallel().moe_dp_rank
-        moe_ep_rank = get_parallel().moe_ep_rank
-        self.config = CacheConfig(
-            model_path=self.model_path,
-            model_arch=(
-                model_config.hf_config.architectures[0]
-                if model_config.hf_config.architectures
-                else ""
-            ),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            pp_size=self.pp_size,
-            pp_rank=self.pp_rank,
-            dp_size=get_parallel().dp_size,
-            ep_size=self.ep_size,
-            moe_dp_size=self.moe_dp_size,
-            moe_dp_rank=moe_dp_rank,
-            moe_ep_rank=moe_ep_rank,
-            attn_dp_size=get_parallel().attn_dp_size,
-            enable_dp_lm_head=self.enable_dp_lm_head,
-            attn_cp_size=self.attn_cp_size,
-            moe_dense_tp_size=self.moe_dense_tp_size,
-            moe_a2a_backend=self.moe_a2a_backend,
+        self.config = build_cache_config(
+            model_config,
             quant_method=quant_method,
-            quant_config_hash=hash_quant_config(quant_config),
-            dtype=str(model_config.dtype),
-            revision=self.revision or "",
-            **compute_env_stamp(),
+            quant_config=quant_config,
+            model_path=self.model_path,
+            revision=self.revision,
+            ep_size=self.ep_size,
         )
 
         current_platform.empty_cache()

@@ -6,6 +6,7 @@ These cover the pure-Python logic that the GPU end-to-end test
 
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
   - CacheConfig compatibility matching / (de)serialization
+  - LoadSpec construction, shard identity and schema validation
   - quant-config hashing and method-name extraction
   - daemon spawn configuration and socket/ready path derivation
   - the IPC quantization allowlist (the gate that keeps silently-wrong
@@ -23,9 +24,14 @@ import struct
 import unittest
 from types import SimpleNamespace
 
+import msgspec
 import torch
+from transformers import PretrainedConfig
 
+from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.protocol import (
     CacheConfig,
     UnsupportedQuantForIPCError,
@@ -41,6 +47,7 @@ from sglang.srt.weight_cache.protocol import (
     recv_msg,
     send_msg,
 )
+from sglang.srt.weight_cache.schema import LoadSpec
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
     TorchIpcTransportBackend,
@@ -79,6 +86,32 @@ def _make_cache_config(**overrides) -> CacheConfig:
     )
     base.update(overrides)
     return CacheConfig(**base)
+
+
+def _make_load_spec(*, tp_size=2, hf_config=None, model_path="m", draft_model_idx=None):
+    model_config = SimpleNamespace(
+        hf_config=PretrainedConfig() if hf_config is None else hf_config,
+        model_path=model_path,
+        revision=None,
+        quantization=None,
+        dtype=torch.float32,
+    )
+    with (
+        get_context().override_server_args(tp_size=tp_size),
+        get_parallel().override(
+            tp_rank=0,
+            pp_rank=0,
+            moe_dp_rank=0,
+            moe_ep_rank=0,
+            moe_dp_group=SimpleNamespace(world_size=1),
+        ),
+    ):
+        return build_load_spec(
+            checkpoint_id="rev1",
+            model_config=model_config,
+            load_config=LoadConfig(draft_model_idx=draft_model_idx),
+            target_device=torch.device("cpu"),
+        )
 
 
 class TestProtocolFraming(CustomTestCase):
@@ -192,6 +225,44 @@ class TestCacheConfig(CustomTestCase):
         restored = CacheConfig.from_dict(cfg.to_dict())
         self.assertTrue(cfg.matches(restored))
         self.assertEqual(cfg.to_dict(), restored.to_dict())
+
+
+class TestLoadSpec(CustomTestCase):
+    def test_load_spec_separates_shard_identity_from_shared_settings(self):
+        spec = _make_load_spec()
+        self.assertEqual(
+            msgspec.json.decode(msgspec.json.encode(spec), type=LoadSpec), spec
+        )
+        unknown_field = {**msgspec.to_builtins(spec), "future_layout": "new"}
+        with self.assertRaisesRegex(msgspec.ValidationError, "future_layout"):
+            msgspec.json.decode(msgspec.json.encode(unknown_field), type=LoadSpec)
+        for field in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
+            with self.subTest(field=field):
+                peer = msgspec.structs.replace(spec, **{field: 1})
+                self.assertNotEqual(spec.digest(), peer.digest())
+                self.assertEqual(
+                    spec.digest(include_rank=False), peer.digest(include_rank=False)
+                )
+        staged = _make_load_spec(
+            hf_config=PretrainedConfig(name_or_path="/tmp/staging"),
+            model_path="/tmp/staging",
+        )
+        self.assertEqual(spec.digest(), staged.digest())
+        self.assertEqual(
+            spec.digest(include_rank=False), staged.digest(include_rank=False)
+        )
+        for other in (
+            _make_load_spec(tp_size=4),
+            _make_load_spec(draft_model_idx=1),
+            _make_load_spec(hf_config=PretrainedConfig(hidden_size=128)),
+            msgspec.structs.replace(spec, checkpoint_id="rev2"),
+            msgspec.structs.replace(spec, flashinfer_cutedsl_swap_ab=True),
+            msgspec.structs.replace(spec, fp4_gemm_runner_backend="flashinfer_trtllm"),
+        ):
+            self.assertNotEqual(spec.digest(), other.digest())
+            self.assertNotEqual(
+                spec.digest(include_rank=False), other.digest(include_rank=False)
+            )
 
 
 class TestQuantConfigHashing(CustomTestCase):
