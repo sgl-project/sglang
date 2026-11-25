@@ -247,6 +247,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 else None
             )
 
+            # Rejection sampling's params, which the graph reads from the batch's
+            # slots of the sampling table (`_read_sampling_params`).
             self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
             # Real per-request top_k, for the same reason temperatures are
             # carried: the draft proposal cannot tell a greedy request from a
@@ -254,7 +256,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             # temperature 0 to temperature=1.0 with top_k=1.
             # TOP_K_ALL, not -1: -1 is not a top_k this pipeline ever carries
             # (SamplingParams rewrites it), and it would read as top_k <= 1, i.e.
-            # greedy, for the padded rows and for a run that never copies in.
+            # greedy, for the padded rows and for a run that never reads them.
             self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
 
             if self.require_gathered_buffer:
@@ -439,6 +441,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             for capture_hook in hooks:
                 capture_hook(self, out, forward_batch, num_tokens)
 
+    def _read_sampling_params(self, slots: torch.Tensor) -> None:
+        """Rejection sampling's params, read in the graph from the batch's slots of
+        the sampling table, so a replay stages none of them."""
+        table = self.model_runner.req_to_token_pool.sampling_params_table
+        num_seqs = slots.shape[0]
+        self.temperatures[:num_seqs, 0].copy_(table.temperatures(slots))
+        self.top_ks[:num_seqs].copy_(table.top_ks(slots))
+        if self.buffers.sampling_seed is not None:
+            self.buffers.sampling_seed[:num_seqs].copy_(table.seeds(slots))
+
     def capture_one_shape(
         self,
         size: int,
@@ -595,6 +607,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
+            if get_spec().speculative_use_rejection_sampling:
+                self._read_sampling_params(req_pool_indices)
             return self.draft_runtime.run_draft_loop(
                 runner=self,
                 forward_batch=forward_batch,
@@ -771,21 +785,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.dsa_seed_topk[:raw_bs].copy_(seed)
             else:
                 buffers.dsa_seed_topk[:raw_bs].zero_()
-        # Only rejection sampling reads temperatures (renorm_draft_probs); skip
-        # the copy otherwise to keep the non-RS path free of extra work.
-        if (
-            get_spec().speculative_use_rejection_sampling
-            and forward_batch.sampling_info is not None
-        ):
-            self.temperatures[:raw_bs].copy_(
-                forward_batch.sampling_info.temperatures[:raw_bs]
-            )
-            if self.buffers.sampling_seed is not None:
-                self.buffers.sampling_seed[:raw_bs].copy_(
-                    forward_batch.sampling_info.sampling_seed[:raw_bs]
-                )
-            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
-
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs * self.captured_req_width)

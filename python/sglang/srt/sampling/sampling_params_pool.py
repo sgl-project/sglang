@@ -118,6 +118,12 @@ class SamplingParamsTable:
         """[n] int32, capturable."""
         return self.values[self.TOP_K][slots]
 
+    def seeds(self, slots: torch.Tensor) -> torch.Tensor:
+        """[n] int64, capturable."""
+        return _seeds(
+            self.values[self.SEED_LO][slots], self.values[self.SEED_HI][slots]
+        )
+
 
 class SamplingParamsPool:
     def __init__(
@@ -188,13 +194,7 @@ class SamplingParamsPool:
         floats = values.view(torch.float32)
         seeds = None
         if _deterministic() or _any_row_with_seed(self.has_seed_host[slots], top_ks):
-            seeds = (
-                torch.stack(
-                    (values[self.table.SEED_LO], values[self.table.SEED_HI]), dim=1
-                )
-                .view(torch.int64)
-                .view(-1)
-            )
+            seeds = _seeds(values[self.table.SEED_LO], values[self.table.SEED_HI])
         return SamplingRows(
             temperatures=floats[self.table.TEMPERATURE].view(-1, 1),
             top_ps=floats[self.table.TOP_P],
@@ -217,6 +217,11 @@ class SamplingParamsPool:
                 values[self.table.WATERMARK :], self.watermark_candidates_host[slots]
             ),
         )
+
+
+def _seeds(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
+    """[n] int64 seeds from their int32 halves."""
+    return torch.stack((lo, hi), dim=1).view(torch.int64).view(-1)
 
 
 def _deterministic() -> bool:
