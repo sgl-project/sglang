@@ -12,6 +12,8 @@ from sglang.srt.models.dspark import (
     DSparkDraftMixin,
     VanillaMarkov,
 )
+from sglang.srt.sampling import sampling_params_pool as sp_pool
+from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     draft_markov_block,
@@ -146,6 +148,8 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         noise = DraftNoise(
             key=5, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
         )
+        with mock.patch.object(sp_pool, "num_watermark_fields", return_value=0):
+            table = SamplingParamsTable(2 * BS + 1, DEVICE)
         sampler = DsparkDraftSampler(
             model=model,
             gamma=GAMMA,
@@ -154,6 +158,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             noise=noise,
             tp_sync=tp_sync,
             greedy_draft=False,
+            sampling_params_table=table,
         )
         hidden = torch.randn(BS * GAMMA, 64, device=DEVICE).to(torch.bfloat16)
         input_ids = torch.randint(0, VOCAB, (BS * GAMMA,), device=DEVICE)
@@ -162,11 +167,16 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             temperatures=(torch.rand(BS, 1, device=DEVICE) + 0.3),
             top_ks=torch.tensor([1, 40] * (BS // 2), device=DEVICE),
         )
-        sampler.stage_sampling_params(bs=BS, sampling_info=sampling_info)
-        sampler(hidden, input_ids)  # warm up outside the capture
+        # The batch's requests sit in slots 1..BS, as admission writes them.
+        slots = torch.arange(1, BS + 1, device=DEVICE)
+        table.values.view(torch.float32)[table.TEMPERATURE, slots] = (
+            sampling_info.temperatures.view(-1)
+        )
+        table.values[table.TOP_K, slots] = sampling_info.top_ks.int()
+        sampler(hidden, input_ids, slots)  # warm up outside the capture
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            sampler(hidden, input_ids)
+            sampler(hidden, input_ids, slots)
         noise.offset.zero_()
         graph.replay()
         torch.cuda.synchronize()

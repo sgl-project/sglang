@@ -112,6 +112,7 @@ class TestDraftSamplerVerifyIds(unittest.TestCase):
     """The folded draft tail writes [anchor | draft tokens], as the eager concat."""
 
     def test_tail_writes_verify_ids(self):
+        from sglang.srt.speculative.dspark_components.dspark_draft import DraftParams
         from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
             DsparkDraftSampler,
         )
@@ -124,6 +125,16 @@ class TestDraftSamplerVerifyIds(unittest.TestCase):
         s.verify_ids = torch.full((max_bs, gamma + 1), -1, dtype=torch.int64)
         s.confidence_out = None
         s.acceptance_estimator = None
+        s.sampling_params_table = SimpleNamespace(
+            temperatures=lambda slots: torch.ones(slots.shape[0]),
+            top_ks=lambda slots: torch.ones(slots.shape[0], dtype=torch.int32),
+        )
+        s.force_greedy = SimpleNamespace(flag=torch.zeros(1, dtype=torch.bool))
+        s.params = DraftParams(
+            temperatures=torch.ones(max_bs),
+            greedy_mask=torch.ones(max_bs, dtype=torch.bool),
+            step_temperatures=torch.zeros(max_bs),
+        )
         draft = torch.arange(bs * gamma, dtype=torch.int64).view(bs, gamma) + 100
 
         def step(model_hidden, anchor):
@@ -134,7 +145,11 @@ class TestDraftSamplerVerifyIds(unittest.TestCase):
             run=lambda **kw: step(kw["model_hidden"], kw["anchor_tokens"])
         )
         input_ids = torch.arange(bs * gamma, dtype=torch.int64) * 3
-        s(torch.zeros(bs * gamma, hidden), input_ids)
+        s(
+            torch.zeros(bs * gamma, hidden),
+            input_ids,
+            torch.zeros(bs, dtype=torch.int64),
+        )
         anchor = input_ids.view(bs, gamma)[:, :1]
         self.assertTrue(
             torch.equal(s.verify_ids[:bs], torch.cat([anchor, draft], dim=1))
