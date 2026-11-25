@@ -140,7 +140,6 @@ class TokenizerManagerScoreMixin:
         items: List,
         label_token_ids: Optional[List[List[int]]],
         apply_softmax: bool,
-        batch_request=None,
         return_pooled_hidden_states: bool = False,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
@@ -497,37 +496,6 @@ class TokenizerManagerScoreMixin:
             for idx, tok in enumerate(token_ids)
             if tok == embed_override_token_id
         ]
-
-    def _resolve_embed_overrides_for_request(
-        self,
-        query: List[int],
-        item: List[int],
-        embed_override_token_id: int,
-        query_embed_overrides: Optional[List[torch.Tensor]],
-        item_embeds: Optional[List[torch.Tensor]],
-        item_position_offset: int,
-        item_label: str,
-    ) -> Optional[PositionalEmbeds]:
-        """Resolve embed overrides for a query+item pair; None when no overrides exist."""
-        q_embeds, q_positions = self._resolve_overrides_for_sequence(
-            query,
-            query_embed_overrides,
-            embed_override_token_id,
-            position_offset=0,
-            label="query",
-        )
-        i_embeds, i_positions = self._resolve_overrides_for_sequence(
-            item,
-            item_embeds,
-            embed_override_token_id,
-            position_offset=item_position_offset,
-            label=item_label,
-        )
-        all_embeds = q_embeds + i_embeds
-        all_positions = q_positions + i_positions
-        if not all_embeds:
-            return None
-        return PositionalEmbeds(embeds=all_embeds, positions=all_positions)
 
     # ------------------------------------------------------------------
     # Input preparation (tokenization + input_ids construction)
@@ -1251,7 +1219,6 @@ class TokenizerManagerScoreMixin:
                 items,
                 label_token_ids,
                 apply_softmax,
-                batch_request,
                 return_pooled_hidden_states,
                 temperature,
                 return_token_logprobs,

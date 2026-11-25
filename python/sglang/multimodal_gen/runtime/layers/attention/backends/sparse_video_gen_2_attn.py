@@ -42,8 +42,6 @@ logger = init_logger(__name__)
 
 
 class SparseVideoGen2AttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128, 256]
@@ -55,10 +53,6 @@ class SparseVideoGen2AttentionBackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["SparseVideoGen2AttentionImpl"]:
         return SparseVideoGen2AttentionImpl
-
-    @staticmethod
-    def get_metadata_cls() -> type["SparseVideoGen2AttentionMetadata"]:
-        return SparseVideoGen2AttentionMetadata
 
     @staticmethod
     def get_builder_cls() -> type["SparseVideoGen2AttentionMetadataBuilder"]:

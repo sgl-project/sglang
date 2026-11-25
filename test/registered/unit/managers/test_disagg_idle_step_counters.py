@@ -227,6 +227,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         for idle_iterations in (0, 1, 2):
             with self.subTest(idle_iterations=idle_iterations):
                 batches = self.make_batches(mode)
+                for batch in batches:
+                    batch.sampling_info = Mock()
                 if chained:
                     # Finishing the request drains its already-launched lookahead
                     # before scheduling fresh work, allowing the loop to go idle.
@@ -303,6 +305,18 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.request_lists = lambda: {}
 
         self.assertEqual(scheduler.collect_inflight_reqs(), {req})
+
+    def test_processed_tokens_count_each_prefill_once(self):
+        # The aging counter must not grow when a prefill batch is reused for
+        # decode with a stale extend_num_tokens.
+        scheduler = self.make_scheduler([])
+        batch = self.make_batch(ForwardMode.EXTEND)
+        self.launch_batch(scheduler, batch, 0.0)
+        # As prepare_for_decode does: switch the mode, keep extend_num_tokens.
+        batch.forward_mode = ForwardMode.DECODE
+        for launch_ts in (0.1, 0.2, 0.3):
+            self.launch_batch(scheduler, batch, launch_ts)
+        self.assertEqual(scheduler.processed_tokens_counter, 1024)
 
     def test_a_prefill_is_not_charged_for_an_overlapping_earlier_one(self):
         # An overlapped launch can precede the previous prefill's result; the
@@ -646,7 +660,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
             return_value=(None, GenerationBatchResult(), Mock())
         )
-        scheduler._pp_pd_get_prefill_transferred_ids = Mock(return_value=None)
         scheduler._pp_pd_get_retract_ids = Mock(return_value=None)
         scheduler._pp_pd_get_prealloc_ids = Mock(return_value=None)
         scheduler._pp_pd_get_decode_transferred_ids = Mock(return_value=None)

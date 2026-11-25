@@ -9,7 +9,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=2, suite="base-a-test-npu")
+register_npu_ci(est_time=2, suite="extra-a-test-npu")
 
 
 @pytest.mark.parametrize("hidden_size", [256, 5120, 8192])
@@ -75,7 +75,8 @@ def test_srt_falls_back_to_torch_npu_on_wheels_without_the_provider():
     source = Path(layernorm_module.__file__).read_text(encoding="utf-8")
     guarded_import = re.search(
         r"try:\s*\n"
-        r"\s*from sgl_kernel_npu\.norm\.gemma_rmsnorm import npu_gemma_rms_norm\s*\n"
+        r"\s*from sgl_kernel_npu\.operators\.norm import gemma_rmsnorm"
+        r" as npu_gemma_rms_norm\s*\n"
         r"\s*except ImportError:\s*\n"
         r"(?:\s*#.*\n)*"
         r"\s*npu_gemma_rms_norm = torch_npu\.npu_gemma_rms_norm\s*\n",
