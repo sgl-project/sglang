@@ -1,20 +1,5 @@
 export const benchmarks = [
   {
-    match: { hw: "b200", mtp: "nextn" },
-    sglang_version: "14290c76749e7c878cb95e01a8479ad407009979",
-    latencyPercentile: "Mean",
-    notes: "2× B200, TP2, MTP (NEXTN: 3 steps, top-k 1, 4 draft tokens; FlashInfer MLA draft backend, page size 1), native 256K-token RoPE configuration. Random prompts with fixed lengths, --flush-cache, 32 requests at concurrency 1 and 64 at concurrency 16. Output throughput: 235.89 tok/s (2048/512, c1), 238.62 tok/s (8192/1024, c1), 1451.78 tok/s (8192/1024, c16); no gain over standard decoding on random prompts. GSM8K: one full run, 1317 stop / 2 length / 0 error, accept length 2.81.",
-    speed: [
-      { workload: { dataset: "random", isl: 2048, osl: 512, max_concurrency: 1, num_prompts: 32 },
-        ttft_ms: 113.48, tpot_ms: 4.02, tokens_per_sec_per_gpu: 589.72 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 32 },
-        ttft_ms: 226.17, tpot_ms: 3.97, tokens_per_sec_per_gpu: 1073.81 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 64 },
-        ttft_ms: 814.46, tpot_ms: 9.65, tokens_per_sec_per_gpu: 6532.99 },
-    ],
-    accuracy: { gsm8k_pct: 97.04, stop_rate_pct: 99.85 },
-  },
-  {
     match: { hw: "b200", mtp: "off" },
     sglang_version: "79a90bb075d916218cc7e3bd493e676563f1d77f",
     latencyPercentile: "Mean",
