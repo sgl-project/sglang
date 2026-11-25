@@ -974,6 +974,7 @@ def extend_attention_fwd(
     extend_seq_lens_cpu=None,
     identity_kv_indices: bool = False,
     bf16_dot: bool = False,
+    dflash_block_dp: bool = False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -991,6 +992,8 @@ def extend_attention_fwd(
     ``bf16_dot``: with an FP8 cache and BF16 q, upcast the cached K/V and run the
     prefix dots in BF16 instead of casting q and the probabilities to FP8 (no FP8
     prefix or zero-prefix kernel). No effect on a BF16 cache.
+    ``dflash_block_dp``: attention DP, where a rank holds all 8 KV heads of a DFlash
+    draft: its block runs on the split-KV kernel too.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -1011,7 +1014,9 @@ def extend_attention_fwd(
         _use_dflash_block_splitkv
         and 1 <= batch_size <= 64
         and Lq == Lk == Lv == 128
-        and k_extend.shape[1] in (1, 2)
+        and (
+            k_extend.shape[1] in (1, 2) or (dflash_block_dp and k_extend.shape[1] == 8)
+        )
         and head_num == 8 * k_extend.shape[1]
         and max_len_extend == 8
         and q_extend.shape[0] == batch_size * 8
@@ -1056,7 +1061,9 @@ def extend_attention_fwd(
             kscale=k_scale,
             vscale=v_scale,
             softmax_scale=sm_scale,
-            splits=8 if k_extend.shape[1] == 2 or wide else 16,
+            # per (request, KV head): 16 at 1 KV head; 8 from 2, where a DP rank's 8 KV heads launch what a TP4
+            # rank does with four times the requests
+            splits=8 if k_extend.shape[1] >= 2 or wide else 16,
             pv_bf16=True,
             out=o_extend,
             window_left=sliding_window_size,

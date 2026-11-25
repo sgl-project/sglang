@@ -88,6 +88,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.rocm_muse_spark import (
+    dp_ep,
     finalize_allreduce,
     mxfp4_moe,
     router_pooler,
@@ -440,6 +441,27 @@ _PREFILL_GEMM_TUNABLEOP = (
     if mxfp4_moe._is_gfx1250()
     else None
 )
+
+
+def _register_dp_tp1_gemms(fp8_shapes, rowmajor_shapes):
+    """Attention DP: the unsharded QKV + gate on the FP8 small-M GEMM (SGLANG_ROCM_MUSE_DP_QKV_FP8) and the O
+    projection on the BF16 row-major small-M GEMM (SGLANG_ROCM_MUSE_DP_O_ROWMAJOR), with their tuned launches."""
+    if _DENSE_FP8 and envs.SGLANG_ROCM_MUSE_DP_QKV_FP8.get():
+        from sglang.kernels.ops.gemm import fp8w_small_m_gemm
+
+        launches = fp8w_small_m_gemm.DP_TP1_CONFIGS
+        fp8w_small_m_gemm.CONFIGS.update(launches)
+        fp8_shapes += tuple({key[:2] for key in launches})
+    if envs.SGLANG_ROCM_MUSE_DP_O_ROWMAJOR.get():
+        from sglang.kernels.ops.gemm import bf16_tiled_small_m_gemm
+
+        launches = bf16_tiled_small_m_gemm.DP_TP1_ROW_MAJOR
+        bf16_tiled_small_m_gemm.ROW_MAJOR.update(launches)
+        bf16_tiled_small_m_gemm.ROW_MAJOR_ROT.update(
+            bf16_tiled_small_m_gemm.DP_TP1_ROW_MAJOR_ROT
+        )
+        rowmajor_shapes += tuple({key[:2] for key in launches})
+    return fp8_shapes, rowmajor_shapes
 
 
 @contextlib.contextmanager
@@ -1198,6 +1220,16 @@ class MuseSpark1xMoE(nn.Module):
                 self.expert_hidden_size,
                 self.intermediate_size,
             )
+        # Attention DP: this rank's rows reach the other ranks' experts through MORI-EP, see dp_ep.
+        self.dp_ep = None
+        if dp_ep.enabled():
+            if nvfp4_checkpoint:
+                raise NotImplementedError(
+                    "Muse Spark attention DP on ROCm runs BF16 and Quark MXFP4 experts"
+                )
+            self.dp_ep = dp_ep.expert_dispatch(
+                self.expert_hidden_size, self.num_experts, self.top_k
+            )
         # Collective and allocating: built at model construction, never under graph capture.
         self._finalize_ar = (
             finalize_allreduce.ensure_finalize_allreduce(
@@ -1205,6 +1237,7 @@ class MuseSpark1xMoE(nn.Module):
                 torch.device("cuda", torch.cuda.current_device()),
             )
             if _FINALIZE_AR_PUSH
+            and self.dp_ep is None
             and _is_rocm()
             and mxfp4_moe.COMPACT_A4_ENABLED
             and self.mxfp4_checkpoint
@@ -1248,6 +1281,13 @@ class MuseSpark1xMoE(nn.Module):
         reduced expert output before the unpooler (fused into the next boundary).
         ``x_fp8`` = (per-row FP8 copy, scales) of ``hidden_states`` for the FP8 pooler;
         ``prefill_fp8`` runs the pooler / unpooler on their FP8 copies (prefill widths)."""
+        if self.dp_ep is not None:
+            return self.forward_dp_ep(
+                hidden_states,
+                skip_post_expert_proj=skip_post_expert_proj,
+                x_fp8=x_fp8,
+                prefill_fp8=prefill_fp8,
+            )
         quantize_a4 = sp is None and self.uses_compact_a4(
             hidden_states.shape[0], target_verify
         )
@@ -1387,6 +1427,54 @@ class MuseSpark1xMoE(nn.Module):
             return output
         return self.unpool(output, prefill_fp8=prefill_fp8)
 
+    def forward_dp_ep(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        skip_post_expert_proj: bool = False,
+        x_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prefill_fp8: bool = False,
+    ) -> torch.Tensor:
+        """MoE under attention DP (``dp_ep``): ``hidden_states`` are this rank's own rows. They go to the ranks
+        holding their experts, this rank's experts run the rows it received, and the partial sums return to their
+        sources; arguments and result as in ``forward``."""
+        topk_scores, topk_ids, expert_input, _ = self.route(
+            hidden_states, x_fp8=x_fp8, prefill_fp8=prefill_fp8
+        )
+        # Rows padding a captured batch are not sent.
+        dp_ep.drop_padding_rows(topk_ids)
+        output = self._exchange_dp_ep(expert_input, topk_scores, topk_ids)
+        if skip_post_expert_proj:
+            return output
+        return self.unpool(output, prefill_fp8=prefill_fp8)
+
+    def serve_peers(self) -> None:
+        """Attention DP, a step in which this rank holds no rows: its experts still run the rows its peers send."""
+        device = self.expert_bias.device
+        self._exchange_dp_ep(
+            torch.empty(
+                (0, self.expert_hidden_size), dtype=torch.bfloat16, device=device
+            ),
+            torch.empty((0, self.top_k), dtype=torch.float32, device=device),
+            torch.empty((0, self.top_k), dtype=torch.int32, device=device),
+        )
+
+    def _exchange_dp_ep(self, expert_input, topk_scores, topk_ids) -> torch.Tensor:
+        """Dispatch this rank's routed rows, run this rank's experts on the received ones, combine: the reduced
+        expert output of this rank's rows, before the unpooler."""
+        received = self.dp_ep.dispatch(expert_input, topk_scores, topk_ids)
+        # The receive view mixes the ranks' rows: compact A4 while every rank verifies, a4w4 once one extends.
+        verify = dp_ep.verify_step()
+        partial = self.run_experts(
+            received.rows,
+            received.scores,
+            received.ids,
+            verify,
+            self.uses_a4w4(received.rows.shape[0], verify),
+            num_local_tokens=received.total,
+        )
+        return self.dp_ep.combine(partial)
+
     def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.router_weight_ek is not None and router_gemm_tlx_supported(
             hidden_states, self.router_weight_ek
@@ -1494,10 +1582,13 @@ class MuseSpark1xMoE(nn.Module):
         quantized=None,
         routed_mx=None,
         push=None,
+        num_local_tokens=None,
     ):
         """This rank's experts over all given rows; per-token partial sums before the TP reduction. ``routed_mx``:
         the gathered packed rows (``sp_gather_routed_mx(mx=True)``) in place of ``expert_input``; ``push``: the
-        gfx1250 finalize pushes the sums to their owners (``mxfp4_moe.run_gfx1250_a8w4``)."""
+        gfx1250 finalize pushes the sums to their owners (``mxfp4_moe.run_gfx1250_a8w4``). ``num_local_tokens``:
+        a one-element device count of the leading rows that are live (a MORI-EP receive view); the rows past it
+        carry expert id -1."""
         if use_a4w4 and getattr(self.experts, "gfx1250_a8w4", None) is not None:
             norm_weight, gain, has_norm = _post_expert_norm_args(self.post_expert_norm)
             assert has_norm and norm_weight is not None
@@ -1527,6 +1618,7 @@ class MuseSpark1xMoE(nn.Module):
                 self.post_expert_norm.eps,
                 gain,
                 quantized=quantized,
+                num_local_tokens=num_local_tokens,
             )
         if self.uses_compact_a4(expert_input.shape[0], target_verify):
             norm_weight, gain, has_norm = _post_expert_norm_args(self.post_expert_norm)
@@ -1872,11 +1964,16 @@ class MuseSpark1xModel(nn.Module):
         # Layer indices whose output residual stream feeds the DFLASH draft
         # context (set through MuseSparkTextForCausalLM.set_dflash_layers_to_capture).
         self.layers_to_capture: list[int] = []
+        # Attention DP: every rank runs its own requests at attention TP1, see dp_ep.
+        self.dp_ep = dp_ep.enabled()
+        if self.dp_ep:
+            dp_ep.validate()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             quant_config=None,
             prefix=add_prefix("embed_tokens", prefix),
+            use_attn_tp_group=self.dp_ep,
         )
         self.embed_norm = MuseSpark1xRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, has_weight=False
@@ -1929,7 +2026,11 @@ class MuseSpark1xModel(nn.Module):
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         sp = None
-        if self._ffn_boundaries is not None:
+        if self.dp_ep:
+            num_tokens = (input_ids if input_embeds is None else input_embeds).shape[0]
+            if forward_batch.forward_mode.is_idle() or num_tokens == 0:
+                return self._serve_peers(num_tokens)
+        elif self._ffn_boundaries is not None:
             # Long plain prefills and wide verify batches: every rank keeps a 1/TP token shard of the stream.
             num_tokens = (input_ids if input_embeds is None else input_embeds).shape[0]
             sp = sp_shape(forward_batch, num_tokens, self.config.hidden_size * 2)
@@ -1996,6 +2097,20 @@ class MuseSpark1xModel(nn.Module):
             hidden_states = self.norm(norm_input).to(torch.bfloat16)
         if self.layers_to_capture:
             return hidden_states, aux_hidden_states
+        return hidden_states
+
+    def _serve_peers(self, rows: int):
+        """Attention DP, a step in which this rank holds no rows (idle; ``rows`` counts the padding of its batch):
+        only the MoE layers run, on the rows the peers dispatch here. Returns what ``forward`` returns, zeroed."""
+        for layer in self.layers:
+            layer.mlp.serve_peers()
+        hidden_states = torch.zeros(
+            (rows, self.config.hidden_size),
+            dtype=torch.bfloat16,
+            device=self.norm.weight.device,
+        )
+        if self.layers_to_capture:
+            return hidden_states, [hidden_states for _ in self.layers_to_capture]
         return hidden_states
 
 
@@ -2114,9 +2229,14 @@ class MuseSparkTextForCausalLM(nn.Module):
         fp8_shapes = _FP8W_LINEAR_SHAPES + (
             _ROWMAJOR_LINEAR_SHAPES if _PREFILL_DENSE_FP8 else ()
         )
+        rowmajor_shapes = _ROWMAJOR_LINEAR_SHAPES
+        if dp_ep.enabled():
+            fp8_shapes, rowmajor_shapes = _register_dp_tp1_gemms(
+                fp8_shapes, rowmajor_shapes
+            )
         register_gfx950_unquantized_gemm_shapes(
             tiled_weights=tuple(TILED_GEMM_LAYOUT),
-            rowmajor_weights=_ROWMAJOR_LINEAR_SHAPES,
+            rowmajor_weights=rowmajor_shapes,
             fp8_weights=fp8_shapes if _DENSE_FP8 else (),
             triton_a16w16=_DRAFT_TRITON_A16W16_GEMMS,
         )
@@ -2151,7 +2271,7 @@ class MuseSparkTextForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=None,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=False,
+            use_attn_tp_group=dp_ep.enabled(),
         )
         if config.tie_word_embeddings:
             self.lm_head.tie_weights(self.model.embed_tokens)
@@ -2552,9 +2672,11 @@ class MuseSparkTextForCausalLM(nn.Module):
                         proj.small_m_tiled_weight = prepare_tiled_weight(
                             proj.weight.data
                         )
-        if ulysses_enabled():
+        if ulysses_enabled() and not dp_ep.enabled():
             for layer in self.model.layers:
                 prepare_ulysses(layer.self_attn, fp8=_PREFILL_DENSE_FP8)
+        if moe_layers and moe_layers[0].dp_ep is not None:
+            moe_layers[0].dp_ep.prepare()
         if _PREFILL_DENSE_FP8:
             for moe in moe_layers:
                 _prepare_prefill_fp8_projections(moe)

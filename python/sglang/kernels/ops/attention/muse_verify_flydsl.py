@@ -877,10 +877,13 @@ def verify_fly_partials(
     return part, maxi, den
 
 
-def pick_splits_flydsl(num_seqs: int, kv_heads: int) -> tuple[int, int]:
+def pick_splits_flydsl(
+    num_seqs: int, kv_heads: int, groups: int = 1
+) -> tuple[int, int]:
     """(partials split dimension, working splits): one workgroup per CU on MI355X (256 CUs), e.g. 64 at 4
-    requests, 32 at 8, 21 of 32 at 12, 16 at 16; the split dimension is a power of two for the reduce kernels."""
-    work = max(1, min(256 // max(num_seqs, 1), 128))
+    requests, 32 at 8, 21 of 32 at 12, 16 at 16; the split dimension is a power of two for the reduce kernels.
+    Each of a request's ``groups`` KV head groups takes a workgroup per split."""
+    work = max(1, min(256 // max(num_seqs * groups, 1), 128))
     splits = 1 << (work - 1).bit_length()
     return splits, work
 
@@ -897,10 +900,12 @@ def gqa_verify_flydsl(
     v_descale,
     *,
     defer_reduce=False,
+    heads_per_group=None,
 ):
     """Full-attention verify (exact BF16 QK / PV) on the FlyDSL kernel, merged by ``_vv2_reduce`` into ``out``
     unless ``defer_reduce`` returns the (partial, maximum, denom) for the caller's merge. MI355X TP4 n8: 123 us
-    (4.75 TB/s) vs 158 us for the Triton pair kernel in the same harness."""
+    (4.75 TB/s) vs 158 us for the Triton pair kernel in the same harness. ``heads_per_group`` (default: all the
+    rank's KV heads) is the KV heads one workgroup runs."""
     import torch
 
     from sglang.kernels.ops.attention.gqa_verify_splitkv_2kv import _vv2_reduce
@@ -912,10 +917,11 @@ def gqa_verify_flydsl(
         seqused_k = seqused_k.to(torch.int32)
     if block_table.dtype != torch.int32:
         block_table = block_table.to(torch.int32)
-    splits, work = pick_splits_flydsl(num_seqs, k.shape[2])
+    kvh = k.shape[2]
+    splits, work = pick_splits_flydsl(num_seqs, kvh, kvh // (heads_per_group or kvh))
     partial, maximum, denom = verify_fly_partials(
         q, k, v, seqused_k, block_table, softmax_scale, k_descale, splits,
-        waves_per_eu=1, fence_vmem=True, wg_per_cu=1, work_splits=work,
+        waves_per_eu=1, heads_per_group=heads_per_group, fence_vmem=True, wg_per_cu=1, work_splits=work,
     )  # fmt: skip
     if defer_reduce:
         return partial, maximum, denom

@@ -28,6 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +48,20 @@ class _KVWriteTarget(NamedTuple):
     cos_sin: torch.Tensor | None
 
 
-def _attention_shape_ok(attention, forward_batch: ForwardBatch) -> bool:
+def _attention_shape_ok(
+    attention, forward_batch: ForwardBatch, dp_heads: bool = False
+) -> bool:
+    """``dp_heads``: the kernel also takes the 16 KV heads of an attention-DP rank."""
     return (
         attention.head_dim == 64
-        and attention.num_kv_heads in (2, 4)
+        and (
+            attention.num_kv_heads in (2, 4)
+            or (
+                dp_heads
+                and attention.num_kv_heads == 16
+                and get_parallel().attn_dp_enabled
+            )
+        )
         and attention.num_heads == 8 * attention.num_kv_heads
         and attention.use_qk_norm
         and not attention.use_attn_temperature_tuning
@@ -180,7 +191,7 @@ def qk_norm_rope_kv_write(
         0 < q.shape[0] <= QK_ROPE_CACHE_MAX_ROWS
         and q.dtype == k.dtype == v.dtype == torch.bfloat16
         and q.stride(1) == k.stride(1) == v.stride(1) == 1
-        and _attention_shape_ok(attention, forward_batch)
+        and _attention_shape_ok(attention, forward_batch, dp_heads=True)
     ):
         return None
     target = _kv_write_target(attention, forward_batch)

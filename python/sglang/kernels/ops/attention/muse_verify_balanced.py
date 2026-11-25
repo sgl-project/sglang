@@ -308,6 +308,7 @@ def swa_verify_flydsl(
     *,
     window,
     defer_reduce=False,
+    heads_per_group=None,
 ):
     """Sliding-layer verify on the FlyDSL kernel: fixed splits over each request's window (every window has the same
     length, so no plan), two workgroups per CU. Faster than the Triton kernels from 16 requests at 4 KV heads per
@@ -321,11 +322,14 @@ def swa_verify_flydsl(
         seqused_k = seqused_k.to(torch.int32)
     if block_table.dtype != torch.int32:
         block_table = block_table.to(torch.int32)
-    work = 16 if num_seqs <= 16 else (8 if num_seqs <= 32 else 4)
+    # with ``heads_per_group`` each split takes one workgroup per KV head group
+    load = num_seqs * (k.shape[2] // heads_per_group if heads_per_group else 1)
+    work = 16 if load <= 16 else (8 if load <= 32 else 4)
     splits = work
     partial, maximum, denom = verify_fly_partials(
         q, k, v, seqused_k, block_table, softmax_scale, k_descale, splits,
-        waves_per_eu=1, fence_vmem=True, wg_per_cu=2, work_splits=work, window=window,
+        waves_per_eu=1, heads_per_group=heads_per_group, fence_vmem=True, wg_per_cu=2, work_splits=work,
+        window=window,
     )  # fmt: skip
     if defer_reduce:
         return partial, maximum, denom
@@ -335,10 +339,11 @@ def swa_verify_flydsl(
     return out
 
 
-def use_balanced_full(num_seqs: int, kv_heads: int) -> bool:
-    # the plan holds at most MAX_REQUESTS requests; larger batches keep the per-request splits
-    return (4 if kv_heads >= 4 else 6) <= num_seqs <= MAX_REQUESTS
+def use_balanced_full(num_seqs: int, kv_heads: int, groups: int = 1) -> bool:
+    # the plan holds at most MAX_REQUESTS requests; larger batches keep the per-request splits. The lower bounds of
+    # both rules count the requests x KV head groups (workgroups per split).
+    return (4 if kv_heads >= 4 else 6) <= num_seqs * groups and num_seqs <= MAX_REQUESTS
 
 
-def use_flydsl_sliding(num_seqs: int, kv_heads: int) -> bool:
-    return num_seqs >= (16 if kv_heads >= 4 else 48)
+def use_flydsl_sliding(num_seqs: int, kv_heads: int, groups: int = 1) -> bool:
+    return num_seqs * groups >= (16 if kv_heads >= 4 else 48)

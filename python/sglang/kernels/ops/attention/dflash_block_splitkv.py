@@ -1,5 +1,5 @@
 """Split-KV attention for a DFlash draft block: 8 query rows x 8 heads per KV head (1 KV head per rank at TP8,
-2 at TP4), head_dim 128, non-causal.
+2 at TP4, all 8 under attention DP), head_dim 128, non-causal.
 
 Each request's block attends to its FP8 prefix cache (paged through ``kv_indptr`` / ``kv_indices``, left window
 ``window_left``) and to the block's own BF16 K/V. The prefix is split across workgroups; FP32 partials are merged
@@ -167,7 +167,7 @@ def dflash_block_splitkv(
     kvh = ke.shape[1]
     if not (
         q.dtype == ke.dtype == ve.dtype == torch.bfloat16
-        and kvh in (1, 2)
+        and kvh in (1, 2, 8)
         and q.shape[1:] == (8 * kvh, 128)
         and ke.shape == ve.shape == (q.shape[0], kvh, 128)
         and kb.dtype == vb.dtype == torch.float8_e4m3fn
@@ -181,7 +181,7 @@ def dflash_block_splitkv(
         and all(t.stride(-1) == 1 for t in (q, ke, ve, kb, vb))
     ):
         raise ValueError(
-            "DFlash split-KV requires flat 8Q/8 heads per KV head/1-2 KV/HD128 mixed BF16/FP8 tensors"
+            "DFlash split-KV requires flat 8Q/8 heads per KV head/1, 2 or 8 KV/HD128 mixed BF16/FP8 tensors"
         )
     rows = q.shape[0] * q.shape[1]
     part = torch.empty((rows, splits, 128), device=q.device, dtype=torch.float32)

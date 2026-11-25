@@ -183,6 +183,7 @@ class TritonAttnBackend(AttentionBackend):
 
     # Set for gfx950 draft workers by triton_draft_hip.init_draft_backend.
     draft_bf16_dot: bool = False
+    draft_block_dp: bool = False
     # Set for the monokernel's DFLASH MLA draft by triton_draft_hip.init_draft_backend.
     verify_mla_draft_fwd: Optional[Callable[..., bool]] = None
     runs_decode: bool = True
@@ -2078,6 +2079,7 @@ class TritonAttnBackend(AttentionBackend):
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             bf16_dot=self.draft_bf16_dot,
+            dflash_block_dp=self.draft_block_dp,
         )
         return o
 

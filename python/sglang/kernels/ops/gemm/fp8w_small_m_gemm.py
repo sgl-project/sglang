@@ -38,6 +38,13 @@ CONFIGS = {
     (2304, 8192, 64): (64, 256, 4, 8, 3),
     (2304, 8192, 128): (64, 256, 4, 4, 3),
 }
+# The attention-DP rank's unsharded QKV + gate [18432, 8192] at decode / verify widths; merged into CONFIGS by the
+# model only under SGLANG_ROCM_MUSE_DP_QKV_FP8.
+DP_TP1_CONFIGS = {
+    (18432, 8192, 32): (64, 256, 4, 4, 3),
+    (18432, 8192, 64): (128, 256, 1, 4, 3),
+    (18432, 8192, 128): (256, 128, 2, 4, 3),
+}
 
 
 @triton.jit
