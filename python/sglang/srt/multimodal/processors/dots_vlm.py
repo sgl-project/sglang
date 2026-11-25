@@ -28,22 +28,6 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         self.IM_START_TOKEN_ID = self.im_start_id
         self.IM_END_TOKEN_ID = self.im_end_id
 
-        vision_config = hf_config.vision_config
-        patch_size = vision_config.patch_size
-        merge_size = vision_config.spatial_merge_size
-
-        self.IMAGE_FACTOR = patch_size * merge_size
-        self.MIN_PIXELS = getattr(
-            _processor.image_processor,
-            "min_pixels",
-            getattr(_processor.image_processor, "size", {}).get("shortest_edge"),
-        )
-        self.MAX_PIXELS = getattr(
-            _processor.image_processor,
-            "max_pixels",
-            getattr(_processor.image_processor, "size", {}).get("longest_edge"),
-        )
-        self.MAX_RATIO = 200
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
             image_token_id=self.image_token_id,
