@@ -394,6 +394,30 @@ class _ExpertWeightAdapter:
             for layout in self._layouts
         ]
 
+    def transfer_signature(self, weights: list[torch.Tensor]) -> tuple:
+        """Describe how each expert's bytes are interpreted, independent of rank."""
+        fields = []
+        for weight, layout in zip(weights, self._layouts, strict=True):
+            nz_row = None
+            if layout.npu_format not in _BASE_FORMATS:
+                import torch_npu
+
+                backing = torch_npu._C._tensor_construct_from_storage(
+                    weight.untyped_storage()
+                )
+                nz_row = (backing.dtype, tuple(backing.shape[1:]))
+            fields.append(
+                (
+                    layout.shape,
+                    weight.stride(),
+                    layout.dtype,
+                    layout.npu_format,
+                    layout.expert_byte_shape,
+                    nz_row,
+                )
+            )
+        return tuple(fields)
+
     def make_weight_views(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         """Return writable aliases of the routed experts, without copying weights."""
         return [

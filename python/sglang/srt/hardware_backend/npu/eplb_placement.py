@@ -348,18 +348,24 @@ def _balance_recorded_steps(
         for layer, candidate in zip(batch, candidates, strict=True):
             candidate_score, _ = evaluate(layer, candidate)
             improvement = 1 - (candidate_score / baseline[layer]).mean()
-            if improvement <= 1e-12:
-                continue
             live = current[layer].numpy().reshape(slots.shape)
-            targets = (ids[layer, order[layer]], ids[layer, candidate])
-            if not all(
-                _migration_gain(samples[:, layer], live, target) for target in targets
-            ):
+            target = ids[layer, candidate]
+            if not _migration_gain(samples[:, layer], live, target):
                 continue
-            rows = [
-                _min_remote_rows(live, target, logical.shape[1]) for target in targets
-            ]
-            alternatives.append((rows[1] - rows[0], improvement, layer, candidate))
+            primary = ids[layer, order[layer]]
+            primary_gain = _migration_gain(samples[:, layer], live, primary)
+            if primary_gain and improvement <= 1e-12:
+                continue
+            extra = _min_remote_rows(live, target, logical.shape[1]) - _min_remote_rows(
+                live, primary, logical.shape[1]
+            )
+            if not primary_gain:
+                # A rejected primary bounds the fallback's cost but saves no rows
+                # that could pay for another layer's migration.
+                if extra <= 0:
+                    order[layer] = candidate
+                continue
+            alternatives.append((extra, improvement, layer, candidate))
 
     # Apply row savings first, then spend them in order of gain per extra row.
     credit = 0

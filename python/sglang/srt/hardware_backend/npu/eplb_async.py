@@ -364,6 +364,11 @@ class NpuEplbRuntime:
         )
         self.layer_ids = tuple(sorted(weights))
         adapter = _ExpertWeightAdapter(weights, list(self.layer_ids), rank)
+        weight_formats = hashlib.sha256()
+        for layer in self.layer_ids:
+            fields = adapter.transfer_signature(weights[layer])
+            weight_formats.update(repr(fields).encode("ascii"))
+        self.weight_format_digest = weight_formats.digest()
         self.weights = {
             layer: adapter.make_weight_views(weights[layer]) for layer in self.layer_ids
         }
@@ -587,7 +592,12 @@ class NpuEplbRuntime:
 
 def create_npu_async_eplb(model_config, weights, metadata):
     from sglang.srt.eplb.eplb_algorithms import compute_algorithm
-    from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
+    from sglang.srt.runtime_context import (
+        get_disagg,
+        get_exec,
+        get_parallel,
+        reports_expert_balancedness,
+    )
 
     parallel = get_parallel()
     world_size = dist.get_world_size()
@@ -635,13 +645,16 @@ def create_npu_async_eplb(model_config, weights, metadata):
             )
         signature = (
             runtime.layer_ids,
-            tuple(tuple(t.shape) for t in runtime.staging),
+            runtime.weight_format_digest,
             borrow_world_group,
             order_submissions,
             runtime._p2p_batch_size,
             p2p_buffer_mib,
             moe.eplb_rebalance_num_iterations,
             moe.expert_distribution_recorder_buffer_size,
+            moe.eplb_min_rebalancing_utilization_threshold
+            if reports_expert_balancedness()
+            else None,
             spec,
             metadata.num_logical_experts,
             hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
@@ -654,8 +667,8 @@ def create_npu_async_eplb(model_config, weights, metadata):
         raise RuntimeError("Async EPLB setup failed on at least one rank") from error
     if any(s != signature for s in signatures):
         raise ValueError(
-            "Async EPLB ranks disagree on transport, layout, weight geometry, "
-            "batching, rebalance interval or recorder window"
+            "Async EPLB ranks disagree on transport, placement, expert weight format, "
+            "batching or recorder configuration"
         )
     # All ranks must agree before any enters a conditional HCCL group creation.
     if not borrow_world_group:
