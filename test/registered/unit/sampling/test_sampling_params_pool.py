@@ -199,7 +199,11 @@ class TestSeeds(_PoolTestCase):
         self.assertEqual(_gather(pool, [1]).sampling_seed.tolist(), [123])
         self.assertIsNone(_gather(pool, [2]).sampling_seed)
         self.assertIsNone(_gather(pool, []).sampling_seed)
+        # The algorithm is fixed per server; a new pool, so no cached gather
+        # outlives the change.
         self.spec_ns.speculative_algorithm = "EAGLE"
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool.write([_req(1, seed=123, top_k=50)])
         self.assertIsNone(_gather(pool, [1]).sampling_seed)
 
     def test_unseeded_row_samples_with_its_filler_seed(self):
@@ -271,6 +275,52 @@ class TestPenaltyIndices(_PoolTestCase):
 
         self.assertEqual(info.step_penalties.batch_indices.tolist(), [1])
         self.assertEqual(info.step_penalties.penalty_indices.tolist(), [0])
+
+    def test_unchanged_batch_reuses_its_params_until_a_write(self):
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool.write([_req(1, temperature=0.7), _req(4, top_k=1)])
+
+        first = _gather(pool, [1, 4])
+        again = _gather(pool, [1, 4])
+        self.assertIs(again.temperatures, first.temperatures)
+        self.assertIs(again.top_ks, first.top_ks)
+        self.assertIsNot(_gather(pool, [4, 1]).temperatures, first.temperatures)
+
+        after_slot_change = _gather(pool, [1, 4])
+        self.assertIsNot(after_slot_change.temperatures, first.temperatures)
+        pool.write([_req(4, temperature=1.2)])
+        params = _gather(pool, [1, 4])
+        self.assertIsNot(params.temperatures, after_slot_change.temperatures)
+        self.assertAlmostEqual(params.temperatures[1].item(), 1.2, places=6)
+        self.assertFalse(params.is_any_greedy)
+
+    def test_unchanged_batch_takes_each_steps_penalties(self):
+        """A reused gather still builds the step's penalties from the counts the
+        previous step committed."""
+        penalty_pool = PenaltyStatusPool(vocab_size=8, device=DEVICE)
+        req = _req(2)
+        req.output_ids = []
+        req.sampling_params.frequency_penalty = 0.5
+        req.sampling_params.presence_penalty = 0.0
+        req.sampling_params.repetition_penalty = 1.0
+        req.sampling_params.min_new_tokens = 0
+        penalty_pool.alloc([req])
+        penalty_pool.reset_history([req])
+        pool = SamplingParamsPool(
+            num_rows=NUM_ROWS, device=DEVICE, penalty_status_pool=penalty_pool
+        )
+        pool.write([_req(3), req])
+
+        first = _gather(pool, [3, 2])
+        additive, _ = first.step_penalties.logit_penalties()
+        self.assertEqual(additive[1].tolist(), [0.0] * 8)
+        first.step_penalties.commit(torch.tensor([0, 5]))
+
+        second = _gather(pool, [3, 2])
+        self.assertIs(second.temperatures, first.temperatures)
+        additive, _ = second.step_penalties.logit_penalties()
+        self.assertEqual(additive[1, 5].item(), -0.5)
+        self.assertEqual(additive[0].tolist(), [0.0] * 8)
 
 
 class TestSlotLifecycle(_PoolTestCase):

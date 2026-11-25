@@ -8,6 +8,9 @@ penalty index, its seed, and the watermark algorithm's per-request values.
   launch's gather runs before a later admission rewrites a reused slot.
 - The host keeps what the batch-level flags and counts need, so a launch derives
   them without a pass over its requests or a device sync.
+- A launch over the same slots as the previous gather, with no write since,
+  reuses that gather's tensors: a decode batch whose requests did not change
+  keeps one set of them. Callers must not write them in place.
 """
 
 from __future__ import annotations
@@ -35,7 +38,8 @@ if TYPE_CHECKING:
 
 class SamplingRows(NamedTuple):
     """One launch's state read from its rows of `SamplingParamsPool`, in batch
-    order; field names match `SamplingBatchInfo`'s."""
+    order; field names match `SamplingBatchInfo`'s. All fields but `step_penalties`
+    may be the previous launch's (see the module docstring)."""
 
     temperatures: torch.Tensor  # [bs, 1] fp32
     top_ps: torch.Tensor  # [bs] fp32
@@ -115,6 +119,9 @@ class SamplingParamsPool:
         self.has_seed_host = np.zeros(num_rows, dtype=bool)
         self.penalty_indices_host = np.full(num_rows, -1, dtype=np.int64)
         self.watermark_candidates_host = np.zeros(num_rows, dtype=bool)
+        # The last gather's slots, its rows without penalties, and its rows'
+        # penalty indices; a write invalidates it.
+        self._last_gather: Optional[tuple[bytes, SamplingRows, torch.Tensor]] = None
 
     def write(self, reqs: Sequence[Req]) -> None:
         """Fill each request's entry; runs after its penalty index is allocated."""
@@ -150,6 +157,7 @@ class SamplingParamsPool:
             host_values[self.WATERMARK : -1] = np.array(values, dtype=np.int32).T
         values = async_h2d_tensor(torch.from_numpy(host_values), self.table.device)
         self.table.index_copy_(1, values[-1].long(), values[:-1])
+        self._last_gather = None
 
     def gather(
         self, req_pool_indices: torch.Tensor, req_pool_indices_cpu: torch.Tensor
@@ -157,6 +165,24 @@ class SamplingParamsPool:
         slots = req_pool_indices_cpu.numpy()
         if slots.size == 0:
             return SamplingRows.empty(self.table.device)
+        key = slots.tobytes()
+        if self._last_gather is None or self._last_gather[0] != key:
+            self._last_gather = (key, *self._gather_rows(req_pool_indices, slots))
+        _, rows, penalty_indices = self._last_gather
+        # Built each step: a StepPenalties caches its step's penalties from the
+        # current counts.
+        return rows._replace(
+            step_penalties=StepPenalties.build(
+                self.penalty_status_pool,
+                penalty_indices,
+                self.penalty_indices_host[slots],
+            )
+        )
+
+    def _gather_rows(
+        self, req_pool_indices: torch.Tensor, slots: np.ndarray
+    ) -> tuple[SamplingRows, torch.Tensor]:
+        """The rows without penalties, and the rows' penalty indices."""
         top_ks = self.top_ks_host[slots]
         lo, hi = int(top_ks.min()), int(top_ks.max())
         # Each row of the [rows, bs] result is a contiguous [bs] tensor.
@@ -169,7 +195,7 @@ class SamplingParamsPool:
                 .view(torch.int64)
                 .view(-1)
             )
-        return SamplingRows(
+        rows = SamplingRows(
             temperatures=floats[self.TEMPERATURE].view(-1, 1),
             top_ps=floats[self.TOP_P],
             top_ks=values[self.TOP_K],
@@ -182,15 +208,12 @@ class SamplingParamsPool:
             npu_top_k_top_p_eligible=lo >= 1 and hi <= 1024,
             max_top_k=hi if lo >= 1 and hi < TOP_K_ALL else None,
             sampling_seed=seeds,
-            step_penalties=StepPenalties.build(
-                self.penalty_status_pool,
-                values[self.PENALTY_INDEX],
-                self.penalty_indices_host[slots],
-            ),
+            step_penalties=None,
             watermark=build_watermark_rows(
                 values[self.WATERMARK :], self.watermark_candidates_host[slots]
             ),
         )
+        return rows, values[self.PENALTY_INDEX]
 
 
 def _deterministic() -> bool:
