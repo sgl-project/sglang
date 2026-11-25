@@ -563,7 +563,7 @@ class TestTokenSpaceSGLangProcessor(CustomTestCase):
         publish(server_args, role="test")
         processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
             _ImageWidthStrategy, TokenSpaceServingSpec
-        )(None, server_args, _bare_tokenizer(), None)
+        )(SimpleNamespace(to_dict=dict), server_args, _bare_tokenizer(), None)
         self.addCleanup(processor.shutdown)
 
         def image_part(width):
