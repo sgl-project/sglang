@@ -23,13 +23,16 @@ _IMAGE_MODE_PRESETS = {
     "gundam": (1024, 640, True),
 }
 _DEFAULT_MODE = "gundam"
+_DEFAULT_MULTI_IMAGE_MODE = "base"
 
 
 def _resolve_mode(images_config, num_images: int = 1) -> dict:
     """Return processor kwargs from images_config (or default)."""
-    mode = _DEFAULT_MODE
-    if images_config:
-        mode = images_config.get("image_mode", _DEFAULT_MODE)
+    raw_mode = images_config.get("image_mode") if images_config else None
+    if raw_mode is None:
+        mode = _DEFAULT_MULTI_IMAGE_MODE if num_images > 1 else _DEFAULT_MODE
+    else:
+        mode = raw_mode
     key = mode.strip().lower()
     preset = _IMAGE_MODE_PRESETS.get(key)
     if preset is None:
@@ -86,6 +89,8 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
         """Process multimodal data asynchronously."""
+        if not image_data:
+            return None
         request_obj = kwargs.get("request_obj")
         images_config = (
             getattr(request_obj, "images_config", None) if request_obj else None
