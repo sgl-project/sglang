@@ -30,12 +30,15 @@ FFN_GRAPH_ROWS = (1, 4, 8, 16)
 FFN_GRAPH_VARIANT = "last_layer_ffn_"
 
 
-def eligible_batch(batch):
+def eligible_batch(batch, min_extend_tokens=0, *, input_embeds=None):
     """Fail closed unless every request finishes an ordinary prefill.
 
     CPU metadata is used for decisions; never synchronize a CUDA tensor here.
+    A None minimum disables pruning for unsupported model configurations.
     Static model/parallel/graph restrictions are checked by the model caller.
     """
+    if min_extend_tokens is None or input_embeds is not None:
+        return False
     # TBO splits/merges full token rows. Neither its parent nor a child may
     # compact the final FFN output until that layout contract is supported.
     if (
@@ -72,7 +75,12 @@ def eligible_batch(batch):
     # rows, whether the prefix came from a cache hit or an earlier chunk.
     if not lens or min(lens) <= 0 or min(prefixes) < 0 or not all(final):
         return False
-    if sum(lens) != batch.input_ids.shape[0] or sum(lens) <= len(lens):
+    total = sum(lens)
+    if (
+        total != batch.input_ids.shape[0]
+        or total <= len(lens)
+        or total < min_extend_tokens
+    ):
         return False
     return batch.extend_seq_lens is not None
 
@@ -101,14 +109,6 @@ def select_attention_rows(hidden_states, batch, indices):
     return residual_batch.import_replay_handoff(handoff, batch)
 
 
-def shape_allows_pruning(batch, min_extend_tokens):
-    """Apply the architecture token minimum, without limiting eager batch size."""
-    if min_extend_tokens is None:
-        return False
-    lens = batch.extend_seq_lens_cpu
-    return bool(lens) and sum(lens) >= min_extend_tokens
-
-
 def select_graph_token_buckets(model_type, capture_num_tokens):
     """Reuse server capture buckets at or above the architecture token minimum."""
     minimum = MIN_EXTEND_TOKENS[model_type]
@@ -130,9 +130,7 @@ def select_graph_row_buckets(max_running_requests):
 
 def graph_rows_for_batch(batch, min_extend_tokens):
     if (
-        not shape_allows_pruning(batch, min_extend_tokens)
-        or not eligible_batch(batch)
-        or batch.input_embeds is not None
+        not eligible_batch(batch, min_extend_tokens, input_embeds=batch.input_embeds)
         or getattr(batch, "return_pooled_hidden_states", False)
         or getattr(batch, "_original_forward_mode", None) == ForwardMode.MIXED
         or getattr(batch, "global_forward_mode", None) == ForwardMode.MIXED
@@ -160,7 +158,7 @@ def configure_last_layer_ffn(
     from sglang.srt.utils import is_cuda
 
     recognized = model_type in MIN_EXTEND_TOKENS
-    model._ffn_pruning_supported = (
+    supported = (
         supported_architecture
         and recognized
         and quant_config is None
@@ -172,11 +170,10 @@ def configure_last_layer_ffn(
         and get_exec().graph.cuda_graph_config.prefill.backend
         in (Backend.DISABLED, Backend.BREAKABLE)
     )
-    model.enable_last_layer_ffn_pruning = model._ffn_pruning_supported
-    if model._ffn_pruning_supported:
-        model.last_layer_ffn_min_extend_tokens = MIN_EXTEND_TOKENS[model_type]
-    else:
-        model.last_layer_ffn_min_extend_tokens = None
+    # The optional minimum is the single source of truth for model support.
+    model.last_layer_ffn_min_extend_tokens = (
+        MIN_EXTEND_TOKENS[model_type] if supported else None
+    )
 
 
 def prepare_last_layer_ffn(model, batch, *, get_embedding=False, input_embeds=None):
@@ -194,16 +191,14 @@ def prepare_last_layer_ffn(model, batch, *, get_embedding=False, input_embeds=No
     if (
         not graph_rows
         and not is_in_prefill_graph_scope()
-        and model.enable_last_layer_ffn_pruning
-        and model._ffn_pruning_supported
-        and shape_allows_pruning(batch, model.last_layer_ffn_min_extend_tokens)
+        and eligible_batch(
+            batch, model.last_layer_ffn_min_extend_tokens, input_embeds=input_embeds
+        )
         and not get_embedding
-        and input_embeds is None
         and not model.capture_aux_hidden_states
         and not model.model.layers_to_capture
         and not torch.compiler.is_compiling()
         and not torch.cuda.is_current_stream_capturing()
-        and eligible_batch(batch)
     ):
         batch.last_layer_ffn_indices = (
             torch.cumsum(batch.extend_seq_lens, dim=0) - 1

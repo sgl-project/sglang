@@ -5,10 +5,10 @@ import torch
 
 from sglang.srt.layers.last_layer_ffn import (
     FFN_GRAPH_ROWS,
+    eligible_batch,
     graph_rows_for_batch,
     select_graph_row_buckets,
     select_graph_token_buckets,
-    shape_allows_pruning,
     stage_graph_indices,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -94,10 +94,10 @@ class GraphTests(CustomTestCase):
     def test_graph_cap_does_not_limit_eager(self):
         for size, rows in [(5, 8), (8, 8), (9, 16), (16, 16), (17, 0), (32, 0)]:
             b = batch([512] * size)
-            self.assertTrue(shape_allows_pruning(b, 512))
+            self.assertTrue(eligible_batch(b, 512))
             self.assertEqual(graph_rows_for_batch(b, 512), rows)
-        self.assertFalse(shape_allows_pruning(batch([8] * 32), 512))
-        self.assertFalse(shape_allows_pruning(batch([512] * 32), None))
+        self.assertFalse(eligible_batch(batch([8] * 32), 512))
+        self.assertFalse(eligible_batch(batch([512] * 32), None))
 
     def test_large_variable_batch_indices_reset_padding(self):
         lengths = [100 + i for i in range(9)]
@@ -147,7 +147,6 @@ class GraphTests(CustomTestCase):
         runner._ffn_graph_token_buckets = frozenset({512, 2048, 4096, 8192})
         runner.model_runner = SimpleNamespace(
             model=SimpleNamespace(
-                enable_last_layer_ffn_pruning=True,
                 last_layer_ffn_min_extend_tokens=512,
             )
         )
@@ -166,9 +165,9 @@ class GraphTests(CustomTestCase):
         b.tbo_split_seq_index = 0
         self.assertIsNone(runner._shape_key(2048, b).variant_label)
         b.tbo_split_seq_index = None
-        runner.model_runner.model.enable_last_layer_ffn_pruning = False
+        runner.model_runner.model.last_layer_ffn_min_extend_tokens = None
         self.assertIsNone(runner._shape_key(2048, b).variant_label)
-        runner.model_runner.model.enable_last_layer_ffn_pruning = True
+        runner.model_runner.model.last_layer_ffn_min_extend_tokens = 512
         runner.model_runner.model.last_layer_ffn_min_extend_tokens = 2048
         runner._ffn_graph_token_buckets = frozenset({2048, 8192})
         self.assertIsNone(runner._shape_key(512, batch([512])).variant_label)

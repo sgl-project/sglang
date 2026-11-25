@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.last_layer_ffn import (
     configure_last_layer_ffn,
     eligible_batch,
+    prepare_last_layer_ffn,
     select_attention_rows,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -16,7 +17,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -80,8 +81,6 @@ class LastLayerFFNTests(CustomTestCase):
             for backend in (Backend.DISABLED, Backend.BREAKABLE):
                 with self.subTest(model_type=model_type, backend=backend):
                     model = self.configure_model(model_type=model_type, backend=backend)
-                    self.assertTrue(model._ffn_pruning_supported)
-                    self.assertTrue(model.enable_last_layer_ffn_pruning)
                     self.assertEqual(model.last_layer_ffn_min_extend_tokens, minimum)
 
     def test_unsupported_runtime_disables_pruning(self):
@@ -99,8 +98,6 @@ class LastLayerFFNTests(CustomTestCase):
         ]:
             with self.subTest(changes=changes):
                 model = self.configure_model(**changes)
-                self.assertFalse(model._ffn_pruning_supported)
-                self.assertFalse(model.enable_last_layer_ffn_pruning)
                 self.assertIsNone(model.last_layer_ffn_min_extend_tokens)
 
     def test_eligibility(self):
@@ -201,6 +198,118 @@ class LastLayerFFNTests(CustomTestCase):
             LogitsProcessor._get_pruned_states(
                 None, x, None, None, meta, already_pruned=True
             )
+
+
+class PrepareLastLayerFFNTests(CustomTestCase):
+    def setUp(self):
+        self.model = SimpleNamespace(
+            last_layer_ffn_min_extend_tokens=512,
+            capture_aux_hidden_states=False,
+            model=SimpleNamespace(layers_to_capture=[]),
+        )
+        self.batch = batch()
+        self.batch.extend_seq_lens_cpu = [300, 212]
+        self.batch.extend_seq_lens = torch.tensor([300, 212])
+        self.batch.input_ids = torch.arange(512)
+        self.batch.last_layer_ffn_indices = None
+        self.batch.last_layer_ffn_pruned = False
+        self.batch.last_layer_ffn_graph_rows = 0
+        self.scope = enter_scope(
+            self,
+            patch(
+                "sglang.srt.model_executor.runner_utils.prefill_graph.is_in_prefill_graph_scope",
+                return_value=False,
+            ),
+        )
+        self.compiling = enter_scope(
+            self, patch("torch.compiler.is_compiling", return_value=False)
+        )
+        self.capturing = enter_scope(
+            self, patch("torch.cuda.is_current_stream_capturing", return_value=False)
+        )
+
+    def assert_unpruned(self):
+        self.assertIsNone(self.batch.last_layer_ffn_indices)
+        self.assertFalse(self.batch.last_layer_ffn_pruned)
+
+    def test_eager_replans_and_clears_stale_selection_on_fallback(self):
+        self.assertEqual(prepare_last_layer_ffn(self.model, self.batch), 0)
+        self.assertEqual(self.batch.last_layer_ffn_indices.tolist(), [299, 511])
+        # Eager selection is planned here; the terminal boundary marks execution.
+        self.assertFalse(self.batch.last_layer_ffn_pruned)
+        self.batch.last_layer_ffn_pruned = True
+        self.batch.return_logprob = True
+        prepare_last_layer_ffn(self.model, self.batch)
+        self.assert_unpruned()
+        self.batch.return_logprob = False
+        self.batch.extend_seq_lens_cpu = [256, 256]
+        self.batch.extend_seq_lens = torch.tensor([256, 256])
+        prepare_last_layer_ffn(self.model, self.batch)
+        self.assertEqual(self.batch.last_layer_ffn_indices.tolist(), [255, 511])
+
+    def test_graph_selection_then_ordinary_graph_clears_stale_state(self):
+        self.scope.return_value = True
+        indices = torch.tensor([299, 511, 0, 0])
+        self.batch.last_layer_ffn_indices = indices
+        self.batch.last_layer_ffn_graph_rows = 4
+        self.assertEqual(prepare_last_layer_ffn(self.model, self.batch), 4)
+        self.assertIs(self.batch.last_layer_ffn_indices, indices)
+        self.assertTrue(self.batch.last_layer_ffn_pruned)
+        self.capturing.assert_not_called()
+        self.batch.last_layer_ffn_graph_rows = 0
+        self.assertEqual(prepare_last_layer_ffn(self.model, self.batch), 0)
+        self.assert_unpruned()
+        self.scope.return_value = False
+        prepare_last_layer_ffn(self.model, self.batch)
+        self.assertEqual(self.batch.last_layer_ffn_indices.tolist(), [299, 511])
+
+    def test_unsupported_model_clears_state_without_cuda_queries(self):
+        self.model.last_layer_ffn_min_extend_tokens = None
+        self.batch.last_layer_ffn_indices = torch.tensor([299, 511])
+        self.batch.last_layer_ffn_pruned = True
+        prepare_last_layer_ffn(self.model, self.batch)
+        self.assert_unpruned()
+        self.capturing.assert_not_called()
+        self.compiling.assert_not_called()
+
+    def test_eager_model_and_execution_guards(self):
+        for case in [
+            "embedding",
+            "input_embeds",
+            "aux",
+            "layers",
+            "compile",
+            "capture",
+        ]:
+            with self.subTest(case=case):
+                self.model.capture_aux_hidden_states = case == "aux"
+                self.model.model.layers_to_capture = [0] if case == "layers" else []
+                self.compiling.return_value = case == "compile"
+                self.capturing.return_value = case == "capture"
+                self.batch.last_layer_ffn_indices = torch.tensor([299, 511])
+                self.batch.last_layer_ffn_pruned = True
+                prepare_last_layer_ffn(
+                    self.model,
+                    self.batch,
+                    get_embedding=case == "embedding",
+                    input_embeds=torch.ones(1) if case == "input_embeds" else None,
+                )
+                self.assert_unpruned()
+
+    def test_eager_selects_more_than_sixteen_requests(self):
+        self.batch.batch_size = 17
+        self.batch.extend_seq_lens_cpu = [32] * 17
+        self.batch.extend_seq_lens = torch.tensor([32] * 17)
+        self.batch.extend_prefix_lens_cpu = [0] * 17
+        self.batch.extend_is_final_cpu = [True] * 17
+        self.batch.input_ids = torch.arange(544)
+        prepare_last_layer_ffn(self.model, self.batch)
+        self.assertEqual(
+            self.batch.last_layer_ffn_indices.tolist(), list(range(31, 544, 32))
+        )
+        self.model.last_layer_ffn_min_extend_tokens = 2048
+        prepare_last_layer_ffn(self.model, self.batch)
+        self.assert_unpruned()
 
 
 if __name__ == "__main__":

@@ -790,7 +790,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         model_type = getattr(getattr(model, "config", None), "model_type", None)
         eligible_buckets = (
             select_graph_token_buckets(model_type, self.capture_num_tokens)
-            if getattr(model, "_ffn_pruning_supported", False)
+            if getattr(model, "last_layer_ffn_min_extend_tokens", None) is not None
             and model_type in MIN_EXTEND_TOKENS
             else ()
         )
@@ -801,8 +801,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._ffn_graph_enabled = (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and not get_exec().overlap.enable_two_batch_overlap
-            and getattr(model, "_ffn_pruning_supported", False)
-            and getattr(model, "enable_last_layer_ffn_pruning", False)
+            and getattr(model, "last_layer_ffn_min_extend_tokens", None) is not None
             and bool(self._ffn_graph_token_buckets)
             and bool(self._ffn_graph_rows)
             and not getattr(model, "capture_aux_hidden_states", False)
@@ -1249,7 +1248,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         variant = None
         if (
             self._ffn_graph_enabled
-            and (model := self.model_runner.model).enable_last_layer_ffn_pruning
+            and (model := self.model_runner.model).last_layer_ffn_min_extend_tokens
+            is not None
             and num_tokens in self._ffn_graph_token_buckets
             and (
                 rows := graph_rows_for_batch(
