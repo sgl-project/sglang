@@ -16,9 +16,6 @@ from sglang.srt.layers.moe.token_dispatcher import (
     StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.utils import get_bool_env_var, is_hip
-
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
 def _apply_ungated_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
@@ -75,13 +72,13 @@ def fused_moe_forward_native(
     expert_outs = torch.einsum(
         "tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype)
     )
-    # The Triton runner this path replaces scales the combined routed output,
-    # unless TopK already folded the factor into topk_weights: always under
-    # aiter, otherwise when the layer fuses it there.
+    # Scale the combined routed output like the Triton runner, unless TopK
+    # already folded the factor into topk_weights: because the layer fuses it
+    # there, or because the selected router applies it on its own.
     if (
         moe_runner_config.routed_scaling_factor is not None
-        and not _use_aiter
         and not layer.should_fuse_routed_scaling_factor_in_topk
+        and not topk_output.routed_scaling_factor_applied
     ):
         expert_outs = expert_outs * moe_runner_config.routed_scaling_factor
     return StandardCombineInput(hidden_states=expert_outs)

@@ -344,9 +344,20 @@ class StandardTopKOutput(NamedTuple):
     topk_ids: torch.Tensor
     router_logits: torch.Tensor
 
+    # Whether the router folded routed_scaling_factor into topk_weights on its
+    # own, beyond what apply_routed_scaling_factor_on_output asked for.
+    routed_scaling_factor_applied = False
+
     @property
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.STANDARD
+
+
+class ScaledStandardTopKOutput(StandardTopKOutput):
+    """Standard top-k output whose topk_weights already carry routed_scaling_factor."""
+
+    __slots__ = ()
+    routed_scaling_factor_applied = True
 
 
 # Standard top-k output plus the FlashInfer routed-MoE packed ids that
@@ -356,6 +367,8 @@ class StandardTopKOutputPacked(NamedTuple):
     topk_ids: torch.Tensor
     router_logits: torch.Tensor
     packed_topk_ids: torch.Tensor
+
+    routed_scaling_factor_applied = False
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -1697,6 +1710,21 @@ def _biased_grouped_topk_postprocess(
     return topk_ids
 
 
+def _use_jit_grouped_gate(
+    correction_bias: torch.Tensor, num_expert_group: Optional[int]
+) -> bool:
+    # The JIT router accepts one shared bias vector, not per-token bias rows.
+    return (
+        correction_bias.ndim != 2
+        and bool(
+            (_is_cuda and num_expert_group and num_expert_group > 1)
+            # ROCm also admits single-group routing; CUDA's condition is unchanged.
+            or (_is_hip and num_expert_group)
+        )
+        and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
+    )
+
+
 def biased_grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1718,15 +1746,7 @@ def biased_grouped_topk_gpu(
 
     # topk for routed experts only (shared experts are appended separately below)
     topk_routed = topk - num_fused_shared_experts
-    # The JIT router accepts one shared bias vector, not per-token bias rows.
-    if (
-        not dynamic_bias
-        and (
-            (_is_cuda and num_expert_group and num_expert_group > 1)
-            # ROCm also admits single-group routing; CUDA's condition is unchanged.
-            or (_is_hip and num_expert_group)
-        )
-    ) and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
+    if _use_jit_grouped_gate(correction_bias, num_expert_group):
         # Opt-in: unified Triton router for DeepSeek-V3 grouped routing. Bit-exact
         # with the flashinfer/AOT paths on DeepSeek-V3.2 e2e (validated); handles any
         # experts-per-group (no <=32 cap). Off by default — see the env-var comment.
@@ -2483,6 +2503,9 @@ def select_experts(
 
     # Set by the fused-gating+pack branches below; None everywhere else.
     packed_topk = None
+    # Set when the selected router folds routed_scaling_factor into the weights
+    # regardless of apply_routed_scaling_factor_on_output.
+    router_applied_scaling = False
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
 
@@ -2577,6 +2600,13 @@ def select_experts(
                 num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+            # aiter's biased grouped kernel always scales the routed weights;
+            # the JIT router only does when asked.
+            router_applied_scaling = (
+                _use_aiter
+                and routed_scaling_factor is not None
+                and not _use_jit_grouped_gate(correction_bias, num_expert_group)
             )
     elif torch_native and custom_routing_function is None:
         assert num_token_non_padded is None, (
@@ -2754,6 +2784,8 @@ def select_experts(
         return StandardTopKOutputPacked(
             topk_weights, topk_ids, router_logits, packed_topk
         )
+    if router_applied_scaling:
+        return ScaledStandardTopKOutput(topk_weights, topk_ids, router_logits)
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
