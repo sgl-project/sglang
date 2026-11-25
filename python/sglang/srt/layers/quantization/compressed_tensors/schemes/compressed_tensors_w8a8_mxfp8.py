@@ -12,37 +12,40 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_mxfp8_linear,
+    prepare_mxfp8_linear_weight_scale,
     resolve_mxfp8_dense_gemm_backend,
+    resolve_mxfp8_linear_weight,
+    resolve_mxfp8_linear_weight_scale,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_hip, is_xpu
 
 __all__ = ["CompressedTensorsW8A8MXFp8"]
 
+_is_hip = is_hip()
 _is_xpu = is_xpu()
 
 
 class CompressedTensorsW8A8MXFp8(CompressedTensorsLinearScheme):
     def __init__(self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs):
         self.group_size = 32
-        self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
-        # Only the XPU kernel reads the checkpoint scale as-is; the CUDA / ROCm kernels
-        # need a load-time scale re-layout this scheme does not perform.
-        if not (
-            self.mxfp8_dense_backend.is_xpu_scaled_mm()
-            or self.mxfp8_dense_backend.is_unsupported()
+        backend = resolve_mxfp8_dense_gemm_backend()
+        if (
+            backend.is_unsupported()
+            or backend.is_gfx95()
+            or (not backend.is_xpu_scaled_mm() and _is_hip)
         ):
             raise NotImplementedError(
-                "compressed-tensors MXFP8 W8A8 is only implemented on XPU, got MXFP8 "
-                f"backend {self.mxfp8_dense_backend.value}."
+                "CompressedTensorsW8A8MXFp8 requires a CUDA Blackwell (SM100+) "
+                "or Intel XPU MXFP8 dense GEMM backend; "
+                f"resolved backend={backend.value}."
             )
-        self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
+        self.mxfp8_dense_backend = backend
+        self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear(backend)
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # TODO: torch.xpu.get_device_capability
         if _is_xpu:
             return 20
-        # blackwell and up
         return 100
 
     def create_weights(
@@ -64,6 +67,7 @@ class CompressedTensorsW8A8MXFp8(CompressedTensorsLinearScheme):
             f"group_size={self.group_size} for MXFP8"
         )
         scale_k = input_size_per_partition // self.group_size
+        layer.params_dtype = params_dtype
 
         weight = ModelWeightParameter(
             data=torch.empty(
@@ -78,7 +82,7 @@ class CompressedTensorsW8A8MXFp8(CompressedTensorsLinearScheme):
         layer.register_parameter("weight", weight)
 
         weight_scale = GroupQuantScaleParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 output_size_per_partition,
                 scale_k,
                 dtype=torch.uint8,
@@ -87,12 +91,17 @@ class CompressedTensorsW8A8MXFp8(CompressedTensorsLinearScheme):
             output_dim=0,
             weight_loader=weight_loader,
         )
+        weight_scale.format_ue8m0 = True
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Checkpoint layout is kept as-is: weight [N, K] e4m3, weight_scale
-        # [N, K // 32] ue8m0 bytes, which xpu_mxfp8_scaled_mm_linear reads directly.
-        pass
+        prepare_mxfp8_linear_weight_scale(
+            layer,
+            self.mxfp8_dense_backend,
+            layer.weight_scale.data,
+            scale_attr="weight_scale",
+            params_dtype=layer.params_dtype,
+        )
 
     def apply_weights(
         self,
@@ -100,10 +109,17 @@ class CompressedTensorsW8A8MXFp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        weight = resolve_mxfp8_linear_weight(layer, self.mxfp8_dense_backend)
+        weight_scale, extra_kwargs = resolve_mxfp8_linear_weight_scale(
+            layer,
+            self.mxfp8_dense_backend,
+            scale_attr="weight_scale",
+        )
         return self.w8a8_mxfp8_linear(
             input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
+            weight=weight,
+            weight_scale=weight_scale,
             input_scale=None,
             bias=bias,
+            **extra_kwargs,
         )

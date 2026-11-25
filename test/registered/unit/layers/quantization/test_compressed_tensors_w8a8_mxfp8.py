@@ -88,8 +88,6 @@ def _config(quant_format, weights, input_activations):
 
 
 def _pin_scheme_to_xpu_backend(test_case):
-    # The scheme resolves the host's MXFP8 backend at construction and refuses any
-    # but XPU, so a CUDA / ROCm host would otherwise fail every case that builds it.
     for name, value in (
         (
             "resolve_mxfp8_dense_gemm_backend",
@@ -292,19 +290,6 @@ class TestMxfp8DenseBackendResolution(CustomTestCase):
         backend, linear = self._resolve(is_xpu=True, deep_gemm_enabled=False)
         self.assertTrue(backend.is_xpu_scaled_mm())
         self.assertIs(linear, fp8_utils.xpu_mxfp8_scaled_mm_linear)
-
-    def test_scheme_rejects_backends_needing_scale_relayout(self):
-        # FlashInfer / DeepGEMM read a re-laid-out scale this scheme never builds;
-        # handing them the raw checkpoint scale would compute garbage silently.
-        with mock.patch.object(
-            schemes_mxfp8,
-            "resolve_mxfp8_dense_gemm_backend",
-            return_value=fp8_utils.Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS,
-        ):
-            with self.assertRaises(NotImplementedError):
-                CompressedTensorsW8A8MXFp8(
-                    weight_quant=MXFP8_WEIGHT_QUANT, input_quant=MXFP8_INPUT_QUANT
-                )
 
     def test_xpu_branch_does_not_claim_cuda(self):
         # On CUDA the XPU branch must stay inert so FlashInfer / DeepGEMM still win.

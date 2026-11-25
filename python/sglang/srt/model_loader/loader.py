@@ -3194,6 +3194,68 @@ class GGUFModelLoader(BaseModelLoader):
         return model
 
 
+def _validate_remote_instance_quantization_support(model: nn.Module) -> None:
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsLinearMethod,
+    )
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_mxfp8 import (
+        CompressedTensorsW8A8MXFp8,
+    )
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    for module, quant_method in _modules_with_quant_method(model):
+        if isinstance(quant_method, CompressedTensorsLinearMethod) and isinstance(
+            module.scheme, CompressedTensorsW8A8MXFp8
+        ):
+            backend = module.scheme.mxfp8_dense_backend
+            if backend is not None and (
+                backend.is_flashinfer()
+                or backend.is_deep_gemm()
+                or backend.is_halops()
+                or backend.is_gfx95()
+            ):
+                raise NotImplementedError(
+                    "load_format='remote_instance' does not run "
+                    "process_weights_after_loading() to materialize derived MXFP8 "
+                    f"execution weights/scales for backend={backend.value!r}."
+                )
+        elif isinstance(quant_method, Fp8LinearMethod):
+            if quant_method.convert_mxfp8_to_block:
+                raise NotImplementedError(
+                    "load_format='remote_instance' does not run "
+                    "process_weights_after_loading() to convert MXFP8 weights to "
+                    "block-FP8."
+                )
+            if quant_method.use_mxfp8 and not quant_method.is_checkpoint_fp8_serialized:
+                raise NotImplementedError(
+                    "load_format='remote_instance' does not run "
+                    "process_weights_after_loading() to online-quantize MXFP8 weights."
+                )
+            if not (quant_method.use_mxfp8 or quant_method.block_fp8_as_mxfp8):
+                continue
+            backend = quant_method.mxfp8_dense_backend
+            if backend is None:
+                continue
+            if (
+                quant_method.use_mxfp8
+                and quant_method.is_checkpoint_fp8_serialized
+                and not quant_method.block_fp8_as_mxfp8
+                and backend.is_gfx95_dot_scaled()
+            ):
+                continue
+            if (
+                backend.is_flashinfer()
+                or backend.is_deep_gemm()
+                or backend.is_halops()
+                or backend.is_gfx95()
+            ):
+                raise NotImplementedError(
+                    "load_format='remote_instance' does not run "
+                    "process_weights_after_loading() to materialize derived MXFP8 "
+                    f"execution weights/scales for backend={backend.value!r}."
+                )
+
+
 class RemoteInstanceModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote sglang instance."""
 
@@ -3244,6 +3306,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config, quant_config)
+        _validate_remote_instance_quantization_support(model)
 
         if (
             load_config.remote_instance_weight_loader_backend
