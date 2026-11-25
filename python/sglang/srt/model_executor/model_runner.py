@@ -745,7 +745,7 @@ class ModelRunner:
             and get_exec().moe.eplb_async_rebalance
         )
         if async_eplb:
-            from sglang.srt.hardware_backend.npu.eplb_manager import (
+            from sglang.srt.hardware_backend.npu.eplb.manager import (
                 AsyncEplbRecorder,
                 NpuAsyncEPLBManager,
             )

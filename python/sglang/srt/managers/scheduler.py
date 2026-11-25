@@ -2256,7 +2256,7 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         should_process_early = self.should_process_last_batch_early
         if _is_npu and get_exec().moe.eplb_async_rebalance:
-            from sglang.srt.hardware_backend.npu.eplb_manager import (
+            from sglang.srt.hardware_backend.npu.eplb.manager import (
                 make_prefill_release_policy,
             )
 

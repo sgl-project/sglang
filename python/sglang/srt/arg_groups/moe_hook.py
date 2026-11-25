@@ -357,20 +357,10 @@ def validate_ascend_ops_config(view: Any) -> dict:
         raise ValueError(
             f"Invalid --moe-ascend-ops-config for ascend_ops MoE backend: {exc}"
         ) from exc
-    if (
-        "fused_op"
-        in (parsed_moe_ascend_ops_config.prefill, parsed_moe_ascend_ops_config.decode)
-        and main_uses_ascend_ops
-        and view.enable_eplb
-    ):
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+    if main_uses_ascend_ops and view.enable_eplb:
+        from sglang.srt.hardware_backend.npu.eplb.config import validate_ascend_ops_eplb
 
-        if not is_npu_arch35():
-            raise ValueError(
-                "Ascend arch22 fused_op keeps per-expert NZ weights outside the "
-                "stacked parameters moved by EPLB. Use alltoallv or allgather for "
-                "prefill and low_latency for decode when enabling EPLB."
-            )
+        validate_ascend_ops_eplb(parsed_moe_ascend_ops_config)
     logger.info(
         "ascend_ops MoE backend enabled for main=%s, draft=%s with "
         "prefill=%s, decode=%s, low_latency comm_alg dispatch=%r combine=%r.",

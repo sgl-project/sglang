@@ -14,7 +14,6 @@ from typing import NamedTuple
 import numpy as np
 import torch
 import torch.distributed as dist
-
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import (
@@ -26,19 +25,19 @@ from sglang.srt.hardware_backend.npu.distributed import (
     eplb_hccl_options,
     eplb_reuses_world_group,
 )
-from sglang.srt.hardware_backend.npu.eplb import (
-    _ExpertWeightAdapter,
-    _validate_migration_topology,
-    prewarm_eplb_communication,
-)
-from sglang.srt.hardware_backend.npu.eplb_coordinator import (
+from sglang.srt.hardware_backend.npu.eplb.coordinator import (
     AsyncEplbCoordinator,
     WeightWriteback,
 )
-from sglang.srt.hardware_backend.npu.eplb_placement import (
+from sglang.srt.hardware_backend.npu.eplb.placement import (
     MigrationPlacement,
     PlanningSpec,
     plan_migration,
+)
+from sglang.srt.hardware_backend.npu.eplb.weights import (
+    _ExpertWeightAdapter,
+    _validate_migration_topology,
+    prewarm_eplb_communication,
 )
 from sglang.srt.utils import get_bool_env_var
 

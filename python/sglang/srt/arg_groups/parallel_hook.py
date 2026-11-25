@@ -810,7 +810,7 @@ def handle_elastic_ep(server_args: Any):
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.eplb_async_rebalance:
-        from sglang.srt.hardware_backend.npu.eplb import validate_async_eplb_args
+        from sglang.srt.hardware_backend.npu.eplb.config import validate_async_eplb_args
 
         validate_async_eplb_args(cfg)
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
