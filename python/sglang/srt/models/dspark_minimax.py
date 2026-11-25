@@ -69,8 +69,12 @@ class DSparkMiniMaxAttention(MiniMaxM3Attention):
         return k_by_head.view_as(k)
 
     def apply_k_rope(self, positions: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        # Use a minimal dummy query (1 head) to avoid doing full-Q work.
-        dummy_q = k.new_empty((k.shape[0], self.head_dim))
+        # Match K's full shape so the RoPE kernel's num_q_heads % num_kv_heads
+        # check passes on all backends. A 1-head dummy_q gives num_q_heads=1,
+        # which fails under TP>1 when num_kv_heads per rank > 1 (the rotary
+        # kernel raises "Expected num_heads % num_kv_heads == 0"). This mirrors
+        # the DFlash apply_k_rope in dflash.py.
+        dummy_q = k.new_empty(k.shape)
         _, k = self.rotary_emb(positions, dummy_q, k)
         return k
 
