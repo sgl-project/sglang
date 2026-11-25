@@ -1156,6 +1156,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
             bias is None
             and _use_hopper_bf16_gemv
             and not get_bf16_gemm_backend().is_gemv()
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            # an fp32 output would select the GEMV's router weight layout
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
             and _use_hopper_bf16_gemv(*output.shape, x.shape[-1])
             and x.is_contiguous()
         ):
