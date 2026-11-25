@@ -37,7 +37,7 @@ from sglang.srt.mem_cache.kv_weight_version_tracker import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
@@ -330,6 +330,9 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         override = get_parallel().override(tp_rank=0, tp_size=1)
         override.__enter__()
         self.addCleanup(override.__exit__, None, None, None)
+        epoch = get_flags().storage.override(weight_epoch=None)
+        epoch.__enter__()
+        self.addCleanup(epoch.__exit__, None, None, None)
         self.recorded = []
 
     def _build_manager(self, target, draft):
@@ -352,6 +355,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
                     new_version
                 ),
                 wait_for_launched_forward=lambda: None,
+                tree_cache=None,
             ),
         )
 
@@ -373,6 +377,20 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
+
+    def test_each_successful_update_moves_the_storage_epoch(self):
+        manager = self._manager(_runner(), session=False)
+        epochs = []
+        for _ in range(2):
+            self.assertTrue(manager.update_weights_from_disk(_request()).success)
+            epochs.append(get_flags().storage.weight_epoch)
+        self.assertNotIn(None, epochs)
+        self.assertEqual(len(set(epochs)), 2)
+
+    def test_failed_update_keeps_the_storage_epoch(self):
+        manager = self._manager(_runner((False, "boom")), session=False)
+        self.assertFalse(manager.update_weights_from_disk(_request()).success)
+        self.assertIsNone(get_flags().storage.weight_epoch)
 
     def test_failed_update_does_not_record_the_version(self):
         """A refit that fails must leave the version alone, or later tokens are mislabelled."""
@@ -869,6 +887,7 @@ class TestWeightWritesWaitForLaunchedForward(_WeightUpdaterManagerTestBase):
         scheduler.schedule_stream = _RecordingStream("schedule", self.log)
         scheduler.forward_stream = _RecordingStream("forward", self.log)
         scheduler.record_weight_version_change = lambda new_version: None
+        scheduler.tree_cache = None
         manager.scheduler = scheduler
         return manager
 

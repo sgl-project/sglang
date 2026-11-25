@@ -226,6 +226,11 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def set_storage_weight_epoch(self, epoch: Optional[str]) -> None:
+        """Seed new storage chains with the served weights' epoch."""
+        ...
+
+    @abstractmethod
     def node_by_id(self, node_id: NodeId) -> UnifiedTreeNode:
         """Resolve a NodeId -- the tree-node identity the Controller passes
         across the boundary (e.g. MatchResult fields, lock-ref args) -- back to

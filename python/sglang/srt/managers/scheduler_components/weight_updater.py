@@ -70,7 +70,7 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
 )
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_flags, get_model, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -141,6 +141,7 @@ class SchedulerWeightUpdaterManager:
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
     _plugin_state: Dict[str, Any] = field(default_factory=dict)
+    _weight_updates: int = 0
     tp_cpu_group: Any = field(init=False)
 
     def __post_init__(self) -> None:
@@ -177,7 +178,15 @@ class SchedulerWeightUpdaterManager:
         return success, message
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
         self.scheduler.record_weight_version_change(new_version=weight_version)
+        # Storage keys follow the weights: an update without a new version
+        # string still moves them, and servers updated alike still share them.
+        self._weight_updates += 1
+        get_flags().storage.weight_epoch = f"{self._weight_updates}:{weight_version}"
+        if isinstance(self.scheduler.tree_cache, UnifiedRadixCache):
+            self.scheduler.tree_cache.sync_storage_weight_epoch()
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""

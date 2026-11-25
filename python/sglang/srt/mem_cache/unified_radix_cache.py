@@ -131,6 +131,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_flags,
     get_memory,
     get_model,
     get_observability,
@@ -498,6 +499,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.page_size / 1024 * timeout_per_ki_token
             )
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
+
+    def sync_storage_weight_epoch(self) -> None:
+        """Hand the served weights' epoch to the tree's storage chains."""
+        self.tree_core.set_storage_weight_epoch(get_flags().storage.weight_epoch)
 
     def reset(self) -> None:
         if self.linker is not None:

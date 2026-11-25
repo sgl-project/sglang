@@ -657,6 +657,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     # ==== Tree API ====
 
+    def set_storage_weight_epoch(self, epoch: Optional[str]) -> None:
+        self._binding.set_storage_weight_epoch(epoch)
+
     def reset(self) -> None:
         self._binding.reset()
         # Node handles are never re-minted, so the fresh root gets a new one.

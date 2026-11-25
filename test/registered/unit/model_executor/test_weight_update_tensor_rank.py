@@ -122,6 +122,7 @@ class TestTensorUpdateRebuildsEachIpcTensorOnce(CustomTestCase):
                 scheduler=SimpleNamespace(
                     record_weight_version_change=lambda new_version: None,
                     wait_for_launched_forward=lambda: None,
+                    tree_cache=None,
                 ),
             )
         manager._session = _WeightUpdateSession(selector=selector)

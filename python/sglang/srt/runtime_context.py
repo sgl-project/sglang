@@ -647,6 +647,14 @@ class SpFlags(_FlagGroupBase):
     enabled: bool = False
 
 
+class StorageFlags(_FlagGroupBase):
+    """Storage-key state, written by the scheduler's weight updater."""
+
+    # Update count and weight version of the served weights; None until the
+    # first update, so storage keys stay as they were.
+    weight_epoch: Optional[str] = None
+
+
 class Flags(_FlagGroupBase):
     """Mutable runtime state; resolved configuration lives in the config bags."""
 
@@ -654,6 +662,7 @@ class Flags(_FlagGroupBase):
     moe: MoeFlags = msgspec.field(default_factory=MoeFlags)
     dp: DpFlags = msgspec.field(default_factory=DpFlags)
     sp: SpFlags = msgspec.field(default_factory=SpFlags)
+    storage: StorageFlags = msgspec.field(default_factory=StorageFlags)
 
 
 class Resources(_FlagGroupBase):

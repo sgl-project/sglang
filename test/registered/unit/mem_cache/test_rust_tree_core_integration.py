@@ -89,7 +89,7 @@ from sglang.srt.mem_cache.utils import (
     hash_str_to_int64,
 )
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import get_context, get_flags, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.tree_slots import (
@@ -2472,6 +2472,25 @@ def test_storage_backup_spec_round_trips_the_backuped_node():
     assert spec.prefix_keys == hashes[:1]
     assert spec.hash_value == hashes[1:]
     assert spec.comp_xfers == {}
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize(
+    "namespace", [{}, {"extra_key": "adapter-a", "cache_salt": "tenant-a"}]
+)
+def test_weight_epoch_seeds_storage_chains(backend, namespace):
+    key = RadixKey(array("q", [1, 2, 7, 8]), **namespace)
+    plain = get_storage_hash_str(key, page_size=2)
+    with get_flags().storage.override(weight_epoch="1:v2"):
+        expected = get_storage_hash_str(key, page_size=2)
+        core = _tree_core(backend, page_size=2)
+        core.set_hicache_enabled()
+        core.enable_storage = True
+        core.set_storage_weight_epoch("1:v2")
+        _pump_insert(core, InsertParams(key=key, value=torch.arange(10, 14)))
+        node = core.match_prefix(MatchPrefixParams(key=key)).best_match_node
+        assert core.get_hash_values(node) == expected
+    assert not set(expected) & set(plain)
 
 
 def test_prefetch_node_accessors_round_trip():
