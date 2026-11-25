@@ -30,6 +30,8 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -40,7 +42,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BumpAllocator, add_prefix, make_pp_layers
+from sglang.srt.utils import BumpAllocator
 
 _GATED_NORM_LOW_RANK = 16
 
@@ -315,11 +317,7 @@ class GigaChat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
     def dispatch_attn_forward_method(self, forward_batch: ForwardBatch):
         method = super().dispatch_attn_forward_method(forward_batch)
         AF = deepseek_v2.AttnForwardMethod
-        fused = [
-            getattr(AF, name, None)
-            for name in ("MLA_FUSED_ROPE", "MLA_FUSED_ROPE_ROCM", "MLA_FUSED_ROPE_CPU")
-        ]
-        if method in [m for m in fused if m is not None]:
+        if method in (AF.MLA_FUSED_ROPE_ROCM, AF.MLA_FUSED_ROPE_CPU):
             return AF.MLA
         return method
 
@@ -401,8 +399,6 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
                 alt_stream=alt_stream,
             )
             qkv_latent_func = self.self_attn.prepare_qkv_latent
-
-        self.is_sparse = self.is_layer_sparse
 
         swiglu_limit = float(getattr(config, "swiglu_limit", None) or 0.0)
         experts = getattr(self.mlp, "experts", None)

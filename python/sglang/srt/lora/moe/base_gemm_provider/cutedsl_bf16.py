@@ -11,6 +11,7 @@ from sglang.kernels.ops.lora.moe.dispatch_masked_small import (
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MoeBaseProviderContract,
     expected_rows_per_expert,
+    prepare_buffer,
 )
 from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
     ContiguousRowDomainProvider,
@@ -21,7 +22,6 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_row_domain import (
     MaskedRowDomainProvider,
     MaskedRowState,
     masked_m_max,
-    prepare_buffer,
 )
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 

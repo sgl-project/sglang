@@ -6,13 +6,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
     resolved_view,
     resolving_view,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
@@ -175,7 +175,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
 
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
-        is_deepseek_v4,
+        uses_compressed_kv_attention,
         uses_kda_attention,
     )
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -194,9 +194,9 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         # c4 indexer scratch is pinned in the capture pool and OOMs. The
         # supported CP path captures a smaller rank-local body.
         (
-            "DeepSeek-V4 (heavy capture-pool memory pressure)",
+            "compressed-KV attention (DeepSeek-V4, ERNIE 5.5 Flash)",
             lambda: (
-                is_deepseek_v4(model_config_of(server_args).hf_config)
+                uses_compressed_kv_attention(model_config_of(server_args).hf_config)
                 and not supports_prefill_cp_bcg(server_args)
             ),
         ),
@@ -223,7 +223,13 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             "unvalidated a2a backend",
             lambda: (
                 resolved_view(server_args).moe_a2a_backend
-                not in ("none", "deepep", "megamoe", "flashinfer")
+                not in (
+                    "none",
+                    "deepep",
+                    "megamoe",
+                    "flashinfer_nvlink_one_sided",
+                    "flashinfer_megamoe",
+                )
             ),
         ),
         # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
@@ -346,6 +352,61 @@ def apply_deepep_adjustments(server_args: Any):
             )
 
 
+def handle_cuda_graph_persistence(server_args: Any):
+    """Activate Foundry and pin what a restored graph cannot replay;
+    runs before the prefill defaults, a contrary explicit value falls back natively."""
+    cfg = resolving_view(server_args)
+    if cfg.cuda_graph_persistence is None:
+        if cfg.cuda_graph_persistence_config is not None:
+            raise ValueError(
+                "--cuda-graph-persistence-config requires --cuda-graph-persistence "
+                "{save,load}"
+            )
+        return
+    # Decided before Foundry is activated: activation pins this process's environment.
+    if (
+        cfg.disable_cuda_graph
+        or cfg.disable_decode_cuda_graph
+        or cfg.cuda_graph_backend_decode == Backend.DISABLED
+    ):
+        logger.info(
+            "--cuda-graph-persistence is inactive: decode CUDA graphs are disabled, "
+            "so there is nothing to persist."
+        )
+        _drop_cuda_graph_persistence(server_args)
+        return
+    if cfg.enable_unified_memory:
+        logger.warning(
+            "--cuda-graph-persistence does not support --enable-unified-memory; "
+            "persistence is disabled and the server initializes natively."
+        )
+        _drop_cuda_graph_persistence(server_args)
+        return
+    from sglang.srt.utils.foundry_adapter import activate_foundry
+
+    activate_foundry(server_args).pin_server_args(server_args)
+
+
+def _drop_cuda_graph_persistence(server_args: Any) -> None:
+    # The record then resolves as without the flag, in this process and its spawns.
+    declare_resolution(
+        server_args,
+        "handle_cuda_graph_persistence",
+        cuda_graph_persistence=None,
+        cuda_graph_persistence_config=None,
+    )
+
+
+def validate_cuda_graph_persistence(server_args: Any):
+    """After handle_other_validations: reject features Foundry cannot persist,
+    re-check the pins and the resolved graph config."""
+    if resolving_view(server_args).cuda_graph_persistence is None:
+        return
+    from sglang.srt.utils.foundry_adapter import get_foundry_adapter
+
+    get_foundry_adapter().validate_resolved_server_args(server_args)
+
+
 def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     """Inkling opts into full-graph prefill CUDA-graph capture. Must run
     before _handle_cuda_graph_config: the generic breakable default is
@@ -364,6 +425,7 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     if arch in (
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
+        "Inkling2ForConditionalGeneration",
     ):
         declare_resolution(
             server_args,
@@ -386,6 +448,40 @@ def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
             server_args,
             "_apply_muse_glimmer_prefill_cuda_graph_max_bs_default",
             cuda_graph_max_bs_prefill=512,
+        )
+
+
+def apply_unlimited_ocr_v2_cuda_graph_default(server_args: Any):
+    """Disable prefill graphs; leave decode graphs opt-in.
+
+    Runs before CUDA graph parsing; prefill block-table width varies per request.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.disable_cuda_graph or parse_connector_type(cfg.model_path) == (
+        ConnectorType.INSTANCE
+    ):
+        return
+    from sglang.srt.configs.model_config import UNLIMITED_OCR_V2_ARCH
+
+    if model_config_of(server_args).hf_config.architectures[0] != UNLIMITED_OCR_V2_ARCH:
+        return
+    if cfg.cuda_graph_backend_decode is None and not cfg.disable_decode_cuda_graph:
+        logger.warning(
+            "Unlimited-OCR v2: decode CUDA graphs are opt-in. Pass "
+            "--cuda-graph-backend-decode full to enable them, and validate with "
+            "a run whose decode batch SHRINKS mid-flight (a fixed batch hides "
+            "cross-graph buffer reuse)."
+        )
+        declare_resolution(
+            server_args,
+            "_apply_unlimited_ocr_v2_cuda_graph_default",
+            cuda_graph_backend_decode=Backend.DISABLED,
+        )
+    if cfg.cuda_graph_backend_prefill is None:
+        declare_resolution(
+            server_args,
+            "_apply_unlimited_ocr_v2_cuda_graph_default",
+            cuda_graph_backend_prefill=Backend.DISABLED,
         )
 
 

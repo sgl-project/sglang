@@ -7,9 +7,8 @@
 # ``IS_KDA`` constexpr selects the gate path and the GDN path is bit-for-bit
 # the original (no regression to the validated GDN kernel).
 #
-# This is a STANDALONE increment: kernel + wrapper only. It is NOT yet wired
-# into the memory pool / radix cache / scheduler / backend dispatch. The caller
-# (currently the correctness test and the microbenchmark) owns the ring tensors.
+# Kernel + wrapper only: the caller (the GDN / KDA Triton decode backends)
+# owns the ring tensors.
 #
 # Idea (vs. ``fused_recurrent_gated_delta_rule_packed_decode`` / ``..._kda_...``):
 #   The plain packed decode reads the full recurrent state S [HV, V, K] from
@@ -81,6 +80,9 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
+    stride_d_slot: tl.constexpr,
+    stride_k_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -146,7 +148,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
 
         # Replay decay over the committed cache, from the cached per-step gates.
         # b_replay_decay[j] = exp(sum_i g_i - cumsum_inclusive_j) = prod_{i>j} alpha_i
-        p_g_main = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c
+        p_g_main = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + o_c
         b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
         b_g_prefix = tl.cumsum(b_g_all, axis=0)
         b_g_total = tl.sum(b_g_all, axis=0)
@@ -156,7 +158,9 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     # Cached corrected-delta vectors d (K-independent).  Layout
     # d_cache[slot, hv, L, V] -> index [V, BC] tile.
     p_d_main = d_cache + (
-        ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None]
+        state_idx * stride_d_slot
+        + (i_hv * MAX_CACHE_LEN + o_c[None, :]) * V
+        + o_v[:, None]
     )
     b_d_all = tl.load(
         p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0
@@ -241,7 +245,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
         )
         p_k_c = (
             k_cache
-            + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K
+            + state_idx * stride_k_slot
+            + (i_h * MAX_CACHE_LEN + o_c[:, None]) * K
             + o_kt[None, :]
         )
 
@@ -259,7 +264,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             # keys and the total decay onto S0.
             p_g_c = (
                 g_cache
-                + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[:, None]) * K
+                + state_idx * stride_g_slot
+                + (i_hv * MAX_CACHE_LEN + o_c[:, None]) * K
                 + o_kt[None, :]
             )
             b_g_all_c = tl.load(
@@ -298,7 +304,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             if write_g_kda:
                 p_cur_g = (
                     g_cache
-                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * K
+                    + state_idx * stride_g_slot
+                    + (i_hv * MAX_CACHE_LEN + b_write_pos) * K
                     + o_kt
                 )
                 tl.store(p_cur_g, g_cur_c, mask=mask_kt & (b_write_pos < MAX_CACHE_LEN))
@@ -310,7 +317,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
         if write_k:
             p_cur_k = (
                 k_cache
-                + ((state_idx * H + i_h) * MAX_CACHE_LEN + b_write_pos) * K
+                + state_idx * stride_k_slot
+                + (i_h * MAX_CACHE_LEN + b_write_pos) * K
                 + o_kt
             )
             tl.store(
@@ -357,7 +365,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             ).to(tl.float32)
             p_k_c = (
                 k_cache
-                + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K
+                + state_idx * stride_k_slot
+                + (i_h * MAX_CACHE_LEN + o_c[:, None]) * K
                 + o_kt[None, :]
             )
             if not IS_KDA:
@@ -371,7 +380,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             else:
                 p_g_c = (
                     g_cache
-                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[:, None]) * K
+                    + state_idx * stride_g_slot
+                    + (i_hv * MAX_CACHE_LEN + o_c[:, None]) * K
                     + o_kt[None, :]
                 )
                 b_g_all_c = tl.load(
@@ -421,7 +431,10 @@ def fused_recurrent_linear_replayssm_decode_kernel(
         # (k chunks were written inside the loop; KDA's g chunks too).  GDN's
         # scalar g is appended here.
         p_cur_d = (
-            d_cache + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * V + o_v
+            d_cache
+            + state_idx * stride_d_slot
+            + (i_hv * MAX_CACHE_LEN + b_write_pos) * V
+            + o_v
         )
         tl.store(
             p_cur_d,
@@ -429,7 +442,9 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             mask=mask_v & (b_write_pos < MAX_CACHE_LEN),
         )
         if (not IS_KDA) and (i_v == 0):
-            p_cur_g = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos
+            p_cur_g = (
+                g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + b_write_pos
+            )
             tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
 
 
@@ -471,8 +486,7 @@ def fused_recurrent_linear_replayssm_decode(
 
     Allocates nothing persistent: the caller owns the ring tensors and is
     responsible for advancing / resetting ``write_pos`` (e.g. ``(write_pos+1) %
-    L`` after each step).  This is a STANDALONE kernel; the memory-pool / cache
-    integration is a later phase.
+    L`` after each step).
     """
     if mixed_qkv.ndim != 2:
         raise ValueError(f"`mixed_qkv` must be 2D (got ndim={mixed_qkv.ndim}).")
@@ -599,6 +613,9 @@ def fused_recurrent_linear_replayssm_decode(
         stride_init_state_token=initial_state.stride(0),
         stride_final_state_token=initial_state.stride(0),
         stride_indices_seq=ssm_state_indices.stride(0),
+        stride_d_slot=d_cache.stride(0),
+        stride_k_slot=k_cache.stride(0),
+        stride_g_slot=g_cache.stride(0),
         H=H,
         HV=HV,
         K=K,
@@ -617,12 +634,3 @@ def fused_recurrent_linear_replayssm_decode(
         num_stages=num_stages,
     )
     return out, initial_state
-
-
-# Backwards-compatible aliases: the original GDN-only names. Existing callers
-# (backend dispatch, tests, microbench) keep working; ``is_kda`` defaults to
-# False so these are the GDN path unchanged.
-fused_recurrent_gdn_replayssm_decode_kernel = (
-    fused_recurrent_linear_replayssm_decode_kernel
-)
-fused_recurrent_gdn_replayssm_decode = fused_recurrent_linear_replayssm_decode

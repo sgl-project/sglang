@@ -7,7 +7,7 @@ from sglang.srt.models.registry import ModelRegistry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 # The hooks the loader resolves on the entry class where a draft/target
 # disagreement is a defect rather than a difference. Weight-name maps
@@ -15,13 +15,14 @@ register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 # draft's checkpoint has its own names, so those differ by design.
 PARITY_HOOKS = ("shared_experts_fusion_disable_reason", "num_fusable_shared_experts")
 
-# Gated entry classes that declare no count, on purpose: HYV4's gate always
-# disables fusion, and the Qwen3.5 family (with the models built on it) fuses a
+# Gated entry classes that declare no count, on purpose: the HYV4 and Hy4-Flash
+# gates always disable fusion, and the Qwen3.5 family (with the models built on it) fuses a
 # gated shared expert inside its own MoE block, outside the loader's count.
 GATE_WITHOUT_COUNT = frozenset(
     {
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
+        "HYV4FlashForConditionalGeneration",
         "InternS2MobiusForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV",

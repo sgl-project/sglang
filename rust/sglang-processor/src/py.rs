@@ -83,6 +83,18 @@ fn write_python_str(s: &str, ascii: bool, out: &mut String) {
     out.push('"');
 }
 
+/// Python's `bool(value)` for a JSON value.
+pub(crate) fn py_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+    }
+}
+
 /// Python's `repr(float)`, as `json.dumps` prints it: the shortest digits that
 /// round-trip, ties to even, scientific outside 1e-4..1e16.
 pub(crate) fn python_float(f: f64) -> String {
@@ -471,10 +483,6 @@ fn py_space(c: char) -> bool {
 
 pub(crate) fn py_strip(text: &str) -> &str {
     text.trim_matches(py_space)
-}
-
-pub(crate) fn py_rstrip(text: &str) -> &str {
-    text.trim_end_matches(py_space)
 }
 
 #[cfg(test)]

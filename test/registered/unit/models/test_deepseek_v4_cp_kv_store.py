@@ -9,7 +9,7 @@ from sglang.srt.models import deepseek_v4
 from sglang.srt.models.deepseek_v4 import MQALayer
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _ENV_GATE = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
 _PREFILL = SimpleNamespace(

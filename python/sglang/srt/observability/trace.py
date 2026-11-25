@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
@@ -181,9 +181,7 @@ threads_info: Dict[int, TraceThreadInfo] = {}
 # Used by trace_async to forward thread info to the exporter process.
 _on_thread_info_set = None
 
-get_cur_time_ns = lambda: int(time.time() * 1e9)
-if hasattr(time, "time_ns"):
-    get_cur_time_ns = lambda: int(time.time_ns())
+get_cur_time_ns = lambda: int(time.time_ns())
 
 
 def _get_host_id() -> str:
@@ -212,7 +210,6 @@ def process_tracing_init(
 ):
     """Initialize OpenTelemetry for this process. Idempotent."""
     global opentelemetry_initialized
-    global get_cur_time_ns
     global tracer
     global global_trace_modules
 
@@ -295,15 +292,18 @@ def get_otlp_span_exporter(endpoint):
 
 
 # Should be called by each tracked thread.
+#
+# The thread_info table is ALWAYS populated (first-write-wins), even when
+# tracing is disabled, so get_thread_caller_info() (caller attribution
+# forwarded to Mooncake) stays readable regardless of the tracing switch. The
+# exporter callback is still gated on `opentelemetry_initialized`, so disabled
+# builds never push thread info.
 def trace_set_thread_info(
     thread_label: str,
     tp_rank: Optional[int] = None,
     dp_rank: Optional[int] = None,
     pp_rank: Optional[int] = None,
 ):
-    if not opentelemetry_initialized:
-        return
-
     pid = threading.get_native_id()
     if pid in threads_info:
         return
@@ -317,8 +317,33 @@ def trace_set_thread_info(
         pp_rank=pp_rank,
     )
 
-    if _on_thread_info_set is not None:
+    if opentelemetry_initialized and _on_thread_info_set is not None:
         _on_thread_info_set(threads_info[pid])
+
+
+def get_thread_caller_info() -> Optional[Tuple[str, str]]:
+    """Return the calling thread's ``(caller_id, caller_role)`` if it has
+    registered via ``trace_set_thread_info``; otherwise ``None``.
+
+    ``caller_role`` is the thread's ``thread_label`` (e.g. ``"Prefetch"`` /
+    ``"Backup"``). ``caller_id`` mirrors the rank+host segment of the scheduler
+    thread-span name (without the leading label, so it does not duplicate
+    ``caller_role``) and is forwarded to Mooncake so per-RPC spans attribute to
+    a specific dummy-client / TP rank. Returns ``None`` on threads that never
+    registered, so callers can omit the fields cleanly.
+    """
+    info = threads_info.get(threading.get_native_id())
+    if info is None:
+        return None
+    parts: List[str] = []
+    if info.tp_rank is not None:
+        parts.append(f"[TP {info.tp_rank}]")
+    if info.pp_rank is not None:
+        parts.append(f"[PP {info.pp_rank}]")
+    if info.dp_rank is not None:
+        parts.append(f"[DP {info.dp_rank}]")
+    parts.append(f"(host:{info.host_id[:8]} | pid:{info.pid})")
+    return " ".join(parts), info.thread_label
 
 
 class TraceReqContext:
@@ -367,9 +392,6 @@ class TraceReqContext:
         self.events_cache: List[TraceEvent] = []
 
         self.pid: int = threading.get_native_id()
-
-    def is_tracing_enabled(self) -> bool:
-        return self.tracing_enable
 
     def __create_thread_context(self, ts: int):
         if self.pid not in threads_info:
@@ -783,20 +805,6 @@ class TraceReqContext:
             attrs = {}
         self.events_cache.append(TraceEvent(name, ts, attrs))
 
-    def trace_set_root_attrs(self, attrs: Dict[str, Any]):
-        if not self.tracing_enable:
-            return
-
-        if self.root_span:
-            self.root_span.set_attributes(attrs)
-
-    def trace_set_thread_attrs(self, attrs: Dict[str, Any]):
-        if self.__check_fast_return():
-            return
-
-        if self.thread_context.thread_span:
-            self.thread_context.thread_span.set_attributes(attrs)
-
     def abort(self, ts=None, abort_info: Optional[Dict] = None):
         if self.__check_fast_return():
             return
@@ -811,7 +819,7 @@ class TraceReqContext:
         # set abort info into thread span
         if self.thread_context.thread_span:
             if abort_info:
-                from sglang.srt.managers.schedule_batch import BaseFinishReason
+                from sglang.srt.managers.req_types import BaseFinishReason
 
                 if isinstance(abort_info, BaseFinishReason):
                     abort_info = abort_info.to_json()

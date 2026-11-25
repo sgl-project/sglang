@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.dsv41_flash_common import DSV41FlashAccuracyMixin
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=600, stage="base-c", runner_config="2-gpu-gb300")
+register_cuda_ci(est_time=600, stage="extra-b", runner_config="2-gpu-gb300")
 
 
 class TestDSV41FlashTrtllmBoundedBCG(DSV41FlashAccuracyMixin, CustomTestCase):

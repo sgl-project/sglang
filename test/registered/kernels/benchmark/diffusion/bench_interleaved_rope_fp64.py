@@ -7,7 +7,7 @@ from sglang.kernels.ops.diffusion import fused_interleaved_rope_fp64
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 
@@ -52,7 +52,7 @@ FN_MAP = {
 
 
 @marker.parametrize("case_name", list(CASES), ci_vals=["sana_video_480p"])
-@marker.benchmark("impl", ["eager", "jit"], unit="ms")
+@marker.benchmark("impl", ["eager", "jit"], unit="ms", gate=["jit"])
 def benchmark(case_name: str, impl: str) -> marker.BenchResult:
     case = CASES[case_name]
     generator = torch.Generator(device="cuda").manual_seed(42)

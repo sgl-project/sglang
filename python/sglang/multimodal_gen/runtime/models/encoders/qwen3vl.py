@@ -58,8 +58,6 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 
-from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
-
 logger = logging.getLogger(__name__)
 
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -539,7 +537,6 @@ class Qwen3VLTextModel(nn.Module):
             ]
         )
         self.norm = _make_text_rms_norm(config.hidden_size, config.rms_norm_eps)
-        self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
 
@@ -877,7 +874,7 @@ class Qwen3VLModel(QwenVLModelBase):
         # Same implementation as for images
         return self.get_image_features(pixel_values_videos, video_grid_thw)
 
-    @cached_conditioning
+    # not cached across requests: hashing pixel_values to look them up costs more than the vision tower
     def _get_flat_visual_features(
         self,
         pixel_values: torch.FloatTensor,
@@ -1102,22 +1099,6 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         "model.visual.blocks",
         "model.visual.deepstack_merger_list",
     ]
-    default_bitsandbytes_target_modules = [
-        ".gate_up_proj.",
-        ".down_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
     _checkpoint_conversion_mapping = {}
     _tied_weights_keys = ["lm_head.weight"]
     # Reference: fix gemma3 grad acc #37208

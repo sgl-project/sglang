@@ -947,7 +947,10 @@ mod tests {
                 best_prefix_blocks: matches.iter().map(|(_, blocks)| *blocks).max().unwrap_or(0),
             },
             query_blocks,
+            pending_winners: Vec::new(),
             block_hashes: None,
+            media_hashes: None,
+            media_winners: Vec::new(),
         }
     }
 

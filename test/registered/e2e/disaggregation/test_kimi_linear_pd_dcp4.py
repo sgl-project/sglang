@@ -16,7 +16,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=700, stage="nightly", runner_config="8-gpu-b200")
+register_cuda_ci(est_time=700, stage="weekly", runner_config="8-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 PHYSICAL_PAGE_SIZE = 64
@@ -49,6 +49,12 @@ PREFILL_ARGS = [
     "4",
     "--chunked-prefill-size",
     str(CHUNKED_PREFILL_SIZE),
+    # test_long_context_needle re-sends the exact prompt and expects the
+    # prefill tree to resume it. The default level (2) keeps only the
+    # prompt-end Mamba state, which an identical re-send cannot match;
+    # level 3 also checkpoints every prefill chunk.
+    "--hybrid-cache-checkpoints-level",
+    "3",
 ]
 DECODE_ARGS = [
     "--dcp-size",

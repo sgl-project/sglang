@@ -1,3 +1,4 @@
+import gc
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -83,10 +84,14 @@ def test_forward_oom_cannot_reuse_a_multi_rank_replica(
     req = SimpleNamespace(is_warmup=False, extra={})
     oom = torch.OutOfMemoryError("allocator OOM")
 
+    def fail_forward():
+        assert not gc.isenabled()
+        raise oom
+
     def run():
         return worker._execute_forward_common(
             req,
-            forward_fn=Mock(side_effect=oom),
+            forward_fn=fail_forward,
             log_reqs=[],
             return_req=False,
             save_output_paths=Mock(),
@@ -94,6 +99,7 @@ def test_forward_oom_cannot_reuse_a_multi_rank_replica(
             propagate_forward_errors=propagate,
         )
 
+    gc_enabled = gc.isenabled()
     if replica_size > 1:
         # Must escape the scheduler's request-level `except Exception` handlers.
         with pytest.raises(SystemExit, match="restart"):
@@ -104,6 +110,7 @@ def test_forward_oom_cannot_reuse_a_multi_rank_replica(
             run()
     else:
         assert "allocator OOM" in run().error
+    assert gc.isenabled() == gc_enabled
 
 
 @pytest.mark.parametrize("is_output_rank", [False, True])
@@ -223,6 +230,18 @@ def test_stage_role_reaches_performance_guard(
             validator._validate_stages(summary)
     else:
         validator._validate_stages(summary)
+
+
+def test_empty_perf_log_dir_disables_the_performance_log(monkeypatch, capsys):
+    """SGLANG_PERF_LOG_DIR="" turns the performance log off; the writer must not
+    try to create "" and warn on stderr for every request."""
+    monkeypatch.setenv("SGLANG_PERF_LOG_DIR", "")
+    monkeypatch.setattr(perf_logger_module, "get_is_main_process", lambda: True)
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+
+    PerformanceLogger.log_request_summary(RequestMetrics("no-log"))
+
+    assert capsys.readouterr().err == ""
 
 
 def test_performance_summary_separates_load_and_runtime_peaks():

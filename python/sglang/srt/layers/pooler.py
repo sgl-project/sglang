@@ -12,6 +12,7 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
+from sglang.srt.runtime_context import get_context, get_model
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -66,11 +67,16 @@ def pool_hidden_states(
     elif pooling_type == PoolingType.MEAN:
         prompt_lens = forward_batch.extend_seq_lens
         end_indices = torch.cumsum(prompt_lens, dim=0) - 1
-        cumulative_hidden_states = torch.cumsum(hidden_states, dim=0)
+        # fp32: a fp16/bf16 batch-wide cumsum swamps short requests after long ones.
+        cumulative_hidden_states = torch.cumsum(
+            hidden_states, dim=0, dtype=torch.float32
+        )
         sums = cumulative_hidden_states[end_indices]
         preceding_sums = torch.zeros_like(sums)
         preceding_sums[1:] = cumulative_hidden_states[end_indices[:-1]]
-        return (sums - preceding_sums) / prompt_lens.unsqueeze(-1)
+        return ((sums - preceding_sums) / prompt_lens.unsqueeze(-1)).to(
+            hidden_states.dtype
+        )
     else:
         raise ValueError(f"Unsupported pooling type: {pooling_type}")
 
@@ -232,6 +238,13 @@ def score_and_pool(
     )
 
 
+def _disable_normalize_embedding() -> bool:
+    # Pooler is also built offline, before any server context is published.
+    if not get_context().is_config_namespace_published("model"):
+        return False
+    return get_model().disable_normalize_embedding
+
+
 class Pooler(nn.Module):
     """A layer that pools specific information from hidden states.
     This layer does the following:
@@ -246,7 +259,7 @@ class Pooler(nn.Module):
     def __init__(self, pooling_type: PoolingType, normalize: bool):
         super().__init__()
         self.pooling_type = pooling_type
-        self.normalize = normalize
+        self.normalize = normalize and not _disable_normalize_embedding()
 
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch

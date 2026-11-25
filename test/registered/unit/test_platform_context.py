@@ -12,11 +12,11 @@ from sglang.srt.runtime_context import (
     get_platform,
     override_platform,
 )
-from sglang.srt.utils import common as _common
+from sglang.srt.utils import device as _device
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestPlatformContext(CustomTestCase):
@@ -24,8 +24,8 @@ class TestPlatformContext(CustomTestCase):
         """A typo in either table would answer with an AttributeError at runtime."""
         for name, probe in {**_PLATFORM_PROBES, **_PLATFORM_VALUES}.items():
             self.assertTrue(
-                callable(getattr(_common, probe, None)),
-                f"{name} maps to {probe!r}, which is not callable in utils.common",
+                callable(getattr(_device, probe, None)),
+                f"{name} maps to {probe!r}, which is not callable in utils.device",
             )
 
     def test_it_answers_before_anything_is_published(self):
@@ -37,7 +37,7 @@ class TestPlatformContext(CustomTestCase):
     def test_the_probe_is_what_it_answers_with(self):
         platform = get_platform()
         for name, probe in {**_PLATFORM_PROBES, **_PLATFORM_VALUES}.items():
-            self.assertEqual(getattr(platform, name), getattr(_common, probe)())
+            self.assertEqual(getattr(platform, name), getattr(_device, probe)())
 
     def test_an_override_is_scoped_and_restores(self):
         platform = get_platform()

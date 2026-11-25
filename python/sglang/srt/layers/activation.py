@@ -22,12 +22,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.distributed import (
     divide,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -36,16 +38,14 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import get_exec, get_parallel, publish_role
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
     is_musa,
     is_npu,
     is_xpu,
-    set_weight_attrs,
 )
-from sglang.utils import resolve_obj_by_qualname
+from sglang.srt.utils.common import dynamic_import
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -54,7 +54,24 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
+
+
+# The jit act-and-mul kernel requires the per-rank hidden size to be a
+# multiple of the vector width (kMaxVecBytes/dtype: 32B on SM100+, else 16B --
+# RuntimeCheck "hidden size must be divisible by vector size" in
+# kernels/jit/csrc/elementwise/activation.cuh). Route unaligned shapes to the
+# sgl_kernel implementation (e.g. DeepSeek-V2-Lite dense 10944/8 = 1368 at
+# tp8, 1368 % 16 != 0).
+_jit_act_max_vec_bytes: Optional[int] = None
+
+
+def _jit_act_supported(out: torch.Tensor) -> bool:
+    global _jit_act_max_vec_bytes
+    if _jit_act_max_vec_bytes is None:
+        _jit_act_max_vec_bytes = current_arch().cuda.max_vec_bytes
+    return out.shape[-1] % (_jit_act_max_vec_bytes // out.dtype.itemsize) == 0
+
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul as _sgl_gelu_and_mul
@@ -73,21 +90,6 @@ if _is_cuda:
     from sglang.kernels.ops.activation.activation import (
         silu_and_mul as _jit_silu_and_mul,
     )
-
-    # The jit act-and-mul kernel requires the per-rank hidden size to be a
-    # multiple of the vector width (kMaxVecBytes/dtype: 32B on SM100+, else 16B --
-    # RuntimeCheck "hidden size must be divisible by vector size" in
-    # kernels/jit/csrc/elementwise/activation.cuh). Route unaligned shapes to the
-    # sgl_kernel implementation (e.g. DeepSeek-V2-Lite dense 10944/8 = 1368 at
-    # tp8, 1368 % 16 != 0).
-    _jit_act_max_vec_bytes: Optional[int] = None
-
-    def _jit_act_supported(out: torch.Tensor) -> bool:
-        global _jit_act_max_vec_bytes
-        if _jit_act_max_vec_bytes is None:
-            major, _ = torch.cuda.get_device_capability()
-            _jit_act_max_vec_bytes = 32 if major >= 10 else 16
-        return out.shape[-1] % (_jit_act_max_vec_bytes // out.dtype.itemsize) == 0
 
     def _act_and_mul(jit_fn, sgl_fn, input: torch.Tensor, out=None) -> torch.Tensor:
         if out is None:
@@ -212,7 +214,7 @@ class SituAndMul(BaseFusedOp):
         return situ_and_mul(x, None, self.beta, self.linear_beta)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        from sgl_kernel_npu.activation.situ import situ_and_mul
+        from sgl_kernel_npu.operators.activation import situ_and_mul
 
         return situ_and_mul(x)
 
@@ -503,7 +505,7 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
             "Loading of activation functions is restricted to "
             "torch.nn.modules for security reasons"
         )
-        return resolve_obj_by_qualname(function_name)()
+        return dynamic_import(function_name)()
     else:
         # adapt bge-reranker
         return nn.Identity()

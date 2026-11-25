@@ -23,7 +23,7 @@ from transformers import LlavaConfig
 from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.llava import LlavaForConditionalGeneration
 
@@ -134,7 +134,7 @@ class Mistral3ForConditionalGeneration(LlavaForConditionalGeneration):
             if self.vision_feature_select_strategy in ["default", "patch"]:
                 selected_image_feature = selected_image_feature[:, 1:]
             elif self.vision_feature_select_strategy == "full":
-                selected_image_feature = selected_image_feature
+                pass
             else:
                 raise ValueError(
                     f"Unexpected select feature: {self.vision_feature_select_strategy}"

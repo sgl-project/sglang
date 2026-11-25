@@ -1,5 +1,6 @@
 import enum
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -9,7 +10,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 def _load_megamoe_module(monkeypatch):
@@ -52,6 +53,9 @@ def _load_megamoe_module(monkeypatch):
         ),
         SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT=types.SimpleNamespace(
             get=lambda: True
+        ),
+        SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
+            get=lambda: 0
         ),
         SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=types.SimpleNamespace(
             get=lambda: "bf16"
@@ -115,25 +119,8 @@ def _load_autotune_module(monkeypatch):
     return module
 
 
-# Deliberately not 1: FlashInfer main writes version 2 and sglang must follow it.
-_FAKE_KNOB_CACHE_VERSION = 2
-
-
-def _install_fake_knob_cache_version(monkeypatch, moe_ep, version=None):
-    version = _FAKE_KNOB_CACHE_VERSION if version is None else version
-    core = types.ModuleType("flashinfer.moe_ep.core")
-    tuning = types.ModuleType("flashinfer.moe_ep.core.tuning")
-    tuning.KNOB_CACHE_VERSION = version
-    for name, module in (
-        ("flashinfer", types.ModuleType("flashinfer")),
-        ("flashinfer.moe_ep", moe_ep),
-        ("flashinfer.moe_ep.core", core),
-        ("flashinfer.moe_ep.core.tuning", tuning),
-    ):
-        monkeypatch.setitem(sys.modules, name, module)
-
-
 def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
+    import enum
     from dataclasses import dataclass
 
     module = _load_autotune_module(monkeypatch)
@@ -161,11 +148,16 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
         def num_tokens(self):
             return self.hidden_states.shape[0]
 
+    class FinalizeMode(enum.Enum):
+        AUTO = "auto"
+
     @dataclass
     class Config:
         knobs: str | None = None
         kernel_name: str = "test_backend"
         input_norm_const: float = 1.0
+        # flashinfer's MegaMoE config carries enum fields such as finalize_mode.
+        finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     @dataclass
     class Fleet:
@@ -255,55 +247,55 @@ def test_megamoe_without_tuning_preserves_capture_forward(monkeypatch):
     assert [workspace for _, workspace in calls] == [None, None]
 
 
-@pytest.mark.parametrize("new_process", [False, True])
-def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
-    import json
-    import os
+@pytest.mark.parametrize("keep_persistent_cache", [False, True])
+def test_megamoe_profiles_reuse_cached_winner(monkeypatch, keep_persistent_cache):
     from dataclasses import replace
     from unittest.mock import Mock
 
     module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
-    payload = {
-        "version": _FAKE_KNOB_CACHE_VERSION,
-        "entries": [{"knobs": {"native_tactic": 7}}],
+    initial_knobs = {
+        "native_tactic": 7,
+        "mma_tiler_mnk": (256, 128, 256),
+        "cluster_shape_mnk": (2, 1, 1),
+        "epi_flag_batch": (2, 4),
     }
+    retuned_knobs = {**initial_knobs, "native_tactic": 11}
+    tuning_results = []
+    namespace = "sglang_flashinfer_megamoe_knobs"
     events = []
-    staged = []
-    native_paths = []
-    require_all_ranks = module.MegaMoeTunedForward._require_all_ranks
-    readiness = Mock()
-
-    def require(self, success, message):
-        readiness(success)
-        require_all_ranks(self, success, message)
-
-    monkeypatch.setattr(module.MegaMoeTunedForward, "_require_all_ranks", require)
+    workspace_knobs = []
 
     class Mega:
         supports_output_view = True
 
         def __init__(self, **kwargs):
             self.auto = kwargs.get("backend", first.backend).megakernel.knobs == "auto"
+            self.tuned = False
+            self.destroyed = False
 
         def warmup(self, inputs, workspace=None):
             if self.auto:
                 events.append("tune")
-                Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"]).write_text(
-                    json.dumps(payload)
-                )
+                self.knobs = (retuned_knobs if tuning_results else initial_knobs).copy()
+                tuning_results.append(self.knobs)
+                self.tuned = True
             else:
                 assert workspace is self.workspace
                 events.append("warmup")
 
+        def get_tuned_knobs(self):
+            assert self.auto and self.tuned and not self.destroyed
+            events.append("get")
+            return self.knobs.copy()
+
         def destroy(self):
+            self.destroyed = True
             events.append("destroy")
 
-        def create_workspace(self, capacity):
+        def create_workspace(self, capacity, *, knobs):
             assert capacity == 1
-            path = Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"])
-            native_paths.append(path)
-            staged.append(json.loads(path.read_text()))
-            self.workspace = object()
+            workspace_knobs.append(knobs.copy())
+            self.workspace = types.SimpleNamespace(knobs=knobs.copy())
             events.append("create")
             return self.workspace
 
@@ -315,29 +307,35 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
     fake_moe = types.ModuleType("flashinfer.moe_ep")
     fake_moe.MoEEpMegaLayer = Mega
     fake_autotuner = types.ModuleType("flashinfer.autotuner")
-    records = {}
+    # The old namespace contains a native cache envelope, not a knob dict.
+    # It must not supply workspace settings after the format change.
+    records = {
+        "sglang_flashinfer_megamoe": {
+            f"{first._geometry_key}:1": {
+                "version": 2,
+                "entries": [{"knobs": {"native_tactic": 99}}],
+            }
+        }
+    }
     tuner = types.SimpleNamespace(
         get_namespaced_records=Mock(
             side_effect=lambda namespace: records.get(namespace, {}).copy()
         ),
         publish_namespaced_records=Mock(
             side_effect=lambda namespace, values: records.__setitem__(
-                namespace, values.copy()
+                namespace, json.loads(json.dumps(values))
             )
         ),
     )
     fake_autotuner.AutoTuner = types.SimpleNamespace(get=lambda: tuner)
-    _install_fake_knob_cache_version(monkeypatch, fake_moe)
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe)
     monkeypatch.setitem(sys.modules, "flashinfer.autotuner", fake_autotuner)
-    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "original-cache.json")
 
     owners = []
     for phase in range(2):
-        if owners:
-            if new_process:
-                module._session_winners.clear()  # Only the loaded cache survives.
-            else:
-                records.clear()  # A new cache context must preserve pooled choices.
+        if phase and not keep_persistent_cache:
+            records.pop(namespace)
         with module.megamoe_autotune_context(
             decode_num_tokens=1,
             prefill_num_tokens=1,
@@ -355,18 +353,62 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
                 mega = Mega()
                 assert forward(mega, tensors) is tensors.hidden_states
                 owners.append(mega)
-            assert readiness.call_count == phase + 1
-            assert native_paths[-2] == native_paths[-1]
-            assert native_paths[-1].is_file()
-        assert not native_paths[-1].exists()
-        assert os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"] == "original-cache.json"
-        assert list(records["sglang_flashinfer_megamoe"].values()) == [payload]
+        expected_knobs = (
+            retuned_knobs if phase and not keep_persistent_cache else initial_knobs
+        )
+        assert list(records[namespace].values()) == [
+            json.loads(json.dumps(expected_knobs))
+        ]
         assert tuner.get_namespaced_records.call_count == phase + 1
+        tuner.get_namespaced_records.assert_called_with(namespace)
 
-    assert tuner.publish_namespaced_records.call_count == (1 if new_process else 2)
-    assert events == ["tune", "destroy"] + ["create", "warmup"] * 4
-    assert staged == [payload] * 4
+    expected_tunes = 1 if keep_persistent_cache else 2
+    assert len(tuning_results) == expected_tunes
+    assert tuner.publish_namespaced_records.call_count == expected_tunes
+    first_context_events = ["tune", "get", "destroy"] + ["create", "warmup"] * 2
+    assert events == first_context_events + (
+        ["create", "warmup"] * 2 if keep_persistent_cache else first_context_events
+    )
+    assert workspace_knobs == [initial_knobs] * 2 + [expected_knobs] * 2
+    # Retuning after a cache clear cannot change already prepared workspaces.
+    assert [owner.workspace.knobs for owner in owners[:2]] == [initial_knobs] * 2
     assert len({id(owner.workspace) for owner in owners}) == 4
+
+
+@pytest.mark.parametrize("failure", ["warmup", "get_tuned_knobs"])
+def test_megamoe_tuning_failure_destroys_temporary_layer(monkeypatch, failure):
+    _, forward, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
+    events = []
+
+    class Mega:
+        def __init__(self, **kwargs):
+            pass
+
+        def warmup(self, inputs):
+            events.append("warmup")
+            if failure == "warmup":
+                raise RuntimeError(failure)
+
+        def get_tuned_knobs(self):
+            events.append("get_tuned_knobs")
+            raise RuntimeError(failure)
+
+        def destroy(self):
+            events.append("destroy")
+
+    fake_moe = types.ModuleType("flashinfer.moe_ep")
+    fake_moe.MoEEpMegaLayer = Mega
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe)
+
+    with pytest.raises(RuntimeError, match=failure):
+        forward._tune(tensors, capacity=1)
+
+    assert events == (
+        ["warmup", "destroy"]
+        if failure == "warmup"
+        else ["warmup", "get_tuned_knobs", "destroy"]
+    )
 
 
 @pytest.mark.parametrize("tokens,capacity", [(0, 8), (3, 8), (3, 1)])
@@ -471,7 +513,7 @@ def test_adapter_keeps_router_ids_int32(monkeypatch):
     class Mega:
         supports_output_view = False
 
-        def forward(self, tensors):
+        def forward(self, tensors, *, workspace=None):
             self.tensors = tensors
             return output
 
@@ -518,7 +560,7 @@ def test_adapter_requests_workspace_output_view(monkeypatch, supports_output_vie
     output = torch.randn_like(hidden_states)
 
     class Mega:
-        def forward(self, tensors, *, return_workspace_view=False):
+        def forward(self, tensors, *, workspace=None, return_workspace_view=False):
             self.tensors = tensors
             self.return_workspace_view = return_workspace_view
             return output
@@ -993,21 +1035,3 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 
-
-def test_native_knob_cache_is_valid_only_at_the_flashinfer_format_version(monkeypatch):
-    """Startup autotune failed with "did not record its selected tactic" even
-    though FlashInfer had tuned: its cache is written at its own format
-    version, and a hard-coded one rejected the winner."""
-    module = _load_autotune_module(monkeypatch)
-    _install_fake_knob_cache_version(monkeypatch, types.ModuleType("flashinfer.moe_ep"))
-    entry = {"knobs": {"native_tactic": 7}}
-
-    assert module._valid_native_cache(
-        {"version": _FAKE_KNOB_CACHE_VERSION, "entries": [entry]}
-    )
-    assert not module._valid_native_cache(
-        {"version": _FAKE_KNOB_CACHE_VERSION - 1, "entries": [entry]}
-    )
-    assert not module._valid_native_cache(
-        {"version": _FAKE_KNOB_CACHE_VERSION, "entries": [{"knobs": {}}]}
-    )

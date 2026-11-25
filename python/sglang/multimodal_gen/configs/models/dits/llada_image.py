@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 SEQUENCE_MULTIPLE = 32
 
@@ -41,12 +40,6 @@ class LLaDAImageArchConfig(DiTArchConfig):
     rope_theta: float = 256.0
     semantic_feat_dim: int = 4096
     t_scale: float = 1000.0
-    _supported_attention_backends: set[AttentionBackendEnum] = field(
-        default_factory=lambda: {
-            AttentionBackendEnum.FA,
-            AttentionBackendEnum.TORCH_SDPA,
-        }
-    )
     param_names_mapping: dict = field(
         default_factory=lambda: {
             r"(.*)\.attention\.to_q\.weight$": (r"\1.attention.to_qkv.weight", 0, 3),

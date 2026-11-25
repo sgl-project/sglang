@@ -174,6 +174,17 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
                 ],
                 device=device,
             ),
+            # Expert-major view of padded domain-major storage, like localized Mega MoE weights
+            torch.empty(
+                (2, len(local_logical_expert_ids) + 1, 4),
+                dtype=torch.int16,
+                device=device,
+            )[:, :-1]
+            .transpose(0, 1)
+            .copy_(
+                local_logical_expert_ids.to(device).view(-1, 1, 1) * 8
+                + torch.arange(8, device=device).view(1, 2, 4)
+            ),
         ]
 
     def _create_physical_to_logical_map():

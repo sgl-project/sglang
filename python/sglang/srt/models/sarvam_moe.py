@@ -3,7 +3,6 @@
 - SarvamMoEForCausalLM (30B)
 """
 
-import math
 from enum import IntEnum, auto
 from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -14,7 +13,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
@@ -44,7 +42,10 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.yarn import yarn_get_mscale
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -53,6 +54,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -61,6 +63,7 @@ from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     DeepseekMHAForwardMixin,
 )
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.runtime_context import (
     attention_backends,
     get_exec,
@@ -71,11 +74,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    add_prefix,
-    bind_or_assign,
     is_cuda,
     is_nvidia_cublas_version_ge_12_9,
-    make_pp_layers,
     next_power_of_2,
 )
 
@@ -114,10 +114,7 @@ class AttnForwardMethod(IntEnum):
     MHA_PREFILL = auto()
 
 
-SEPARATE_ROPE_BACKENDS = frozenset(
-    ["fa3", "flashinfer", "dsa", "nsa", "trtllm_mla"]
-    # "nsa" is a deprecated alias for "dsa"
-)
+SEPARATE_ROPE_BACKENDS = frozenset(["fa3", "flashinfer", "dsa", "trtllm_mla"])
 CONCAT_ROPE_BACKENDS = frozenset(["flashmla", "triton"])
 
 
@@ -521,7 +518,7 @@ class SarvamMoEMLAAttention(nn.Module):
         if rope_scaling and rope_scaling["type"] == "deepseek_yarn":
             mscale_all_dim = rope_scaling.get("mscale_all_dim", 1.0)
             scaling_factor = rope_scaling.get("factor", 1.0)
-            mscale = self.yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
         self.attn_mqa = RadixAttention(
@@ -549,11 +546,6 @@ class SarvamMoEMLAAttention(nn.Module):
         self.w_kc = None
         self.w_vc = None
         self.w_scale = None
-
-    def yarn_get_mscale(self, scale: float = 1, mscale: float = 1) -> float:
-        if scale <= 1:
-            return 1.0
-        return 0.1 * mscale * math.log(scale) + 1.0
 
     def _concat_and_cast_mha_k(
         self,
@@ -644,7 +636,7 @@ class SarvamMoEMLAAttention(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        get_token_to_kv_pool().set_mla_kv_buffer(
+        get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
             self.attn_mha,
             KVWriteLoc.for_batch(forward_batch),
             k_nope,
@@ -802,141 +794,6 @@ class SarvamMoEMLAAttention(nn.Module):
             )
         else:
             raise ValueError(f"Unknown forward method: {forward_method}")
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-
-        attn_bmm_output = self._maybe_fp8_bmm(
-            attn_output.transpose(0, 1), self.w_vc, zero_allocator
-        )
-        attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-
-        output, _ = self.o_proj(attn_bmm_output)
-        return output
-
-    def forward_prepare(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: Optional[BumpAllocator] = None,
-        llama_4_scaling: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], ForwardBatch, Optional[Tuple]]:
-        del llama_4_scaling
-        if hidden_states.shape[0] == 0:
-            return hidden_states, forward_batch, None
-
-        if self.q_lora_rank is None:
-            # Dual-stream parallel Q and KV projections
-            if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-                q, _ = self.q_proj(hidden_states)
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                q, _ = self.q_proj(hidden_states)
-                latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
-        else:
-            # For q_lora_rank path, overlap q_a_proj with kv_a_proj
-            if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-                q_a, _ = self.q_a_proj(hidden_states)
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                q_a, _ = self.q_a_proj(hidden_states)
-                latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-            q_a = self.q_a_layernorm(q_a)
-            q, _ = self.q_b_proj(q_a)
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
-
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
-
-        self._set_current_attention_backend(forward_batch)
-        forward_method = get_attn_forward_method(forward_batch)
-
-        if forward_method == AttnForwardMethod.MHA_PREFILL:
-            output = self._run_mha_prefill(
-                positions=positions,
-                q=q,
-                q_pe=q_pe,
-                k_nope=k_nope,
-                k_pe=k_pe,
-                forward_batch=forward_batch,
-            )
-            return output, forward_batch, None
-
-        # Parallel Absorption + RoPE on separate streams
-        # - Stream 1 (main): Absorption (q_nope @ w_kc)
-        # - Stream 2 (alt): RoPE (q_pe, k_pe)
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-
-            # RoPE on alt stream
-            with torch.cuda.stream(self.alt_stream):
-                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-            # Absorption on main stream (runs in parallel with RoPE)
-            q_nope_out = self._maybe_fp8_bmm(
-                q_nope.transpose(0, 1), self.w_kc, zero_allocator
-            )
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_nope_out = self._maybe_fp8_bmm(
-                q_nope.transpose(0, 1), self.w_kc, zero_allocator
-            )
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-        inner_state = (q_nope_out, k_nope, q_pe, k_pe, forward_batch, zero_allocator)
-        return None, forward_batch, inner_state
-
-    def forward_core(
-        self,
-        intermediate_state: Tuple[
-            Optional[torch.Tensor], ForwardBatch, Optional[Tuple]
-        ],
-    ) -> torch.Tensor:
-        hidden_states, forward_batch, inner_state = intermediate_state
-
-        if inner_state is None:
-            return hidden_states
-
-        q_nope_out, k_nope, q_pe, k_pe, forward_batch, zero_allocator = inner_state
-
-        self._set_current_attention_backend(forward_batch)
-
-        forward_method = get_attn_forward_method(forward_batch)
-
-        if forward_method == AttnForwardMethod.MLA_SEPARATE_ROPE:
-            attn_output = self.attn_mqa(
-                q_nope_out,
-                k_nope,
-                k_nope,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
-            )
-        else:
-            q = torch.cat([q_nope_out, q_pe], dim=-1)
-            k = torch.cat([k_nope, k_pe], dim=-1)
-            attn_output = self.attn_mqa(
-                q,
-                k,
-                k_nope,
-                forward_batch,
-            )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         attn_bmm_output = self._maybe_fp8_bmm(
@@ -1230,39 +1087,6 @@ class SarvamMLAForCausalLM(nn.Module):
             )
         return hidden_states
 
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],
-        input_embeds: torch.Tensor = None,
-    ) -> Optional[LogitsProcessorOutput]:
-        start, end = split_interval
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-
-        for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.model.layers[i]
-                forward_batch.hidden_states = layer(
-                    positions, forward_batch.hidden_states, forward_batch
-                )
-
-        if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            return self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        return None
-
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(
@@ -1405,41 +1229,7 @@ class SarvamMLAForCausalLM(nn.Module):
 
 
 class SarvamMoEForCausalLM(BailingMoEForCausalLM):
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],
-        input_embeds: torch.Tensor = None,
-    ) -> Optional[LogitsProcessorOutput]:
-        start, end = split_interval
-
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.word_embeddings(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-
-        for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.model.layers[i]
-                forward_batch.hidden_states = layer(
-                    positions, forward_batch.hidden_states, forward_batch
-                )
-
-        if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-
-            return self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-
-        return None
+    pass
 
 
 EntryClass = [SarvamMLAForCausalLM, SarvamMoEForCausalLM]
