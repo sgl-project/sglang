@@ -227,6 +227,7 @@ def _create_scheduler_actor(
         pp_rank=pp_rank,
         dp_rank=dp_rank,
         dist_init_addr=dist_init_addr,
+        cpu_share_board=cpu_share.board if cpu_share is not None else None,
     )
 
 
@@ -397,6 +398,7 @@ class RayEngine(Engine):
 
             cpu_share.close()
             try:
+                ray.get([actor.start.remote() for actor in scheduler_actors])
                 scheduler_infos = ray.get(
                     [actor.get_info.remote() for actor in scheduler_actors]
                 )

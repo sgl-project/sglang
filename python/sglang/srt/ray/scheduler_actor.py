@@ -29,34 +29,20 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 logger = logging.getLogger(__name__)
 
 
-def cpu_share_board(pg):
-    """The placement group's ``CpuShareBoard`` actor, created on first use."""
-    from sglang.srt.utils.process import CpuShareBoard
-
-    return (
-        ray.remote(CpuShareBoard)
-        .options(
-            name=f"sglang_cpu_share_board_{pg.id.hex()}",
-            get_if_exists=True,
-            num_cpus=0,
-        )
-        .remote()
-    )
-
-
 class CpuShareLaunch:
-    """Counts the scheduler actors a launch places on each node and tells the CPU share
-    board once they all exist (SGLANG_SET_CPU_AFFINITY)."""
+    """One launch's ``CpuShareBoard`` (SGLANG_SET_CPU_AFFINITY on the driver): counts
+    the scheduler actors the launch places on each node and tells the board once they
+    all exist. Each actor gets the board as an argument."""
 
     def __init__(self, pg):
         from sglang.srt.environ import envs
+        from sglang.srt.utils.process import CpuShareBoard
 
-        self.board = cpu_share_board(pg) if envs.SGLANG_SET_CPU_AFFINITY.get() else None
-        self.node_of = (
-            ray.util.placement_group_table(pg)["bundles_to_node_id"]
-            if self.board is not None
-            else {}
-        )
+        self.board = None
+        self.node_of = {}
+        if envs.SGLANG_SET_CPU_AFFINITY.get():
+            self.board = ray.remote(CpuShareBoard).options(num_cpus=0).remote()
+            self.node_of = ray.util.placement_group_table(pg)["bundles_to_node_id"]
         self.counts = Counter()
 
     def add(self, bundle_idx: int):
@@ -68,19 +54,15 @@ class CpuShareLaunch:
             ray.get(self.board.expect.remote(dict(self.counts)))
 
 
-def _cpu_share(server_args: ServerArgs, gpu_id: int) -> Optional[list[int]]:
-    """This actor's CPUs, split with the other scheduler actors on its node, or None
-    when they cannot be gathered."""
+def _cpu_share(board, server_args: ServerArgs, gpu_id: int) -> Optional[list[int]]:
+    """This actor's CPUs, split by ``board`` with the other scheduler actors its launch
+    placed on this node, or None when they cannot be gathered."""
     from sglang.srt.utils import numa_utils
     from sglang.srt.utils.process import physical_cores
 
-    pg = ray.util.get_current_placement_group()
-    if pg is None:
-        return None
     node_id = ray.get_runtime_context().get_node_id()
     # the CPUs this actor keeps once NUMA binding places it, as the launcher plans them
     cpus = numa_utils.numa_bound_cpus(server_args, gpu_id, set(os.sched_getaffinity(0)))
-    board = cpu_share_board(pg)
     return ray.get(board.register.remote(node_id, gpu_id, physical_cores(cpus)))
 
 
@@ -88,7 +70,8 @@ def _cpu_share(server_args: ServerArgs, gpu_id: int) -> Optional[list[int]]:
 class SchedulerActor:
     """Ray actor wrapper for SGLang Scheduler.
 
-    Each actor manages one GPU and runs the Scheduler + TpModelWorker stack.
+    Each actor manages one GPU and runs the Scheduler + TpModelWorker stack, built by
+    ``start`` so a launcher can place every actor before any loads its weights.
     Ray is used for process lifecycle; ZMQ handles request/response communication.
     """
 
@@ -101,10 +84,10 @@ class SchedulerActor:
         pp_rank: int,
         dp_rank: Optional[int],
         dist_init_addr: Optional[str] = None,
+        cpu_share_board=None,
     ):
         from sglang.srt.environ import envs
         from sglang.srt.managers.scheduler import (
-            Scheduler,
             configure_scheduler_process,
             resolve_spawn_dp_rank,
         )
@@ -151,8 +134,8 @@ class SchedulerActor:
             ),
         )
 
-        if envs.SGLANG_SET_CPU_AFFINITY.get():
-            cpus = _cpu_share(server_args, actual_gpu_id)
+        if cpu_share_board is not None:
+            cpus = _cpu_share(cpu_share_board, server_args, actual_gpu_id)
             if cpus:
                 envs.SGLANG_GPU_PROC_CPUS.set(",".join(map(str, cpus)))
 
@@ -171,14 +154,19 @@ class SchedulerActor:
                     f"[TP{tp_rank}] Bound to NUMA node {numa_node} for GPU {actual_gpu_id}"
                 )
 
-        # Create scheduler (loads model into GPU, initializes NCCL)
-        self.scheduler = Scheduler(
-            server_args=server_args,
-            port_args=port_args,
-        )
-
+        self._server_args = server_args
+        self._port_args = port_args
         self._tp_rank = tp_rank
         self._pp_rank = pp_rank
+
+    def start(self) -> None:
+        """Create the scheduler (loads the model into GPU, initializes NCCL)."""
+        from sglang.srt.managers.scheduler import Scheduler
+
+        self.scheduler = Scheduler(
+            server_args=self._server_args,
+            port_args=self._port_args,
+        )
 
     def get_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake."""

@@ -100,17 +100,20 @@ class RayDataParallelController(DataParallelController):
         for sock in sockets:
             sock.close()
 
-        # Create every DP group before waiting on any: an actor waits for the others on
-        # its node to split their CPUs.
-        first = len(self.scheduler_actors)
+        # Create every DP group before any loads its weights: an actor waits for the
+        # others on its node to split their CPUs.
         cpu_share = CpuShareLaunch(self.pg)
-
+        firsts = []
         for dp_rank in range(get_parallel().num_dp_ranks):
+            firsts.append(len(self.scheduler_actors))
             self._launch_ray_tp_group(
                 server_args, dp_port_args_list[dp_rank], dp_rank, cpu_share=cpu_share
             )
         cpu_share.close()
-        self._await_ray_actors(first)
+        # Then load one DP group at a time, so one replica's weights sit in host memory
+        # at once.
+        for first, stop in zip(firsts, firsts[1:] + [None]):
+            self._await_ray_actors(first, stop)
 
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
@@ -279,11 +282,12 @@ class RayDataParallelController(DataParallelController):
                 )
                 self.scheduler_actors.append(actor)
 
-    def _await_ray_actors(self, first: int):
-        """Wait for the actors created from index ``first`` on to initialize, then
-        start their event loops."""
-        batch_actors = self.scheduler_actors[first:]
+    def _await_ray_actors(self, first: int, stop: Optional[int] = None):
+        """Start the actors at ``scheduler_actors[first:stop]``, wait for them to
+        initialize, then start their event loops."""
+        batch_actors = self.scheduler_actors[first:stop]
         try:
+            ray.get([actor.start.remote() for actor in batch_actors])
             scheduler_infos = ray.get(
                 [actor.get_info.remote() for actor in batch_actors]
             )

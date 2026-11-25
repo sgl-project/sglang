@@ -974,6 +974,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                     self._store(registered=(PoolName.INDEXER,))
                 )
                 return SimpleNamespace(
+                    start=SimpleNamespace(remote=lambda: None),
                     get_info=SimpleNamespace(remote=actor.get_info),
                     run_event_loop=SimpleNamespace(remote=lambda: None),
                 )
@@ -990,6 +991,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                     controller._launch_ray_tp_group(
                         SimpleNamespace(), SimpleNamespace(nccl_port=1234), rank
                     )
+                controller._await_ray_actors(0)
                 return controller
 
             with (
