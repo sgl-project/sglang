@@ -46,7 +46,8 @@ pub struct DetokenizeResponse {
 /// it; a model started with `--no-tokenizer` has none.
 pub(crate) fn served_tokenizer(ctx: &AppContext) -> Result<Arc<Tokenizer>, ApiError> {
     let model = &ctx.config.model.id;
-    ctx.tokenizers
+    ctx.preprocessor
+        .tokenizers()
         .get(model)
         .ok_or_else(|| ApiError::BadRequest(format!("tokenizer disabled for model {model}")))
 }
@@ -131,6 +132,7 @@ mod tests {
                 decode_policy: Default::default(),
                 dp_aware: false,
                 dp_rank_policy: Default::default(),
+                decode_dp_rank_policy: None,
                 bucket_config: None,
                 reorg_buckets: None,
                 reorg_admission: Default::default(),
@@ -357,7 +359,12 @@ mod tests {
     #[tokio::test]
     async fn disabled_tokenizer_is_a_bad_request() {
         let mut ctx = ctx_with_tiny();
-        Arc::get_mut(&mut ctx).unwrap().tokenizers = Default::default();
+        let ctx_mut = Arc::get_mut(&mut ctx).unwrap();
+        ctx_mut.preprocessor = crate::server::routes::chat::Preprocessor::new(
+            &ctx_mut.config.model,
+            Default::default(),
+            Arc::clone(&ctx_mut.metrics),
+        );
         let res = crate::server::app::build_router(ctx)
             .oneshot(
                 Request::builder()

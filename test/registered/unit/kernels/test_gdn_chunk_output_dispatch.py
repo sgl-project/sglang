@@ -50,6 +50,7 @@ class TestGDNChunkOutputDispatch(CustomTestCase):
             ),
             "is_hip": Mock(return_value=False),
             "use_gfx115_kernels": Mock(return_value=True),
+            "is_batch_invariant_mode_enabled": Mock(return_value=False),
             "prepare_chunk_indices": Mock(side_effect=AssertionError("rebuilt table")),
             "chunk_fwd_kernel_o": generic_kernel,
             "chunk_fwd_kernel_o_grouped_three_head": grouped_kernel,
