@@ -56,6 +56,14 @@ _GROUP_MERGE = os.environ.get("SGLANG_DIFFUSION_ROCM_CE_MERGE", "end") == "group
 # with a fill: at most this many group attentions in flight (0: no limit);
 # group g starts after group g - N has attended
 _MAX_CONC = int(os.environ.get("SGLANG_DIFFUSION_ROCM_CE_MAX_CONC", "0"))
+# the last head group, which nothing else overlaps (comma list):
+#   klast: its output blocks go to every peer in one copy kernel, not in one
+#     SDMA copy per peer one after another on its stream (an extra stream per
+#     peer stalls the other groups: its waits hold their streams back)
+#   tlast: its key-split tail runs on a side stream beside its full-wave launch
+_LAST = frozenset(
+    x for x in os.environ.get("SGLANG_DIFFUSION_ROCM_CE_LAST", "").split(",") if x
+)
 
 
 class _Unsupported(RuntimeError):
@@ -170,6 +178,7 @@ class IpcA2ARocmState:
         self.pools = {}
         self.copy_streams = []
         self.group_streams = []
+        self.tail_stream = None
 
     def reset(self):
         self.__init__()
@@ -355,11 +364,25 @@ class IpcA2ARocmState:
             st.wait_event(own[g])
             if max_conc and g >= max_conc:
                 st.wait_event(attended[g - max_conc])
+            last = g == groups - 1
             with torch.cuda.stream(st):
                 for p in self.peers:
                     hip.wait(st, pool.fin_ptr[r] + 4 * p, base + g + 1)
                 qkv = recv[g].view(world * rows, gh, 3 * hd)
-                out = attend(*qkv.split(hd, dim=-1))
+                if last and "tlast" in _LAST:
+                    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+                        aiter as _aiter,
+                    )
+
+                    if self.tail_stream is None:
+                        self.tail_stream = torch.cuda.Stream()
+                    _aiter._TAIL_STREAM = self.tail_stream
+                    try:
+                        out = attend(*qkv.split(hd, dim=-1))
+                    finally:
+                        _aiter._TAIL_STREAM = None
+                else:
+                    out = attend(*qkv.split(hd, dim=-1))
                 attended.append(st.record_event())
                 if not out.is_contiguous():
                     out = out.contiguous()
@@ -386,13 +409,21 @@ class IpcA2ARocmState:
                     merged[:, col : col + gh].copy_(out[r * rows : (r + 1) * rows])
                     done.append(st.record_event())
                     continue
-                for p in self.peers:
-                    hip.copy(
-                        st,
-                        pool.outb_ptr[p] + ((g * world + r) * rows * gh * hd) * esz,
-                        optr + p * chunk_out,
-                        chunk_out,
+                if last and "klast" in _LAST:
+                    n = rows * gh * hd
+                    at = (g * world + r) * n
+                    torch._foreach_copy_(
+                        [pool.outb[p][at : at + n] for p in self.peers],
+                        [out[p * rows : (p + 1) * rows].view(-1) for p in self.peers],
                     )
+                for p in self.peers:
+                    if not (last and "klast" in _LAST):
+                        hip.copy(
+                            st,
+                            pool.outb_ptr[p] + ((g * world + r) * rows * gh * hd) * esz,
+                            optr + p * chunk_out,
+                            chunk_out,
+                        )
                     hip.copy(
                         st,
                         pool.fout_ptr[p] + 4 * (g * world + r),
