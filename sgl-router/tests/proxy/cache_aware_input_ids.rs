@@ -140,8 +140,8 @@ async fn caller_input_ids_are_used_for_routing_and_preserved() {
             "messages": [{"role": "user", "content": "hi"}],
             "input_ids": ids,
         });
-        let tokens = sgl_router::policies::request_tokens_for(
-            &ctx.tokenizers,
+        let tokens = sgl_router::tokenizer::prompt::request_tokens_for(
+            ctx.preprocessor.tokenizers(),
             &ModelId(MODEL.into()),
             &request,
         );

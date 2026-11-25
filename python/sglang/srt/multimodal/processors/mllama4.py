@@ -13,8 +13,6 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        self.vision_config = hf_config.vision_config
-        self.text_config = hf_config.text_config
         self.IM_START_TOKEN_ID = hf_config.boi_token_index
         self.IM_END_TOKEN_ID = hf_config.eoi_token_index
         self.IM_TOKEN_ID = hf_config.image_token_index
