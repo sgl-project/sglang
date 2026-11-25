@@ -154,9 +154,12 @@ def install(*, archs, lookups=None, is_load_observed=False, model_type="fake"):
     return lm
 
 
-def runner(*, capture_bs):
+def runner(*, capture_bs, is_draft_worker=False):
     """A decode CUDA graph runner, as the capture tail hook sees it."""
-    return SimpleNamespace(capture_bs=capture_bs)
+    return SimpleNamespace(
+        capture_bs=capture_bs,
+        model_runner=SimpleNamespace(is_draft_worker=is_draft_worker),
+    )
 
 
 class Lm(torch.nn.Module):
@@ -458,6 +461,23 @@ class TestMonokernelFramework(CustomTestCase):
         # the largest graph of its mode runs eagerly
         eager = binding._eager_keys(served=served, captured=check.captured.values())
         self.assertEqual([k.batch_size for k in eager], [8])
+
+    def test_a_draft_runners_captures_are_not_checked(self):
+        # the draft decode and draft extend runners run the model runner's capture tail
+        # hooks too; their steps (1 token, or an extend) are not the served verify keys
+        served = frozenset(
+            ShapeKey(forward_mode="target_verify", batch_size=bs, tokens_per_request=4)
+            for bs in (1, 2)
+        )
+        check = binding._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            for draft_step in (batch("decode", 1, 1), batch("draft_extend_v2", 1, 4)):
+                check(runner(capture_bs=[1], is_draft_worker=True), None, draft_step, 1)
+            self.assertFalse(check.is_done)
+            self.assertEqual(check.captured, {})
+            # the target's own runner is still checked
+            with self.assertRaisesRegex(ValueError, "none of the 1 captured decode"):
+                check(runner(capture_bs=[1]), None, batch("decode", 1, 1), 1)
 
     def test_the_runtime_reads_the_published_config(self):
         graphs = with_phase(default_cuda_graph_config(), Phase.DECODE, bs=[1, 2, 8])

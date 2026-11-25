@@ -516,6 +516,12 @@ class _CaptureCheck:
     ) -> None:
         if self.is_done or not torch.cuda.is_current_stream_capturing():
             return  # the runner's warmup runs, and any recapture
+        if getattr(runner.model_runner, "is_draft_worker", False):
+            # The draft decode and draft extend runners run the capture tail hooks too.
+            # A draft spec serves other steps than the target's decode or verify keys
+            # checked here (a draft decode is 1 token a request, a draft extend is no
+            # decode or verify step) and routes and reports its own steps.
+            return
         self.captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
         if not set(runner.capture_bs) <= set(self.captured):
             return
