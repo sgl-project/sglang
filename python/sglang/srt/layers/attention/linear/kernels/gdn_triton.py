@@ -20,9 +20,11 @@ if not is_cpu():
     )
 
 if is_npu():
-    from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
-        fused_sigmoid_gating_delta_rule_update_decode_npu as fused_sigmoid_gating_delta_rule_update,
+    from sgl_kernel_npu.operators.attention.gdn import (
+        chunk_gated_delta_rule_npu,
+    )
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_gdn_decode as fused_sigmoid_gating_delta_rule_update,
     )
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
