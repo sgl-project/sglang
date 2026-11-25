@@ -60,6 +60,12 @@ impl ChatProcessor {
         }
     }
 
+    #[getter]
+    fn unreported_prompt_tokens(&self) -> u64 {
+        sglang_processor::openai::ChatModel::for_formatter(&self.formatter)
+            .unreported_prompt_tokens()
+    }
+
     fn token_id(&self, token: &str) -> PyResult<Option<u32>> {
         let tokenizer = self.tokenizer.tokenizer();
         if let Ok(id) = tokenizer.token_to_id(token) {
@@ -126,33 +132,63 @@ impl ChatProcessor {
     ) -> PyResult<(Vec<u32>, ReasoningDecoder)> {
         py.detach(|| {
             let body: Value = serde_json::from_slice(request_json).map_err(invalid)?;
-            let decoder = self.reasoning_decoder(name, &body)?;
-            Ok((self.encode_body(body)?, decoder))
+            let mut options = self.reasoning_options(name, &body);
+            let check_glm_prompt = name == "glm45"
+                && body["continue_final_message"] != true
+                && body["add_generation_prompt"] != false;
+            let unary_text = (body["stream"] != true).then(String::new);
+            let ids = self.encode_body(body)?;
+            if check_glm_prompt && let Some(open) = self.glm_prompt_reasoning_open(&ids)? {
+                options.force_reasoning = Some(open);
+            }
+            let parser = sglang_processor::ReasoningStream::new(name, &options)
+                .ok_or_else(|| invalid(format!("unsupported reasoning parser {name}")))?;
+            Ok((ids, ReasoningDecoder { parser, unary_text }))
         })
     }
 }
 
 impl ChatProcessor {
-    fn reasoning_decoder(&self, name: &str, body: &Value) -> PyResult<ReasoningDecoder> {
+    fn reasoning_options(&self, name: &str, body: &Value) -> sglang_processor::ReasoningOptions {
         let model = sglang_processor::openai::ChatModel::for_formatter(&self.formatter);
         let previous = body["messages"]
             .as_array()
             .and_then(|m| m.last())
             .filter(|m| body["continue_final_message"] == true && m["role"] == "assistant");
-        let options = sglang_processor::ReasoningOptions {
+        sglang_processor::ReasoningOptions {
             force_reasoning: model.request_thinking(Some(name), body, &self.default_kwargs),
             previous_content: previous
                 .and_then(|m| m["content"].as_str())
                 .map(str::to_owned),
             stream_reasoning: body["stream_reasoning"].as_bool().unwrap_or(true),
             force_nonempty_content: body["chat_template_kwargs"]["force_nonempty_content"] == true,
-        };
-        sglang_processor::ReasoningStream::new(name, &options)
-            .map(|parser| ReasoningDecoder {
-                parser,
-                unary_text: (body["stream"] != true).then(String::new),
-            })
-            .ok_or_else(|| invalid(format!("unsupported reasoning parser {name}")))
+        }
+    }
+
+    /// GLM templates can open or close reasoning regardless of request flags.
+    /// Extend the decoded tail only when whitespace or a split marker requires it.
+    fn glm_prompt_reasoning_open(&self, ids: &[u32]) -> PyResult<Option<bool>> {
+        let mut width = 16;
+        loop {
+            let start = ids.len().saturating_sub(width);
+            let tail = self
+                .tokenizer
+                .tokenizer()
+                .decode(&ids[start..], false)
+                .map_err(invalid)?;
+            let suffix = tail.as_str().trim_end();
+            if suffix.ends_with("<think>") {
+                return Ok(Some(true));
+            }
+            if suffix.ends_with("</think>") {
+                return Ok(Some(false));
+            }
+            let suffix = suffix.trim_start_matches('\u{fffd}');
+            if start == 0 || !("<think>".ends_with(suffix) || "</think>".ends_with(suffix)) {
+                return Ok(None);
+            }
+            width *= 2;
+        }
     }
 
     fn encode_body(&self, mut body: Value) -> PyResult<Vec<u32>> {

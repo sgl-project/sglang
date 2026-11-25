@@ -310,6 +310,26 @@ mod tests {
         ChatFormatter::from_tokenizer_config(&json!({ "chat_template": template })).unwrap()
     }
 
+    #[test]
+    fn text_jinja_serializes_messages_in_pydantic_field_order() {
+        let body = json!({"messages": [
+            {"content": "Hi", "role": "user"},
+            {"name": "helper", "role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Again"},
+        ]});
+        let (prompt, _) = jinja("{{ messages|tojson }}")
+            .render_text_jinja(&body, &HashMap::new())
+            .unwrap();
+        assert_eq!(
+            prompt.as_str(),
+            concat!(
+                r#"[{"role": "user", "content": "Hi"}, "#,
+                r#"{"role": "assistant", "content": "Hello", "name": "helper"}, "#,
+                r#"{"role": "user", "content": "Again"}]"#
+            )
+        );
+    }
+
     fn render(
         formatter: &ChatFormatter,
         mut body: Value,

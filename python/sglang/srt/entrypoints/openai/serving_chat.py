@@ -1787,7 +1787,18 @@ class OpenAIServingChat(OpenAIServingBase):
             raise ValueError(
                 "Forwarded prompt_token_ids support only single-candidate text chat"
             )
-        if is_multimodal and self._text_only_requires_mm_processor():
+        mm_needs_text = is_multimodal and (
+            self._text_only_requires_mm_processor()
+            or (
+                self._tokenizer_auto_adds_specials
+                and not chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)
+            )
+        )
+        parser_frames_prefix = _continues_final_assistant(request) and isinstance(
+            self._reasoning_detector, ResponseTemplateReasoningDetector
+        )
+        # Forwarded IDs carry no HF template name or response-parser state.
+        if mm_needs_text or parser_frames_prefix or get_serving().hf_chat_template_name:
             request.input_ids = None
             return False
         request.input_ids = ids

@@ -83,6 +83,8 @@ def _validate(request):
             raise InvalidArgument(f"sglang-rust does not support {key}")
     if request.get("tool_choice") not in (None, "none", "auto"):
         raise InvalidArgument("sglang-rust does not support tool_choice")
+    if request.get("continue_final_message") and messages[-1]["role"] != "assistant":
+        raise InvalidArgument("sglang-rust can continue only a final assistant message")
     if request.get("add_generation_prompt") is False and not request.get(
         "continue_final_message"
     ):
@@ -232,6 +234,9 @@ class DynamoChat:
         self.routed_engine = routed_engine
         self.eos = eos
         self.template_stops = processor.template_stops
+        self.unreported_prompt_tokens = getattr(
+            processor, "unreported_prompt_tokens", 0
+        )
         self.default_thinking_mode = default_thinking_mode
 
     def _encode(self, request):
@@ -351,6 +356,17 @@ class DynamoChat:
             if cached is not None:
                 data["llm_metrics"]["cached_tokens"] = cached
             if usage:
+                if self.unreported_prompt_tokens:
+                    prompt_tokens = max(
+                        0, usage["prompt_tokens"] - self.unreported_prompt_tokens
+                    )
+                    usage["prompt_tokens"] = prompt_tokens
+                    usage["total_tokens"] = prompt_tokens + usage["completion_tokens"]
+                    if cached is not None:
+                        usage["prompt_tokens_details"] = {
+                            **usage["prompt_tokens_details"],
+                            "cached_tokens": min(cached, prompt_tokens),
+                        }
                 data["usage"] = usage
             if reason and "prompt_token_ids" in (
                 (request.get("nvext") or {}).get("extra_fields") or []

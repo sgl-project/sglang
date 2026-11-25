@@ -2067,6 +2067,61 @@ class ServingChatTestCase(CustomTestCase):
         self.assertTrue(actual.prompt.endswith("<think>"))
         self.assertEqual(actual.prompt_ids, [1, 2, 3, 4, 5])
 
+    def test_llm_d_vlm_preserves_text_tokenization_with_bos(self):
+        """A text-only VLM request still goes through its BOS-adding tokenizer."""
+        self.tm.model_config.is_multimodal = True
+        self.tm.model_config.hf_config.architectures = ["LlavaForConditionalGeneration"]
+        self.tm.model_config.token_id_vocab_size = 100
+        self.template_manager.chat_template_name = None
+        self.chat._prompt_text_round_trip_is_lossy = False
+        self.chat._tokenizer_auto_adds_specials = True
+        self.tm.tokenizer.apply_chat_template.return_value = "Hi"
+        self.tm.tokenizer.decode.return_value = "Hi"
+        self.basic_req.kv_transfer_params = {"prompt_token_ids": [20]}
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.assertEqual(adapted.text, "Hi")
+        self.assertIsNone(adapted.input_ids)
+
+    def test_llm_d_named_template_uses_worker_selection(self):
+        """An unlabelled forwarded prompt cannot override the selected HF template."""
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.token_id_vocab_size = 100
+        self.tm.tokenizer.apply_chat_template.return_value = [3, 4, 5]
+        self.chat._prompt_text_round_trip_is_lossy = True
+        self.basic_req.kv_transfer_params = {"prompt_token_ids": [20]}
+        with get_context().override_server_args(
+            hf_chat_template_name="rag", trust_llm_d_prompt_token_ids=True
+        ):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.assertEqual(adapted.input_ids, [3, 4, 5])
+
+    def test_llm_d_beam_continuation_keeps_final_channel_opener(self):
+        """Forwarding a continuation must preserve Beam's answer-channel tokens."""
+        self.tm._config_overrides["reasoning_parser"] = "beam"
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.token_id_vocab_size = 100
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.chat._prompt_text_round_trip_is_lossy = True
+        self.tm.tokenizer.apply_chat_template.return_value = [10]
+        self.tm.tokenizer.decode.return_value = "<|start|>assistant"
+        self.tm.tokenizer.encode.side_effect = {
+            "<|channel|>final<|message|>The capital is ": [30, 20],
+            "The capital is ": [20],
+        }.__getitem__
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Capital?"},
+                {"role": "assistant", "content": "The capital is "},
+            ],
+            continue_final_message=True,
+            kv_transfer_params={"prompt_token_ids": [10, 20]},
+        )
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            result = self.chat._process_messages(request, False)
+        self.assertEqual(result.prompt_ids, [10, 30, 20])
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         _use_chat_encoding(self.chat, "kimi_k3")
         ret = [
