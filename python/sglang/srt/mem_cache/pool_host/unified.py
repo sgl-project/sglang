@@ -353,6 +353,9 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             io_backend == "kernel"
             and _is_cuda
             and self.page_size > 1
+            # The copy kernel moves 8-byte words; composite units can pad a page
+            # to a size whose per-token share is not word aligned.
+            and self.size_per_token % 8 == 0
             and self._device_page_buffer.device.type == "cuda"
         )
 
@@ -364,7 +367,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         src_indices: torch.Tensor,
         dst_indices: torch.Tensor,
     ) -> None:
-        # Token-major envelopes let token IDs index rows directly.
+        # Callers copy whole pages, so page_size equal slices of a page cover its bytes.
         num_items = src_indices.numel()
         if num_items % self.page_size != 0:
             raise ValueError(

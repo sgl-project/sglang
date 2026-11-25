@@ -12,6 +12,8 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_page_unified_lf,
 )
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions
+from sglang.srt.mem_cache.kv.layout.page import PageEnvelopeHostLayout
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host import unified as unified_host
@@ -1150,6 +1152,59 @@ def test_unified_envelope_kernel_copy_moves_whole_pages(dtype, page_size, side):
         torch.cuda.synchronize()
         for host_pool in hosts:
             host_pool.destroy()
+        reset_context()
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Row-split envelope copy is CUDA only")
+def test_unified_envelope_kernel_copy_with_unaligned_token_share():
+    """Pages whose per-token share is not 8-byte aligned still copy byte-exact."""
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    # A composite unit padded to lcm(4, 16, 48): 60 bytes per token.
+    page_size, page_bytes, num_pages = 4, 240, 8
+    device_pages = torch.zeros(num_pages, page_bytes, dtype=torch.uint8, device=DEVICE)
+    host = PageEnvelopeHostLayout(
+        buffer=device_pages,
+        allocation=device_pages,
+        registration_bytes=device_pages.nbytes,
+        page_size=page_size,
+        capacity=num_pages * page_size,
+    ).build(
+        HostPoolOptions(
+            ratio=1.0,
+            size=0,
+            page_size=page_size,
+            layout="layer_first",
+            allocator_type="default",
+            pool_label="kv",
+        )
+    )
+    host_pages = host._host_page_buffer_view
+    device_ids, host_ids = torch.tensor([5, 2, 7]), torch.tensor([0, 6, 3])
+
+    def rows(pages):
+        return (pages[:, None] * page_size + torch.arange(page_size)).reshape(-1)
+
+    try:
+        device_pages.copy_(torch.randint_like(device_pages, 256))
+        expected = host_pages.clone()
+        expected[host_ids] = device_pages[device_ids.to(DEVICE)].cpu()
+        host.backup_from_device_all_layer_physical(
+            None, rows(host_ids).to(DEVICE), rows(device_ids).to(DEVICE), "kernel"
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(host_pages, expected)
+
+        host_pages.copy_(torch.randint_like(host_pages, 256))
+        expected = device_pages.clone()
+        expected[device_ids.to(DEVICE)] = host_pages[host_ids].to(DEVICE)
+        host.load_to_device_per_layer_physical(
+            None, rows(host_ids).to(DEVICE), rows(device_ids).to(DEVICE), 0, "kernel"
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(device_pages, expected)
+    finally:
+        torch.cuda.synchronize()
+        host.destroy()
         reset_context()
 
 
