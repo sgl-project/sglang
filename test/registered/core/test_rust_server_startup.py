@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_rust_server_built,
+    skip_if_no_hf_token_in_ci,
 )
 
 register_cuda_ci(est_time=200, stage="base-b", runner_config="1-gpu-small")
@@ -24,6 +25,7 @@ register_cuda_ci(est_time=200, stage="base-b", runner_config="1-gpu-small")
     is_rust_server_built(),
     "embedded rust server extension not built",
 )
+@skip_if_no_hf_token_in_ci
 class TestRustServerStartupWarmupFailure(CustomTestCase):
     def _launch_until_exit(self, rust_server: bool):
         host, port = DEFAULT_URL_FOR_TEST.removeprefix("http://").rsplit(":", 1)

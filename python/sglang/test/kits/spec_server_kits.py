@@ -27,6 +27,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
     run_logprob_check,
+    skip_if_no_hf_token_in_ci,
 )
 
 
@@ -83,6 +84,7 @@ class SpecCorrectnessKit:
             print(f"batch {acc_length=:.4f}")
             self.assertGreater(acc_length, self.batch_accept_len_thres)
 
+    @skip_if_no_hf_token_in_ci
     def test_eos_token(self):
         prompt = "[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\nToday is a sunny day and I like [/INST]"
         res = requests.post(

@@ -23,7 +23,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    skip_if_no_hf_token_in_ci,
+)
 
 register_cuda_ci(est_time=54, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd")
@@ -49,6 +52,7 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = False
 
 
+@skip_if_no_hf_token_in_ci
 class TestOriginalLogprob(unittest.TestCase):
     def setUp(self):
         # ----- HF side (float32 weights) -----

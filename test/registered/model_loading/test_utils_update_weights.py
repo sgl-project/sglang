@@ -14,7 +14,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.weight_sync.utils import update_weights
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    skip_if_no_hf_token_in_ci,
+)
 
 register_cuda_ci(est_time=49, stage="base-b", runner_config="1-gpu-small")
 
@@ -55,6 +58,7 @@ def setup_single_process_distributed():
         os.environ["LOCAL_RANK"] = "0"
 
 
+@skip_if_no_hf_token_in_ci
 class TestUtilsUpdateWeights(unittest.TestCase):
     """Test class for utils.update_weights function"""
 

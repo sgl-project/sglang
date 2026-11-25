@@ -245,6 +245,27 @@ def is_rust_server_built():
     return importlib.util.find_spec("sglang.srt.rust_extensions._server") is not None
 
 
+def _is_hf_token_missing_in_ci() -> bool:
+    if not is_in_ci():
+        return False
+
+    import huggingface_hub.constants
+
+    if huggingface_hub.constants.HF_HUB_OFFLINE:
+        return False
+    # Checks HF_TOKEN, HUGGING_FACE_HUB_TOKEN, and the stored token file.
+    return huggingface_hub.get_token() is None
+
+
+# Temporary workaround for the CI runners that lost their HF token, where gated
+# meta-llama loads outside the offline cache path fail with HF 401
+# (sgl-project/sglang#42752, entry I73); drop once every runner has a token again.
+skip_if_no_hf_token_in_ci = unittest.skipIf(
+    _is_hf_token_missing_in_ci(),
+    "CI runner has no HF token; gated meta-llama loads fail with HF 401",
+)
+
+
 def _use_cached_default_models(model_repo: str):
     cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
     if cache_dir and model_repo:

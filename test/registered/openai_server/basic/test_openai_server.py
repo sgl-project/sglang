@@ -29,12 +29,14 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_rust_server_built,
     popen_launch_server,
+    skip_if_no_hf_token_in_ci,
 )
 
 register_cuda_ci(est_time=353, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=280, suite="base-b-test-1-gpu-small-amd")
 
 
+@skip_if_no_hf_token_in_ci
 class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
     @classmethod
     def setUpClass(cls):
@@ -550,6 +552,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
     is_rust_server_built(),
     "embedded rust server extension not built",
 )
+@skip_if_no_hf_token_in_ci
 class TestOpenAICompletionWithRust(CustomTestCase):
     """Run the existing Completion matrix unchanged through the Rust frontend."""
 
@@ -597,6 +600,7 @@ class TestOpenAIChatWithRust(TestOpenAICompletionWithRust):
     test_completion_stream = None
 
 
+@skip_if_no_hf_token_in_ci
 class TestOpenAIServerv1Responses(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -1019,6 +1023,7 @@ class TestOpenAIV1Rerank(CustomTestCase):
         self.assertTrue(isinstance(response[1]["index"], int))
 
 
+@skip_if_no_hf_token_in_ci
 class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1107,6 +1112,7 @@ class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
 
 
+@skip_if_no_hf_token_in_ci
 class TestOpenAIV1Score(CustomTestCase):
     @classmethod
     def setUpClass(cls):

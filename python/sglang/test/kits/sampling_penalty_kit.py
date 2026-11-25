@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from transformers import AutoTokenizer
 
+from sglang.test.test_utils import skip_if_no_hf_token_in_ci
+
 
 class PenalizedEOSMixin:
     """A +100 bias makes the end-of-sequence token the greedy choice as soon as
@@ -12,6 +14,7 @@ class PenalizedEOSMixin:
     minimum. A verifier that bans the token at every draft position of a block
     starting below the minimum stops later."""
 
+    @skip_if_no_hf_token_in_ci
     def test_penalized_eos_after_minimum(self):
         eos = AutoTokenizer.from_pretrained(self.model).eos_token_id
 

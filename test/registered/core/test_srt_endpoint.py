@@ -29,6 +29,7 @@ from sglang.test.test_utils import (
     is_rust_server_built,
     popen_launch_server,
     run_logprob_check,
+    skip_if_no_hf_token_in_ci,
 )
 
 register_cuda_ci(est_time=239, stage="base-b", runner_config="1-gpu-small")
@@ -714,6 +715,7 @@ class TestSRTEndpoint(CustomTestCase):
 # -------------------------------------------------------------------------
 
 
+@skip_if_no_hf_token_in_ci
 class TestTokenizeDetokenize(CustomTestCase):
     @classmethod
     def setUpClass(cls):

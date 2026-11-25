@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
+    skip_if_no_hf_token_in_ci,
 )
 
 register_cuda_ci(est_time=293, stage="base-b", runner_config="1-gpu-small")
@@ -25,6 +26,7 @@ register_amd_ci(est_time=261, suite="base-b-test-1-gpu-small-amd")
 
 
 class TestSRTEngine(CustomTestCase):
+    @skip_if_no_hf_token_in_ci
     def test_1_engine_runtime_consistency(self):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -60,6 +62,7 @@ class TestSRTEngine(CustomTestCase):
 
         self.assertTrue(torch.allclose(out1, out2, atol=1e-5, rtol=1e-3))
 
+    @skip_if_no_hf_token_in_ci
     def test_3_engine_token_ids_consistency(self):
         # just to ensure there is no issue running multiple generate calls
         prompt = "Today is a sunny day and I like"
@@ -116,6 +119,7 @@ class TestSRTEngine(CustomTestCase):
         print(out2)
         self.assertEqual(out1, out2)
 
+    @skip_if_no_hf_token_in_ci
     def test_7_engine_offline_throughput(self):
         server_args = ServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

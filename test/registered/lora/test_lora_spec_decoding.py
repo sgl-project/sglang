@@ -23,6 +23,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    skip_if_no_hf_token_in_ci,
 )
 
 register_cuda_ci(est_time=95, stage="base-b", runner_config="1-gpu-small")
@@ -75,6 +76,7 @@ def _decode_passes(base_url, *, require_samples=False):
     return {mode: sum(values) for mode, values in samples.items()}
 
 
+@skip_if_no_hf_token_in_ci
 class TestEagle3MultiLoRA(CustomTestCase):
     process = None
 
