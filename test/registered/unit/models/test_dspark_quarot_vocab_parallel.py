@@ -21,6 +21,7 @@ from sglang.srt.distributed import (
     destroy_model_parallel,
     init_distributed_environment,
     initialize_model_parallel,
+    parallel_state,
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dspark_quarot import (
@@ -128,6 +129,14 @@ def _check_vocab_case(rank, *, dp_enabled, replicate):
 
 def _run_vocab_worker(rank, world_size, init_path):
     torch.set_num_threads(1)
+    init_group = parallel_state.init_model_parallel_group
+
+    def init_cpu_group(*args, **kwargs):
+        # Gloo groups can still initialize optional GPU communicators.
+        kwargs["use_pynccl"] = False
+        kwargs["use_custom_allreduce"] = False
+        return init_group(*args, **kwargs)
+
     init_distributed_environment(
         world_size=world_size,
         rank=rank,
@@ -153,7 +162,10 @@ def _run_vocab_worker(rank, world_size, init_path):
                 # shared-memory object-broadcast transport.
                 envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.override(False),
             ):
-                initialize_model_parallel(backend="gloo")
+                with patch.object(
+                    parallel_state, "init_model_parallel_group", init_cpu_group
+                ):
+                    initialize_model_parallel(backend="gloo")
                 try:
                     for replicate in (False, True):
                         _check_vocab_case(
