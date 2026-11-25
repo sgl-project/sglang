@@ -31,7 +31,6 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
-    AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
 from sglang.srt.layers.dp_attention import (
@@ -53,12 +52,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
-    get_deepep_mode,
     get_moe_a2a_backend,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -90,7 +87,6 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import is_cuda
 
-LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
@@ -289,7 +285,6 @@ class BailingMoESparseMoeBlock(nn.Module):
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
-            # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
             scoring_func=self.score_function
@@ -342,20 +337,6 @@ class BailingMoESparseMoeBlock(nn.Module):
                     or get_moe_a2a_backend().is_ascend_ops()
                 )
                 else "tp",
-            )
-        # dispatcher
-        if get_moe_a2a_backend().is_deepep():
-            self.deepep_dispatcher = DeepEPDispatcher(
-                group=get_parallel().tp_group.device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.num_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=get_deepep_mode(),
-                async_finish=True,  # TODO
-                return_recv_hook=True,
             )
 
     def forward(
@@ -729,13 +710,11 @@ class BailingMoEBlock(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         capture_output=None,
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            capture_gathered=captured_last_layer_outputs,
             capture=capture_output,
         )
 
@@ -834,9 +813,6 @@ class BailingMoEModel(nn.Module):
                     positions,
                     hidden_states,
                     forward_batch,
-                    captured_last_layer_outputs=aux_hidden_states
-                    if getattr(layer, "_is_layer_to_capture", False)
-                    else None,
                     capture_output=aux_hidden_states.capture
                     if i in self.layers_to_capture
                     else None,
@@ -875,7 +851,7 @@ class BailingMoEForCausalLM(nn.Module):
             prefix=add_prefix("model", ""),
         )
 
-        # tie_word_embeddings为true，复用tie_word_embeddings，反之是独立的
+        # Tied checkpoints reuse the input embedding as the LM head.
         if config.tie_word_embeddings:
             self.lm_head = self.model.word_embeddings
         else:
@@ -998,8 +974,6 @@ class BailingMoEForCausalLM(nn.Module):
                 and self.config.norm_head
                 and "lm_head.weight" in name
             ):
-                import torch.nn.functional as F
-
                 loaded_weight = F.normalize(loaded_weight, dim=0, p=2, eps=1e-7)
 
             for param_name, weight_name in replaced_params_mapping.items():
