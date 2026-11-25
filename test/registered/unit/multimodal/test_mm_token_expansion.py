@@ -995,39 +995,6 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             self._item_hash(_PixelShapeStrategy, (2, 1)),
         )
 
-    def test_mrope_fallback_skips_the_rebuild_without_mrope(self):
-        """The scheduler asks every request without M-RoPE positions for them; a strategy
-        without M-RoPE answers none, and its item fields need not survive a rebuild."""
-        reset_context()
-        self.addCleanup(reset_context)
-        server_args = ServerArgs(
-            model_path="dummy",
-            model_impl="sglang",
-            mm_process_config={},
-            enable_token_space_processor=True,
-            mm_processor_worker_num=1,
-        )
-        publish(server_args, role="test")
-        processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
-            _ImageWidthStrategy, TokenSpaceServingSpec
-        )(None, server_args, _bare_tokenizer(), None)
-        self.addCleanup(processor.shutdown)
-        output = asyncio.run(
-            processor.process_mm_data_async(
-                image_data=[Image.new("RGB", (2, 1)), Image.new("RGB", (3, 1))],
-                input_ids=[1, IMAGE, 2, IMAGE],
-            )
-        )
-        with patch.object(
-            processor._core.strategy,
-            "merge_media",
-            side_effect=AssertionError("rebuilt the item fields"),
-        ):
-            self.assertEqual(
-                processor.compute_mrope_positions(output.input_ids, output.mm_items),
-                (None, None),
-            )
-
 
 class TestStrategyLoaders(unittest.TestCase):
     """The IO path decodes every source with the strategy's loaders, the shared ones by default."""

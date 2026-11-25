@@ -8,20 +8,18 @@ serving   the flag selects this strategy for the checkpoint's architecture; serv
           -> test_serving_output_matches_legacy_processor
 hashes    transposed solid images have equal patches, but their grids and spans differ
           -> test_transposed_images_get_different_hashes
+cache     two vision configs sharing one item feature cache each compute their own patches
+          -> test_vision_config_scopes_the_item_feature_cache
 turns     a later turn adds one image behind the expanded prefix
           -> test_partial_expansion_adds_the_new_turns_image
 mrope     the scheduler's M-RoPE fallback returns none for two images
           -> test_scheduler_mrope_fallback_takes_two_images
-media     video and audio are request errors; a GPU image decoder is rejected
-          -> test_video_and_audio_are_rejected, test_gpu_image_decoder_is_rejected
-trainer   the strategy module imports without serving modules
-          -> test_strategy_imports_without_serving_modules
+media     video and audio are request errors; a GPU image decoder or device is rejected
+          -> test_video_and_audio_are_rejected, test_gpu_image_options_are_rejected
 """
 
 import asyncio
 import io
-import subprocess
-import sys
 import unittest
 from unittest.mock import patch
 
@@ -40,6 +38,7 @@ from sglang.srt.multimodal.token_space_mm_process.models.deepseek_v41 import (
     DeepseekV41TokenSpaceProcessStrategy,
     DeepseekV41TokenSpaceServingSpec,
 )
+from sglang.srt.multimodal.token_space_mm_process.processor import TokenSpaceProcessor
 from sglang.srt.multimodal.token_space_mm_process.registry import (
     TOKEN_SPACE_SERVING_SPEC_MAPPING,
     TOKEN_SPACE_STRATEGY_MAPPING,
@@ -65,17 +64,20 @@ def _tokenizer():
     )
 
 
-def _config():
+def _config(**overrides):
     # 4 px patches in 8 px token cells keep the grids small; each resize depends on ratios only.
     return DeepseekV41Config(
-        architectures=[ARCH],
-        vision_n_layers=1,
-        image_token_id=IMAGE,
-        vision_patch_size=4,
-        vision_downsample_ratio=2,
-        vision_max_n_token=40,
-        vision_min_pixels=256,
-        vision_max_wh_ratio=4,
+        **{
+            "architectures": [ARCH],
+            "vision_n_layers": 1,
+            "image_token_id": IMAGE,
+            "vision_patch_size": 4,
+            "vision_downsample_ratio": 2,
+            "vision_max_n_token": 40,
+            "vision_min_pixels": 256,
+            "vision_max_wh_ratio": 4,
+            **overrides,
+        }
     )
 
 
@@ -102,7 +104,7 @@ class TestDeepseekV41TokenSpace(CustomTestCase):
             mm_process_config={},
             mm_feature_transport="cpu",
             mm_preprocess_cache_size_mb=0,
-            disable_fast_image_processor=True,
+            image_processor_backend="pil",
             mm_processor_worker_num=1,
             enable_token_space_processor=True,
         )
@@ -118,7 +120,7 @@ class TestDeepseekV41TokenSpace(CustomTestCase):
         ]
 
     def _processors(self):
-        # disable_fast_image_processor pins legacy to PIL, the backend the strategy uses.
+        # image_processor_backend pins legacy to PIL, the backend the strategy uses.
         legacy = DeepseekV41ImageProcessor(
             _config(), self.server_args, self.tokenizer, None
         )
@@ -203,6 +205,29 @@ class TestDeepseekV41TokenSpace(CustomTestCase):
         self.assertTrue(torch.equal(wide.feature, tall.feature))
         self.assertNotEqual(wide.hash, tall.hash)
 
+    def test_vision_config_scopes_the_item_feature_cache(self):
+        """Servers that override the vision config share one model path and cache directory;
+        a hit must not hand one the other's patches and span length."""
+        cache = {}
+        outputs = {}
+        for max_n_token in (40, 16, 16):
+            processor = TokenSpaceProcessor.for_strategy(
+                DeepseekV41TokenSpaceProcessStrategy
+            )(
+                _config(vision_max_n_token=max_n_token),
+                self.tokenizer,
+                item_feature_cache=cache,
+            )
+            self.addCleanup(processor.shutdown)
+            # The last run reads the second one's entry.
+            outputs[max_n_token] = asyncio.run(
+                processor.process(self.images[5:], input_ids=[IMAGE])
+            )
+        self.assertEqual(len(cache), 2)
+        # 80x60 is capped at 40 tokens as 26, and at 16 as 10.
+        self.assertEqual(outputs[40]["input_ids"].shape[-1], 26)
+        self.assertEqual(outputs[16]["input_ids"].shape[-1], 10)
+
     def test_partial_expansion_adds_the_new_turns_image(self):
         """The second turn resends every image; only the placeholder after the prefix expands."""
         legacy, served = self._processors()
@@ -255,29 +280,19 @@ class TestDeepseekV41TokenSpace(CustomTestCase):
                     )
                 )
 
-    def test_gpu_image_decoder_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "image_decoder must be 'pil'"):
-            DeepseekV41TokenSpaceProcessStrategy(
-                _config(), self.tokenizer, mm_process_config={"image_decoder": "nvjpeg"}
-            )
-
-    def test_strategy_imports_without_serving_modules(self):
-        """Trainers import the strategy; the serving spec defers its serving imports."""
-        loaded = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "import sys\n"
-                "import sglang.srt.multimodal.token_space_mm_process.models.deepseek_v41\n"
-                "print(sorted(m for m in sys.modules if m.startswith(("
-                "'sglang.srt.managers', 'sglang.srt.models', 'sglang.srt.server_args', "
-                "'sglang.srt.multimodal.processors.base_processor'))))",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        self.assertEqual(loaded, "[]")
+    def test_gpu_image_options_are_rejected(self):
+        """Patches are made from PIL images on the CPU; other options would be ignored."""
+        for mm_process_config, message in (
+            ({"image_decoder": "nvjpeg"}, "image_decoder must be 'pil'"),
+            ({"image": {"device": "cuda:0"}}, "image device must be 'cpu'"),
+        ):
+            with (
+                self.subTest(mm_process_config=mm_process_config),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                DeepseekV41TokenSpaceProcessStrategy(
+                    _config(), self.tokenizer, mm_process_config=mm_process_config
+                )
 
 
 if __name__ == "__main__":

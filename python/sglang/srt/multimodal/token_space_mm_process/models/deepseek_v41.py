@@ -7,6 +7,7 @@ pass through unchanged.
 
 from types import MappingProxyType
 
+import PIL
 import torch
 
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
@@ -28,6 +29,7 @@ _NUM_IMAGE_TOKENS = "num_image_tokens"
 class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
     """ViT patches and grids, from the legacy processor's PIL backend."""
 
+    # As DeepseekV41Config normalizes it; a checkpoint's own config names DeepseekV41ForCausalLM.
     models = ("DeepseekV4ForCausalLM",)
     mm_item_fields = MappingProxyType(
         {
@@ -49,7 +51,25 @@ class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 "mm_process_config image_decoder must be 'pil' for DeepSeek-V4.1, "
                 "which patchifies PIL images"
             )
+        # A cache hit moves to the image device, where the CPU patches of a miss would not be.
+        if self.image_config.get("device", "cpu") != "cpu":
+            raise ValueError(
+                "mm_process_config image device must be 'cpu' for DeepSeek-V4.1, "
+                "which patchifies on the CPU"
+            )
         self.mm_token_expansion_params = {"image_token_id": hf_config.image_token_id}
+
+    def preprocess_fingerprint_payload(self):
+        # What patchify_image reads; Pillow 13 resizes some images differently
+        # (python-pillow/Pillow#9549).
+        return {
+            "vision_patch_size": self.hf_config.vision_patch_size,
+            "vision_downsample_ratio": self.hf_config.vision_downsample_ratio,
+            "vision_max_n_token": self.hf_config.vision_max_n_token,
+            "vision_min_pixels": self.hf_config.vision_min_pixels,
+            "vision_max_wh_ratio": self.hf_config.vision_max_wh_ratio,
+            "pillow": PIL.__version__,
+        }
 
     # Legacy loads images only; reject other media before decoding it.
     def load_video(self, source, *, video_decode_device):

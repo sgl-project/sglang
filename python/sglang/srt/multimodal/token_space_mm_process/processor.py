@@ -101,6 +101,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         self.strategy = strategy_class(
             hf_config, processor, mm_process_config=self.mm_process_config
         )
+        self._strategy_fingerprint = self.strategy.preprocess_fingerprint_payload()
         self._video_preprocessing_device = self.mm_process_config.get(
             "video_preprocessing_device", strategy_class.video_preprocessing_device
         )
@@ -271,6 +272,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                         transformers.__version__,
                         sglang_version,
                         self.hf_config.name_or_path,
+                        self._strategy_fingerprint,
                         self.mm_process_config,
                         self.image_processor_backend,
                         modality,

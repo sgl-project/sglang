@@ -111,6 +111,14 @@ class TokenSpaceProcessStrategy:
         """The mono waveform of one source at `audio_sample_rate`."""
         return load_audio_item(source, audio_sample_rate=self.audio_sample_rate)
 
+    def preprocess_fingerprint_payload(self) -> dict:
+        """Settings the item features depend on beyond the processor and mm_process_config.
+
+        Part of every item feature cache key, e.g. the hf_config fields a strategy reads,
+        which --json-model-override-args can change under the same model path.
+        """
+        return {}
+
     def resolve_media_options(
         self, processor, *, image_device=None, video_device=None
     ) -> dict:
