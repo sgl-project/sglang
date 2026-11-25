@@ -306,7 +306,17 @@ impl ChatFormatter {
     /// whose plain text never parses as special tokens. `None` for the others.
     pub fn encode_request(
         &self,
-        request: Value,
+        mut request: Value,
+        default_kwargs: &HashMap<String, Value>,
+    ) -> Option<Result<Vec<u32>, TemplateError>> {
+        self.take_and_encode_request(&mut request, default_kwargs)
+    }
+
+    /// Take the body only when the formatter has its own tokenizer. On `None`
+    /// the caller can render the original body without first making a copy.
+    pub fn take_and_encode_request(
+        &self,
+        request: &mut Value,
         default_kwargs: &HashMap<String, Value>,
     ) -> Option<Result<Vec<u32>, TemplateError>> {
         let tokenizer = match self {
@@ -316,7 +326,7 @@ impl ChatFormatter {
             _ => return None,
         };
         Some(
-            self.render_request(request, default_kwargs)
+            self.render_request(request.take(), default_kwargs)
                 .and_then(|(prompt, _)| {
                     tokenizer
                         .encode(&prompt)

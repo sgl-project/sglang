@@ -30,6 +30,33 @@ _SAMPLING = {
     "repetition_penalty",
 }
 
+_SUPPORTED_FIELDS = _SAMPLING | {
+    "model",
+    "messages",
+    "n",
+    "stream",
+    "stream_options",
+    "stop",
+    "stop_token_ids",
+    "max_tokens",
+    "max_completion_tokens",
+    "ignore_eos",
+    "skip_special_tokens",
+    "cache_salt",
+    "nvext",
+    "chat_template_args",
+    "chat_template_kwargs",
+    "continue_final_message",
+    "add_generation_prompt",
+    "thinking",
+    "reasoning_effort",
+    "separate_reasoning",
+    "stream_reasoning",
+    "response_format",
+    "tool_choice",
+    "user",
+}
+
 
 def _validate(request):
     messages = request.get("messages")
@@ -45,34 +72,8 @@ def _validate(request):
         raise InvalidArgument("sglang-rust supports a single completion (n=1)")
     if request.get("response_format") not in (None, {"type": "text"}):
         raise InvalidArgument("sglang-rust supports only text response_format")
-    supported = _SAMPLING | {
-        "model",
-        "messages",
-        "n",
-        "stream",
-        "stream_options",
-        "stop",
-        "stop_token_ids",
-        "max_tokens",
-        "max_completion_tokens",
-        "ignore_eos",
-        "skip_special_tokens",
-        "cache_salt",
-        "nvext",
-        "chat_template_args",
-        "chat_template_kwargs",
-        "continue_final_message",
-        "add_generation_prompt",
-        "thinking",
-        "reasoning_effort",
-        "separate_reasoning",
-        "stream_reasoning",
-        "response_format",
-        "tool_choice",
-        "user",
-    }
     for key, value in request.items():
-        if key not in supported and value is not None:
+        if key not in _SUPPORTED_FIELDS and value is not None:
             # Some clients explicitly disable optional OpenAI features.
             if (
                 key in {"tools", "logprobs", "parallel_tool_calls", "store"}

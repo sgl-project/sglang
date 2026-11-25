@@ -130,7 +130,7 @@ impl ChatProcessor {
             .ok_or_else(|| invalid(format!("unsupported reasoning parser {name}")))
     }
 
-    fn encode_body(&self, body: Value) -> PyResult<Vec<u32>> {
+    fn encode_body(&self, mut body: Value) -> PyResult<Vec<u32>> {
         let defaults = &self.default_kwargs;
         let render_generic = |body: Value| {
             let args = TemplateArgs::new(&body, defaults);
@@ -139,7 +139,7 @@ impl ChatProcessor {
                 .render_template(&typed, &args)
                 .map_err(invalid)
         };
-        if let Some(ids) = self.formatter.encode_request(body.clone(), defaults) {
+        if let Some(ids) = self.formatter.take_and_encode_request(&mut body, defaults) {
             return ids.map_err(invalid);
         }
         // Only formatters without a model-specific request renderer use the

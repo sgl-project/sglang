@@ -143,13 +143,15 @@ impl ChatFormatter {
         config: &Value,
         model_type: Option<&str>,
     ) -> Result<Self, TemplateError> {
-        let glm53 = config["chat_template"].as_str().is_some_and(is_glm53);
+        let source = config["chat_template"].as_str();
+        let content_parts = || source.and_then(super::content_format::takes_content_parts);
+        let glm53 = source.is_some_and(is_glm53);
         let minimax_m3 = model_type.map_or_else(
-            || config["chat_template"].as_str().is_some_and(is_minimax_m3),
+            || source.is_some_and(is_minimax_m3),
             |model_type| model_type == "minimax_m3_vl",
         );
-        let qwen38 = config["chat_template"].as_str().filter(|t| is_qwen38(t));
-        let step3p5 = config["chat_template"].as_str().is_some_and(is_step3p5);
+        let qwen38 = source.filter(|t| is_qwen38(t));
+        let step3p5 = source.is_some_and(is_step3p5);
         let thinking = ThinkingTemplates::from_config(config);
         let mut render_config = config.clone();
         let message_context = if glm53 {
@@ -183,12 +185,8 @@ impl ChatFormatter {
             Self::MiniMaxM3 {
                 formatter,
                 message_context,
-                xml_arguments: config["chat_template"]
-                    .as_str()
-                    .is_some_and(prints_arguments_as_xml),
-                content_parts: config["chat_template"]
-                    .as_str()
-                    .and_then(super::content_format::takes_content_parts),
+                xml_arguments: source.is_some_and(prints_arguments_as_xml),
+                content_parts: content_parts(),
             }
         } else if let Some(template) = qwen38 {
             Self::Qwen38 {
@@ -201,9 +199,7 @@ impl ChatFormatter {
                 formatter,
                 thinking,
                 message_context,
-                content_parts: config["chat_template"]
-                    .as_str()
-                    .and_then(super::content_format::takes_content_parts),
+                content_parts: content_parts(),
             }
         } else {
             let developer_errors = DeveloperErrors::probe(config, &formatter);
@@ -211,9 +207,7 @@ impl ChatFormatter {
                 formatter,
                 thinking,
                 developer_errors,
-                content_parts: config["chat_template"]
-                    .as_str()
-                    .and_then(super::content_format::takes_content_parts),
+                content_parts: content_parts(),
                 message_context,
             }
         })
