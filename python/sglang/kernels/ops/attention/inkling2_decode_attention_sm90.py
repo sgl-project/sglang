@@ -225,13 +225,14 @@ def _decode_partials(
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m = m_new
     if INTERIOR > 0:
-        # After the masked loop, so its first loads issue as early as main's (up to 7%
-        # slower on short keys before it); unpipelined to fit main's shared memory.
-        for tile in tl.range(big_lo, big_hi, num_stages=1):
-            m, l, acc = _interior_tile(
-                q, m, l, acc, tile * INTERIOR, b, hk, d, scale, K, V, PageTable,
-                SK0, SK1, SK2, SP, PAGE, INTERIOR,
-            )  # fmt: skip
+        # After the masked loop, so its first loads issue as early as main's. Pipelined:
+        # 1.05-1.3x from 32K keys (H200); skipped in splits with no interior tile.
+        if big_hi > big_lo:
+            for tile in tl.range(big_lo, big_hi, num_stages=2):
+                m, l, acc = _interior_tile(
+                    q, m, l, acc, tile * INTERIOR, b, hk, d, scale, K, V, PageTable,
+                    SK0, SK1, SK2, SP, PAGE, INTERIOR,
+                )  # fmt: skip
     stat = (split * batch * QLEN + token) * (HEADS_K * GROUP) + qh
     tl.store(MPartial + stat, m, head_mask)
     tl.store(LPartial + stat, l, head_mask)
@@ -308,8 +309,8 @@ def decode_partials(
         prefetch,
         num_warps=4,
         num_stages=2 if qlen == 1 or prefetch else 3,
-        # Changes ptxas's schedule (205 registers, 197 without on TP8): against no cap,
-        # 8-token blocks of 64-1536 keys ran 0.9% slower to 2.9% faster on H200.
+        # 64 rows: 204 registers, 212-217 without; with it 8-token blocks ran up to 2.8%
+        # faster at 1 unit, 4.9% slower at 16 (H200). 32-row blocks were timed with it.
         maxnreg=232 if prefetch else None,
         launch_pdl=True,
     )
