@@ -9,6 +9,8 @@ constexpr int R2MAX = 96, WOFF_R = 16384, SOFF_R1 = 24576, SOFF_R2 = 32768;
 constexpr int EWS = 3328;
 constexpr int STG = NSLOT * SLOTB, BAR = STG + 69632;
 constexpr int C_QUEUE = 96, C_CDONE = 97, C_LDONE = 98, C_EXIT = 99;
+// per-tile counters: a launch of up to 8 * chunk + 64 routes has at most chunk / 32 + NE tiles
+// of 256 rows, which must stay below C_READY - C_DONE (the ops module asserts it for its chunk)
 constexpr int C_GW = 104, C_DONE = 128, C_READY = 1152;
 constexpr int GW13 = 16 * 32, GW2 = 16 * 16;
 constexpr int C_TOT = 3200, C_LB = 3240, C_PRE = 3280, C_WORDS = 3400;

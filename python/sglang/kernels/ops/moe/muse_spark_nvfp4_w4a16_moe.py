@@ -25,6 +25,9 @@ _BIG_MAXT = 16384
 _BIG_SLOTS = 8 * BIG_TOKENS + 1152
 DYNAMIC_GUESTS = 2
 _BIG_NE = 32 + DYNAMIC_GUESTS
+# A large-M launch has at most BIG_TOKENS / 32 + _BIG_NE tiles of 256 rows; the kernel's
+# per-tile done and ready counters (C_DONE, C_READY) are 1024 words apart.
+assert BIG_TOKENS % 128 == 0 and BIG_TOKENS // 32 + _BIG_NE <= 1024
 _BIG_SMEM = 4 * 38912 + 69632 + 3328 + 1280
 _BIG_WIDTHS = (32, 64, 96, 128, 160, 192, 224, 256, 240)
 _BIG_CTR = 3400 + 32
