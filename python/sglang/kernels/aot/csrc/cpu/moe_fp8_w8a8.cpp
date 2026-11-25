@@ -395,7 +395,6 @@ void fused_experts_fp8_a8_kernel_impl(
     float* __restrict__ Ukernel_tmp,
     at::Float8_e4m3fn* __restrict__ Aq_tmp,
     float* __restrict__ As_tmp,
-    bool full_w8a8,
     const at::Float8_e4m3fn* __restrict__ input,
     const at::Float8_e4m3fn* __restrict__ packed_w1,
     const at::Float8_e4m3fn* __restrict__ packed_w2,
@@ -523,104 +522,21 @@ void fused_experts_fp8_a8_kernel_impl(
 
   // Full FP8 quantizes each BF16 SiLU row immediately, reusing per-thread scratch.
   at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
-    scalar_t* thread_silu = full_w8a8 ? ic1 + get_thread_num() * N : nullptr;
+    scalar_t* thread_silu = ic1 + get_thread_num() * N;
     for (int64_t m = begin; m < end; ++m) {
-      scalar_t* silu_out = full_w8a8 ? thread_silu : ic1 + m * N;
+      scalar_t* silu_out = thread_silu;
       silu_and_mul_stub(silu_out, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
-      if (full_w8a8) {
-        if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
-          As_tmp[m] = quantize_fp8_cpu_row(silu_out, Aq_tmp + m * N, N);
-        }
+      if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+        As_tmp[m] = quantize_fp8_cpu_row(silu_out, Aq_tmp + m * N, N);
       }
     }
   });
 
   // stage 2: intermediate_cache2 = intermediate_cache1 @ w2
   //   w2 : [E, K, N] as [E, OC, IC]
-  if (full_w8a8) {
-    fp8_down(
-        ic2,
-        Aq_tmp,
-        As_tmp,
-        packed_w2,
-        w2s,
-        topk_weights,
-        sorted_ids,
-        expert_ids,
-        offsets,
-        C_tmp,
-        Ukernel_tmp,
-        MB,
-        N,
-        K);
-  } else {
-    const int64_t OC = K;  // rename K as OC
-    const int64_t IC = N;  // rename N as IC
-    const int64_t MB2 = MB;
-    const int64_t NB2 = div_up(OC, BLOCK_N);
-    scale_size_N = div_up(K, block_size_N);
-    scale_size_K = div_up(N, block_size_K);
-    const int64_t stride_e2 = OC * IC;
-    const int64_t stride_oc = IC;
-    int64_t avg_M = std::max(int64_t(1), M * topk / E);
-    use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(avg_M);
+  fp8_down(
+      ic2, Aq_tmp, As_tmp, packed_w2, w2s, topk_weights, sorted_ids, expert_ids, offsets, C_tmp, Ukernel_tmp, MB, N, K);
 
-    // parallel on [MB2, NB2]
-    parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-      int tid = get_thread_num();
-      alignas(64) scalar_t C[BLOCK_M * BLOCK_K];
-
-      loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-        int64_t m_size = offsets[mb + 1] - offsets[mb];
-        int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
-
-        // A ptr from ic1 of [M * topk, N] in sorted order
-        // so as to avoid copy A to tmp buffer again
-        const scalar_t* __restrict__ A = ic1 + offsets[mb] * N;
-        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
-
-        // B shape [IC, n_size] in vnni format
-        int32_t expert_id = expert_ids[mb];
-        const at::Float8_e4m3fn* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
-        const float* __restrict__ Bs =
-            w2s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
-
-        // do unpacking for the first row or a new expert
-        int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
-        bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
-
-        tinygemm_kernel<scalar_t>(
-            /*   A            */ A,
-            /*   B            */ B,
-            /*   C            */ C,
-            /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * IC,
-            /*   Ctmp         */ C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
-            /*   Bbias        */ nullptr,
-            /*   scale        */ Bs,
-            /*   M            */ m_size,
-            /*   N            */ n_size,
-            /*   K            */ IC,
-            /*   lda          */ IC,
-            /*   ldb          */ n_size,
-            /*   ldc          */ BLOCK_N,
-            /*   brg          */ use_brgemm,
-            /*   block_size_K */ block_size_K,
-            /*   do_unpack    */ do_unpack);
-
-        // 2.b copy from C to ic2 in original order
-        //   and also mul topk_weights in float32
-        for (int64_t m = 0; m < m_size; ++m) {
-          int32_t index = A_ids[m];
-          float weight = topk_weights[index];
-          copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
-        }
-      });
-
-      if (use_brgemm) {
-        at::native::cpublas::brgemm_release();
-      }
-    });
-  }
   // stage 3: out = intermediate_cache2.sum(dim=1)
   //   from [M, topk, K] to [M, K]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
@@ -642,7 +558,6 @@ void fused_experts_fp8_a8_kernel_impl(
       float* __restrict__ Ukernel_tmp,                  \
       at::Float8_e4m3fn* __restrict__ Aq_tmp,           \
       float* __restrict__ As_tmp,                       \
-      bool full_w8a8,                                   \
       const at::Float8_e4m3fn* __restrict__ input,      \
       const at::Float8_e4m3fn* __restrict__ packed_w1,  \
       const at::Float8_e4m3fn* __restrict__ packed_w2,  \
