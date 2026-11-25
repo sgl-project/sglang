@@ -198,6 +198,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         self.invariant_checker = Mock()
         self.uocr_runtime = None
+        self.admission = None
         self.waiting_queue = IndexedReqList(ListKind.WAITING)
         self.cur_batch_for_debug = None
         self.pause_state = PauseState()

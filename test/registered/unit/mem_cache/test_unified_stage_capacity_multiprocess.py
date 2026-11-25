@@ -298,6 +298,7 @@ def _loop_worker(rank, path, level, drift_round):
             self.tree_cache = None
             self.recv_skipper = None
             self.uocr_runtime = None
+            self.admission = None
             self.device = "cpu"
             self.spec_algorithm = NS(is_none=lambda: True)
             self.pp_group = NS(
