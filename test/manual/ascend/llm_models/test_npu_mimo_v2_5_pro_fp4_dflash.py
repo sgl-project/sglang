@@ -36,6 +36,8 @@ class TestMiMoV25ProFP4GraphWithDFlash(GSM8KAscendMixin, CustomTestCase):
         MIMO_V2_5_PRO_FP4_DFLASH_DRAFT_WEIGHTS_PATH,
         "--speculative-num-draft-tokens",
         "8",
+        # DFLASH verifies non-greedy requests greedily on NPU.
+        "--speculative-dflash-allow-greedy-verification",
         "--attn-dp-size",
         "2",
         "--enable-dp-lm-head",

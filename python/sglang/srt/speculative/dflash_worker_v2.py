@@ -74,6 +74,7 @@ from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_memory,
     get_parallel,
@@ -625,7 +626,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
         self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
 
-        self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
         self._warned_megakernel_head_eager = False
         self._draft_probs_buf = None
@@ -701,6 +701,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH with dp attention supports plain DFlash and DFlash2 "
                     "drafts; Domino and LiLiCorr heads are not supported."
                 )
+        self._check_sampling_verify_support()
         self.domino_candidate_pool_size = int(
             get_spec().speculative_domino_candidate_pool_size
         )
@@ -3674,21 +3675,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             return True
         return is_dflash_sampling_verify_available()
 
-    def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
-        sampling_info = batch.sampling_info
-        if sampling_info is None or sampling_info.is_all_greedy:
+    def _check_sampling_verify_support(self) -> None:
+        # A PD prefill server never verifies.
+        if (
+            get_disagg().disaggregation_mode == "prefill"
+            or self.supports_sampling_verify()
+        ):
             return
-        if self.supports_sampling_verify() or self._warned_sampling_fallback:
-            return
-        # Admission rejects these except on a PD prefill server, which never verifies.
+        if not get_spec().speculative_dflash_allow_greedy_verification:
+            raise ValueError(
+                "DFLASH cannot verify non-greedy requests by sampling on this "
+                "device with this draft. Pass "
+                "--speculative-dflash-allow-greedy-verification to verify them "
+                "greedily instead, which does not preserve their sampling "
+                "distribution."
+            )
         if get_parallel().tp_rank == 0:
             logger.warning(
-                "DFLASH non-greedy verification is unavailable on this "
-                "build/device; falling back to greedy argmax verification. "
-                "The requested sampling distribution will not be preserved; "
-                "use temperature=0 and top_k=1 for lossless greedy decoding."
+                "DFLASH verifies non-greedy requests greedily on this device with "
+                "this draft (--speculative-dflash-allow-greedy-verification); "
+                "their sampling distribution is not preserved."
             )
-            self._warned_sampling_fallback = True
 
     def _make_next_draft_input_prefill(
         self,
@@ -3723,7 +3730,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             return batch_output
-        self._validate_phase1_sampling_support(batch)
         if (
             batch.forward_mode.is_extend()
             or batch.is_extend_in_batch
