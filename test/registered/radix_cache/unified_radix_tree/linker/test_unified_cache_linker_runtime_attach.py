@@ -124,7 +124,7 @@ class TestUnifiedCacheLinkerRuntimeAttach(CustomTestCase):
         response = self._request("PUT", "/unified-cache/external-linker")
         self.assertEqual(response.status_code, 200, response.text)
 
-        self._loaded_tokens(detached_ids, flush=False)
+        self._loaded_tokens(detached_ids + stored_ids[:PAGE_SIZE], flush=False)
         self.assertGreaterEqual(self._loaded_tokens(detached_ids), min_loaded)
         self.assertGreaterEqual(self._loaded_tokens(stored_ids), min_loaded)
 
