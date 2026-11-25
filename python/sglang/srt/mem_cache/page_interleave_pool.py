@@ -64,7 +64,7 @@ from __future__ import annotations
 import logging
 import math
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -110,6 +110,30 @@ _TensorSpec = Tuple[Tuple[int, ...], torch.dtype]
 _NUM_SCRATCH_SLOTS = 2
 # Every slot tensor starts on a 4 KiB boundary of the symmetric buffer.
 _SCRATCH_ALIGN_BYTES = 4096
+
+
+class _TorchDistributedAllGather:
+    """The NCCL-path gather interface over torch.distributed, for devices
+    without PyNccl (XPU, whose group backend is xccl).
+
+    Owns a group of its own over the shard ranks, as the PyNccl path owns a
+    communicator, so layer-ahead gathers do not queue behind the shard group's
+    model collectives. The collective runs on the caller's current stream.
+    """
+
+    def __init__(self, shard_group: GroupCoordinator) -> None:
+        self.group = torch.distributed.new_group(
+            ranks=shard_group.ranks,
+            backend=torch.distributed.get_backend(shard_group.device_group),
+            use_local_synchronization=True,
+        )
+
+    @contextmanager
+    def change_state(self, enable: bool = True):
+        yield
+
+    def all_gather(self, output: torch.Tensor, send: torch.Tensor) -> None:
+        torch.distributed.all_gather_into_tensor(output, send, group=self.group)
 
 
 def _multicast_gather_supported(
@@ -240,8 +264,12 @@ class PageInterleaveKVPoolMixin:
         ]
         # Otherwise a dedicated communicator, so the layer-ahead gathers never
         # interleave with the group's main collectives.
-        self.kv_gather_comm: Optional[PyNcclCommunicator] = None
-        if self._multicast_gather is None:
+        self.kv_gather_comm: Optional[
+            Union[PyNcclCommunicator, _TorchDistributedAllGather]
+        ] = None
+        if self._multicast_gather is None and torch.device(self.device).type == "xpu":
+            self.kv_gather_comm = _TorchDistributedAllGather(shard_group)
+        elif self._multicast_gather is None:
             self.kv_gather_comm = PyNcclCommunicator(
                 group=shard_group.cpu_group, device=shard_group.device
             )
@@ -293,7 +321,15 @@ class PageInterleaveKVPoolMixin:
             spec.chunk_tokens,
             scratch_rows,
             scratch_bytes / (1024 * 1024),
-            "multicast" if self._multicast_gather is not None else "NCCL",
+            (
+                "multicast"
+                if self._multicast_gather is not None
+                else (
+                    "xccl"
+                    if isinstance(self.kv_gather_comm, _TorchDistributedAllGather)
+                    else "NCCL"
+                )
+            ),
         )
 
     @contextmanager

@@ -59,6 +59,23 @@ def kv_shard_storage_backend_supported(name: Optional[str]) -> bool:
     return name in _KV_SHARD_STORAGE_BACKENDS
 
 
+def _validate_kv_shard_xpu_backend(server_args: Any, cfg: Any, prefill_backend) -> None:
+    """XPU shards MLA latent KV over attention TP, and GQA KV over prefill CP
+    ranks (checked with the other CP requirements below), through intel_xpu."""
+    if prefill_backend != "intel_xpu":
+        raise ValueError(
+            "--enable-kv-cache-sharding on XPU requires the intel_xpu prefill "
+            f"attention backend; got {prefill_backend!r}."
+        )
+    if is_deepseek_dsa(model_config_of(server_args).hf_config):
+        raise ValueError("DSA KV sharding is not supported on XPU.")
+    if use_mla_backend(server_args) and cfg.attn_cp_size > 1:
+        raise ValueError(
+            "--enable-kv-cache-sharding on XPU supports plain-TP MLA only "
+            "(attn_cp_size must be 1): intel_xpu has no MLA prefill CP."
+        )
+
+
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
     if is_qwen_qsa(model_config_of(server_args).hf_config):
@@ -73,6 +90,9 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
             )
         return
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
+    if resolved_view(server_args).device == "xpu":
+        _validate_kv_shard_xpu_backend(server_args, cfg, prefill_backend)
+        return
     if prefill_backend == "dsa":
         hf_config = model_config_of(server_args).hf_config
         if (
@@ -293,11 +313,14 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "fancy index. Got --disaggregation-transfer-backend "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
-    if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+    if (
+        envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        and cfg.disaggregation_transfer_backend != "mooncake"
+    ):
         raise ValueError(
-            "--enable-kv-cache-sharding is incompatible with "
-            "SGLANG_DISAGG_STAGING_BUFFER (the staging path assumes "
-            "contiguous send slices)."
+            "--enable-kv-cache-sharding with SGLANG_DISAGG_STAGING_BUFFER is "
+            "only supported on the mooncake transfer backend; the nixl staging "
+            "path assumes contiguous send slices."
         )
 
     if use_mla_backend(server_args):

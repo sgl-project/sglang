@@ -810,6 +810,7 @@ class MoriKVManager(CommonKVManager):
         wait_event: Optional[object] = None,
         indices_event: Optional[object] = None,
         trace_ctx=None,
+        chunk_slice: Optional[slice] = None,
     ) -> None:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -837,6 +838,7 @@ class MoriKVManager(CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 wait_event=wait_event,
+                chunk_slice=chunk_slice,
             )
         )
 

@@ -20,6 +20,8 @@ from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadata,
     make_local_attention_virtual_batches,
 )
+from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -155,6 +157,10 @@ class XPUAttentionBackend(AttentionBackend):
     - XPU Graph support, see https://github.com/pytorch/pytorch/issues/162143
     """
 
+    # Set in __init__; the class default covers instances built without it.
+    _kv_shard_pool = None
+    _cp_pool_kv_heads = None
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -189,6 +195,21 @@ class XPUAttentionBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Imported only when sharding is on: the pool module pulls in the
+        # CUDA gather stack, which the plain XPU path must not depend on.
+        self._kv_shard_pool = None
+        if get_parallel().enable_kv_cache_sharding:
+            from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
+
+            self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
+        # begin_shard_extend plans the prefix gather from host-side lengths.
+        self.needs_cpu_seq_lens = self._kv_shard_pool is not None
+        # Under prefill CP the pool is sized for attention TP, not the full TP.
+        self._cp_pool_kv_heads = (
+            model_runner.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+            if get_parallel().attn_cp_size > 1
+            else None
+        )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.page_size = model_runner.page_size
@@ -292,6 +313,69 @@ class XPUAttentionBackend(AttentionBackend):
             raise ValueError(
                 "DCP on intel_xpu requires CUDA graph disabled (it is off by "
                 "default on XPU)."
+            )
+
+    def _forward_extend_prefill_cp(
+        self,
+        *,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        causal: bool,
+        window_size,
+        unsupported: bool,
+        kwargs: dict,
+    ) -> torch.Tensor:
+        """Zigzag prefill CP for dense attention, in the FA3 calling convention:
+        the strategy runs the rank's two query halves against the full cache."""
+        # Each half's KV length is its causal prefix, so non-causal layers
+        # (encoder-only, bidirectional) would silently miss later tokens.
+        if unsupported or not causal:
+            raise NotImplementedError(
+                "Prefill CP on XPU supports plain causal dense attention only: "
+                "not local, sliding-window, cascade, cross or bidirectional attention."
+            )
+
+        def _cp_attn(q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp):
+            return flash_attn_with_kvcache(
+                q=q_chunk,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens_cp,
+                cu_seqlens_q=cu_seqlens_q_cp,
+                cu_seqlens_k_new=None,
+                max_seqlen_q=max_seqlen_q_cp,
+                softmax_scale=layer.scaling,
+                causal=causal,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                k_descale=None,
+                v_descale=None,
+                return_softmax_lse=False,
+                **kwargs,
+            )
+
+        o = get_cp_strategy().run_attention(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            forward_batch,
+            self.device,
+            _cp_attn,
+            attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _check_cp_kv_heads(self, layer: RadixAttention) -> None:
+        if layer.tp_k_head_num != self._cp_pool_kv_heads:
+            raise ValueError(
+                f"Prefill CP: layer {layer.layer_id} produces {layer.tp_k_head_num} "
+                f"KV heads per rank but the KV pool holds {self._cp_pool_kv_heads}. "
+                "The model splits attention heads by the full TP size instead of "
+                "attention TP (as Llama does), so it cannot run --attn-cp-size > 1; "
+                "use a model that splits by attention TP, such as Qwen3."
             )
 
     def _set_kv_buffer_mha(
@@ -728,6 +812,20 @@ class XPUAttentionBackend(AttentionBackend):
                     workspace_prefill_size, device=self.device, dtype=torch.uint8
                 )
 
+        # Sharded extend: attention reads the gathered scratch, not the pool.
+        # Must run before the `// page_size` reduction below, as in FA3.
+        if self._kv_shard_pool is not None:
+            from sglang.srt.layers.attention.kv_shard_hooks import (
+                prepare_kv_shard_forward,
+            )
+
+            if prepare_kv_shard_forward(
+                self._kv_shard_pool, self.req_to_token, forward_batch
+            ):
+                metadata.page_table = self._kv_shard_pool.translate_loc_to_scratch(
+                    metadata.page_table
+                ).to(torch.int32)
+
         # Convert the page table to a strided format which is needed by FA3 API.
         # Encoder-decoder page_table holds token-slot indices for the varlen
         # kernel (page_size=1 semantics), so it must not be page-strided.
@@ -773,7 +871,12 @@ class XPUAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if not self.use_mla:
+                if not self.use_mla and is_cp_active(forward_batch):
+                    # Zigzag CP: k, v are rank-local; the strategy all-gathers
+                    # the chunk and writes every rank's pool.
+                    self._check_cp_kv_heads(layer)
+                    get_cp_strategy().materialize_full_kv(forward_batch, layer, k, v)
+                elif not self.use_mla:
                     self._set_kv_buffer_mha(layer, forward_batch, cache_loc, k, v)
                 else:
                     self.kv_layers.layer(layer.layer_id).store_mla(
@@ -933,6 +1036,25 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 if bidirectional_block_ids is not None:
                     causal_arg = False
+            if is_cp_active(forward_batch):
+                return self._forward_extend_prefill_cp(
+                    q=q,
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    page_table=page_table,
+                    causal=causal,
+                    window_size=window_size,
+                    unsupported=(
+                        use_local_attn
+                        or use_cascade_attn
+                        or is_hybrid_swa
+                        or layer.is_cross_attention
+                        or bidirectional_block_ids is not None
+                    ),
+                    kwargs=kwargs,
+                )
             if bidirectional_block_ids is not None and any(
                 forward_batch.extend_prefix_lens_cpu
             ):

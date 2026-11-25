@@ -1014,6 +1014,42 @@ def compute_staging_layout(
     return num_writers, writer_bytes, sum(writer_bytes)
 
 
+def sharded_staging_transfer_blocks(
+    *,
+    src_ptr: int,
+    dst_ptr: int,
+    page_positions,
+    slab_pairs: List[Tuple[int, int]],
+    src_slab_bytes: int,
+    dst_slab_bytes: int,
+    page_bytes: int,
+) -> List[Tuple[int, int, int]]:
+    """(src, dst, length) blocks placing one shard writer's pages in a chunk region.
+
+    The source holds this writer's pages packed in order, one slab per K/V layer;
+    the destination is the whole chunk's layout, where page_positions[i] (relative
+    to the chunk start, strictly increasing) is the slot of packed page i.
+    """
+    if len(page_positions) == 0:
+        return []
+    positions = [int(p) for p in page_positions]
+    runs = []  # (first packed index, first position, num_pages)
+    run_start = 0
+    for i in range(1, len(positions) + 1):
+        if i == len(positions) or positions[i] != positions[i - 1] + 1:
+            runs.append((run_start, positions[run_start], i - run_start))
+            run_start = i
+    return [
+        (
+            src_ptr + src_slab * src_slab_bytes + packed * page_bytes,
+            dst_ptr + dst_slab * dst_slab_bytes + position * page_bytes,
+            count * page_bytes,
+        )
+        for src_slab, dst_slab in slab_pairs
+        for packed, position, count in runs
+    ]
+
+
 def resolve_total_kv_heads(
     kv_args,
     attn_tp_size: int,
