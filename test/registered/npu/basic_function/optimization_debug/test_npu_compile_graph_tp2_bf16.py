@@ -40,7 +40,7 @@ os.environ["ASCEND_USE_FIA"] = "true"
 # torch>=2.13 validates custom-op aliasing and raises when CI=true. The NPU
 # fused-infer-attention .out op returns tensors aliasing its inputs, so let
 # the check warn instead of failing this compile lane.
-os.environ.setdefault('TORCHINDUCTOR_ERROR_ON_CUSTOM_OP_ALIASING', '0')
+os.environ.setdefault("TORCHINDUCTOR_ERROR_ON_CUSTOM_OP_ALIASING", "0")
 
 
 class TestNpuCompileGraphTp2Bf16(CustomTestCase, NPUGSM8KMixin):
