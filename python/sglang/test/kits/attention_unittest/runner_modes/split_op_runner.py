@@ -420,6 +420,7 @@ def run_mla_split_op_extend_case(
     max_context_len: int = MLA_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = MLA_DEFAULT_DTYPE,
     device: str = MLA_DEFAULT_DEVICE,
+    fp8_kv_cache: bool = False,
 ):
     adapter = SplitOpAdapter(
         build_fixture=build_mla_attention_fixture,
@@ -444,6 +445,7 @@ def run_mla_split_op_extend_case(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,
+            fp8_kv_cache=fp8_kv_cache,
         ),
         max_context_len=max_context_len,
         dtype=dtype,
