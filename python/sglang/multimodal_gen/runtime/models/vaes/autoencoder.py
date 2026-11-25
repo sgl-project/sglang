@@ -1,12 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 
 import torch
-from diffusers.models.attention_processor import (
-    Attention,
-    FusedAttnProcessor2_0,
-)
 from diffusers.models.autoencoders.vae import (
     Decoder,
     DecoderOutput,
@@ -66,7 +62,6 @@ class AutoencoderKL(AutoencoderKLMixin, nn.Module, LayerwiseOffloadableModuleMix
     """
 
     layerwise_offload_dit_group_enabled = False
-    _supports_gradient_checkpointing = True
     _no_split_modules = ["BasicTransformerBlock", "ResnetBlock2D"]
     layer_names = ["encoder.down_blocks", "decoder.up_blocks"]
 
@@ -231,52 +226,6 @@ class AutoencoderKL(AutoencoderKLMixin, nn.Module, LayerwiseOffloadableModuleMix
             decoded = self._decode(z).sample
 
         return decoded
-
-    def forward(
-        self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        generator: Optional[torch.Generator] = None,
-    ) -> Union[DecoderOutput, torch.Tensor]:
-        r"""
-        Args:
-            sample (`torch.Tensor`): Input sample.
-            sample_posterior (`bool`, *optional*, defaults to `False`):
-                Whether to sample from the posterior.
-        """
-        x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z).sample
-
-        return dec
-
-    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.fuse_qkv_projections
-    def fuse_qkv_projections(self):
-        """
-        Enables fused QKV projections. For self-attention modules, all projection matrices (i.e., query, key, value)
-        are fused. For cross-attention modules, key and value projection matrices are fused.
-
-        > [!WARNING] > This API is 🧪 experimental.
-        """
-        self.original_attn_processors = None
-
-        for _, attn_processor in self.attn_processors.items():
-            if "Added" in str(attn_processor.__class__.__name__):
-                raise ValueError(
-                    "`fuse_qkv_projections()` is not supported for models having added KV projections."
-                )
-
-        self.original_attn_processors = self.attn_processors
-
-        for module in self.modules():
-            if isinstance(module, Attention):
-                module.fuse_projections(fuse=True)
-
-        self.set_attn_processor(FusedAttnProcessor2_0())
 
 
 EntryClass = AutoencoderKL
