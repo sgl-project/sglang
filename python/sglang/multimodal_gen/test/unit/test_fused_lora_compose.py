@@ -772,3 +772,104 @@ def test_flux_lora_on_q_and_v_of_fused_qkv_keeps_k(tmp_path):
         dim=-1,
     )
     torch.testing.assert_close(out, x @ base_weight.T + delta, rtol=1e-5, atol=1e-5)
+
+
+class QwenImageTransformer2DModel(torch.nn.Module):
+    """Stand-in whose class name selects the Qwen-Image Kohya converter."""
+
+
+def test_kohya_qwen_image_lora_on_fp8_fused_qkv_keeps_q_and_v(tmp_path):
+    # ModelOpt FP8 Qwen-Image fuses to_q/to_k/to_v into to_qkv; a Kohya LoRA on
+    # to_q, to_v and to_out.0 must apply Q and V there and leave K alone.
+    from sglang.multimodal_gen.configs.models.dits.qwenimage import (
+        QwenImageArchConfig,
+    )
+
+    layer = _make_layer()
+    base_weight = layer.base_layer.weight.detach().clone()
+    transformer = QwenImageTransformer2DModel()
+    transformer.transformer_blocks = torch.nn.ModuleList([torch.nn.Module()])
+    transformer.transformer_blocks[0].attn = torch.nn.Module()
+    transformer.transformer_blocks[0].attn.to_qkv = layer
+    transformer.lora_param_names_mapping = {}
+    layers = {"transformer_blocks.0.attn.to_qkv": layer}
+
+    pipeline = _make_loader_pipeline()
+    pipeline.modules = {"transformer": transformer}
+    pipeline.lora_layers = {**layers, "transformer_blocks.0.attn.to_out.0": layer}
+    pipeline.server_args.pipeline_config.dit_config.arch_config = QwenImageArchConfig()
+
+    rank, alpha = 2, 4.0
+    torch.manual_seed(19)
+    q_a, v_a = torch.randn(rank, IN_DIM), torch.randn(rank, IN_DIM)
+    q_b = torch.randn(OUTPUT_SIZES[0], rank)
+    v_b = torch.randn(OUTPUT_SIZES[2], rank)
+    prefix = "lora_unet_transformer_blocks_0_attn"
+    adapter = {}
+    for proj, a, b in (("to_q", q_a, q_b), ("to_v", v_a, v_b)):
+        adapter[f"{prefix}_{proj}.lora_down.weight"] = a
+        adapter[f"{prefix}_{proj}.lora_up.weight"] = b
+        adapter[f"{prefix}_{proj}.alpha"] = torch.tensor(alpha)
+    adapter[f"{prefix}_to_out_0.lora_down.weight"] = torch.randn(rank, IN_DIM)
+    adapter[f"{prefix}_to_out_0.lora_up.weight"] = torch.randn(IN_DIM, rank)
+    adapter[f"{prefix}_to_out_0.alpha"] = torch.tensor(alpha)
+    adapter_file = str(tmp_path / "qwen_kohya_q_v.safetensors")
+    save_file(adapter, adapter_file)
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
+    with (
+        patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
+        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        patch(f"{loader_mod}.dist.get_rank", return_value=0),
+    ):
+        pipeline.load_lora_adapter(adapter_file, "adapter", rank=0)
+        applied = pipeline._apply_lora_to_layers(
+            layers,
+            ["adapter"],
+            [adapter_file],
+            rank=0,
+            strengths=[1.0],
+            merge_weights=False,
+        )
+
+    assert applied == 1
+    x = torch.randn(3, IN_DIM)
+    with patch(_TP_RANK_PATCH, return_value=0):
+        out, _ = layer.forward(x)
+    scale = alpha / rank
+    delta = torch.cat(
+        [
+            scale * (x @ q_a.T @ q_b.T),
+            torch.zeros(3, OUTPUT_SIZES[1]),
+            scale * (x @ v_a.T @ v_b.T),
+        ],
+        dim=-1,
+    )
+    torch.testing.assert_close(out, x @ base_weight.T + delta, rtol=1e-4, atol=1e-4)
+
+
+def test_qwen_image_bf16_lora_keeps_split_qkv_targets():
+    from sglang.multimodal_gen.configs.models.dits.qwenimage import (
+        QwenImageArchConfig,
+    )
+    from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+    from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
+        resolve_lora_target_name,
+    )
+
+    attn = "transformer_blocks.0.attn"
+    mapping = QwenImageArchConfig().param_names_mapping
+    split = {
+        f"{attn}.{p}.{s}"
+        for p in ("to_q", "to_k", "to_v")
+        for s in ("lora_A", "lora_B", "alpha")
+    }
+    fused = {f"{attn}.to_qkv.{s}" for s in ("lora_A", "lora_B", "alpha")}
+    for targets, expected in (
+        (split, (f"{attn}.to_k.lora_A", None, None)),
+        (fused, (f"{attn}.to_qkv.lora_A", 1, 3)),
+    ):
+        fn = get_param_names_mapping(mapping, valid_target_names=targets)
+        assert resolve_lora_target_name(fn, f"{attn}.to_k.lora_A", targets) == expected
+    # Base weights keep their names.
+    fn = get_param_names_mapping(mapping)
+    assert fn(f"{attn}.to_q.weight") == (f"{attn}.to_q.weight", None, None)
