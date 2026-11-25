@@ -106,13 +106,14 @@ class RadixKey:
         is_bigram: bool = False,
         limit: Optional[int] = None,
     ) -> RadixKey:
+        # Avoid keyword dispatch on the request-key hot path.
         return cls(
             token_ids,
-            extra_key=req.extra_key,
-            cache_salt=req.cache_salt,
-            request_cache_salt=req._user_cache_salt,
-            is_bigram=is_bigram,
-            limit=limit,
+            req.extra_key,
+            is_bigram,
+            limit,
+            req.cache_salt,
+            req._user_cache_salt,
         )
 
     def _raw_len(self) -> int:

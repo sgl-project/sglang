@@ -4491,15 +4491,14 @@ def test_host_insert_publishes_the_caller_namespace(backend, user_salt, monkeypa
     assert all(event.request_cache_salt == user_salt for event in stored)
 
 
-@pytest.mark.parametrize("user_salt", [msgspec.UNSET, None, "caller-a"])
-def test_buffer_backup_snapshot_round_trips_and_detects_a_split(user_salt):
+def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
     core = _tree_core()
     core.enable_storage = True
     key = RadixKey(
         array("q", [1, 2]),
         extra_key="adapter-a",
         cache_salt="tenant-a",
-        request_cache_salt=user_salt,
+        request_cache_salt="caller-a",
     )
     inserted = _pump_insert(
         core,
@@ -4516,7 +4515,6 @@ def test_buffer_backup_snapshot_round_trips_and_detects_a_split(user_salt):
     assert snapshot.key.token_ids == array("q", [1, 2])
     assert snapshot.key.extra_key == "adapter-a"
     assert snapshot.key.cache_salt == "tenant-a"
-    assert snapshot.key.request_cache_salt == key.request_cache_salt
     assert not snapshot.key.is_bigram
     assert snapshot.prefix_keys == []
     assert core.validate_buffer_backup(leaf, len(snapshot.key)) is not None

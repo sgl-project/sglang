@@ -1704,7 +1704,11 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
 
         # A root anchor has no namespace; probe and prefetch must use the request's.
-        cons, _, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
+        cons, _, cons_rtp = build_fixture(
+            self.cfg, enable_kv_cache_events=True, dynamo_kv_event_format=True
+        )
+        self._init_buffer_hicache(cons, storage_dir)
+        cons.take_events()
         self.assertEqual(
             cons.query_storage_hit_length(
                 cons.root_node_handle(),
@@ -1761,10 +1765,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(
             cons.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, len(seq)
         )
-        leaf = cons.match_prefix(MatchPrefixParams(key=key)).last_device_node
-        snapshot = cons.tree_core.snapshot_buffer_backup(leaf, pass_prefix_keys=False)
-        self.assertIsNotNone(snapshot)
-        self.assertEqual(snapshot.key.request_cache_salt, "client-a")
+        stored = [e for e in cons.take_events() if isinstance(e, BlockStored)]
+        self.assertTrue(stored)
+        self.assertTrue(all(e.request_cache_salt == "client-a" for e in stored))
         for miss in (
             RadixKey(array("q", seq)),
             RadixKey(array("q", seq), extra_key=extra_key, cache_salt="tenant-b"),

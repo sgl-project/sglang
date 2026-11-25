@@ -716,7 +716,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 extra_key=node.key.extra_key,
                 is_bigram=node.key.is_bigram,
                 cache_salt=node.key.cache_salt,
-                request_cache_salt=node.key.request_cache_salt,
             ),
             prefix_keys=(
                 node.get_prefix_hash_values(parent) if pass_prefix_keys else None

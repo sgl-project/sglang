@@ -164,13 +164,21 @@ class TestRadixKey(unittest.TestCase):
             for bigram in (False, True):
                 with self.subTest(salt=salt, bigram=bigram):
                     req = SimpleNamespace(
-                        extra_key=None,
+                        extra_key="adapter-a",
                         cache_salt="sglang-mm-v1:internal",
                         _user_cache_salt=salt,
                     )
-                    key = RadixKey.from_req(req, array("q", range(7)), is_bigram=bigram)
+                    key = RadixKey.from_req(
+                        req, array("q", range(7)), is_bigram=bigram, limit=5
+                    )
+                    self.assertEqual(
+                        (key.extra_key, key.is_bigram, key.limit),
+                        ("adapter-a", bigram, 5),
+                    )
+                    self.assertEqual(list(key.raw_token_ids()), [0, 1, 2, 3, 4])
                     query = RadixKey(
-                        key.token_ids,
+                        key.raw_token_ids(),
+                        extra_key=req.extra_key,
                         cache_salt=req.cache_salt,
                         is_bigram=bigram,
                     )

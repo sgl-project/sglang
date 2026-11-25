@@ -123,7 +123,7 @@ def _kv_event_from_tagged(
 ):
     """Build the Python KV cache event for one of the binding's tagged tuples.
 
-    Rust hashes are LoRA-agnostic; the trailing extra_key selects the LoRA
+    Rust hashes are LoRA-agnostic; extra_key selects the LoRA
     namespace, applied here as in KVCacheEventRecorder.
     """
     tag = event[0]
@@ -973,6 +973,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # The binding always receives a value tensor; fall back to the
             # token ids materialized on the core's device.
             value = torch.tensor(key_buffer, dtype=torch.int64, device=self.device)
+        # Shared identity marks inheritance; equal-but-distinct salts use the explicit path.
         has_request_cache_salt = key.request_cache_salt is not key.cache_salt
         step = self._binding.begin_insert(
             self._bindings.InsertParamsBinding(
@@ -1108,6 +1109,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         host_value: torch.Tensor,
         hash_value: list[str],
     ) -> InsertResult:
+        # Shared identity marks inheritance; equal-but-distinct salts use the explicit path.
         has_request_cache_salt = key.request_cache_salt is not key.cache_salt
         result = self._binding.insert_host(
             node_id,
@@ -1281,7 +1283,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 extra_key=snapshot.extra_key,
                 is_bigram=snapshot.is_bigram,
                 cache_salt=snapshot.cache_salt,
-                request_cache_salt=snapshot.request_cache_salt,
             ),
             prefix_keys=snapshot.prefix_keys,
         )
