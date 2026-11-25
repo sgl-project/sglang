@@ -423,3 +423,49 @@ def test_qwen_image_top_level_projection_loads_with_the_blocks():
             got * out[f"{native}.alpha"].item() / RANK, (ALPHA / RANK) * ref
         )
     assert "transformer_blocks.0.img_mlp.net.0.proj.lora_A.weight" in out
+
+
+def test_fused_qkv_next_to_complete_split_qkv_loads_the_split_weights(monkeypatch):
+    # Diffusers skips a fused qkv when the file has all of to_q/to_k/to_v.
+    convert = format_adapter.lcu._convert_non_diffusers_z_image_lora_to_diffusers
+
+    def skips_qkv(state_dict):
+        return convert({k: v for k, v in state_dict.items() if "_qkv." not in k})
+
+    monkeypatch.setattr(
+        format_adapter.lcu,
+        "_convert_non_diffusers_z_image_lora_to_diffusers",
+        skips_qkv,
+    )
+    split = [f"layers_0_attention_to_{x}" for x in "qkv"]
+    out = normalize_lora_state_dict(_kohya(["layers_0_attention_qkv", *split]))
+    assert {k.rsplit(".", 2)[0] for k in out if k.endswith("lora_A.weight")} == {
+        f"layers.0.attention.to_{x}" for x in "qkv"
+    }
+
+
+def test_qwen_image_top_level_only_file_resolves_by_loaded_dit():
+    sd = _kohya(["img_in"])
+    assert (
+        detect_lora_format_from_state_dict(sd, "QwenImageTransformer2DModel")
+        == LoRAFormat.KOHYA_QWEN_IMAGE
+    )
+    out = normalize_lora_state_dict(sd, dit_class_name="QwenImageTransformer2DModel")
+    assert {k for k in out if k.endswith("lora_A.weight")} == {"img_in.lora_A.weight"}
+
+
+def test_top_level_module_next_to_unreadable_block_tensors_fails():
+    # LoKr block tensors next to a plain img_in pair would otherwise load only
+    # img_in.
+    sd = _kohya(["img_in"])
+    sd["lora_unet_transformer_blocks_0_img_mlp_net_0_proj.lokr_w1"] = torch.randn(4, 4)
+    sd["lora_unet_transformer_blocks_0_img_mlp_net_0_proj.lokr_w2"] = torch.randn(4, 4)
+    with pytest.raises(ValueError, match="Kohya Qwen-Image"):
+        normalize_lora_state_dict(sd, dit_class_name="QwenImageTransformer2DModel")
+
+
+def test_top_level_module_alpha_must_be_one_number():
+    sd = _kohya(["transformer_blocks_0_img_mlp_net_0_proj", "img_in"])
+    sd["lora_unet_img_in.alpha"] = torch.tensor([ALPHA, ALPHA])
+    with pytest.raises(ValueError, match="must be a single number"):
+        normalize_lora_state_dict(sd)

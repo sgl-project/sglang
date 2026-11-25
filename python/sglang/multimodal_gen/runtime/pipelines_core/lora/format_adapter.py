@@ -280,8 +280,9 @@ def detect_lora_format_from_state_dict(
         return LoRAFormat.KOHYA_QWEN_IMAGE
     # An attention-only Qwen-Image LoRA has no img/txt mlp or mod names, and its
     # `transformer_blocks_N_attn_*` keys are shared with other MMDiTs.
-    if _is_qwen_image_dit(dit_class_name) and _has_prefix_key(
-        keys, "lora_unet_transformer_blocks_"
+    if _is_qwen_image_dit(dit_class_name) and (
+        _has_prefix_key(keys, "lora_unet_transformer_blocks_")
+        or any(k.split(".", 1)[0] in _QWEN_IMAGE_KOHYA_TOP_LEVEL_MODULES for k in keys)
     ):
         return LoRAFormat.KOHYA_QWEN_IMAGE
     if _looks_like_kohya_z_image(state_dict):
@@ -605,6 +606,18 @@ def _resolve_kohya_alpha(
     return values.pop() if values else default
 
 
+def _split_qkv_converted(module: str, converted_names: Mapping[str, Any]) -> bool:
+    """A fused `..._qkv` module that diffusers skips because the same file also
+    has its split q/k/v, all of which converted."""
+    if not module.endswith("qkv"):
+        return False
+    base = module[: -len("qkv")]
+    return all(
+        f"{base}to_{x}" in converted_names or f"{base}to.{x}" in converted_names
+        for x in "qkv"
+    )
+
+
 # Qwen-Image modules outside the transformer blocks, which diffusers' Kohya
 # converter does not rename.
 _QWEN_IMAGE_KOHYA_TOP_LEVEL_MODULES = {
@@ -668,13 +681,27 @@ def _convert_kohya_dit_via_diffusers(
         if module in downs
     }
     block_downs = {m: k for m, k in downs.items() if m not in top_level}
-    # Without any block module (e.g. a LoKr file) the converter still runs, so
-    # an adapter it cannot read fails instead of loading as a no-op.
-    run_blocks = bool(block_downs) or not top_level
+    top_level_keys = {
+        key
+        for module in top_level
+        for key in (
+            downs[module],
+            downs[module].replace("down.weight", "up.weight"),
+            _kohya_alpha_key(module),
+        )
+    }
+    # Anything besides the top-level modules (block LoRA pairs, or e.g. LoKr
+    # tensors) goes through the converter, so an adapter it cannot read fails
+    # instead of loading only in part.
+    run_blocks = any(key not in top_level_keys for key in state_dict)
     converted_names = (
         _kohya_converted_names(block_downs, run_converter) if block_downs else {}
     )
-    dropped = sorted(set(block_downs) - set(converted_names))
+    dropped = sorted(
+        module
+        for module in set(block_downs) - set(converted_names)
+        if not _split_qkv_converted(module, converted_names)
+    )
     if dropped:
         raise ValueError(
             f"The installed diffusers drops {len(dropped)} module(s) of this Kohya "
@@ -694,6 +721,11 @@ def _convert_kohya_dit_via_diffusers(
             name: match_peft_alpha_pattern(name, alpha_patterns or []) for name in names
         }
         if own_alpha is not None and own_alpha.numel() != 1:
+            if module in top_level:
+                raise ValueError(
+                    f"Kohya LoRA alpha of {module!r} must be a single number, "
+                    f"got shape {tuple(own_alpha.shape)}"
+                )
             if any(alpha is not None for alpha in pattern_alphas.values()):
                 raise ValueError(f"PEFT alpha_pattern conflicts with {alpha_key!r}")
             continue
@@ -707,15 +739,6 @@ def _convert_kohya_dit_via_diffusers(
         if own_alpha is None:
             state_dict[alpha_key] = torch.tensor(alphas[module])
 
-    top_level_keys = {
-        key
-        for module in top_level
-        for key in (
-            downs[module],
-            downs[module].replace("down.weight", "up.weight"),
-            _kohya_alpha_key(module),
-        )
-    }
     out = (
         run_converter({k: v for k, v in state_dict.items() if k not in top_level_keys})
         if run_blocks
@@ -731,11 +754,7 @@ def _convert_kohya_dit_via_diffusers(
         out[f"{name}.lora_B.weight"] = state_dict[
             down_key.replace("down.weight", "up.weight")
         ]
-        out[f"{name}.alpha"] = (
-            torch.tensor(alphas[module])
-            if module in alphas
-            else state_dict[_kohya_alpha_key(module)]
-        )
+        out[f"{name}.alpha"] = torch.tensor(alphas[module])
     return out
 
 
