@@ -16,6 +16,7 @@ async function check({
   snapshot = [], live = [], lint = 'success', event = 'pull_request',
   failedJobNames = ['model-test'], jobs, independentTestJobPrefix = '',
   lintErrors = [], jobErrors = [], quotaWait = () => assert.fail('unexpected quota wait'),
+  maxQuotaWaitMinutes = '2',
 } = {}) {
   const failures = [];
   let labelReads = 0;
@@ -55,7 +56,8 @@ async function check({
       ? { pull_request: { number: 42, head: { sha: 'head' }, labels: labels(snapshot) } }
       : {},
   }, { info: () => {}, setFailed: message => failures.push(message) },
-     { env: { GITHUB_WORKSPACE: WORKSPACE, INDEPENDENT_TEST_JOB_PREFIX: independentTestJobPrefix } }, name => name === 'node:timers/promises' ? { setTimeout: quotaWait } : require(name));
+     { env: { GITHUB_WORKSPACE: WORKSPACE, INDEPENDENT_TEST_JOB_PREFIX: independentTestJobPrefix,
+       MAX_QUOTA_WAIT_MINUTES: maxQuotaWaitMinutes } }, name => name === 'node:timers/promises' ? { setTimeout: quotaWait } : require(name));
   return { failures, labelReads, jobReads };
 }
 
@@ -219,6 +221,18 @@ test('a jobs read retries once and still blocks on a failed job', async () => {
   const result = await check({ jobErrors: [quotaError()], quotaWait: () => {} });
   assert.equal(result.jobReads, 2);
   assert.deepEqual(result.failures, ['Fail-fast: skipping — root cause job(s): model-test']);
+});
+
+test('diffusion can wait for a ten-minute reset and still enforces lint', async () => {
+  const waits = [];
+  const result = await check({ lintErrors: [quotaError(603)], lint: 'failure',
+    maxQuotaWaitMinutes: '12', quotaWait: ms => waits.push(ms) });
+  assert.equal(waits.length, 1);
+  assert.ok(waits[0] >= 602_000 && waits[0] <= 604_000);
+  assert.deepEqual(result.failures, ['Fail-fast: lint check failed']);
+  const tooLate = quotaError(730);
+  await assert.rejects(check({ lintErrors: [tooLate], maxQuotaWaitMinutes: '12' }),
+    err => err === tooLate);
 });
 
 test('another quota failure, a long reset or a permission error still fails the check', async () => {

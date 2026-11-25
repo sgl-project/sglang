@@ -96,6 +96,7 @@ jobs:
       - uses: ./.github/actions/check-pr-test-health
         with:
           independent-test-job-prefix: 'call-multimodal-gen-tests /'
+          max-quota-wait-minutes: '12'
 
       - uses: ./.github/actions/check-maintenance
 
