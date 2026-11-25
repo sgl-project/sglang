@@ -48,7 +48,9 @@ def ref_dequant(kv_cache, out=None, rows=None):
 def ref_pack(indices, group, packed, lengths):
     """Sorted union of each group's valid ids; bit 26 + g marks token g as an owner."""
     n = indices.shape[0] // group
-    assert indices.shape[0] == n * group and packed.shape[0] >= n and lengths.shape[0] >= n
+    assert (
+        indices.shape[0] == n * group and packed.shape[0] >= n and lengths.shape[0] >= n
+    )
     for row in range(n):
         owners = {}
         for g in range(group):
@@ -63,7 +65,9 @@ def ref_pack(indices, group, packed, lengths):
     return packed, lengths
 
 
-def ref_attention(q, kv, indices, sm_scale, heads_per_group=0, topk_length=None, out=None):
+def ref_attention(
+    q, kv, indices, sm_scale, heads_per_group=0, topk_length=None, out=None
+):
     """q [N, R, 576], kv [rows, 1, 576], indices [N, 1, W], topk_length [N].
     heads_per_group == 0: every row of q attends to the first topk_length valid ids.
     heads_per_group == h: q row r belongs to token r // h and attends to the ids that
@@ -80,7 +84,9 @@ def ref_attention(q, kv, indices, sm_scale, heads_per_group=0, topk_length=None,
             mine = ids
             if heads_per_group:
                 mine = ids[(ids & (1 << (SHIFT + first // step))) != 0] & SLOT_MASK
-            out[i, first : first + step] = _attend(keys[mine.long()], q[i, first : first + step], sm_scale)
+            out[i, first : first + step] = _attend(
+                keys[mine.long()], q[i, first : first + step], sm_scale
+            )
     return out
 
 
@@ -104,11 +110,23 @@ def direct_reference(q_all, kv_cache, indices, sm_scale):
     return out
 
 
-def make_inputs(T=13, h=12, topk=128, pages=4, seed=0, extra_rows=0, valid=None, disjoint=False, split_q=True):
+def make_inputs(
+    T=13,
+    h=12,
+    topk=128,
+    pages=4,
+    seed=0,
+    extra_rows=0,
+    valid=None,
+    disjoint=False,
+    split_q=True,
+):
     gen = torch.Generator().manual_seed(seed)
     rows = pages * 64
     q = (torch.randn(T, h, 576, generator=gen) * 0.2).to(torch.bfloat16)
-    kv_cache = torch.randint(0, 256, (pages, 64, 1, 656), generator=gen, dtype=torch.uint8)
+    kv_cache = torch.randint(
+        0, 256, (pages, 64, 1, 656), generator=gen, dtype=torch.uint8
+    )
     indices = torch.full((T + extra_rows, topk), -1, dtype=torch.int32)
     for t in range(T):
         count = topk if valid is None else valid[t % len(valid)]
@@ -119,7 +137,13 @@ def make_inputs(T=13, h=12, topk=128, pages=4, seed=0, extra_rows=0, valid=None,
             ids = torch.randperm(rows, generator=gen)[:count]
         indices[t, :count] = ids.to(torch.int32)
     if split_q:
-        return q[..., :512].contiguous(), q[..., 512:].contiguous(), kv_cache, indices, q
+        return (
+            q[..., :512].contiguous(),
+            q[..., 512:].contiguous(),
+            kv_cache,
+            indices,
+            q,
+        )
     return q, None, kv_cache, indices, q
 
 
@@ -132,7 +156,11 @@ class _ReaderCase(CustomTestCase):
         self.addCleanup(torch.set_num_threads, threads)
         reader._reset_for_tests()
         self.addCleanup(reader._reset_for_tests)
-        self.ops = (MagicMock(side_effect=ref_attention), MagicMock(side_effect=ref_pack), MagicMock(side_effect=ref_dequant))
+        self.ops = (
+            MagicMock(side_effect=ref_attention),
+            MagicMock(side_effect=ref_pack),
+            MagicMock(side_effect=ref_dequant),
+        )
         p = patch.object(reader, "_load", return_value=self.ops)
         p.start()
         self.addCleanup(p.stop)
@@ -145,7 +173,10 @@ class _ReaderCase(CustomTestCase):
     def assert_close(self, out, ref):
         self.assertEqual(out.shape, ref.shape)
         self.assertEqual(out.dtype, torch.bfloat16)
-        self.assertTrue(torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2), (out.float() - ref.float()).abs().max())
+        self.assertTrue(
+            torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2),
+            (out.float() - ref.float()).abs().max(),
+        )
 
 
 class TestNumerics(_ReaderCase):
@@ -157,7 +188,9 @@ class TestNumerics(_ReaderCase):
         self.ops[1].assert_not_called()
 
     def test_packed_with_tail_matches_the_definition(self):
-        out, ref = self.run_reader(pack=True, T=13)  # G = 5: two groups, three tail rows
+        out, ref = self.run_reader(
+            pack=True, T=13
+        )  # G = 5: two groups, three tail rows
         self.assert_close(out, ref)
         packed_call, tail_call = self.ops[0].call_args_list
         self.assertEqual(tuple(packed_call.args[0].shape), (2, 60, 576))
@@ -223,7 +256,9 @@ class TestScreening(_ReaderCase):
         q, q_rope, kv_cache, indices, _ = make_inputs()
         args = dict(q=q, q_rope=q_rope, kv_cache=kv_cache, indices=indices)
         args.update(changes)
-        out = reader.k31_prefill_reader(args["q"], args["q_rope"], args["kv_cache"], args["indices"], 0.05)
+        out = reader.k31_prefill_reader(
+            args["q"], args["q_rope"], args["kv_cache"], args["indices"], 0.05
+        )
         self.assertIsNone(out, why)
         self.assertIn(why, reader.reader_stats()["declined_reasons"])
         for op in self.ops:
@@ -233,30 +268,52 @@ class TestScreening(_ReaderCase):
         q, q_rope, kv_cache, indices, q_all = make_inputs()
         self._declines("q is not a 3-d bf16 tensor", q=q.float())
         self._declines("empty batch", q=q[:0], q_rope=q_rope[:0])
-        self._declines("head count outside 1..32", q=q.repeat(1, 4, 1), q_rope=q_rope.repeat(1, 4, 1))
+        self._declines(
+            "head count outside 1..32",
+            q=q.repeat(1, 4, 1),
+            q_rope=q_rope.repeat(1, 4, 1),
+        )
         self._declines("query width is not 512 + 64", q=q_all)
         self._declines("q_rope does not match q", q_rope=q_rope[:, :6])
         self._declines("KV cache is not FP8", kv_cache=kv_cache.to(torch.bfloat16))
-        self._declines("KV buffer is not contiguous V32 pages", kv_cache=kv_cache[:, :32])
+        self._declines(
+            "KV buffer is not contiguous V32 pages", kv_cache=kv_cache[:, :32]
+        )
         self._declines("KV buffer is not contiguous V32 pages", kv_cache=kv_cache[::2])
-        self._declines("top-k ids are not contiguous int32 rows", indices=indices.long())
-        self._declines("top-k ids are not contiguous int32 rows", indices=indices[:, ::2])
+        self._declines(
+            "top-k ids are not contiguous int32 rows", indices=indices.long()
+        )
+        self._declines(
+            "top-k ids are not contiguous int32 rows", indices=indices[:, ::2]
+        )
         self._declines("fewer top-k rows than query tokens", indices=indices[:5])
-        self._declines("top-k width is not a multiple of 64 in 128..2048", indices=indices[:, :64].contiguous())
-        self._declines("top-k width is not a multiple of 64 in 128..2048", indices=indices[:, :100].contiguous())
+        self._declines(
+            "top-k width is not a multiple of 64 in 128..2048",
+            indices=indices[:, :64].contiguous(),
+        )
+        self._declines(
+            "top-k width is not a multiple of 64 in 128..2048",
+            indices=indices[:, :100].contiguous(),
+        )
         self.assertEqual(reader.reader_stats()["declined"], 13)
 
     def test_size_limit(self):
         q, q_rope, kv_cache, indices, _ = make_inputs()
-        out = reader.k31_prefill_reader(q, q_rope, kv_cache, indices, 0.05, max_bf16_bytes=4 * 64 * 1152 - 1)
+        out = reader.k31_prefill_reader(
+            q, q_rope, kv_cache, indices, 0.05, max_bf16_bytes=4 * 64 * 1152 - 1
+        )
         self.assertIsNone(out)
-        out = reader.k31_prefill_reader(q, q_rope, kv_cache, indices, 0.05, max_bf16_bytes=4 * 64 * 1152)
+        out = reader.k31_prefill_reader(
+            q, q_rope, kv_cache, indices, 0.05, max_bf16_bytes=4 * 64 * 1152
+        )
         self.assertIsNotNone(out)
 
     def test_wide_top_k_runs_unpacked(self):
         # 5 tokens x 2496 ids would exceed the packed row; the module keeps such calls unpacked.
         q, q_rope, kv_cache, indices, _ = make_inputs(T=5, h=12, topk=2048, pages=40)
-        self.assertIsNotNone(reader.k31_prefill_reader(q, q_rope, kv_cache, indices, 0.05, pack=True))
+        self.assertIsNotNone(
+            reader.k31_prefill_reader(q, q_rope, kv_cache, indices, 0.05, pack=True)
+        )
         self.assertEqual(reader.reader_stats()["packed"], 1)
         with patch.object(reader, "_MAX_GROUP", 7):
             q, q_rope, kv_cache, indices, _ = make_inputs(T=7, h=8, topk=2048, pages=40)
@@ -281,7 +338,9 @@ class TestFallback(CustomTestCase):
         self.assertIn("flash_mla_sparse_fwd_packed", logs.output[0])
 
     def test_missing_wheel_keeps_stock(self):
-        with patch.object(reader, "_flash_mla", side_effect=ImportError("No module named 'flash_mla'")):
+        with patch.object(
+            reader, "_flash_mla", side_effect=ImportError("No module named 'flash_mla'")
+        ):
             with self.assertLogs(reader.logger, level="WARNING"):
                 self.assertFalse(reader.k31_prefill_reader_available())
 
@@ -300,14 +359,22 @@ class TestFallback(CustomTestCase):
         # The stand-ins of this file are called the way the reader calls the wheel:
         # flash_mla_sparse_fwd_packed(q, kv, indices, sm_scale, heads_per_group, topk_length, out),
         # flash_mla_sparse_pack_indices(indices, group, packed, lengths), flash_mla_dequant_v32_kv(kv, out).
-        ops = (MagicMock(side_effect=ref_attention), MagicMock(side_effect=ref_pack), MagicMock(side_effect=ref_dequant))
+        ops = (
+            MagicMock(side_effect=ref_attention),
+            MagicMock(side_effect=ref_pack),
+            MagicMock(side_effect=ref_dequant),
+        )
         q, q_rope, kv_cache, indices, _ = make_inputs(T=13)
         with patch.object(reader, "_load", return_value=ops):
-            self.assertIsNotNone(reader.k31_prefill_reader(q, q_rope, kv_cache, indices, 0.05))
+            self.assertIsNotNone(
+                reader.k31_prefill_reader(q, q_rope, kv_cache, indices, 0.05)
+            )
         packed_call, tail_call = ops[0].call_args_list
         self.assertEqual(len(packed_call.args), 7)
         self.assertEqual(packed_call.args[3], 0.05)
-        self.assertEqual(tuple(packed_call.args[5].shape), (2,))  # lengths of the packed lists
+        self.assertEqual(
+            tuple(packed_call.args[5].shape), (2,)
+        )  # lengths of the packed lists
         self.assertEqual(tuple(packed_call.args[6].shape), (2, 60, 512))
         self.assertEqual(tuple(tail_call.args[5].shape), (3,))
         self.assertEqual(len(ops[1].call_args.args), 4)
@@ -316,11 +383,19 @@ class TestFallback(CustomTestCase):
     def test_runtime_error_disables_the_reader(self):
         failing = MagicMock(side_effect=RuntimeError("CUDA out of memory"))
         q, q_rope, kv_cache, indices, _ = make_inputs()
-        with patch.object(reader, "_load", return_value=(failing, ref_pack, ref_dequant)):
+        with patch.object(
+            reader, "_load", return_value=(failing, ref_pack, ref_dequant)
+        ):
             with self.assertLogs(reader.logger, level="ERROR"):
-                self.assertIsNone(reader.k31_prefill_reader(q, q_rope, kv_cache, indices, 0.05))
-            self.assertIsNone(reader.k31_prefill_reader(q, q_rope, kv_cache, indices, 0.05))
-        self.assertEqual(failing.call_count, 1)  # the second call never reaches the operators
+                self.assertIsNone(
+                    reader.k31_prefill_reader(q, q_rope, kv_cache, indices, 0.05)
+                )
+            self.assertIsNone(
+                reader.k31_prefill_reader(q, q_rope, kv_cache, indices, 0.05)
+            )
+        self.assertEqual(
+            failing.call_count, 1
+        )  # the second call never reaches the operators
         self.assertIn("out of memory", reader.reader_stats()["disabled"])
 
     def test_env_defaults(self):
@@ -346,7 +421,9 @@ class TestOverlapGuard(_ReaderCase):
         self.assertEqual([guard.want_packed(False) for _ in range(3)], [False] * 3)
         self.assertEqual(guard.switches, 1)
         self.assertTrue(guard.want_packed(False))  # hold over: packed again ...
-        guard.observe(torch.tensor([320]), torch.tensor([128] * 5), False)  # ... and measured at once
+        guard.observe(
+            torch.tensor([320]), torch.tensor([128] * 5), False
+        )  # ... and measured at once
         self.assertIsNotNone(guard.pending)
         self.assertTrue(guard.want_packed(False))
         self.assertAlmostEqual(guard.last_fraction, 0.5)
@@ -398,7 +475,9 @@ class TestOverlapGuard(_ReaderCase):
     def test_reader_keeps_packing_on_overlapping_rows(self):
         reader._GUARD = reader._OverlapGuard(0.8, probe_every=1, hold=2)
         for _ in range(4):
-            self.run_reader(pack=True, T=10, pages=3)  # 192 rows, 128 ids each: heavy overlap
+            self.run_reader(
+                pack=True, T=10, pages=3
+            )  # 192 rows, 128 ids each: heavy overlap
         stats = reader.reader_stats()
         self.assertEqual((stats["packed"], stats["unpacked"]), (4, 0))
         self.assertLess(stats["last_union_fraction"], 0.5)
@@ -406,9 +485,19 @@ class TestOverlapGuard(_ReaderCase):
 
 def _resolve(**changes):
     args = dict(
-        requested="packed", deterministic=False, is_cuda=True, is_sm100=True, shards_index_k=True,
-        prefill_cp=False, index_kpool=1, kv_cache_store_fp8=True, kv_format="V32",
-        physical_page_size=64, local_num_q_heads=12, hisparse=False, available=lambda: True,
+        requested="packed",
+        deterministic=False,
+        is_cuda=True,
+        is_sm100=True,
+        shards_index_k=True,
+        prefill_cp=False,
+        index_kpool=1,
+        kv_cache_store_fp8=True,
+        kv_format="V32",
+        physical_page_size=64,
+        local_num_q_heads=12,
+        hisparse=False,
+        available=lambda: True,
     )
     args.update(changes)
     return _resolve_k31_sparse_prefill_reader(**args)
@@ -416,7 +505,9 @@ def _resolve(**changes):
 
 class TestEligibility(CustomTestCase):
     def test_flag_is_off_by_default(self):
-        field = {f.name: f for f in msgspec.structs.fields(ExecKernel)}["k31_sparse_prefill_reader"]
+        field = {f.name: f for f in msgspec.structs.fields(ExecKernel)}[
+            "k31_sparse_prefill_reader"
+        ]
         self.assertEqual(field.default, "off")
 
     def test_covered_deployment(self):
@@ -434,10 +525,18 @@ class TestEligibility(CustomTestCase):
     def test_uncovered_deployments_stay_off_without_loading(self):
         available = MagicMock(return_value=True)
         for change in (
-            dict(is_cuda=False), dict(is_sm100=False), dict(shards_index_k=False), dict(prefill_cp=True),
-            dict(index_kpool=2), dict(kv_cache_store_fp8=False), dict(kv_format="V32_NO_ROPE"),
-            dict(kv_format=None), dict(physical_page_size=32), dict(local_num_q_heads=48),
-            dict(local_num_q_heads=0), dict(hisparse=True),
+            dict(is_cuda=False),
+            dict(is_sm100=False),
+            dict(shards_index_k=False),
+            dict(prefill_cp=True),
+            dict(index_kpool=2),
+            dict(kv_cache_store_fp8=False),
+            dict(kv_format="V32_NO_ROPE"),
+            dict(kv_format=None),
+            dict(physical_page_size=32),
+            dict(local_num_q_heads=48),
+            dict(local_num_q_heads=0),
+            dict(hisparse=True),
         ):
             with self.subTest(change=change):
                 self.assertEqual(_resolve(available=available, **change), "off")
@@ -455,13 +554,26 @@ class TestDispatch(CustomTestCase):
         backend.kv_cache_dim = 656
         return backend
 
-    def _call(self, backend, forward_mode=ForwardMode.EXTEND, v_head_dim=512, q_rope=True, result="reader"):
+    def _call(
+        self,
+        backend,
+        forward_mode=ForwardMode.EXTEND,
+        v_head_dim=512,
+        q_rope=True,
+        result="reader",
+    ):
         layer = SimpleNamespace(v_head_dim=v_head_dim, scaling=0.05)
         batch = SimpleNamespace(forward_mode=forward_mode)
         kv = torch.zeros(2 * 64, 656, dtype=torch.uint8)
         with patch.object(reader, "k31_prefill_reader", return_value=result) as fn:
             out = backend._k31_prefill_reader_extend(
-                layer, batch, "q_nope", "q_rope" if q_rope else None, "q_all", kv, "table"
+                layer,
+                batch,
+                "q_nope",
+                "q_rope" if q_rope else None,
+                "q_all",
+                kv,
+                "table",
             )
         return out, fn
 
@@ -508,7 +620,10 @@ class TestDispatch(CustomTestCase):
             branch.index("_k31_prefill_reader_extend"),
             branch.index("self.flashmla_prefill_token_packing"),
         )
-        self.assertLess(branch.index("if reader_out is not None"), branch.index("flashmla_kv_token_packed"))
+        self.assertLess(
+            branch.index("if reader_out is not None"),
+            branch.index("flashmla_kv_token_packed"),
+        )
 
 
 if __name__ == "__main__":
