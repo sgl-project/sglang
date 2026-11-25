@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import TYPE_CHECKING, List
 
 import numpy as np
@@ -166,3 +168,78 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+# DeepSeek-V4 token-parallel prefill (SGLANG_DSV4_TOKEN_PARALLEL_PREFILL=1) runs
+# only on eager EXTEND chunks of at least SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS
+# rows, and the first chunk of each size class pays one-time costs (AITER MoE
+# configs and FlyDSL builds for the pre-quantized MXFP8 input per token bucket,
+# new GEMM / kernel shapes): -3 to -6 % on the first large batch after boot.
+# This warm-up sends one prompt per tail size before the server takes traffic:
+# a full first chunk (prefill graph) and then a tail chunk of that size
+# (eager, token-parallel). On by default when token-parallel prefill is on.
+_DSV4_TP_WARMUP_TAILS = (
+    2048,
+    2049,
+    3072,
+    4071,
+    4096,
+    6144,
+    8175,
+    8192,
+    10240,
+    12279,
+    12288,
+    14336,
+    16383,
+    16384,
+)
+
+
+def _env_on(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def default_warmups() -> List[str]:
+    """Warm-ups that run without --warmups (token-parallel prefill's, when it is on)."""
+    if _env_on("SGLANG_DSV4_TOKEN_PARALLEL_PREFILL", "0") and _env_on(
+        "SGLANG_DSV4_TOKEN_PARALLEL_WARMUP", "1"
+    ):
+        return ["dsv4_token_parallel"]
+    return []
+
+
+@warmup("dsv4_token_parallel")
+async def dsv4_token_parallel(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    chunk = getattr(tokenizer_manager.server_args, "chunked_prefill_size", None) or 0
+    min_rows = int(os.environ.get("SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS", "2048"))
+    context_len = getattr(tokenizer_manager, "context_len", None) or (1 << 30)
+    if chunk <= 0:
+        logger.info("dsv4 token-parallel warm-up skipped: chunked prefill is off")
+        return
+    tails = [
+        t
+        for t in _DSV4_TP_WARMUP_TAILS
+        if min_rows <= t <= chunk and chunk + t < context_len
+    ]
+    rng = np.random.default_rng(0)
+    t0 = time.perf_counter()
+    for tail in tails:
+        req = GenerateReqInput(
+            input_ids=rng.integers(1000, 100000, size=chunk + tail).tolist(),
+            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+        )
+        if disaggregation_mode != "null":
+            req.bootstrap_room = 0
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        async for _ in tokenizer_manager.generate_request(req, None):
+            pass
+    logger.info(
+        "dsv4 token-parallel warm-up: %d prompts (first chunk %d + tails %s) in %.1f s",
+        len(tails),
+        chunk,
+        tails,
+        time.perf_counter() - t0,
+    )
