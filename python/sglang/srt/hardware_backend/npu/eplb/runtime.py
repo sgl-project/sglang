@@ -43,12 +43,6 @@ from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-_DEVICE_ROUTING_FIELDS = (
-    "physical_to_logical_map",
-    "logical_to_all_physical_map",
-    "logical_to_all_physical_map_num_valid",
-    "logical_to_rank_dispatch_physical_map",
-)
 _MAX_PACKED_FIELD_BYTES = 16 * 1024
 
 
@@ -203,29 +197,72 @@ def _hccl_expert_order(old_layout, new_layout, num_logical, world_size, batch_si
     )
 
 
-def _install_routing_layer(current, planned, layer: int, staged_rows) -> None:
-    """Publish the staged device rows and their CPU mirrors at the same boundary."""
-    width = staged_rows["logical_to_all_physical_map"].size(-1)
-    for name, row in staged_rows.items():
-        destination = getattr(current, name)[layer]
-        if name == "logical_to_all_physical_map":
-            destination = destination[..., :width]
-        destination.copy_(row)
-    current.physical_to_logical_map_cpu[layer].copy_(planned["physical_to_logical_map"])
-    current.logical_to_all_physical_map_cpu[layer, :, :width].copy_(
-        planned["logical_to_all_physical_map"]
-    )
+class _RoutingTensors(NamedTuple):
+    """The routing fields carried by both pinned host rows and device staging."""
 
+    physical_to_logical: torch.Tensor
+    logical_to_physical: torch.Tensor
+    replica_counts: torch.Tensor
+    static_dispatch: torch.Tensor | None = None
+
+    @classmethod
+    def allocate_layer(cls, metadata: ExpertLocationMetadata) -> _RoutingTensors:
+        def allocate(table: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(table[0], memory_format=torch.contiguous_format)
+
+        static_dispatch = metadata.logical_to_rank_dispatch_physical_map
+        return cls(
+            physical_to_logical=allocate(metadata.physical_to_logical_map),
+            logical_to_physical=allocate(metadata.logical_to_all_physical_map),
+            replica_counts=allocate(metadata.logical_to_all_physical_map_num_valid),
+            static_dispatch=allocate(static_dispatch)
+            if static_dispatch is not None
+            else None,
+        )
+
+    def pin_memory(self) -> _RoutingTensors:
+        return _RoutingTensors(
+            *(
+                table.contiguous().pin_memory() if table is not None else None
+                for table in self
+            )
+        )
+
+    def row_at(self, row: int) -> _RoutingTensors:
+        return _RoutingTensors(
+            *(table[row] if table is not None else None for table in self)
+        )
+
+
+def _install_routing_layer(
+    current: ExpertLocationMetadata,
+    layer: int,
+    host_rows: _RoutingTensors,
+    staged_rows: _RoutingTensors,
+) -> None:
+    """Publish staged device rows and their CPU mirrors in place."""
+    width = staged_rows.logical_to_physical.size(-1)
+    current.physical_to_logical_map[layer].copy_(staged_rows.physical_to_logical)
+    replica_slots = current.logical_to_all_physical_map[layer, :, :width]
+    replica_slots.copy_(staged_rows.logical_to_physical)
+    replica_counts = current.logical_to_all_physical_map_num_valid[layer]
+    replica_counts.copy_(staged_rows.replica_counts)
+    static_dispatch = current.logical_to_rank_dispatch_physical_map
+    if staged_rows.static_dispatch is not None:
+        assert static_dispatch is not None
+        static_dispatch[layer].copy_(staged_rows.static_dispatch)
+
+    current.physical_to_logical_map_cpu[layer].copy_(host_rows.physical_to_logical)
+    current.logical_to_all_physical_map_cpu[layer, :, :width].copy_(
+        host_rows.logical_to_physical
+    )
     for algorithm, (physical, count) in current._mega_gate_maps.items():
         if algorithm == "static":
-            physical[layer, ..., 0].copy_(
-                current.logical_to_rank_dispatch_physical_map[layer]
-            )
+            assert static_dispatch is not None
+            physical[layer, ..., 0].copy_(static_dispatch[layer])
         else:
-            physical[layer, :, :width].copy_(
-                current.logical_to_all_physical_map[layer, :, :width]
-            )
-            count[layer].copy_(current.logical_to_all_physical_map_num_valid[layer])
+            physical[layer, :, :width].copy_(replica_slots)
+            count[layer].copy_(replica_counts)
 
 
 class _PlacementRows(NamedTuple):
@@ -372,8 +409,8 @@ class _PackedExpertFields:
 class _RoutingPlan:
     """Pinned host tables and views of the reusable one-layer device buffers."""
 
-    host_rows: dict[int, dict[str, torch.Tensor]]
-    device_rows: dict[str, torch.Tensor]
+    host_rows: dict[int, _RoutingTensors]
+    device_rows: _RoutingTensors
     last_layer: int
 
 
@@ -422,20 +459,17 @@ class NpuEplbRuntime:
         )
         # Reserve one layer before KV sizing. The owner event fences its reuse
         # after writes from the preceding layer have been enqueued.
-        self._routing_buffers = {
-            name: torch.empty_like(table[0], memory_format=torch.contiguous_format)
-            for name in _DEVICE_ROUTING_FIELDS
-            if (table := getattr(metadata, name)) is not None
-        }
+        self._routing_buffers = _RoutingTensors.allocate_layer(metadata)
         # A loaded placement can have holes before the last populated slot.
-        self._replica_width = _populated_replica_width(
-            metadata.logical_to_all_physical_map_cpu
-        )
+        initial_replicas = metadata.logical_to_all_physical_map_cpu
+        self._replica_width = _populated_replica_width(initial_replicas)
         # An initial mapping may expose only nearby replicas on this rank.
         # Startup takes the union across ranks; install clears one layer at a time.
         self.narrowed_replica_layers: set[int] = set()
         if spec.dispatch_mode == "random":
-            visible_slots = (self._replica_map >= 0).sum(dim=(1, 2))
+            visible_slots = (initial_replicas[..., : self._replica_width] >= 0).sum(
+                dim=(1, 2)
+            )
             narrowed = (visible_slots < spec.physical_experts).nonzero().flatten()
             self.narrowed_replica_layers.update(narrowed.tolist())
         self.device = self.staging[0].device
@@ -448,12 +482,6 @@ class NpuEplbRuntime:
         self._routing_plan: _RoutingPlan | None = None
         self.stage_seconds = self.install_enqueue_seconds = 0.0
         self.interleaved_layers = 0
-
-    @property
-    def _replica_map(self) -> torch.Tensor:
-        return self.metadata.logical_to_all_physical_map_cpu[
-            :, :, : self._replica_width
-        ]
 
     def planner(self, window: RecordedWindow):
         self.stage_seconds = self.install_enqueue_seconds = 0.0
@@ -531,40 +559,33 @@ class NpuEplbRuntime:
         # overwrites stale replicas. The graph still points to the full table.
         install_width = max(self._replica_width, incoming_width)
         self._replica_width = install_width
-        num_experts = logical.size(1)
-        replica_buffer = self._routing_buffers["logical_to_all_physical_map"]
-        device_rows = dict(
-            self._routing_buffers,
-            logical_to_all_physical_map=replica_buffer.view(-1)[
-                : num_experts * install_width
-            ].view(num_experts, install_width),
+        num_logical = logical.size(1)
+        replica_buffer = self._routing_buffers.logical_to_physical
+        device_rows = self._routing_buffers._replace(
+            logical_to_physical=replica_buffer.view(-1)[
+                : num_logical * install_width
+            ].view(num_logical, install_width)
         )
         padded_logical = logical
         if incoming_width < install_width:
             padded_logical = torch.nn.functional.pad(
                 logical, (0, install_width - incoming_width), value=-1
             )
-        host_rows = {
-            "physical_to_logical_map": physical,
-            "logical_to_all_physical_map": padded_logical,
-            "logical_to_all_physical_map_num_valid": (logical != -1).sum(dim=-1),
-        }
-        if "logical_to_rank_dispatch_physical_map" in device_rows:
+        static_dispatch = None
+        if device_rows.static_dispatch is not None:
             # Without replicas the inverse table already gives the static pick.
-            host_rows["logical_to_rank_dispatch_physical_map"] = (
-                logical[..., 0] if dispatch is None else dispatch
-            )
+            static_dispatch = logical[..., 0] if dispatch is None else dispatch
         # Pageable H2D blocks the worker on the current stream. Keep the plan
         # pinned until the asynchronous routing copies have drained.
         self.device_module.set_device(self.device)
-        pinned = {
-            name: rows.contiguous().pin_memory() for name, rows in host_rows.items()
-        }
+        pinned = _RoutingTensors(
+            physical_to_logical=physical,
+            logical_to_physical=padded_logical,
+            replica_counts=(logical != -1).sum(dim=-1),
+            static_dispatch=static_dispatch,
+        ).pin_memory()
         self._routing_plan = _RoutingPlan(
-            host_rows={
-                layer: {name: rows[i] for name, rows in pinned.items()}
-                for i, layer in enumerate(changed)
-            },
+            host_rows={layer: pinned.row_at(i) for i, layer in enumerate(changed)},
             device_rows=device_rows,
             last_layer=changed[-1],
         )
@@ -589,12 +610,17 @@ class NpuEplbRuntime:
         start = time.perf_counter()
         routing = self._routing_plan
         assert routing is not None
+        host_rows = routing.host_rows[layer]
         pending_work = []
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
-            for name, row in routing.device_rows.items():
-                row.copy_(routing.host_rows[layer][name], non_blocking=True)
-            writeback = self._stage_weights(layer, routing, pending_work)
+            for destination, source in zip(routing.device_rows, host_rows, strict=True):
+                if destination is not None:
+                    assert source is not None
+                    destination.copy_(source, non_blocking=True)
+            writeback = self._stage_weights(
+                layer, host_rows.physical_to_logical, pending_work
+            )
             if submitted is not None:
                 submitted.set_result(None)
             # The caller can install only after the stream and its Work handles drain.
@@ -602,9 +628,11 @@ class NpuEplbRuntime:
         self.stage_seconds += time.perf_counter() - start
         return writeback
 
-    def _stage_weights(self, layer, routing, pending_work) -> WeightWriteback:
+    def _stage_weights(
+        self, layer: int, planned_layout: torch.Tensor, pending_work: list[dist.Work]
+    ) -> WeightWriteback:
         old_layout = self.metadata.physical_to_logical_map_cpu[layer].tolist()
-        new_layout = routing.host_rows[layer]["physical_to_logical_map"].tolist()
+        new_layout = planned_layout.tolist()
         if old_layout == new_layout:
             # A replica-order update only publishes the staged routing rows.
             return lambda: None
@@ -681,7 +709,7 @@ class NpuEplbRuntime:
         get_global_expert_distribution_recorder().before_layer_install(layer)
         writeback()
         _install_routing_layer(
-            self.metadata, routing.host_rows[layer], layer, routing.device_rows
+            self.metadata, layer, routing.host_rows[layer], routing.device_rows
         )
         self.narrowed_replica_layers.discard(layer)
         if layer == routing.last_layer:
@@ -889,7 +917,7 @@ def create_npu_async_eplb(model_config, model, *, startup_weight_load):
         "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d "
         "hccl_buffer_mib=%d hccl_blocking_wait=%s layers_per_chunk=1 packed_fields=%d",
         weight_staging_bytes,
-        sum(row.nbytes for row in runtime._routing_buffers.values()),
+        sum(row.nbytes for row in runtime._routing_buffers if row is not None),
         p2p_buffer_mib,
         blocking_wait,
         len(packed_fields.small) if packed_fields is not None else 0,
