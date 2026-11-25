@@ -1012,7 +1012,7 @@ class AiterAttnBackend(AttentionBackend):
         # topk > 1 stays on the CK path; the vectorized 5D KV layout keeps its own
         # forward_extend_vectorized_5d path (unified_attention reads it as a plain
         # page table and would mix token positions).
-        draft_extend_topk = get_spec().speculative_eagle_topk
+        draft_extend_topk = getattr(get_spec(), "speculative_eagle_topk", None)
         self._use_unified_draft_extend = (
             not self.use_mla
             and not self.kv_cache_is_vectorized_5d
@@ -3271,7 +3271,12 @@ class AiterAttnBackend(AttentionBackend):
                 n_qo = qo_indptr.shape[0]
                 self.qo_indptr[:n_qo].copy_(qo_indptr)
                 qo_indptr = self.qo_indptr[:n_qo]
-                max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
+                # Reuse the guarded max_kv_len computed above: it is None on the
+                # sync-free path (e.g. Muse), where seq_lens_cpu is absent and
+                # the unified draft-extend path sizes from its page table. A bare
+                # seq_lens_cpu.max() here would raise before that path runs.
+                if max_kv_len is not None:
+                    max_kv_len = int(max_kv_len)
                 self.forward_metadata = ForwardMetadata(
                     kv_indptr,
                     kv_indices,
@@ -5714,10 +5719,19 @@ class AiterAttnBackend(AttentionBackend):
                     sinks,
                 )
 
-            if self.use_triton_unified_attention:
+            if (
+                self.use_triton_unified_attention
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+            ):
                 # unified_attention has no head_dim cap; route extend through it
                 # so Gemma-4's 512-wide full-attention layers don't hit the CK
                 # `head dimension at most 256` assert.
+                #
+                # draft_extend_v2 is excluded: topk<=1 already took the graph-safe
+                # unified block above, so reaching here means topk>1, which the PR
+                # keeps on CK. _forward_extend_unified builds its page table from
+                # capture-time seq_lens, so under a draft-extend cuda graph a
+                # longer replay prompt would read missing page ids.
                 return self._forward_extend_unified(
                     q,
                     layer,
