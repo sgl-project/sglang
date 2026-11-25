@@ -9,6 +9,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
+from sglang.srt.managers.pending_abort_table import PendingAbortTable
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -38,6 +39,7 @@ class TestSenderWrapper(CustomTestCase):
         routed_output = mock_sock_send.call_args.args[1]
         router = MultiTokenizerRouter.__new__(MultiTokenizerRouter)
         router.socket_mapping = MagicMock()
+        router.pending_aborts = PendingAbortTable()
         asyncio.run(router._distribute_result_to_workers(routed_output))
 
         router.socket_mapping.send_output.assert_called_once_with(
