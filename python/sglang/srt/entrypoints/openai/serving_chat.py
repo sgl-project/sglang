@@ -390,6 +390,14 @@ def _chat_stops(template_stops, request: ChatCompletionRequest):
     return stop
 
 
+def _continues_final_assistant(request: ChatCompletionRequest) -> bool:
+    return bool(
+        request.continue_final_message
+        and request.messages
+        and request.messages[-1].role == "assistant"
+    )
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -1747,10 +1755,6 @@ class OpenAIServingChat(OpenAIServingBase):
         if params is not None and not isinstance(params, dict):
             raise ValueError("kv_transfer_params must be an object")
         if params is None or "prompt_token_ids" not in params:
-            if request.input_ids is not None:
-                raise ValueError(
-                    "Expected llm-d to forward prompt_token_ids for this input_ids request"
-                )
             return False
         ids = params["prompt_token_ids"]
         vocab_size = self.tokenizer_manager.model_config.token_id_vocab_size
@@ -1798,7 +1802,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         forwarded = (
-            (request.kv_transfer_params is not None or request.input_ids is not None)
+            request.kv_transfer_params is not None
             and get_serving().trust_llm_d_prompt_token_ids
             and self._accept_llm_d_prompt(request, is_multimodal)
         )
@@ -1829,6 +1833,15 @@ class OpenAIServingChat(OpenAIServingBase):
         self._patch_reasoning_skip_special_tokens(request)
 
         thinking_mode = self._get_reasoning_from_request(request)
+        if (
+            forwarded
+            and self.template_manager.chat_template_name is not None
+            and self._legacy_adds_think_prefix(request, thinking_mode)
+        ):
+            # The llm-d renderer does not have the worker's reasoning parser.
+            # Render and tokenize the complete prompt, including its prefix.
+            request.input_ids = None
+            forwarded = False
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
         # when --reasoning-parser is configured, so builtin xgrammar
         # tags must describe only the post-reasoning tool-call suffix.
@@ -2360,6 +2373,18 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return prompt_ids, decoded_prompt
 
+    def _legacy_adds_think_prefix(
+        self, request: ChatCompletionRequest, thinking_mode: bool
+    ) -> bool:
+        return (
+            thinking_mode
+            and not _continues_final_assistant(request)
+            and (
+                self._reasoning_detector is None
+                or not self._reasoning_detector.thinks_internally
+            )
+        )
+
     def _apply_conversation_template(
         self,
         request: ChatCompletionRequest,
@@ -2376,11 +2401,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         # If we should continue the final assistant message, adjust the conversation.
-        if (
-            request.continue_final_message
-            and request.messages
-            and request.messages[-1].role == "assistant"
-        ):
+        if _continues_final_assistant(request):
             # Remove the auto-added blank assistant turn, if present.
             if conv.messages and conv.messages[-1][1] is None:
                 conv.messages.pop()
@@ -2399,9 +2420,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
-            if self._get_reasoning_from_request(request) and (
-                self._reasoning_detector is None
-                or not self._reasoning_detector.thinks_internally
+            if self._legacy_adds_think_prefix(
+                request, self._get_reasoning_from_request(request)
             ):
                 # Models with thinks_internally=True think without a leading <think> token
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token

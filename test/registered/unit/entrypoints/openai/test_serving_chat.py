@@ -2033,6 +2033,40 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
+    def test_llm_d_trust_preserves_top_level_input_ids(self):
+        """Trusted forwarding must still accept pretokenized chat from existing clients."""
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            for params in (None, {"do_remote_prefill": True}):
+                with self.subTest(params=params):
+                    req = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        input_ids=[10, 20],
+                        kv_transfer_params=params,
+                    )
+                    adapted, _ = self.chat._convert_to_internal_request(
+                        req, self.fastapi_request
+                    )
+                    self.assertEqual(adapted.input_ids, [10, 20])
+
+    def test_llm_d_legacy_thinking_uses_worker_prefix(self):
+        """A legacy worker that inserts <think> must serve the complete prompt."""
+        self.template_manager.chat_template_name = "chatml"
+        self.chat.reasoning_parser = "deepseek-r1"
+        self.chat._reasoning_detector = ReasoningParser("deepseek-r1").detector
+        self.tm.model_config.token_id_vocab_size = 100
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            kv_transfer_params={"prompt_token_ids": [10, 20]},
+        )
+
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            actual = self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertTrue(actual.prompt.endswith("<think>"))
+        self.assertEqual(actual.prompt_ids, [1, 2, 3, 4, 5])
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         _use_chat_encoding(self.chat, "kimi_k3")
         ret = [

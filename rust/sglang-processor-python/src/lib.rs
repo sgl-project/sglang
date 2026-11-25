@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -80,12 +80,34 @@ impl ChatProcessor {
         sglang_processor::ReasoningStream::supports(name)
     }
 
-    fn decoder(&self, prompt_tail: Vec<u32>, skip_special_tokens: bool) -> Decoder {
-        Decoder(
-            self.tokenizer
-                .tokenizer()
-                .decode_stream(&prompt_tail, skip_special_tokens),
-        )
+    #[pyo3(signature = (prompt_tail, skip_special_tokens, reasoning_parser=None))]
+    fn decoder(
+        &self,
+        prompt_tail: Vec<u32>,
+        skip_special_tokens: bool,
+        reasoning_parser: Option<&str>,
+    ) -> Decoder {
+        let tokenizer = self.tokenizer.tokenizer();
+        let framing = reasoning_parser
+            .filter(|_| skip_special_tokens)
+            .into_iter()
+            .flat_map(sglang_processor::ReasoningStream::framing)
+            .filter_map(|marker| {
+                let encoded = tokenizer
+                    .encode_segments(&[EncodeSegment::new(marker, true)])
+                    .ok()?;
+                let ids = encoded.token_ids();
+                let raw = tokenizer.decode(ids, false).ok()?;
+                let filtered = tokenizer.decode(ids, true).ok()?;
+                (raw.as_str() == marker && filtered.as_str() != marker)
+                    .then(|| (ids.to_vec(), marker))
+            })
+            .collect();
+        Decoder {
+            stream: tokenizer.decode_stream(&prompt_tail, skip_special_tokens),
+            framing,
+            pending: VecDeque::new(),
+        }
     }
 
     /// Render and encode one serialized OpenAI chat request.
@@ -196,21 +218,62 @@ impl ReasoningDecoder {
 
 /// One incremental decoder per generation. Token boundaries can split UTF-8.
 #[pyclass(module = "sglang_processor._native")]
-struct Decoder(DecodeStream);
+struct Decoder {
+    stream: DecodeStream,
+    framing: Vec<(Vec<u32>, &'static str)>,
+    pending: VecDeque<u32>,
+}
 
 #[pymethods]
 impl Decoder {
     fn push(&mut self, ids: Vec<u32>, finished: bool) -> PyResult<String> {
         let mut text = String::new();
-        for id in ids {
-            if let Some(piece) = self.0.step(id).map_err(invalid)? {
-                text.push_str(&piece);
+        if self.framing.is_empty() {
+            for id in ids {
+                text.extend(self.stream.step(id).map_err(invalid)?);
+            }
+        } else {
+            for id in ids {
+                self.pending.push_back(id);
+                self.decode_pending(false, &mut text)?;
+            }
+            if finished {
+                self.decode_pending(true, &mut text)?;
             }
         }
-        if finished && let Some(tail) = self.0.finish().map_err(invalid)? {
-            text.push_str(&tail);
+        if finished {
+            text.extend(self.stream.finish().map_err(invalid)?);
         }
         Ok(text)
+    }
+}
+
+impl Decoder {
+    /// Pass complete parser markers through even when they span multiple
+    /// tokens. Decode every other token with the caller's normal skip setting.
+    fn decode_pending(&mut self, finished: bool, text: &mut String) -> PyResult<()> {
+        while let Some(&id) = self.pending.front() {
+            if let Some((ids, marker)) = self
+                .framing
+                .iter()
+                .find(|(ids, _)| self.pending.iter().take(ids.len()).eq(ids))
+            {
+                text.extend(self.stream.finish().map_err(invalid)?);
+                text.push_str(marker);
+                self.pending.drain(..ids.len());
+            } else if !finished
+                && self
+                    .framing
+                    .iter()
+                    .any(|(ids, _)| ids.iter().take(self.pending.len()).eq(self.pending.iter()))
+            {
+                break;
+            } else {
+                self.pending.pop_front();
+                text.extend(self.stream.step(id).map_err(invalid)?);
+            }
+        }
+        Ok(())
     }
 }
 

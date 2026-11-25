@@ -114,6 +114,26 @@ impl ReasoningStream {
         Some(Self(ThinkDetector::new(think_config(name)?, options)))
     }
 
+    /// Output framing that the parser needs even when special tokens are skipped.
+    pub fn framing(name: &str) -> Vec<&'static str> {
+        use crate::kimi_k3_format::{
+            MESSAGE_CLOSE, RESPONSE_CLOSE, RESPONSE_OPEN, THINK_CLOSE, THINK_OPEN,
+        };
+        match think_config(name) {
+            Some(ThinkConfig::Tags(tags)) => vec![tags.start, tags.end],
+            Some(ThinkConfig::KimiK3) => {
+                vec![
+                    THINK_OPEN,
+                    THINK_CLOSE,
+                    RESPONSE_OPEN,
+                    RESPONSE_CLOSE,
+                    MESSAGE_CLOSE,
+                ]
+            }
+            None => Vec::new(),
+        }
+    }
+
     pub fn push(&mut self, text: &str, finished: bool) -> (String, String) {
         let (mut reasoning, mut content) = self.0.push(text);
         if finished {

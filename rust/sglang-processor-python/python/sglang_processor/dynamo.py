@@ -171,9 +171,9 @@ def _display_prefix(raw, shown, limit):
 class _StringStopDecoder:
     """Match raw decoded text and commit the corresponding display text."""
 
-    def __init__(self, processor, tail, skip_special, stops):
-        self.raw = processor.decoder(tail, False)
-        self.display = processor.decoder(tail, True) if skip_special else self.raw
+    def __init__(self, raw, display, stops):
+        self.raw = raw
+        self.display = display
         self.stops = stops
         self.pending = deque()
 
@@ -263,16 +263,15 @@ class DynamoChat:
             raise InvalidArgument(str(error)) from error
         worker = _worker_request(request, ids, self.eos, self.template_stops)
         stops = worker["stop_conditions"]
-        if splitter is not None:
-            # Parser delimiters can be registered as special tokens.
-            worker["output_options"]["skip_special_tokens"] = False
         skip_special = worker["output_options"]["skip_special_tokens"]
-        if stops["stop"]:
-            decoder = _StringStopDecoder(
-                self.processor, ids[-5:], skip_special, stops["stop"]
-            )
+        tail = ids[-5:]
+        if splitter is not None and skip_special:
+            decoder = self.processor.decoder(tail, True, self.reasoning_parser)
         else:
-            decoder = self.processor.decoder(ids[-5:], skip_special)
+            decoder = self.processor.decoder(tail, skip_special)
+        if stops["stop"]:
+            raw = self.processor.decoder(tail, False) if skip_special else decoder
+            decoder = _StringStopDecoder(raw, decoder, stops["stop"])
         hidden = (
             set()
             if stops["ignore_eos"]
