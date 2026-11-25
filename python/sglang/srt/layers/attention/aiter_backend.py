@@ -684,6 +684,13 @@ def _aiter_fp8_asm_gqa_repeat(num_q_heads: int, num_kv_heads: int) -> int:
     return ratio // pow2 if pow2 in _AITER_FP8_ASM_GQA_RATIOS else 1
 
 
+# Cap on the repeated K + V gather of one batch. The scheduler charges a shared
+# prefix once, but the gather copies it per request; above the cap the batch
+# takes the paged path. 2 GiB holds one 256K-token context at Qwen3.8-27B TP1
+# (4 KV heads x 3 x 256 B x 2 = 6 KiB per token).
+_FP8_ASM_GQA_REPEAT_MAX_GATHER_BYTES = 2 << 30
+
+
 # Cross-check the per-batch fast indices against the generic gather (syncs).
 _GFX_ASM_CTX_GATHER_CHECK = (
     os.environ.get("SGLANG_GFX_ASM_CTX_GATHER_CHECK", "0") == "1"
@@ -2264,7 +2271,8 @@ class AiterAttnBackend(AttentionBackend):
     ) -> Optional[torch.Tensor]:
         """fp8 ASM varlen prefill over the gathered paged KV with each KV head
         repeated ``repeat`` times, for GQA ratios the kernel does not take.
-        Returns None when the batch has no usable gather indices."""
+        Returns None when the batch has no usable gather indices or its gather
+        would exceed _FP8_ASM_GQA_REPEAT_MAX_GATHER_BYTES."""
         bs = forward_batch.batch_size
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         tok_idx, cu_k = self._asm_context_prefill_indices(
@@ -2274,6 +2282,11 @@ class AiterAttnBackend(AttentionBackend):
             return None
         num_kv_heads = layer.tp_k_head_num
         head_dim = layer.qk_head_dim
+        gather_bytes = (
+            2 * tok_idx.numel() * num_kv_heads * repeat * head_dim
+        ) * k_cache.element_size()
+        if gather_bytes > _FP8_ASM_GQA_REPEAT_MAX_GATHER_BYTES:
+            return None
 
         def gather_and_repeat(cache: torch.Tensor) -> torch.Tensor:
             # One pass over the already quantized cache: each context row is
@@ -2290,7 +2303,7 @@ class AiterAttnBackend(AttentionBackend):
             q_scale.reshape(1),
             k_descale.reshape(1),
             v_descale.reshape(1),
-            self.qo_indptr[:bs0],
+            self.forward_metadata.qo_indptr[:bs0],
             cu_k,
             self.forward_metadata.max_q_len,
             int(self.forward_metadata.max_kv_len),

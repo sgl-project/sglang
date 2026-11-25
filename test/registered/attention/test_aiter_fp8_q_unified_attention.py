@@ -395,10 +395,14 @@ class TestAiterFP8AsmPrefillGQARepeat(CustomTestCase):
         backend.input_dtype = torch.bfloat16
         backend.q_scale = q_scale
         backend.k_scale = k_scale
-        backend.qo_indptr = cu(extend_lens)
+        # A stale backend buffer, as after decode graph setup replaces it: the
+        # path must read the batch's own qo_indptr.
+        backend.qo_indptr = torch.zeros_like(cu(extend_lens))
         backend.token_to_kv_pool = _FakeKVPool(k_cache, v_cache)
         backend.forward_metadata = SimpleNamespace(
-            max_q_len=max(extend_lens), max_kv_len=max(seq_lens)
+            qo_indptr=cu(extend_lens),
+            max_q_len=max(extend_lens),
+            max_kv_len=max(seq_lens),
         )
         layer = SimpleNamespace(
             layer_id=0,
@@ -503,12 +507,11 @@ class TestAiterFP8AsmPrefillGQARepeat(CustomTestCase):
         backend = object.__new__(AiterAttnBackend)
         backend.input_dtype = torch.bfloat16
         backend.q_scale = backend.k_scale = torch.ones(1, device=device)
-        backend.qo_indptr = torch.tensor(
-            [0, num_tokens], dtype=torch.int32, device=device
-        )
         backend.token_to_kv_pool = _FakeKVPool(cache, cache)
         backend.forward_metadata = SimpleNamespace(
-            max_q_len=num_tokens, max_kv_len=num_tokens
+            qo_indptr=torch.tensor([0, num_tokens], dtype=torch.int32, device=device),
+            max_q_len=num_tokens,
+            max_kv_len=num_tokens,
         )
         layer = SimpleNamespace(
             layer_id=0,
@@ -571,6 +574,80 @@ class TestAiterFP8AsmPrefillGQARepeat(CustomTestCase):
                     self.assertEqual(o.data_ptr(), buf.data_ptr())
                 else:
                     self.assertIsNone(seen[0])
+
+    def test_gather_over_budget_takes_the_paged_path(self):
+        """A batch whose repeated K + V gather exceeds the byte cap (e.g. many
+        requests sharing a long cached prefix) returns None without gathering,
+        so the caller falls through to the paged attention path."""
+        num_q_heads, num_kv_heads, head_dim, device = 24, 4, 256, "cuda"
+        repeat = _aiter_fp8_asm_gqa_repeat(num_q_heads, num_kv_heads)
+        num_tokens = 8
+        cache = torch.zeros(
+            16, num_kv_heads, head_dim, dtype=torch.uint8, device=device
+        ).view(fp8_dtype)
+        backend = object.__new__(AiterAttnBackend)
+        backend.token_to_kv_pool = _FakeKVPool(cache, cache)
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=num_q_heads,
+            tp_k_head_num=num_kv_heads,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+        )
+        tok_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        cu_k = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+        gather_bytes = 2 * num_tokens * num_kv_heads * repeat * head_dim
+        q_fp8 = torch.zeros(
+            num_tokens, num_q_heads * head_dim, dtype=torch.uint8, device=device
+        ).view(fp8_dtype)
+        for cap, expect_none in ((gather_bytes - 1, True), (gather_bytes, False)):
+            with self.subTest(cap=cap):
+                with (
+                    mock.patch.object(
+                        backend,
+                        "_asm_context_prefill_indices",
+                        return_value=(tok_idx, cu_k),
+                    ),
+                    mock.patch.object(
+                        backend,
+                        "_quantize_q_fp8",
+                        return_value=(q_fp8, torch.ones(1, device=device)),
+                    ),
+                    mock.patch.object(
+                        aiter_backend,
+                        "_FP8_ASM_GQA_REPEAT_MAX_GATHER_BYTES",
+                        cap,
+                        create=True,
+                    ),
+                    mock.patch.object(
+                        aiter_backend,
+                        "gather_repeat_kv_heads",
+                        side_effect=RuntimeError("gathered"),
+                    ) as gather,
+                ):
+                    if expect_none:
+                        o = backend._forward_extend_fp8_asm_gqa_repeat(
+                            None,
+                            layer,
+                            SimpleNamespace(batch_size=1),
+                            repeat,
+                            2,
+                            None,
+                            None,
+                        )
+                        self.assertIsNone(o)
+                        gather.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "gathered"):
+                            backend._forward_extend_fp8_asm_gqa_repeat(
+                                None,
+                                layer,
+                                SimpleNamespace(batch_size=1),
+                                repeat,
+                                2,
+                                None,
+                                None,
+                            )
 
 
 if __name__ == "__main__":
