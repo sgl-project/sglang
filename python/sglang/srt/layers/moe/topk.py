@@ -2914,6 +2914,173 @@ def _post_process_topk_ids(
     return topk_ids, topk_weights, recorder_topk_ids
 
 
+def _select_biased_topk_experts(
+    *,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk_config: TopKConfig,
+    correction_bias: Optional[torch.Tensor],
+    scoring_func: str,
+    top_k: int,
+    top_k_for_gate: int,
+    num_shared_topk_slots: int,
+    num_shared_topk_slots_for_gate: int,
+    renormalize: bool,
+    routed_scaling_factor: Optional[float],
+    apply_routed_scaling_factor_on_output: bool,
+    num_token_non_padded: Optional[torch.Tensor],
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+    routing_overridden: bool,
+    router_logits_partials: Optional[torch.Tensor],
+):
+    ep_policy = topk_config.ep_remap_policy or _resolve_ep_remap_policy(topk_config)
+    _biased_topk = biased_topk_xpu if _is_xpu else biased_topk_jit_kernel_impl
+    packed_topk = None
+    _packed_kwargs = {}
+    if _fused_gate_emits_packed_ids(
+        scoring_func,
+        num_shared_topk_slots,
+        expert_location_dispatch_info,
+        routing_overridden,
+        topk_config.fused_gate_packed_ids,
+    ):
+        packed_topk = torch.empty(
+            (hidden_states.shape[0], top_k),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        _packed_kwargs = dict(packed_out=packed_topk)
+    if topk_config.sqrtsoftplus_log1p:
+        _packed_kwargs["sqrtsoftplus_log1p"] = True
+    if router_logits_partials is not None:
+        _packed_kwargs["router_logits_partials"] = router_logits_partials
+        if (
+            _use_aiter
+            and num_shared_topk_slots > 0
+            and not has_per_rank_fused_shared_slots(num_shared_topk_slots)
+        ):
+            # the ROCm decode gate writes the aiter shared columns itself
+            _packed_kwargs["num_shared_append"] = num_shared_topk_slots
+    ep_kwargs, ep_local_remapped = prepare_biased_topk_ep_kwargs(
+        policy=ep_policy,
+        topk_config=topk_config,
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        scoring_func=scoring_func,
+        top_k_for_gate=top_k_for_gate,
+        num_shared_topk_slots_for_gate=num_shared_topk_slots_for_gate,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+        routing_overridden=routing_overridden,
+        packed_topk=packed_topk,
+        router_logits_partials=router_logits_partials,
+    )
+    _packed_kwargs.update(ep_kwargs)
+    topk_weights, topk_ids = _biased_topk(
+        hidden_states=hidden_states,
+        gating_output=router_logits,
+        correction_bias=correction_bias,
+        topk=top_k_for_gate,
+        renormalize=renormalize,
+        scoring_func=scoring_func,
+        num_fused_shared_experts=num_shared_topk_slots_for_gate,
+        routed_scaling_factor=routed_scaling_factor,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        **_packed_kwargs,
+    )
+    padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func) or bool(
+        _packed_kwargs.get("mask_padded_rows", False)
+    )
+    return topk_weights, topk_ids, packed_topk, padded_rows_masked, ep_local_remapped
+
+
+def _select_softmax_topk_experts(
+    *,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk_config: TopKConfig,
+    correction_bias: Optional[torch.Tensor],
+    scoring_func: str,
+    top_k: int,
+    top_k_for_gate: int,
+    num_shared_topk_slots: int,
+    num_shared_topk_slots_for_gate: int,
+    renormalize: bool,
+    routed_scaling_factor: Optional[float],
+    apply_routed_scaling_factor_on_output: bool,
+    fold_scale_after_routing: bool,
+    num_token_non_padded: Optional[torch.Tensor],
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+    routing_overridden: bool,
+):
+    ep_policy = topk_config.ep_remap_policy or _resolve_ep_remap_policy(topk_config)
+    packed_topk = None
+    # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): only on the plain
+    # CUDA softmax path with no EPLB remap / shared experts / bias / routing overrides.
+    _fused_topk_pack = False
+    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+        from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+
+        _fused_topk_pack = lora_envs.SGLANG_OPT_LORA_FUSED_TOPK_PACK.get()
+    if (
+        _fused_topk_pack
+        and _is_cuda
+        and not _use_aiter
+        and scoring_func == "softmax"
+        and correction_bias is None
+        and expert_location_dispatch_info is None
+        and num_shared_topk_slots == 0
+        and not routing_overridden
+        and not (
+            apply_routed_scaling_factor_on_output
+            and routed_scaling_factor not in (None, 1.0)
+        )
+    ):
+        num_experts = router_logits.shape[-1]
+        if num_experts & (num_experts - 1) == 0 and num_experts <= 512:
+            packed_topk = torch.empty(
+                (hidden_states.shape[0], top_k),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+
+    # Qwen3MOE uses fused_topk
+    # ===== TO BE REFACTORED ====
+    # Only CUDA softmax paths pass packed_out / num_token_non_padded / EP remap
+    # kwargs; non-CUDA implementations (e.g. fused_topk_cpu) keep the base args.
+    _fused_topk_kwargs, softmax_padded_masked, ep_local_remapped = (
+        prepare_softmax_topk_kwargs(
+            policy=ep_policy,
+            topk_config=topk_config,
+            num_routed_experts=router_logits.shape[1],
+            scoring_func=scoring_func,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+            routing_overridden=routing_overridden,
+            packed_topk=packed_topk,
+        )
+    )
+    padded_rows_masked = softmax_padded_masked if packed_topk is None else False
+    # ===== END TO BE REFACTORED ====
+    topk_weights, topk_ids = fused_topk(
+        hidden_states=hidden_states,
+        gating_output=router_logits,
+        topk=top_k_for_gate,
+        renormalize=renormalize,
+        correction_bias=correction_bias,
+        scoring_func=scoring_func,
+        num_fused_shared_experts=num_shared_topk_slots_for_gate,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=(
+            apply_routed_scaling_factor_on_output and not fold_scale_after_routing
+        ),
+        **_fused_topk_kwargs,
+    )
+    return topk_weights, topk_ids, packed_topk, padded_rows_masked, ep_local_remapped
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -2950,7 +3117,6 @@ def select_experts(
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
     ep_local_remapped = False
-    ep_policy = topk_config.ep_remap_policy or _resolve_ep_remap_policy(topk_config)
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
@@ -3090,63 +3256,29 @@ def select_experts(
         if _can_use_jit_kernel and (
             scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid"
         ):
-            _biased_topk = biased_topk_xpu if _is_xpu else biased_topk_jit_kernel_impl
-            _packed_kwargs = {}
-            if _fused_gate_emits_packed_ids(
-                scoring_func,
-                num_shared_topk_slots,
-                expert_location_dispatch_info,
-                routing_overridden,
-                topk_config.fused_gate_packed_ids,
-            ):
-                packed_topk = torch.empty(
-                    (hidden_states.shape[0], top_k),
-                    dtype=torch.int32,
-                    device=hidden_states.device,
-                )
-                _packed_kwargs = dict(packed_out=packed_topk)
-            if topk_config.sqrtsoftplus_log1p:
-                _packed_kwargs["sqrtsoftplus_log1p"] = True
-            if router_logits_partials is not None:
-                _packed_kwargs["router_logits_partials"] = router_logits_partials
-                if (
-                    _use_aiter
-                    and num_shared_topk_slots > 0
-                    and not has_per_rank_fused_shared_slots(num_shared_topk_slots)
-                ):
-                    # the ROCm decode gate writes the aiter shared columns itself
-                    _packed_kwargs["num_shared_append"] = num_shared_topk_slots
-            ep_kwargs, ep_local_remapped = prepare_biased_topk_ep_kwargs(
-                policy=ep_policy,
-                topk_config=topk_config,
+            (
+                topk_weights,
+                topk_ids,
+                packed_topk,
+                padded_rows_masked,
+                ep_local_remapped,
+            ) = _select_biased_topk_experts(
+                hidden_states=hidden_states,
                 router_logits=router_logits,
+                topk_config=topk_config,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
+                top_k=top_k,
                 top_k_for_gate=top_k_for_gate,
+                num_shared_topk_slots=num_shared_topk_slots,
                 num_shared_topk_slots_for_gate=num_shared_topk_slots_for_gate,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
                 routing_overridden=routing_overridden,
-                packed_topk=packed_topk,
                 router_logits_partials=router_logits_partials,
-            )
-            _packed_kwargs.update(ep_kwargs)
-            topk_weights, topk_ids = _biased_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=top_k_for_gate,
-                renormalize=renormalize,
-                scoring_func=scoring_func,
-                num_fused_shared_experts=num_shared_topk_slots_for_gate,
-                routed_scaling_factor=routed_scaling_factor,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-                **_packed_kwargs,
-            )
-            padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func) or bool(
-                _packed_kwargs.get("mask_padded_rows", False)
             )
         elif (
             topk_config.runner_backend is not None
@@ -3162,68 +3294,29 @@ def select_experts(
                 renormalize=renormalize,
             )
         else:
-            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): only on the plain
-            # CUDA softmax path with no EPLB remap / shared experts / bias / routing overrides.
-            _fused_topk_pack = False
-            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-                from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
-
-                _fused_topk_pack = lora_envs.SGLANG_OPT_LORA_FUSED_TOPK_PACK.get()
-            if (
-                _fused_topk_pack
-                and _is_cuda
-                and not _use_aiter
-                and scoring_func == "softmax"
-                and correction_bias is None
-                and expert_location_dispatch_info is None
-                and num_shared_topk_slots == 0
-                and not routing_overridden
-                and not (
-                    apply_routed_scaling_factor_on_output
-                    and routed_scaling_factor not in (None, 1.0)
-                )
-            ):
-                num_experts = router_logits.shape[-1]
-                if num_experts & (num_experts - 1) == 0 and num_experts <= 512:
-                    packed_topk = torch.empty(
-                        (hidden_states.shape[0], top_k),
-                        dtype=torch.int32,
-                        device=hidden_states.device,
-                    )
-
-            # Qwen3MOE uses fused_topk
-            # ===== TO BE REFACTORED ====
-            # Only CUDA softmax paths pass packed_out / num_token_non_padded / EP remap
-            # kwargs; non-CUDA implementations (e.g. fused_topk_cpu) keep the base args.
-            _fused_topk_kwargs, softmax_padded_masked, ep_local_remapped = (
-                prepare_softmax_topk_kwargs(
-                    policy=ep_policy,
-                    topk_config=topk_config,
-                    num_routed_experts=router_logits.shape[1],
-                    scoring_func=scoring_func,
-                    num_token_non_padded=num_token_non_padded,
-                    expert_location_dispatch_info=expert_location_dispatch_info,
-                    routing_overridden=routing_overridden,
-                    packed_topk=packed_topk,
-                )
-            )
-            if packed_topk is None:
-                padded_rows_masked = softmax_padded_masked
-            # ===== END TO BE REFACTORED ====
-            topk_weights, topk_ids = fused_topk(
+            (
+                topk_weights,
+                topk_ids,
+                packed_topk,
+                padded_rows_masked,
+                ep_local_remapped,
+            ) = _select_softmax_topk_experts(
                 hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k_for_gate,
-                renormalize=renormalize,
+                router_logits=router_logits,
+                topk_config=topk_config,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
-                num_fused_shared_experts=num_shared_topk_slots_for_gate,
+                top_k=top_k,
+                top_k_for_gate=top_k_for_gate,
+                num_shared_topk_slots=num_shared_topk_slots,
+                num_shared_topk_slots_for_gate=num_shared_topk_slots_for_gate,
+                renormalize=renormalize,
                 routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=(
-                    apply_routed_scaling_factor_on_output
-                    and not fold_scale_after_routing
-                ),
-                **_fused_topk_kwargs,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                fold_scale_after_routing=fold_scale_after_routing,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                routing_overridden=routing_overridden,
             )
     else:
         # custom_routing_function itself is padding-unaware; its output on

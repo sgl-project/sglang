@@ -716,15 +716,17 @@ class TestEpRemapFusionRuntime(CustomTestCase):
             use_custom_local_expert_mapping=True,
             layer_id=0,
         )
-        d_ctrl = StandardDispatcher(runner_cfg)
-        d_ctrl.local_expert_mapping = custom_map
-        d_treat = StandardDispatcher(runner_cfg)
-        d_treat.local_expert_mapping = custom_map
-
         with envs.SGLANG_DISABLE_FUSED_EP_REMAP.override(True):
+            d_ctrl = StandardDispatcher(runner_cfg)
+            d_ctrl.local_expert_mapping = custom_map
             tk_ctrl = select_experts(hidden, logits, cfg_custom)
             self.assertNotIsInstance(tk_ctrl, StandardTopKOutputLocalMapped)
             ctrl_disp = d_ctrl.dispatch(hidden, tk_ctrl)
+
+        d_treat = StandardDispatcher(runner_cfg)
+        d_treat.local_expert_mapping = custom_map
+        self.assertTrue(d_ctrl._disable_fused_ep_remap)
+        self.assertFalse(d_treat._disable_fused_ep_remap)
 
         tk_treat = select_experts(hidden, logits, cfg_custom)
         self.assertNotIsInstance(tk_treat, StandardTopKOutputLocalMapped)
@@ -748,7 +750,6 @@ class TestEpRemapFusionRuntime(CustomTestCase):
             )
         self.assertTrue(torch.all(treat_disp.topk_output.topk_ids[2:] == -1))
 
-        # Mismatch guard: omitting use_custom_local_expert_mapping fails loudly.
         cfg_default = TopKConfig(
             top_k=topk,
             renormalize=True,

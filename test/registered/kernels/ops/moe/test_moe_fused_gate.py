@@ -831,7 +831,6 @@ def test_moe_fused_gate_ep_remap_offset_strided_and_warp_bypass() -> None:
             assert torch.equal(ids_ref, ids_view)
             assert torch.allclose(w_ref, w_view, atol=1e-6, rtol=1e-5)
 
-    # Verify EP remap bypasses moe_route_warp cleanly even on warp-covered shapes.
     warp_scores = torch.randn((8, 128), dtype=torch.bfloat16, device=DEVICE)
     w_warp_bypass, ids_warp_bypass = moe_fused_gate(
         warp_scores,

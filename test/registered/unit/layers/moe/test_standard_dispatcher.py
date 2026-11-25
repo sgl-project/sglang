@@ -1149,17 +1149,15 @@ class TestEpStandardDispatcherRemapFusion(CustomTestCase):
                         torch.ones((2, 128)),
                     ),
                 )
-            for disable_fused in (True, False):
-                with envs.SGLANG_DISABLE_FUSED_EP_REMAP.override(disable_fused):
-                    out = disp.dispatch(
-                        torch.ones((2, 16)),
-                        StandardTopKOutput(
-                            torch.ones((2, 8), dtype=torch.float32) / 8.0,
-                            global_ids.clone(),
-                            torch.ones((2, 128)),
-                        ),
-                    )
-                    self.assertTrue(torch.equal(out.topk_output.topk_ids, expected))
+            out = disp.dispatch(
+                torch.ones((2, 16)),
+                StandardTopKOutput(
+                    torch.ones((2, 8), dtype=torch.float32) / 8.0,
+                    global_ids.clone(),
+                    torch.ones((2, 128)),
+                ),
+            )
+            self.assertTrue(torch.equal(out.topk_output.topk_ids, expected))
 
     def test_ep_local_mapped_populates_mapping_and_dwdp_reset(self):
         cfg = MoeRunnerConfig(
@@ -1352,6 +1350,41 @@ class TestEpStandardDispatcherRemapFusion(CustomTestCase):
                         quant_method=method,
                     )
                     self.assertFalse(deepep_layer._interleaved_experts)
+
+    def test_map_topk_ids_skips_triton_when_not_nvidia_cuda(self):
+        from sglang.srt.layers.moe.token_dispatcher import standard as standard_mod
+
+        class _FakeCudaTensor(torch.Tensor):
+            @property
+            def is_cuda(self):
+                return True
+
+        fake_ids = torch.tensor([[0, 2, -1]], dtype=torch.int32).as_subclass(
+            _FakeCudaTensor
+        )
+        mapping = torch.tensor([-1, -1, 0], dtype=torch.int32)
+        expected = torch.tensor([[-1, 0, -1]], dtype=torch.int32)
+
+        with patch.object(
+            standard_mod, "map_topk_ids_to_local_experts", return_value=expected
+        ) as mock_triton:
+            with patch.object(standard_mod, "_is_cuda", False):
+                out_eager = standard_mod._map_topk_ids_to_local_experts(
+                    topk_ids=fake_ids, local_expert_mapping=mapping
+                )
+            mock_triton.assert_not_called()
+            self.assertTrue(
+                torch.equal(out_eager.as_subclass(torch.Tensor), expected)
+            )
+
+            with patch.object(standard_mod, "_is_cuda", True):
+                out_triton = standard_mod._map_topk_ids_to_local_experts(
+                    topk_ids=fake_ids, local_expert_mapping=mapping
+                )
+            mock_triton.assert_called_once_with(
+                topk_ids=fake_ids, local_expert_mapping=mapping
+            )
+            self.assertTrue(torch.equal(out_triton, expected))
 
 
 if __name__ == "__main__":
