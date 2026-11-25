@@ -70,5 +70,26 @@ def test_fp4_index_cache_store_dcp_owned_slots(dcp_rank: int) -> None:
     torch.testing.assert_close(cache, expected)
 
 
+@pytest.mark.parametrize("rne", [False, True])
+def test_fp4_index_cache_fused_store_matches_batched_store(rne: bool) -> None:
+    """Below 4096 tokens the store quantizes in the store kernel; the bytes must
+    equal the batched quantize-then-store path."""
+    num_tokens, num_pages = 4096, 4096 // PAGE_SIZE
+    torch.manual_seed(int(rne))
+    x = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
+    x[0] = 0
+    x[1] *= 1e-6
+    loc = torch.randperm(num_tokens, device=get_device()).to(torch.int64)
+    shape = (num_pages, PAGE_SIZE * (FP4_DIM + SCALE_BYTES))
+    batched = torch.zeros(shape, device=get_device(), dtype=torch.uint8)
+    fused = torch.zeros(shape, device=get_device(), dtype=torch.uint8)
+
+    store_fp4_index_k_cache(x, batched, loc, page_size=PAGE_SIZE, rne=rne)
+    for part in (slice(0, 2048), slice(2048, 4096)):
+        store_fp4_index_k_cache(x[part], fused, loc[part], page_size=PAGE_SIZE, rne=rne)
+
+    torch.testing.assert_close(fused, batched)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
