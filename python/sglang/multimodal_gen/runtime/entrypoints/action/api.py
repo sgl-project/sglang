@@ -21,11 +21,19 @@ from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.action.ws_utils import (
     run_action_msgpack_ws,
 )
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    ReleaseRealtimeSessionReq,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     flatten_extra_params,
     save_image_to_path,
     temp_dir_if_disabled,
 )
+from sglang.multimodal_gen.runtime.realtime.action_chunk import (
+    ActionChunkConflict,
+    ActionDeadlineExceeded,
+)
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.utils.json_response import orjson_response
 
@@ -191,6 +199,11 @@ async def _multipart_action_payload(request: Request, uploads_dir: str) -> dict:
             "observation": observation,
         },
         "parameters": parameters,
+        **(
+            {"realtime": _parse_extra_params(raw_form["realtime"], "realtime")}
+            if "realtime" in raw_form
+            else {}
+        ),
     }
 
 
@@ -224,6 +237,10 @@ async def create_action_generation(request: Request):
                     server_args,
                     preserve_numpy=wants_msgpack,
                 )
+    except ActionChunkConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ActionDeadlineExceeded as exc:
+        raise HTTPException(status_code=408, detail="Action deadline elapsed") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if wants_msgpack:
@@ -231,6 +248,16 @@ async def create_action_generation(request: Request):
             content=pack_msgpack(response), media_type="application/msgpack"
         )
     return orjson_response(response)
+
+
+@router.delete("/sessions/{session_id:path}", status_code=204)
+async def release_action_session(session_id: str):
+    reply = await async_scheduler_client.forward(
+        ReleaseRealtimeSessionReq(session_id=f"action/{session_id}")
+    )
+    if getattr(reply, "error", None):
+        raise HTTPException(status_code=500, detail=reply.error)
+    return Response(status_code=204)
 
 
 @router.get("/metadata")

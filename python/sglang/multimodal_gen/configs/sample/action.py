@@ -71,6 +71,10 @@ class ActionSamplingParams:
 
     def apply_request_extra(self, req: Any) -> None:
         req.extra.update(self.build_request_extra())
+        session_id = req.extra.get("vla", {}).get("observation", {}).get("session_id")
+        if session_id is not None:
+            req.realtime_session_id = f"action/{session_id}"
+            req.extra["action_session"] = True
 
     def _validate(self):
         if (

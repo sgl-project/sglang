@@ -318,6 +318,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # served model name exposed via /v1/models and generation responses
     served_model_name: str | None = None
 
+    action_stage_graph: str | None = None
+    session_gpu_budget_mib: int | None = None
+
     # Model backend (sglang native or diffusers)
     backend: Backend = Backend.AUTO
 
@@ -729,6 +732,11 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        if self.session_gpu_budget_mib is not None and (
+            type(self.session_gpu_budget_mib) is not int
+            or self.session_gpu_budget_mib < 1
+        ):
+            raise ValueError("session_gpu_budget_mib must be positive")
         validate_env_values()
         self._validate_scheduler_rpc_timeout()
         timeout = self.http_graceful_shutdown_timeout
@@ -2325,6 +2333,17 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+        parser.add_argument(
+            "--action-stage-graph",
+            default=None,
+            help="Installed module:factory for in-process action policy stages.",
+        )
+        parser.add_argument(
+            "--session-gpu-budget-mib",
+            type=int,
+            default=None,
+            help="Per-worker budget in MiB for persistent realtime session tensors.",
+        )
         # Model and path configuration
         parser.add_argument(
             "--model-path",

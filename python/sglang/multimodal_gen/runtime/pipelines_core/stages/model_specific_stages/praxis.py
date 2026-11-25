@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import time
-from collections import OrderedDict
+from copy import copy
 from typing import Any
 
 import numpy as np
@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
     vla_state,
     vla_timings,
 )
+from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.vla import praxis_bimanual
 from sglang.multimodal_gen.runtime.vla.praxis_policy import PraxisEpisode, PraxisPolicy
@@ -28,7 +29,6 @@ from sglang.multimodal_gen.runtime.vla.praxis_sampler import SamplerSettings
 # Request and response conversion of each embodiment.
 _POSE8_DIM = 8
 _PASSTHROUGH_KEYS = ("descriptor", "robot_state.q", "reset_context")
-MAX_SESSIONS = 32
 
 
 def to_uint8(value: Any) -> np.ndarray:
@@ -132,24 +132,22 @@ def response_extras(
     return extras
 
 
-class SessionTable:
-    """Reference sessions by id; the least recently used one is dropped beyond the limit."""
+class PraxisState(BaseRealtimeState):
+    episode = None
 
-    def __init__(self, *, max_sessions: int):
-        self._max_sessions = max_sessions
-        self._sessions: OrderedDict[str, Any] = OrderedDict()
+    def fork(self):
+        state = PraxisState()
+        if self.episode is not None:
+            state.episode = copy(self.episode)
+            state.episode.session = copy(self.episode.session)
+            state.episode.session.stream = copy(self.episode.session.stream)
+        return state
 
-    def get(self, *, session_id: str) -> Any | None:
-        session = self._sessions.get(session_id)
-        if session is not None:
-            self._sessions.move_to_end(session_id)
-        return session
-
-    def put(self, *, session_id: str, session: Any) -> None:
-        self._sessions[session_id] = session
-        self._sessions.move_to_end(session_id)
-        while len(self._sessions) > self._max_sessions:
-            self._sessions.popitem(last=False)
+    def tensor_roots(self):
+        if self.episode is None:
+            return ()
+        session = self.episode.session
+        return (session._boundary_latents, vars(session.stream))
 
 
 # Size of the views of a robot client for the antialiased checkpoint: the fit size of the tiles.
@@ -182,7 +180,6 @@ class PraxisPolicyStage(PipelineStage):
         super().__init__()
         self.config = config
         self._policy = policy
-        self._sessions = SessionTable(max_sessions=MAX_SESSIONS)
 
     def _sampler(self, *, batch: Req) -> SamplerSettings:
         options = vla_options(batch)
@@ -206,18 +203,13 @@ class PraxisPolicyStage(PipelineStage):
             exec_horizon=self.config.action_horizon,
         )
 
-    def _episode(self, *, batch: Req, observation: dict[str, Any]) -> PraxisEpisode:
-        session_id = observation.get("session_id")
-        episode = (
-            None
-            if session_id is None
-            else self._sessions.get(session_id=str(session_id))
-        )
-        if episode is None:
-            episode = self._new_episode(batch=batch)
-            if session_id is not None:
-                self._sessions.put(session_id=str(session_id), session=episode)
-        return episode
+    def _episode(self, *, batch: Req) -> PraxisEpisode:
+        if batch.session is None:
+            return self._new_episode(batch=batch)
+        state = batch.session.get_or_create_state(PraxisState)
+        if state.episode is None:
+            state.episode = self._new_episode(batch=batch)
+        return state.episode
 
     def _warmup(self, *, batch: Req, settings: SamplerSettings):
         """Run both context depths once, so the kernels of each are compiled before the first request."""
@@ -242,7 +234,7 @@ class PraxisPolicyStage(PipelineStage):
         if batch.is_warmup:
             result = self._warmup(batch=batch, settings=settings)
         else:
-            episode = self._episode(batch=batch, observation=observation)
+            episode = self._episode(batch=batch)
             result = episode.step(
                 reference_observation(
                     observation=observation, embodiment=self.config.embodiment

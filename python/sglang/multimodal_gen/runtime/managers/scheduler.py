@@ -244,6 +244,7 @@ class Scheduler(
         self._pi05_sequence = 0
         self._batching_max_size = server_args.batching_max_size
         self._batching_delay_s = server_args.batching_delay_ms / 1000.0
+        self._action_service_times = deque(maxlen=8)
         self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
@@ -376,6 +377,13 @@ class Scheduler(
     ) -> OutputBatch | list[OutputBatch] | _SequentiallyReturnedOutputs:
         """Dispatch ready queue items; several plain `Req`s form one dynamic batch."""
         reqs = [item[1] for item in items]
+        if all(
+            isinstance(req, Req) and req.extra.get("action_session") for req in reqs
+        ):
+            started = time.monotonic()
+            result = self._handle_generation(reqs, allow_dynamic_batching=len(reqs) > 1)
+            self._action_service_times.append(time.monotonic() - started)
+            return result
         if len(reqs) > 1 and all(isinstance(req, Req) for req in reqs):
             return self._handle_generation(reqs, allow_dynamic_batching=True)
         if len(reqs) > 1:
@@ -537,6 +545,12 @@ class Scheduler(
                 return self._build_dynamic_batch_error_outputs(
                     reqs=reqs, error_msg=output_batch.error, cancelled=True
                 )
+            if output_batch.error and output_batch.error.startswith(
+                ("action_input_rejected:", "action_deadline_exceeded")
+            ):
+                # No action history was committed. Isolate a bad observation or
+                # duplicate control step without rejecting the other robots.
+                return self._execute_generation_sequential(reqs)
             if output_batch.error:
                 logger.error(
                     "Native grouped execution returned error. Returning per-request errors: %s",
@@ -746,9 +760,7 @@ class Scheduler(
             base_req, candidate_req
         ):
             return "pipeline_request_unsupported"
-        if self._has_realtime_session(base_req) or self._has_realtime_session(
-            candidate_req
-        ):
+        if self._sessions_require_single_request(base_req, candidate_req):
             return "realtime_session"
         if not isinstance(base_req.prompt, str) or not isinstance(
             candidate_req.prompt, str
@@ -772,6 +784,41 @@ class Scheduler(
     @staticmethod
     def _has_realtime_session(req: Req) -> bool:
         return bool(req.realtime_session_id) or req.session is not None
+
+    def _can_wait_for_action_batch(self, reqs, wait_s):
+        deadlines = [
+            r.extra["action_realtime"]["deadline_unix_ms"]
+            for r in reqs
+            if r.extra.get("action_realtime")
+        ]
+        if not deadlines:
+            return True
+        # Cold workers have no service-time estimate. Once warm, reserve the
+        # slowest recent forward plus the remainder of the configured dwell.
+        return bool(self._action_service_times) and (
+            min(deadlines) - time.time_ns() // 1_000_000
+            > 1000 * (max(self._action_service_times) + wait_s)
+        )
+
+    def _sessions_require_single_request(self, left: Req, right: Req) -> bool:
+        if not (self._has_realtime_session(left) or self._has_realtime_session(right)):
+            return False
+        if not getattr(
+            self.server_args.pipeline_config,
+            "supports_independent_action_sessions",
+            False,
+        ):
+            return True
+        if any(
+            self._has_realtime_session(r) and not r.extra.get("action_session")
+            for r in (left, right)
+        ):
+            return True
+        return (
+            left is not right
+            and left.realtime_session_id is not None
+            and left.realtime_session_id == right.realtime_session_id
+        )
 
     def _has_unbatchable_image_conditioning(
         self, base_req: Req, candidate_req: Req
@@ -814,9 +861,7 @@ class Scheduler(
         ):
             return False
 
-        if self._has_realtime_session(base_req) or self._has_realtime_session(
-            candidate_req
-        ):
+        if self._sessions_require_single_request(base_req, candidate_req):
             return False
 
         if not isinstance(base_req.prompt, str) or not isinstance(
@@ -1399,6 +1444,15 @@ class Scheduler(
             ):
                 break
             _identity, candidate_req, _enqueue_time = self.waiting_queue[idx]
+            if (
+                isinstance(candidate_req, Req)
+                and candidate_req.realtime_session_id
+                and any(
+                    r.realtime_session_id == candidate_req.realtime_session_id
+                    for r in compatible_reqs
+                )
+            ):
+                continue
             if isinstance(candidate_req, Req) and self._can_dynamic_batch(
                 req, candidate_req
             ):
@@ -1422,6 +1476,9 @@ class Scheduler(
         should_wait_for_more = (
             batch_len < self._batching_max_size
             and not self._batch_admission.batch_is_full(compatible_reqs)
+            and self._can_wait_for_action_batch(
+                compatible_reqs, max(0, self._batching_delay_s - oldest_wait_s)
+            )
             and oldest_wait_s < self._batching_delay_s
         )
         if should_wait_for_more:
