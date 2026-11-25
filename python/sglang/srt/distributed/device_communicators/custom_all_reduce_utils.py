@@ -449,12 +449,17 @@ def gather_physical_device_ids(
     """Every rank's physical GPU index (before CUDA_VISIBLE_DEVICES), gathered
     over a CPU group."""
     world_size = dist.get_world_size(group=group)
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_ids = list(map(int, cuda_visible_devices.split(",")))
+    if _is_cuda:
+        from sglang.srt.utils.numa_utils import _get_nvml_device_index
+
+        physical_device_id = _get_nvml_device_index(device.index)
     else:
-        device_ids = list(range(torch.cuda.device_count()))
-    physical_device_id = device_ids[device.index]
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        if cuda_visible_devices:
+            device_ids = list(map(int, cuda_visible_devices.split(",")))
+        else:
+            device_ids = list(range(torch.cuda.device_count()))
+        physical_device_id = device_ids[device.index]
     tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
     gather_list = [
         torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)

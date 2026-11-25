@@ -27,6 +27,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -365,15 +366,29 @@ def load_model_with_memory_saver(
     # Remove monkey_patch when linear.py quant remove dependencies with vllm
     monkey_patch_vllm_parallel_state()
 
+    offload = get_exec().offload
+    ple_offload_embedding = offload.ple_offload_embedding
     if not is_draft_worker:
         architectures = model_config.hf_config.architectures or []
         is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in architectures
-        ple_offload_embedding = get_exec().offload.ple_offload_embedding
         if ple_offload_embedding and not is_qwen4_exp:
             raise ValueError(
                 "--ple-offload-embedding only supports Qwen4ExpForConditionalGeneration"
             )
         if is_qwen4_exp:
+            if envs.SGLANG_USE_QWEN4_PLE_NVLINK.get():
+                if (
+                    offload.cpu_offload_gb > 0
+                    or offload.offload_group_size > 0
+                    or get_model().weight_cache_mode != "off"
+                    or get_exec().features.enable_memory_saver
+                ):
+                    raise ValueError(
+                        "Qwen PLE NVLink lookup requires the table to stay in HBM "
+                        "and cannot use generic layer offload, IPC weight cache, "
+                        "or --enable-memory-saver"
+                    )
+                ple_offload_embedding = False
             model_config.hf_text_config.ple_offload_embedding = ple_offload_embedding
             model_config.hf_text_config.ple_offload_backend = (
                 get_exec().offload.ple_offload_backend
@@ -444,11 +459,7 @@ def load_model_with_memory_saver(
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info
             )
-    if (
-        not is_draft_worker
-        and get_exec().offload.ple_offload_embedding
-        and device == "cuda"
-    ):
+    if not is_draft_worker and ple_offload_embedding and device == "cuda":
         current_platform.empty_cache()
     # Cache needs to be cleared after loading model weights (in the loader.load_model function).
     # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
