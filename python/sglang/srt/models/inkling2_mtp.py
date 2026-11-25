@@ -93,20 +93,18 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
             zeros = hidden_states.new_zeros(batch_size, self.markov_rank)
         return zeros, f_rnn[:batch_size].to(hidden_states.dtype)
 
-    def step_latent(self, prev_tokens, *, hidden_states, state):
+    def step_fold(self, prev_tokens, *, hidden_states, state):
+        if not get_platform().is_hip or not inkling2_mtp_hip.folds_step_bias(
+            self, prev_tokens
+        ):
+            return None
         state, f_rnn = state
         state, latent = self._rnn_step(state, prev_tokens, hidden_states, f_rnn)
-        return latent, (state, f_rnn)
-
-    def step_fold(self):
-        if self.vocab_shard is None or self._fold_weight is None:
-            return None
-        return self._fold_weight, self._fold_bias
+        return latent, (self._fold_weight, self._fold_bias), (state, f_rnn)
 
     def step_bias(self, prev_tokens, *, hidden_states, state):
-        latent, state = self.step_latent(
-            prev_tokens, hidden_states=hidden_states, state=state
-        )
+        state, f_rnn = state
+        state, latent = self._rnn_step(state, prev_tokens, hidden_states, f_rnn)
         assert self._fold_weight is not None and self._fold_bias is not None
         assert self._gather_logits is not None
         bias = torch.addmm(
@@ -114,7 +112,7 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         )
         if self.vocab_shard is None:
             bias = self._gather_logits(bias)
-        return bias, state
+        return bias, (state, f_rnn)
 
     def step_logits_dtype(self, base_dtype):
         return torch.promote_types(base_dtype, self._fold_weight.dtype)

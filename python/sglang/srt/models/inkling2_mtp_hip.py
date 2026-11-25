@@ -20,6 +20,21 @@ def run_rnn_step(head, state, prev_tokens, hidden, f_rnn):
     )
 
 
+# Rows up to which a step computes its folded bias in the sampling kernel (each
+# row's programs read the fold weight block again).
+_FOLD_MAX_ROWS = 4
+
+
+def folds_step_bias(head, prev_tokens):
+    """Whether the sampling kernel computes this step's folded bias (its GEMM and
+    the candidate pass in one launch): a few rows over the rank's vocab shard."""
+    return (
+        head.vocab_shard is not None
+        and head._fold_weight is not None
+        and len(prev_tokens) <= _FOLD_MAX_ROWS
+    )
+
+
 # Rows of the persistent zero initial RNN state (larger draft batches fill their own).
 _ZERO_STATE_ROWS = 1024
 
