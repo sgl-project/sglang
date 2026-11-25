@@ -5952,6 +5952,7 @@ class Scheduler(
             snapshot=snapshot,
         )
 
+        self.tree_cache.processing_step = batch
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -5971,6 +5972,7 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+        self.tree_cache.processing_step = None
         self._on_step_processed(batch, result)
 
         # Submit this batch's queued host backups before the next scheduler step.

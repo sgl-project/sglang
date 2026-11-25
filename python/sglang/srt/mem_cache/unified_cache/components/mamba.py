@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import math
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -267,6 +268,20 @@ class MambaComponent(TreeComponent):
     def _mamba_host_only_checkpoint(self) -> bool:
         return self.host_only_checkpoint
 
+    def _final_slot_stream(self, req):
+        """The device-to-host stream if no launched step carrying ``req`` is still
+        running, else None. The step whose result is being processed has ended."""
+        controller = self.cache.cache_controller
+        if controller is None or controller.l2_transfer_engine is None:
+            return None
+        pending = req.inflight_steps
+        step = self.cache.processing_step
+        if step is not None and req in step.launched_reqs:
+            pending -= 1
+        if pending != 0:
+            return None
+        return controller.l2_transfer_engine.device_to_host_stream
+
     def _copy_mamba_slot_to_host(
         self, insert_params: InsertParams, slot: torch.Tensor
     ) -> None:
@@ -284,9 +299,18 @@ class MambaComponent(TreeComponent):
             raise RuntimeError(
                 "Not enough host memory for a mamba host-only checkpoint"
             )
-        device_indices = slot.reshape(-1).to(dtype=torch.int64)
+        stream = insert_params.mamba_host_src_stream
+        insert_params.mamba_host_src_stream = None
         try:
-            self._backup_mamba_slot(host_indices, device_indices)
+            if stream is None:
+                device_indices = slot.reshape(-1).to(dtype=torch.int64)
+                self._backup_mamba_slot(host_indices, device_indices)
+            else:
+                with torch.get_device_module().stream(stream):
+                    device_indices = slot.reshape(-1).to(dtype=torch.int64)
+                    start_event = torch.get_device_module().Event()
+                    start_event.record(stream)
+                    self._backup_mamba_slot(host_indices, device_indices, start_event)
         except Exception:
             self.free_host_values([host_indices])
             raise
@@ -294,7 +318,10 @@ class MambaComponent(TreeComponent):
         insert_params.mamba_host_src = None
 
     def _backup_mamba_slot(
-        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        start_event=None,
     ) -> None:
         from sglang.srt.managers.cache_controller import CacheOperation
 
@@ -315,7 +342,8 @@ class MambaComponent(TreeComponent):
             operation
         )
         completion = controller.l2_transfer_engine.submit_device_to_host(
-            controller._l2_transfers(write_host, write_device, write_pools)
+            controller._l2_transfers(write_host, write_device, write_pools),
+            start_event=start_event,
         )
         # The transfer engine owns the layout lease. Finish before the host
         # index is stored or the source slot is freed.
@@ -1008,14 +1036,22 @@ class MambaComponent(TreeComponent):
                 cache_len, keep_idx = checkpoint
                 if not self._mamba_host_only_checkpoint():
                     insert_params.mamba_keep_idx = keep_idx
-                active_value = (
-                    req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
-                )
+                slot = req.kv.mamba_ping_pong_track_buffer[keep_idx]
             else:
-                active_value = req.kv.mamba_pool_idx.unsqueeze(-1).clone()
+                slot = req.kv.mamba_pool_idx
             if self._mamba_host_only_checkpoint():
-                self._stash_host_checkpoint_source(insert_params, active_value)
+                stream = self._final_slot_stream(req)
+                with (
+                    torch.get_device_module().stream(stream)
+                    if stream is not None
+                    else nullcontext()
+                ):
+                    self._stash_host_checkpoint_source(
+                        insert_params, slot.unsqueeze(-1).clone()
+                    )
+                insert_params.mamba_host_src_stream = stream
                 return cache_len
+            active_value = slot.unsqueeze(-1).clone()
             if self.quantizes_checkpoints:
                 insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
             else:

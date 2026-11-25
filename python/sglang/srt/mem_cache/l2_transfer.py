@@ -202,9 +202,11 @@ class L2TransferEngine:
                     ack_finish if finish_recorded else None, layout_key
                 )
 
-    def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
+    def submit_device_to_host(
+        self, transfers: list[L2Transfer], start_event=None
+    ) -> TransferCompletion:
         with self._submission(
-            transfers, self.device_to_host_stream, "device_to_host"
+            transfers, self.device_to_host_stream, "device_to_host", start_event
         ) as (transfers, completion):
             for transfer in transfers:
                 transfer.host_pool.backup_from_device_all_layer_physical(

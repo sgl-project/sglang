@@ -99,6 +99,9 @@ class InsertParams:
     # waits until the insert key is known, so a leaf that already has mamba
     # never pays the D2H.
     mamba_host_src: Optional[torch.Tensor] = None
+    # Stream mamba_host_src was built on when its slot is final; None orders the
+    # copy behind the current stream.
+    mamba_host_src_stream: Optional[Any] = None
     # Both mamba values stay empty and the leaf already holds the checkpoint.
     allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
@@ -489,6 +492,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+    # The step whose result the scheduler is processing; its forward has ended.
+    processing_step: Optional[Any] = None
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
