@@ -65,6 +65,8 @@ small floating-point differences that accumulate during denoising.
 The pipeline reuses SGLang's native Qwen3 encoder, Qwen-Image VAE, component loaders,
 denoising loop, and residency management. Anima's transformer and text conditioner
 are native modules, not wrappers around Diffusers models.
+On CUDA, breakable graph warmup verifies fused BF16 LayerNorm and timestep
+modulation against the transformer's original computation before capture.
 
 For multi-GPU execution, choose TP to shard transformer weights or Ulysses/Ring to
 shard image tokens. The transformer has 16 heads, so `tp_size * ulysses_degree`

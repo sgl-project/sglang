@@ -1689,20 +1689,12 @@ class DeepseekSparseAttnBackend(
                 sum(extend_seq_lens_cpu),
                 self.speculative_num_draft_tokens,
             )
-            if forward_batch.forward_mode.is_draft_extend_v2():
-                # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
-                # tokens upfront. All requests extend by the same fixed
-                # (speculative_num_draft_tokens). Use scalar to avoid GPU sync.
-                page_table = torch.repeat_interleave(
-                    page_table, repeats=self.speculative_num_draft_tokens, dim=0
-                )
-            else:
-                # DRAFT_EXTEND: the draft worker extends by (num_correct_drafts + 1)
-                # per request after verification. Lengths vary per request based on
-                # how many tokens were accepted.
-                page_table = torch.repeat_interleave(
-                    page_table, repeats=forward_batch.extend_seq_lens, dim=0
-                )
+            # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
+            # tokens upfront. All requests extend by the same fixed
+            # (speculative_num_draft_tokens). Use scalar to avoid GPU sync.
+            page_table = torch.repeat_interleave(
+                page_table, repeats=self.speculative_num_draft_tokens, dim=0
+            )
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -2143,14 +2135,8 @@ class DeepseekSparseAttnBackend(
     def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        out_cache_loc: Optional[torch.Tensor] = None,
-        actual_forward_mode: Optional[ForwardMode] = None,
     ):
         """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
         self.set_dsa_prefill_impl(forward_batch=None)
@@ -2319,17 +2305,7 @@ class DeepseekSparseAttnBackend(
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
         if bs not in self.decode_cuda_graph_metadata:
-            self._build_forward_metadata_cuda_graph(
-                bs,
-                None,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_cpu,
-                forward_mode,
-                spec_info,
-                out_cache_loc,
-                actual_forward_mode,
-            )
+            self._build_forward_metadata_cuda_graph(bs, seq_lens, forward_mode)
             return
 
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
@@ -5216,7 +5192,6 @@ class DeepseekSparseAttnMultiStepBackend:
         self.runner_ids = model_runner.runner_ids
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-        self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
