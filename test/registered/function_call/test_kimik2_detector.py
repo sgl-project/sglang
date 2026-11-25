@@ -897,10 +897,8 @@ class TestKimiK2EndToEnd(unittest.TestCase):
         """
         tc_det = KimiK2FuncDetector()
 
-        # ``weird@id`` matches the broad ``[^\\s<|]+`` capture in
-        # ``stream_tool_call_portion_regex`` but fails both the standard
-        # ``name:idx`` form and the bare-counter form, so
-        # ``_parse_tool_call_id`` returns ``(None, 0)``.
+        # ``weird@id`` fails both the standard ``name:idx`` form and the
+        # bare-counter form, so ``_parse_tool_call_id`` returns ``(None, 0)``.
         chunks = [
             "normal text before",
             "<|tool_calls_section_begin|>"

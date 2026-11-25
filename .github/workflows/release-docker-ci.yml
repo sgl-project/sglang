@@ -1,0 +1,216 @@
+name: Build and Push CI Docker Images
+
+# Publishes docker/ci.Dockerfile, the job container for externally managed CUDA
+# runners, to its own repo: lmsysorg/sglang-ci:<gpu family> plus a dated
+# nightly-<gpu family>-<date>-<sha> tag. Nightly builds the scheduled defaults.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_family:
+        description: "blackwell (B200, B300, GB300) or hopper (H100, H200)"
+        required: false
+        type: choice
+        options: [blackwell, hopper]
+        default: blackwell
+      arches:
+        description: "Comma-separated architectures: arm64, amd64. Empty builds the family's default: arm64 for blackwell (GB300), amd64 for hopper."
+        required: false
+        default: ""
+      cu_version:
+        description: "CU_VERSION the install script uses; keep in step with the fleet. Empty uses cu130."
+        required: false
+        default: ""
+      cuda_version:
+        description: "CUDA base image version. Empty uses 13.0.3."
+        required: false
+        default: ""
+      tag:
+        description: "Custom tag suffix, e.g. 'my-test' -> blackwell-my-test. Empty publishes the rolling and nightly tags."
+        required: false
+        default: ""
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang-ci"
+  schedule:
+    # After the 00:00 UTC dev image, so both track the same day of main.
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: release-docker-ci-${{ inputs.gpu_family || 'blackwell' }}-${{ inputs.tag || 'nightly' }}
+  # Rolling-tag runs queue rather than cancel a running build (a newer run still
+  # replaces a pending one); custom-tag runs replace older ones.
+  cancel-in-progress: ${{ inputs.tag != '' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: ${{ inputs.image_repo || 'lmsysorg/sglang-ci' }}
+  GPU_FAMILY: ${{ inputs.gpu_family || 'blackwell' }}
+
+jobs:
+  prepare:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    # Scheduled runs have no inputs, so every default and every per-family
+    # setting is resolved here once and the build reads these outputs.
+    outputs:
+      matrix: ${{ steps.config.outputs.matrix }}
+      is_blackwell: ${{ steps.config.outputs.is_blackwell }}
+      cu_version: ${{ steps.config.outputs.cu_version }}
+      cuda_version: ${{ steps.config.outputs.cuda_version }}
+    steps:
+      - name: Resolve build config
+        id: config
+        env:
+          ARCHES: ${{ inputs.arches }}
+          TAG_SUFFIX: ${{ inputs.tag }}
+          CU_VERSION: ${{ inputs.cu_version }}
+          CUDA_VERSION: ${{ inputs.cuda_version }}
+        run: |
+          set -euo pipefail
+          CU_VERSION="${CU_VERSION:-cu130}"
+          CUDA_VERSION="${CUDA_VERSION:-13.0.3}"
+          case "${GPU_FAMILY}" in
+            blackwell) IS_BLACKWELL=1 DEFAULT_ARCHES=arm64 ;;
+            hopper) IS_BLACKWELL=0 DEFAULT_ARCHES=amd64 ;;
+          esac
+          ARCHES=$(printf '%s' "${ARCHES:-${DEFAULT_ARCHES}}" | tr ',' '\n' | tr -d ' ' | sed '/^$/d' | sort -u | paste -sd, -)
+
+          # Runners pull the rolling tag, so only a main build of the family's
+          # default architectures may replace it; anything else needs a tag.
+          if [ -z "${TAG_SUFFIX}" ]; then
+            if [ "${GITHUB_REF}" != "refs/heads/main" ] || [ "${ARCHES}" != "${DEFAULT_ARCHES}" ]; then
+              echo "::error::Publishing the rolling ${GPU_FAMILY} tag needs ref main and arches ${DEFAULT_ARCHES} (got ${GITHUB_REF}, ${ARCHES}); set a custom tag instead."
+              exit 1
+            fi
+          fi
+
+          # The toolkit minor may differ from the wheels' (cu130 wheels on a 13.4
+          # toolkit), but not the major.
+          if [ "cu${CUDA_VERSION%%.*}" != "${CU_VERSION:0:4}" ]; then
+            echo "::error::CUDA base image ${CUDA_VERSION} and CU_VERSION ${CU_VERSION} name different CUDA majors."
+            exit 1
+          fi
+
+          MATRIX=$(printf '%s' "${ARCHES}" | tr ',' '\n' | jq -R -s -c '
+            split("\n") | map(select(length > 0)) | map(
+              if . == "amd64" then {arch: ., runner: "x64-docker-build-node"}
+              elif . == "arm64" then {arch: ., runner: "arm-docker-build-node"}
+              else error("unsupported arch: \(.)") end
+            ) | {include: .}')
+          {
+            echo "matrix=${MATRIX}"
+            echo "is_blackwell=${IS_BLACKWELL}"
+            echo "cu_version=${CU_VERSION}"
+            echo "cuda_version=${CUDA_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prune Docker to reclaim disk space
+        run: |
+          docker buildx prune --filter "until=72h" -f
+          docker system prune -af --filter "until=72h"
+          docker volume prune -af
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.arch }} image
+        env:
+          IS_BLACKWELL: ${{ needs.prepare.outputs.is_blackwell }}
+          CU_VERSION: ${{ needs.prepare.outputs.cu_version }}
+          CUDA_VERSION: ${{ needs.prepare.outputs.cuda_version }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true \
+            -f docker/ci.Dockerfile \
+            --build-arg CUDA_VERSION="${CUDA_VERSION}" \
+            --build-arg CU_VERSION="${CU_VERSION}" \
+            --build-arg IS_BLACKWELL="${IS_BLACKWELL}" \
+            --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
+            --label org.opencontainers.image.source="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --metadata-file "${RUNNER_TEMP}/metadata-ci.json" \
+            --no-cache \
+            .
+
+          DIGEST=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['containerimage.digest'])" "${RUNNER_TEMP}/metadata-ci.json")
+          echo "Pushed digest: ${DIGEST}"
+          mkdir -p "${RUNNER_TEMP}/digests"
+          printf '%s' "${DIGEST}" > "${RUNNER_TEMP}/digests/${{ matrix.arch }}"
+
+      # Matrix legs cannot each set a job output, so the digests travel as artifacts.
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          retention-days: 1
+
+  create-manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create manifest
+        env:
+          TAG_SUFFIX: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          SOURCES=()
+          for f in "${RUNNER_TEMP}"/digests/*; do
+            SOURCES+=("${IMAGE_REPO}@$(cat "${f}")")
+          done
+          BASE="${GPU_FAMILY}"
+          if [ -n "${TAG_SUFFIX}" ]; then
+            TAGS=(-t "${IMAGE_REPO}:${BASE}-${TAG_SUFFIX}")
+          else
+            TAGS=(-t "${IMAGE_REPO}:${BASE}" -t "${IMAGE_REPO}:nightly-${BASE}-$(date +%Y%m%d)-${GITHUB_SHA:0:8}")
+          fi
+          docker buildx imagetools create "${TAGS[@]}" "${SOURCES[@]}"
+          echo "Published: ${TAGS[*]}"
+
+  cleanup-nightly:
+    needs: create-manifest
+    if: ${{ !inputs.tag }}
+    uses: ./.github/workflows/_docker-cleanup-nightly.yml
+    with:
+      tag_prefixes: '["nightly-blackwell", "nightly-hopper"]'
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang-ci' }}
+    secrets: inherit
