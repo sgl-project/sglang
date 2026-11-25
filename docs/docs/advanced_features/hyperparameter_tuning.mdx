@@ -92,6 +92,14 @@ The gate currently supports ordinary RadixCache and FULL-only UnifiedRadixCache 
 
 Non-members retain the existing periodic, capped prefix refresh. dLLM retains the original LPM large-queue FCFS fallback because its separate transfer path does not use this admission loop. Disabling prefix caching still uses FCFS. No new policy name or server argument is required.
 
+### Protect overtaken requests in shortest-prefill-first
+
+On a PD prefill worker using `--schedule-policy shortest-prefill-first`, set `--shortest-prefill-wait-guard-seconds` above zero to try admitting one older request ahead of the SPF queue head. The older request must have waited long enough and arrived at least `--shortest-prefill-wait-guard-age-gap-seconds` (default 60) before the head. This preserves SPF ordering within a burst of requests that arrived together.
+
+The guard stays out of continuing chunked prefills and uses the usual prefill budget and admission checks. A failed promotion leaves the other requests in their SPF order. Successful promotions on the same attention DP queue are spaced by `--shortest-prefill-wait-guard-cooldown-seconds` (default 4). The waiting threshold is an eligibility condition, and requests may still wait longer for capacity.
+
+The guard defaults to off. It uses the local monotonic clock of the scheduler that owns the queue, so enabling it requires attention TP=1, attention CP=1, and PP=1. Independent attention DP queues may each enable it. It applies to local device and host caches and stays inactive with external cache staging or unified memory.
+
 ### Reduce tail latency with `--schedule-policy uniboost`
 
 For mixed prompt lengths, such as agentic RL rollouts, `uniboost` admits requests with little uncached prefill work ahead of long ones. Each request gets a bounded boost, so long requests keep their place in line and are not starved.
