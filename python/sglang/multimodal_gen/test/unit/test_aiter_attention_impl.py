@@ -4,6 +4,7 @@
 import sys
 import types
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
@@ -193,6 +194,88 @@ def test_head_group_calls_plan_the_tail_split_of_a_wider_call(split_heads, full_
             cu_seqlens_host=bounds,
         )
     assert split.call_args.args[-1] == full_rows
+
+
+class _NamedStream:
+    def __init__(self, name):
+        self.name, self.log = name, []
+
+    def wait_stream(self, other):
+        self.log.append(other.name)
+
+
+def _tail_split_calls(monkeypatch, tail_stream):
+    """Runs _tail_split_attention with _flash/_lse_merge recorded on CPU; returns
+    the output and each call as (stream, signature)."""
+    _impl_cls()
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    main = _NamedStream("main")
+    stack = [main]
+
+    @contextmanager
+    def stream(s):
+        stack.append(s)
+        try:
+            yield
+        finally:
+            stack.pop()
+
+    torch.manual_seed(0)
+    keys, full_rows, heads, dim = 8 * backend._TAIL_KEY_CHUNKS + 3, 32, 2, 4
+    q, k, v = (torch.randn(1, keys, heads, dim) for _ in range(3))
+    out = torch.empty(keys, heads, dim)
+    calls = []
+
+    def view(t):
+        # a view of q/k/v/out: which tensor, where it starts, its layout
+        for name, base in (("q", q), ("k", k), ("v", v), ("out", out)):
+            if t.untyped_storage().data_ptr() == base.untyped_storage().data_ptr():
+                return name, t.storage_offset(), tuple(t.shape), t.stride()
+        return "new", tuple(t.shape)
+
+    def flash(q_, k_, v_, scale, return_lse=False, out=None):
+        calls.append(
+            (
+                stack[-1].name,
+                ("flash", view(q_), view(k_), view(v_), scale, return_lse)
+                + ((view(out),) if out is not None else ()),
+            )
+        )
+        o = q_ + k_.mean(1, keepdim=True) * scale + v_.mean(1, keepdim=True)
+        if out is not None:
+            out.copy_(o)
+            o = out
+        return (o, o.sum(-1).transpose(1, 2)) if return_lse else o
+
+    def merge(o, lse, out_):
+        calls.append((stack[-1].name, ("merge", tuple(o.shape), view(out_))))
+        out_.copy_(o.sum(0) + lse.sum(0).transpose(0, 1)[..., None])
+
+    monkeypatch.setattr(backend, "_flash", flash)
+    monkeypatch.setattr(backend, "_lse_merge", merge)
+    monkeypatch.setattr(backend, "_TAIL_STREAM", tail_stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a, **kw: stack[-1])
+    monkeypatch.setattr(torch.cuda, "stream", stream)
+    backend._tail_split_attention(q, k, v, 0.5, out, full_rows)
+    return out, calls, main
+
+
+def test_tail_stream_runs_the_same_kernels_beside_the_full_wave_launch(monkeypatch):
+    """With _TAIL_STREAM set, the key-split tail is queued on that stream after
+    it waited for the caller's, before the full-wave launch on the caller's
+    stream, which then waits for it: the same launches on the same views."""
+    ref, ref_calls, _ = _tail_split_calls(monkeypatch, None)
+    side = _NamedStream("side")
+    out, calls, main = _tail_split_calls(monkeypatch, side)
+    assert torch.equal(out, ref)
+    assert {name for name, _ in ref_calls} == {"main"}
+    # default: the full-wave launch, then the tail (key chunks, the rest, merge)
+    assert [c for _, c in ref_calls][0][0] == "flash"
+    assert len(ref_calls) == 4
+    assert [c for _, c in calls] == [c for _, c in ref_calls[1:] + ref_calls[:1]]
+    assert [name for name, _ in calls] == ["side"] * 3 + ["main"]
+    assert side.log == ["main"] and main.log == ["side"]
 
 
 class TestBF16AttentionUnderCompile(unittest.TestCase):
