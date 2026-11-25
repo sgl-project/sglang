@@ -923,25 +923,40 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PIP" cache purge || true; \
   \
   # TVM Python bits need Cython + z3 before configure.
+  # Pin apache-tvm-ffi==0.1.11: preserves the ROCm DLPack fix and provides the
+  # extra_lib_paths loader argument required by xgrammar>=0.2.8 within TileLang 0.1.x.
   # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
-  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" "z3-solver==4.15.4.0"; \
+  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi==0.1.11" "z3-solver==4.15.4.0"; \
   \
   # Clone + pin TileLang (bundled TVM), then build
-  git clone --recursive "${TILELANG_REPO}" /opt/tilelang && \
-  cd /opt/tilelang && \
-  git fetch --depth=1 origin "${TILELANG_COMMIT}" || true && \
-  git checkout -f "${TILELANG_COMMIT}" && \
-  git submodule update --init --recursive && \
+  git clone --recursive "${TILELANG_REPO}" /opt/tilelang; \
+  cd /opt/tilelang; \
+  if ! git cat-file -e "${TILELANG_COMMIT}^{commit}" 2>/dev/null; then \
+    git fetch origin "${TILELANG_COMMIT}"; \
+  fi; \
+  git checkout -f "${TILELANG_COMMIT}"; \
+  git submodule update --init --recursive; \
+  # Backport TileLang/tvm #32 and #33: apache-tvm-ffi 0.1.11 requires explicit slots on derived objects.
+  for tvm_commit in \
+    329056d80424f88cfff65ad9e74c0ef7e1c6c96f \
+    0e15b274bce8b46f971abf5ac390e844aa6acee5; do \
+    if ! git -C 3rdparty/tvm cat-file -e "${tvm_commit}^{commit}" 2>/dev/null; then \
+      git -C 3rdparty/tvm fetch origin "${tvm_commit}"; \
+    fi; \
+  done; \
+  git -C 3rdparty/tvm cherry-pick --no-commit \
+    329056d80424f88cfff65ad9e74c0ef7e1c6c96f \
+    0e15b274bce8b46f971abf5ac390e844aa6acee5; \
   if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
     export ROCM_PATH=${ROCM_HOME}; \
   else \
     export ROCM_PATH=/opt/rocm; \
   fi; \
-  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
+  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}"; \
   "$VENV_PIP" install -e . -v --no-build-isolation --no-deps; \
   if [ -f pyproject.toml ]; then sed -i "/^[[:space:]]*\"torch/d" pyproject.toml || true; fi; \
   "$VENV_PIP" cache purge || true; \
-  "$VENV_PY" -c "import tilelang; print(tilelang.__version__)"'
+  "$VENV_PY" -c "import tilelang, xgrammar; print(tilelang.__version__)"'
 
 # -----------------------
 # Hadamard-transform (HIP build)
