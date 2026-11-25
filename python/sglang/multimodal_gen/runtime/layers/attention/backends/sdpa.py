@@ -48,14 +48,13 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 
 _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
 
-# PyTorch's flash forward splits the keys across thread blocks when
-# batch * heads * ceil(query_len / 128) falls below 80% of the SMs
-# (num_splits_heuristic in ATen's flash_api.cpp); keys of at most 128 rows
-# are never split. The block sizes are measured on sm100 (B200) for
-# head_dim 64 and 128, where they reproduce every split boundary.
-_FLASH_QUERY_BLOCK = 128
-_FLASH_UNSPLIT_KEY_LEN = 128
-_FLASH_SPLIT_OCCUPANCY = 0.8
+# Mirrors ATen's flash_api.cpp (num_splits_heuristic, set_params_splitkv); checked
+# against torch 2.14.1. The query block and SM factor are those of its split kernel.
+_FLASH_QUERY_BLOCK = 64
+_FLASH_SM_FACTOR = 2
+_FLASH_UNSPLIT_OCCUPANCY = 0.8
+_FLASH_SPLIT_EFFICIENCY_RATIO = 0.85
+_FLASH_MAX_SPLITS = 128
 # Arbitrary bound; one entry per distinct attention shape an impl has seen.
 _MAX_SPLIT_PADDING_PLANS = 256
 # Tiers that rule out "lossless" fast paths, i.e. the requests that pad.
@@ -67,6 +66,32 @@ _EXACT_QUALITY_LEVELS = frozenset(
 @functools.cache
 def _multi_processor_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _flash_num_splits(
+    query_blocks: int, key_len: int, head_dim: int, num_sms: int
+) -> int:
+    """Key splits flash picks; ``query_blocks`` is batch * heads * query blocks."""
+    capacity = num_sms * _FLASH_SM_FACTOR
+    if query_blocks >= _FLASH_UNSPLIT_OCCUPANCY * capacity:
+        return 1
+    key_block = 256 if head_dim <= 64 else 128 if head_dim <= 128 else 64
+    key_blocks = math.ceil(key_len / key_block)
+    efficiency = {}
+    for splits in range(1, min(_FLASH_MAX_SPLITS, capacity, key_blocks) + 1):
+        # A count that leaves the blocks per split unchanged is not a new split.
+        if splits > 1 and math.ceil(key_blocks / splits) == math.ceil(
+            key_blocks / (splits - 1)
+        ):
+            continue
+        waves = query_blocks * splits / capacity
+        efficiency[splits] = waves / math.ceil(waves)
+    best = max(efficiency.values())
+    return next(
+        splits
+        for splits, value in efficiency.items()
+        if value >= _FLASH_SPLIT_EFFICIENCY_RATIO * best
+    )
 
 
 def _request_quality_is_exact() -> bool:
@@ -188,17 +213,20 @@ class SDPAImpl(AttentionImpl):
             not query.is_cuda
             or query.dtype not in (torch.float16, torch.bfloat16)
             or head_dim > 256
-            or key_len <= _FLASH_UNSPLIT_KEY_LEN
         ):
             return 0
-        threshold = _FLASH_SPLIT_OCCUPANCY * _multi_processor_count(query.device.index)
+        num_sms = _multi_processor_count(query.device.index)
         blocks = math.ceil(query_len / _FLASH_QUERY_BLOCK)
-        if (
-            batch * heads * blocks >= threshold
-            or batch * self.global_num_heads * blocks < threshold
-        ):
+
+        def num_splits(num_heads: int) -> int:
+            return _flash_num_splits(
+                batch * num_heads * blocks, key_len, head_dim, num_sms
+            )
+
+        if num_splits(heads) == 1 or num_splits(self.global_num_heads) > 1:
             return 0
-        return math.ceil(threshold / (batch * heads)) * _FLASH_QUERY_BLOCK
+        unsplit_blocks = _FLASH_UNSPLIT_OCCUPANCY * _FLASH_SM_FACTOR * num_sms
+        return math.ceil(unsplit_blocks / (batch * heads)) * _FLASH_QUERY_BLOCK
 
     def _sdpa_context(self, query: torch.Tensor):
         if self.allow_cudnn_sdp and query.device.type == "cuda":

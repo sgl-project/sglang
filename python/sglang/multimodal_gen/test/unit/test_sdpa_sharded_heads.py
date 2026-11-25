@@ -73,7 +73,8 @@ class TestSDPAShardedHeads(CustomTestCase):
             self.skipTest("too few SMs for these shapes to split")
         for dtype in (torch.float16, torch.bfloat16):
             for head_dim in (64, 128, 256):
-                for seq_len in (1025, 1536, 4608):
+                # 1025 and 1154 sit at a split boundary on 132 and 148 SMs.
+                for seq_len in (1025, 1154, 1536, 4608):
                     query, key, value = _qkv(seq_len, head_dim, dtype=dtype)
                     expected = F.scaled_dot_product_attention(
                         *(x.transpose(1, 2) for x in (query, key, value)),
@@ -103,6 +104,60 @@ class TestSDPAShardedHeads(CustomTestCase):
                                 dim=2,
                             )
                             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    @torch.no_grad()
+    def test_short_key_shards_match_unsharded_attention(self):
+        """Key blocks shrink with the head dim, and two key blocks leave a half-full
+        unsharded layer unsplit; a shard that splits there must still be padded."""
+        num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+        for head_dim, query_len, key_len in ((256, 1025, 100), (128, 400, 192)):
+            blocks = _GLOBAL_HEADS * -(-query_len // 64)
+            if sdpa._flash_num_splits(blocks, key_len, head_dim, num_sms) > 1:
+                continue  # the unsharded layer splits too, so nothing is padded
+            query = _qkv(query_len, head_dim)[0]
+            key, value = _qkv(key_len, head_dim)[1:]
+            expected = F.scaled_dot_product_attention(
+                *(x.transpose(1, 2) for x in (query, key, value)),
+                scale=head_dim**-0.5,
+            ).transpose(1, 2)
+            for local_heads in (12, 6, 3):
+                with self.subTest(head_dim=head_dim, local_heads=local_heads):
+                    impl = _impl(
+                        heads=local_heads,
+                        head_dim=head_dim,
+                        global_num_heads=_GLOBAL_HEADS,
+                    )
+                    actual = torch.cat(
+                        [
+                            impl.forward(q, k, v, None)
+                            for q, k, v in zip(
+                                query.split(local_heads, dim=2),
+                                key.split(local_heads, dim=2),
+                                value.split(local_heads, dim=2),
+                            )
+                        ],
+                        dim=2,
+                    )
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_split_boundaries_per_sm_count(self):
+        """Split decisions at the boundaries of the 132-SM and 148-SM GPUs."""
+        cases = (
+            # num_sms, local heads, query_len, key_len, head_dim, splits
+            (132, 12, 1025, 1025, 128, True),
+            (132, 12, 1089, 1025, 128, False),
+            (148, 12, 1154, 1154, 128, True),
+            (148, 12, 1217, 1217, 128, False),
+            (148, 6, 1025, 100, 256, True),
+            (148, 6, 1025, 64, 256, False),
+            (148, 12, 400, 192, 128, True),
+            (148, 24, 400, 192, 128, False),
+        )
+        for num_sms, heads, query_len, key_len, head_dim, splits in cases:
+            with self.subTest(num_sms=num_sms, heads=heads, query_len=query_len):
+                blocks = heads * -(-query_len // 64)
+                num_splits = sdpa._flash_num_splits(blocks, key_len, head_dim, num_sms)
+                self.assertEqual(num_splits > 1, splits)
 
     def test_padding_only_when_the_shard_alone_would_split(self):
         query = torch.empty(1, 6, 1025, 128, device="cuda", dtype=torch.bfloat16)
@@ -197,7 +252,8 @@ class TestSDPAShardedHeads(CustomTestCase):
             with self.subTest(batch=batch):
                 query, key, value = _qkv(1025, 128, batch=batch)
                 shard_probe = query[:, :, :6].transpose(1, 2)
-                self.assertGreater(impl._unsplit_query_len(shard_probe, 1025), 1025)
+                if impl._unsplit_query_len(shard_probe, 1025) == 1025:
+                    self.skipTest("too few SMs for this batch to split")
                 expected = F.scaled_dot_product_attention(
                     *(x.transpose(1, 2) for x in (query, key, value)),
                     scale=128**-0.5,
