@@ -60,17 +60,8 @@ class ToleranceConfig:
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
         """Load a specific tolerance profile from a dictionary of profiles."""
-        # Support both flat structure (backward compatibility) and profiled structure
-        if "e2e" in all_tolerances and not isinstance(all_tolerances["e2e"], dict):
-            tol_data = all_tolerances
-            actual_profile = "legacy/flat"
-        else:
-            tol_data = all_tolerances.get(
-                profile_name, all_tolerances.get("pr_test", {})
-            )
-            actual_profile = (
-                profile_name if profile_name in all_tolerances else "pr_test"
-            )
+        tol_data = all_tolerances.get(profile_name, all_tolerances.get("pr_test", {}))
+        actual_profile = profile_name if profile_name in all_tolerances else "pr_test"
 
         if not tol_data:
             raise ValueError(
@@ -177,7 +168,6 @@ class BaselineConfig:
     scenarios: dict[str, ScenarioConfig]
     step_fractions: Sequence[float]
     tolerances: ToleranceConfig
-    improvement_threshold: float
 
     @classmethod
     def load(cls, path: Path) -> BaselineConfig:
@@ -209,15 +199,13 @@ class BaselineConfig:
         scenarios = {
             name: ScenarioConfig.from_dict(cfg)
             for name, cfg in data["scenarios"].items()
+            if set(cfg) != {"estimated_full_test_time_s"}
         }
 
         return cls(
             scenarios=scenarios,
             step_fractions=tuple(data["sampling"]["step_fractions"]),
             tolerances=tolerances,
-            improvement_threshold=data.get("improvement_reporting", {}).get(
-                "threshold", 0.2
-            ),
         )
 
     def update(self, path: Path):
@@ -229,6 +217,7 @@ class BaselineConfig:
             {
                 name: ScenarioConfig.from_dict(cfg)
                 for name, cfg in data["scenarios"].items()
+                if set(cfg) != {"estimated_full_test_time_s"}
             }
         )
         return self
@@ -564,6 +553,39 @@ FLUX3_ACTION_CI_sampling_params = DiffusionSamplingParams(
         # by up to max 0.064 / mean 0.020 (eager QK-norm+RoPE in every block).
         "action_max_abs_diff_threshold": 0.2,
         "action_mean_abs_diff_threshold": 0.05,
+    },
+)
+
+
+# Praxis-1 first call of an episode: one frame per view and one pose8 row per arm, so
+# the server returns 21 command rows. The video guidance is the checkpoint default.
+PRAXIS_DROID_CI_sampling_params = DiffusionSamplingParams(
+    prompt="Put the red block in the bowl.",
+    extras={
+        "action_horizon": 21,
+        "action_dim": 13,
+        "state_dim": 8,
+        "image_height": 234,
+        "image_width": 416,
+        "camera_order": ("exterior", "wrist"),
+        "observation_rows": 1,
+        "state_row": [0.4, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0, 0.0],
+        "seed": 0,
+    },
+)
+
+PRAXIS_YAM_CI_sampling_params = DiffusionSamplingParams(
+    prompt="Pick up the pen from the center of the table, then place the pen in the bag",
+    extras={
+        "action_horizon": 21,
+        "action_dim": 26,
+        "state_dim": 16,
+        "image_height": 260,
+        "image_width": 416,
+        "camera_order": ("exterior", "wrist_left", "wrist_right"),
+        "observation_rows": 1,
+        "state_row": [0.4, 0.2, 0.35, 1.0, 0.0, 0.0, 0.0, 0.0] * 2,
+        "seed": 0,
     },
 )
 
@@ -951,15 +973,6 @@ LONGLIVE2_I2V_CI_sampling_params = replace(
     extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
 )
 
-TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
-    prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
-    image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
-    direct_url_test=True,
-    output_size="960x960",
-    num_frames=4,
-    fps=4,
-)
-
 # Wan-Animate-2 inputs; they ship in the same ci-data-diffusion commit as the GT,
 # so the pinned revision must point at a commit that carries them.
 _WAN_2_2_ANIMATE_2_CI_INPUT_BASE = (
@@ -1116,6 +1129,7 @@ PERF_BASELINE_FILE_BY_PLATFORM = {
     "b200": "b200.json",
     "5090": "5090.json",
     "xpu_b60": "xpu_b60.json",
+    "xpu_b70": "xpu_b70.json",
 }
 PERF_BASELINE_PLATFORM_ALIASES = {
     "sm90": "h100",
@@ -1129,6 +1143,10 @@ PERF_BASELINE_PLATFORM_ALIASES = {
     "5090": "5090",
     "xpu": "xpu_b60",
     "bmg": "xpu_b60",
+    "b60": "xpu_b60",
+    "xpub60": "xpu_b60",
+    "b70": "xpu_b70",
+    "xpub70": "xpu_b70",
 }
 
 
@@ -1144,12 +1162,24 @@ def _normalize_perf_baseline_platform(platform: str) -> str:
     return PERF_BASELINE_PLATFORM_ALIASES[normalized]
 
 
+def _xpu_perf_baseline_platform(device_name: str, total_bytes: int) -> str:
+    # CI pools mix Arc Pro B60 (24 GiB) and B70 (32 GiB) under one runner label;
+    # memory is the fallback when the driver reports a generic device name.
+    name = device_name.upper()
+    if "B70" in name or ("B60" not in name and total_bytes > 28 * 1024**3):
+        return "xpu_b70"
+    return "xpu_b60"
+
+
 def get_perf_baseline_platform() -> str:
     override = os.getenv(PERF_BASELINE_PLATFORM_ENV)
     if override:
         return _normalize_perf_baseline_platform(override)
     if current_platform.is_xpu():
-        return "xpu_b60"
+        return _xpu_perf_baseline_platform(
+            current_platform.get_device_name(),
+            current_platform.get_device_total_memory(),
+        )
     if current_platform.is_sm120():
         return "5090"
     if current_platform.is_blackwell():

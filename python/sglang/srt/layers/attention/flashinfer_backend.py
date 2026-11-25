@@ -2239,7 +2239,10 @@ class FlashInferIndicesUpdaterPrefill:
             custom_kv_indices=custom_kv_indices,
             kv_dequant_num_tokens=(
                 seq_lens_sum - sum(extend_prefix_lens_cpu)
-                if spec_info is None
+                if getattr(self.attn_backend, "fp8_prefill_kv_dequant", None)
+                is not None
+                and not use_ragged
+                and spec_info is None
                 and extend_prefix_lens_cpu is not None
                 and cross_attention_custom_mask is None
                 and custom_kv_indices is None
