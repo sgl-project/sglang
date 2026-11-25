@@ -16,6 +16,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.step3_vl import embed_step3_image_items
 from sglang.srt.models.step3_vl_10b import PerceptionEncoder
 from sglang.srt.models.step3p5 import Step3p5ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -77,54 +78,19 @@ class Step3p7ForConditionalGeneration(nn.Module):
     def device(self) -> torch.device:
         return self.vit_large_projector.weight.device
 
-    def _flatten_embeddings(self, embeddings) -> torch.Tensor:
-        if isinstance(embeddings, torch.Tensor):
-            return embeddings.flatten(0, -2)
-        return torch.cat(tuple(self._flatten_embeddings(t) for t in embeddings))
-
     def _process_image_features(self, image_features: torch.Tensor) -> torch.Tensor:
         image_features, _ = self.vit_large_projector(image_features)
         return image_features
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        assert len(items) == 1
-
-        item = items[0]
-        pixel_values = item.feature.type(self.vision_model.dtype)
-        num_patches = item.model_specific_data.get("num_patches")
-        patch_pixel_values = item.model_specific_data.get("patch_pixel_values", None)
-        if patch_pixel_values is not None:
-            patch_pixel_values = patch_pixel_values.type(self.vision_model.dtype).to(
-                self.device
-            )
-
-        image_features = self._get_vision_model_output(pixel_values)
-        patch_image_features = (
-            self._get_vision_model_output(patch_pixel_values)
-            if patch_pixel_values is not None
-            else None
+        return embed_step3_image_items(
+            items,
+            dtype=self.vision_model.dtype,
+            device=self.device,
+            encode=lambda pixels: self._process_image_features(
+                self._get_vision_model_output(pixels)
+            ),
         )
-        image_features = self._process_image_features(image_features)
-        patch_image_features = (
-            self._process_image_features(patch_image_features)
-            if patch_image_features is not None
-            else None
-        )
-        merged_image_features = []
-        cur_patch_idx = 0
-        for i, num_patch in enumerate(num_patches):
-            cur_feature = []
-            if num_patch > 0:
-                patch_slice = patch_image_features[
-                    cur_patch_idx : cur_patch_idx + num_patch
-                ]
-                cur_feature.append(patch_slice.view(-1, patch_slice.shape[-1]))
-            cur_feature.append(image_features[i].view(-1, image_features.shape[-1]))
-            cur_patch_idx += num_patch
-            merged_image_features.append(
-                torch.cat(cur_feature) if len(cur_feature) > 1 else cur_feature[0]
-            )
-        return self._flatten_embeddings(merged_image_features)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
