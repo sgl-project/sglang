@@ -7,10 +7,12 @@ returning exactly the tail rows the rest of the forward reads. Summed values are
 small integers, so fp32 / bf16 reductions are exact in any order.
 """
 
+import os
 import socket
 import traceback
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -276,6 +278,37 @@ class TestTokenParallelLayout(unittest.TestCase):
             for name, ok in res:
                 with self.subTest(rank=rank, check=name):
                     self.assertTrue(ok)
+
+
+class TestTokenParallelEntryState(unittest.TestCase):
+    def tearDown(self):
+        tp.exit_token_parallel()
+
+    def test_state_belongs_to_its_forward_batch(self):
+        batch, other = SimpleNamespace(), SimpleNamespace()
+        state = SimpleNamespace(forward_batch=batch)
+        tp._ACTIVE = state
+        self.assertIs(tp.token_parallel_state(batch), state)
+        self.assertIsNone(tp.token_parallel_state(other))
+        tp.exit_token_parallel()
+        self.assertIsNone(tp.token_parallel_state(batch))
+        self.assertIsNone(tp.active_state())
+
+    def test_switches_are_read_once_per_model(self):
+        model = SimpleNamespace()
+        env = {
+            "SGLANG_DSV4_TOKEN_PARALLEL_PREFILL": "1",
+            "SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS": "4096",
+        }
+        with mock.patch.dict(os.environ, env):
+            config = tp._config(model)
+        self.assertEqual(config, tp.TokenParallelConfig(True, 4096, False))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIs(tp._config(model), config)
+            self.assertEqual(
+                tp._config(SimpleNamespace()),
+                tp.TokenParallelConfig(False, 2048, False),
+            )
 
 
 if __name__ == "__main__":

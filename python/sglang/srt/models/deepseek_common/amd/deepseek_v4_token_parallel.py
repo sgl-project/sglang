@@ -37,28 +37,12 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
-
-ENV_ON = "SGLANG_DSV4_TOKEN_PARALLEL_PREFILL"
-ENV_DSPARK = "SGLANG_DSV4_TOKEN_PARALLEL_DSPARK"
-ENV_MIN_TOKENS = "SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS"
-# fly7444 (default): AITER #7444 INT4 reduce-scatter; rccl: exact bf16 (diagnostic only).
-ENV_RS = "SGLANG_DSV4_TP_RS"
-# mxfp8 (default): the seam's MXFP8 MoE input is gathered; bf16: the bf16 rows (diagnostic).
-ENV_MOE_INPUT = "SGLANG_DSV4_TP_MOE_INPUT"
-# Equivalence check: a directory; every EXTEND forward writes its last-token final hidden
-# states there (rank 0).
-ENV_HIDDEN_DUMP = "SGLANG_DSV4_TP_HIDDEN_DUMP"
-# Equivalence check: a file holding 1 or 0; with ENV_ON=1, eligible forwards run
-# token-parallel only while it holds 1 on every rank (the ranks agree on each forward
-# over the TP CPU group).
-ENV_TOGGLE = "SGLANG_DSV4_TP_TOGGLE_FILE"
 
 LOG_PREFIX = "[dsv4-token-parallel]"
 # #7444's reduce-scatter takes whole 32 KiB tiles per rank: 16 rows of 5120 bf16.
@@ -67,16 +51,9 @@ ROW_ALIGN = 16
 # copies 16-byte vectors).
 PACK_ALIGN = 16
 
-_STATE_ATTR = "_dsv4_token_parallel"
 _ACTIVE: Optional[TokenParallelState] = None
 _DISABLED_REASON: Optional[str] = None
 _LOGGED: set = set()
-
-HIDDEN_DUMP_DIR = os.environ.get(ENV_HIDDEN_DUMP, "")
-
-
-def _env_on(name: str) -> bool:
-    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _log_once(key: str, msg: str, *args, rank0: bool = True) -> None:
@@ -87,7 +64,6 @@ def _log_once(key: str, msg: str, *args, rank0: bool = True) -> None:
         return
     text = msg % args if args else msg
     logger.info("%s %s", LOG_PREFIX, text)
-    print(f"{LOG_PREFIX} {text}", flush=True)
 
 
 def _rank() -> int:
@@ -168,16 +144,6 @@ def tail_global_rows(extend_lens: Sequence[int], tail_lens: Sequence[int]) -> Li
         if not 0 <= t <= n:
             raise ValueError((n, t))
         rows.extend(range(start + n - t, start + n))
-        start += n
-    return rows
-
-
-def last_rows(lens: Sequence[int]) -> List[int]:
-    """The last row of each request in a [sum(lens), ...] layout (empty requests skipped)."""
-    rows, start = [], 0
-    for n in lens:
-        if n:
-            rows.append(start + n - 1)
         start += n
     return rows
 
@@ -278,17 +244,15 @@ class Collectives:
 class SglangCollectives(Collectives):
     """SGLang's TP group: GroupCoordinator.all_gather_into_tensor (AITER custom IPC
     all-gather when it fits, else RCCL; exact either way) and, for the
-    reduce-scatter, AITER #7444's INT4 FlyDSL engine or RCCL."""
+    reduce-scatter, AITER #7444's INT4 FlyDSL engine."""
 
-    def __init__(self, group, rs_backend: str):
+    name = "fly7444"
+
+    def __init__(self, group):
         self.group = group
         self.world = group.world_size
         self.rank = group.rank_in_group
-        self.rs_backend = rs_backend
-        self.name = rs_backend
-        self._engine = None
-        if rs_backend == "fly7444":
-            self._engine = _fly7444_engine(group)
+        self._engine = _fly7444_engine(group)
 
     def all_gather(self, out: torch.Tensor, inp: torch.Tensor) -> None:
         self.group.all_gather_into_tensor(
@@ -296,12 +260,7 @@ class SglangCollectives(Collectives):
         )
 
     def reduce_scatter(self, out: torch.Tensor, inp: torch.Tensor) -> None:
-        if self._engine is not None:
-            self._engine.reduce_scatter(inp, out)
-            return
-        import torch.distributed as dist
-
-        dist.reduce_scatter_tensor(out, inp, group=self.group.device_group)
+        self._engine.reduce_scatter(inp, out)
 
 
 _FLY7444 = None
@@ -334,7 +293,7 @@ def _fly7444_engine(group):
             "fly7444",
             "INT4 reduce-scatter: AITER #7444 3c77ea12e engine built in %.1f s (inbox %s)",
             time.time() - t0,
-            getattr(_FLY7444, "inbox_memory", "?"),
+            kw.get("inbox_memory", "default"),
         )
     return _FLY7444
 
@@ -354,7 +313,6 @@ class TokenParallelState:
         comm: Collectives,
         *,
         end_layer: int,
-        moe_mxfp8: bool = True,
     ):
         self.comm = comm
         self.layout = RowLayout(num_tokens, comm.world, comm.rank)
@@ -363,7 +321,7 @@ class TokenParallelState:
         self.local = self.layout.local
         self.lo, self.hi = self.layout.lo, self.layout.hi
         self.end_layer = end_layer
-        self.moe_mxfp8 = moe_mxfp8
+        self.forward_batch = None
         self.input_ids = input_ids
         self._ids_local = None
         self._pending: Dict[Tuple[int, str], Any] = {}
@@ -456,7 +414,8 @@ class TokenParallelState:
 
 
 def token_parallel_state(forward_batch) -> Optional[TokenParallelState]:
-    return getattr(forward_batch, _STATE_ATTR, None)
+    state = _ACTIVE
+    return state if state is not None and state.forward_batch is forward_batch else None
 
 
 def active_state() -> Optional[TokenParallelState]:
@@ -464,16 +423,36 @@ def active_state() -> Optional[TokenParallelState]:
     return _ACTIVE
 
 
-def exit_token_parallel(forward_batch) -> None:
+def exit_token_parallel() -> None:
     global _ACTIVE
     _ACTIVE = None
-    if forward_batch is not None:
-        setattr(forward_batch, _STATE_ATTR, None)
 
 
 # ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
+
+
+class TokenParallelConfig(NamedTuple):
+    """The switches, read once per model."""
+
+    enabled: bool
+    min_tokens: int
+    dspark: bool
+
+
+def _config(model) -> TokenParallelConfig:
+    config = model.__dict__.get("_dsv4_tp_config")
+    if config is None:
+        from sglang.srt.environ import envs
+
+        config = TokenParallelConfig(
+            enabled=envs.SGLANG_DSV4_TOKEN_PARALLEL_PREFILL.get(),
+            min_tokens=envs.SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS.get(),
+            dspark=envs.SGLANG_DSV4_TOKEN_PARALLEL_DSPARK.get(),
+        )
+        model.__dict__["_dsv4_tp_config"] = config
+    return config
 
 
 def _static_ineligible(model) -> Optional[str]:
@@ -508,11 +487,11 @@ def _static_check(model) -> Optional[str]:
     for i in range(model.start_layer, model.late_layer_start + 1):
         layer = model.layers[i]
         attn = layer.self_attn
-        if not getattr(attn, "fuse_wqa_wkv", False):
+        if not attn.fuse_wqa_wkv:
             return f"layer {i}: no fused wqkv_a"
-        if getattr(attn, "use_mega_attention", False):
+        if attn.use_mega_attention:
             return f"layer {i}: mega attention"
-        if getattr(attn, "use_fused_qk_norm_rope", False):
+        if attn.use_fused_qk_norm_rope:
             return f"layer {i}: fused qk norm rope (q_head_norm)"
         ratio = attn.compress_ratio
         if i < model.late_layer_start and ratio not in (0, 2):
@@ -520,15 +499,13 @@ def _static_check(model) -> Optional[str]:
         if i == model.late_layer_start:
             break
         mlp = layer.mlp
-        if getattr(mlp, "shared_experts", None) is not None:
+        if mlp.shared_experts is not None:
             return (
                 f"layer {i}: shared expert not fused (--enforce-shared-experts-fusion)"
             )
-        if getattr(mlp, "_shared_expert_tp1", False) or getattr(
-            mlp, "_fuse_shared_experts_inside_sbo", False
-        ):
+        if mlp._shared_expert_tp1 or mlp._fuse_shared_experts_inside_sbo:
             return f"layer {i}: shared expert layout"
-        if getattr(mlp.experts, "reduce_results", False):
+        if mlp.experts.reduce_results:
             return f"layer {i}: experts reduce their own output"
         if layer.attn_hc is None or layer.ffn_hc is None:
             return f"layer {i}: no mHC sublayers"
@@ -547,12 +524,15 @@ def _dynamic_ineligible(
     tail_in_graph,
     use_tail_graph,
     capture_dspark,
+    config: TokenParallelConfig,
 ) -> Optional[str]:
     from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
     from sglang.srt.layers.cp.utils import is_cp_active
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.model_executor.forward_context import get_attn_backend
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.model_executor.runner import get_is_capture_mode
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
         is_in_breakable_cuda_graph,
@@ -560,14 +540,12 @@ def _dynamic_ineligible(
     from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip
     from sglang.srt.runtime_context import get_forward, get_parallel
 
-    mode = forward_batch.forward_mode
-    if getattr(mode, "name", None) != "EXTEND":
+    if forward_batch.forward_mode != ForwardMode.EXTEND:
         return "not a plain extend"
     par = get_parallel()
     if par.tp_size < 2:
         return "tp 1"
-    min_tokens = max(int(os.environ.get(ENV_MIN_TOKENS, "2048")), par.tp_size**2)
-    if num_tokens < min_tokens:
+    if num_tokens < max(config.min_tokens, par.tp_size**2):
         return "short"
     if (
         par.attn_tp_size != par.tp_size
@@ -591,8 +569,8 @@ def _dynamic_ineligible(
         return "no eager decoder SWA tail"
     if tail.pad_rows or tail.cp_metadata is not None:
         return "CP tail"
-    if capture_dspark and not _env_on(ENV_DSPARK):
-        return "DSpark capture without " + ENV_DSPARK
+    if capture_dspark and not config.dspark:
+        return "DSpark capture without SGLANG_DSV4_TOKEN_PARALLEL_DSPARK"
     if _hip.fused_boundary_this_step(forward_batch):
         return "fused HIP boundary step (needs SGLANG_OPT_DSV41_MEGA_MHC_PREFILL=1)"
     if not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get():
@@ -603,10 +581,9 @@ def _dynamic_ineligible(
         return "SGLANG_OPT_MOE_QUANT_ONCE (the MoE takes a pre-quantized bf16 input)"
     if forward_batch.extend_seq_lens_cpu is None or forward_batch.seq_lens_cpu is None:
         return "no CPU lengths"
-    if getattr(forward_batch, "encoder_swa_replay", False):
+    if forward_batch.encoder_swa_replay:
         return "encoder SWA replay"
-    contains_images = getattr(forward_batch, "contains_image_inputs", None)
-    if contains_images is not None and contains_images():
+    if forward_batch.contains_image_inputs():
         return "image inputs (vision top-k)"
     from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
@@ -621,8 +598,9 @@ def _dynamic_ineligible(
         return f"attention backend {type(backend).__name__}"
     for i in range(model.start_layer, model.late_layer_start):
         idx = model.layers[i].self_attn.indexer
-        if idx is not None and 0 < num_tokens <= getattr(
-            idx, "weights_proj_hip_max_tokens", -1
+        if (
+            isinstance(idx, DeepseekV41Indexer)
+            and 0 < num_tokens <= idx.weights_proj_hip_max_tokens
         ):
             return "indexer GEMV row count"
     return None
@@ -642,11 +620,10 @@ def enter_token_parallel(
     """Called at the start of every hc_pre_from_prev layer loop. Clears any stale
     state, then attaches a TokenParallelState when this prefill can run
     token-parallel."""
-    global _ACTIVE, _DISABLED_REASON
+    global _ACTIVE
     _ACTIVE = None
-    _LAST_FORWARD_TP[0] = False
-    setattr(forward_batch, _STATE_ATTR, None)
-    if not _env_on(ENV_ON) or _DISABLED_REASON is not None:
+    config = _config(model)
+    if not config.enabled or _DISABLED_REASON is not None:
         return None
     num_tokens = hidden_states.shape[0]
     reason = _static_ineligible(model)
@@ -661,69 +638,35 @@ def enter_token_parallel(
         tail_in_graph=tail_in_graph,
         use_tail_graph=use_tail_graph,
         capture_dspark=capture_dspark,
+        config=config,
     )
     if reason is not None:
         _log_once(
             "skip:" + reason, "this forward stays replicated (%s); logged once", reason
         )
         return None
-    toggle = os.environ.get(ENV_TOGGLE)
-    if toggle and not _toggle_on(toggle):
-        return None
     comm = _collectives()
     if comm is None:
         return None
-    moe_mxfp8 = os.environ.get(ENV_MOE_INPUT, "mxfp8").strip().lower() != "bf16"
     state = TokenParallelState(
-        num_tokens,
-        input_ids,
-        comm,
-        end_layer=model.late_layer_start,
-        moe_mxfp8=moe_mxfp8,
+        num_tokens, input_ids, comm, end_layer=model.late_layer_start
     )
     state.forward_batch = forward_batch
-    setattr(forward_batch, _STATE_ATTR, state)
     _ACTIVE = state
-    _LAST_FORWARD_TP[0] = True
     _log_once(
         "entered",
-        "token-parallel prefill entered: tokens=%d padded=%d local=%d layers=[%d,%d) rs=%s moe_input=%s",
+        "token-parallel prefill entered: tokens=%d padded=%d local=%d layers=[%d,%d) rs=%s",
         num_tokens,
         state.padded,
         state.local,
         model.start_layer,
         model.late_layer_start,
         comm.name,
-        "mxfp8" if moe_mxfp8 else "bf16",
     )
-    _COUNT[0] += 1
-    if _COUNT[0] in (10, 100, 1000, 10000):
-        _log_once(
-            f"count{_COUNT[0]}", "token-parallel prefill forwards so far: %d", _COUNT[0]
-        )
     return state
 
 
-_COUNT = [0]
 _COMM: Optional[Collectives] = None
-_LAST_FORWARD_TP = [False]
-
-
-def _toggle_on(path: str) -> bool:
-    """The equivalence check's in-server switch: every rank reads the file, then the
-    ranks take the minimum over the TP CPU group, so they never disagree."""
-    import torch.distributed as dist
-
-    from sglang.srt.runtime_context import get_parallel
-
-    try:
-        with open(path) as f:
-            mine = 1.0 if f.read().strip() == "1" else 0.0
-    except OSError:
-        mine = 0.0
-    flag = torch.tensor([mine])
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=get_parallel().tp_group.cpu_group)
-    return flag.item() == 1.0
 
 
 def _collectives() -> Optional[Collectives]:
@@ -738,22 +681,17 @@ def _collectives() -> Optional[Collectives]:
     from sglang.srt.runtime_context import get_parallel
 
     group = get_parallel().tp_group
-    rs = os.environ.get(ENV_RS, "fly7444").strip().lower()
     comm, ok = None, 1.0
     try:
-        comm = SglangCollectives(group, rs)
-    except Exception as e:  # noqa: BLE001
+        comm = SglangCollectives(group)
+    except Exception:  # noqa: BLE001
         ok = 0.0
-        logger.exception("%s reduce-scatter backend %s failed to build", LOG_PREFIX, rs)
-        print(
-            f"{LOG_PREFIX} reduce-scatter backend {rs} failed: {type(e).__name__}: {e}",
-            flush=True,
-        )
+        logger.exception("%s reduce-scatter engine failed to build", LOG_PREFIX)
     flag = torch.tensor([ok])
     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group.cpu_group)
     if flag.item() < 1.0:
-        _DISABLED_REASON = f"reduce-scatter backend {rs} unavailable on some rank"
-        print(f"{LOG_PREFIX} DISABLED for this process: {_DISABLED_REASON}", flush=True)
+        _DISABLED_REASON = "reduce-scatter engine unavailable on some rank"
+        logger.warning("%s DISABLED for this process: %s", LOG_PREFIX, _DISABLED_REASON)
         return None
     _COMM = comm
     return _COMM
@@ -765,9 +703,9 @@ def _collectives() -> Optional[Collectives]:
 
 
 def _compressor_runs(attn, forward_batch, backend) -> bool:
-    if attn.compressor is None or getattr(forward_batch, "encoder_swa_replay", False):
+    if attn.compressor is None or forward_batch.encoder_swa_replay:
         return False
-    return attn.layer_id != getattr(backend, "tail_source_kv_layer_id", None)
+    return attn.layer_id != backend.tail_source_kv_layer_id
 
 
 def _compressor_projection_local(comp, x: torch.Tensor):
@@ -1078,26 +1016,25 @@ def _mega_post_mxfp8(y, residual, pre, post_mix, comb, nxt):
     )
 
 
-def _attn_post(hc, y, residual, *, next_boundary, precomputed, emit_mxfp8: bool):
-    """deepseek_v4_mhc.run_attn_post for a plain tensor y; with emit_mxfp8 the
+def _attn_post(hc, y, residual, *, next_boundary, precomputed):
+    """deepseek_v4_mhc.run_attn_post for a plain tensor y; where it can, the
     chained Mega-mHC launch also writes the MoE input as MXFP8."""
     from sglang.srt.models import deepseek_v4_mhc as mhc
 
-    if emit_mxfp8:
-        nxt = next_boundary
-        if (
-            nxt is not None
-            and nxt.norm_fusable
-            and nxt.hc is not None
-            and mhc._can_use_mega_mhc(hc.cfg)
-            and y.shape[0] > 0
-        ):
-            pre, post_mix, comb = mhc._compute_triplet(hc, residual, None, precomputed)
-            return _mega_post_mxfp8(y, residual, pre, post_mix, comb, nxt.hc)
-        _log_once(
-            "mxfp8:declined",
-            "the attention-to-FFN seam cannot emit MXFP8 here; the MoE input is gathered in bf16",
-        )
+    nxt = next_boundary
+    if (
+        nxt is not None
+        and nxt.norm_fusable
+        and nxt.hc is not None
+        and mhc._can_use_mega_mhc(hc.cfg)
+        and y.shape[0] > 0
+    ):
+        pre, post_mix, comb = mhc._compute_triplet(hc, residual, None, precomputed)
+        return _mega_post_mxfp8(y, residual, pre, post_mix, comb, nxt.hc)
+    _log_once(
+        "mxfp8:declined",
+        "the attention-to-FFN seam cannot emit MXFP8 here; the MoE input is gathered in bf16",
+    )
     return mhc.run_attn_post(
         hc,
         y,
@@ -1151,7 +1088,6 @@ def forward_layer(
         residual,
         next_boundary=local_boundary,
         precomputed=precomputed,
-        emit_mxfp8=tp_state.moe_mxfp8,
     )
     del y
 
@@ -1207,7 +1143,7 @@ def take_staged_moe_input(hidden_states: torch.Tensor) -> Optional[torch.Tensor]
             "token-parallel MXFP8 MoE input was copied before the AITER runner"
         )
     _STAGED_TAKEN[0] = True
-    if scale.dtype == torch.uint8 and hasattr(torch, "float8_e8m0fnu"):
+    if scale.dtype == torch.uint8:
         scale = scale.view(torch.float8_e8m0fnu)
     return scale
 
@@ -1222,8 +1158,7 @@ def _routed_scale_needed(moe) -> bool:
         and not dv2._is_xpu
         and not (dv2._use_aiter and moe.routed_scaling_factor_fused_in_topk)
     )
-    ktep = getattr(dv2, "KTEPWrapperMethod", None)
-    return need or (ktep is not None and isinstance(moe.experts.quant_method, ktep))
+    return need or isinstance(moe.experts.quant_method, dv2.KTEPWrapperMethod)
 
 
 def run_moe(
@@ -1241,9 +1176,7 @@ def run_moe(
             f"MoE input has {x_local.shape[0]} rows, expected {state.local}"
         )
     router_logits, partials = _hip_moe.forward_gate(moe, x_local, None, fused_gate=True)
-    kw = (
-        {"input_ids": state.local_input_ids()} if getattr(moe, "is_hash", False) else {}
-    )
+    kw = {"input_ids": state.local_input_ids()} if moe.is_hash else {}
     if partials is not None:
         kw["router_logits_partials"] = partials
     topk = moe.topk(x_local, router_logits, **kw)
@@ -1441,58 +1374,4 @@ def write_source_kv_and_gather_tail(
         )
         return narrowed
     finally:
-        exit_token_parallel(forward_batch)
-
-
-# ---------------------------------------------------------------------------
-# Equivalence check: final hidden states of the last token of each request
-# ---------------------------------------------------------------------------
-
-_HIDDEN_DUMP_SEQ = [0]
-
-
-def dump_last_hidden(hidden_states: torch.Tensor, tail, forward_batch) -> None:
-    """With SGLANG_DSV4_TP_HIDDEN_DUMP set (both arms of the check), save the final normed
-    hidden state of every request's last extend row of each EXTEND forward, on TP
-    rank 0. Off when unset. Prefill-graph capture is skipped (it cannot copy host
-    indices, and graph replays never run this Python code)."""
-    if (
-        not HIDDEN_DUMP_DIR
-        or not forward_batch.forward_mode.is_extend_without_speculative()
-    ):
-        return
-    from sglang.srt.model_executor.runner import get_is_capture_mode
-    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
-        is_in_breakable_cuda_graph,
-    )
-    from sglang.srt.runtime_context import get_parallel
-
-    if (
-        get_is_capture_mode()
-        or is_in_breakable_cuda_graph()
-        or torch.cuda.is_current_stream_capturing()
-    ):
-        return
-    if get_parallel().tp_group.rank_in_group != 0:
-        return
-    lens = (
-        tail.extend_seq_lens_cpu
-        if tail is not None
-        else forward_batch.extend_seq_lens_cpu
-    )
-    rows = last_rows(list(lens))
-    idx = torch.tensor(rows, dtype=torch.long, device=hidden_states.device)
-    out = {
-        "last_hidden": hidden_states.index_select(0, idx).float().cpu(),
-        "extend_lens": list(forward_batch.extend_seq_lens_cpu),
-        "seq_lens": list(forward_batch.seq_lens_cpu)
-        if forward_batch.seq_lens_cpu is not None
-        else None,
-        "token_parallel": _LAST_FORWARD_TP[0],
-        "rs_backend": os.environ.get(ENV_RS, "fly7444")
-        if _LAST_FORWARD_TP[0]
-        else None,
-    }
-    os.makedirs(HIDDEN_DUMP_DIR, exist_ok=True)
-    torch.save(out, os.path.join(HIDDEN_DUMP_DIR, f"fwd{_HIDDEN_DUMP_SEQ[0]:06d}.pt"))
-    _HIDDEN_DUMP_SEQ[0] += 1
+        exit_token_parallel()
