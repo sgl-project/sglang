@@ -143,13 +143,18 @@ class SchedulerProfilerManager:
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
 
-        if num_steps:
-            if self.profile_by_stage:
-                self.profiler_prefill_ct = 0
-                self.profiler_decode_ct = 0
-                self.profiler_target_prefill_ct = num_steps
-                self.profiler_target_decode_ct = num_steps
-            elif start_step:
+        if self.profile_by_stage:
+            # _profile_batch_predicate increments these counters on the first
+            # prefill/decode batch.  Initialize them even when num_steps is
+            # None: a caller that only wants a wall-clock window stops with
+            # /stop_profile and does not provide a step target.
+            self.profiler_prefill_ct = 0
+            self.profiler_decode_ct = 0
+            self.profiler_target_prefill_ct = num_steps
+            self.profiler_target_decode_ct = num_steps
+            self.profiler_target_forward_ct = None
+        elif num_steps:
+            if start_step:
                 self.profiler_target_forward_ct = (
                     self.profiler_start_forward_ct + num_steps
                 )
@@ -420,7 +425,10 @@ class SchedulerProfilerManager:
                 if self.profiler_prefill_ct == 0:
                     self._start_profile(batch.forward_mode)
                 self.profiler_prefill_ct += 1
-                if self.profiler_prefill_ct > self.profiler_target_prefill_ct:
+                if (
+                    self.profiler_target_prefill_ct is not None
+                    and self.profiler_prefill_ct > self.profiler_target_prefill_ct
+                ):
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.EXTEND)
             elif batch.forward_mode.is_decode():
@@ -434,7 +442,10 @@ class SchedulerProfilerManager:
                         return
                     self._start_profile(batch.forward_mode)
                 self.profiler_decode_ct += 1
-                if self.profiler_decode_ct > self.profiler_target_decode_ct:
+                if (
+                    self.profiler_target_decode_ct is not None
+                    and self.profiler_decode_ct > self.profiler_target_decode_ct
+                ):
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.DECODE)
             elif batch.forward_mode.is_idle() or batch.forward_mode.is_prebuilt():
