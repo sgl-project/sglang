@@ -402,8 +402,15 @@ impl Args {
             "--protocol grpc carries the native /generate contract only; use --backend sglang \
              (the OpenAI routes have no gRPC service)"
         );
+        // ShareGPT keeps Python's floor of four; prebuilt prompts may ask for
+        // a single token, which measures prefill alone.
         if let Some(len) = self.sharegpt_output_len {
-            anyhow::ensure!(len >= 4, "--sharegpt-output-len is too small, got {len}");
+            let min = if self.dataset_name == DatasetName::Sharegpt {
+                4
+            } else {
+                1
+            };
+            anyhow::ensure!(len >= min, "--sharegpt-output-len is too small, got {len}");
         }
         if let Some(limit) = self.max_concurrency {
             anyhow::ensure!(limit > 0, "--max-concurrency must be at least 1");
@@ -552,6 +559,12 @@ mod tests {
         let mut chat = token_ids.to_vec();
         chat.extend(["--backend", "sglang-oai-chat"]);
         assert!(args(&chat).validate().is_err());
+        // Only sharegpt needs four output tokens; prebuilt prompts take 1.
+        let mut prefill_only = token_ids.to_vec();
+        prefill_only.extend(["--sharegpt-output-len", "1"]);
+        assert!(args(&prefill_only).validate().is_ok());
+        *prefill_only.last_mut().unwrap() = "0";
+        assert!(args(&prefill_only).validate().is_err());
     }
 
     /// `--vocab-size` replaces the tokenizer, so it is only coherent where the

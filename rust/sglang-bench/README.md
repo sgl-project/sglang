@@ -127,10 +127,11 @@ were tokenized ahead of time, one JSON object per line:
 Lines are read in file order up to `--num-prompts`, and each line's ids are
 sent as they are, so the server's tokenizer and chat template play no part in
 what is measured. `--sharegpt-output-len` overrides every line's
-`output_len`, as it does for the Python `custom` dataset. The ids must come
-from the served model's tokenizer; the client does not check them. The ids
-travel as `input_ids` on `/generate` and as a token-array `prompt` on
-`/v1/completions`; a chat backend cannot carry them and is refused.
+`output_len`, as it does for the Python `custom` dataset, and may be 1 to
+measure prefill alone. The ids must come from the served model's tokenizer;
+the client does not check them. The ids travel as `input_ids` on `/generate`
+and as a token-array `prompt` on `/v1/completions`; a chat backend cannot
+carry them and is refused.
 
 ### gRPC
 
