@@ -571,9 +571,9 @@ def _npu_combine_premix(
         apply_pre = x.new_zeros((x.shape[0], cfg.mult), dtype=torch.float32)
         apply_pre[:, 0] = 1.0
     if not is_npu_arch35():
-        from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn
+        from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn_v2
 
-        y, post_mix, comb, pre = mhc_pre_sinkhorn(
+        y, post_mix, comb, pre = mhc_pre_sinkhorn_v2(
             x.contiguous(),
             hc.fn,
             hc.scale,
@@ -583,8 +583,6 @@ def _npu_combine_premix(
             cfg.eps,
             cfg.rms_eps,
             pre_mix=apply_pre.contiguous(),
-            return_pre=True,
-            impl="cann_ops_transformer_v2",
         )
         state.stats = (pre, post_mix, comb.view(x.shape[0], cfg.mult, cfg.mult))
         return hc.norm(y)

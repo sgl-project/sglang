@@ -367,7 +367,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         current = torch.full((2, 4), 0.5)
         kernel = Mock(return_value=(x[:, 0], post, flat_comb, current))
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_pre_sinkhorn = kernel
+        stub.mhc_pre_sinkhorn_v2 = kernel
 
         with (
             patch.object(mhc, "_is_npu", True),
@@ -378,8 +378,6 @@ class TestNpuMhcSeam(unittest.TestCase):
                 state = mhc.HcState(x, pre=previous)
                 torch.testing.assert_close(mhc.combine(hc, state), x[:, 0])
                 call = kernel.call_args
-                self.assertEqual(call.kwargs["impl"], "cann_ops_transformer_v2")
-                self.assertTrue(call.kwargs["return_pre"])
                 expected = (
                     torch.tensor([[1.0, 0, 0, 0]]).expand(2, -1)
                     if previous is None
@@ -401,7 +399,7 @@ class TestNpuMhcSeam(unittest.TestCase):
 
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
         stub.mhc_pre_dpskv4 = boom
-        stub.mhc_pre_sinkhorn = boom
+        stub.mhc_pre_sinkhorn_v2 = boom
         with (
             patch.object(mhc, "_is_npu", True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
