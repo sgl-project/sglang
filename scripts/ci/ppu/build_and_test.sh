@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Wheel globs feed sha256sum in shell collation order; pin the C locale so the
+# manifest generated at build time verifies identically in every runtime image.
+export LC_ALL=C
 
 phase=${1:?Usage: build_and_test.sh build|test}
 case "$phase" in
