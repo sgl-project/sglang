@@ -25,6 +25,7 @@ from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     dcp_extend_crop_free,
     dcp_extend_gather_buffer,
     dcp_extend_gathers_kv,
+    dcp_issue_gather_chunks,
     dcp_packed_read_plan,
 )
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
@@ -678,10 +679,11 @@ def _dcp_extend_send_rows(pool, layer, md, plan, layer_id: int):
     """This rank's padded prefix shard for ``layer_id`` -- the gather's input.
 
     Prefix rows only, so it reads nothing the current forward wrote. One send
-    per gathered key, in scratch order (latent then rope).
+    per gathered key, in scratch order (latent then rope); None when the plan
+    gathers nothing.
     """
     if not plan.send_rows:
-        return [None, None]
+        return None
     send_nope, send_rope = pool.get_mla_kv_buffer(
         layer, md.dcp_local_prefix_kv_indices, layer_id_override=layer_id
     )
@@ -795,8 +797,8 @@ class _DcpGatherPrefetcher:
                 send_rope = _pad_dcp_packed_send(send_rope, plan, parallel.dcp_rank)
                 # The helper waits for backend work before this stream's
                 # ready event can release the compute-stream consumer.
-                _dcp_issue_gather_chunks(parallel.dcp_group, out_nope, send_nope, plan)
-                _dcp_issue_gather_chunks(parallel.dcp_group, out_rope, send_rope, plan)
+                dcp_issue_gather_chunks(parallel.dcp_group, out_nope, send_nope, plan)
+                dcp_issue_gather_chunks(parallel.dcp_group, out_rope, send_rope, plan)
             self.ready[slot] = self.stream.record_event()
         self.filled[slot] = layer_id
 
@@ -980,62 +982,6 @@ def _write_packed_extend_tail(
     )
     out_nope[plan.gathered_rows :] = k_nope[:n]
     out_rope[plan.gathered_rows :] = k_pe[:n]
-
-
-def _dcp_all_gather_async(group, out: torch.Tensor, send: torch.Tensor):
-    """The chunked gather's async collective; returns a Work handle or None.
-
-    torch.distributed directly rather than a GroupCoordinator method: the
-    chunked DCP gather is the only async all-gather user on NPU, so the async
-    path stays NPU-side and GroupCoordinator keeps its synchronous API.
-    """
-    return torch.distributed.all_gather_into_tensor(
-        out, send, group=group.device_group, async_op=True
-    )
-
-
-def _dcp_issue_gather_chunks(
-    group, out: torch.Tensor, send: torch.Tensor, plan: "DcpPackedReadPlan"
-):
-    """Fill ``out``'s prefix region with the all-gather of ``send``.
-
-    D2v2: ``plan.chunks > 1`` issues one sub-all-gather per chunk instead of
-    one monolithic collective. Chunk k moves local rows [st, st + sz) of every
-    rank -- the first chunks-1 hold q = send_rows // chunks rows, the last
-    q + send_rows % chunks -- and each lands in the CONTIGUOUS slice
-    ``out[C*st : C*(st + sz)]`` of the very buffer the packed read expects
-    (chunk-major, see DcpPackedReadPlan), so no extra buffer and no copy. With
-    ``plan.chunks == 1`` this is exactly the old single collective.
-
-    The point is not the bytes (they are the same) but the AIV episode: the
-    monolithic gather was one 9-16 ms AIV kernel (93% MTE2) that starved the
-    compute stream's own AIV work for its whole flight; N sub-collectives of
-    roughly 1-2 ms leave the inter-collective windows in which that work runs.
-    See _DCP_GATHER_CHUNKS in layers/dcp/layout.py for the measurement.
-
-    Order every chunk's completion before the caller consumes the prefix or
-    records its ready event; communication may use a separate backend stream.
-    """
-    c = plan.dcp_size
-    if plan.chunks <= 1:
-        group.all_gather_into_tensor(out[: plan.gathered_rows], send)
-        return ()
-    q, rem = divmod(plan.send_rows, plan.chunks)
-    n = plan.chunks
-    works = []
-    st = 0
-    for k in range(n):
-        sz = q + (rem if k == n - 1 else 0)
-        works.append(
-            _dcp_all_gather_async(
-                group, out[c * st : c * (st + sz)], send[st : st + sz]
-            )
-        )
-        st += sz
-    for work in works:
-        if work is not None:
-            work.wait()
-    return tuple(works)
 
 
 def _pad_dcp_packed_send(

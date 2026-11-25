@@ -459,3 +459,59 @@ def dcp_packed_kv_lens(forward_batch, plan: DcpPackedReadPlan, device) -> torch.
         cached = torch.tensor([plan.rows], dtype=torch.int32, device=device)
         md.packed_kv_lens = cached
     return cached
+
+
+def _dcp_all_gather_async(group, out: torch.Tensor, send: torch.Tensor):
+    """The chunked gather's async collective; returns a Work handle or None.
+
+    torch.distributed directly rather than a GroupCoordinator method: the
+    chunked DCP gather is the only async all-gather user on NPU, so the async
+    path stays NPU-side and GroupCoordinator keeps its synchronous API.
+    """
+    return torch.distributed.all_gather_into_tensor(
+        out, send, group=group.device_group, async_op=True
+    )
+
+
+def dcp_issue_gather_chunks(
+    group, out: torch.Tensor, send: torch.Tensor, plan: DcpPackedReadPlan
+):
+    """Fill ``out``'s prefix region with the all-gather of ``send``.
+
+    D2v2: ``plan.chunks > 1`` issues one sub-all-gather per chunk instead of
+    one monolithic collective. Chunk k moves local rows [st, st + sz) of every
+    rank -- the first chunks-1 hold q = send_rows // chunks rows, the last
+    q + send_rows % chunks -- and each lands in the CONTIGUOUS slice
+    ``out[C*st : C*(st + sz)]`` of the very buffer the packed read expects
+    (chunk-major, see DcpPackedReadPlan), so no extra buffer and no copy. With
+    ``plan.chunks == 1`` this is exactly the old single collective.
+
+    The point is not the bytes (they are the same) but the AIV episode: the
+    monolithic gather was one 9-16 ms AIV kernel (93% MTE2) that starved the
+    compute stream's own AIV work for its whole flight; N sub-collectives of
+    roughly 1-2 ms leave the inter-collective windows in which that work runs.
+    See _DCP_GATHER_CHUNKS in layers/dcp/layout.py for the measurement.
+
+    Order every chunk's completion before the caller consumes the prefix or
+    records its ready event; communication may use a separate backend stream.
+    """
+    c = plan.dcp_size
+    if plan.chunks <= 1:
+        group.all_gather_into_tensor(out[: plan.gathered_rows], send)
+        return ()
+    q, rem = divmod(plan.send_rows, plan.chunks)
+    n = plan.chunks
+    works = []
+    st = 0
+    for k in range(n):
+        sz = q + (rem if k == n - 1 else 0)
+        works.append(
+            _dcp_all_gather_async(
+                group, out[c * st : c * (st + sz)], send[st : st + sz]
+            )
+        )
+        st += sz
+    for work in works:
+        if work is not None:
+            work.wait()
+    return tuple(works)
