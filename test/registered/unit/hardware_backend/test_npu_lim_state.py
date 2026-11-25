@@ -51,7 +51,7 @@ class TestLIMKernelLoad(CustomTestCase):
     def test_packaged_loader_preserves_in_place_outputs(self):
         package = ModuleType("sgl_kernel_npu")
         package.__path__ = []
-        api = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
+        api = ModuleType("sgl_kernel_npu.operators.indexer")
 
         def native(*tensors, full_visible=False):
             # Emulate the native boundary, not the framework's tensor ordering.
@@ -99,7 +99,7 @@ class TestLIMKernelLoad(CustomTestCase):
     def test_missing_native_registration_fails_before_graph(self):
         package = ModuleType("sgl_kernel_npu")
         package.__path__ = []
-        api = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
+        api = ModuleType("sgl_kernel_npu.operators.indexer")
         api.fused_lightning_indexer_manage = lambda *args: None
         with (
             patch.dict("sys.modules", {"sgl_kernel_npu": package, api.__name__: api}),

@@ -5,7 +5,7 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
+from sgl_kernel_npu.operators.attention.prepare_copy_sfa_metadata import (
     prepare_copy_sfa_metadata,
 )
 

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from copy import copy
-from dataclasses import dataclass
 from math import prod
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -20,8 +20,7 @@ MISS_CAPACITY = 32768
 MAX_QUERY_WIDTH = 14
 
 
-@dataclass(frozen=True)
-class BufferSpec:
+class BufferSpec(msgspec.Struct, frozen=True):
     """Shape, dtype and multiplicity of a persistent tensor allocation."""
 
     shape: tuple[int, ...]
@@ -250,7 +249,7 @@ def resolve_sparse_kv_budget(
         or capacity % page_size
     ):
         raise ValueError(
-            "Native LIM cache capacity must cover query width * TopK, be <= 32640 and aligned to 128."
+            f"Native LIM cache capacity must cover query width * TopK, be <= {MISS_CAPACITY - page_size} and aligned to {page_size}."
         )
     resident_rows = request_rows if resident_rows is None else resident_rows
     return BudgetPlan(

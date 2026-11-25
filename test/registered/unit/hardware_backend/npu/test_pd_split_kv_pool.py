@@ -142,6 +142,9 @@ class TestPDSplitKVPool(CustomTestCase):
         from sglang.srt.environ import envs
 
         prefix = "sglang.srt.hardware_backend.npu.memory_pool_npu."
+        api = ModuleType(
+            "sgl_kernel_npu.operators.attention.fused_scatter_copy_sparse_flash_attention_split"
+        )
         for fused, mode, draft, native in (
             (True, "decode", False, False),
             (True, "null", False, False),
@@ -158,6 +161,10 @@ class TestPDSplitKVPool(CustomTestCase):
                 get_parallel().override(attn_dcp_rank=0),
                 patch(prefix + "get_bool_env_var", return_value=False),
                 patch.object(NPUMLATokenToKVPool, "_finalize_allocation_log"),
+                patch.object(
+                    api, "validate_pd_split_copy_sfa_layout", create=True
+                ) as validate,
+                patch.dict(sys.modules, {api.__name__: api}),
             ):
                 pool = NPUMLATokenToKVPool(
                     size=128,
@@ -173,6 +180,10 @@ class TestPDSplitKVPool(CustomTestCase):
                 )
                 self.assertEqual(pool.k_buffer is not None, native)
                 self.assertEqual(pool.v_buffer is not None, native)
+                if fused and mode == "decode" and not draft:
+                    validate.assert_called_once_with(512, 64, 128, torch.bfloat16)
+                else:
+                    validate.assert_not_called()
 
     def test_native_combined_export_uses_upstream_layout(self):
         pool = _make_pool()

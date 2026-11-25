@@ -9,9 +9,13 @@ def load_copy_sfa_operator():
     """Resolve the registered A3 implementation before graph capture."""
     name = "fused_scatter_copy_sparse_flash_attention_split"
     try:
-        import sgl_kernel_npu  # noqa: F401
+        from sgl_kernel_npu.operators.attention import (
+            fused_scatter_copy_sparse_flash_attention_split as operator,
+        )
 
-        return getattr(torch.ops.npu, name).default
+        # Require the native registration before capturing a graph.
+        torch.ops.npu.fused_scatter_copy_sparse_flash_attention_split.default
+        return operator
     except (ImportError, AttributeError) as error:
         raise RuntimeError(
             f"Copy-SFA requires an sgl-kernel-npu A3 wheel containing npu::{name}."

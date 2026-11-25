@@ -791,16 +791,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.enable_sparsity_driven_kv_offload
             and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
             and get_disagg().disaggregation_mode == "decode"
-            and (
-                (kv_lora_rank, qk_rope_head_dim, page_size) != (512, 64, 128)
-                or dtype != torch.bfloat16
-                or modelslim_cache_layout is not None
-                or self.use_fia_nz
-            )
         ):
-            raise ValueError(
-                "Ascend PD split KV requires row-major BF16 MLA with "
-                "512/64 features and page size 128."
+            if modelslim_cache_layout is not None or self.use_fia_nz:
+                raise ValueError("Ascend PD split KV requires row-major MLA caches.")
+            from sgl_kernel_npu.operators.attention.fused_scatter_copy_sparse_flash_attention_split import (
+                validate_pd_split_copy_sfa_layout,
+            )
+
+            validate_pd_split_copy_sfa_layout(
+                kv_lora_rank, qk_rope_head_dim, page_size, dtype
             )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
@@ -1267,7 +1266,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
         host_pool = getattr(getattr(self, "sparse_kv_manager", None), "host_pool", None)
         if host_pool is not None:
-            # Match native prefill's CKV layers, then KPE layers, then indexer.
+            # Split transfer order is CKV, KPE, indexer K and optional scale.
             entries = [
                 (buf, True) for component in host_pool.buffers for buf in component
             ]

@@ -14,7 +14,7 @@ import torch
 def load_fused_lim_operator():
     """Resolve the operator from the installed sgl-kernel-npu wheel."""
     try:
-        from sgl_kernel_npu.sparsity_driven_kv_offload import (
+        from sgl_kernel_npu.operators.indexer import (
             fused_lightning_indexer_manage as operator,
         )
 

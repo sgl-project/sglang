@@ -200,7 +200,7 @@ class FusedSparseKVCacheManager:
         self.request_to_resident.copy_(mapping, non_blocking=True)
 
     def prepare_copy_sfa_plan(self, plan) -> None:
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
+        from sgl_kernel_npu.operators.attention.prepare_copy_sfa_metadata import (
             prepare_copy_sfa_metadata,
         )
 
@@ -303,9 +303,10 @@ class FusedSparseKVCacheManager:
     def prepare_offload_rows(
         self, tokens: int, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        from sglang.kernels.ops.kvcache.npu_sparse_kv import (
+        from sgl_kernel_npu.operators.mem_cache.prepare_sparse_kv_offload_rows import (
             prepare_sparse_kv_offload_rows,
         )
+
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
             sparse_query_width,
         )

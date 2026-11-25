@@ -36,7 +36,7 @@ class LIMSelection:
 
 class LIMDecodeAdapter:
     def __init__(self, manager):
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_input_metadata import (
+        from sgl_kernel_npu.operators.indexer.fused_prepare_lim_metadata import (
             fused_prepare_lim_metadata,
         )
 

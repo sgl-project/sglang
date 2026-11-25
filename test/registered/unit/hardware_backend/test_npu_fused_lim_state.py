@@ -238,7 +238,7 @@ class TestLIMState(CustomTestCase):
                 patch.dict(
                     "sys.modules",
                     {
-                        prefix + "npu_lim_input_metadata": pre,
+                        "sgl_kernel_npu.operators.indexer.fused_prepare_lim_metadata": pre,
                     },
                 ),
             ):
@@ -380,8 +380,8 @@ class TestLIMState(CustomTestCase):
             patch.dict(
                 sys.modules,
                 {
-                    prefix + "npu_lim_input_metadata": pre,
-                    prefix + "npu_lim_copy_sfa_metadata": post,
+                    "sgl_kernel_npu.operators.indexer.fused_prepare_lim_metadata": pre,
+                    "sgl_kernel_npu.operators.attention.prepare_copy_sfa_metadata": post,
                 },
             ),
         ):
@@ -461,7 +461,10 @@ class TestLIMState(CustomTestCase):
         adapter._pre_valid[:2].fill_(True)
         adapter._pre_cache_sizes[:2].copy_(torch.tensor([8192, 0]))
         adapter.block_table[:2].copy_(torch.arange(66).view(2, 33))
-        with patch.dict(sys.modules, {prefix + "npu_lim_copy_sfa_metadata": post}):
+        with patch.dict(
+            sys.modules,
+            {"sgl_kernel_npu.operators.attention.prepare_copy_sfa_metadata": post},
+        ):
             selection = adapter.select(
                 manager,
                 query=torch.zeros(rows, 64, 128, dtype=torch.bfloat16),
@@ -544,7 +547,10 @@ class TestLIMState(CustomTestCase):
 
         post.prepare_copy_sfa_metadata.side_effect = prepare_metadata
         adapter._pre_lengths[:2].copy_(torch.tensor([9000, 100], dtype=torch.int32))
-        with patch.dict(sys.modules, {prefix + "npu_lim_copy_sfa_metadata": post}):
+        with patch.dict(
+            sys.modules,
+            {"sgl_kernel_npu.operators.attention.prepare_copy_sfa_metadata": post},
+        ):
             manager.prepare_copy_sfa_plan(selection)
             for _ in range(2):
                 result = manager.copy_sfa_attention(
