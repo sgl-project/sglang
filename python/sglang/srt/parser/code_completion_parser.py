@@ -82,7 +82,7 @@ def is_completion_template_defined() -> bool:
 
 def generate_completion_prompt_from_request(request: CompletionRequest) -> str:
     global completion_template_name
-    if request.suffix == "":
+    if not request.suffix or completion_template_name is None:
         return request.prompt
 
     return generate_completion_prompt(
