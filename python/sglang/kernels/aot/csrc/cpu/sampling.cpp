@@ -3,11 +3,70 @@
 #include <torch/library.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
+#include <vector>
 
 #include "common.h"
+#include "vec.h"
 
 namespace {
+
+// NaN counts as the maximum and ties take the lowest index, same as torch.argmax.
+void argmax_float_kernel_impl(
+    int64_t* __restrict__ out, const float* __restrict__ x, int64_t rows, int64_t cols, int64_t stride) {
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int64_t kVecSize = Vec::size();
+  constexpr int64_t kChunk = 4096;
+  const int64_t num_chunks = div_up(cols, kChunk);
+
+  std::vector<float> chunk_max(rows * num_chunks);
+
+  at::parallel_for(0, rows * num_chunks, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t t = begin; t < end; ++t) {
+      const int64_t row = t / num_chunks;
+      const int64_t c = t % num_chunks;
+      const float* p = x + row * stride + c * kChunk;
+      const int64_t n = std::min(kChunk, cols - c * kChunk);
+
+      Vec vmax(-std::numeric_limits<float>::infinity());
+      int64_t i = 0;
+      for (; i <= n - kVecSize; i += kVecSize) {
+        vmax = at::vec::maximum(vmax, Vec::loadu(p + i));
+      }
+      float m = at::vec::vec_reduce_all([](Vec& a, Vec& b) { return at::vec::maximum(a, b); }, vmax);
+      for (; i < n; ++i) {
+        if (!std::isnan(m) && (std::isnan(p[i]) || p[i] > m)) {
+          m = p[i];
+        }
+      }
+      chunk_max[t] = m;
+    }
+  });
+
+  at::parallel_for(0, rows, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      int64_t best_chunk = 0;
+      float best = chunk_max[row * num_chunks];
+      for (int64_t c = 1; c < num_chunks && !std::isnan(best); ++c) {
+        const float v = chunk_max[row * num_chunks + c];
+        if (std::isnan(v) || v > best) {
+          best = v;
+          best_chunk = c;
+        }
+      }
+      const float* p = x + row * stride + best_chunk * kChunk;
+      const int64_t n = std::min(kChunk, cols - best_chunk * kChunk);
+      int64_t idx = 0;
+      while (idx < n && (std::isnan(best) ? !std::isnan(p[idx]) : p[idx] != best)) {
+        ++idx;
+      }
+      out[row] = best_chunk * kChunk + idx;
+    }
+  });
+}
+
 inline uint32_t rotl32(uint32_t x, int r) {
   return (x << r) | (x >> (32 - r));
 }
@@ -83,6 +142,22 @@ void murmur_hash32_kernel_impl(
 }
 
 }  // namespace
+
+// logits: [rows, vocab] float32, last dim contiguous
+at::Tensor argmax_cpu(const at::Tensor& logits) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(logits);
+  CHECK_DIM(2, logits);
+  TORCH_CHECK(logits.scalar_type() == at::kFloat, "argmax_cpu: expect float32 logits, got ", logits.scalar_type());
+  const int64_t rows = logits.size(0);
+  const int64_t cols = logits.size(1);
+  TORCH_CHECK(cols > 0, "argmax_cpu: expect non-empty rows");
+
+  auto out = at::empty({rows}, logits.options().dtype(at::kLong));
+  if (rows > 0) {
+    argmax_float_kernel_impl(out.data_ptr<int64_t>(), logits.data_ptr<float>(), rows, cols, logits.stride(0));
+  }
+  return out;
+}
 
 at::Tensor murmur_hash32_cpu(const at::Tensor& seed, const at::Tensor& positions, const at::Tensor& col_indices) {
   CHECK_INPUT(seed);

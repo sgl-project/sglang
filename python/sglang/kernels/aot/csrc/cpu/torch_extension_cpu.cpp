@@ -574,6 +574,7 @@ void multimodal_rotary_embedding_cpu(
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
 // murmur_hash32
+at::Tensor argmax_cpu(const at::Tensor& logits);
 at::Tensor murmur_hash32_cpu(const at::Tensor& seed, const at::Tensor& positions, const at::Tensor& col_indices);
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
@@ -1037,6 +1038,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+
+  // argmax
+  m.def("argmax_cpu(Tensor logits) -> Tensor");
+  m.impl("argmax_cpu", torch::kCPU, &argmax_cpu);
 
   // murmur_hash32
   m.def("murmur_hash32_cpu(Tensor seed, Tensor positions, Tensor col_indices) -> Tensor");
