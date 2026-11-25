@@ -32,6 +32,7 @@ def make_backend(*, dflash=False, dspark=False, width=1, bs=4, raw_bs=2):
                 is_dflash=lambda: dflash,
                 is_dspark=lambda: dspark,
                 is_dflash_family=lambda: dflash or dspark,
+                uses_block_verify=lambda: dflash or dspark,
             ),
         ),
         attn_backend=attention,

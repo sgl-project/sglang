@@ -130,7 +130,9 @@ def test_only_dflash_target_models_share_aux_output(
     assert (
         resolve_aux_hidden_states_width(
             model=model,
-            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: dflash),
+            spec_algorithm=SimpleNamespace(
+                is_dflash_family=lambda: dflash, uses_block_verify=lambda: dflash
+            ),
             is_draft_worker=is_draft_worker,
         )
         == expected
