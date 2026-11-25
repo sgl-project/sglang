@@ -1776,6 +1776,10 @@ class Envs:
     # same way whatever else shares its batch. Raise it to buy back bandwidth
     # on links that can drive more channels.
     SGLANG_DETERMINISTIC_NCCL_NCHANNELS = EnvInt(8)
+    # FlashInfer's batch-invariant kernels under the deterministic and
+    # batch-invariant modes on SM100/SM103/SM107 (the BF16 GEMM today); False
+    # returns to the previous DeepGEMM/Triton kernels.
+    SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS = EnvBool(True)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
     # ROCm CustomAllReduceV2 workspace sharing: auto, fabric or posix_fd
     SGLANG_HIP_VMM_HANDLE_TYPE = EnvStr("auto")

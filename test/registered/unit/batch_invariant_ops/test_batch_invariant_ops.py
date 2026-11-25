@@ -1,11 +1,13 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/test_batch_invariance.py
 import math
 import unittest
+import unittest.mock
 
 import torch
 
 from sglang.srt.batch_invariant_ops import batch_invariant_ops
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import calc_diff
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -171,6 +173,36 @@ class TestBatchInvariantOps(CustomTestCase):
                 expected = mm_bf16(a, b, backend="auto", batch_invariant=True)
                 torch.testing.assert_close(out_mm, expected, rtol=0, atol=0)
                 self.assertLess(calc_diff(out_mm, a.float() @ b.float()), 1e-4)
+
+    def test_flashinfer_bf16_opt_out(self):
+        """SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS=0 returns mm to the
+        previous DeepGEMM/Triton kernels, read per call."""
+        if not batch_invariant_ops._flashinfer_mm_bf16_supported(
+            torch.cuda.current_device()
+        ):
+            self.skipTest("FlashInfer batch-invariant BF16 GEMM is unavailable")
+        generator = torch.Generator(device=device_type).manual_seed(0)
+        a = torch.randn(64, 4096, dtype=torch.bfloat16, generator=generator)
+        b = torch.randn(4096, 4096, dtype=torch.bfloat16, generator=generator).T
+
+        def no_flashinfer(*args, **kwargs):
+            raise AssertionError("FlashInfer ran with the opt-out set")
+
+        with envs.SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS.override(False):
+            self.assertFalse(
+                batch_invariant_ops._can_use_flashinfer_mm_bf16(a, b, torch.bfloat16)
+            )
+            with (
+                unittest.mock.patch.object(
+                    batch_invariant_ops, "_matmul_persistent_flashinfer", no_flashinfer
+                ),
+                set_batch_invariant_mode(True),
+            ):
+                out = torch.mm(a, b)
+        self.assertLess(calc_diff(out, a.float() @ b.float()), 1e-4)
+        self.assertTrue(
+            batch_invariant_ops._can_use_flashinfer_mm_bf16(a, b, torch.bfloat16)
+        )
 
     def test_small_matrices(self):
         """Test batch invariance with small matrix sizes"""

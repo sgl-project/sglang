@@ -550,6 +550,8 @@ def _can_use_flashinfer_mm_bf16(
             or (b.stride(0) == 1 and b.stride(1) == K)
         )
         and b.data_ptr() % 16 == 0
+        # Read per call, not cached, so a trainer process can flip it too.
+        and envs.SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS.get()
         and _flashinfer_mm_bf16_supported(a.device.index)
     )
 
