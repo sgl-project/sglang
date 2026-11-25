@@ -51,11 +51,13 @@ and attention coverage lives in ``test_page_sharded_dsa_attention.py``.
 import ctypes
 import gc
 import math
+import random
 import shutil
 import unittest
 import unittest.mock
 from array import array
 from contextlib import ExitStack, contextmanager, nullcontext
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -1805,6 +1807,89 @@ class TestBeginShardExtendPlan(CustomTestCase):
                 [_chain_row(pages, 4 * PS)],
             )
 
+    def test_random_batches_match_reference(self):
+        """Shared cached prefixes and empty prefixes mixed in one batch: the
+        device-built plan equals the brute-force reference on every rank (and
+        runs without host syncs on CUDA)."""
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        rng = random.Random(0)
+        for trial in range(40):
+            requests, next_local = [], 5
+            for _ in range(rng.randint(1, 10)):
+                src = rng.choice(requests) if requests and rng.random() < 0.5 else None
+                shared = rng.randint(0, src["prefix"] // PS) if src else 0
+                base = (src["base"] + shared) % N if src else rng.randrange(N)
+                fresh = _chain_pages(base, 16, local_start=next_local)
+                next_local += 16
+                pages = (src["pages"][:shared] if src else []) + fresh
+                prefix = (shared + rng.choice([0, 1, 3, rng.randint(0, 5)])) * PS
+                seq = prefix + rng.randint(1, 4 * PS)
+                requests.append(
+                    dict(pages=pages, base=src["base"] if src else base, prefix=prefix)
+                )
+                requests[-1]["row"] = _chain_row(pages, seq)
+                requests[-1]["seq"] = seq
+            prefix_pages = [r["pages"][: r["prefix"] // PS] for r in requests]
+            slots, block = _reference_prefix_slots(prefix_pages)
+            chunk_pages = [
+                p
+                for r in requests
+                for p in r["pages"][r["prefix"] // PS : ceil_div(r["seq"], PS)]
+            ]
+            for device in devices:
+                for rank in range(N):
+                    stub = _make_pool_stub(
+                        _make_spec(chunk_pages=128), rank, debug=(device == "cpu")
+                    )
+                    stub._page_pos = stub._page_pos.to(device)
+                    rows = [r["row"] for r in requests]
+                    width = max(r.numel() for r in rows)
+                    table = torch.stack(
+                        [
+                            torch.cat(
+                                [r, torch.zeros(width - r.numel(), dtype=torch.int32)]
+                            )
+                            for r in rows
+                        ]
+                    ).to(device)
+                    req_indices = torch.arange(len(rows), device=device)
+                    prefix_lens = [r["prefix"] for r in requests]
+                    seq_lens = [r["seq"] for r in requests]
+                    if device == "cuda":
+                        prev_mode = torch.cuda.get_sync_debug_mode()
+                        torch.cuda.set_sync_debug_mode("error")
+                        try:
+                            PageInterleaveKVPoolMixin.begin_shard_extend(
+                                stub, table, req_indices, prefix_lens, seq_lens
+                            )
+                        finally:
+                            torch.cuda.set_sync_debug_mode(prev_mode)
+                    else:
+                        PageInterleaveKVPoolMixin.begin_shard_extend(
+                            stub, table, req_indices, prefix_lens, seq_lens
+                        )
+                    msg = f"trial {trial} rank {rank} {device}"
+                    self.assertEqual(stub._block_pages, block, msg)
+                    expect = torch.full_like(stub._page_pos, stub._trash_base // PS)
+                    for page, slot in slots.items():
+                        expect[page] = slot
+                    for j, page in enumerate(chunk_pages):
+                        expect[page] = stub._chunk_base // PS + j
+                    self.assertTrue(torch.equal(stub._page_pos, expect), msg)
+                    own = sorted(
+                        (p for p in slots if p % N == rank), key=lambda p: p // N
+                    )
+                    local = [p // N for p in own] + [0] * (block - len(own))
+                    if block:
+                        self.assertEqual(stub._send_pages.cpu().tolist(), local, msg)
+                        send = torch.cat(
+                            [torch.arange(lp * PS, (lp + 1) * PS) for lp in local]
+                        )
+                        self.assertTrue(torch.equal(stub._send_rows.cpu(), send), msg)
+                    else:
+                        self.assertIsNone(stub._send_pages, msg)
+                        self.assertIsNone(stub._send_rows, msg)
+
     def test_owner_congruence_guard(self):
         """A rotation-base bug that breaks a request's prefix-owner
         cyclicity invalidates the sync-free block bound (a rank can own more
@@ -1915,44 +2000,61 @@ class TestScratchTranslation(CustomTestCase):
 
 
 class TestWritePlan(CustomTestCase):
-    def test_owner_filter_cached_per_loc_tensor(self):
-        spec = _make_spec(shard_rank=2)
+    def _stub(self, rank, device="cpu"):
+        spec = _make_spec(shard_rank=rank)
         stub = SimpleNamespace()
+        stub.shard_spec = spec
         stub.placement = PageInterleavePlacement(spec)
-        stub.shard_rank = 2
+        stub.shard_rank = rank
         stub._epoch = 1
+        stub._shard_extend_active = True
         stub._write_plan_key = stub._write_plan = None
+        stub._local_rows_or_trash = partial(
+            PageInterleaveKVPoolMixin._local_rows_or_trash, stub
+        )
+        return stub
 
+    def test_owned_rows_and_trash_cached_per_loc_tensor(self):
+        stub = self._stub(rank=2)
         loc = torch.arange(5 * GS, 7 * GS)  # two whole groups
-        owned_idx, local_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
-        self.assertEqual(owned_idx.numel(), 2 * PS)
+        rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
+        # One row per token, so the write shape never depends on ownership.
+        self.assertEqual(rows.shape, loc.shape)
+        owned = stub.placement.local_mask(loc, 2)
         # Owned rows are ps-contiguous runs at [Q*ps, (Q+1)*ps).
         self.assertTrue(
             torch.equal(
-                local_rows,
+                rows[owned],
                 torch.cat([torch.arange(5 * PS, 6 * PS), torch.arange(6 * PS, 7 * PS)]),
             )
         )
+        # Unowned tokens target the reserved trash page (local page 0).
+        self.assertTrue(torch.equal(rows[~owned], loc[~owned] % PS))
         # Same tensor + same epoch -> cached (identity).
-        again = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
-        self.assertIs(again[0], owned_idx)
+        self.assertIs(PageInterleaveKVPoolMixin._get_write_plan(stub, loc), rows)
         # Epoch bump invalidates.
         stub._epoch = 2
-        fresh = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
-        self.assertIsNot(fresh[0], owned_idx)
+        self.assertIsNot(PageInterleaveKVPoolMixin._get_write_plan(stub, loc), rows)
+        # Outside a sharded extend the epoch is stale: never reuse a plan.
+        stub._shard_extend_active = False
+        self.assertIsNot(PageInterleaveKVPoolMixin._get_write_plan(stub, loc), rows)
 
     def test_partial_tail_page_may_own_nothing(self):
-        spec = _make_spec(shard_rank=3)
-        stub = SimpleNamespace()
-        stub.placement = PageInterleavePlacement(spec)
-        stub.shard_rank = 3
-        stub._epoch = 1
-        stub._write_plan_key = stub._write_plan = None
+        stub = self._stub(rank=3)
         # 10 tokens: all inside owner-0's page of the group.
         loc = torch.arange(8 * GS, 8 * GS + 10)
-        owned_idx, local_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
-        self.assertEqual(owned_idx.numel(), 0)
-        self.assertEqual(local_rows.numel(), 0)
+        rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
+        self.assertTrue(torch.equal(rows, loc % PS))
+        self.assertTrue(bool((rows < PS).all()))
+        if torch.cuda.is_available():
+            cuda_loc = loc.cuda()
+            prev_mode = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                cuda_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, cuda_loc)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev_mode)
+            self.assertTrue(torch.equal(cuda_rows.cpu(), rows))
 
 
 class TestShardedPoolFootprint(CustomTestCase):
@@ -2028,8 +2130,9 @@ class TestShardedPoolFootprint(CustomTestCase):
                 for pool in pools:
                     pool.set_kv_buffer(SimpleNamespace(layer_id=0), loc, cache_k, None)
                     tags = pool.kv_buffer[0][:, 0, :2].float()
-                    rows = torch.nonzero(tags[:, 0]).squeeze(1)
-                    # Every row past the padded page is filled, and no more.
+                    # Local page 0 [0, PS) is the reserved trash page absorbing
+                    # unowned writes; every allocated row past it is filled.
+                    rows = torch.nonzero(tags[PS:, 0]).squeeze(1) + PS
                     self.assertTrue(
                         torch.equal(rows, torch.arange(PS, PS + stock.size))
                     )

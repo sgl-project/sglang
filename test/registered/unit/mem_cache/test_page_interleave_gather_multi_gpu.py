@@ -596,8 +596,11 @@ def _mtp_check_persisted(pool, kind, locs, tag, rank):
         for buffer, values in zip(_mtp_buffers(pool, kind, local_layer), canonical):
             expected = torch.full_like(buffer, _MTP_UNWRITTEN)
             expected[local_rows] = values
+            # Local page 0 is the reserved trash page absorbing unowned writes.
             _mtp_assert_bytes(
-                buffer, expected, f"{kind} pool {tag} owned layer {local_layer}"
+                buffer[_GATHER_PAGE_SIZE:],
+                expected[_GATHER_PAGE_SIZE:],
+                f"{kind} pool {tag} owned layer {local_layer}",
             )
 
 
