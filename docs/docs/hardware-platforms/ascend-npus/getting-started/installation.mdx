@@ -286,10 +286,6 @@ For installation of Triton on Ascend nightly builds or from sources, follow [ins
 
 We provide SGL kernels for Ascend NPU, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
 
-DeepSeek-V4.1 on Ascend A3 uses the fused `mhc_pre_sinkhorn_v2` operator.
-Build the A3 wheel with the `ops_transformer` profile from a kernel checkout
-that provides this operator.
-
 <Note>
 Gemma-family models (including Qwen3.5) call `sgl_kernel_npu.norm.gemma_rmsnorm`,
 whose implementation is chosen when the wheel is built: the native `torch_npu`
