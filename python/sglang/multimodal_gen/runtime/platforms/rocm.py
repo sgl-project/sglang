@@ -256,6 +256,25 @@ class RocmPlatform(Platform):
                     exc_info=True,
                 )
 
+        try:
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import (
+                MiniMaxH3ImageVAE,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+                maybe_optimize_minimax_h3_vae,
+            )
+
+            # batched tile decode and the fused residual-add RMSNorm
+            # (quality-gated). Video VAE only: the fused blocks change the image
+            # VAE's lossless output, which has no quality validation on ROCm.
+            if not isinstance(vae, MiniMaxH3ImageVAE):
+                vae = maybe_optimize_minimax_h3_vae(vae, fast_attention=False)
+        except Exception:
+            logger.warning(
+                "Failed to apply the MiniMax-H3 VAE fast path; using the unmodified VAE.",
+                exc_info=True,
+            )
+
         if is_gfx1250_supported():
             count = cls._force_math_sdpa_in_attention(vae)
             if count > 0:
