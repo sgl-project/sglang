@@ -1,7 +1,7 @@
 export const config = {
   modelName: "Muse Glimmer",
 
-  supportedHardware: ["b200", "h200", "rtx5090", "rtxpro6000", "dgx-spark", "mac"],
+  supportedHardware: ["b200", "h200", "h100", "rtx5090", "rtxpro6000", "dgx-spark", "mac"],
 
   hardware: [
     // RTX 5090 and RTX PRO 6000 are Blackwell-generation but not in the shared
