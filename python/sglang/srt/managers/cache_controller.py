@@ -1412,12 +1412,13 @@ class HiCacheController:
     ) -> int:
         positions, rows = self.storage_host_pool.owned_storage_pages(host_indices)
         if not positions:
+            # With no pages to load, this rank cannot shorten the prefix.
             return len(hash_values)
         hits = self._generic_page_get(
             operation, [hash_values[i] for i in positions], rows
         )
-        # The first owned miss bounds this rank's logical prefix. The caller
-        # reduces these bounds across ranks.
+        # A miss limits the prefix at its original batch position. If every
+        # owned page loaded, the full length lets other ranks set the limit.
         return positions[hits] if hits < len(positions) else len(hash_values)
 
     def _page_transfer(self, operation: PrefetchOperation) -> int:
