@@ -644,6 +644,8 @@ class GenerateReqInput:
             self.sampling_params = self.sampling_params.copy()
         if self.rid is None:
             self.rid = uuid.uuid4().hex
+        elif not isinstance(self.rid, str):
+            raise ValueError("rid should be a string for a single request.")
         if self.return_logprob is None:
             self.return_logprob = False
         if self.logprob_start_len is None:
@@ -1521,6 +1523,8 @@ class EmbeddingReqInput:
         if self.is_single:
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
+            elif not isinstance(self.rid, str):
+                raise ValueError("rid should be a string for a single request.")
             if self.sampling_params is None:
                 self.sampling_params = {}
             else:
