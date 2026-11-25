@@ -1,6 +1,8 @@
 """SM90 small-M BF16 ``x @ w.T`` (fp32 acc) in TileLang, for unquant's BF16 dispatch
 (SGLANG_HOPPER_SMALL_M_GEMV) and the Muse Spark fp32 router."""
 
+import contextlib
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -11,7 +13,6 @@ from tilelang.cuda.intrinsics.macro.wgmma_macro_generator import (
     TensorCoreIntrinEmitter as _E,
 )
 
-tilelang.set_log_level("WARNING")
 _PTX = r"""
 #include <tl_templates/cuda/intrin.h>
 namespace tl { template <> __forceinline__ __device__ bool tl_shuffle_elect<1>() { return true; } }
@@ -222,31 +223,53 @@ def _gw(TB, KC, NB, NS, PRE, F=False):
     return main
 
 
-class _Wide(threading.local):
+class _Building(threading.local):
     on = False
 
 
-_WIDE, _prefix = _Wide(), _E._initialize_wgmma_prefix
+_BUILDING = _Building()
 
 
-# TileLang 0.1.12 issues gcd(TB, 256)-wide wgmmas; the build threads (_WIDE.on) get one m64nTBk16.
-def _one_wgmma(self, n_dim):
-    _prefix(self, n_dim)
-    if _WIDE.on:
-        self.wgmma_inst_n, self.wgmma_prefix = (
-            self.warp_col_tiles,
-            f"m64n{self.warp_col_tiles}k16",
-        )
+class _QuietBuild(logging.Filter):
+    def filter(self, record):
+        return record.levelno >= logging.WARNING or not _BUILDING.on
 
 
-_E._initialize_wgmma_prefix = _one_wgmma
+@contextlib.contextmanager
+def _build_scope():
+    """Only this module's build threads (_BUILDING.on) see these, and only while they run:
+    TileLang 0.1.12 issues gcd(TB, 256)-wide wgmmas, they get one m64nTBk16;
+    and TileLang's per-kernel INFO logs are dropped."""
+    prefix = _E._initialize_wgmma_prefix
+
+    def one_wgmma(self, n_dim=16):
+        prefix(self, n_dim)
+        if _BUILDING.on:
+            self.wgmma_inst_n, self.wgmma_prefix = (
+                self.warp_col_tiles,
+                f"m64n{self.warp_col_tiles}k16",
+            )
+
+    handlers, quiet = logging.getLogger("tilelang").handlers, _QuietBuild()
+    _E._initialize_wgmma_prefix = one_wgmma
+    for h in handlers:
+        h.addFilter(quiet)
+    try:
+        yield
+    finally:
+        _E._initialize_wgmma_prefix = prefix
+        for h in handlers:
+            h.removeFilter(quiet)
 
 
 def _build(cfg):
-    _WIDE.on = True
-    k = _gw(*cfg)
-    if k.adapter.executable is None:
-        k.adapter.executable = k.adapter.get_exportable_executable().jit()
+    _BUILDING.on = True
+    try:
+        k = _gw(*cfg)
+        if k.adapter.executable is None:
+            k.adapter.executable = k.adapter.get_exportable_executable().jit()
+    finally:
+        _BUILDING.on = False
     return cfg, k
 
 
@@ -356,9 +379,12 @@ def gemv(x, w, out=None, tab=_GWR):
                 if (c := _config(m, 512, 8192, t))
             }
         )
-        with ThreadPoolExecutor(
-            16, initializer=torch.cuda.set_device, initargs=(x.device,)
-        ) as ex:
+        with (
+            _build_scope(),
+            ThreadPoolExecutor(
+                16, initializer=torch.cuda.set_device, initargs=(x.device,)
+            ) as ex,
+        ):
             list(ex.map(_build, cfgs[x.device.index :: torch.cuda.device_count()]))
             _K.update(ex.map(_build, cfgs))
     f = out.dtype == torch.float32

@@ -58,6 +58,34 @@ def test_use_admits_only_table_shapes():
             assert not g.use(1, n + 8, k, tab) and not g.use(1, n, k + 8, tab)
 
 
+def test_wide_wgmma_stays_inside_the_build():
+    """Importing the module and building its kernels leave TileLang's wgmma emitter and
+    log level as they were; the kernels still get one m64nTBk16 per k16 step."""
+    import logging
+    import subprocess
+
+    from tilelang.cuda.intrinsics.macro.wgmma_macro_generator import (
+        TensorCoreIntrinEmitter as E,
+    )
+
+    probe = (
+        "import logging, tilelang\n"
+        "from tilelang.cuda.intrinsics.macro.wgmma_macro_generator import "
+        "TensorCoreIntrinEmitter as E\n"
+        "before = (logging.getLogger('tilelang').level, E._initialize_wgmma_prefix)\n"
+        "import sglang.kernels.ops.gemm.hopper_bf16_small_m_gemv\n"
+        "assert (logging.getLogger('tilelang').level, E._initialize_wgmma_prefix) == before\n"
+    )
+    subprocess.run([sys.executable, "-c", probe], check=True)
+    stock, level = E._initialize_wgmma_prefix, logging.getLogger("tilelang").level
+    tab, f32, x, w, arg = _setup(2304, 8192, "GWC", seed=0)
+    m = 112  # TB 112: TileLang alone would issue gcd(112, 256) = 16-wide wgmmas
+    g.gemv(x[:m], arg, torch.empty(m, 2304, dtype=torch.bfloat16, device="cuda"), tab)
+    assert E._initialize_wgmma_prefix is stock
+    assert logging.getLogger("tilelang").level == level
+    assert "64, 112, 16," in g._K[g._config(m, 2304, 8192)].get_kernel_source()
+
+
 @pytest.mark.parametrize("n,k,mode", CASES)
 def test_every_m(n, k, mode):
     tab, f32, x, w, arg = _setup(n, k, mode, seed=n + k)
