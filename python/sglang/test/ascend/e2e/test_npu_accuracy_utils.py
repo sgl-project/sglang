@@ -74,10 +74,16 @@ REMOTE_EVAL_DATASETS = frozenset({"deep_swe"})
 
 # DeepSWE eval pod: an amd64 node (kubernetes.io/arch=amd64) holding a
 # ``docker:dind`` sidecar plus a python container that drives evalscope.
-# Images/arch are overridable through the pod env when the cluster mirrors
-# them under a different registry; an empty value keeps the default.
-DEEPSWE_EVAL_IMAGE = os.environ.get("DEEPSWE_EVAL_IMAGE") or "python:3.12"
-DEEPSWE_DIND_IMAGE = os.environ.get("DEEPSWE_DIND_IMAGE") or "docker:dind"
+# Images/arch are overridable through the pod env (the workflow injects the
+# cluster's SWR mirror); an empty value keeps the default.
+DEEPSWE_EVAL_IMAGE = (
+    os.environ.get("DEEPSWE_EVAL_IMAGE")
+    or "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/library/python:3.12"
+)
+DEEPSWE_DIND_IMAGE = (
+    os.environ.get("DEEPSWE_DIND_IMAGE")
+    or "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/library/docker:27-dind"
+)
 DEEPSWE_EVAL_NODE_ARCH = os.environ.get("DEEPSWE_EVAL_NODE_ARCH") or "amd64"
 # Time to get the pod scheduled and the eval container up (image pulls, node
 # availability) versus the wall-clock budget of the evaluation itself.
@@ -478,6 +484,7 @@ def _build_deepswe_eval_pod(pod_name, namespace, env_vars, share_volume, share_s
     dind_container = k8s.V1Container(
         name="dind",
         image=DEEPSWE_DIND_IMAGE,
+        image_pull_policy="IfNotPresent",
         security_context=k8s.V1SecurityContext(privileged=True),
         # Empty TLS cert dir: serve plain HTTP on 2375 so the eval container can
         # talk to it over the pod's shared network namespace.
@@ -493,6 +500,7 @@ def _build_deepswe_eval_pod(pod_name, namespace, env_vars, share_volume, share_s
     eval_container = k8s.V1Container(
         name="eval",
         image=DEEPSWE_EVAL_IMAGE,
+        image_pull_policy="IfNotPresent",
         env=[k8s.V1EnvVar(name=key, value=value) for key, value in env_vars.items()],
         command=["/bin/bash", "-c"],
         args=["bash /root/sglang/python/sglang/test/ascend/e2e/run_deepswe_eval.sh"],

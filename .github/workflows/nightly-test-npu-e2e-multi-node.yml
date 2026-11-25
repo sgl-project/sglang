@@ -89,6 +89,16 @@ on:
         type: string
         default: ''
         description: "sgl-router-build's aarch64 artifact for the router pod; empty uses the image's sgl-router."
+      deepswe_eval_image:
+        required: false
+        type: string
+        default: ''
+        description: "Image for the DeepSWE amd64 eval container; empty keeps the framework default (SWR-mirrored python:3.12)."
+      deepswe_dind_image:
+        required: false
+        type: string
+        default: ''
+        description: "Image for the DeepSWE docker:dind sidecar; empty keeps the framework default (SWR-mirrored docker:27-dind)."
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -336,6 +346,17 @@ jobs:
             fi
             echo "Test method: ${test_method}"
             CMD="${CMD} --test-method ${test_method}"
+          fi
+
+          # DeepSWE eval-pod images. Empty keeps the framework default; set them
+          # when the cluster mirrors the images under a different registry.
+          deepswe_eval_image="${{ inputs.deepswe_eval_image }}"
+          if [ -n "${deepswe_eval_image}" ]; then
+            CMD="${CMD} --deepswe-eval-image ${deepswe_eval_image}"
+          fi
+          deepswe_dind_image="${{ inputs.deepswe_dind_image }}"
+          if [ -n "${deepswe_dind_image}" ]; then
+            CMD="${CMD} --deepswe-dind-image ${deepswe_dind_image}"
           fi
 
           if [ "$prefill_decode_deployment" = "separation" ];then
