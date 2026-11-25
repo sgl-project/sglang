@@ -60,7 +60,13 @@ def _jit_hc_combine_logits_module(
         )
     if hc_count <= 0:
         raise RuntimeError(f"Unsupported hc_count {hc_count}. Must be positive.")
-    if (hc_count * hidden_size) % 2048 == 0:
+    vecs = (hc_count * hidden_size) // 8
+    split_ok = (
+        (hc_count * hidden_size) % 2048 == 0
+        and vecs % (8 * 160) == 0
+        and (hidden_size // 8) % (vecs // 8) == 0
+    )
+    if split_ok:
         return _jit_hc_combine_module(hc_count, hidden_size, dtype)
     args = make_cpp_args(hc_count, hidden_size, is_arch_support_pdl(), dtype)
     return load_jit(

@@ -641,12 +641,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         head_v_dim = v.shape[3]
 
         q_tok, k_tok, v_tok = q[0], k[0], v[0]
-        if (
-            qk_normalized
-            and q_tok.is_contiguous()
-            and k_tok.is_contiguous()
-            and v_tok.is_contiguous()
-        ):
+        if qk_normalized:
             q_fi, k_fi, v_fi = q_tok, k_tok, v_tok
         else:
             q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(q_tok, k_tok, v_tok)
@@ -715,8 +710,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             and self._supports_state_indices
             and ssm_states.dtype == state_dtype
             and ssm_states.data_ptr() % _FLASHINFER_GDN_ALIGNMENT == 0
-            and cache_indices.is_contiguous()
-            and cache_indices.shape == (num_seqs,)
             and (self._sm_major == 10 or ssm_states.is_contiguous())
         )
 
@@ -733,6 +726,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
 
         if use_direct_state:
+            direct_cache_indices = cache_indices[:num_seqs].contiguous()
             output_fi, _ = self._run_prefill(
                 q=q_fi,
                 k=k_fi,
@@ -741,7 +735,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 beta=beta_fi,
                 initial_state=ssm_states,
                 output_state=ssm_states,
-                state_indices=cache_indices,
+                state_indices=direct_cache_indices,
                 cu_seqlens=cu_seqlens,
                 output=output_fi,
                 state_checkpoints=state_checkpoints,

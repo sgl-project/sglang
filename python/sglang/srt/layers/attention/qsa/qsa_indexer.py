@@ -470,6 +470,14 @@ class QSAIndexer(MultiPlatformOp):
         )
         return torch.cat([rotated, tensor[..., rotary_dim:]], dim=-1)
 
+    @staticmethod
+    def prefill_min_scored_len(block_topk: int) -> int:
+        # fast_topk (k = 512) writes 0..length-1 for rows that fit k without
+        # reading their scores, and reads nothing past a row's length.
+        if block_topk == 512 and not is_batch_invariant_mode_enabled():
+            return block_topk
+        return 0
+
     def select_prefill_tokens(
         self,
         q: torch.Tensor,
@@ -506,13 +514,8 @@ class QSAIndexer(MultiPlatformOp):
             and q.is_cuda
             and HAS_TILELANG
         )
-        # fast_topk (k = 512) writes 0..length-1 for rows that fit k without
-        # reading their scores, and reads nothing past a row's length.
-        use_fast_topk = (
-            relative
-            and self.block_topk == 512
-            and not is_batch_invariant_mode_enabled()
-        )
+        min_scored_len = self.prefill_min_scored_len(self.block_topk)
+        use_fast_topk = relative and min_scored_len > 0
         row_chunk_size = _qsa_prefill_row_chunk_size(
             rows,
             max_row_keys if relative else compressed_keys.shape[0],
@@ -552,7 +555,7 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     max_row_keys,
                     None,
-                    self.block_topk if use_fast_topk else 0,
+                    min_scored_len if use_fast_topk else 0,
                 )
                 if use_fast_topk:
                     from sglang.kernels.ops.attention.fast_topk import fast_topk
@@ -892,13 +895,21 @@ class QSAIndexer(MultiPlatformOp):
         cp_global_rope_positions: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if out is not None:
+            return self._forward_impl(
+                hidden_states,
+                positions,
+                forward_batch,
+                indexer_metadata,
+                cp_global_rope_positions,
+                out=out,
+            )
         return self._forward_impl(
             hidden_states,
             positions,
             forward_batch,
             indexer_metadata,
             cp_global_rope_positions,
-            out=out,
         )
 
     def forward_xpu(

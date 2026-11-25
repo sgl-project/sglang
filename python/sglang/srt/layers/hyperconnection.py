@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
@@ -186,7 +187,6 @@ class GatedResidual(HyperConnectionBase):
 
         self._gate_stream = None
         self._fused_down_gate_weight = None
-        self._fused_down_gate_weight_key = None
         self._jit_combine_logits_ok = False
         if use_combine:
             self.block_inject_weight = nn.Linear(
@@ -290,18 +290,34 @@ class GatedResidual(HyperConnectionBase):
     def _get_fused_down_gate_weight(self) -> torch.Tensor:
         w_down = self.input_mix_weight_down.weight
         w_gate = self.block_inject_weight.weight
-        key = weight_cache_key(w_down, w_gate)
-        if self._fused_down_gate_weight_key == key and self._fused_down_gate_weight is not None:
-            return self._fused_down_gate_weight
-        total_out = w_down.shape[0] + w_gate.shape[0]
-        pad_rows = (-total_out) % 16
-        parts = [w_down, w_gate]
-        if pad_rows:
-            parts.append(w_down.new_zeros((pad_rows, w_down.shape[1])))
-        fused = torch.cat(parts, dim=0).contiguous()
+        lowrank = w_down.shape[0]
+        hc = w_gate.shape[0]
+        cached = self._fused_down_gate_weight
+        if (
+            cached is not None
+            and cached.device == w_down.device
+            and cached.dtype == w_down.dtype
+            and w_gate.dtype == w_down.dtype
+            and w_down.untyped_storage().data_ptr()
+            == cached.untyped_storage().data_ptr()
+            and w_gate.untyped_storage().data_ptr()
+            == cached.untyped_storage().data_ptr()
+            and w_down.storage_offset() == 0
+            and w_gate.storage_offset() == w_down.numel()
+        ):
+            return cached
+
+        total_out = lowrank + hc
+        padded_out = ((total_out + 15) // 16) * 16
+        fused = w_down.new_zeros((padded_out, w_down.shape[1]))
+        fused[:lowrank].copy_(w_down)
+        fused[lowrank:total_out].copy_(w_gate)
         if not torch.cuda.is_current_stream_capturing():
+            # Alias both parameter tensors onto the shared backing buffer so
+            # in-place weight hot reloads (param.data.copy_) update `fused`.
+            w_down.data = fused[:lowrank]
+            w_gate.data = fused[lowrank:total_out]
             self._fused_down_gate_weight = fused
-            self._fused_down_gate_weight_key = key
         return fused
 
     def _flydsl_mix_ok(self) -> bool:
@@ -400,6 +416,7 @@ class GatedResidual(HyperConnectionBase):
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
             and self.input_mix_weight_down.weight.dtype == hyper_input_normed.dtype
             and self.block_inject_weight.weight.dtype == hyper_input_normed.dtype
+            and not is_batch_invariant_mode_enabled()
             and not torch.compiler.is_compiling()
         ):
             # Fuse block_inject_weight into the down-projection TensorCore GEMM
@@ -440,6 +457,33 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed.record_stream(stream)
         return mixed_input, (hyper_input, hyper_input_normed, gate_state)
 
+    def _can_use_jit_combine_logits(
+        self,
+        block_output: torch.Tensor,
+        hyper_input: torch.Tensor,
+        gate_state: Optional[torch.Tensor],
+        next_norm: Optional[GroupedGemmaRMSNorm] = None,
+    ) -> bool:
+        if (
+            gate_state is None
+            or gate_state.ndim != 2
+            or block_output.shape[0] == 0
+            or not (block_output.is_contiguous() and hyper_input.is_contiguous())
+            or block_output.dtype != hyper_input.dtype
+            or block_output.dtype != gate_state.dtype
+            or block_output.data_ptr() % 32 != 0
+            or hyper_input.data_ptr() % 32 != 0
+        ):
+            return False
+        if next_norm is not None:
+            return (
+                next_norm.group_size == self.hidden_size
+                and next_norm.weight.dtype == block_output.dtype
+                and next_norm.weight.is_contiguous()
+                and next_norm.weight.data_ptr() % 32 == 0
+            )
+        return True
+
     def combine_and_normalize(
         self,
         block_output: torch.Tensor,
@@ -473,22 +517,8 @@ class GatedResidual(HyperConnectionBase):
                     next_norm.weight,
                     next_norm.variance_epsilon,
                 )
-            if (
-                gate_state.ndim == 2
-                and self._jit_combine_logits_ok
-                and block_output.shape[0] > 0
-                and block_output.is_cuda
-                and block_output.is_contiguous()
-                and hyper_input.is_contiguous()
-                and next_norm.weight.is_contiguous()
-                and next_norm.group_size == self.hidden_size
-                and block_output.dtype in (torch.bfloat16, torch.float16)
-                and hyper_input.dtype == block_output.dtype
-                and gate_state.dtype == block_output.dtype
-                and next_norm.weight.dtype == block_output.dtype
-                and block_output.data_ptr() % 32 == 0
-                and hyper_input.data_ptr() % 32 == 0
-                and next_norm.weight.data_ptr() % 32 == 0
+            if self._can_use_jit_combine_logits(
+                block_output, hyper_input, gate_state, next_norm
             ):
                 from sglang.kernels.ops.elementwise.hc_combine import (
                     hc_combine_logits_norm,
@@ -525,19 +555,7 @@ class GatedResidual(HyperConnectionBase):
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
 
-        if (
-            gate_state is not None
-            and gate_state.ndim == 2
-            and self._jit_combine_logits_ok
-            and block_output.is_cuda
-            and block_output.is_contiguous()
-            and hyper_input.is_contiguous()
-            and block_output.dtype in (torch.bfloat16, torch.float16)
-            and hyper_input.dtype == block_output.dtype
-            and gate_state.dtype == block_output.dtype
-            and block_output.data_ptr() % 32 == 0
-            and hyper_input.data_ptr() % 32 == 0
-        ):
+        if self._can_use_jit_combine_logits(block_output, hyper_input, gate_state):
             from sglang.kernels.ops.elementwise.hc_combine import hc_combine_logits
 
             return hc_combine_logits(

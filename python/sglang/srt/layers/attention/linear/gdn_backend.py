@@ -746,7 +746,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         # Also prewarm the Triton prefill helpers (causal_conv1d_fn and fused
         # QKV+gating+norm) so serving batches do not stall on lazy Triton JIT.
-        conv_prewarmed = set()
+        conv_prewarmed = {}
         prep_prewarmed = set()
         conv_state_len = self.conv_states_shape[-1]
         conv_state_dtype = self.state_pool.mamba_cache.conv[0].dtype
@@ -762,7 +762,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.activation,
             )
             if conv_key not in conv_prewarmed:
-                conv_prewarmed.add(conv_key)
                 conv_pool = self.state_layer_cache(layer.layer_id).conv[0]
                 if conv_pool.stride(1) == 1:
                     conv_states_tmp = torch.zeros(
@@ -776,8 +775,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         dtype=conv_state_dtype,
                         device=device,
                     )
+                conv_fn = (
+                    causal_conv1d_fn_triton
+                    if not conv_states_tmp.is_contiguous() and not is_cpu()
+                    else causal_conv1d_fn
+                )
                 has_init = torch.zeros((1,), dtype=torch.bool, device=device)
                 cache_idx = torch.ones((1,), dtype=state_indices_dtype, device=device)
+                conv_outs = {}
                 # Warm both cu_seqlen % 16 == 0 and != 0 (Triton divisibility
                 # specialization) and both block_table=None / non-None.
                 for seq_len in (64, 65):
@@ -787,7 +792,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cu_q = torch.tensor(
                         [0, seq_len], dtype=torch.int32, device=device
                     )
-                    causal_conv1d_fn(
+                    conv_out = conv_fn(
                         mixed_tmp.transpose(0, 1),
                         layer.conv_weights,
                         layer.bias,
@@ -797,7 +802,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         cache_indices=cache_idx,
                         query_start_loc=cu_q,
                         seq_lens_cpu=[seq_len],
-                    )
+                    ).transpose(0, 1)[:seq_len]
+                    conv_outs[seq_len] = conv_out
                     num_blocks = (
                         seq_len + CAUSAL_CONV1D_FWD_BLOCK_M - 1
                     ) // CAUSAL_CONV1D_FWD_BLOCK_M
@@ -806,7 +812,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         dtype=torch.int32,
                         device=device,
                     )
-                    causal_conv1d_fn(
+                    conv_fn(
                         mixed_tmp.transpose(0, 1),
                         layer.conv_weights,
                         layer.bias,
@@ -818,6 +824,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         seq_lens_cpu=[seq_len],
                         block_table=block_table,
                     )
+                conv_prewarmed[conv_key] = conv_outs
             if (is_cuda() or _is_hip) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
                 prep_key = (
                     layer.num_q_heads,
@@ -831,31 +838,43 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 if prep_key not in prep_prewarmed:
                     prep_prewarmed.add(prep_key)
-                    # causal_conv1d_fn returns [seq_len, qkv_dim] with strides (1, seq_len).
-                    # Warm both seq_len % 16 == 0 and != 0 (Triton divisibility specialization).
+                    conv_outs = conv_prewarmed[conv_key]
+                    # Match production post-conv QKV strides and both strided
+                    # [T, 2*Hv] projection views and contiguous [T, Hv] gates.
                     for seq_len in (64, 65):
-                        mixed_tmp = torch.zeros(
-                            (qkv_dim, seq_len), dtype=io_dtype, device=device
-                        ).transpose(0, 1)
-                        a_tmp = torch.zeros(
-                            (seq_len, layer.num_v_heads), dtype=io_dtype, device=device
+                        mixed_post_conv = conv_outs[seq_len]
+                        ba_packed = torch.zeros(
+                            (seq_len, 2 * layer.num_v_heads),
+                            dtype=io_dtype,
+                            device=device,
                         )
-                        b_tmp = torch.zeros_like(a_tmp)
-                        fused_qkv_gating_gdn_prefill(
-                            mixed_tmp,
-                            layer.num_q_heads,
-                            layer.num_k_heads,
-                            layer.num_v_heads,
-                            layer.head_q_dim,
-                            layer.head_k_dim,
-                            layer.head_v_dim,
-                            A_log=layer.A_log,
-                            a=a_tmp,
-                            b=b_tmp,
-                            dt_bias=layer.dt_bias,
-                            token_indices=None,
-                            exp_g=kernel.wants_exp_g,
+                        b_strided = ba_packed[:, : layer.num_v_heads]
+                        a_strided = ba_packed[:, layer.num_v_heads :]
+                        a_contig = torch.zeros(
+                            (seq_len, layer.num_v_heads),
+                            dtype=io_dtype,
+                            device=device,
                         )
+                        b_contig = torch.zeros_like(a_contig)
+                        for a_tmp, b_tmp in (
+                            (a_strided, b_strided),
+                            (a_contig, b_contig),
+                        ):
+                            fused_qkv_gating_gdn_prefill(
+                                mixed_post_conv,
+                                layer.num_q_heads,
+                                layer.num_k_heads,
+                                layer.num_v_heads,
+                                layer.head_q_dim,
+                                layer.head_k_dim,
+                                layer.head_v_dim,
+                                A_log=layer.A_log,
+                                a=a_tmp,
+                                b=b_tmp,
+                                dt_bias=layer.dt_bias,
+                                token_indices=None,
+                                exp_g=kernel.wants_exp_g,
+                            )
         # Prewarm gated RMSNorm (_layer_norm_fwd_1pass_kernel) across rows_per_block buckets,
         # covering both 2D contiguous z and 3D strided prefill z (Z_IS_3D=True).
         from sglang.kernels.ops.attention.fla.layernorm_gated import (
@@ -1749,10 +1768,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and not extend_kernel.defers_prefill_gates
             and extend_kernel.supports_pre_normalized_qk
             and not is_batch_invariant_mode_enabled()
-            and a.ndim == 2
-            and b.ndim == 2
-            and a.shape[0] == actual_seq_len
-            and b.shape[0] == actual_seq_len
         )
         qk_normalized = False
         g_is_exp = False

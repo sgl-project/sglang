@@ -1865,16 +1865,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 if self._kv_shard_pool is None
                 else getattr(metadata, "kv_shard_slot_table", None)
             )
-        if (
-            save_kv_cache
-            and topk_indices.ndim == 2
-            and cu_seqlens_q.shape[0] - 1 == bs
-            and slot_table is not None
-            and slot_table.is_cuda
-            and slot_table.stride(-1) == 1
-            and slot_table.shape[0] >= bs
-            and slot_table.shape[1] >= max(sequence_lens[:bs], default=0)
-        ):
+        if save_kv_cache and slot_table is not None and slot_table.is_cuda:
             # Every selected token, prefix or new, is in the pool now, so read
             # K/V in place instead of packing each request's whole context per layer.
             output = sparse_gqa_paged_prefill_triton(
@@ -2832,6 +2823,8 @@ def prewarm_qsa_prefill_kernels(
             runs += 1
 
     if HAS_TILELANG:
+        from sglang.srt.layers.attention.qsa.mqa import _prefill_key_splits
+
         indexer_geoms = {
             (m.index_n_heads, m.index_head_dim, m.block_topk)
             for m in model.modules()
@@ -2842,7 +2835,24 @@ def prewarm_qsa_prefill_kernels(
             k_comp = torch.zeros(
                 (64, 1, index_head_dim), dtype=scoring_dtype, device=device
             )
-            for rows, width in ((128, 2048), (4096, 2048)):
+            block_q = max(1, 128 // index_n_heads)
+            min_scored_len = QSAIndexer.prefill_min_scored_len(block_topk)
+            seen_splits = set()
+            for rows, width in (
+                (block_q, 4096),
+                (block_q * 4, 4096),
+                (block_q * 16, 4096),
+                (block_q * 32, 4096),
+                (block_q * 64, 4096),
+                (block_q * 128, 4096),
+                (block_q * 256, 4096),
+                (block_q, 64),
+            ):
+                row_blocks = (rows + block_q - 1) // block_q
+                ks = _prefill_key_splits(row_blocks, width, 64, device)
+                if ks in seen_splits:
+                    continue
+                seen_splits.add(ks)
                 q_idx = torch.zeros(
                     (rows, index_n_heads, index_head_dim),
                     dtype=scoring_dtype,
@@ -2851,7 +2861,7 @@ def prewarm_qsa_prefill_kernels(
                 starts = torch.zeros(rows, dtype=torch.int32, device=device)
                 ends = torch.ones(rows, dtype=torch.int32, device=device)
                 qsa_mqa_prefill_relative(
-                    q_idx, k_comp, starts, ends, width, None, block_topk
+                    q_idx, k_comp, starts, ends, width, None, min_scored_len
                 )
                 runs += 1
 

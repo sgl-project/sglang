@@ -200,6 +200,87 @@ def test_hc_combine_logits_and_norm_correctness(dtype, num_tokens, strided_logit
     torch.testing.assert_close(normalized, ref_norm, **norm_tol)
 
 
+def test_hc_combine_logits_non_split_shape():
+    # hc_count=5, hidden_size=2048 fails HcCombineSplitKernel's static_assert
+    # (256 % 160 != 0) and must compile via the standalone logits JIT module.
+    torch.manual_seed(7)
+    hc_count, hidden_size, rows = 5, 2048, 4
+    block_output = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(
+        rows, hc_count * hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    gate_logits = torch.randn(rows, hc_count, device="cuda", dtype=torch.bfloat16)
+    out = hc_combine_logits(block_output, residual, gate_logits, hc_count, hidden_size)
+    a = 2.0 * torch.sigmoid(gate_logits.float() / hc_count)
+    ref = (
+        residual.float().view(rows, hc_count, hidden_size)
+        + a.unsqueeze(-1) * block_output.float().unsqueeze(1)
+    ).view(rows, hc_count * hidden_size).to(torch.bfloat16)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def test_gated_residual_inplace_weight_reload_updates_fused_prefill():
+    from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
+
+    cfg = HyperConnectionConfig(
+        hc_count=4,
+        hidden_size=256,
+        params_dtype=torch.bfloat16,
+        hc_lowrank=16,
+        hc_per_branch_norm=True,
+    )
+    hc = GatedResidual(cfg).to(device="cuda", dtype=torch.bfloat16).eval()
+    with torch.no_grad():
+        hc.input_mix_weight_down.weight.data.fill_(-0.01)
+        hc.block_inject_weight.weight.data.fill_(1.0)
+        hc.input_mix_weight_up.weight.data.fill_(0.1)
+
+    x = torch.ones(260, 4 * 256, device="cuda", dtype=torch.bfloat16) * 0.01
+    mixed_before, residuals_before = hc.mix(x)
+    assert residuals_before[2] is not None and residuals_before[2].ndim == 2
+
+    # Simulate default weight loader in-place copy_ hot reload.
+    with torch.no_grad():
+        hc.input_mix_weight_down.weight.data.copy_(
+            torch.full_like(hc.input_mix_weight_down.weight.data, 0.01)
+        )
+        hc.block_inject_weight.weight.data.copy_(
+            torch.full_like(hc.block_inject_weight.weight.data, 7.0)
+        )
+
+    fused = hc._get_fused_down_gate_weight()
+    assert torch.all(fused[:16] == torch.tensor(0.01, dtype=torch.bfloat16, device="cuda"))
+    assert torch.all(fused[16:20] == 7.0)
+    mixed_after, residuals_after = hc.mix(x)
+    assert not torch.equal(residuals_before[2], residuals_after[2])
+    assert not torch.equal(mixed_before, mixed_after)
+
+
+def test_gated_residual_batch_invariant_across_256_threshold(monkeypatch):
+    from sglang.srt.layers import hyperconnection as hc_mod
+    from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
+
+    monkeypatch.setattr(hc_mod, "is_batch_invariant_mode_enabled", lambda: True)
+    cfg = HyperConnectionConfig(
+        hc_count=4,
+        hidden_size=512,
+        params_dtype=torch.bfloat16,
+        hc_lowrank=16,
+        hc_per_branch_norm=True,
+    )
+    hc = GatedResidual(cfg).to(device="cuda", dtype=torch.bfloat16).eval()
+    torch.manual_seed(0)
+    x_257 = torch.randn(257, 4 * 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    y_257 = torch.ones(257, 512, device="cuda", dtype=torch.bfloat16)
+
+    _, res_256 = hc.mix(x_257[:256])
+    _, res_257 = hc.mix(x_257)
+    assert res_256[2] is None and res_257[2] is None
+    out_256 = hc.combine(y_257[:256], res_256)
+    out_257 = hc.combine(y_257, res_257)
+    assert torch.equal(out_256[0], out_257[0])
+
+
 if __name__ == "__main__":
     import sys
 

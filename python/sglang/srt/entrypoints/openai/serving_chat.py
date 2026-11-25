@@ -1163,13 +1163,14 @@ class OpenAIServingChat(OpenAIServingBase):
         # ids instead. Only when nothing needs placeholder expansion: with media
         # attached the MM processor still has to tokenize the text itself.
         prefers_prompt_ids = (
-            self._prompt_text_round_trip_is_lossy
+            (self._prompt_text_round_trip_is_lossy or not processed_messages.prompt)
             and isinstance(processed_messages.prompt_ids, list)
             and processed_messages.prompt_ids
             and not (
                 processed_messages.image_data
                 or processed_messages.video_data
                 or processed_messages.audio_data
+                or getattr(processed_messages, "modalities", None)
             )
         )
         if (
