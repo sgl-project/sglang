@@ -18,7 +18,7 @@ GigaChat 4 supports both **instant** and **reasoning** modes in the same checkpo
 
 - **Low-Latency** — enables speculative decoding with the model’s built-in Multi-Token Prediction (MTP) layer to reduce time between output tokens. Start here for chat and agent loops.
 - **High-Throughput** — speculative decoding off, for tuning workloads with many concurrent requests. Compare it with MTP on your workload before choosing a serving strategy.
-- **DFlash2** — speculative decoding with a separate BF16 draft and a learned path selector. Set **DFlash2 draft path** in the command placeholders to a draft trained for the same target checkpoint.
+- **DFlash2** — speculative decoding with a separate BF16 draft and a learned path selector. Download the checkpoint's `dflash_draft/` directory before launching; **DFlash2 draft path** defaults to `dflash_draft`.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/ai-sage/gigachat4.jsx";
@@ -84,9 +84,13 @@ for reasoning in (False, True):
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": "What is 17 times 24?"}],
-        temperature=0,
+        temperature=1.0,
+        top_p=1.0,
         max_tokens=4096,
-        extra_body={"chat_template_kwargs": {"reasoning": reasoning}},
+        extra_body={
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": {"reasoning": reasoning},
+        },
     )
     message = response.choices[0].message
     print("Reasoning enabled:", reasoning)
@@ -96,19 +100,19 @@ for reasoning in (False, True):
 
 </Accordion>
 
-**Sampling.** The example uses `temperature=0` for greedy decoding. To sample, set `temperature` and `top_p` in the client request; SGLang's `repetition_penalty` goes in `extra_body`, alongside `chat_template_kwargs`:
+**Sampling.** Set `temperature` and `top_p` in the client request; SGLang's `repetition_penalty` goes in `extra_body`, alongside `chat_template_kwargs`:
 
 ```python Sampling parameters
 # Reuse client and model from the previous example.
 response = client.chat.completions.create(
     model=model,
     messages=[{"role": "user", "content": "Write a short story about a lighthouse."}],
-    temperature=0.3,
-    top_p=0.8,
+    temperature=1.0,
+    top_p=1.0,
     seed=42,
     max_tokens=4096,
     extra_body={
-        "repetition_penalty": 1.1,
+        "repetition_penalty": 1.0,
         "chat_template_kwargs": {"reasoning": False},
     },
 )
@@ -136,9 +140,13 @@ for prompt in (
     response = client.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=0,
+        temperature=1.0,
+        top_p=1.0,
         max_tokens=4096,
-        extra_body={"chat_template_kwargs": {"reasoning": True}},
+        extra_body={
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": {"reasoning": True},
+        },
     )
     message = response.choices[0].message
     print("Reasoning:", getattr(message, "reasoning_content", None))
@@ -187,9 +195,13 @@ for _ in range(4):
         messages=messages,
         tools=tools,
         tool_choice="auto",
-        temperature=0,
+        temperature=1.0,
+        top_p=1.0,
         max_tokens=4096,
-        extra_body={"chat_template_kwargs": {"reasoning": False}},
+        extra_body={
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": {"reasoning": False},
+        },
     )
     message = response.choices[0].message
     print("Reasoning:", getattr(message, "reasoning_content", None))
@@ -229,10 +241,14 @@ Set `stream=True` in the same `chat.completions.create` request. Thinking and an
 stream = client.chat.completions.create(
     model=model,
     messages=[{"role": "user", "content": "Explain the Pythagorean theorem simply."}],
-    temperature=0,
+    temperature=1.0,
+    top_p=1.0,
     max_tokens=4096,
     stream=True,
-    extra_body={"chat_template_kwargs": {"reasoning": True}},
+    extra_body={
+        "repetition_penalty": 1.0,
+        "chat_template_kwargs": {"reasoning": True},
+    },
 )
 content_parts = []
 print("Reasoning:")
@@ -263,10 +279,14 @@ stream = client.chat.completions.create(
     messages=[{"role": "user", "content": "What's the weather in London and Paris?"}],
     tools=tools,
     tool_choice="auto",
-    temperature=0,
+    temperature=1.0,
+    top_p=1.0,
     max_tokens=4096,
     stream=True,
-    extra_body={"chat_template_kwargs": {"reasoning": False}},
+    extra_body={
+        "repetition_penalty": 1.0,
+        "chat_template_kwargs": {"reasoning": False},
+    },
 )
 calls = {}
 for chunk in stream:
@@ -305,15 +325,25 @@ The **Low-Latency** recipe runs the checkpoint's own NextN layer through EAGLE. 
 
 The **DFlash2** recipe uses a separate draft trained for the target checkpoint. The draft combines grouped convolutions with a learned path selector over token candidates. It has its own weights and layer count; it does not use the target's bundled MTP layer.
 
+Download the draft from the model repository into `./dflash_draft`. Run this command on each node, or use a shared working directory:
+
+```bash Download the draft
+hf download ai-sage/GigaChat4-708B-A41B \
+  --include "dflash_draft/*" \
+  --local-dir .
+```
+
+Run the deployment command from the same working directory, using these DFlash2 flags:
+
 ```bash Flags
 --speculative-algorithm DFLASH \
 --speculative-dflash-block-size 8 \
---speculative-draft-model-path "$DRAFT_MODEL_PATH" \
+--speculative-draft-model-path dflash_draft \
 --speculative-draft-model-quantization unquant \
 --speculative-draft-attention-backend flashinfer
 ```
 
-- **Use a matching draft.** Set **DFlash2 draft path** in the deployment panel. The draft config must identify `GigaChat4DFlash2DraftModel` and contain the trained `dflash_config`, including the target depth. A draft trained for a different target size is not interchangeable.
+- **Use a matching draft.** The bundled `dflash_draft/` directory contains the draft for this target. If you download it elsewhere, update **DFlash2 draft path** in the deployment panel. The draft config must identify `GigaChat4DFlash2DraftModel` and contain the trained `dflash_config`, including the target depth. A draft trained for a different target size is not interchangeable.
 - **Keep the MLA draft in BF16.** The target can remain FP8. `unquant` prevents the draft from inheriting the target's quantization setting; the current MLA draft implementation requires unquantized weights.
 - **Configure the draft backend separately.** `--speculative-draft-attention-backend flashinfer` applies to the draft's dense MLA attention. The target keeps its DSA attention backend.
 - **Choose the block size for the trained draft.** The preset uses eight positions: one anchor and seven proposed tokens. Check the draft's configuration before changing it.

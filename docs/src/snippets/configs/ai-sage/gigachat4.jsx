@@ -15,7 +15,7 @@ export const config = {
   placeholders: {
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
     PORT: { target: "command", label: "Bind port", default: "30000" },
-    DRAFT_MODEL_PATH: { target: "command", label: "DFlash2 draft path", default: "/path/to/GigaChat4-DFlash2" },
+    DRAFT_MODEL_PATH: { target: "command", label: "DFlash2 draft path", default: "dflash_draft" },
     CURL_HOST: { target: "curl", label: "Server host", default: "localhost" },
     CURL_PORT: { target: "curl", label: "Server port", default: "30000" },
   },
@@ -106,7 +106,7 @@ export const config = {
             "--speculative-draft-model-quantization unquant",
             "--speculative-draft-attention-backend flashinfer",
           ],
-          note: "Set the DFlash2 draft path in the command placeholders. Use a BF16 MLA draft trained for the same target checkpoint.",
+          note: "Download dflash_draft/ from the target model repository before launching. Update the draft path if you download it elsewhere. Keep the MLA draft in BF16.",
         },
       ],
     },
