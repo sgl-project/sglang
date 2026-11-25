@@ -313,8 +313,7 @@ class TestSlotLifecycle(_PoolTestCase):
         """A retraction frees the slot and keeps the penalty index; the
         re-admission writes both to the request's new slot."""
         pool = SamplingParamsPool(
-            num_rows=NUM_ROWS,
-            device=DEVICE,
+            SamplingParamsTable(NUM_ROWS, DEVICE),
             penalty_status_pool=SimpleNamespace(kinds=[0, 0, 1]),
         )
         req = _req(1, seed=7, top_k=20, penalty_index=2)
@@ -333,8 +332,7 @@ class TestSlotLifecycle(_PoolTestCase):
         slot overwrites every field, host copies included."""
         self.exec_ns = _exec(watermark_algorithm="synthid")
         pool = SamplingParamsPool(
-            num_rows=NUM_ROWS,
-            device=DEVICE,
+            SamplingParamsTable(NUM_ROWS, DEVICE),
             penalty_status_pool=SimpleNamespace(kinds=[0, 1]),
         )
         pool.write([_req(3, seed=5, top_k=50, penalty_index=1)])
