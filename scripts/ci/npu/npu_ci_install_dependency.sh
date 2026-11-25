@@ -81,9 +81,8 @@ case "${DEVICE_TYPE}" in
         ;;
 esac
 
-${PIP_INSTALL} "memfabric-hybrid==1.5.0.dev20261123" \
-    --trusted-host ascend.devcloud.huaweicloud.com \
-    --index-url https://ascend.devcloud.huaweicloud.com/pypi/simple
+${PIP_INSTALL} "memfabric-hybrid==1.5.0.dev20261124" \
+    --index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly/
 
 command -v mfcli
 mfcli kernel install --soc-version "${MF_SOC_VERSION}"
