@@ -7,12 +7,12 @@
 
 use crate::config::{ConflictPolicy, ModelConfig, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
-use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::proxy::grpc::{sampling_value, RoutingView};
 use crate::server::error::ApiError;
 use crate::server::metrics::{InputIdsForwarding, MediaCounts, MetricsRegistry};
 use crate::state::kv_events::CacheNamespace;
 use crate::tokenizer::chat_formatter::ChatTemplateKwargs;
+use crate::tokenizer::prompt::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::tokenizer::{ForwardingScope, TokenizerRegistry};
 use axum::http::HeaderMap;
 use bytes::Bytes;

@@ -646,10 +646,13 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     let value = body("hello world");
     let config = config_for("");
     let tokenizers = TokenizerRegistry::load_from_config(&config).unwrap();
-    let ids =
-        sgl_router::policies::request_tokens_for(&tokenizers, &ModelId("tiny".into()), &value)
-            .unwrap()
-            .ids;
+    let ids = sgl_router::tokenizer::prompt::request_tokens_for(
+        &tokenizers,
+        &ModelId("tiny".into()),
+        &value,
+    )
+    .unwrap()
+    .ids;
     let hashes = compute_block_hashes(&ids, 1);
     let tree = Arc::new(HashTree::new());
     for worker in [&rejected, &owner] {
