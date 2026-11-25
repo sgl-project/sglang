@@ -3675,6 +3675,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
+                elif (
+                    self.forward_mode.is_extend()
+                    and req.kv.holds_kv
+                    and req.session is not None
+                    and req.session.streaming
+                ):
+                    # A streaming session chunk extends the session's own row on a
+                    # prefix-sharing cache; it retires SWA behind the window as decode
+                    # does, otherwise a long session holds every SWA row it wrote and
+                    # concurrent sessions exhaust the SWA pool. Later chunks of a plain
+                    # chunked prefill also hold their row but keep their SWA until
+                    # decode. Under overlap the previous extend of this row may still
+                    # be in flight.
+                    pre_len = self.prefix_lens[idx]
+                    chunk = get_schedule().chunked_prefill_size
+                    if self.enable_overlap and chunk > 0:
+                        pre_len -= chunk
+                    self._evict_swa(req, pre_len)
             self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
