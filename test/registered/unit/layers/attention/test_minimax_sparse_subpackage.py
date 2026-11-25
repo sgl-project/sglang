@@ -7,11 +7,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention import (
-    minimax_sparse_backend,
-    minimax_sparse_backend_hip,
-    minimax_sparse_nvfp4_backend,
-)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.minimax_sparse import (
     MiniMaxBF16SparseAttnBackend,
@@ -50,7 +45,7 @@ class TestMiniMaxSparseSubpackageDispatch(CustomTestCase):
             model_config=SimpleNamespace(quantization=quantization),
         )
 
-    def test_subclass_hierarchy_and_compat_reexports(self):
+    def test_subclass_hierarchy(self):
         for cls in (
             MiniMaxBF16SparseAttnBackend,
             MiniMaxROCmSparseAttnBackend,
@@ -62,20 +57,6 @@ class TestMiniMaxSparseSubpackageDispatch(CustomTestCase):
             self.assertTrue(issubclass(cls, AttentionBackend))
 
         self.assertIs(MiniMaxSparseNvfp4AttnBackend, MiniMaxMSAV1AttnBackend)
-        self.assertIs(
-            minimax_sparse_backend.MiniMaxSparseAttnBackend, MiniMaxSparseAttnBackend
-        )
-        self.assertIs(
-            minimax_sparse_backend.MiniMaxHybridAttnBackend, MiniMaxHybridAttnBackend
-        )
-        self.assertIs(
-            minimax_sparse_nvfp4_backend.MiniMaxSparseNvfp4AttnBackend,
-            MiniMaxMSAV1AttnBackend,
-        )
-        self.assertIs(
-            minimax_sparse_backend_hip.MiniMaxROCmSparseAttnBackend,
-            MiniMaxROCmSparseAttnBackend,
-        )
 
     def test_resolve_backend_cls_by_platform_and_quantization(self):
         with (

@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     ShortConvHybridAttnBackend,
 )
-from sglang.srt.layers.attention.minimax_sparse_backend import (
+from sglang.srt.layers.attention.minimax_sparse import (
     MiniMaxHybridAttnBackend,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
