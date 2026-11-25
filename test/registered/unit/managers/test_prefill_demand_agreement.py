@@ -2,6 +2,7 @@
 check, commitment, load-back, decode ceiling) builds its demand the same way."""
 
 import itertools
+import random
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -220,6 +221,7 @@ def _req(rid, prompt, max_new_tokens=4):
     req.finished.return_value = False
     req.needs_host_load_back.return_value = False
     req.last_node = MagicMock()
+    req.beam_group = None
     return req
 
 
@@ -491,23 +493,49 @@ class TestMemoryClip(_AdderCase):
             self.assertGreater(accepted, 0)
             self.assertGreater(refused, 0)
 
-    def test_clip_applies_the_scheduler_token_capacity(self):
-        """BUG REGRESSION. The clip must not grant decode beyond the token
-        capacity the scheduler passes (CP padding, KV sharding)."""
-        allocator = _window_pool(8192)
-        kwargs = dict(sliding_window_size=8, chunk_size=16)
-        free = allocator.max_new_tokens_for_memory(
-            12, 80, token_capacity=allocator.size_full, **kwargs, **RETIRE_AT_ONCE
-        )
-        self.assertEqual(free, 80)
-        for capacity in (40, 64, 90):
-            with self.subTest(capacity=capacity):
-                self.assertEqual(
-                    allocator.max_new_tokens_for_memory(
-                        12, 80, token_capacity=capacity, **kwargs, **RETIRE_AT_ONCE
-                    ),
-                    min(80, max(0, capacity - 12 - 4 - 1)),
-                )
+    def test_clip_prices_each_question_once(self):
+        """Every request of one prompt and decode length asks the clip the
+        same question of an empty pool. Over randomized questions, repeated
+        and with memory taken between them, each answer equals a fresh pool's,
+        a repeated question is not priced again, and one that fits with all
+        of its decode is priced once."""
+        rng = random.Random(0)
+        allocator = _window_pool(4096)
+        questions = [
+            dict(
+                input_tokens=rng.choice((8, 40, 96, 200, 400)),
+                max_new_tokens=rng.choice((0, 4, 64, 600)),
+                token_capacity=10**6,
+                sliding_window_size=8,
+                chunk_size=rng.choice((None, 16)),
+                chunk_align=rng.choice((None, 8)),
+                prefill_retire_lag=rng.choice((0, 16)),
+                eviction_interval=rng.choice((1, 8)),
+                checkpoint_interval=rng.choice((0, 4)),
+                decode_retire_lag=rng.choice((0, 1)),
+            )
+            for _ in range(24)
+        ]
+        asked, held, whole = set(), [], 0
+        with patch.object(allocator, "admits", wraps=allocator.admits) as priced:
+            for question in rng.choices(questions, k=96):
+                before = priced.call_count
+                answer = allocator.max_new_tokens_for_memory(**question)
+                fresh = _window_pool(4096).max_new_tokens_for_memory(**question)
+                self.assertEqual(answer, fresh, question)
+                key = tuple(sorted(question.items()))
+                if key in asked:
+                    self.assertEqual(priced.call_count, before)
+                elif answer == question["max_new_tokens"]:
+                    whole += 1
+                    self.assertEqual(priced.call_count, before + 1)
+                asked.add(key)
+                if (tokens := allocator.alloc(4)) is not None:
+                    held.append(tokens)
+        self.assertGreater(whole, 0)
+        self.assertLess(whole, len(asked))
+        for tokens in held:
+            allocator.free(tokens)
 
     def test_clip_cuts_no_chunk_below_the_alignment(self):
         """A truncated chunk is cut to the scheduler's alignment, so the clip

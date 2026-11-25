@@ -31,17 +31,20 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
             )
         return
     architectures = model_config_of(server_args).hf_config.architectures
+    architecture = architectures[0] if architectures else None
     validate_layernorm_sp(
-        architecture=architectures[0] if architectures else None,
+        architecture=architecture,
         tp_size=cfg.tp_size,
         ep_size=cfg.ep_size,
+        pp_size=cfg.pp_size,
+        attn_cp_size=cfg.attn_cp_size,
         quantization=cfg.quantization,
         moe_a2a_backend=cfg.moe_a2a_backend,
         moe_runner_backend=cfg.moe_runner_backend,
         attn_dp_enabled=attn_dp_enabled_of(cfg),
         speculative_algorithm=cfg.speculative_algorithm,
-        pp_size=cfg.pp_size,
         enable_megamoe_for_layernorm_sp=use_megamoe,
+        enable_attn_tp_input_scattered=cfg.enable_attn_tp_input_scattered,
     )
     if architectures and architectures[0] in ("MuseSparkForConditionalGeneration",):
         from sglang.srt.environ import envs
@@ -154,13 +157,16 @@ def validate_layernorm_sp(
     speculative_algorithm: Optional[str],
     pp_size: int = 1,
     ep_size: int = 1,
+    attn_cp_size: int = 1,
     quantization: Optional[str] = None,
     moe_a2a_backend: str = "none",
     moe_runner_backend: str = "auto",
     enable_megamoe_for_layernorm_sp: bool = False,
+    enable_attn_tp_input_scattered: bool = False,
 ) -> None:
     """Fail loud for unsupported / incompatible configs. Callers gate on the flag."""
     from sglang.srt.layers.layernorm_sp import (
+        KIMI_K3_SP_ARCHITECTURES,
         SP_SUPPORTED_ARCHITECTURES,
         is_muse_spark_architecture,
     )
@@ -176,6 +182,28 @@ def validate_layernorm_sp(
         raise ValueError(
             "--enable-layernorm-sp requires tp_size > 1: there is no sequence to "
             "shard across a single TP rank."
+        )
+    if architecture and architecture.startswith("Qwen4Exp"):
+        if ep_size != tp_size:
+            raise ValueError(
+                "--enable-layernorm-sp requires ep_size == tp_size for Qwen4Exp; "
+                f"got ep_size={ep_size}, tp_size={tp_size}."
+            )
+        if attn_cp_size != 1:
+            raise ValueError(
+                "--enable-layernorm-sp requires attn_cp_size == 1 for Qwen4Exp; "
+                f"got attn_cp_size={attn_cp_size}."
+            )
+    if architecture in KIMI_K3_SP_ARCHITECTURES and attn_cp_size != 1:
+        raise ValueError(
+            "--enable-layernorm-sp requires attn_cp_size == 1 for Kimi-K3; "
+            f"got attn_cp_size={attn_cp_size}."
+        )
+    if architecture == "Glm5NextForConditionalGeneration":
+        _validate_glm5_next_layernorm_sp(
+            attn_cp_size=attn_cp_size,
+            moe_a2a_backend=moe_a2a_backend,
+            enable_attn_tp_input_scattered=enable_attn_tp_input_scattered,
         )
     if is_muse_spark_architecture(architecture):
         if (tp_size, ep_size) not in ((4, 4), (8, 8)):
@@ -215,19 +243,49 @@ def validate_layernorm_sp(
             "SP shards the sequence across the full TP group, which under DP "
             "attention spans data-parallel groups holding different sequences."
         )
-    if speculative_algorithm is not None and not (
+    gathers_aux_hidden_states = (
         is_muse_spark_architecture(architecture) and speculative_algorithm == "DFLASH"
-    ):
+    ) or (
+        architecture in KIMI_K3_SP_ARCHITECTURES
+        and speculative_algorithm in ("DFLASH", "DSPARK")
+    )
+    if speculative_algorithm is not None and not gathers_aux_hidden_states:
         raise ValueError(
             "--enable-layernorm-sp supports speculative decoding only with "
-            "Muse Spark DFLASH: other models/algorithms do not gather the "
-            "sequence-sharded auxiliary hidden states."
+            "Muse Spark DFLASH and Kimi-K3 DFLASH / DSPARK: other "
+            "models/algorithms do not gather the sequence-sharded auxiliary "
+            "hidden states."
         )
     if pp_size > 1:
         raise ValueError(
             "--enable-layernorm-sp is not compatible with pipeline parallelism: "
             "only the first rank's stack starts the sequence-sharded region, so "
             "the next rank would receive a stream it does not expect."
+        )
+
+
+def _validate_glm5_next_layernorm_sp(
+    *,
+    attn_cp_size: int,
+    moe_a2a_backend: str,
+    enable_attn_tp_input_scattered: bool,
+) -> None:
+    # GLM's SP layer runs attention and the FFN on gathered rows over the TP
+    # group; these modes move or split those rows themselves.
+    if attn_cp_size != 1:
+        raise ValueError(
+            "--enable-layernorm-sp requires attn_cp_size == 1 for GLM-5.3-Flash; "
+            f"got attn_cp_size={attn_cp_size}."
+        )
+    if moe_a2a_backend != "none":
+        raise ValueError(
+            "--enable-layernorm-sp requires --moe-a2a-backend none for "
+            f"GLM-5.3-Flash; got {moe_a2a_backend}."
+        )
+    if enable_attn_tp_input_scattered:
+        raise ValueError(
+            "--enable-layernorm-sp and --enable-attn-tp-input-scattered both "
+            "shard GLM-5.3-Flash's token rows; enable one of them."
         )
 
 
