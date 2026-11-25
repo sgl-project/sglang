@@ -7,16 +7,13 @@ The Ascend attention backend has three selectable execution paths:
   ``flash_attn_npu_v3`` package),
 * FIA - torch_npu fused-infer-attention when ``ASCEND_USE_FIA=1``.
 
-RL training alternates rollout and training steps on the same models, and A5
-products pin FIA while A3 machines default elsewhere, so greedy token ids and
-logprobs must agree across these paths. Each case launches one server per
-available path with identical inputs and compares the responses.
-
-The FA3 side is capability-gated: when ``flash_attn_npu_v3`` is not installed
-FA3 simply joins no comparison, and default-versus-FIA still runs, so the suite
-never fails for a missing optional package.
+On A3, each case launches one server per available path with identical inputs
+and compares greedy token IDs and logprobs. FA3 participates when its extension
+is available. On A5, the default prefill operator cannot run on Ascend 950DT,
+so the comparisons skip and separate FIA cases validate generation outputs.
 """
 
+import math
 import os
 import unittest
 
@@ -26,6 +23,7 @@ from sglang.test.ascend.test_ascend_utils import (
     QWEN3_8B_WEIGHTS_PATH,
 )
 from sglang.test.ascend.test_npu_rl_utils import (
+    _is_ascend_950,
     assert_logprob_signature_equal,
     generate,
     logprob_signature,
@@ -94,6 +92,9 @@ HAVE_QWEN3_8B = os.path.isfile(os.path.join(QWEN3_8B_WEIGHTS_PATH, "config.json"
 HAVE_EAGLE3_DRAFT = os.path.isfile(
     os.path.join(QWEN3_8B_EAGLE3_WEIGHTS_PATH, "config.json")
 )
+IS_A5 = _is_ascend_950()
+A5_COMPARISON_SKIP = "A5 uses FIA-only coverage; default prefill is unsupported"
+FIA_ENV = {"ASCEND_USE_FIA": "1", "ASCEND_USE_FA": "0"}
 
 
 def _fa3_available():
@@ -106,10 +107,9 @@ def _fa3_available():
 
 def _available_backends():
     """Return [(name, env-overrides)] for every usable attention path."""
-    # Override both flags, including FIA inherited from the A5 RL environment.
     backends = [
         ("default", {"ASCEND_USE_FIA": "0", "ASCEND_USE_FA": "0"}),
-        ("fia", {"ASCEND_USE_FIA": "1", "ASCEND_USE_FA": "0"}),
+        ("fia", FIA_ENV),
     ]
     if _fa3_available():
         backends.append(("fa3", {"ASCEND_USE_FIA": "0", "ASCEND_USE_FA": "1"}))
@@ -154,21 +154,24 @@ def _collect_chunked(base_url):
     return tuple(body["output_ids"])
 
 
+def _run_backend(model_path, extra_args, collectors, env_extra):
+    with npu_server(
+        model_path,
+        extra_args=extra_args,
+        env={**npu_rl_env(), **env_extra},
+    ) as base_url:
+        return {key: collector(base_url) for key, collector in collectors.items()}
+
+
 def _run_per_backend(extra_args, collectors, *, model_path=QWEN3_0_6B_WEIGHTS_PATH):
     """Collect once per available backend, one server at a time."""
-    results = {}
-    for name, env_extra in _available_backends():
-        with npu_server(
-            model_path,
-            extra_args=extra_args,
-            env={**npu_rl_env(), **env_extra},
-        ) as base_url:
-            results[name] = {
-                key: collector(base_url) for key, collector in collectors.items()
-            }
-    return results
+    return {
+        name: _run_backend(model_path, extra_args, collectors, env_extra)
+        for name, env_extra in _available_backends()
+    }
 
 
+@unittest.skipIf(IS_A5, A5_COMPARISON_SKIP)
 @unittest.skipUnless(HAVE_QWEN3_06B, f"model not found: {QWEN3_0_6B_WEIGHTS_PATH}")
 class TestNpuAscendAttentionConsistency(CustomTestCase):
     """Single / mixed-batch / logprob outputs must agree across attention paths."""
@@ -209,6 +212,7 @@ class TestNpuAscendAttentionConsistency(CustomTestCase):
             )
 
 
+@unittest.skipIf(IS_A5, A5_COMPARISON_SKIP)
 @unittest.skipUnless(HAVE_QWEN3_06B, f"model not found: {QWEN3_0_6B_WEIGHTS_PATH}")
 class TestNpuAscendAttentionChunkedPrefillConsistency(CustomTestCase):
     """Multi-chunk prefill must produce the same tokens on every path."""
@@ -229,6 +233,7 @@ class TestNpuAscendAttentionChunkedPrefillConsistency(CustomTestCase):
             )
 
 
+@unittest.skipIf(IS_A5, A5_COMPARISON_SKIP)
 @unittest.skipUnless(
     HAVE_EAGLE3_DRAFT, f"draft model not found: {QWEN3_8B_EAGLE3_WEIGHTS_PATH}"
 )
@@ -249,6 +254,56 @@ class TestNpuAscendAttentionSpecConsistency(CustomTestCase):
                 self.results[right]["spec"],
                 f"speculative: {left} vs {right} differ",
             )
+
+
+@unittest.skipUnless(IS_A5, "FIA-only coverage is for A5")
+class TestNpuAscendAttentionFia(CustomTestCase):
+    """Validate FIA generation without a cross-backend reference on A5."""
+
+    def _assert_token_rows(self, rows):
+        self.assertEqual(len(rows), len(PROMPTS))
+        for token_ids in rows:
+            self.assertEqual(len(token_ids), MAX_NEW_TOKENS)
+
+    @unittest.skipUnless(HAVE_QWEN3_06B, f"model not found: {QWEN3_0_6B_WEIGHTS_PATH}")
+    def test_single_mixed_and_logprobs(self):
+        results = _run_backend(
+            QWEN3_0_6B_WEIGHTS_PATH,
+            BASE_ARGS,
+            {
+                "single": _collect_single,
+                "mixed": _collect_mixed,
+                "logprob": _collect_logprob,
+            },
+            FIA_ENV,
+        )
+        self._assert_token_rows(results["single"])
+        self._assert_token_rows(results["mixed"])
+        self.assertEqual(len(results["logprob"]), len(PROMPTS))
+        for token_ids, logprobs in results["logprob"]:
+            self.assertEqual(len(token_ids), MAX_NEW_TOKENS)
+            self.assertEqual(len(logprobs), len(token_ids))
+            self.assertTrue(all(math.isfinite(value) for value in logprobs), logprobs)
+
+    @unittest.skipUnless(HAVE_QWEN3_06B, f"model not found: {QWEN3_0_6B_WEIGHTS_PATH}")
+    def test_chunked_prefill(self):
+        results = _run_backend(
+            QWEN3_0_6B_WEIGHTS_PATH,
+            (*BASE_ARGS, "--chunked-prefill-size", "256"),
+            {"chunked": _collect_chunked},
+            FIA_ENV,
+        )
+        self.assertEqual(len(results["chunked"]), MAX_NEW_TOKENS)
+
+    @unittest.skipUnless(
+        HAVE_EAGLE3_DRAFT, f"draft model not found: {QWEN3_8B_EAGLE3_WEIGHTS_PATH}"
+    )
+    @unittest.skipUnless(HAVE_QWEN3_8B, f"model not found: {QWEN3_8B_WEIGHTS_PATH}")
+    def test_speculative_decoding(self):
+        results = _run_backend(
+            QWEN3_8B_WEIGHTS_PATH, SPEC_ARGS, {"spec": _collect_single}, FIA_ENV
+        )
+        self._assert_token_rows(results["spec"])
 
 
 if __name__ == "__main__":
