@@ -1094,6 +1094,86 @@ class TestAllocationIntegration(CustomTestCase):
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Failed)
 
+    def test_worker_survives_a_room_cleared_between_its_cleanup_status_reads(self):
+        """An abort that lands during worker cleanup lets the scheduler clear the
+        room while the worker is still reading its status."""
+        from sglang.srt.disaggregation.common.conn import KVTransferError
+
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        mgr = self.prefill
+        mgr._staging_outstanding = defaultdict(int)
+        mgr.session_lock = threading.Lock()
+        mgr.failed_sessions = set()
+        mgr.state_layout_rejections = {}
+        mgr.state_strides_validated = set()
+        mgr.enable_deferred_decode_kv_release = True
+        mgr.decode_kv_args_table = {
+            "session": SimpleNamespace(
+                requires_dcp_relayout=False, dst_aux_ptrs=[], dst_aux_item_lens=None
+            )
+        }
+        mgr._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
+        mgr.send_aux = Mock(return_value=0)
+        mgr.transfer_infos[1] = {
+            "session": SimpleNamespace(
+                is_dummy=False,
+                mooncake_session_id="session",
+                dst_kv_indices=[],
+                dst_device_kv_indices=None,
+                endpoint="decode",
+                dst_port=2,
+                room=1,
+                required_dst_info_num=1,
+            )
+        }
+        steps = []
+
+        def scheduler_clears_once():
+            # The scheduler polls Failed and clears the room after the worker's
+            # next status read.
+            if steps == ["aborted"]:
+                steps.append("cleared")
+                with self.assertRaises(KVTransferError):
+                    sender.failure_exception()
+
+        class Statuses(dict):
+            def get(table, room, default=None):
+                status = dict.get(table, room, default)
+                scheduler_clears_once()
+                return status
+
+        mgr.request_status = Statuses(mgr.request_status)
+        check_status, note_send_finished = mgr.check_status, mgr.note_send_finished
+
+        def check_then_clear(room):
+            status = check_status(room)
+            scheduler_clears_once()
+            return status
+
+        def abort_after_uncount(room, record=None):
+            note_send_finished(room, record)
+            self.assertEqual(mgr._staging_outstanding[room], 0)
+            sender.abort()
+            steps.append("aborted")
+
+        mgr.check_status = check_then_clear
+        mgr.note_send_finished = abort_after_uncount
+        chunk = TransferKVChunk(
+            room=1,
+            index_slice=slice(0, 0),
+            prefill_kv_indices=[],
+            is_last_chunk=True,
+            state_indices=None,
+            prefill_aux_index=0,
+        )
+        mgr.transfer_worker(Mock(get=Mock(side_effect=[chunk, None])), None)
+        self.assertEqual(steps, ["aborted", "cleared"])
+        self.assertNotIn(1, mgr._staging_outstanding)
+        self.assertNotIn(1, mgr.request_status)
+
 
 if __name__ == "__main__":
     unittest.main()
