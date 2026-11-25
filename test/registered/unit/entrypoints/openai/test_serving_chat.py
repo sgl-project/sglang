@@ -968,6 +968,27 @@ class ServingChatTestCase(CustomTestCase):
             ):
                 self.assertIsNone(self.chat._validate_request(above_limit))
 
+    def test_request_stop_joins_non_list_template_stop_str(self):
+        """A request's stop joins the template's stop strings when the template
+        declares stop_str as a string or a tuple, not only as a list."""
+        cases = {
+            "phi-4-mm": ["<|end|>"],
+            "minicpmv": ["<|im_end|>", "<|endoftext|>"],
+        }
+        for template_name, template_stop in cases.items():
+            for request_stop in ("x", ["x", "y"]):
+                with self.subTest(template=template_name, stop=request_stop):
+                    self.template_manager.chat_template_name = template_name
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        stop=request_stop,
+                    )
+                    result = self.chat._apply_conversation_template(
+                        request, is_multimodal=False
+                    )
+                    self.assertEqual(result.stop, template_stop + list(request_stop))
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (
@@ -4055,9 +4076,9 @@ class ServingChatTestCase(CustomTestCase):
             first_chunk_call.tool_index = 0
             first_chunk_call.name = "get_weather"
             first_chunk_call.parameters = ""
-            parser_instance.parse_stream_chunk.side_effect = [
-                ("", [first_chunk_call]),
-                ("", []),
+            parser_instance.parse_stream_segments.side_effect = [
+                [("", [first_chunk_call])],
+                [("", [])],
             ]
 
             async def collect_first_tool_chunk():
@@ -4086,6 +4107,43 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(payload["created"], 123)
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
+
+    def test_tool_call_stream_keeps_generation_order_within_a_delta(self):
+        """Text after a call in the same delta is sent after that call."""
+        self.chat.tool_call_parser = "glm47"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=True,
+        )
+        delta = (
+            "Sure.<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>Paris</arg_value></tool_call> Done."
+        )
+
+        async def collect():
+            return [
+                line
+                async for line in self.chat._process_tool_call_stream(
+                    index=0,
+                    delta=delta,
+                    parser_dict={},
+                    content={"meta_info": {"id": "chatcmpl-test"}},
+                    request=req,
+                    has_tool_calls={},
+                    created=0,
+                )
+            ]
+
+        lines = get_or_create_event_loop().run_until_complete(collect())
+        order = []
+        for line in lines:
+            message = json.loads(line[len("data: ") :])["choices"][0]["delta"]
+            part = message["content"] or "<call>"
+            if not order or part != order[-1]:
+                order.append(part)
+        self.assertEqual(order, ["Sure.", "<call>", " Done."])
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""

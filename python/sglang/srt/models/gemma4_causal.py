@@ -1328,11 +1328,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
         ],
     }
 
-    # Gemma does not apply LoRA to the embedding layer.
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = False
-
     def __init__(
         self,
         config: Gemma4TextConfig,
@@ -1650,9 +1645,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
             return weight
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
         return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
-
-    def get_embed(self):
-        return self._shard_weight(self.model.embed_tokens.weight)
 
     def get_embed_and_head(self, *, draft_embedding=None):
         if self.pp_group.world_size > 1:
