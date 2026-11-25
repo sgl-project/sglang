@@ -32,9 +32,8 @@ from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     build_dcp_extend_gather_plan,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    get_sparse_kv_offload_mode,
     get_sparsity_driven_kv_offload_sparse_context_len,
-    is_sparsity_driven_kv_offload_enabled,
-    use_fused_sparse_kv_offload,
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -453,14 +452,13 @@ class AscendAttnBackend(AttentionBackend):
             self.dcp_fp8_sparse_attention = kv_quant_sparse_flash_attention
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
-        self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
+        offload_mode = get_sparse_kv_offload_mode(
             model_config=model_runner.model_config,
             use_mla_backend=model_runner.use_mla_backend,
             is_draft_worker=self.is_draft_worker,
         )
-        self.use_fused_sparse_kv = (
-            self.enable_sparsity_driven_kv_offload and use_fused_sparse_kv_offload()
-        )
+        self.enable_sparsity_driven_kv_offload = offload_mode is not None
+        self.use_fused_sparse_kv = offload_mode == "fused"
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                 register_sparse_kv_manager,

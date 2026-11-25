@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from copy import copy
 from math import prod
 from typing import TYPE_CHECKING
@@ -188,6 +187,10 @@ class BudgetPlan:
 
     def bind_native_pool(self, pool) -> BudgetPlan:
         """Bind the physical layout once after native pool creation."""
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            MLA_KV_HEAD_NUM,
+        )
+
         indexer_layer_ids = getattr(pool, "indexer_layer_ids", (pool.start_layer,))
         if not indexer_layer_ids:
             raise ValueError("Native LIM requires at least one indexer K layer.")
@@ -203,7 +206,7 @@ class BudgetPlan:
         host_token_capacity = key.shape[0] * self.page_size
         self.host_token_capacity = host_token_capacity
         self.host_kv_spec = BufferSpec(
-            (1, self.host_token_capacity, 1, self.kv_cache_dim),
+            (self.host_token_capacity, MLA_KV_HEAD_NUM, self.kv_cache_dim),
             self.kv_dtype,
             self.num_layers,
         )
@@ -242,15 +245,9 @@ def resolve_sparse_kv_budget(
         or kv_bytes_per_token != (kv_lora_rank + qk_rope_head_dim) * kv_dtype.itemsize
     ):
         raise ValueError("Native LIM requires BF16 MLA KV storage.")
-    capacity = cache_tokens or max_query_width * top_k
-    if (
-        capacity < max_query_width * top_k
-        or capacity + page_size > MISS_CAPACITY
-        or capacity % page_size
-    ):
-        raise ValueError(
-            f"Native LIM cache capacity must cover query width * TopK, be <= {MISS_CAPACITY - page_size} and aligned to {page_size}."
-        )
+    capacity = resolve_sparse_kv_cache_tokens(
+        cache_tokens, max_query_width, top_k, page_size
+    )
     resident_rows = request_rows if resident_rows is None else resident_rows
     return BudgetPlan(
         request_rows=request_rows,
@@ -271,18 +268,34 @@ def resolve_sparse_kv_budget(
     )
 
 
-def fit_pd_sparse_budget(
-    requested: BudgetPlan,
+def resolve_sparse_kv_cache_tokens(
+    cache_tokens: int, max_query_width: int, top_k: int, page_size: int
+) -> int:
+    capacity = cache_tokens or max_query_width * top_k
+    if (
+        capacity < max_query_width * top_k
+        or capacity + page_size > MISS_CAPACITY
+        or capacity % page_size
+    ):
+        raise ValueError(
+            f"Native LIM cache capacity must cover query width * TopK, be <= {MISS_CAPACITY - page_size} and aligned to {page_size}."
+        )
+    return capacity
+
+
+def fit_pd_sparse_running_requests(
+    requested_rows: int,
     available_bytes: int,
     page_size: int,
     *,
-    build_plan: Callable[..., BudgetPlan],
+    cache_tokens: int,
+    context_len: int,
+    num_layers: int,
+    kv_bytes_per_token: int,
     token_limit: int | None,
     num_reserved_decode_tokens: int,
-) -> BudgetPlan:
-    """Size the P/D Decode resident pool from a full-context request budget."""
-    requested_rows = requested.resident_rows - 1
-    extra_rows = requested.request_rows - requested.resident_rows
+) -> int:
+    """Return the P/D Decode concurrency that fits the full-context budget."""
     max_rows = requested_rows
     if token_limit is not None:
         aligned_limit = token_limit // page_size * page_size
@@ -296,22 +309,12 @@ def fit_pd_sparse_budget(
         max_rows = min(max_rows, aligned_limit // 2)
 
     # Charge the resident window and the full context at the MLA KV rate.
-    bytes_per_request = (
-        (requested.cache_tokens + requested.context_len)
-        * requested.num_layers
-        * requested.kv_cache_dim
-        * requested.kv_dtype.itemsize
-    )
+    bytes_per_request = (cache_tokens + context_len) * num_layers * kv_bytes_per_token
     fitting_rows = min(max_rows, available_bytes // bytes_per_request)
     if fitting_rows < 1:
         raise RuntimeError(
             "Cannot fit one sparse KV resident row: "
             f"need {bytes_per_request} bytes per request, have {available_bytes} bytes "
-            f"(C={requested.cache_tokens}, context_len={requested.context_len})."
+            f"(C={cache_tokens}, context_len={context_len})."
         )
-    if fitting_rows == requested_rows:
-        return requested
-    return build_plan(
-        request_rows=fitting_rows + extra_rows + 1,
-        resident_rows=fitting_rows + 1,
-    )
+    return fitting_rows

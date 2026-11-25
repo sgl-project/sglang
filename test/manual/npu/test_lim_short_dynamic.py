@@ -368,6 +368,7 @@ def test_short_sparse_graph_lifecycle(
                     forward_batch=inputs,
                     layer_id=0,
                 )
+                manager.prepare_copy_sfa_plan(plan)
                 backend.forward_metadata.sparse_kv_lim_plan = plan
                 outputs = []
                 for layer, value in zip(layers, fresh):

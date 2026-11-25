@@ -8,8 +8,10 @@ import torch
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparse_kv_budget,
+    get_sparse_kv_offload_mode,
     get_sparsity_driven_kv_offload_cell_size,
     get_sparsity_driven_kv_offload_sparse_context_len,
+    is_fused_sparse_kv_offload_enabled,
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -52,7 +54,7 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
         )
 
         def enabled():
-            return is_sparsity_driven_kv_offload_enabled(
+            return is_fused_sparse_kv_offload_enabled(
                 model_config=_make_glm51_model_config(), use_mla_backend=True
             )
 
@@ -132,17 +134,29 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                 disagg.disaggregation_mode = mode
                 with self.subTest(mode=mode):
                     self.assertEqual(
-                        is_sparsity_driven_kv_offload_enabled(
+                        is_fused_sparse_kv_offload_enabled(
                             model_config=model, use_mla_backend=True
                         ),
                         mode != "prefill",
                     )
-            disagg.disaggregation_mode = "prefill"
-            with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(False):
-                self.assertTrue(
-                    is_sparsity_driven_kv_offload_enabled(
-                        model_config=model, use_mla_backend=True
+                    self.assertEqual(
+                        get_sparse_kv_offload_mode(
+                            model_config=model, use_mla_backend=True
+                        ),
+                        None if mode == "prefill" else "fused",
                     )
+            disagg.disaggregation_mode = "prefill"
+            self.assertTrue(
+                is_sparsity_driven_kv_offload_enabled(
+                    model_config=model, use_mla_backend=True
+                )
+            )
+            with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(False):
+                self.assertEqual(
+                    get_sparse_kv_offload_mode(
+                        model_config=model, use_mla_backend=True
+                    ),
+                    "legacy",
                 )
 
     def test_copy_sfa_heads_follow_model_and_attention_tp(self):

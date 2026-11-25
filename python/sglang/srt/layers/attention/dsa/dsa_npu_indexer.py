@@ -658,6 +658,7 @@ class DSANPUIndexerMixin:
                     layer_id=layer_id,
                     reuse_metadata=metadata.sparse_kv_lim_plan is not None,
                 )
+                manager.prepare_copy_sfa_plan(plan)
                 metadata.sparse_kv_lim_plan = plan
                 return plan.source_ids
 

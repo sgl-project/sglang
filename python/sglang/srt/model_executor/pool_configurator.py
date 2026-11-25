@@ -340,50 +340,35 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc,
             include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
         )
-        if (
-            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
-            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
-        ):
-            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-                build_sparse_kv_budget_options,
-                get_sparse_kv_budget,
-                is_sparsity_driven_kv_offload_enabled,
-            )
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            build_sparse_kv_budget_options,
+            get_sparse_kv_budget,
+            is_fused_sparse_kv_offload_enabled,
+        )
 
-            if is_sparsity_driven_kv_offload_enabled(
-                model_config=kvc.model_config,
-                use_mla_backend=kvc.use_mla_backend,
-                is_draft_worker=kvc.is_draft_worker,
-            ):
-                # The variable-sized native pool contains only indexer KV. The
-                # separate sparse manager is allocated later by AscendAttnBackend
-                # and must be charged before that indexer pool fills HBM.
-                disagg = get_disagg()
-                self._pd_sparse_decode = (
-                    disagg.disaggregation_mode == "decode"
-                    and not disagg.enable_pd_role_switch
+        fused_sparse_kv = is_fused_sparse_kv_offload_enabled(
+            model_config=kvc.model_config,
+            use_mla_backend=kvc.use_mla_backend,
+            is_draft_worker=kvc.is_draft_worker,
+        )
+        if fused_sparse_kv:
+            # Charge the sparse manager before sizing the native indexer pool.
+            self._pd_sparse_decode = get_disagg().disaggregation_mode == "decode"
+            budget = kvc.sparse_kv_budget_plan
+            if budget is None:
+                budget_options = build_sparse_kv_budget_options(
+                    model_config=kvc.model_config,
+                    kv_dtype=kvc.kv_cache_dtype,
+                    num_layers=num_layers,
+                    attn_dp_size=kvc.attn_dp_size,
+                    pd_sparse_decode=self._pd_sparse_decode,
                 )
-                if kvc.sparse_kv_budget_plan is None or (
-                    self._pd_sparse_decode and not kvc.sparse_kv_budget_finalized
-                ):
-                    budget_options = build_sparse_kv_budget_options(
-                        model_config=kvc.model_config,
-                        kv_dtype=kvc.kv_cache_dtype,
-                        num_layers=num_layers,
-                        attn_dp_size=kvc.attn_dp_size,
-                        pd_sparse_decode=self._pd_sparse_decode,
-                    )
-                    if self._pd_sparse_decode:
-                        self._pd_sparse_budget_options = budget_options
-                    if kvc.sparse_kv_budget_plan is None:
-                        kvc.sparse_kv_budget_plan = get_sparse_kv_budget(
-                            **budget_options
-                        )
-                budget = kvc.sparse_kv_budget_plan
-                self._sparse_budget = budget
-                self._sparse_min_tokens = get_schedule().max_total_tokens or max(
-                    budget.context_len, 2 * (budget.request_rows - 1)
-                )
+                if self._pd_sparse_decode:
+                    self._pd_sparse_budget_options = budget_options
+                else:
+                    budget = get_sparse_kv_budget(**budget_options)
+            self._sparse_budget = budget
+            if budget is not None:
                 self._fixed_overhead_bytes += budget.managed_hbm_bytes
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
@@ -410,38 +395,41 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # address space that KVCacheConfigurator allocates below.
                     draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
                 if is_deepseek_dsa(kvc.model_config.hf_config):
-                    target_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=num_layers,
-                    )
-                    if not dsa_shards_index_k():
-                        target_indexer_size *= dcp_size
-                    target_kv_size = self._cell_size - target_indexer_size
-                    from sglang.srt.layers.cp.utils import (
-                        get_glm_dsa_layer_split_effective_num_layers,
-                    )
-
-                    target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-                        kvc, num_layers
-                    )
-                    if self._sparse_budget is not None:
+                    if fused_sparse_kv:
                         from sglang.srt.mem_cache.kv_cache_configurator import (
                             calculate_mla_kv_cache_dim,
                         )
 
-                        # Restore the native attention-KV price for draft sizing.
-                        target_kv_size = (
+                        # Charge native MLA KV for the draft layers.
+                        draft_kv_size = (
                             calculate_mla_kv_cache_dim(
                                 model_config=kvc.model_config,
                                 kv_cache_dtype=kvc.kv_cache_dtype,
                             )
                             * torch._utils._element_size(kvc.kv_cache_dtype)
-                            * target_kv_num_layers
+                            * draft_num_layers
                         )
-                    draft_kv_size = (
-                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
-                        * draft_loc_space_scale
-                    )
+                    else:
+                        from sglang.srt.layers.cp.utils import (
+                            get_glm_dsa_layer_split_effective_num_layers,
+                        )
+
+                        target_indexer_size = self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=num_layers,
+                        )
+                        if not dsa_shards_index_k():
+                            target_indexer_size *= dcp_size
+                        target_kv_size = self._cell_size - target_indexer_size
+                        target_kv_num_layers = (
+                            get_glm_dsa_layer_split_effective_num_layers(
+                                kvc, num_layers
+                            )
+                        )
+                        draft_kv_size = int(
+                            target_kv_size * draft_num_layers / target_kv_num_layers
+                        )
+                    draft_kv_size *= draft_loc_space_scale
                     # _compute_dsa_indexer_cell_size already applies the
                     # HiSparse logical-space ratio to the draft indexer.
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
@@ -524,22 +512,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 kvc.modelslim_cache_layout.bytes_per_token * effective_num_layers
             )
         elif kvc.use_mla_backend:
-            if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
-                # NPU sparse KV offload uses an index-only device pool.
-                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-                    get_sparsity_driven_kv_offload_cell_size,
-                )
+            # NPU sparse KV offload uses an index-only device pool.
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                get_sparsity_driven_kv_offload_cell_size,
+            )
 
-                offload_cell_size = get_sparsity_driven_kv_offload_cell_size(
-                    model_config=model_config,
-                    use_mla_backend=kvc.use_mla_backend,
-                    num_layers=num_layers,
-                    element_size=kv_size,
-                    start_layer=kvc.layer_info.start_layer,
-                    is_draft_worker=kvc.is_draft_worker,
-                )
-                if offload_cell_size is not None:
-                    return offload_cell_size
+            offload_cell_size = get_sparsity_driven_kv_offload_cell_size(
+                model_config=model_config,
+                use_mla_backend=kvc.use_mla_backend,
+                num_layers=num_layers,
+                element_size=kv_size,
+                start_layer=kvc.layer_info.start_layer,
+                is_draft_worker=kvc.is_draft_worker,
+            )
+            if offload_cell_size is not None:
+                return offload_cell_size
 
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
@@ -855,26 +842,32 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     ) -> MemoryPoolConfig:
         budget = self._sparse_budget
         fixed_overhead_bytes = self._fixed_overhead_bytes
-        if budget is not None and not self._kvc.sparse_kv_budget_finalized:
-            if self._pd_sparse_decode:
+        if self._pd_sparse_decode or budget is not None:
+            fixed_without_manager = fixed_overhead_bytes
+            if budget is not None:
+                fixed_without_manager -= budget.managed_hbm_bytes
+            finalized_budget = self._kvc.sparse_kv_budget_plan
+            if finalized_budget is not None:
+                budget = finalized_budget
+            elif self._pd_sparse_decode:
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-                    fit_pd_sparse_budget_from_config,
+                    get_sparse_kv_budget,
                 )
 
-                fixed_without_manager = fixed_overhead_bytes - budget.managed_hbm_bytes
-                budget = fit_pd_sparse_budget_from_config(
-                    budget,
-                    available_bytes - fixed_without_manager,
-                    page_size,
-                    self._pd_sparse_budget_options,
+                budget = get_sparse_kv_budget(
+                    **self._pd_sparse_budget_options,
+                    pd_available_bytes=available_bytes - fixed_without_manager,
                 )
-                fixed_overhead_bytes = fixed_without_manager + budget.managed_hbm_bytes
-            elif budget.prefill_workspace_tokens:
-                min_tokens = ceil_align(self._sparse_min_tokens, page_size)
+            elif budget is not None and budget.prefill_workspace_tokens:
+                min_tokens = ceil_align(
+                    get_schedule().max_total_tokens
+                    or max(budget.context_len, 2 * (budget.request_rows - 1)),
+                    page_size,
+                )
                 required = fixed_overhead_bytes + min_tokens * self._cell_size
                 if required > available_bytes:
-                    fixed_overhead_bytes -= budget.prefill_workspace_bytes
                     budget = budget.without_prefill_workspace()
+            fixed_overhead_bytes = fixed_without_manager + budget.managed_hbm_bytes
         available_bytes = max(available_bytes - fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
@@ -901,7 +894,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if budget is not None:
             self._fixed_overhead_bytes = fixed_overhead_bytes
             self._sparse_budget = self._kvc.sparse_kv_budget_plan = budget
-            self._kvc.sparse_kv_budget_finalized = True
         return config
 
     def calculate_pool_sizes_from_max_tokens(

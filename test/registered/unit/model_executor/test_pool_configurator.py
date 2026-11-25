@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.page_interleave import (
 )
 from sglang.srt.runtime_context import (
     get_context,
+    get_disagg,
     get_memory,
     get_parallel,
     get_schedule,
@@ -506,7 +507,7 @@ class TestDefaultConfigurator(CustomTestCase):
             ),
             patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
             patch(
-                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_sparsity_driven_kv_offload_enabled",
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_fused_sparse_kv_offload_enabled",
                 return_value=True,
             ),
             patch(
@@ -531,7 +532,13 @@ class TestDefaultConfigurator(CustomTestCase):
             ),
         ):
             cfg = DefaultPoolConfigurator(mr)
+            self.assertIsNone(mr.sparse_kv_budget_plan)
+            cfg.calculate_pool_sizes(
+                cfg._fixed_overhead_bytes + cfg._cell_size * 1_000_000, 128
+            )
+            selected_plan = mr.sparse_kv_budget_plan
             second_cfg = DefaultPoolConfigurator(mr)
+            self.assertIs(second_cfg._sparse_budget, selected_plan)
 
         # The compact target indexer and the draft's full native CKV/KPE
         # plus indexer remain in HBM; native BF16 LIM needs no scale buffer.
@@ -1200,7 +1207,7 @@ class TestEagleConfigurator(CustomTestCase):
             with envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0):
                 mr.sparse_kv_budget_plan = None
                 automatic = DefaultPoolConfigurator(mr)
-                plan = mr.sparse_kv_budget_plan
+                plan = automatic._sparse_budget
                 self.assertEqual(plan.cache_tokens, 3 * 2048)
                 self.assertEqual(
                     automatic._fixed_overhead_bytes,
@@ -1279,7 +1286,7 @@ class TestEagleConfigurator(CustomTestCase):
                 side_effect=lambda kvc, count: count,
             ),
             patch(
-                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_sparsity_driven_kv_offload_enabled",
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_fused_sparse_kv_offload_enabled",
                 return_value=True,
             ),
             patch(
@@ -1327,9 +1334,18 @@ class TestEagleConfigurator(CustomTestCase):
                         mr.dp_size = dp
                         mr.attn_dp_size = attn_dp
                         mr.sparse_kv_budget_plan = None
-                        DefaultPoolConfigurator(mr)
+                        configurator = DefaultPoolConfigurator(mr)
+                        if extra:
+                            self.assertIsNone(mr.sparse_kv_budget_plan)
+                            self.assertEqual(
+                                configurator._pd_sparse_budget_options["request_rows"],
+                                expected_rows,
+                            )
 
                     calls = mock_sparse_budget.call_args_list
+                    if extra:
+                        self.assertEqual(len(calls), 0)
+                        continue
                     self.assertEqual(len(calls), 1)
                     self.assertEqual([call.kwargs["num_layers"] for call in calls], [4])
                     self.assertEqual(
@@ -1345,6 +1361,9 @@ class TestEagleConfigurator(CustomTestCase):
         from sglang.srt.environ import envs
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
             get_sparse_kv_budget,
+        )
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+            resolve_sparse_kv_budget,
         )
         from sglang.srt.mem_cache.allocation_sizing import (
             get_req_to_token_extra_context_len,
@@ -1453,14 +1472,20 @@ class TestEagleConfigurator(CustomTestCase):
             ):
                 with self.subTest(available=available, cap=cap):
                     mr.sparse_kv_budget_plan = None
-                    mr.sparse_kv_budget_finalized = False
                     mr._profile_available_bytes.return_value = available
-                    with get_context().override_server_args(
-                        **server_args, max_total_tokens=cap
+                    with (
+                        get_context().override_server_args(
+                            **server_args, max_total_tokens=cap
+                        ),
+                        patch(
+                            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.resolve_sparse_kv_budget",
+                            wraps=resolve_sparse_kv_budget,
+                        ) as resolve_plan,
                     ):
                         sizes = KVCacheConfigurator._resolve_memory_pool_config(
                             mr, pre_model_load_memory=0
                         )
+                    self.assertEqual(resolve_plan.call_count, 1)
                     self.assertEqual(sizes.max_running_requests, rows)
                     self.assertEqual(sizes.max_total_num_tokens, tokens)
                     plan = mr.sparse_kv_budget_plan
@@ -1476,7 +1501,6 @@ class TestEagleConfigurator(CustomTestCase):
                     )
 
             mr.sparse_kv_budget_plan = None
-            mr.sparse_kv_budget_finalized = False
             mr._profile_available_bytes.return_value = request_bytes - 1
             with self.assertRaisesRegex(RuntimeError, "one sparse KV resident row"):
                 KVCacheConfigurator._resolve_memory_pool_config(
@@ -1484,7 +1508,6 @@ class TestEagleConfigurator(CustomTestCase):
                 )
 
             mr.sparse_kv_budget_plan = None
-            mr.sparse_kv_budget_finalized = False
             mr._profile_available_bytes.return_value = 4 * request_bytes
             with (
                 get_context().override_server_args(
@@ -1499,18 +1522,22 @@ class TestEagleConfigurator(CustomTestCase):
                 )
 
             mr.sparse_kv_budget_plan = None
-            mr.sparse_kv_budget_finalized = False
             mr._profile_available_bytes.return_value = request_bytes
             with (
-                get_context().override_server_args(
-                    max_total_tokens=None, num_reserved_decode_tokens=one_request_tokens
-                ),
+                get_schedule().override(max_total_tokens=None),
+                get_disagg().override(num_reserved_decode_tokens=one_request_tokens),
                 self.assertRaisesRegex(RuntimeError, "P/D Decode native KV pool"),
             ):
                 KVCacheConfigurator._resolve_memory_pool_config(
                     mr, pre_model_load_memory=0
                 )
-            self.assertFalse(mr.sparse_kv_budget_finalized)
+            self.assertIsNone(mr.sparse_kv_budget_plan)
+            with get_disagg().override(num_reserved_decode_tokens=decode_reserve):
+                sizes = KVCacheConfigurator._resolve_memory_pool_config(
+                    mr, pre_model_load_memory=0
+                )
+            self.assertEqual(sizes.max_running_requests, 1)
+            self.assertEqual(mr.sparse_kv_budget_plan.resident_rows, 2)
 
     def test_eagle_does_not_exceed_budget(self):
         """Total memory (target + draft KV cache) must not exceed available."""

@@ -150,14 +150,17 @@ class TestLIMState(CustomTestCase):
             configurator = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
             configurator._sparse_budget = plan
             configurator._pd_sparse_decode = False
-            configurator._kvc = SimpleNamespace(
-                sparse_kv_budget_plan=plan, sparse_kv_budget_finalized=False
-            )
-            configurator._sparse_min_tokens = 129
+            configurator._kvc = SimpleNamespace(sparse_kv_budget_plan=None)
             configurator._cell_size = 8
             configurator._fixed_overhead_bytes = plan.managed_hbm_bytes
             required = plan.managed_hbm_bytes + 256 * 8
-            result = configurator.calculate_pool_sizes(required - int(not fits), 128)
+            with patch(
+                "sglang.srt.model_executor.pool_configurator.get_schedule",
+                return_value=SimpleNamespace(max_total_tokens=129),
+            ):
+                result = configurator.calculate_pool_sizes(
+                    required - int(not fits), 128
+                )
             selected = configurator._kvc.sparse_kv_budget_plan
             self.assertEqual(plan.prefill_workspace_tokens, 129)
             self.assertEqual(selected.prefill_workspace_tokens, 129 if fits else 0)
@@ -167,7 +170,6 @@ class TestLIMState(CustomTestCase):
             later._kvc = configurator._kvc
             later._sparse_budget = selected
             later._pd_sparse_decode = False
-            later._sparse_min_tokens = 129
             later._cell_size = 8
             later._fixed_overhead_bytes = selected.managed_hbm_bytes
             with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
@@ -483,6 +485,7 @@ class TestLIMState(CustomTestCase):
                 ),
                 layer_id=0,
             )
+            manager.prepare_copy_sfa_plan(selection)
         torch.testing.assert_close(selection.source_ids, source_values)
         torch.testing.assert_close(selection.device_slots, slot_values)
         self.assertEqual(selection.source_ids.data_ptr(), adapter.source_ids.data_ptr())
@@ -592,6 +595,7 @@ class TestLIMState(CustomTestCase):
         pool.size = 3968
 
         self.assertEqual(plan.host_token_capacity, 4096 + 128)
+        self.assertEqual(plan.host_kv_spec.shape, (4096 + 128, manager.head_num, 576))
         self.assertEqual(plan.host_kv_bytes, (4096 + 128) * 576 * 2 * 2)
 
     def test_metadata_reuse_commits_only_after_all_owners(self):
@@ -663,7 +667,7 @@ class TestLIMState(CustomTestCase):
             seen, [(-2, 12), (-2, 12), (-1, 13), (-1, 13), (-2, 9), (-2, 9)]
         )
         self.assertEqual(adapter._prepare_forward.call_count, 3)
-        self.assertEqual(manager.prepare_copy_sfa_plan.call_count, 6)
+        manager.prepare_copy_sfa_plan.assert_not_called()
 
     def test_host_bytes_are_unavailable_before_physical_pool_binding(self):
         plan = resolve_sparse_kv_budget(**self.options())

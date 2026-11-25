@@ -90,9 +90,18 @@ def test_budget_validates_normalized_query_geometry(
                 make_plan()
 
 
-@pytest.mark.parametrize("fused", [False, True])
-@pytest.mark.parametrize("draft", [False, True])
-def test_draft_policy_is_private_to_fused_mode(monkeypatch, fused, draft):
+@pytest.mark.parametrize(
+    "offload,fused,draft,expected_mode",
+    [
+        (False, False, False, None),
+        (False, True, False, None),
+        (True, False, False, "legacy"),
+        (True, False, True, "legacy"),
+        (True, True, False, "fused"),
+        (True, True, True, None),
+    ],
+)
+def test_sparse_kv_offload_mode(monkeypatch, offload, fused, draft, expected_mode):
     monkeypatch.setattr(config, "is_npu", lambda: True)
     monkeypatch.setattr(config, "is_deepseek_dsa", lambda _: True)
     monkeypatch.setattr(config, "attention_backends", lambda: ("ascend", "ascend"))
@@ -111,13 +120,18 @@ def test_draft_policy_is_private_to_fused_mode(monkeypatch, fused, draft):
         config, "get_disagg", lambda: SimpleNamespace(disaggregation_mode="null")
     )
     with (
-        envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+        envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(offload),
         envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(fused),
     ):
-        enabled = config.is_sparsity_driven_kv_offload_enabled(
-            model_config=MODEL_CONFIG, use_mla_backend=True, is_draft_worker=draft
+        args = dict(model_config=MODEL_CONFIG, use_mla_backend=True)
+        assert (
+            config.get_sparse_kv_offload_mode(**args, is_draft_worker=draft)
+            == expected_mode
         )
-    assert enabled is not (fused and draft)
+        assert config.is_fused_sparse_kv_offload_enabled(
+            **args, is_draft_worker=draft
+        ) == (expected_mode == "fused")
+        assert config.is_sparsity_driven_kv_offload_enabled(**args) == offload
 
 
 def test_fused_draft_bypasses_target_validation(monkeypatch):
@@ -129,7 +143,7 @@ def test_fused_draft_bypasses_target_validation(monkeypatch):
         envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
         envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
     ):
-        assert not config.is_sparsity_driven_kv_offload_enabled(
+        assert not config.is_fused_sparse_kv_offload_enabled(
             model_config=None, use_mla_backend=True, is_draft_worker=True
         )
 

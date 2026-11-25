@@ -2758,11 +2758,7 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
-    "SGLANG_NPU_LIM_LIBRARY": _DeprecatedEnv(
-        note="LIM is loaded from sgl-kernel-npu; external library paths are ignored."
-    ),
-}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
 
 
 def _handle_deprecated_envs():

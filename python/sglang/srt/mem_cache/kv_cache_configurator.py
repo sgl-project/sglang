@@ -436,8 +436,8 @@ class KVCacheConfigurator:
     dflash_draft_cell_size_per_token: int | None = field(init=False, default=None)
     dflash_draft_loc_space_scale: int = field(init=False, default=1)
     draft_model_idx: Optional[int] = None
+    # Published by the pool configurator after sizing succeeds.
     sparse_kv_budget_plan: Optional[BudgetPlan] = field(default=None, init=False)
-    sparse_kv_budget_finalized: bool = field(default=False, init=False)
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
     extra_mamba_cache_bytes_per_request_row: int = 0

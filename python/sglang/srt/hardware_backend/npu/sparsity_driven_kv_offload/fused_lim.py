@@ -134,7 +134,7 @@ class LIMDecodeAdapter:
             operator=self.operator,
             full_visible=True,
         )
-        plan = LIMSelection(
+        return LIMSelection(
             sources,
             self.device_slots[:rows],
             self.topk_misses[:rows],
@@ -147,8 +147,6 @@ class LIMDecodeAdapter:
             self.resident_safe_slots[:batch],
             width,
         )
-        manager.prepare_copy_sfa_plan(plan)
-        return plan
 
     def commit_forward(self, batch: int) -> None:
         """Publish the visible lengths after the last layer has copied its KV."""
