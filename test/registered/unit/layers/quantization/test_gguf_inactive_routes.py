@@ -73,18 +73,22 @@ class TestGgufInactiveRoutes(CustomTestCase):
 
         with torch.device("cuda"):
             layer = FusedMoE(
-                num_experts=4,
+                num_experts=2,
                 top_k=2,
-                hidden_size=256,
-                intermediate_size=256,
+                hidden_size=32,
+                intermediate_size=32,
                 layer_id=0,
                 quant_config=GGUFConfig(),
             )
-        packed, _ = self._weights(GGMLQuantizationType.Q4_0)
-        for expert in range(4):
+            # One Q4_0 block per row: 32 weights occupy 18 packed bytes.
+            packed = [
+                torch.arange(2 * rows * 18, dtype=torch.uint8).view(2, rows, 18)
+                for rows in (64, 32)
+            ]
+        for expert in range(2):
             for param, weight, shard in (
-                (layer.w13_qweight, packed[0][expert, :256], "w1"),
-                (layer.w13_qweight, packed[0][expert, 256:], "w3"),
+                (layer.w13_qweight, packed[0][expert, :32], "w1"),
+                (layer.w13_qweight, packed[0][expert, 32:], "w3"),
                 (layer.w2_qweight, packed[1][expert], "w2"),
             ):
                 param.weight_loader(param, weight, "qweight", shard, expert)
