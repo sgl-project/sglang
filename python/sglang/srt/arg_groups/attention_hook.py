@@ -543,6 +543,16 @@ def handle_linear_attn_backend(server_args: Any):
     # request with the triton verify path, and replace the recurrent verify's
     # per-draft snapshots (so ReplaySSM spec-verify cannot be stacked on top).
     if cfg.enable_linear_bole_spec:
+        if cfg.enable_unified_memory:
+            raise ValueError(
+                "--enable-linear-bole-spec is not supported with "
+                "--enable-unified-memory."
+            )
+        if pp_spec_stable_rows_enabled():
+            raise ValueError(
+                "--enable-linear-bole-spec does not support "
+                "SGLANG_ENABLE_PP_SPEC stable verify rows."
+            )
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(
                 "--enable-linear-bole-spec requires a linear draft chain "

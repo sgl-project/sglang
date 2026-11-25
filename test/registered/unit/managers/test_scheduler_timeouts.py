@@ -37,7 +37,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
+from sglang.test.scheduler_test_utils import (
+    FakeReq,
+    empty_request_lists,
+    idle_penalty_status_pool,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -124,6 +128,7 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.schedule_low_priority_values_first = False
         s.enable_hierarchical_cache = True
         s.tree_cache = MagicMock(spec=["finish"])
+        s.penalty_status_pool = idle_penalty_status_pool()
         s.init_request_retirer()
 
         self.assertFalse(s._abort_on_queued_limit(incoming))
@@ -145,6 +150,7 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.max_queued_requests = 1
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
+        s.penalty_status_pool = idle_penalty_status_pool()
         s.init_request_retirer()
 
         with patch(
@@ -165,6 +171,7 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.max_queued_requests = 1
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
+        s.penalty_status_pool = idle_penalty_status_pool()
         s.init_request_retirer()
 
         self.assertTrue(s._abort_on_queued_limit(incoming))
@@ -218,6 +225,7 @@ class TestQueuedAbort(CustomTestCase):
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
+        s.penalty_status_pool = idle_penalty_status_pool()
         s.init_request_retirer()
         s.request_retirer._detach = MagicMock()
 

@@ -6,16 +6,19 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -55,6 +58,28 @@ def _pool(*, bole, allocate):
 
 
 class TestBoleSpecIntegration(CustomTestCase):
+    def test_unsupported_verify_layouts_fail_before_pool_allocation(self):
+        with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+            handle_linear_attn_backend(
+                ServerArgs(
+                    model_path="dummy",
+                    enable_linear_bole_spec=True,
+                    enable_unified_memory=True,
+                    linear_attn_verify_backend="triton",
+                )
+            )
+        with (
+            envs.SGLANG_ENABLE_PP_SPEC.override(True),
+            self.assertRaisesRegex(ValueError, "SGLANG_ENABLE_PP_SPEC"),
+        ):
+            handle_linear_attn_backend(
+                ServerArgs(
+                    model_path="dummy",
+                    enable_linear_bole_spec=True,
+                    linear_attn_verify_backend="triton",
+                )
+            )
+
     def test_pool_preserves_optional_snapshot_and_conv_layouts(self):
         for bole in (False, True):
             for allocate in (False, True):
