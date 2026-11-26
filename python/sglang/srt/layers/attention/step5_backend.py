@@ -260,14 +260,14 @@ class Step5SelectionWorkspace(msgspec.Struct, frozen=True, kw_only=True):
             ),
             tiles=cls._tiles(rows=rows, capacity=capacity),
         )
-        return workspace.slice(
+        return workspace.for_rows(
             rows=rows,
             row_to_req=row_to_req,
             positions=positions,
             region_size=region_size,
         )
 
-    def slice(
+    def for_rows(
         self,
         *,
         rows: int,
@@ -311,7 +311,6 @@ class Step5IndexerMetadata(msgspec.Struct, frozen=True, kw_only=True):
     # Query/scoring layout, complete at construction (no later replace/binding).
     query_request_slots: torch.Tensor  # [Q], request slot for each query
     query_positions: torch.Tensor  # [Q], absolute logical query positions
-    score_width: int  # maximum logical block count to score per query
 
     # Per-layer scratch: _admit overwrites both buffers for every request row,
     # so they must not be cached as input validity.
@@ -499,7 +498,6 @@ class Step5AttnBackend(AttentionBackend):
             compression=plan,
             query_request_slots=row_to_req,
             query_positions=positions,
-            score_width=score_width,
             selection_workspace=selection_workspace,
             compression_enabled=torch.empty_like(plan.request_slots, dtype=torch.bool),
             compression_success=torch.empty_like(plan.request_slots, dtype=torch.bool),
@@ -579,7 +577,7 @@ class Step5AttnBackend(AttentionBackend):
             selection_workspace=(
                 None
                 if graph_workspace is None
-                else graph_workspace.slice(
+                else graph_workspace.for_rows(
                     rows=positions.numel(),
                     row_to_req=row_to_req,
                     positions=positions,

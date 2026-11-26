@@ -48,8 +48,6 @@ _TRITON_KERNELS = [
     ("pad", "seqlens_expand_triton"),
     ("position", "compute_position_triton"),
     ("table_qk_norm_rope", "table_qk_norm_rope_"),
-    ("step5_dsa_sparse_attention", "step5_dsa_sparse_attention"),
-    ("step5_dsa_indexer", "step5_dsa_select_blocks"),
     ("dsv4.attn_metadata_kernels", "expand_prefill_causally"),
     ("dsv4.attn_metadata_kernels", "build_page_table_positions"),
     ("dsv4.attn_metadata_kernels", "build_causal_swa_page_indices"),
@@ -360,6 +358,25 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_kpool_ragged_v2",
         capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.step5_dsa_sparse_attention",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.step5_dsa_sparse_attention:step5_dsa_sparse_attention",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.step5_dsa_select_blocks",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.step5_dsa_indexer:step5_dsa_select_blocks",
+        capabilities=frozenset(
+            CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
+            for sm in ((9, 0), (10, 0), (10, 3), (10, 7))
+        ),
     )
 )
 register_kernel(

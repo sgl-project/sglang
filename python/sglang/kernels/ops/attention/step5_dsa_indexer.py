@@ -40,7 +40,6 @@ def _indexer_norm_rope_kernel(
     D: tl.constexpr,
     ROPE: tl.constexpr,
     EPS: tl.constexpr,
-    ZERO_CENTERED: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
@@ -52,7 +51,7 @@ def _indexer_norm_rope_kernel(
         )
         w = tl.load(QW + channel).to(tl.float32)
         inverse_rms = tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
-        y = x * inverse_rms * (w + ZERO_CENTERED)
+        y = x * inverse_rms * (w + 1)
     else:
         x = tl.load(K + token * K_ROW + channel, real_row, other=0).to(tl.float32)
         w = tl.load(KW + channel).to(tl.float32)
@@ -122,7 +121,6 @@ def step5_dsa_indexer_norm_rope(
             head_dim,
             cache.shape[1],
             eps,
-            1,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -494,7 +492,6 @@ def _score_blocks_kernel(
     BLOCKS,
     BLOCK_R: tl.constexpr,
     GRID_TILES: tl.constexpr,
-    WEIGHT_SCALE: tl.constexpr,
     D: tl.constexpr,
     REGION: tl.constexpr,
 ):
@@ -509,12 +506,9 @@ def _score_blocks_kernel(
         (request > 0) & (head[:, None] < HEADS),
         other=0.0,
     ).to(tl.bfloat16)
-    weights = (
-        tl.load(W + row * HEADS + head, (request > 0) & (head < HEADS), other=0).to(
-            tl.float32
-        )
-        * WEIGHT_SCALE
-    )
+    weights = tl.load(
+        W + row * HEADS + head, (request > 0) & (head < HEADS), other=0
+    ).to(tl.float32)
     last_tile = tl.cdiv(BLOCKS, BLOCK_R)
     for tile in range(first_tile, last_tile, GRID_TILES):
         num_blocks = tile * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -580,7 +574,6 @@ def _indexer_logits(
         out.shape[1],
         blocks_per_tile,
         grid_tiles,
-        1.0,
         head_dim,
         region_size,
         num_warps=4,
