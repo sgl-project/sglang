@@ -1038,7 +1038,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # preshuffle_on kernel family.
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
-            # K3 SiTU w13 is GU-interleaved; only gfx950's INTERLEAVE reads this layout
+            # A8W4 (gfx950) reads w13 GU-interleaved; tag it so apply() passes INTERLEAVE.
             if is_gfx95_supported() and k3_situ and use_aiter_gu_interleave:
                 layer.situ_gate_up_interleaved = True
 
