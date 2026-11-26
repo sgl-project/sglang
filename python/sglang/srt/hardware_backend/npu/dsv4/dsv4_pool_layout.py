@@ -16,12 +16,18 @@ class NPUDSV4PagedPoolLayout(DSV4PagedPoolLayout):
     def __init__(self, kvc):
         # A3 SMLA consumes native BF16 KV/index rows; A5 keeps its existing
         # mixed-quant pricing. V4 C4/C128 keep the existing budget on both.
-        self.bf16_low_ratio = not is_npu_arch35() and any(
+        self.index_layout = None
+        if any(
             r in NPUDSV4KVLayout.COMPRESSED_RATIOS
             for r in kvc.model_config.compress_ratios
-        )
+        ):
+            self.index_layout = (
+                NPUDSV4KVLayout.V41_CMP_FP4
+                if is_npu_arch35()
+                else NPUDSV4KVLayout.V41_BF16
+            )
         if (
-            self.bf16_low_ratio
+            self.index_layout is NPUDSV4KVLayout.V41_BF16
             and kvc.spec_algorithm.is_dspark()
             and not get_exec().features.enable_encoder_swa_bounded_replay
         ):
@@ -33,13 +39,17 @@ class NPUDSV4PagedPoolLayout(DSV4PagedPoolLayout):
             assert self.draft_swa_layers > 0, "DSpark draft layer count is required"
 
     def low_ratio_index_row_bytes(self, head_dim):
-        if not self.bf16_low_ratio:
+        if self.index_layout is None:
             return super().low_ratio_index_row_bytes(head_dim)
-        k, s, kd, sd = NPUDSV4KVLayout.V41_BF16.indexer_kv_info(head_dim)
+        k, s, kd, sd = self.index_layout.indexer_kv_info(head_dim)
         return k * kd.itemsize + s * sd.itemsize
 
     def kv_row_bytes(self, pool, compress_ratio):
-        if self.bf16_low_ratio and compress_ratio in (0, 1, 2):
+        if self.index_layout is NPUDSV4KVLayout.V41_BF16 and compress_ratio in (
+            0,
+            1,
+            2,
+        ):
             width, dtype = NPUDSV4KVLayout.V41_BF16.kv_info(
                 pool.qk_nope_head_dim, pool.qk_rope_head_dim
             )
@@ -47,7 +57,7 @@ class NPUDSV4PagedPoolLayout(DSV4PagedPoolLayout):
         return pool.kv_bytes
 
     def low_ratio_padding_bytes(self, pool, full_tokens):
-        if not self.bf16_low_ratio:
+        if self.index_layout is not NPUDSV4KVLayout.V41_BF16:
             return 0
         row_bytes = self.kv_row_bytes(pool, 0)
         # SWA and compressed main KV each reserve one physical page.
@@ -66,7 +76,7 @@ class NPUDSV4PagedPoolLayout(DSV4PagedPoolLayout):
         return padding
 
     def pair_state_rows(self, num_slots, ring_size):
-        if not self.bf16_low_ratio:
+        if self.index_layout is not NPUDSV4KVLayout.V41_BF16:
             return super().pair_state_rows(num_slots, ring_size)
         # CompressorV2's 3-D state cache requires a full ring per padded TP bank.
         banks = get_a3_c2_state_bank_count(num_slots)
