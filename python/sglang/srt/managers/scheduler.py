@@ -112,6 +112,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _is_fake_transfer,
     decode_offloads_kvcache,
     get_dsa_seed_metadata_dim,
     lacks_decode_peer,
@@ -3656,8 +3657,18 @@ class Scheduler(
             return
 
         if req.return_sampling_mask:
+            if self.disaggregation_mode == DisaggregationMode.DECODE and (
+                _is_fake_transfer(req)
+            ):
+                self._reject_bad_request(
+                    req,
+                    "Fake PD decode synthesizes its first token without a sampler. "
+                    "return_sampling_mask requires a real prefill result.",
+                )
+                return
             if (
                 self.disaggregation_mode != DisaggregationMode.NULL
+                and not self._lacks_decode_peer(req)
                 and not self.disagg_metadata_buffers.enable_sampling_mask
             ):
                 self._reject_bad_request(
