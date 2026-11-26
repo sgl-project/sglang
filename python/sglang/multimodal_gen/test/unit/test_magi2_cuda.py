@@ -4,7 +4,7 @@ import unittest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.magi2 import Magi2PreviewArchConfig
-from sglang.multimodal_gen.runtime.models.dits.magi2_block_grid_attention import (
+from sglang.multimodal_gen.runtime.models.dits.magi2_refiner import (
     Magi2BlockGrid,
     Magi2BlockGridAttention,
     cached_block_mask,
@@ -175,7 +175,7 @@ def _reference(streams, block_out, post, res):
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestMhcMixOutputKernel(unittest.TestCase):
     def test_matches_an_fp32_reference(self):
-        from sglang.multimodal_gen.runtime.models.dits.magi2_mhc_kernel import (
+        from sglang.multimodal_gen.runtime.models.dits.magi2_preview import (
             mhc_mix_output,
         )
 
@@ -187,7 +187,7 @@ class TestMhcMixOutputKernel(unittest.TestCase):
         torch.testing.assert_close(got.float(), _reference(*args), rtol=0, atol=0.07)
 
     def test_hidden_size_wider_than_one_column_block(self):
-        from sglang.multimodal_gen.runtime.models.dits.magi2_mhc_kernel import (
+        from sglang.multimodal_gen.runtime.models.dits.magi2_preview import (
             mhc_mix_output,
         )
 
@@ -213,7 +213,7 @@ class TestMhcMixOutputKernel(unittest.TestCase):
         self.assertTrue(hasattr(torch.ops.sglang, "magi2_mhc_mix_output"))
 
     def test_module_uses_the_kernel_and_tracks_the_einsum_fallback(self):
-        from sglang.multimodal_gen.runtime.models.dits.magi2_mhc import Magi2MHC
+        from sglang.multimodal_gen.runtime.models.dits.magi2_preview import Magi2MHC
 
         dev = torch.device("cuda")
         mhc = Magi2MHC(num_stream=NUM_STREAM, hidden_size=HIDDEN).to(dev)

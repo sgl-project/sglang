@@ -26,9 +26,6 @@ from sglang.multimodal_gen.configs.models.vaes.magi2 import (
     Magi2TurboVAEConfig,
     Magi2VideoVAEConfig,
 )
-from sglang.multimodal_gen.runtime.models.dits.magi2_block_grid_attention import (
-    Magi2BlockGridAttention,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -36,9 +33,12 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     set_default_torch_dtype,
 )
-from sglang.multimodal_gen.runtime.models.dits.magi2_common import Magi2ModalityRMSNorm
+from sglang.multimodal_gen.runtime.models.dits.magi2_layers import Magi2ModalityRMSNorm
 from sglang.multimodal_gen.runtime.models.dits.magi2_preview import Magi2PreviewDiT
-from sglang.multimodal_gen.runtime.models.dits.magi2_refiner import Magi2RefinerDiT
+from sglang.multimodal_gen.runtime.models.dits.magi2_refiner import (
+    Magi2BlockGridAttention,
+    Magi2RefinerDiT,
+)
 from sglang.multimodal_gen.runtime.models.vaes.magi2_audio_vae import Magi2AudioVAE
 from sglang.multimodal_gen.runtime.models.vaes.magi2_turbo_vae import (
     Magi2TurboVAE,
@@ -702,7 +702,9 @@ def build_expert_parallel_group(server_args: ServerArgs) -> dist.ProcessGroup | 
 
 
 def _dit_dtype(server_args: ServerArgs, component_name: str) -> torch.dtype:
-    return resolve_precision(server_args, component_name, precision_attr="dit_precision")
+    return resolve_precision(
+        server_args, component_name, precision_attr="dit_precision"
+    )
 
 
 class _Magi2WeightsLoader(ComponentLoader):
@@ -722,7 +724,6 @@ class _Magi2WeightsLoader(ComponentLoader):
         return server_args.component_precisions.get(component_name)
 
 
-
 class Magi2PreviewDiTLoader(_Magi2WeightsLoader):
     def load_customized(self, component_model_path, server_args, component_name):
         return load_magi2_preview_dit(
@@ -730,7 +731,9 @@ class Magi2PreviewDiTLoader(_Magi2WeightsLoader):
             config=server_args.pipeline_config.dit_config,
             # The MoE takes its process group at construction time.
             ep_group=build_expert_parallel_group(server_args),
-            device=self.target_device(server_args.should_start_component_on_cpu(component_name)),
+            device=self.target_device(
+                server_args.should_start_component_on_cpu(component_name)
+            ),
             param_dtype=_dit_dtype(server_args, component_name),
         )
 
@@ -740,7 +743,9 @@ class Magi2RefinerDiTLoader(_Magi2WeightsLoader):
         return load_magi2_refiner_dit(
             component_path=component_model_path,
             config=server_args.pipeline_config.refiner_dit_config,
-            device=self.target_device(server_args.should_start_component_on_cpu(component_name)),
+            device=self.target_device(
+                server_args.should_start_component_on_cpu(component_name)
+            ),
             param_dtype=_dit_dtype(server_args, component_name),
         )
 
@@ -757,7 +762,9 @@ class Magi2TextEncoderLoader(_Magi2WeightsLoader):
     def load_customized(self, component_model_path, server_args, component_name):
         return load_magi2_text_encoder(
             component_path=component_model_path,
-            device=self.target_device(server_args.should_start_component_on_cpu(component_name)),
+            device=self.target_device(
+                server_args.should_start_component_on_cpu(component_name)
+            ),
             param_dtype=resolve_component_precision(server_args, component_name),
         )
 
@@ -774,7 +781,9 @@ class Magi2VideoVAELoader(_Magi2WeightsLoader):
         return load_magi2_video_vae(
             component_path=component_model_path,
             config=server_args.pipeline_config.vae_config,
-            device=self.target_device(server_args.should_start_component_on_cpu(component_name)),
+            device=self.target_device(
+                server_args.should_start_component_on_cpu(component_name)
+            ),
             param_dtype=resolve_precision(
                 server_args, component_name, precision_attr="vae_precision"
             ),
@@ -786,7 +795,9 @@ class Magi2TurboVAELoader(_Magi2WeightsLoader):
         return load_magi2_turbo_vae(
             component_path=component_model_path,
             config=server_args.pipeline_config.turbo_vae_config,
-            device=self.target_device(server_args.should_start_component_on_cpu(component_name)),
+            device=self.target_device(
+                server_args.should_start_component_on_cpu(component_name)
+            ),
             # No turbo_vae_precision field: it follows the preview DiT.
             param_dtype=resolve_component_precision_override(
                 server_args, component_name
@@ -800,7 +811,9 @@ class Magi2AudioVAELoader(_Magi2WeightsLoader):
         return load_magi2_audio_vae(
             component_path=component_model_path,
             config=server_args.pipeline_config.audio_vae_config,
-            device=self.target_device(server_args.should_start_component_on_cpu(component_name)),
+            device=self.target_device(
+                server_args.should_start_component_on_cpu(component_name)
+            ),
             param_dtype=resolve_precision(
                 server_args, component_name, precision_attr="audio_vae_precision"
             ),

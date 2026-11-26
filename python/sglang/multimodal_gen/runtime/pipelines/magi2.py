@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2.stages import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2 import (
     Magi2DecodingStage,
     Magi2DenoisingStage,
     Magi2ImageEncodingStage,

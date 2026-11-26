@@ -21,19 +21,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
-from sglang.multimodal_gen.runtime.models.dits import magi2_sink_attention
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
-from sglang.multimodal_gen.runtime.models.dits.magi2_block_grid_attention import (
-    SEQ_BUCKET,
-    Magi2BlockGrid,
-    Magi2BlockGridAttention,
-    block_scan_order,
-    build_mask_mod,
-    cached_block_mask,
-)
-from sglang.multimodal_gen.runtime.models.dits.magi2_sink_attention import (
-    Magi2SinkAttention,
-)
 from sglang.multimodal_gen.runtime.layers.moe_multihead import (
     MAX_KERNEL_EXPERTS,
     Magi2MultiHeadExperts,
@@ -49,7 +37,8 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.magi2_loader import 
     Magi2VideoVAELoader,
     _is_ep_sharded,
 )
-from sglang.multimodal_gen.runtime.models.dits.magi2_common import (
+from sglang.multimodal_gen.runtime.models.dits import magi2_preview
+from sglang.multimodal_gen.runtime.models.dits.magi2_layers import (
     MAGI2_MODALITY_AUDIO,
     MAGI2_MODALITY_TEXT,
     MAGI2_MODALITY_VIDEO,
@@ -61,33 +50,42 @@ from sglang.multimodal_gen.runtime.models.dits.magi2_common import (
     pad_rows_to_multiple,
     sharded_cu_seqlens,
 )
-from sglang.multimodal_gen.runtime.models.dits.magi2_mhc import sinkhorn_knopp
-from sglang.multimodal_gen.runtime.models.dits.magi2_preview import Magi2PreviewDiT
-from sglang.multimodal_gen.runtime.models.dits.magi2_refiner import Magi2RefinerDiT
+from sglang.multimodal_gen.runtime.models.dits.magi2_preview import (
+    Magi2PreviewDiT,
+    Magi2SinkAttention,
+    sinkhorn_knopp,
+)
+from sglang.multimodal_gen.runtime.models.dits.magi2_refiner import (
+    SEQ_BUCKET,
+    Magi2BlockGrid,
+    Magi2BlockGridAttention,
+    Magi2RefinerDiT,
+    block_scan_order,
+    build_mask_mod,
+    cached_block_mask,
+)
 from sglang.multimodal_gen.runtime.pipelines.magi2 import Magi2Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2 import (
-    build_layout,
-    build_timesteps,
+    denoising as magi2_renoise,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2 import (
-    coords as magi2_coords,
+    encoding as ref_images,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2 import (
-    ref_images,
+    packed_sequence as magi2_coords,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2 import (
-    renoise as magi2_renoise,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2.decoding import (
+    Magi2DecodingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2.guidance import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2.denoising import (
+    Magi2DenoisingStage,
     apply_guidance,
     skimming_mask,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2.stages.decoding import (
-    Magi2DecodingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2.stages.denoising import (
-    Magi2DenoisingStage,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2.packed_sequence import (
+    build_layout,
+    build_timesteps,
 )
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 from sglang.multimodal_gen.runtime.warmup_request_builder import lighten_warmup_req
@@ -1139,10 +1137,10 @@ class TestSinkAttentionBackend(unittest.TestCase):
         attention = Magi2SinkAttention(num_heads=4, head_dim=64, sink_token_num=1)
         with (
             mock.patch.object(
-                magi2_sink_attention, "get_attn_backend", return_value=SDPABackend
+                magi2_preview, "get_attn_backend", return_value=SDPABackend
             ),
             mock.patch.object(
-                magi2_sink_attention,
+                magi2_preview,
                 "get_ulysses_parallel_world_size",
                 return_value=1,
             ),
