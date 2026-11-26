@@ -141,7 +141,6 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         if _is_cpu_amx_available and query.dtype == self.long_short_cos_sin_cache.dtype:
             # The whole batch switches to the long cache once any position exceeds k.
             if torch.compiler.is_compiling():
-                # the cache below would graph-break and recompile; the compiler dedups idx itself
                 idx = positions + (positions > k).any().long() * k
             else:
                 # All layers of a forward share `positions`, so compute idx once.
