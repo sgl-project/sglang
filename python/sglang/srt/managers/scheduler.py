@@ -112,6 +112,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    decode_metadata_buffer_size,
     decode_offloads_kvcache,
     get_dsa_seed_metadata_dim,
     prepare_abort,
@@ -1724,7 +1725,11 @@ class Scheduler(
             buffer_multiplier = (
                 8 if is_minimax_sparse(self.model_config.hf_config) else 2
             )
-            buffer_size = (self.req_to_token_pool.size) * buffer_multiplier
+            buffer_size = decode_metadata_buffer_size(
+                max_running_requests=self.req_to_token_pool.size,
+                prealloc_slots=self.req_to_token_pool.pre_alloc_size,
+                rows_per_request=buffer_multiplier,
+            )
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
