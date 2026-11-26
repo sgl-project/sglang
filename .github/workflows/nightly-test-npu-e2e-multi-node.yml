@@ -54,7 +54,7 @@ on:
         required: false
         type: string
         description: image for pods
-        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-a3"
+        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.2.0-a3"
       prefill_decode_deployment:
         required: true
         type: string
@@ -266,7 +266,7 @@ jobs:
           create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
           if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
           # Append the image tag to the workflow-name segment so that runs with
-          # different images (CANN 9.0.0/9.1.0, a3/a5) persist into distinct,
+          # different image tags persist into distinct,
           # image-tagged output/log directories.
           image_label=$(echo "${{ inputs.image }}" | sed 's#.*[/:]##')
           workflow_name="${workflow_name}--${image_label}"

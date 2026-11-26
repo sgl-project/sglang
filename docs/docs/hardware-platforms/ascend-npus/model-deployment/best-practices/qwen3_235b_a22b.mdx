@@ -107,7 +107,7 @@ python3 -m sglang.launch_server \
     --mem-fraction-static 0.78 \
     --cuda-graph-bs-decode 1 \
     --reasoning-parser qwen3 \
-    --tool-call-parser qwen25
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
@@ -180,10 +180,10 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
 python3 -m sglang.launch_server \
+    --enable-prefill-delayer \
+    --prefill-delayer-max-delay-passes 100 \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
@@ -214,7 +214,7 @@ python3 -m sglang.launch_server \
     --mem-fraction-static 0.8 \
     --cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27 \
     --reasoning-parser qwen3 \
-    --tool-call-parser qwen25
+    --tool-call-parser qwen
 ```
 
 #### Benchmark

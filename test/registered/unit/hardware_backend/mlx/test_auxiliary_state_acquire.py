@@ -38,7 +38,7 @@ class TestMlxAuxiliaryStateAcquire(CustomTestCase):
     def setUp(self):
         self.table = MlxAuxiliaryStateReqToTokenPool(
             size=4,
-            max_context_len=16,
+            row_width=16,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,

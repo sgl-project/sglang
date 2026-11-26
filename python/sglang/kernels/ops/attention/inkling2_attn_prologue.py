@@ -5,8 +5,20 @@ from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.numerics import rsqrt_approx_f32
+from sglang.srt.utils import is_hip
 
 REL_WORKERS = 4
+
+_is_hip = is_hip()
+_IS_HIP = tl.constexpr(_is_hip)
+
+
+@triton.jit
+def _rsqrt_approx(x):
+    if _IS_HIP:
+        return tl.math.rsqrt(x)
+    else:
+        return rsqrt_approx_f32(x)
 
 
 @triton.jit
@@ -65,7 +77,7 @@ def _l2_clip(
                 )
             acc = tl.fma(x, x, acc)
     total = _lane_sum8(acc, ROWS_P)
-    norm = tl.where(total > 0.0, total * rsqrt_approx_f32(total), 0.0)
+    norm = tl.where(total > 0.0, total * _rsqrt_approx(total), 0.0)
     coeff = tl.div_rn(threshold, eps + norm)
     coeff = tl.where(coeff >= 1.0, 1.0, coeff)
     cols = tl.arange(0, D)
@@ -92,7 +104,7 @@ def _rms_norm128(X, eps, ROWS: tl.constexpr):
             x = tl.load(X + rows[:, None] * 128 + cols[None, :]).to(tl.float32)
             acc = tl.fma(x, x, acc)
     total = _lane_sum16(acc, ROWS)
-    rstd = rsqrt_approx_f32(tl.fma(total, 0.0078125, eps))
+    rstd = _rsqrt_approx(tl.fma(total, 0.0078125, eps))
     cols = tl.arange(0, 128)
     x = tl.load(X + rows[:, None] * 128 + cols[None, :]).to(tl.float32)
     return x * rstd[:, None]
@@ -267,6 +279,20 @@ def _verify_sconv(
 
 
 @triton.jit
+def _store_pool(KPool, VPool, PoolLoc, pool_stride, row, k, v, KV_HEADS: tl.constexpr):
+    """The row's K and V into the KV cache pool at its write loc, as the attention
+    backend's save would store them (padding rows included)."""
+    slot = tl.load(PoolLoc + row).to(tl.int64)
+    offs = (
+        slot * pool_stride
+        + tl.arange(0, KV_HEADS)[:, None] * 128
+        + tl.arange(0, 128)[None, :]
+    )
+    tl.store(KPool + offs, k.to(KPool.dtype.element_ty))
+    tl.store(VPool + offs, v.to(VPool.dtype.element_ty))
+
+
+@triton.jit
 def _attention_prologue(
     QX,
     KX,
@@ -331,6 +357,11 @@ def _attention_prologue(
     VERIFY: tl.constexpr = False,
     dyn_rows=0,
     DYN_GROUPS: tl.constexpr = 0,
+    KPool=None,
+    VPool=None,
+    PoolLoc=None,
+    pool_stride=0,
+    STORE_POOL: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
 ):
     if USE_PDL:
@@ -487,6 +518,8 @@ def _attention_prologue(
         tl.store(K + row * KV_WIDTH + heads_kv[:, None] * 128 + cols_kv[None, :], k)
         v = _rms_norm128(VConv + row * KV_WIDTH, norm_eps, KV_HEADS)
         tl.store(V + row * KV_WIDTH + heads_kv[:, None] * 128 + cols_kv[None, :], v)
+        if STORE_POOL:
+            _store_pool(KPool, VPool, PoolLoc, pool_stride, row, k, v, KV_HEADS)
     elif part == 1:
         heads_q = tl.arange(0, HEADS_P)
         cols_q = tl.arange(0, 128)
@@ -648,6 +681,8 @@ def _cuda_prologue(
     (else decode, with track = (track_mask, track_indices) or None); False when
     unsupported. With shear = (seqlens_k, window_left, left_pad), verify writes
     the rel rows sheared as FA4's ShearingBias would."""
+    if _is_hip:
+        return False
     q, k, v, rel = outputs
     decode = windows is None
     k_window, v_window = (k_cache, v_cache) if decode else windows
@@ -804,6 +839,7 @@ def attention_prologue(
     track_indices=None,
     verify_windows=None,
     shear=None,
+    kv_pool=None,
 ):
     """Decode attention prologue in one launch: K/V short convolutions (with cache
     update), Q/K/rel L2 clips (with log-scaling tau when positions is given), and
@@ -818,7 +854,9 @@ def attention_prologue(
     (seqlens_k, window_left) (verify only), the rel bias is written sheared as
     FA4's ShearingBias builds it from the compact one for that verify attention
     call: seqlens_k its cache_seqlens, window_left its left window or None (a
-    window must be rel_extent - 1, as FA4 requires)."""
+    window must be rel_extent - 1, as FA4 requires). kv_pool (k_buffer, v_buffer,
+    loc) also stores each row's K and V into the KV cache (the Triton prologue only;
+    the attention then skips its own save)."""
     tokens = q_in.shape[0]
     kv_width = kv_heads * 128
     device = q_in.device
@@ -855,6 +893,7 @@ def attention_prologue(
     assert shear is None or verify
     if (
         tokens
+        and kv_pool is None
         and _cuda_prologue(
             q_in,
             k_in,
@@ -954,6 +993,11 @@ def attention_prologue(
             verify,
             tokens,
             k_dynamic.shape[0] if dynamic and k_dynamic.ndim == 3 else 0,
+            *(
+                (kv_pool[0], kv_pool[1], kv_pool[2], kv_pool[0].stride(0), True)
+                if kv_pool is not None
+                else ()
+            ),
             num_warps=4,
             enable_fp_fusion=False,
             **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
