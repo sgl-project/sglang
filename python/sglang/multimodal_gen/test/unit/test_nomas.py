@@ -276,6 +276,41 @@ def condition(device="cpu", dtype=torch.float32, padded=True):
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires CUDA graph capture",
+)
+@torch.inference_mode()
+def test_offline_graph_replays_with_current_action_mask():
+    from functools import partial
+
+    from msgspec.structs import replace
+
+    model = tiny_model("cuda", "flex").bfloat16()
+    runner = model.offline_graph(warmup=True)
+    results = []
+    shape = (2, 2, 2)
+    for index, padded in enumerate((True, False, True)):
+        event = condition("cuda", torch.bfloat16, padded)
+        event = replace(event, camera_embedding=None, camera_has_mask=None)
+
+        def generate(graph_predict=None):
+            session = NomasLatentSession(model, cache_capacity=0, seed=11, steps=2)
+            return session.generate_segment(
+                shape, event, cache_segment=False, graph_predict=graph_predict
+            )
+
+        expected = generate()
+        result = generate(partial(runner.predict, warmup=index == 0))
+        assert len(runner.entries) == 1
+        assert torch.equal(result, expected)
+        results.append(result)
+    assert torch.equal(results[0], results[2])
+    assert not torch.equal(results[0], results[1])
+    model.release_cuda_graphs()
+    assert not runner.entries and model.offline_graph(warmup=False) is None
+
+
 def tiny_decoder():
     torch.manual_seed(5)
     arch = NomasVAEArchConfig(
