@@ -97,14 +97,14 @@ def cap_glm_split_index_k_dcp_context_length(server_args: Any) -> None:
         max_speculative_num_draft_tokens,
     )
     from sglang.srt.configs.model_config import glm_dsa_shards_index_k
-    from sglang.srt.mem_cache.allocation_sizing import req_to_token_extra_context_len
+    from sglang.srt.mem_cache.allocation_sizing import req_to_token_headroom
 
     cfg = resolving_view(server_args)
     model_config = model_config_of(server_args)
     if not glm_dsa_shards_index_k(model_config.hf_config, cfg.dcp_size):
         return
     alloc_page_size = cfg.page_size * cfg.dcp_size
-    extra_context_len = req_to_token_extra_context_len(
+    headroom = req_to_token_headroom(
         speculative_algorithm=cfg.speculative_algorithm,
         num_steps=cfg.speculative_num_steps,
         eagle_topk=cfg.speculative_eagle_topk,
@@ -113,7 +113,7 @@ def cap_glm_split_index_k_dcp_context_length(server_args: Any) -> None:
     )
     # The merge takes rows of at most 2^20 scores; a row spans the request
     # table rounded up to whole allocator pages.
-    max_context_len = (1 << 20) // alloc_page_size * alloc_page_size - extra_context_len
+    max_context_len = (1 << 20) // alloc_page_size * alloc_page_size - headroom
     if cfg.context_length is None:
         if model_config.context_len > max_context_len:
             declare_resolution(
@@ -161,6 +161,8 @@ def _reject_unsupported_hyv4_flash(cfg: Any) -> None:
     "Dots3NoteForCausalLM",
     "Xing4_0ForCausalLM",
     "KimiK31ForConditionalGeneration",
+    "GigaChat4ForCausalLM",
+    "GigaChat4ForCausalLMNextN",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""

@@ -85,12 +85,18 @@ patches:
 
 _PR_REVERT_YAML_26972 = """
 patches:
-  - target: sglang.srt.mem_cache.allocation_sizing.get_req_to_token_extra_context_len
+  - target: sglang.srt.mem_cache.allocation_sizing.get_req_to_token_headroom
     edits:
       - match: |
-          extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
+          return req_to_token_headroom(
+              speculative_algorithm=spec.speculative_algorithm,
+              num_steps=spec.speculative_num_steps,
+              eagle_topk=spec.speculative_eagle_topk,
+              num_draft_tokens=max_speculative_num_draft_tokens(),
+              page_size=get_alloc_page_size(),
+          )
         replacement: |
-          pass
+          return 4 + (max_speculative_num_draft_tokens() or 0)
 """
 
 

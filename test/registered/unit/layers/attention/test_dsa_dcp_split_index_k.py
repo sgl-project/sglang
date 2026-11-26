@@ -93,12 +93,12 @@ def test_unset_context_length_is_capped_only_under_split_index_k():
                 cap_glm_split_index_k_dcp_context_length(server_args)
                 return model_config_of(server_args).context_len
 
-        # The request table over-allocates four tokens without a draft.
-        assert context_len(dcp_size=4) == model_context_len - 4
+        # The request table over-allocates one token without a draft.
+        assert context_len(dcp_size=4) == model_context_len - 1
         assert context_len() == model_context_len
         assert context_len(is_sm90=False, dcp_size=4) == model_context_len
         assert context_len(dcp_size=4, context_length=4096) == 4096
-        with pytest.raises(ValueError, match="--context-length 1048572"):
+        with pytest.raises(ValueError, match="--context-length 1048575"):
             context_len(dcp_size=4, context_length=model_context_len)
         # A long draft reserves more than one allocator page of the table.
         long_draft = dict(
