@@ -32,5 +32,5 @@ The allowed types and the scope and hardware rules: https://docs.sglang.io/docs/
 1. Ping Merge Oncalls to start the process. See the [PR Merge Process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process).
 2. Get approvals from [CODEOWNERS](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and other reviewers.
 3. Trigger CI tests with [comments](https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests) or contact authorized users to do so.
-   - Common commands include `/tag-and-rerun-ci`, `/tag-run-ci-label`, `/rerun-failed-ci`
+   - Common commands include `/tag-and-rerun-ci`, `/approve-ci`, `/rerun-failed-ci`
 4. After green CI and required approvals, ask Merge Oncalls or people with Write permission to merge the PR.
