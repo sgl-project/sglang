@@ -49,6 +49,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         )
         obj.page_size = page_size
         obj.req_to_token_pool = SimpleNamespace(req_to_token=pool, row_width=pool_len)
+        obj.max_kv_len = pool_len
         obj.kv_indptr = torch.zeros(
             (steps, n * topk + 1), device="cuda", dtype=torch.int32
         )
