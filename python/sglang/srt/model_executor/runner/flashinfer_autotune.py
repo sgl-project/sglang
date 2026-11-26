@@ -575,25 +575,20 @@ def _even_split_batch_size(*, num_tokens: int, max_batch_size: int) -> int:
     )
 
 
-def _round_up_hybrid_autotune_bucket(num_tokens: int) -> int:
-    try:
-        from flashinfer.fused_moe.utils import map_to_hybrid_bucket_uncapped
-    except ImportError:
-        return num_tokens
-    return max(num_tokens, int(map_to_hybrid_bucket_uncapped(num_tokens)))
-
-
 def maybe_flashinfer_autotune_extend(
     runner: BaseRunner, *, decode_num_tokens: int
 ) -> None:
     """Also autotune kernels at the prefill token ceiling.
 
-    The decode-shaped autotune only covers token counts up to the decode
-    batch size, so larger prefill/extend batches fall outside the tuned
-    buckets and run flashinfer's default heuristic — which can be far
-    slower than the tuned tactic (e.g. trtllm-gen fp4 MoE is ~30% slower
-    untuned at >=8k tokens on sm100). One extra forward at the largest
-    per-rank extend token count tunes all buckets up to it.
+    The decode-shaped autotune only covers token counts up to
+    ``decode_num_tokens`` (decode or speculative verify rows), so larger
+    prefill/extend batches fall outside the tuned buckets and run flashinfer's
+    default heuristic — which can be far slower than the tuned tactic (e.g.
+    trtllm-gen fp4 MoE is ~30% slower untuned at >=8k tokens on sm100). One
+    extra forward at the largest per-rank extend token count tunes all buckets
+    up to it. A model-owned ``autotune_prefill_kernels`` hook instead receives
+    the larger of the prefill ceiling and ``decode_num_tokens``, so it also
+    covers the widest verify-row bucket.
     """
     mr = runner.model_runner
     # Prefer the per-rank scheduler buffer while preserving the legacy ceiling
@@ -607,11 +602,10 @@ def maybe_flashinfer_autotune_extend(
         # ranks, so a model that has nothing to tune must decline before it.
         prefill_autotune = None
     if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
-        model_num_tokens = _round_up_hybrid_autotune_bucket(
-            max(num_tokens, decode_num_tokens or 0)
-        )
         with flashinfer_autotune_context(mr, run_lm_head=False):
-            tuned = prefill_autotune(model_num_tokens, dtype=mr.dtype)
+            tuned = prefill_autotune(
+                max(num_tokens, decode_num_tokens or 0), dtype=mr.dtype
+            )
         if tuned:
             return
 
