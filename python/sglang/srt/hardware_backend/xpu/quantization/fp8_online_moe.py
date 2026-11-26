@@ -89,10 +89,18 @@ def _online_weight_loader(
 ) -> Callable:
     loaded_numel = 0
 
-    def online_fp8_moe_weight_loader(param, loaded_weight, *args, **kwargs):
+    def online_fp8_moe_weight_loader(
+        param, loaded_weight, weight_name, shard_id, expert_id=None
+    ):
         nonlocal loaded_numel
         with lock:
             weight = getattr(layer, f"{name}_weight")
+            if expert_id is not None and not tuple(
+                layer._weight_loader_expert_ids(weight, expert_id)
+            ):
+                # Nonlocal experts must not allocate or start a reload: with EP
+                # their callbacks can arrive after this rank's weight is quantized.
+                return
             if weight.is_meta or weight.dtype != source_dtype:
                 # First shard, or a reload after quantization.
                 source = torch.nn.Parameter(
@@ -107,7 +115,9 @@ def _online_weight_loader(
             # it copies rather than what arrives.
             counter = CopyNumelCounter()
             with counter:
-                original_weight_loader(weight, loaded_weight, *args, **kwargs)
+                original_weight_loader(
+                    weight, loaded_weight, weight_name, shard_id, expert_id
+                )
             loaded_numel += counter.copied_numel
             if loaded_numel == weight.numel():
                 _quantize(layer, name)

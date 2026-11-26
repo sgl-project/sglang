@@ -39,34 +39,44 @@ class _StubFusedMoE(torch.nn.Module):
     )
     _load_w13 = FusedMoE._load_w13
     _load_w2 = FusedMoE._load_w2
+    _weight_loader_expert_ids = FusedMoE._weight_loader_expert_ids
+    _map_global_expert_id_to_local_expert_id = (
+        FusedMoE._map_global_expert_id_to_local_expert_id
+    )
 
     quant_config = None
     use_padded_loading = False
     use_presharded_weights = False
+    uses_expert_location = False
+    _has_fused_shared = False
 
-    def __init__(self, tp_size: int, tp_rank: int):
+    def __init__(self, tp_size: int, tp_rank: int, ep_size: int = 1, ep_rank: int = 0):
         super().__init__()
         self.moe_tp_size = tp_size
         self.moe_tp_rank = tp_rank
         self.num_local_experts = NUM_EXPERTS
+        self._num_local_routed = NUM_EXPERTS
+        self._num_global_routed = NUM_EXPERTS * ep_size
+        self._expert_storage_rank = ep_rank
         self.moe_runner_config = SimpleNamespace(is_gated=True)
 
     def weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id):
-        """FusedMoE.weight_loader for local experts: TP narrowing into the expert."""
-        self._load_model_weight_or_group_weight_scale(
-            shard_dim=SHARD_DIM[shard_id],
-            expert_data=param.data[expert_id],
-            shard_id=shard_id,
-            loaded_weight=loaded_weight,
-        )
+        """FusedMoE.weight_loader: global -> local expert (EP), then TP narrowing."""
+        for local_expert_id in self._weight_loader_expert_ids(param, expert_id):
+            self._load_model_weight_or_group_weight_scale(
+                shard_dim=SHARD_DIM[shard_id],
+                expert_data=param.data[local_expert_id],
+                shard_id=shard_id,
+                loaded_weight=loaded_weight,
+            )
 
 
-def _checkpoint():
+def _checkpoint(num_experts=NUM_EXPERTS):
     """Per-expert gate / up / down in BF16, with a different magnitude per expert so a
     scale stored into the wrong expert is visible."""
     gen = torch.Generator().manual_seed(0)
     experts = []
-    for e in range(NUM_EXPERTS):
+    for e in range(num_experts):
         mag = 0.01 * (e + 1)
 
         def rand(*shape):
@@ -82,12 +92,12 @@ def _checkpoint():
     return experts
 
 
-def _make(tp_size, tp_rank, xpu=True):
+def _make(tp_size, tp_rank, xpu=True, ep_size=1, ep_rank=0):
     """A layer as create_weights leaves it: ``XPUOnlineFp8MoEMethod``, or with
     ``xpu=False`` the ``Fp8MoEMethod`` every other platform uses."""
     cls = XPUOnlineFp8MoEMethod if xpu else Fp8MoEMethod
     method = cls(Fp8Config(is_checkpoint_fp8_serialized=False))
-    layer = _StubFusedMoE(tp_size, tp_rank)
+    layer = _StubFusedMoE(tp_size, tp_rank, ep_size, ep_rank)
     layer.quant_method = method
     with torch.device(DEV):
         method.create_weights(
@@ -198,6 +208,31 @@ class TestXpuOnlineFp8MoE(_BackendMocked):
         _process(method, layer)
         self.assertNotEqual(layer.w13_weight.dtype, torch.bfloat16)
         self.assertEqual(tuple(layer.w13_weight_scale.shape), (NUM_EXPERTS,))
+
+    def test_ep_nonlocal_experts_after_local_loading(self):
+        # EP=2: this rank holds global experts [ep_rank * 4, ep_rank * 4 + 4). The
+        # checkpoint also delivers the other rank's experts, here after every local
+        # weight is complete and quantized; they must not start a reload.
+        ckpt = _checkpoint(2 * NUM_EXPERTS)
+        for ep_rank in (0, 1):
+            local = range(ep_rank * NUM_EXPERTS, (ep_rank + 1) * NUM_EXPERTS)
+            nonlocal_ = [e for e in range(2 * NUM_EXPERTS) if e not in local]
+            order = [(e, s) for e in local for s in ("w1", "w3", "w2")]
+            order += [(e, s) for e in nonlocal_ for s in ("w1", "w3", "w2")]
+            with self.subTest(ep_rank=ep_rank):
+                ref_method, ref = _make(1, 0, xpu=False, ep_size=2, ep_rank=ep_rank)
+                _load(ref, order, ckpt)
+                _process(ref_method, ref)
+
+                method, layer = _make(1, 0, ep_size=2, ep_rank=ep_rank)
+                _load(layer, order[: 3 * NUM_EXPERTS], ckpt)
+                quantized = {n: getattr(layer, n) for n in ("w13_weight", "w2_weight")}
+                self.assertEqual(layer.w13_weight.dtype, ref.w13_weight.dtype)
+                _load(layer, order[3 * NUM_EXPERTS :], ckpt)
+                for n, param in quantized.items():
+                    self.assertIs(getattr(layer, n), param, n)
+                _process(method, layer)
+                self.assertSameWeights(layer, ref)
 
     def test_never_loaded_weight_is_materialized(self):
         # --load-format dummy never calls the weight loader.
