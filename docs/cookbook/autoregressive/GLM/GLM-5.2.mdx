@@ -49,10 +49,10 @@ Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environ
 <Tab title="A3">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:v0.5.22-cann9.1.0-a3
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 ```
 
-Run the following setup before copying the generated command (CANN 9.1.0). CPU tuning requires host privileges.
+Run the following setup before copying the generated command (CANN 9.2.0). CPU tuning requires host privileges.
 
 ```bash Command
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
@@ -220,6 +220,136 @@ sglang serve \
   --host 0.0.0.0 \
   --port 30000
 ```
+
+### MI355X prefill/decode disaggregation with the Infera router
+
+MXFP4 checkpoint with EAGLE MTP on MI355X as prefill/decode disaggregation behind [Infera](https://github.com/AMD-AGI/Infera)'s KV-aware router, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) as `glm5.2-fp4-mi355x-infera-sglang-agentic-disagg` ([InferenceX #5138](https://github.com/SemiAnalysisAI/InferenceX/pull/5138), [validation run](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/44733355916)). Every worker is SGLang's own server, started through Infera's launcher `python3 -m infera.engine.sglang`, which forwards the SGLang flags unchanged and registers the worker in etcd. The router discovers the workers there, routes prefill on the cached prefix each worker reports through SGLang's ZMQ KV events, keeps a session on one prefill worker, and balances the decode DP-attention ranks.
+
+| Shape | Prefill | Decode | GPUs | Concurrency | Router `--decode-request-weight` |
+|---|---|---|---|---|---|
+| 1P1D | 1 × TP1·PP4 | TP8, DP attention 8 | 12 | 32–88 | `1000000` |
+| 1P + 4-GPU decode | 1 × TP1·PP4 | TP4, DP attention 4 | 8 | 64–80 | default (`0`) |
+
+Image: `lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261117` (`sha256:e016f33423250be30bde9e0888d159b67b01e00944de1edc11f36dd1f3dd0269`), unpatched. Run every process with the RDMA NICs passed in (`--device /dev/infiniband`, `--network host`, `--ipc host`, `--cap-add IPC_LOCK`, `--ulimit memlock=-1`) on top of the ROCm device flags from the Install panel. Infera is not in the image; install it without touching the image's packages (only `nats-py` is missing):
+
+```bash Install Infera
+pip install --no-deps nats-py==2.16.0 amd-infera==0.3.3
+```
+
+The `amd-infera` Linux x86_64 wheel bundles the `infera-router` binary that `python3 -m infera.server` runs.
+
+Start the processes in this order: etcd, the prefill worker, the decode worker, then the router. `$ETCD_IP` is the etcd host, `$NODE_IP` the worker's own routable address, `$NIC` its network interface, and `$RDMA_DEVICES` the host's eight RDMA devices as a comma-separated list (for example `ionic_0,ionic_1,...,ionic_7` or `rdma0,rdma1,...,rdma7`, depending on the host's naming).
+
+```bash etcd
+etcd --data-dir /tmp/etcd \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls http://$ETCD_IP:2379
+```
+
+```bash Environment for both roles
+export GLOO_SOCKET_IFNAME=$NIC NCCL_SOCKET_IFNAME=$NIC NCCL_IB_DISABLE=1 NCCL_IGNORE_CPU_AFFINITY=1
+export HSA_NO_SCRATCH_RECLAIM=1 HIP_FORCE_DEV_KERNARG=1 SAFETENSORS_FAST_GPU=1 PYTHONHASHSEED=0
+export AITER_USE_FLYDSL_MOE_SORTING=1 SGLANG_DP_USE_GATHERV=1
+export SGLANG_OPT_USE_TOPK_V2=true SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK=0
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1800 SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800
+export SGLANG_TIMEOUT_KEEP_ALIVE=900 INFERA_ENGINE_READY_TIMEOUT=3600
+# Mooncake over the ionic NICs: VRAM registered through peer memory in 1 GiB regions.
+export MC_DISABLE_HIP=1 MOONCAKE_DISABLE_HIP_DMABUF=1 MC_MAX_MR_SIZE=1073741824
+export MC_GID_INDEX=1 MC_ENABLE_DEST_DEVICE_AFFINITY=1 RDMAV_FORK_SAFE=1
+```
+
+```bash Prefill (TP1·PP4, layers 20/20/20/18)
+ROCR_VISIBLE_DEVICES=0,1,2,3 \
+SGLANG_PP_LAYER_PARTITION=20,20,20,18 \
+SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB=512 \
+python3 -m infera.engine.sglang \
+  --discovery-backend etcd --etcd-endpoint http://$ETCD_IP:2379 \
+  --advertise-host $NODE_IP --request-transport http --kv-event-transport zmq --kv-events off \
+  --model-path amd/GLM-5.2-MXFP4 --served-model-name amd/GLM-5.2-MXFP4 --trust-remote-code \
+  --host 0.0.0.0 --port 30000 \
+  --disaggregation-mode prefill --disaggregation-bootstrap-port 8998 \
+  --disaggregation-transfer-backend mooncake --disaggregation-ib-device $RDMA_DEVICES \
+  --kv-events-config '{"publisher": "zmq", "topic": "kv-events", "endpoint": "tcp://*:5557"}' \
+  --tp-size 1 --pp-size 4 --ep-size 1 --disable-overlap-schedule \
+  --chunked-prefill-size 8192 --max-prefill-tokens 8192 --mem-fraction-static 0.88 \
+  --schedule-policy shortest-prefill-first --max-running-requests 256 \
+  --enable-hierarchical-cache --hicache-size 250 --hicache-ratio 1.5 \
+  --hicache-write-policy write_back --hicache-io-backend kernel --hicache-mem-layout page_first \
+  --kv-cache-dtype fp8_e4m3 --dsa-prefill-backend triton --dsa-decode-backend triton \
+  --json-model-override-args '{"index_share_for_mtp_iteration":false}' \
+  --disable-custom-all-reduce --enable-aiter-allreduce-fusion --enable-fused-qk-norm-rope \
+  --speculative-algorithm EAGLE --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
+  --reasoning-parser glm45 --tool-call-parser glm47 \
+  --enable-metrics --enable-cache-report --watchdog-timeout 3600 --skip-server-warmup
+```
+
+```bash Decode, TP8 + DP attention (1P1D)
+python3 -m infera.engine.sglang \
+  --discovery-backend etcd --etcd-endpoint http://$ETCD_IP:2379 \
+  --advertise-host $NODE_IP --request-transport http --kv-event-transport zmq --kv-events off \
+  --no-enable-kv-events \
+  --model-path amd/GLM-5.2-MXFP4 --served-model-name amd/GLM-5.2-MXFP4 --trust-remote-code \
+  --host 0.0.0.0 --port 30000 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake --disaggregation-ib-device $RDMA_DEVICES \
+  --tp-size 8 --dp-size 8 --enable-dp-attention --ep-size 1 \
+  --chunked-prefill-size 32768 --mem-fraction-static 0.92 \
+  --max-running-requests 256 --cuda-graph-max-bs-decode 256 --tokenizer-worker-num 4 \
+  --kv-cache-dtype fp8_e4m3 --dsa-prefill-backend triton --dsa-decode-backend triton \
+  --json-model-override-args '{"index_share_for_mtp_iteration":false}' \
+  --disable-custom-all-reduce --enable-aiter-allreduce-fusion --enable-fused-qk-norm-rope \
+  --speculative-algorithm EAGLE --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
+  --reasoning-parser glm45 --tool-call-parser glm47 \
+  --enable-metrics --enable-cache-report --watchdog-timeout 3600 --skip-server-warmup
+```
+
+```bash Decode, TP4 + DP attention (1P + 4-GPU decode)
+ROCR_VISIBLE_DEVICES=0,1,2,3 \
+python3 -m infera.engine.sglang \
+  --discovery-backend etcd --etcd-endpoint http://$ETCD_IP:2379 \
+  --advertise-host $NODE_IP --request-transport http --kv-event-transport zmq --kv-events off \
+  --no-enable-kv-events \
+  --model-path amd/GLM-5.2-MXFP4 --served-model-name amd/GLM-5.2-MXFP4 --trust-remote-code \
+  --host 0.0.0.0 --port 30000 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake --disaggregation-ib-device $RDMA_DEVICES \
+  --tp-size 4 --dp-size 4 --enable-dp-attention --ep-size 1 \
+  --chunked-prefill-size 32768 --mem-fraction-static 0.92 \
+  --max-running-requests 256 --cuda-graph-max-bs-decode 256 --tokenizer-worker-num 4 \
+  --kv-cache-dtype fp8_e4m3 --dsa-prefill-backend triton --dsa-decode-backend triton \
+  --json-model-override-args '{"index_share_for_mtp_iteration":false}' \
+  --disable-custom-all-reduce --enable-aiter-allreduce-fusion --enable-fused-qk-norm-rope \
+  --speculative-algorithm EAGLE --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
+  --reasoning-parser glm45 --tool-call-parser glm47 \
+  --enable-metrics --enable-cache-report --watchdog-timeout 3600 --skip-server-warmup
+```
+
+```bash Router (OpenAI API on port 8000)
+python3 -m infera.server --router-backend rust \
+  --host 0.0.0.0 --port 8000 \
+  --discovery-backend etcd --etcd-endpoint http://$ETCD_IP:2379 \
+  --request-transport http --kv-event-transport zmq \
+  --router-tokenizer-path amd/GLM-5.2-MXFP4 --router-policy kv-aware \
+  --kv-prefill-overlap-weight 20 --kv-decode-overlap-weight 2 \
+  --session-affinity prefill --pd-prefill-guard-release completion \
+  --decode-input-demand on \
+  --decode-request-weight 1000000  # 1P1D only; omit for the 4-GPU decode
+```
+
+Clients pass a session id in the `X-Session-ID` header so the router keeps a session's turns on the prefill worker that holds its prefix.
+
+Settings that matter on this deployment:
+
+- **Decode request weight.** Under DP attention a decode step waits for its busiest rank, so the 8-GPU decode balances the requests each rank holds (`--decode-request-weight 1000000`). The 4-GPU decode is KV-bound and balances on tokens alone.
+- **`--disable-custom-all-reduce`.** With the custom all-reduce on, decode output under DP attention with CUDA graphs is garbled.
+- **`--disable-overlap-schedule`** is required by pipeline parallelism on the prefill worker.
+- **MTP on both roles.** The prefill carries the decode's EAGLE flags so the KV transfer includes the draft layer.
+- **HiCache sizing.** `--hicache-size 250` is per PP stage, so the prefill worker pins 1 TB of host memory for KV plus the DSA indexer's host pool (about 23% more).
+- **Locked memory.** The ionic RDMA driver charges each KV registration against the soft `RLIMIT_MEMLOCK` before it falls back to peer memory. Without `--ulimit memlock=-1` (or, under Slurm containers without `CAP_IPC_LOCK`, raising the soft limit to the hard limit in the shell that starts the worker), Mooncake's 1 GiB registrations fail with `ENOMEM` and the decode exits before it is ready.
+- **GPU driver.** The run used amdgpu-dkms 6.16.13. On DKMS 6.18.4 and later (checked on 6.19.14), KFD charges NIC-pinned VRAM twice, so device allocations fail after the KV cache is registered; the fix is upstream in [torvalds/linux@9131cc85d0de](https://github.com/torvalds/linux/commit/9131cc85d0dedd8ba4cae60dbe5985d081551f30).
 
 ## 1. Model Introduction
 
