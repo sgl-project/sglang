@@ -45,6 +45,12 @@ class _RotaryEmbeddingStub(_ModuleStub):
 
 
 class TestDeepseekV4RoPEPolicy(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", device="cpu"), role="test")
+
     @staticmethod
     def _config(compress_ratio):
         return SimpleNamespace(
