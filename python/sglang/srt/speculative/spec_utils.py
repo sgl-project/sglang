@@ -770,7 +770,7 @@ def traverse_tree(
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
             current_token = draft_tokens[curr]
-            if vocab_size and current_token >= vocab_size:
+            if current_token < 0 or (vocab_size and current_token >= vocab_size):
                 is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers

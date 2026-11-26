@@ -6,6 +6,10 @@ import unittest
 
 import torch
 from llguidance import LLTokenizer, grammar_from
+from llguidance.hf import from_tokenizer
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.constrained.llguidance_backend import GuidanceGrammar
 from sglang.srt.speculative.spec_utils import traverse_tree
@@ -38,6 +42,39 @@ class TestGuidanceAcceptTokenReject(CustomTestCase):
         grammar.accept_token(self._tok("b"))
         grammar.rollback(1)
         grammar.accept_token(self._tok("c"))
+
+    def test_negative_draft_does_not_clear_valid_last_token(self):
+        # Token "z" occupies bit 31 of the last word, which a -1 index aliases.
+        words = ["<eos>", *"abcdefghijklmnopqrstuvwxy01234z"]
+        vocab = {word: i for i, word in enumerate(words)}
+        tokenizer = from_tokenizer(
+            PreTrainedTokenizerFast(
+                tokenizer_object=Tokenizer(WordLevel(vocab)),
+                eos_token="<eos>",
+            )
+        )
+        grammar = GuidanceGrammar(
+            llguidance_tokenizer=tokenizer,
+            serialized_grammar=grammar_from("lark", 'start: ("a" | "z") "b"'),
+        )
+        mask = grammar.allocate_vocab_mask(tokenizer.vocab_size, 3, "cpu")
+        grammar.fill_vocab_mask(mask, 0)
+        root_mask = mask[0].clone()
+        self.assertLess(int(root_mask[-1]), 0)
+
+        # The missing child and its valid sibling both branch from the root.
+        traverse_tree(
+            torch.tensor([1, -1, -1]),
+            torch.tensor([-1, 2, -1]),
+            torch.tensor([0, -1, vocab["z"]]),
+            grammar,
+            mask,
+            tokenizer.vocab_size,
+        )
+        torch.testing.assert_close(mask[0], root_mask)
+        self.assertNotEqual(int(mask[2, 0]) & (1 << vocab["b"]), 0)
+        grammar.accept_token(vocab["a"])
+        grammar.accept_token(vocab["b"])
 
     def test_traverse_tree_survives_reject_below_root(self):
         # Verify tree: root -> "a" -> {"x", "b"}. Keep every mask row all-allow so
