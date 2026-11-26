@@ -151,6 +151,7 @@ However, because GPU KV computation is naturally performed layer by layer, the G
 
 * **Compute-Transfer Overlap**: During the prefill phase, when transferring data from CPU to GPU, HiCache overlaps layers by concurrently loading the KV cache of layer N+1 while computing layer N. This effectively hides data transfer latency.
 * **GPU-assisted I/O Kernels**: On top of `cudaMemcpyAsync`, HiCache implements a set of GPU-assisted I/O kernels specifically optimized for KV cache transfers between CPU and GPU. Compared to the baseline approach, these kernels achieve up to 3x higher transfer speed.
+* **Batched Page-Run Copies**: With the `direct` I/O backend and the `layer_first` layout on CUDA, MLA KV and DSA indexer transfers group pages that are consecutive on both the GPU and the host into runs. Each run is copied with one descriptor per layer, and the descriptors of a transfer are submitted together where CUDA allows (see [Memory Layout Optimization](/docs/advanced_features/hicache_best_practices#memory-layout-optimization)). The bytes moved are unchanged; the number of copies submitted falls with the run length.
 
 **Write-back Optimization for MLA**: For MHA (Multi-Head Attention) models under multi-TP, each rank holds `1/tp_size` of a token’s KV data. In contrast, for MLA (Multi-Layer Attention) models, all ranks hold the complete and identical KV data for each token. HiCache includes a dedicated optimization for MLA: only one rank initiates the write-back operation, ensuring that data is not redundantly stored across ranks.
 
