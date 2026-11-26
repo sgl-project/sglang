@@ -1253,6 +1253,13 @@ def validate_dflash_request(
     req: Req, enable_overlap: bool, bound_runtime: bool
 ) -> Optional[str]:
     """bound_runtime is the same on every rank, so every rank rejects alike."""
+    if (
+        get_spec().speculative_dspark_pp_replicated_draft
+        and req.sampling_params.top_k > 1
+    ):
+        return "PP DSpark currently requires greedy sampling (temperature=0)."
+    if get_spec().speculative_dspark_pp_replicated_draft and req.return_hidden_states:
+        return "PP DSpark does not support return_hidden_states yet."
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 

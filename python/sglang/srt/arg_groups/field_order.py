@@ -563,6 +563,8 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
     "hybrid_cache_checkpoints_level",
+    "speculative_dspark_pp_replicated_draft",
+    "speculative_draft_scheduling_policy",
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
     "enable_token_space_processor",
