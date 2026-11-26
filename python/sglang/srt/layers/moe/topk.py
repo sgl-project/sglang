@@ -2982,7 +2982,7 @@ def select_experts(
 
                 if glm_aiter_presort.kernel_ready(router_logits, correction_bias):
                     shared_weight = topk_config.fused_shared_experts_scaling_factor
-                    topk_weights, topk_ids = glm_aiter_presort.route_and_register(
+                    topk_weights, topk_ids = glm_aiter_presort.route_and_stage(
                         hidden_states,
                         router_logits,
                         correction_bias,

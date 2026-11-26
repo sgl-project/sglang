@@ -234,8 +234,6 @@ def test_aiter_accepts_the_registered_sort(monkeypatch, ep_size, ep_rank, m):
 
     from sglang.srt.layers.moe import glm_aiter_presort
 
-    registrations = []
-    monkeypatch.setattr(glm_aiter_presort, "_registrar", lambda: registrations.append)
     monkeypatch.setattr(
         glm_aiter_presort,
         "get_parallel",
@@ -243,12 +241,12 @@ def test_aiter_accepts_the_registered_sort(monkeypatch, ep_size, ep_rank, m):
     )
     scores, bias = _inputs(m, torch.float32, seed=m)
     hidden = torch.empty((m, MODEL_DIM), dtype=torch.bfloat16, device="cuda")
-    w, ids = glm_aiter_presort.route_and_register(
+    w, ids = glm_aiter_presort.route_and_stage(
         hidden, scores, bias, SCALING, SHARED_WEIGHT, True, None
     )
-    (aux,) = registrations
-    output = glm_aiter_presort.take_zeroed_output(
-        hidden.shape, hidden.dtype, hidden.device
+    aux = glm_aiter_presort.take_staged(ids, w)
+    output = glm_aiter_presort.zeroed_output(
+        aux, hidden.shape, hidden.dtype, hidden.device
     )
     assert aux["topk_ids"] is ids and aux["topk_weights"] is w
     assert aux["moe_buf"] is output

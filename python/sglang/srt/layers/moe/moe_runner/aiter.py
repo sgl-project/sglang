@@ -190,6 +190,14 @@ class AiterRunnerCore(MoeRunnerCore):
                 "supports fused_moe no_combine output."
             )
 
+        # Taken before any early return, so a sort the GLM router staged never
+        # outlives the experts call it was written for.
+        from sglang.srt.layers.moe import glm_aiter_presort
+
+        glm_presort = glm_aiter_presort.take_staged(
+            runner_input.topk_ids, runner_input.topk_weights
+        )
+
         if runner_input.hidden_states.shape[0] == 0:
             if self.config.no_combine:
                 topk = runner_input.topk_ids.shape[-1]
@@ -271,11 +279,9 @@ class AiterRunnerCore(MoeRunnerCore):
                     runner_input.hidden_states.device,
                 )
                 output = zero_copy_context.get_moe_output_spec(*out_spec)
-                if output is None:
-                    # The GLM router may have zeroed this call's output already.
-                    from sglang.srt.layers.moe import glm_aiter_presort
-
-                    output = glm_aiter_presort.take_zeroed_output(*out_spec)
+                if output is None and glm_presort is not None:
+                    # The GLM router zeroed this call's output already.
+                    output = glm_aiter_presort.zeroed_output(glm_presort, *out_spec)
             if output is not None:
                 extra["output"] = output
         extra["moe_sorting_dispatch_policy"] = _MOE_SORTING_DISPATCH_POLICY
@@ -336,6 +342,8 @@ class AiterRunnerCore(MoeRunnerCore):
         if activation is None:
             activation = _aiter_activation(self.config)
 
+        if glm_presort is not None:
+            glm_aiter_presort.register(glm_presort)
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,
