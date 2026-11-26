@@ -114,9 +114,10 @@ class HarmonyContext(ConversationContext):
         return self._messages
 
     def need_builtin_tool_call(self) -> bool:
-        if not self.messages:
+        messages = self.messages
+        if not messages:
             return False
-        last_msg = self.messages[-1]
+        last_msg = messages[-1]
         recipient = last_msg.recipient
         return recipient is not None and (
             recipient.startswith("browser.") or recipient.startswith("python")
@@ -179,6 +180,9 @@ class HarmonyContext(ConversationContext):
 
 
 class StreamingHarmonyContext(HarmonyContext):
+    # Index in parser.messages of the call awaiting a tool result.
+    pending_builtin_tool_message: int | None = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.last_output = None

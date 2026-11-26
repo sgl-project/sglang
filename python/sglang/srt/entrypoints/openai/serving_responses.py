@@ -1962,6 +1962,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         active_item = None
         active_model = None
         num_messages = 0
+        tool_pending = False
+        tool_actions = {
+            "web_search_call": "searching",
+            "code_interpreter_call": "interpreting",
+        }
 
         def _send_event(event_type: str, **fields):
             nonlocal sequence_number
@@ -1969,7 +1974,30 @@ class OpenAIServingResponses(OpenAIServingChat):
             sequence_number += 1
             return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
 
-        def _update_item(item, *, done=False, status="completed"):
+        def _finish_item(status):
+            nonlocal active_item, active_model
+            output_index = len(emitted_items)
+            snapshot = active_model.model_dump()
+            if "status" in snapshot:
+                snapshot["status"] = status
+            if status == "completed" and active_model.type in tool_actions:
+                yield _send_event(
+                    f"response.{active_model.type}.completed",
+                    output_index=output_index,
+                    item_id=active_model.id,
+                )
+            finished_item = type(active_model).model_validate(snapshot)
+            if status != "failed":
+                yield _send_event(
+                    "response.output_item.done",
+                    output_index=output_index,
+                    item=finished_item.model_dump(),
+                )
+            emitted_items.append(finished_item)
+            active_item = None
+            active_model = None
+
+        def _update_item(item, *, done=False, status="completed", start_tool=False):
             nonlocal active_item, active_model
             if item.type == "reasoning":
                 item = self._make_reasoning_item(
@@ -1997,7 +2025,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     output_index=output_index,
                     item=active_item,
                 )
-                if item.type in ("web_search_call", "code_interpreter_call"):
+                if item.type in tool_actions:
                     yield _send_event(
                         f"response.{item.type}.in_progress",
                         output_index=output_index,
@@ -2092,34 +2120,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if delta:
                     yield _send_event(f"{event_prefix}.delta", **common, delta=delta)
                 active_item[field] = value
-                if done:
+                if done or start_tool:
                     yield _send_event(
                         f"{event_prefix}.done", **common, **{field: value}
                     )
 
-            if done:
-                if "status" in snapshot:
-                    snapshot["status"] = status
-                if status == "completed" and item.type in (
-                    "web_search_call",
-                    "code_interpreter_call",
-                ):
-                    action = (
-                        "searching"
-                        if item.type == "web_search_call"
-                        else "interpreting"
-                    )
-                    yield _send_event(f"response.{item.type}.{action}", **common)
-                    yield _send_event(f"response.{item.type}.completed", **common)
-                completed_item = type(item).model_validate(snapshot)
+            if item.type in tool_actions and (
+                start_tool or (done and status == "completed")
+            ):
                 yield _send_event(
-                    "response.output_item.done",
-                    output_index=output_index,
-                    item=completed_item.model_dump(),
+                    f"response.{item.type}.{tool_actions[item.type]}", **common
                 )
-                emitted_items.append(completed_item)
-                active_item = None
-                active_model = None
+            if done:
+                yield from _finish_item(status)
 
         initial_response = ResponsesResponse.from_request(
             request,
@@ -2135,19 +2148,33 @@ class OpenAIServingResponses(OpenAIServingChat):
         yield _send_event("response.in_progress", response=initial_response)
 
         async for ctx in result_generator:
-            for message in ctx.messages[num_messages:]:
-                for item in parse_output_message(message):
-                    for event in _update_item(item, done=True):
-                        yield event
-            num_messages = len(ctx.messages)
-            for item in parse_remaining_state(ctx.parser):
-                for event in _update_item(item):
+            pending_message = ctx.pending_builtin_tool_message
+            if tool_pending and pending_message is None:
+                for event in _finish_item("completed"):
                     yield event
+                tool_pending = False
+            messages = ctx.messages
+            for index, message in enumerate(messages[num_messages:], num_messages):
+                for item in parse_output_message(message):
+                    tool_pending = index == pending_message
+                    for event in _update_item(
+                        item, done=not tool_pending, start_tool=tool_pending
+                    ):
+                        yield event
+            num_messages = len(messages)
+            if not tool_pending:
+                for item in parse_remaining_state(ctx.parser):
+                    for event in _update_item(item):
+                        yield event
 
-        if active_model is not None:
+        if tool_pending:
+            for event in _finish_item("failed"):
+                yield event
+        elif active_model is not None:
             status = (
                 "incomplete"
-                if self._status_from_finish_reason(context.finish_reason) != "completed"
+                if active_model.type in tool_actions
+                or self._status_from_finish_reason(context.finish_reason) != "completed"
                 else "completed"
             )
             for event in _update_item(active_model, done=True, status=status):
@@ -3057,6 +3084,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> AsyncGenerator[Any, None]:
         """Generate with builtin tool support for harmony-based models."""
         orig_priority = priority or 0
+        streaming = isinstance(context, StreamingHarmonyContext)
 
         while True:
             # Generate using SGLang's tokenizer manager
@@ -3067,21 +3095,33 @@ class OpenAIServingResponses(OpenAIServingChat):
             async for res in generator:
                 context.append_output(res)
                 # NOTE(woosuk): The stop condition is handled by the engine.
+                if streaming and context.need_builtin_tool_call():
+                    context.pending_builtin_tool_message = len(context.messages) - 1
                 yield context
 
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
                 break
 
-            if self.is_disaggregated:
-                raise ValueError(
-                    "built-in tool calls are not supported with prefill-decode "
-                    "disaggregation"
-                )
-
             # Call the tool and update the context with the result.
-            tool_output = await context.call_tool()
-            context.append_output(tool_output)
+            try:
+                if self.is_disaggregated:
+                    raise ValueError(
+                        "built-in tool calls are not supported with prefill-decode "
+                        "disaggregation"
+                    )
+                tool_output = await context.call_tool()
+                context.append_output(tool_output)
+            except Exception as exc:
+                if not streaming:
+                    raise
+                logger.exception("Error executing Harmony tool for %s", request_id)
+                context.finish_reason = {"type": "error", "message": str(exc)}
+                break
+            if streaming:
+                # Publish the finished call before requesting the next generation turn.
+                context.pending_builtin_tool_message = None
+                yield context
 
             # Prepare for the next generation turn
             # Render the updated conversation for the next completion
