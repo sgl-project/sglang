@@ -4,6 +4,7 @@ test_basic_sanity.py / test_basic_sanity_eagle3.py with the DFLASH path active
 
 import unittest
 
+from sglang.srt.speculative.dflash_utils import is_dflash_sampling_verify_available
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
@@ -53,27 +54,32 @@ class TestBasicSanityDFlash(
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--trust-remote-code",
+            "--attention-backend",
+            cls.attention_backend,
+            "--speculative-draft-attention-backend",
+            cls.draft_attention_backend,
+            "--speculative-algorithm",
+            "DFLASH",
+            "--speculative-draft-model-path",
+            DEFAULT_DRAFT_MODEL_DFLASH,
+            "--cuda-graph-max-bs-decode",
+            "4",
+            "--mem-fraction-static",
+            "0.7",
+            "--enable-metrics",
+            "--cuda-graph-backend-prefill=disabled",
+        ]
+        # The default draft has no selector or LiLiCorr head, so without the kernel
+        # DFLASH can only verify greedily.
+        if not is_dflash_sampling_verify_available():
+            other_args.append("--speculative-dflash-allow-greedy-verification")
         cls.process = popen_launch_server(
             DEFAULT_TARGET_MODEL_DFLASH,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--attention-backend",
-                cls.attention_backend,
-                "--speculative-draft-attention-backend",
-                cls.draft_attention_backend,
-                "--speculative-algorithm",
-                "DFLASH",
-                "--speculative-draft-model-path",
-                DEFAULT_DRAFT_MODEL_DFLASH,
-                "--cuda-graph-max-bs-decode",
-                "4",
-                "--mem-fraction-static",
-                "0.7",
-                "--enable-metrics",
-                "--cuda-graph-backend-prefill=disabled",
-            ],
+            other_args=other_args,
             env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
         )
 

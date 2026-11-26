@@ -4,6 +4,7 @@ from contextlib import ExitStack
 import openai
 
 from sglang.srt.environ import envs
+from sglang.srt.speculative.dflash_utils import is_dflash_sampling_verify_available
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
@@ -72,6 +73,10 @@ class TestDFlashServerBase(
         ]
         if cls.disable_overlap:
             launch_args.append("--disable-overlap-schedule")
+        # The default draft has no selector or LiLiCorr head, so without the kernel
+        # DFLASH can only verify greedily.
+        if not is_dflash_sampling_verify_available():
+            launch_args.append("--speculative-dflash-allow-greedy-verification")
         launch_args.extend(cls.other_launch_args)
         with ExitStack() as stack:
             for env, value in (

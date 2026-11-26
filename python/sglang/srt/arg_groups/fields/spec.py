@@ -72,6 +72,12 @@ class Spec(msgspec.Struct):
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dflash_allow_greedy_verification: A[
+        bool,
+        "DFLASH only. Verify non-greedy requests greedily where DFLASH cannot verify "
+        "them by sampling, as on Ascend NPU; their sampling distribution is then not "
+        "preserved. Without this flag, such a server refuses to start.",
+    ] = False
     speculative_domino_candidate_pool_size: A[
         int,
         "Domino only. Size of the approximate block-shared base-logit candidate pool. Set to 0 to score the full vocabulary.",

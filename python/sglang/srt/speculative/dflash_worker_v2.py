@@ -61,6 +61,7 @@ from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_memory,
     get_parallel,
@@ -531,7 +532,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
         self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
 
-        self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
         self._draft_probs_buf = None
         self._full_embed_gpu: Optional[torch.Tensor] = None
@@ -606,6 +606,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH with dp attention supports plain DFlash and DFlash2 "
                     "drafts; Domino and LiLiCorr heads are not supported."
                 )
+        self._check_sampling_verify_support()
         self.domino_candidate_pool_size = int(
             get_spec().speculative_domino_candidate_pool_size
         )
@@ -2929,38 +2930,41 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, cap_trim_lens
 
-    def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
-        sampling_info = batch.sampling_info
-        if sampling_info is None or sampling_info.is_all_greedy:
-            return
-
+    def _supports_sampling_verify(self) -> bool:
+        """True when _accept_block verifies non-greedy rows by sampling."""
+        if self._is_domino:
+            # Domino proposes by greedy rollout; selector and LiLiCorr heads sit unused.
+            return is_dflash_sampling_verify_available()
         if self.selector is not None:
-            if self._selector_sampling_enabled:
-                return
-            if not self._warned_sampling_fallback and get_parallel().tp_rank == 0:
-                logger.warning(
-                    "DFLASH non-greedy verification is unavailable on this "
-                    "build/device; falling back to greedy argmax verification. "
-                    "The requested sampling distribution will not be preserved; "
-                    "use temperature=0 and top_k=1 for lossless greedy decoding."
-                )
-                self._warned_sampling_fallback = True
-            return
-
+            return (
+                self._selector_sampling_enabled or is_dflash_sampling_verify_available()
+            )
         # The sampled head hands verify the q it drew from, so no fallback is needed.
         if self.lilicorr is not None and self._lilicorr_sampling_enabled:
-            return
+            return True
+        return is_dflash_sampling_verify_available()
 
+    def _check_sampling_verify_support(self) -> None:
+        # A PD prefill server never verifies.
         if (
-            not is_dflash_sampling_verify_available()
-            and not self._warned_sampling_fallback
-            and get_parallel().tp_rank == 0
+            get_disagg().disaggregation_mode == "prefill"
+            or self._supports_sampling_verify()
         ):
-            logger.warning(
-                "DFLASH non-greedy verification is unavailable on this build/device; "
-                "falling back to greedy argmax verification."
+            return
+        if not get_spec().speculative_dflash_allow_greedy_verification:
+            raise ValueError(
+                "DFLASH cannot verify non-greedy requests by sampling on this "
+                "device with this draft. Pass "
+                "--speculative-dflash-allow-greedy-verification to verify them "
+                "greedily instead, which does not preserve their sampling "
+                "distribution."
             )
-            self._warned_sampling_fallback = True
+        if get_parallel().tp_rank == 0:
+            logger.warning(
+                "DFLASH verifies non-greedy requests greedily on this device with "
+                "this draft (--speculative-dflash-allow-greedy-verification); "
+                "their sampling distribution is not preserved."
+            )
 
     def _make_next_draft_input_prefill(
         self,
@@ -2995,7 +2999,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             return batch_output
-        self._validate_phase1_sampling_support(batch)
         if (
             batch.forward_mode.is_extend()
             or batch.is_extend_in_batch
