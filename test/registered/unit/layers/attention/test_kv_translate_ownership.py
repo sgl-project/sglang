@@ -127,7 +127,6 @@ class _Inner(AttentionBackend):
         self.token_to_kv_pool = None
         self.req_to_token_pool = None
         self.needs_cpu_seq_lens = False
-        self.max_context_len = 8
         self.dense_layer_ids = []
 
 
@@ -138,7 +137,7 @@ class _Runner:
         self.runner_ids = runner_ids
         self.kv_cache_dtype = None
         self.token_to_kv_pool = None
-        self.req_to_token_pool = SimpleNamespace(max_context_len=8)
+        self.req_to_token_pool = SimpleNamespace(row_width=8)
 
 
 def _build_wrappers(runner_ids):
