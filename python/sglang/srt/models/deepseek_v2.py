@@ -808,8 +808,11 @@ class DeepseekV2MoE(nn.Module):
                 # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
                 output_format=(
                     TopKOutputFormat.STANDARD
-                    if (quant_config is None)
-                    and (not get_moe_runner_backend().is_flashinfer_trtllm())
+                    if get_moe_a2a_backend().is_megamoe()
+                    or (
+                        quant_config is None
+                        and not get_moe_runner_backend().is_flashinfer_trtllm()
+                    )
                     else None
                 ),
             )

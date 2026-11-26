@@ -47,7 +47,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK, TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopK, TopKOutputChecker, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -312,6 +312,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             renormalize=norm_topk_prob,
             use_grouped_topk=False,
             layer_id=layer_id,
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if get_moe_a2a_backend().is_megamoe()
+                else None
+            ),
         )
 
     def forward(
