@@ -25,7 +25,7 @@ from sglang.srt.multimodal.processors.deepseek_ocr import apply_ocr_geometry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _hf_config(vision_model_name: str, projector_input_dim) -> SimpleNamespace:

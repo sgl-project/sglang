@@ -23,8 +23,12 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
             "4xH200 deployment; the VDN-H3 8-step hybrid checkpoint has no "
-            'audited high-quality deployment. Use quality="lossless".'
+            'audited high-quality deployment. Use quality="exact".'
         )
+
+    def extra_dit_components(self, server_args) -> tuple[str, ...]:
+        # one partition; validate_server_args rejects --model-variant
+        return ()
 
     def validate_server_args(self, server_args) -> None:
         if server_args.model_variant is not None:
@@ -74,3 +78,24 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
 
 
 __all__ = ["VDNH3PipelineConfig"]
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.minimax_h3_vdn import (
+        VDNH3SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=VDNH3SamplingParams,
+        pipeline_config_cls=VDNH3PipelineConfig,
+        hf_model_paths=[
+            "OpenVDN/vdn-minimax-h3",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "vdn" in model_id.lower()
+                and "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )

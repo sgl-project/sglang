@@ -3,23 +3,23 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import dataclasses
-import hashlib
 import json
 import math
 import os
 import os.path
 import re
-import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 
 logger = init_logger(__name__)
 
@@ -27,37 +27,50 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-def _json_safe(obj: Any):
-    """
-    Recursively convert objects to JSON-serializable forms.
-    - Enums -> their name
-    - Callables -> stable module-qualified name
-    - Sets/Tuples -> lists
-    - Dicts/Lists -> recursively processed
-    """
-    if isinstance(obj, Enum):
-        return obj.name
-    if callable(obj):
-        module = getattr(obj, "__module__", None)
-        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
-        return f"{module}.{qualname}" if module else qualname
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_json_safe(v) for v in obj]
-    return obj
-
-
 def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
-# Validated request-level quality levels, ordered from the strictest numerical
-# contract to the broadest optimization set. "lossless" keeps the exact
-# reference path; "extra-high" adds only request-gated kernel fusions; "high"
-# is cumulative and may also enable model-owned approximate optimizations.
-QUALITY_LEVELS: tuple[str, ...] = ("lossless", "extra-high", "high")
-KERNEL_FUSION_QUALITY_LEVELS = frozenset({"extra-high", "high"})
+# Request-level quality levels, ordered from the strictest numerical contract to
+# the broadest optimization set; each level includes the fast paths of the ones
+# before it:
+# - "exact": bit-identical to the reference path in the same environment
+# - "lossless": the same math; fast paths may change rounding order or position
+# - "high": may also change what is computed (precision, sparsity, reuse)
+QUALITY_LEVELS: tuple[str, ...] = ("exact", "lossless", "high")
+# "extra-high" is the pre-rename name of "lossless"
+QUALITY_ALIASES: dict[str, str] = {"extra-high": "lossless"}
+# libx264 presets, fastest first: each spends more encode time for a smaller
+# file at the same CRF.
+X264_PRESETS: tuple[str, ...] = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+)
+# RIFE multiplies the frame count by 2**exp and recurses forever for exp < 1.
+# The upper bound (16x) is arbitrary; each step doubles RIFE calls and frames.
+MIN_FRAME_INTERPOLATION_EXP = 1
+MAX_FRAME_INTERPOLATION_EXP = 4
+
+
+def validate_frame_interpolation_exp(exp: int) -> None:
+    if (
+        isinstance(exp, bool)
+        or not isinstance(exp, int)
+        or not MIN_FRAME_INTERPOLATION_EXP <= exp <= MAX_FRAME_INTERPOLATION_EXP
+    ):
+        raise ValueError(
+            "frame_interpolation_exp must be an int in "
+            f"[{MIN_FRAME_INTERPOLATION_EXP}, {MAX_FRAME_INTERPOLATION_EXP}], "
+            f"got {exp!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -111,9 +124,20 @@ def resolve_skip_softmax_params(
     return SkipSoftmaxParams(float(threshold), start_step)
 
 
-def quality_allows_kernel_fusions(quality: str) -> bool:
-    """Return whether a quality level includes request-gated kernel fusions."""
-    return quality in KERNEL_FUSION_QUALITY_LEVELS
+def normalize_quality(quality: str) -> str:
+    """Return the canonical quality level for ``quality``, resolving aliases."""
+    level = QUALITY_ALIASES.get(quality, quality)
+    if level not in QUALITY_LEVELS:
+        raise ValueError(
+            f"quality must be one of {[*QUALITY_LEVELS, *QUALITY_ALIASES]}, "
+            f"got {quality!r}"
+        )
+    return level
+
+
+def quality_allows(quality: str, tier: str) -> bool:
+    """Whether a request at ``quality`` may run a fast path of class ``tier``."""
+    return QUALITY_LEVELS.index(quality) >= QUALITY_LEVELS.index(tier)
 
 
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
@@ -189,20 +213,31 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
-class DataType(Enum):
-    IMAGE = auto()
-    VIDEO = auto()
-    MESH = auto()
-    ACTION = auto()
+# Arbitrary upper bounds; upscaling_scale squares the pixel count.
+_FRAME_INTERPOLATION_SCALE_RANGE = (0.25, 4.0)
+_MAX_UPSCALING_SCALE = 8
 
-    def get_default_extension(self) -> str:
-        if self == DataType.IMAGE:
-            return "png"
-        if self == DataType.VIDEO:
-            return "mp4"
-        if self == DataType.ACTION:
-            return "json"
-        return "glb"
+
+def _check_postprocess_controls(params: "SamplingParams") -> None:
+    scale = params.frame_interpolation_scale
+    low, high = _FRAME_INTERPOLATION_SCALE_RANGE
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, (int, float))
+        or not low <= scale <= high
+    ):
+        raise ValueError(
+            f"frame_interpolation_scale must be in [{low}, {high}], got {scale!r}"
+        )
+    up = params.upscaling_scale
+    if (
+        isinstance(up, bool)
+        or not isinstance(up, int)
+        or not 1 <= up <= _MAX_UPSCALING_SCALE
+    ):
+        raise ValueError(
+            f"upscaling_scale must be an int in [1, {_MAX_UPSCALING_SCALE}], got {up!r}"
+        )
 
 
 @dataclass
@@ -222,13 +257,25 @@ class SamplingParams:
     """
 
     data_type: DataType = DataType.VIDEO
+    # Included in the dynamic batching signature and retained by replace/pickle.
+    task_type: ModelTaskType | str | None = None
 
     request_id: str | None = field(default=None, metadata={"batch_sig_exclude": True})
 
     # All fields below are copied from ForwardBatch
 
     # Image inputs
-    image_path: str | list[str] | None = None
+    # Per-request conditioning input: excluded from the dynamic-batch
+    # signature so image-conditioned requests can still group (the grouping
+    # gate is supports_batching_image_conditioning()).
+    image_path: str | list[str] | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
+    # Audio conditioning stays in the signature: S2V output follows the audio,
+    # so two requests with different audio must not share a batch.
+    audio_path: str | None = None
+    pose_video_path: str | None = None
+    num_clip: int | None = None
 
     # Video inputs (video-to-video conditioning)
     video_path: str | list[str] | None = None
@@ -245,18 +292,22 @@ class SamplingParams:
     )
     output_quality: str | None = "default"
     output_compression: int | None = None
-    # Model-owned, request-scoped quality level.
+    # MP4 encode speed; None keeps the server's default preset
+    x264_preset: str | None = None
+    # Model-owned, request-scoped quality level (see QUALITY_LEVELS).
     #
-    # - "lossless" (default): the exact reference path. Output is expected to
-    #   be bit-identical to the HF reference implementation and to pass the
-    #   CI golden/ground-truth comparisons.
-    # - "extra-high": add only validated kernel fusions. These may change
-    #   half-precision rounding order, so output is not bit-exact versus the
-    #   reference, but this tier does not itself enable sparse or approximate
-    #   optimizations.
-    # - "high": include every "extra-high" fusion and allow model-owned
-    #   approximate optimizations such as sparse computation or feature
-    #   caching. These paths require model-specific quality validation.
+    # - "exact": the reference path, plus the fast paths that reproduce its
+    #   rounding exactly. Output is bit-identical to it in the same
+    #   environment; ask for this when a run has to be reproducible or when
+    #   bisecting a numerical bug.
+    # - "lossless" (default): also mount the fast paths that keep the
+    #   reference math and the precision of every operand and accumulator,
+    #   and only move where the rounding happens. Output matches the
+    #   reference to rounding error rather than bit for bit, by less than the
+    #   same path already moves between two legal environments.
+    # - "high": also allow model-owned approximate optimizations (lower
+    #   precision, sparse computation, feature caching), which need
+    #   model-specific quality validation.
     #
     # It intentionally participates in the dynamic-batch signature.
     quality: str = "lossless"
@@ -291,6 +342,13 @@ class SamplingParams:
     # The base __post_init__ will apply them when height/width are not provided.
     _default_height: ClassVar[int | None] = None
     _default_width: ClassVar[int | None] = None
+    # Fewest denoising steps the model's schedule accepts. Warmup requests are
+    # clamped to it, so a generic 1-step warmup stays a valid request.
+    min_num_inference_steps: ClassVar[int] = 1
+
+    # A prompt-free pipeline (e.g. a text-free SR / video-to-video DiT) sets this to
+    # ``True`` so the multipart video-generation route does not require ``prompt``.
+    prompt_optional: ClassVar[bool] = False
 
     height: int | None = None
     width: int | None = None
@@ -386,6 +444,8 @@ class SamplingParams:
 
     # return output file paths directly to client
     return_file_paths_only: bool = True
+    # also return each image's encoded bytes, which are written to disk only when save_output
+    return_image_bytes: bool = False
     enable_sequence_shard: bool | None = None
     diffusers_kwargs: dict | None = None
     max_sequence_length: int | None = None
@@ -403,36 +463,9 @@ class SamplingParams:
             )
 
     def _set_output_file_name(self):
-        # settle output_file_name
-        if (
-            self.output_file_name is None
-            and self.prompt
-            and isinstance(self.prompt, str)
-        ):
-            # generate a random filename
-            # get a hash of current params
-            params_dict = dataclasses.asdict(self)
-            # Avoid recursion
-            params_dict["output_file_name"] = ""
-
-            # Convert to a stable JSON string
-            params_str = json.dumps(_json_safe(params_dict), sort_keys=True)
-            # Create a hash
-            hasher = hashlib.sha256()
-            hasher.update(params_str.encode("utf-8"))
-            param_hash = hasher.hexdigest()[:8]
-
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            base = f"{self.prompt[:100]}_{timestamp}_{param_hash}"
-            self.output_file_name = base
-
         if self.output_file_name is None:
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            self.output_file_name = f"output_{timestamp}"
-
+            self.output_file_name = f"output_{uuid.uuid4().hex}"
         self.output_file_name = _sanitize_filename(self.output_file_name)
-
-        # Ensure a proper extension is present
         self._set_output_file_ext()
 
     def __post_init__(self) -> None:
@@ -452,9 +485,9 @@ class SamplingParams:
         self._validate()
 
         # Allow env var to override num_inference_steps (for faster CI testing on AMD)
-        env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
+        env_steps = envs.SGLANG_TEST_NUM_INFERENCE_STEPS
         if env_steps is not None and self.num_inference_steps is not None:
-            self.num_inference_steps = int(env_steps)
+            self.num_inference_steps = env_steps
 
         if self.enable_spectrum and isinstance(self.spectrum_params, dict):
             from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
@@ -512,6 +545,18 @@ class SamplingParams:
         """Number of final samples produced by one expanded scheduler request."""
         return 1
 
+    def should_use_classifier_free_guidance(self) -> bool:
+        cfg_scale = (
+            self.true_cfg_scale
+            if self.true_cfg_scale is not None
+            else self.guidance_scale
+        )
+        return (
+            cfg_scale is not None
+            and cfg_scale > 1.0
+            and self.negative_prompt is not None
+        )
+
     @classmethod
     def default_image_output_format(cls) -> str | None:
         """Return a model-owned default format for the image API, if any."""
@@ -554,6 +599,11 @@ class SamplingParams:
         """Resolve model-specific facts for one synthetic warmup request."""
         del req, server_args
 
+    def request_task(self) -> str | None:
+        """Task name that ``--request-time-limit TASK=SECONDS`` matches, or None
+        for models without named tasks."""
+        return None
+
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         """Return model-resolved fields to publish with the queued video job."""
         del req
@@ -583,7 +633,12 @@ class SamplingParams:
         output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
         if output_quality == "default":
             return 50 if data_type == DataType.VIDEO else 75
-        return output_quality_mapper.get(output_quality)
+        if output_quality not in output_quality_mapper:
+            valid = list(output_quality_mapper.keys()) + ["default"]
+            raise ValueError(
+                f"Invalid output_quality {output_quality!r}. Expected one of: {valid}"
+            )
+        return output_quality_mapper[output_quality]
 
     def _validate(self):
         """
@@ -594,10 +649,7 @@ class SamplingParams:
                 f"prompt_path must be a txt file, got {self.prompt_path!r}"
             )
 
-        if self.quality not in QUALITY_LEVELS:
-            raise ValueError(
-                f"quality must be one of {list(QUALITY_LEVELS)}, got {self.quality!r}"
-            )
+        self.quality = normalize_quality(self.quality)
 
         resolve_skip_softmax_params(self.skip_softmax_params)
 
@@ -627,9 +679,18 @@ class SamplingParams:
                 f"seed must be a non-negative int or list of ints, got {self.seed!r}"
             )
 
-        # Used by seconds() and video writer; fps <= 0 is always invalid.
+        if self.x264_preset is not None and self.x264_preset not in X264_PRESETS:
+            raise ValueError(
+                f"x264_preset must be one of {', '.join(X264_PRESETS)}, "
+                f"got {self.x264_preset!r}"
+            )
+
+        # Used by the video writer; fps <= 0 is always invalid.
         if not isinstance(self.fps, int) or self.fps <= 0:
             raise ValueError(f"fps must be a positive int, got {self.fps!r}")
+
+        # scale bounds follow RIFE's supported range.
+        _check_postprocess_controls(self)
 
         # num_frames is already asserted in __post_init__, but keep a friendly error here too
         # (e.g., when validation is triggered from other code paths).
@@ -646,6 +707,8 @@ class SamplingParams:
                 raise ValueError(
                     f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
                 )
+
+        validate_frame_interpolation_exp(self.frame_interpolation_exp)
 
         if self.progressive_mode not in ("fullres", "dct", "dct_rewind"):
             raise ValueError(
@@ -723,22 +786,23 @@ class SamplingParams:
             )
 
         RLRolloutArgs.validate_sampling_params(self)
-
-    def check_sampling_param(self):
-        # Keep backward-compatibility for old call sites.
-        self._validate()
+        if self.num_clip is not None:
+            if not isinstance(self.num_clip, int) or self.num_clip <= 0:
+                raise ValueError(
+                    f"num_clip must be a positive int, got {self.num_clip!r}"
+                )
 
     def _validate_with_pipeline_config(self, pipeline_config):
         """
         check if the sampling params is compatible and valid with server_args
         """
-        task_type = pipeline_config.task_type
+        task_type = self.resolve_task_type(pipeline_config)
         if task_type.is_action_gen():
             return
 
         if task_type.requires_image_input():
             # requires image input
-            if self.image_path is None:
+            if not self.image_path:
                 raise ValueError(
                     f"Served model with task type '{task_type.name}' requires an 'image_path' input, but none was provided"
                 )
@@ -749,6 +813,54 @@ class SamplingParams:
                 raise ValueError(
                     f"input_reference is not supported for {task_type.name} models."
                 )
+
+        if task_type.requires_video_input() and not self.video_path:
+            raise ValueError(f"Task {task_type.name} requires a 'video_path' input")
+        # Legacy pipelines retain their model-owned video conditioning checks.
+        # Explicit multi-task declarations use the standard per-task contract.
+        if (
+            self.video_path
+            and (
+                getattr(pipeline_config, "supported_task_types", None) is not None
+                or (
+                    hasattr(pipeline_config, "get_supported_task_types")
+                    and len(pipeline_config.get_supported_task_types()) > 1
+                )
+            )
+            and not task_type.accepts_video_input()
+        ):
+            raise ValueError(f"video_path is not supported for task {task_type.name}")
+
+        if pipeline_config.task_type.requires_audio_input():
+            if self.audio_path is None:
+                raise ValueError(
+                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'audio_path' input, but none was provided"
+                )
+
+        if not pipeline_config.task_type.accepts_audio_input():
+            if self.audio_path is not None:
+                raise ValueError(
+                    f"audio_path is not supported for {pipeline_config.task_type.name} models."
+                )
+
+        if (
+            self.pose_video_path is not None
+            and not pipeline_config.task_type.accepts_audio_input()
+        ):
+            raise ValueError(
+                f"pose_video_path is not supported for {pipeline_config.task_type.name} models."
+            )
+
+    def resolve_task_type(self, pipeline_config) -> ModelTaskType:
+        resolver = getattr(pipeline_config, "resolve_task_type", None)
+        if resolver is None:
+            # Compatibility with integrations that supply a lightweight config.
+            return ModelTaskType.parse(self.task_type or pipeline_config.task_type)
+        return resolver(
+            self.task_type,
+            has_image=bool(self.image_path),
+            has_video=bool(self.video_path),
+        )
 
     def _adjust(
         self,
@@ -761,7 +873,8 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
-        task_type = pipeline_config.task_type
+        task_type = self.resolve_task_type(pipeline_config)
+        self.task_type = task_type
         self.data_type = task_type.data_type()
 
         self._adjust_output_path(server_args)
@@ -807,7 +920,6 @@ class SamplingParams:
             except ImportError:
                 self.guidance_scale = 1.0
         self.return_frames = False
-        self.return_video = False
         self.num_frames = 1
         self.adjust_frames = False
         if self.save_output and not server_args.comfyui_mode:
@@ -858,13 +970,16 @@ class SamplingParams:
         else:
             self.enable_sequence_shard = False
 
-        if self.enable_sequence_shard:
+        if (
+            self.enable_sequence_shard
+            and pipeline_config.task_type != ModelTaskType.S2V
+        ):
             self.adjust_frames = False
             logger.info(
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
-        if pipeline_config.task_type.is_image_gen():
+        if self.resolve_task_type(pipeline_config).is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug("Setting `num_frames` to 1 for image generation model")
@@ -884,7 +999,9 @@ class SamplingParams:
                 self.num_frames,
             )
 
-            if self.adjust_frames:
+            # Wan S2V trims one frame and shards its own padded sequence, so the
+            # generic per-GPU latent-frame alignment does not apply to it.
+            if self.adjust_frames and pipeline_config.task_type != ModelTaskType.S2V:
                 new_num_frames = align_num_frames_for_num_gpus(
                     self.num_frames,
                     num_gpus=server_args.num_gpus,
@@ -986,12 +1103,6 @@ class SamplingParams:
 
         return sampling_params
 
-    def output_size_str(self) -> str:
-        return f"{self.width}x{self.height}"
-
-    def seconds(self) -> float:
-        return self.num_frames / self.fps
-
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
         """Add CLI arguments for SamplingParam fields.
@@ -1007,8 +1118,13 @@ class SamplingParams:
             return parser.add_argument(*name_or_flags, **kwargs)
 
         add_argument("--data-type", type=str, nargs="+")
-        # Predict the shot length from the caption, overriding `--num-frames`.
+        add_argument(
+            "--task-type",
+            type=str,
+            help="Request task (for example t2i, i2i, t2v, i2v, v2v, f2v); must be supported by the pipeline.",
+        )
         add_argument("--use-diffusion-decoder", action="store_true")
+        # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--auto-duration", action="store_true")
         add_argument("--auto-duration-min-seconds", type=float)
         add_argument("--auto-duration-max-seconds", type=float)
@@ -1187,6 +1303,7 @@ class SamplingParams:
         add_argument(
             "--output-quality",
             type=str,
+            choices=["maximum", "high", "medium", "low", "default"],
             help="Output quality setting (default, low, medium, high, maximum)",
         )
         add_argument(
@@ -1195,18 +1312,29 @@ class SamplingParams:
             help="Output compression level (0-100, higher means better quality but larger file size)",
         )
         add_argument(
+            "--x264-preset",
+            type=str,
+            choices=list(X264_PRESETS),
+            help=(
+                "libx264 preset for MP4 output. Faster presets encode sooner "
+                "and produce larger files at the same quality setting; "
+                "unset keeps the default (fast)."
+            ),
+        )
+        add_argument(
             "--quality",
             type=str,
-            choices=list(QUALITY_LEVELS),
+            choices=[*QUALITY_LEVELS, *QUALITY_ALIASES],
             help=(
-                "Request-level quality: 'lossless' (default) keeps the exact "
-                "reference path, bit-exact against the reference "
-                "implementation; 'extra-high' adds only request-gated kernel "
-                "fusions and does not itself enable sparse or approximate "
-                "optimization; 'high' includes every extra-high fusion and "
-                "may also enable "
-                "model-owned approximate paths. Support and validated "
-                "deployment constraints are model-specific."
+                "Request-level quality: 'lossless' (default) runs every fast "
+                "path that keeps the reference math and operand precision and "
+                "only moves the rounding, so output matches the reference to "
+                "rounding error; 'exact' restricts it to the fast paths that "
+                "reproduce the reference's rounding exactly, giving "
+                "bit-identical output in the same environment; 'high' may "
+                "also enable model-owned approximate paths. 'extra-high' is "
+                "accepted as the former name of 'lossless'. Support and "
+                "validated deployment constraints are model-specific."
             ),
         )
         add_argument(
@@ -1299,7 +1427,7 @@ class SamplingParams:
             "--true-cfg-scale",
             type=float,
             dest="true_cfg_scale",
-            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image)",
+            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image, FLUX.1)",
         )
         add_argument(
             "--guidance-rescale",
@@ -1386,6 +1514,43 @@ class SamplingParams:
                 "frames for the generated output."
             ),
         )
+        # Kandinsky6 video super-resolution (ignored by other models)
+        add_argument(
+            "--sr-resolution-scale",
+            type=float,
+            help="Kandinsky6 SR total upscale factor: 2, 4 or 2.25 (default: 2.25).",
+        )
+        add_argument(
+            "--sr-num-steps",
+            action=DeprecatedAction,
+            nargs=None,
+            type=int,
+            help="(Deprecated) No effect: Kandinsky6 SR reads --num-inference-steps.",
+        )
+        add_argument(
+            "--sr-tiles-batch-size",
+            type=int,
+            help="Kandinsky6 SR: number of tiles denoised together (default: 1).",
+        )
+        add_argument(
+            "--sr-tile-min-overlap",
+            type=float,
+            help="Kandinsky6 SR: minimum tile overlap fraction in [0, 1) "
+            "(default: 0.2).",
+        )
+        add_argument(
+            "--sr-target-resolution",
+            type=str,
+            help="Kandinsky6 SR delivery resolution: hd, fullhd, 2k or WxH; the "
+            "result is only ever downscaled to it (default: keep the SR size).",
+        )
+        add_argument(
+            "--sr-target-resize-mode",
+            type=str,
+            choices=["fit", "exact"],
+            help="Kandinsky6 SR: 'fit' keeps the aspect ratio inside the target "
+            "resolution, 'exact' resizes to it exactly (default: fit).",
+        )
         add_argument(
             "--action-mode",
             type=str,
@@ -1428,9 +1593,26 @@ class SamplingParams:
             ),
         )
         add_argument(
-            "--moba-config-path",
+            "--audio-path",
             type=str,
-            help="Path to a JSON file containing V-MoBA specific configurations.",
+            help="Path to the input audio file for speech-driven video generation.",
+        )
+        add_argument(
+            "--pose-video-path",
+            type=str,
+            help="Optional pose guidance video for speech-driven video generation.",
+        )
+        add_argument(
+            "--num-clip",
+            type=int,
+            help="Optional clip repeat/count override for speech-driven video generation.",
+        )
+        add_argument(
+            "--moba-config-path",
+            action=DeprecatedAction,
+            nargs=None,
+            type=str,
+            help="(Deprecated) No effect: no sampling parameter reads this path.",
         )
         add_argument(
             "--return-trajectory-latents",
@@ -1519,6 +1701,29 @@ class SamplingParams:
             "--upscaling-scale",
             type=int,
             help="Upscaling factor (default: 4).",
+        )
+        # HunyuanImage-3 and similar model-specific tokenizer/prompt arguments
+        add_argument(
+            "--bot-task",
+            dest="bot_task",
+            type=str,
+            help=(
+                "Tokenizer bot task (model-specific). For HunyuanImage-3: "
+                "auto, image, think, recaption, think_recaption, img_ratio, none. "
+                "Controls the bot response prefix in the tokenizer."
+            ),
+        )
+        add_argument(
+            "--system-prompt",
+            dest="system_prompt",
+            type=str,
+            help=(
+                "System prompt: preset name or raw custom text. "
+                "Presets: none, en_unified, en_vanilla, en_recaption, "
+                "en_think_recaption, dynamic, auto. "
+                "Any other string is used directly as the system prompt. "
+                "Default: en_unified."
+            ),
         )
         return parser
 
@@ -1627,20 +1832,6 @@ class SamplingParams:
         if explicit_fields is not None:
             self._explicit_fields = set(explicit_fields)
         self.__post_init__()
-
-    @property
-    def n_tokens(self) -> int:
-        # Calculate latent sizes
-        if self.height and self.width:
-            latents_size = [
-                (self.num_frames - 1) // 4 + 1,
-                self.height // 8,
-                self.width // 8,
-            ]
-            n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
-        else:
-            n_tokens = -1
-        return n_tokens
 
 
 @dataclass

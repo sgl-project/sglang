@@ -7,6 +7,12 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_cuda
 
@@ -359,7 +365,7 @@ def ar_sconv_norm_fused(
             activation=sconv.activation,
             use_residual=sconv.use_residual,
             track_mask=forward_batch.mamba_track_mask,
-            track_indices=forward_batch.mamba_track_indices,
+            track_indices=sconv._conv_state(forward_batch).track_cache_indices,
             shared=shared,
         )
     res.v5_cur = 1 - cur
@@ -416,9 +422,7 @@ def symm_mem_all_reduce(
     input: torch.Tensor,
     group: GroupCoordinator,
     *,
-    output: torch.Tensor | None = None,
     input_is_ar_buffer: bool = False,
-    num_sms: int = 32,
     shared: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """All-reduce ``input`` across ``group`` in the communicator's symm buffer.
@@ -436,19 +440,14 @@ def symm_mem_all_reduce(
     fallback PRE-ADDS during its stage-in copy, so passing ``shared`` is
     always numerics-identical to {torch.add -> all_reduce}.
     """
-    _ = num_sms
     if group.world_size == 1:
         if shared is not None:
             input = input + shared
-        if output is None:
-            return input
-        output.copy_(input)
-        return output
+        return input
 
     comm = group.torch_symm_mem_comm
     if (
-        output is None
-        and comm is not None
+        comm is not None
         and not comm.disabled
         and group.world_size in _INKLING_AR_WORLD_SIZES
         and comm.should_torch_symm_mem_allreduce(input)
@@ -585,11 +584,7 @@ def symm_mem_all_reduce(
 
     if shared is not None:
         input = input + shared
-    result = group.all_reduce(input)
-    if output is None:
-        return result
-    output.copy_(result)
-    return output
+    return group.all_reduce(input)
 
 
 # --- scattered sconv (--enable-scattered-sconv) comm helpers -----------------
@@ -710,10 +705,9 @@ def scattered_ar_sconv_fusable(
     if not (fm.is_extend() or fm.is_decode()):
         return False
     # Prefill scope: the BCG runner's eager-break sites are not wired (its
-    # baked flags would disagree with the break bodies) and tc_piecewise's
-    # FX pieces can't carry the cross-layer producer/consumer contract, so
-    # both fall back to the unfused chain. The FULL prefill CUDA-graph
-    # backend (context.full_graph -- the whole model captured uniformly) IS
+    # baked flags would disagree with the break bodies), so it falls back
+    # to the unfused chain. The FULL prefill CUDA-graph
+    # backend (the whole model captured uniformly) IS
     # supported: the kernel is capture-safe (barrier epochs advance across
     # replays; validated capture+replay) and all its metadata (qsl/si/
     # cache_mask/safe_idx/track rows) is recomputed in-graph from the
@@ -721,12 +715,12 @@ def scattered_ar_sconv_fusable(
     # rows only write pad rows of the OUT region (the eager tail slices
     # [:raw]), and sentinel request slots have qlen == 0 so the in-kernel
     # cache update/track skip them.
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        get_tc_piecewise_forward_context,
-    )
 
-    tc_ctx = get_tc_piecewise_forward_context()
-    if tc_ctx is not None and not tc_ctx.full_graph:
+    if (
+        is_in_prefill_graph_scope()
+        and is_in_breakable_cuda_graph()
+        and fm.is_extend_without_speculative()
+    ):
         return False
     comm = group.torch_symm_mem_comm
     if (
@@ -795,9 +789,7 @@ def ar_scattered_sconv_fused(
     # optimal (n/P in + n/P out per rank, no window staging) and each rank
     # convs only its own channels. The price, accepted by design: decode pays
     # a second cross-rank sync round (consumers need full rows, so the
-    # post-conv shard exchange must publish). The one-shot decode and
-    # banded-scattered variants (window-shard push) remain available in the
-    # JIT module / bench harness as alternatives.
+    # post-conv shard exchange must publish).
 
     buf = comm.buffer[:n].view(t, h)
     if input.data_ptr() != buf.data_ptr():
@@ -834,7 +826,7 @@ def ar_scattered_sconv_fused(
     if fm.is_decode() and forward_batch.mamba_track_mask is not None:
         b = forward_batch.batch_size
         track_mask = forward_batch.mamba_track_mask[:b]
-        track_dst = forward_batch.mamba_track_indices[:b]
+        track_dst = sconv._conv_state(forward_batch).track_cache_indices[:b]
         track_from_cache = True
 
     esz = comm.buffer.element_size()
@@ -1050,15 +1042,11 @@ def fullwidth_ar_sconv_fusable(
         return False
     if num_tokens < _INKLING_AR_FW_MIN_TOKENS:
         return False
-    # Same prefill-runner scope as the scattered gate: BCG / tc_piecewise
+    # Same prefill-runner scope as the scattered gate: BCG
     # pieces can't carry the cross-layer producer contract; the FULL prefill
     # CUDA-graph backend is supported (capture-safe kernel, in-graph metadata).
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        get_tc_piecewise_forward_context,
-    )
 
-    tc_ctx = get_tc_piecewise_forward_context()
-    if tc_ctx is not None and not tc_ctx.full_graph:
+    if is_in_prefill_graph_scope() and is_in_breakable_cuda_graph():
         return False
     comm = group.torch_symm_mem_comm
     if (

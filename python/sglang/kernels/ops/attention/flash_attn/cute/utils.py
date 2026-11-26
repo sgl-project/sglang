@@ -9,7 +9,6 @@ from typing import Callable, NamedTuple, Optional, Tuple, Type, overload
 
 import cutlass
 import cutlass.cute as cute
-import quack.activation
 from cutlass import Float32, Int32, const_expr
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute import FastDivmodDivisor
@@ -925,10 +924,10 @@ def ex2_emulation_2(
     )
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
-    xy_rounded_back = quack.activation.sub_packed_f32x2(
+    xy_rounded_back = cute.arch.sub_packed_f32x2(
         xy_rounded, (fp32_round_int, fp32_round_int)
     )
-    xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_frac = cute.arch.sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
@@ -1145,6 +1144,36 @@ def cvt_tensor_ue8m0_to_bf16(
 
     for i in cutlass.range_constexpr(n // 2):
         scales_out_x2[i] = cvt_bf16x2_ue8m0x2(scales_x2[i])
+
+
+@dsl_user_op
+def cvt_f16x2_e4m3x2(a: cutlass.Int16, *, loc=None, ip=None) -> cutlass.Int32:
+    """Packed e4m3x2 -> f16x2 (sm_89+); exact, since every e4m3 value is an f16."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Int16(a).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.f16x2.e4m3x2 $0, $1;",
+            "=r,h",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def cvt_tensor_e4m3_to_f16(src: cute.Tensor, dst: cute.Tensor):
+    n = cute.size(src)
+    assert n % 2 == 0
+    assert cute.size(dst) == n
+    assert src.element_type.width == 8
+    assert dst.element_type == cutlass.Float16
+
+    src_x2 = cute.recast_tensor(src, dtype=cutlass.Int16)
+    dst_x2 = cute.recast_tensor(dst, dtype=cutlass.Int32)
+    for i in cutlass.range_constexpr(n // 2):
+        dst_x2[i] = cvt_f16x2_e4m3x2(src_x2[i])
 
 
 @cute.jit

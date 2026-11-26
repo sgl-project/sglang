@@ -6,6 +6,8 @@ import copy
 
 from comfy.model_patcher import ModelPatcher
 
+from ..convert import CONVERT_COMMAND
+
 
 class SGLDModelPatcher(ModelPatcher):
     """Model patcher for SGLang Diffusion models in ComfyUI."""
@@ -45,10 +47,34 @@ class SGLDModelPatcher(ModelPatcher):
 
         n.object_patches = self.object_patches.copy()
         n.model_options = copy.deepcopy(self.model_options)
+        n.parent = self
         n.backup = self.backup
         n.object_patches_backup = self.object_patches_backup
         n.lora_cache = copy.copy(self.lora_cache)
+        n.model_type = self.model_type
+        n.wrappers = {}
+        for wrapper_type, keyed in self.wrappers.items():
+            n.wrappers[wrapper_type] = {
+                key: wrappers.copy() for key, wrappers in keyed.items()
+            }
+        n.callbacks = {}
+        for call_type, keyed in self.callbacks.items():
+            n.callbacks[call_type] = {
+                key: callbacks.copy() for key, callbacks in keyed.items()
+            }
         return n
+
+    def add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
+        # The SGLD worker owns the diffusion model's weights, so a ComfyUI weight
+        # patch (a LoRA node other than SGLDLoraLoader) would be dropped silently.
+        if patches:
+            raise ValueError(
+                "A ComfyUI LoRA or weight-patch node is applied to an SGLD model, "
+                "whose weights live in the SGLD worker; load LoRAs with "
+                "SGLDLoraLoader (SGLDiffusion LoRA Loader) instead, or convert the "
+                f"workflow: {CONVERT_COMMAND}"
+            )
+        return []
 
     def model_size(self):
         """Get the model size in bytes."""

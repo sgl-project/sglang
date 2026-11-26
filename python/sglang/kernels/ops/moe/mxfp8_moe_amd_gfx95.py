@@ -139,9 +139,9 @@ def _grouped_gemm_mxfp8(
     M_routed = num_valid_tokens
     E, N, K = w.shape
     assert K % 128 == 0, f"MXFP8 native MoE requires K%128==0, got K={K}"
-    # Keep zero-fill: moe_align_block_size reserves an extra expert bucket for
-    # filtered routes, which should contribute zeros if present.
-    out = torch.zeros((M_routed, N), dtype=out_dtype, device=a_q.device)
+    # Every route is stored, including zeros for EP-filtered experts. Padding
+    # token ids fail token_mask, so they cannot leave valid output rows unwritten.
+    out = torch.empty((M_routed, N), dtype=out_dtype, device=a_q.device)
     if a_div == top_k and M_routed <= 32 and K >= 3072:
         BLOCK_N = 64
         num_warps = 4
@@ -258,10 +258,11 @@ def fused_moe_mxfp8_native(
     limit: Optional[float],
     no_combine: bool = False,
     expert_map: Optional[torch.Tensor] = None,
+    sanitize_topk_ids: bool = True,
 ) -> torch.Tensor:
     # Lazy import: the jit_kernel package pulls in Triton at first use; importing
     # at call time avoids any import-time cycle with the moe runner package.
-    from sglang.kernels.ops.moe.minimax_m3_swiglu import (
+    from sglang.kernels.ops.activation.minimax_m3_swiglu import (
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
     )
@@ -279,9 +280,12 @@ def fused_moe_mxfp8_native(
         topk_ids.masked_fill_(
             ~valid_global | (topk_ids < 0) | (topk_ids >= local_num_experts), -1
         )
-    else:
+    elif sanitize_topk_ids:
         topk_ids = topk_ids.to(torch.int32, copy=True)
         topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
+    else:
+        # May alias the caller's tensor; everything below reads topk_ids only.
+        topk_ids = topk_ids.to(torch.int32)
 
     block_m = 64
     sorted_ids, expert_ids, num_post = moe_align_block_size(
@@ -380,6 +384,7 @@ def fused_experts_mxfp8(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     expert_map: Optional[torch.Tensor] = None,
+    sanitize_topk_ids: bool = True,
 ) -> torch.Tensor:
     """Native MXFP8 MoE entry (CDNA4 ``dot_scaled``).
 
@@ -426,6 +431,7 @@ def fused_experts_mxfp8(
         limit=limit,
         no_combine=no_combine,
         expert_map=expert_map,
+        sanitize_topk_ids=sanitize_topk_ids,
     )
 
     if no_combine:

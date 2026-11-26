@@ -7,18 +7,20 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
-from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
-from sglang.kernels.ops.kvcache.kv_indices import (
+from sglang.kernels.ops.attention.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
+from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import get_bool_env_var, get_device_core_count
+from sglang.srt.utils import get_device_core_count
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -66,7 +68,7 @@ class WaveAttnBackend(AttentionBackend):
         import wave_lang.kernel.wave.cache as cache
 
         base_cache_dir = cache.CACHE_BASE_DIR
-        new_dir = base_cache_dir / f"worker_{model_runner.ps.tp_rank}"
+        new_dir = base_cache_dir / f"worker_{get_parallel().tp_rank}"
         logger.info(f"Setting Wave cache dir: {new_dir}")
         cache.CACHE_BASE_DIR = new_dir
 
@@ -109,15 +111,13 @@ class WaveAttnBackend(AttentionBackend):
             get_parallel().attn_tp_size
         )
 
-        self.static_kv_splits = get_bool_env_var(
-            "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
-        )
+        self.static_kv_splits = envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.get()
         self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 
         self.forward_metadata: ForwardMetadata = None
 
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
 
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
@@ -496,7 +496,7 @@ class WaveAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
 
@@ -511,8 +511,8 @@ class WaveAttnBackend(AttentionBackend):
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             self.forward_metadata.qo_indptr,
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,
@@ -546,14 +546,14 @@ class WaveAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,

@@ -13,14 +13,19 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils.arch import get_default_target_flags
-from sglang.kernels.jit.utils.common import is_hip_runtime
-from sglang.kernels.jit.utils.compile import cache, ninja
+from sglang.kernels.jit.utils.arch import (
+    CudaArchPolicy,
+    get_default_target_flags,
+    resolve_compile_arch,
+)
+from sglang.kernels.jit.utils.common import is_hip_runtime, is_sail_runtime
+from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import (
     DEFAULT_CFLAGS,
     DEFAULT_INCLUDE,
     DEFAULT_LDFLAGS,
 )
+from sglang.kernels.jit.utils.compile.sailify import convert_cuda_sources
 from sglang.kernels.jit.utils.compile.spec import BuildSpec, resolve_sources
 from sglang.kernels.jit.utils.deps import REGISTERED_DEPENDENCIES
 from sglang.srt.environ import envs
@@ -37,6 +42,13 @@ else:
 logger = logging.getLogger(__name__)
 
 _LOCK_FILE = ".lock"
+# SGLANG_JIT_DEBUG_TRACE -> the macros sgl_kernel/debug/trace.cuh switches on.
+_TRACE_FLAGS = {
+    "iket": ["-DSGL_TRACE_IKET"],
+    "iket-extended": ["-DSGL_TRACE_IKET", "-DSGL_TRACE_IKET_EXTENDED"],
+    "naive": ["-DSGL_TRACE_NAIVE"],
+    "naive-debug": ["-DSGL_TRACE_NAIVE", "-DSGL_TRACE_NAIVE_DEBUG"],
+}
 
 
 # JIT compilation is pure Python/filesystem plumbing (path `.resolve()` calls
@@ -57,6 +69,8 @@ def load_jit(
     extra_include_paths: List[str] | None = None,
     extra_dependencies: List[str] | None = None,
     header_only: bool = True,
+    cuda_units: List[List[str]] | None = None,
+    cuda_arch_policy: CudaArchPolicy | None = None,
 ) -> Module:
     """Load a JIT module, compiling it if no cached build still applies.
 
@@ -78,29 +92,66 @@ def load_jit(
     :param header_only: Compile through a generated wrapper that exports the
                         given entry points. Otherwise the sources must export
                         from the C++ side themselves.
+    :param cuda_units: Extra translation units of a header-only module, one
+                       list of ``NAME=VALUE`` macros each. A unit defines its
+                       macros, includes `cuda_files` and exports nothing; ninja
+                       builds the units in parallel, so a module can split its
+                       kernel instantiations across them.
+    :param cuda_arch_policy: The CUDA target: "specific" (the local GPU's
+                             arch-specific one, e.g. sm_103a) or "family" (its
+                             family's, e.g. sm_100f, one build every device of
+                             the family runs). None takes
+                             ``SGLANG_JIT_CUDA_ARCH_POLICY``. A module that needs
+                             the arch-specific target (its instructions, or
+                             more than 48 KB of static shared memory) passes
+                             "specific".
     """
+    if cuda_units and not (header_only and cuda_files):
+        raise ValueError("cuda_units needs a header-only module with cuda_files.")
+    # A private copy, so the flags below never mutate the caller's list.
+    extra_cuda_cflags = list(extra_cuda_cflags or [])
     if is_hip_runtime():
         extra_cuda_cflags = [
             flag
-            for flag in (extra_cuda_cflags or [])
+            for flag in extra_cuda_cflags
             if flag not in ("--use_fast_math", "-use_fast_math")
         ]
 
     if envs.SGLANG_JIT_LOG_RESOURCE_USAGE.get():
         # nvcc reports through ptxas; hipcc through a clang remark pass.
-        extra_cuda_cflags = list(extra_cuda_cflags or []) + (
+        extra_cuda_cflags += (
             ["-Rpass-analysis=kernel-resource-usage"]
             if is_hip_runtime()
             else ["-Xptxas=-v"]
         )
+    if envs.SGLANG_JIT_ENABLE_LINEINFO.get():
+        extra_cuda_cflags += (
+            ["-gline-tables-only"] if is_hip_runtime() else ["-lineinfo"]
+        )
+    trace = envs.SGLANG_JIT_DEBUG_TRACE.get()
+    if trace:
+        if trace not in _TRACE_FLAGS:
+            raise ValueError(
+                f"SGLANG_JIT_DEBUG_TRACE={trace!r}; expected one of {list(_TRACE_FLAGS)}"
+            )
+        extra_cuda_cflags += _TRACE_FLAGS[trace]
 
     includes = list(DEFAULT_INCLUDE) + (extra_include_paths or [])
+    if is_sail_runtime():
+        includes = toolchain.base_include_paths() + includes
     for dep in sorted(set(extra_dependencies or [])):
         if dep not in REGISTERED_DEPENDENCIES:
             raise ValueError(f"Dependency {dep} is not registered.")
         includes += REGISTERED_DEPENDENCIES[dep]()
 
+    if is_sail_runtime() and cuda_files:
+        resolved_cuda = list(resolve_sources(cuda_files))
+        converted, sailify_flags = convert_cuda_sources(resolved_cuda, includes)
+        cuda_files = converted  # absolute paths pass through resolve_sources below
+        extra_cuda_cflags = _filter_hgcc_cuda_flags(extra_cuda_cflags) + sailify_flags
+
     module_args = tuple(str(arg) for arg in args)
+    compile_arch = resolve_compile_arch(cuda_arch_policy, module_args[0])
     spec = BuildSpec(
         module_args=module_args,
         cpp_files=resolve_sources(cpp_files),
@@ -108,10 +159,12 @@ def load_jit(
         cpp_wrappers=tuple(cpp_wrappers or ()),
         cuda_wrappers=tuple(cuda_wrappers or ()),
         cflags=tuple(DEFAULT_CFLAGS + (extra_cflags or [])),
-        cuda_cflags=tuple(get_default_target_flags() + (extra_cuda_cflags or [])),
+        cuda_cflags=tuple(get_default_target_flags(compile_arch) + extra_cuda_cflags),
         ldflags=tuple(DEFAULT_LDFLAGS + (extra_ldflags or [])),
         include_paths=tuple(includes),
         header_only=header_only,
+        cuda_units=tuple(tuple(unit) for unit in cuda_units or ()),
+        compile_arch=compile_arch,
     )
 
     # Generated once and threaded through: the cache key is taken over this
@@ -119,7 +172,9 @@ def load_jit(
     build_file = ninja.generate(spec)
 
     build_key = cache.compute_build_key(spec, build_file=build_file)
-    scope = cache.build_key_dir(module_name=spec.module_name, build_key=build_key)
+    scope = cache.build_key_dir(
+        module_name=spec.module_name, build_key=build_key, arch=spec.compile_arch
+    )
 
     prebuilt = _find_prebuilt(spec=spec, scope=scope)
     if prebuilt is not None:
@@ -202,6 +257,37 @@ def _find_prebuilt(*, spec: BuildSpec, scope: pathlib.Path) -> pathlib.Path | No
     return cache.find_prebuilt(scope=scope, module_name=spec.module_name)
 
 
+# Verified against hgcc 2.2: it is an nvcc-style driver and accepts
+# -Xcompiler, --use_fast_math, --expt-relaxed-constexpr and
+# --expt-extended-lambda; the genuinely unsupported options are the
+# nvcc-specific code-generation and ptxas ones below.
+_HGCC_DROP_WITH_ARG = frozenset({"-Xptxas"})
+_HGCC_DROP_PREFIX = ("-gencode", "--generate-code")
+
+
+def _filter_hgcc_cuda_flags(flags: List[str]) -> List[str]:
+    """Drop nvcc-only flags hgcc would not understand; keep everything else."""
+    kept: List[str] = []
+    dropped: List[str] = []
+    skip_next = False
+    for flag in flags:
+        if skip_next:
+            skip_next = False
+            dropped.append(flag)
+            continue
+        if flag in _HGCC_DROP_WITH_ARG:
+            skip_next = True
+            dropped.append(flag)
+            continue
+        if flag.startswith(_HGCC_DROP_PREFIX):
+            dropped.append(flag)
+            continue
+        kept.append(flag)
+    if dropped:
+        logger.warning("Dropping nvcc-only flags hgcc does not accept: %s", dropped)
+    return kept
+
+
 @contextlib.contextmanager
 def _build_lock(scope: pathlib.Path):
     """Serialize builds of one module variant across processes.
@@ -228,4 +314,10 @@ def _build_lock(scope: pathlib.Path):
 def _load(library: pathlib.Path) -> Module:
     from tvm_ffi import load_module
 
-    return load_module(str(library))
+    module = load_module(str(library))
+    if (envs.SGLANG_JIT_DEBUG_TRACE.get() or "").startswith("naive"):
+        # The naive trace buffer is handed to every traced module at capture time.
+        from sglang.kernels.jit.debug import trace
+
+        trace.register_naive_module(library.stem, module)
+    return module

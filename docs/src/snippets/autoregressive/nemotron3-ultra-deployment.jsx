@@ -30,7 +30,7 @@ export const Nemotron3UltraDeployment = () => {
     [...new Set(VERIFIED_CONFIGS.filter((c) => c.model === model && c.hardware === hardware).map((c) => c.tp))];
 
   // DP attention is verified at dp=2 for BF16, and dp in {2,4,8} for NVFP4. SGLang
-  // requires tp_size % dp_size == 0, so dp is capped at both the selected TP and the
+  // requires tp_size % attn_dp_size == 0, so dp is capped at both the selected TP and the
   // max verified TP for this model+hardware (whichever is smaller).
   const dpCandidatesForModel = (model) => (model === 'bf16' ? ['2'] : ['2', '4', '8']);
 
@@ -128,12 +128,12 @@ export const Nemotron3UltraDeployment = () => {
           };
         });
       },
-      // dp_size must divide tp_size; only emit when the selected DP is valid for the current TP.
+      // attn_dp_size must divide tp_size; only emit when the selected DP is valid for the current TP.
       commandRule: (value, state) =>
         value && value !== 'disabled' &&
         dpCandidatesForModel(state.model).includes(value) &&
         Number(value) <= Number(state.tp)
-          ? `--dp ${value} \\\n  --enable-dp-attention`
+          ? `--attn-dp-size ${value}`
           : null
     },
     mtp: {

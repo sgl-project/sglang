@@ -18,12 +18,13 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils import pool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative import dflash_utils, dflash_worker_v2, eagle_utils
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestGraphPoolBorrow(CustomTestCase):
@@ -80,25 +81,6 @@ class TestGraphPoolBorrow(CustomTestCase):
                 self.assertEqual(pool.graph_pool_borrow_largest_run(), 8192)
             self.assertEqual(pool.graph_pool_borrow_largest_run(), 0)
             self.assertEqual(snapshot.call_count, 3)
-
-    def test_borrow_capacity_includes_rounding_and_small_pool_reserve(self):
-        for payload, largest_run, expected in (
-            (-1, 64 << 20, False),
-            (0, 64 << 20, False),
-            (1, 0, False),
-            (1, 32 << 20, False),
-            (1, 34 << 20, True),
-            (2 << 20, 34 << 20, True),
-            ((2 << 20) + 1, 34 << 20, False),
-            ((2 << 20) + 1, 36 << 20, True),
-        ):
-            with (
-                self.subTest(payload=payload, largest_run=largest_run),
-                patch.object(
-                    pool, "graph_pool_borrow_largest_run", return_value=largest_run
-                ),
-            ):
-                self.assertEqual(pool.graph_pool_borrow_can_fit(payload), expected)
 
     def test_graph_replay_fails_during_active_pool_borrow(self):
         graph = Mock()
@@ -192,13 +174,13 @@ class TestGraphPoolBorrow(CustomTestCase):
             draft_probs=None,
         )
         sampling_info = SimpleNamespace(
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
+            step_penalties=None,
             logit_bias=None,
             is_all_greedy=False,
             temperatures=torch.ones((1, 1)),
             need_top_k_sampling=False,
             need_top_p_sampling=False,
+            need_min_p_sampling=False,
             sampling_seed=None,
         )
         batch = SimpleNamespace(
@@ -207,7 +189,10 @@ class TestGraphPoolBorrow(CustomTestCase):
             sampling_info=sampling_info,
             forward_mode=SimpleNamespace(is_idle=lambda: False),
         )
-        logits_output = SimpleNamespace(next_token_logits=torch.randn((2, 8)))
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.randn((2, 8)),
+            next_token_logits_vocab_shard=None,
+        )
         spec_config = SimpleNamespace(
             speculative_use_rejection_sampling=False,
             speculative_accept_threshold_single=1.0,
@@ -222,14 +207,10 @@ class TestGraphPoolBorrow(CustomTestCase):
                 "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
-            # `parallel_state`, not the package re-export: a stub on the
-            # re-export is never consulted.
-            patch(
-                "sglang.srt.distributed.parallel_state.get_tp_group",
-                return_value=tp_group,
-            ),
-            patch(
-                "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
+            get_parallel().override(tp_group=tp_group),
+            patch.object(
+                eagle_utils,
+                "tree_speculative_sampling_target_only",
                 side_effect=fake_sampling,
             ),
         ):
@@ -380,6 +361,9 @@ class TestGraphPoolBorrow(CustomTestCase):
                     logits = torch.randn(rows, 4096, device="cuda")
                     token_ids = torch.randint(0, 4096, (rows,), device="cuda")
                     split = rows // 2
+                    # Exercise tied top-k scores in both sequences explicitly.
+                    for row in (0, split):
+                        logits[row, :4] = logits[row].max() + 1
                     sample_indices = [split - 1, rows - 1]
                     metadata = SimpleNamespace(
                         sample_indices_cpu=sample_indices,
@@ -387,6 +371,7 @@ class TestGraphPoolBorrow(CustomTestCase):
                         extend_return_top_logprob=True,
                         extend_token_ids_logprob=True,
                         top_logprobs_nums=[2, 3],
+                        input_candidate_selectors=None,
                         extend_logprob_pruned_lens_cpu=[split, rows - split],
                         extend_input_logprob_token_ids_gpu=token_ids,
                         token_ids_logprobs=[[0, 7], [4]],
@@ -428,14 +413,22 @@ class TestGraphPoolBorrow(CustomTestCase):
                     )
                     self.assertTrue(torch.equal(sampled, logits[sample_indices]))
                     for i, (lo, hi) in enumerate(((0, split), (split, rows))):
-                        values, indices = expected[lo:hi].topk(
-                            metadata.top_logprobs_nums[i]
+                        values = (
+                            expected[lo:hi].topk(metadata.top_logprobs_nums[i]).values
                         )
                         self.assertEqual(
                             output.input_top_logprobs_val[i], values.tolist()
                         )
+                        # topk(max_k)[:k] and topk(k) may choose different tied
+                        # tokens. Check that the returned IDs select the right
+                        # scores and never repeat a token within one row.
+                        actual_indices = output.input_top_logprobs_idx[i]
+                        indices = torch.tensor(actual_indices, device=expected.device)
                         self.assertEqual(
-                            output.input_top_logprobs_idx[i], indices.tolist()
+                            expected[lo:hi].gather(1, indices).tolist(), values.tolist()
+                        )
+                        self.assertTrue(
+                            all(len(set(row)) == len(row) for row in actual_indices)
                         )
                         self.assertEqual(
                             output.input_token_ids_logprobs_val[i],
@@ -460,6 +453,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             extend_return_top_logprob=False,
             extend_token_ids_logprob=False,
             top_logprobs_nums=None,
+            input_candidate_selectors=None,
             extend_logprob_pruned_lens_cpu=[rows],
             extend_input_logprob_token_ids_gpu=token_ids,
             token_ids_logprobs=None,
@@ -797,6 +791,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             top_ps=torch.ones(1),
             need_top_k_sampling=False,
             need_top_p_sampling=False,
+            need_min_p_sampling=False,
         )
         with (
             patch.object(dflash_utils, "borrow_graph_pool", recording_borrow),

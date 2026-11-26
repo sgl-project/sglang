@@ -48,6 +48,11 @@ ENV HSA_ENABLE_DXG_DETECTION=1
 RUN python3 -c "import torch; print('torch', torch.__version__); assert torch.version.hip" \
     && test -x /opt/rocm/bin/hipcc
 
+# SGLang's ROCm detector needs the AMD SMI Python package.
+RUN python3 -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/rocm/share/amd_smi \
+    && cd / \
+    && python3 -c "import amdsmi; print('[amdsmi]', amdsmi.__file__)"
+
 # =============================================================================
 # Stage 2: SGLang on top of the gfx1151 ROCm stack.
 # =============================================================================
@@ -113,7 +118,7 @@ from pathlib import Path
 project = tomllib.loads(Path("python/pyproject.toml").read_text())["project"]
 extras = project["optional-dependencies"]
 requirements = list(project["dependencies"])
-for group in ("runtime_base", "runtime_common", "srt_hip"):
+for group in ("runtime_base", "runtime_common", "srt_hip", "diffusion_common"):
     requirements.extend(
         "compressed-tensors==0.15.0"
         if requirement == "compressed-tensors"
@@ -121,6 +126,17 @@ for group in ("runtime_base", "runtime_common", "srt_hip"):
         for requirement in extras[group]
         if not requirement.startswith("sglang[") and requirement != "torch"
     )
+# diffusion_hip's pure-Python packages, needed by sglang.multimodal_gen
+# (Wan2.2/video-gen) at import time. st_attn/vsa are deliberately left out:
+# they're prebuilt CUDA-oriented wheels of unverified gfx1151 compatibility,
+# same posture as skipping aiter's compiled CDNA kernels below.
+requirements.extend(
+    requirement
+    for requirement in extras["diffusion_hip"]
+    if not requirement.startswith("sglang[")
+    and not requirement.startswith("st_attn")
+    and not requirement.startswith("vsa")
+)
 requirements = list(dict.fromkeys(requirements))
 subprocess.check_call(
     [sys.executable, "-m", "pip", "install", "--no-cache-dir", *requirements]

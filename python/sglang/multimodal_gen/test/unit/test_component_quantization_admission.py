@@ -68,6 +68,7 @@ def _loader_server_args(component_weights_paths, *, fsdp_requested=False):
         component_weights_paths=component_weights_paths,
         pipeline_config=SimpleNamespace(native_only_components=()),
         resolve_component_attention_backend=lambda _name: (None, None),
+        resolve_component_backend_by_role=lambda *_names: {},
         requested_component_attention_backend=lambda _name: None,
         should_direct_gpu_weight_load_component=lambda _name: False,
         should_start_component_on_cpu=lambda _name: True,

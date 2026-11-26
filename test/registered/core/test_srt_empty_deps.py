@@ -33,11 +33,7 @@ TORCH_PULLING_PACKAGES = frozenset(
 
 def _parse_runtime_base() -> set:
     """Parse runtime_base package names from pyproject_other.toml."""
-    # Try tomllib (3.11+) or tomli
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        import tomli as tomllib  # type: ignore[no-redef]
+    import tomllib
 
     toml_path = Path(__file__).resolve().parents[3] / "python" / "pyproject_other.toml"
     if not toml_path.exists():

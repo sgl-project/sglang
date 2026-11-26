@@ -1,10 +1,12 @@
 """SM120 FlashMLA sparse decode implementation.
 
 On SM120 (Blackwell Desktop / RTX PRO 6000) the flash_mla CUDA kernel
-is not available, so this module provides alternative implementations:
+is not available, so this module provides alternative implementations,
+selected by ``SGLANG_SM120_FLASHMLA_BACKEND``:
 
-- A fused Triton kernel (default, ``SGLANG_SM120_TRITON_FLASHMLA=1``)
-- A pure-PyTorch fallback (``SGLANG_SM120_TRITON_FLASHMLA=0``)
+- FlashInfer's SM120 sparse MLA decode (``flashinfer``, the default)
+- A fused Triton kernel (``triton``)
+- A pure-PyTorch fallback (``torch``)
 
 The FP8 KV cache uses a page-internal layout where NOPE+ROPE data has
 stride (nope_dim + rope_dim*2) per token, and scales are stored in a
@@ -700,12 +702,15 @@ def _validate_flashinfer_sparse_mla_backend(
             f"decode_impl={decode_impl!r}."
         )
     if is_glm_sm12_fp8:
-        unsupported = selected - {"flashinfer_sparse_mla"}
+        # flashinfer_sparse_mla stays the auto-selected default on this
+        # platform; triton_sparse_mla is a validated alternative prefill
+        # implementation that the user may select explicitly.
+        unsupported = selected - {"flashinfer_sparse_mla", "triton_sparse_mla"}
         if unsupported:
             raise ValueError(
                 "GLM DSA with FP8 KV cache on NVIDIA SM120/SM121 supports "
-                "only flashinfer_sparse_mla, "
-                f"but got {sorted(unsupported)}."
+                "only flashinfer_sparse_mla (default) or triton_sparse_mla "
+                f"(prefill), but got {sorted(unsupported)}."
             )
     return uses_flashinfer_sparse_mla
 

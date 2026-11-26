@@ -19,7 +19,7 @@ EPS = 1e-6
 
 
 @marker.parametrize("rows", [512, 4096, 4608], [512])
-@marker.benchmark("impl", ["split", "fused"], unit="us")
+@marker.benchmark("impl", ["split", "fused"], unit="us", gate=["fused"])
 def benchmark(rows: int, impl: str):
     generator = torch.Generator(device=DEVICE)
     generator.manual_seed(20260831 + rows)
