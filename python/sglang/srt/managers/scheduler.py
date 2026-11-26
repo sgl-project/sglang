@@ -114,6 +114,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     decode_offloads_kvcache,
     get_dsa_seed_metadata_dim,
+    lacks_decode_peer,
     prepare_abort,
 )
 from sglang.srt.distributed import bootstrap
@@ -3088,6 +3089,13 @@ class Scheduler(
         # 0. Constant output: every PP rank must derive the same
         # sampling_params (rank consensus hashes them).
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # No decode takes a handoff from a request prefill answers alone,
+            # so it keeps the budget it asked for.
+            if self._lacks_decode_peer(req) and req.sampling_params.max_new_tokens in (
+                0,
+                1,
+            ):
+                return
             req.sampling_params.max_new_tokens = 1
             # min <= max invariant; EOS stays legal as the handoff token
             # unless the user set min_new_tokens.
@@ -3487,6 +3495,7 @@ class Scheduler(
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
+                    and not self._lacks_decode_peer(req)
                 ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
@@ -3616,6 +3625,18 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            return
+
+        if self._lacks_decode_peer(req) and req.sampling_params.max_new_tokens not in (
+            0,
+            1,
+        ):
+            self._reject_bad_request(
+                req,
+                "A prefill request without a bootstrap host has no decode to "
+                "continue it, so max_new_tokens must be 0 or 1; got "
+                f"max_new_tokens={req.sampling_params.max_new_tokens}.",
+            )
             return
 
         if (
@@ -3992,6 +4013,16 @@ class Scheduler(
                 req.time_stats.set_wait_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _lacks_decode_peer(self, req: Req) -> bool:
+        # Only a prefill server consults its transfer backend for this.
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return False
+        return lacks_decode_peer(
+            req,
+            disaggregation_mode=self.disaggregation_mode,
+            transfer_backend=self.transfer_backend,
+        )
 
     def _reject_bad_request(self, req: Req, error_msg: str) -> None:
         """Return a validation error as a 400 without running the model."""
