@@ -35,7 +35,7 @@ def _init_decode_pool(pool):
     DecodeReqToTokenPool.__init__(
         pool,
         size=1,
-        max_context_len=4,
+        row_width=4,
         device="cpu",
         enable_memory_saver=False,
         pre_alloc_size=1,
@@ -67,7 +67,7 @@ def test_request_pool_clear_keeps_row_generations_monotonic(pool_cls, pool_kwarg
     next request would otherwise match the generation its previous request had."""
     pool = pool_cls(
         size=2,
-        max_context_len=4,
+        row_width=4,
         device="cpu",
         enable_memory_saver=False,
         **pool_kwargs,

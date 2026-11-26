@@ -406,6 +406,7 @@ class TestDecodeLaunchCounts(CustomTestCase):
                 full_tokens=PAGES * PAGE,
                 max_running_requests=self.BS,
                 context_len=PAGES * PAGE,
+                req_to_token_row_width=PAGES * PAGE,
                 alignment=1,
             ),
         )
@@ -419,7 +420,6 @@ class TestDecodeLaunchCounts(CustomTestCase):
                 enable_memory_saver=False,
                 need_sort=False,
                 max_num_reqs=self.BS,
-                model_context_len=PAGES * PAGE,
             ),
         ).allocator.get_kvcache()
         static = DSATokenToKVPool(
