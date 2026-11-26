@@ -33,6 +33,8 @@ sglang serve "${SERVER_ARGS[@]}"
 - **--model-path**: Path to the model or model ID.
 - **--served-model-name**: Stable model name exposed by the serving APIs. It defaults to `--model-id` when set, otherwise `--model-path`.
 - **--port**: HTTP port to listen on (default: `30000`).
+- **--api-key**: Require `Authorization: Bearer <key>` on every endpoint except the health, readiness, and metrics ones.
+- **--admin-api-key**: Unlock the admin endpoints (weight updates, LoRA loading, memory release and resume, profiling); they answer HTTP 403 until it is set. Defaults to `SGLANG_ADMIN_API_KEY`.
 
 ### Served model name
 
@@ -513,6 +515,8 @@ transports depend on the policy; consult its metadata and recipe before use.
 
 The server supports dynamic loading, merging, and unmerging of LoRA adapters.
 
+`/v1/set_lora`, `/v1/merge_lora_weights`, and `/v1/unmerge_lora_weights` are admin endpoints. Launch the server with `--admin-api-key <key>` (or `SGLANG_ADMIN_API_KEY=<key>` set) and send `Authorization: Bearer <key>` with each call; without an admin key configured, the server answers HTTP 403 (`--api-key` does not unlock them). The examples below read the key from `$SGLANG_ADMIN_API_KEY`.
+
 **Important Notes:**
 - Mutual Exclusion: Only one LoRA configuration can be active per target at a time; that configuration can contain multiple adapters
 - Switching: To switch LoRAs, deactivate the current LoRA with `unmerge_lora_weights`, then `set` the new one
@@ -543,6 +547,7 @@ When `merge_mode` is omitted, the request inherits the server's `--lora-merge-mo
 
 ```bash Command
 curl -X POST http://localhost:30010/v1/set_lora \
+  -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
         "lora_nickname": "lora_name",
@@ -556,6 +561,7 @@ curl -X POST http://localhost:30010/v1/set_lora \
 
 ```bash Command
 curl -X POST http://localhost:30010/v1/set_lora \
+  -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
         "lora_nickname": ["lora_1", "lora_2"],
@@ -569,6 +575,7 @@ curl -X POST http://localhost:30010/v1/set_lora \
 
 ```bash Command
 curl -X POST http://localhost:30010/v1/set_lora \
+  -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
         "lora_nickname": ["style_lora", "character_lora"],
@@ -605,6 +612,7 @@ With FSDP-sharded weights, manual merge may require a full-gather and can OOM. U
 
 ```bash
 curl -X POST http://localhost:30010/v1/merge_lora_weights \
+  -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"strength": 0.8}'
 ```
@@ -620,6 +628,7 @@ Unmerges the currently active LoRA weights from the base model, restoring it to 
 
 ```bash
 curl -X POST http://localhost:30010/v1/unmerge_lora_weights \
+  -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" \
   -H "Content-Type: application/json"
 ```
 
@@ -665,16 +674,16 @@ Notes:
 
 1.  Set LoRA A:
     ```bash Command
-    curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "lora_a", "lora_path": "path/to/A"}'
+    curl -X POST http://localhost:30010/v1/set_lora -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" -d '{"lora_nickname": "lora_a", "lora_path": "path/to/A"}'
     ```
 2.  Generate with LoRA A...
 3.  Unmerge LoRA A:
     ```bash Command
-    curl -X POST http://localhost:30010/v1/unmerge_lora_weights
+    curl -X POST http://localhost:30010/v1/unmerge_lora_weights -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY"
     ```
 4.  Set LoRA B:
     ```bash Command
-    curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "lora_b", "lora_path": "path/to/B"}'
+    curl -X POST http://localhost:30010/v1/set_lora -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" -d '{"lora_nickname": "lora_b", "lora_path": "path/to/B"}'
     ```
 5.  Generate with LoRA B...
 

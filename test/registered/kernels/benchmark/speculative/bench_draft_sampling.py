@@ -30,7 +30,7 @@ FN_MAP = {"fused": fused_sample, "torch": torch_sample}
 
 @marker.parametrize("vocab_size", [32000, 129280, 151936, 248320], [151936])
 @marker.parametrize("batch_size", [1, 4, 16, 64, 128, 256], [1, 64])
-@marker.benchmark("impl", ["fused", "torch"])
+@marker.benchmark("impl", ["fused", "torch"], gate=["fused"])
 def benchmark(vocab_size: int, batch_size: int, impl: str):
     probs = torch.softmax(
         torch.randn((batch_size, vocab_size), device="cuda", dtype=torch.float32),
