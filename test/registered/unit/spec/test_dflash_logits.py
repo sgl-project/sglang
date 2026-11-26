@@ -580,6 +580,98 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
 
 
+@pytest.mark.parametrize("branch", ["selector", "sampled", "cutoff", "triton_failed"])
+def test_accept_commits_the_block_in_one_launch_into_the_accept_ring(
+    monkeypatch, branch
+):
+    """Once the greedy Triton kernel fails, the eager commit returns no stale lengths."""
+    from types import MethodType
+
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    # Row 0 rejects every draft, row 1 accepts every draft, row 2 accepts one.
+    candidates = torch.tensor([[9, 1, 2, 3], [9, 4, 5, 6], [9, 7, 8, 0]])
+    target_predict = torch.tensor([[11, 0, 0, 0], [4, 5, 6, 12], [7, 13, 0, 0]])
+    accept_len = torch.tensor([0, 3, 1], dtype=torch.int32)
+    bonus = torch.tensor([11, 12, 13])
+    launches = []
+
+    def commit_block(**kwargs):
+        launches.append(kwargs)
+        tokens, num_accept = worker_mod._commit_accept(
+            kwargs["candidates"], kwargs["num_correct_drafts"], kwargs["bonus_tokens"]
+        )
+        kwargs["out_tokens"].copy_(tokens)
+        kwargs["num_accept_tokens_out"].copy_(num_accept)
+        kwargs["new_seq_lens_out"].copy_(kwargs["prefix_lens"] + num_accept)
+
+    monkeypatch.setattr(worker_mod, "dflash_commit_block", commit_block)
+    worker = SimpleNamespace(
+        device=torch.device("cpu"),
+        block_size=4,
+        _use_triton_accept_bonus=True,
+        _accept_bonus_buffer_cap=0,
+        _accept_bonus_buffer_slot=0,
+        _accept_len_buf=None,
+        _selector_sample=None,
+        _tp_sync=SimpleNamespace(sync=lambda site, tensor: None),
+    )
+    for name in ("_ensure_accept_bonus_buffers", "_next_accept_bonus_buffers"):
+        method = getattr(worker_mod.DFlashWorkerV2, name)
+        setattr(worker, name, MethodType(method, worker))
+    inputs = dict(
+        candidates=candidates,
+        next_token_logits=None,
+        sampling_info=SimpleNamespace(is_all_greedy=False),
+        draft_input=SimpleNamespace(max_top_k=4, uniform_top_k_value=None),
+        prefix_lens=torch.tensor([100, 200, 300]),
+        bs=3,
+    )
+    if branch == "selector":
+        worker._selector_sample = (None, None)
+        worker._selector_sampling_accept = lambda **kwargs: (
+            accept_len,
+            bonus,
+            torch.zeros(3, dtype=torch.int32),
+        )
+    elif branch == "sampled":
+        monkeypatch.setattr(
+            worker_mod, "is_dflash_sampling_verify_available", lambda: True
+        )
+        monkeypatch.setattr(
+            worker_mod,
+            "compute_dflash_sampling_correct_drafts_and_bonus",
+            lambda **kwargs: (accept_len, bonus),
+        )
+    else:
+        inputs["target_predict"] = target_predict
+    if branch == "cutoff":
+        inputs["cutoff_verify_lens"] = torch.full((3,), 4, dtype=torch.int32)
+    if branch == "triton_failed":
+
+        def fail(**kwargs):
+            raise ValueError("non-contiguous")
+
+        monkeypatch.setattr(
+            worker_mod, "_compute_dflash_accept_bonus_triton_unchecked", fail
+        )
+
+    rounds = [worker_mod.DFlashWorkerV2._accept_block(worker, **inputs) for _ in "ab"]
+
+    for slot, (_, commit_lens, _, out_tokens, new_seq_lens, _) in enumerate(rounds):
+        assert out_tokens.tolist() == [[11, 2, 3, 0], [4, 5, 6, 12], [7, 13, 0, 0]]
+        assert commit_lens.dtype == torch.int32
+        assert commit_lens.tolist() == [1, 4, 2]
+        if branch == "triton_failed":
+            assert new_seq_lens is None
+            continue
+        assert new_seq_lens.tolist() == [101, 204, 302]
+        assert out_tokens.data_ptr() == worker._out_tokens_bufs[slot].data_ptr()
+        assert commit_lens.data_ptr() == worker._commit_lens_bufs[slot].data_ptr()
+        assert new_seq_lens.data_ptr() == worker._new_seq_lens_bufs[slot].data_ptr()
+    assert len(launches) == (0 if branch == "triton_failed" else 2)
+
+
 def test_grouped_conv_supports_runtime_block_sizes():
     """The conv indexes a position inside the block, so it must follow whatever
     block size the worker resolved -- including one that is not a power of two."""

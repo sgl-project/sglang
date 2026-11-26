@@ -243,7 +243,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         super().__init__()
 
         # Parse constants
-        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
         # The paged MLA wrappers fix the mask when they plan a batch.
@@ -251,6 +250,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
         self.enable_chunk_kv = (
@@ -536,7 +536,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
-                (max_bs * self.max_context_len,),
+                (max_bs * self.max_kv_len,),
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -1260,13 +1260,12 @@ class FlashInferMLAMultiStepDraftBackend:
                 )
             )
 
-        self.max_context_len = self.attn_backends[0].max_context_len
         self.attn_backend_list = self.attn_backends
         self.forward_metadata = None
 
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.max_kv_len = self.attn_backends[0].max_kv_len
         self.page_size = get_schedule().page_size
         self.runner_ids = model_runner.runner_ids
 
@@ -1288,7 +1287,7 @@ class FlashInferMLAMultiStepDraftBackend:
         assert_buffer_fits(
             required_kv_indices_len,
             kv_indices_buffer.shape[1],
-            "EAGLE draft kv_indices row (size max_bs * topk * max_context_len)",
+            "EAGLE draft kv_indices row (size max_bs * topk * req_to_token_row_width)",
             bs=bs,
             seq_lens_sum=seq_lens_sum,
         )
@@ -1357,7 +1356,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
-            forward_batch.batch_size, self.topk, self.max_context_len
+            forward_batch.batch_size, self.topk, self.max_kv_len
         )
         kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),
@@ -1380,7 +1379,7 @@ class FlashInferMLAMultiStepDraftBackend:
         # Row holds topk per-branch sequences (generate_draft_decode_kv_indices), so
         # it needs the topk factor, matching the eager init_forward_metadata.
         kv_indices_width = draft_kv_indices_buffer_width(
-            max_bs, self.topk, self.max_context_len
+            max_bs, self.topk, self.max_kv_len
         )
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),
