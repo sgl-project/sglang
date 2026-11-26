@@ -5927,6 +5927,29 @@ class Scheduler(
         for. Under Confidential Computing the copy would block this thread until
         the forward is done, so the worker issues it from its own thread instead.
         """
+        if (
+            getattr(self, "enable_overlap", False)
+            and batch.return_hidden_states
+            and batch_result.can_run_cuda_graph
+            and batch_result.logits_output is not None
+        ):
+            # Snapshot the graph output before the next replay overwrites it.
+            # Use a fresh stream context so nested calls inside run_batch do
+            # not overwrite self.forward_stream_ctx's saved caller stream.
+            stream_ctx = (
+                self.device_module.stream(self.forward_stream)
+                if hasattr(self, "device_module")
+                else self.forward_stream_ctx
+            )
+            with stream_ctx:
+                logits_output = batch_result.logits_output
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states.clone()
+                if logits_output.last_hidden_states is not None:
+                    logits_output.last_hidden_states = (
+                        logits_output.last_hidden_states.clone()
+                    )
+
         copy_fn = partial(
             batch_result.copy_to_cpu,
             return_logprob=batch.return_logprob,
