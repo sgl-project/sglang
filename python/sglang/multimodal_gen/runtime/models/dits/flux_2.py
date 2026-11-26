@@ -51,6 +51,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_world_size,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     build_shard_plan,
     join_seqs,
@@ -86,6 +89,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
     FluxPosEmbed as Flux2PosEmbed,
 )
+from sglang.multimodal_gen.runtime.layers.usp import ulysses_exchange_qkv_norm_rope
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    request_allows_lossless,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -96,8 +103,12 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+_is_rocm = current_platform.is_rocm()
 
 _get_qkv_projections = get_qkv_projections
 
@@ -240,6 +251,43 @@ def _defer_gated_residual(
     ):
         return residual, update, gate
     return residual_gate_add(residual, update, gate)
+
+
+def _rocm_lossless() -> bool:
+    # The ROCm Triton Q/K norm + RoPE kernel reorders the RMS reduction, so it
+    # needs the lossless tier.
+    return _is_rocm and not torch.compiler.is_compiling() and request_allows_lossless()
+
+
+def _flux2_rocm_exchange_qkv(
+    attn: USPAttention,
+    segments: list[tuple[torch.Tensor, ...]],
+    norms: tuple[nn.Module, ...],
+    complex_freqs: Optional[torch.Tensor],
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Q/K RMSNorm + RoPE applied inside the Ulysses pack, or None.
+
+    ``segments`` lists ``(q, k, v, q_weight, k_weight)`` per token segment of a
+    batch-1 call; callers check ``_rocm_lossless()`` first and then attend with
+    ``qkv_pre_all_to_all=True``.
+    """
+    if not (
+        complex_freqs is not None
+        and attn.sp_attention_mode == "ulysses"
+        and not attn.skip_sequence_parallel
+        and get_ring_parallel_world_size() == 1
+        and not torch.cuda.is_current_stream_capturing()
+        and not is_in_breakable_cuda_graph()
+        and all(
+            type(norm) is RMSNorm and norm.variance_size_override is None
+            for norm in norms
+        )
+        and len({norm.variance_epsilon for norm in norms}) == 1
+    ):
+        return None
+    return ulysses_exchange_qkv_norm_rope(
+        segments, torch.view_as_real(complex_freqs), norms[0].variance_epsilon
+    )
 
 
 def _can_defer_xpu(
@@ -762,6 +810,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         value = value.unflatten(-1, (self.local_heads, -1))
 
         joint_qkv = None
+        exchanged = None
         sp_txt_pad = 0
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.local_heads, -1))
@@ -793,7 +842,39 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                     self.norm_added_q.variance_epsilon,
                 )
 
-            if joint_qkv is None:
+            if (
+                _rocm_lossless()
+                and joint_qkv is None
+                and sp_txt_pad == 0
+                and attn_mask is None
+                and num_replicated_prefix == 0
+                and query.shape[0] == 1
+                and complex_freqs is not None
+            ):
+                exchanged = _flux2_rocm_exchange_qkv(
+                    self.attn,
+                    [
+                        (
+                            encoder_query[0],
+                            encoder_key[0],
+                            encoder_value[0],
+                            self.norm_added_q.weight,
+                            self.norm_added_k.weight,
+                        ),
+                        (
+                            query[0],
+                            key[0],
+                            value[0],
+                            self.norm_q.weight,
+                            self.norm_k.weight,
+                        ),
+                    ],
+                    (self.norm_added_q, self.norm_added_k, self.norm_q, self.norm_k),
+                    complex_freqs[: text_seq_len + query.shape[1]],
+                )
+            if exchanged is not None:
+                pass
+            elif joint_qkv is None:
                 if self.use_fused_qkv_epilogue:
                     query, key, value = [
                         tensor.contiguous() for tensor in (query, key, value)
@@ -864,14 +945,19 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-        hidden_states = self.attn(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            attn_mask_meta=attn_mask_meta,
-            num_replicated_prefix=num_replicated_prefix,
-        )
+        if exchanged is not None:
+            hidden_states = self.attn(
+                *exchanged, attn_mask_meta=attn_mask_meta, qkv_pre_all_to_all=True
+            )
+        else:
+            hidden_states = self.attn(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                attn_mask_meta=attn_mask_meta,
+                num_replicated_prefix=num_replicated_prefix,
+            )
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -1045,25 +1131,43 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         if complex_freqs is not None:
             complex_freqs = complex_freqs[: query.shape[1]]
 
-        # Packed QKV/MLP projection views can be normalized and rotated
-        # without materializing contiguous Q/K inputs on the supported path.
-        query, key = _flux2_single_qk_rope(
-            query,
-            key,
-            self.norm_q,
-            self.norm_k,
-            self.head_dim,
-            cos_sin_cache,
-            complex_freqs,
-        )
-        hidden_states = self.attn(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            attn_mask_meta=attn_mask_meta,
-            num_replicated_prefix=num_replicated_prefix,
-        )
+        exchanged = None
+        if (
+            _rocm_lossless()
+            and attn_mask is None
+            and num_replicated_prefix == 0
+            and query.shape[0] == 1
+        ):
+            exchanged = _flux2_rocm_exchange_qkv(
+                self.attn,
+                [(query[0], key[0], value[0], self.norm_q.weight, self.norm_k.weight)],
+                (self.norm_q, self.norm_k),
+                complex_freqs,
+            )
+        if exchanged is not None:
+            hidden_states = self.attn(
+                *exchanged, attn_mask_meta=attn_mask_meta, qkv_pre_all_to_all=True
+            )
+        else:
+            # Packed QKV/MLP projection views can be normalized and rotated
+            # without materializing contiguous Q/K inputs on the supported path.
+            query, key = _flux2_single_qk_rope(
+                query,
+                key,
+                self.norm_q,
+                self.norm_k,
+                self.head_dim,
+                cos_sin_cache,
+                complex_freqs,
+            )
+            hidden_states = self.attn(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                attn_mask_meta=attn_mask_meta,
+                num_replicated_prefix=num_replicated_prefix,
+            )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 

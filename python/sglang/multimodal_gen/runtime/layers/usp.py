@@ -9,7 +9,12 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor.experimental._attention import _cp_options
 
-from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
+from sglang.kernels.ops.diffusion import (
+    can_use_pack_qkv_norm_rope,
+    pack_qkv_destination_major,
+    pack_qkv_norm_rope_destination_major,
+    usp_merge_heads,
+)
 from sglang.multimodal_gen.runtime.distributed.device_communicators import (
     flashinfer_ulysses,
 )
@@ -627,6 +632,44 @@ def _usp_input_all_to_all_qkv(
             .view(b, world_size * s_local, h_local, 3 * d)
         )
     q, k, v = packed.split(d, dim=-1)
+    # Copy out before the staging buffer is recycled by the next collective.
+    return q.contiguous(), k.contiguous(), v.contiguous()
+
+
+def ulysses_exchange_qkv_norm_rope(
+    segments,
+    rope: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Ulysses input exchange that applies Q/K RMSNorm + RoPE while packing.
+
+    ``segments`` and ``rope`` are as in ``pack_qkv_norm_rope_destination_major``
+    (batch 1, segments in token order). Returns ``[1, s_global, h_local, 128]``
+    Q/K/V like ``_usp_input_all_to_all_qkv`` on the normalized and rotated
+    inputs, or None when the fused pack cannot serve the call.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1 or not can_use_pack_qkv_norm_rope(segments, rope, world_size):
+        return None
+    first = segments[0][0]
+    rows, head_size = rope.shape[0], first.shape[-1]
+    h_local = first.shape[1] // world_size
+    packed = pack_qkv_norm_rope_destination_major(
+        segments,
+        rope,
+        eps,
+        world_size,
+        out=_a2a_staging_buffer(
+            "usp_packed_qkv_src",
+            (world_size, rows, h_local, 3 * head_size),
+            first.dtype,
+            first.device,
+        ),
+    )
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    # Rank j's rows arrive at offset j * rows, so this view is sequence-major.
+    packed = packed.view(1, world_size * rows, h_local, 3 * head_size)
+    q, k, v = packed.split(head_size, dim=-1)
     # Copy out before the staging buffer is recycled by the next collective.
     return q.contiguous(), k.contiguous(), v.contiguous()
 
