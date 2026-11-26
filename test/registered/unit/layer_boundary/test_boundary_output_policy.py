@@ -142,11 +142,13 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                     calls.append("AR")
                     return value * 2
 
+                # Equal MAX_LEN rows take the fixed-size reduce-scatter when it
+                # is eligible, ahead of reduce_scatterv.
                 selected = (
-                    "dp_reduce_scatterv"
-                    if varlen and policy in ("rsv", "rs+rsv")
-                    else "dp_reduce_scatter"
+                    "dp_reduce_scatter"
                     if max_len and can_rs and policy in ("rs", "rs+rsv")
+                    else "dp_reduce_scatterv"
+                    if varlen and policy in ("rsv", "rs+rsv")
                     else "_dp_scatter_step"
                 )
                 with (
