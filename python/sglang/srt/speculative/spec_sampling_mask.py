@@ -26,7 +26,6 @@ def validate_spec_sampling_mask_request(
     if not spec_algorithm.is_dflash_family():
         return "return_sampling_mask is not supported with speculative decoding."
 
-    # build_speculative_verify_target_probs applies top-k/top-p only.
     if req.sampling_params.min_p > 0:
         return "return_sampling_mask with speculative decoding does not support min_p."
 

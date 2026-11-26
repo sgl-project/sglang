@@ -235,6 +235,12 @@ class PipelineConfig:
         # return the model-specific config for optimal deployment setting
         return ModelDeploymentConfig()
 
+    def extra_dit_components(self, server_args: Any) -> tuple[str, ...]:
+        """DiTs this deployment loads next to the checkpoint's ``transformer``
+        that model_index.json does not list, for the automatic memory policy."""
+        del server_args
+        return ()
+
     def get_supported_task_types(self) -> tuple[ModelTaskType, ...]:
         """Return the tasks implemented by this configured pipeline.
 
