@@ -26,8 +26,12 @@ def humming_is_layer_skipped(config: dict[str, Any], prefix: str):
             ignored_layers = config[key] or []
             break
 
-    if any(module_name in prefix for module_name in ignored_layers):
-        return True
+    for module_name in ignored_layers:
+        if isinstance(module_name, str) and module_name.startswith("re:"):
+            if re.match(module_name[3:], prefix):
+                return True
+        elif module_name in prefix:
+            return True
     if "lm_head" in prefix:
         return True
 

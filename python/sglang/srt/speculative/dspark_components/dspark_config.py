@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+from copy import deepcopy
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
@@ -189,7 +191,7 @@ def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
         "Inkling2ForConditionalGeneration"
     ]:
         return _cfg_get(hf_config, "mtp_config", None) is not None
-    return any(
+    return is_namespaced_dspark_bundle(hf_config) or any(
         _cfg_get(hf_config, key, None) is not None
         for key in (
             "dspark_block_size",
@@ -198,6 +200,37 @@ def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
             "dspark_target_layer_ids",
         )
     )
+
+
+def is_namespaced_dspark_bundle(config: Any) -> bool:
+    """Identify native Ling bundles without changing other draft families."""
+    return (
+        _cfg_get(config, "model_type", None) == "bailing_hybrid"
+        and _cfg_get(config, "dspark_bundle_format", None) == "namespaced_safetensors"
+        and _cfg_get(config, "dspark_bundle_version", None) == 1
+        and bool(_get_dspark_config(config))
+    )
+
+
+def apply_namespaced_dspark_draft_config(config: Any) -> bool:
+    """Project a bundled draft sub-config onto a draft ModelConfig copy."""
+    if not is_namespaced_dspark_bundle(config):
+        return False
+
+    dspark_config = _get_dspark_config(config)
+    architectures = dspark_config.get("architectures")
+    if architectures != ["LingV3ForCausalLMDSparkMLA"]:
+        raise ValueError("Unsupported namespaced DSpark draft architecture.")
+    attention_type = dspark_config.get("attention_type")
+    if attention_type != "mla":
+        raise ValueError("Ling DSpark bundles require MLA attention.")
+    for key, value in dspark_config.items():
+        setattr(config, key, value)
+    config.full_attention_type = attention_type
+    config.attention_type = 1
+    # The target is KDA/MLA hybrid; this draft contains MLA layers only.
+    config.use_kda = False
+    return True
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
@@ -238,6 +271,16 @@ def _get_dspark_config(config: Any) -> dict:
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
+    if is_namespaced_dspark_bundle(draft_hf_config):
+        # Parse the draft view without rewriting the target checkpoint config.
+        draft_hf_config = deepcopy(draft_hf_config)
+        if isinstance(draft_hf_config, dict):
+            draft_hf_config = SimpleNamespace(**draft_hf_config)
+        apply_namespaced_dspark_draft_config(draft_hf_config)
+        normalized = _get_dspark_config(draft_hf_config)
+        if normalized.get("attention_type") == "mla":
+            normalized["attention_mode"] = "mla"
+        draft_hf_config.dflash_config = normalized
     if _cfg_get(draft_hf_config, "architectures", None) == [
         "Inkling2ForConditionalGeneration"
     ]:

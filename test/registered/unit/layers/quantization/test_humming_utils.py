@@ -151,6 +151,17 @@ class TestHummingMoePreparation(CustomTestCase):
                     )
                 )
 
+    def test_regex_exclusions_are_honored(self):
+        config = {"ignored_layers": [r"re:^layers\.\d+\.attention(?:\.|$)"]}
+        self.assertTrue(
+            humming_utils.humming_is_layer_skipped(
+                config, "layers.0.attention.kv_b_proj"
+            )
+        )
+        self.assertFalse(
+            humming_utils.humming_is_layer_skipped(config, "layers.0.mlp.experts")
+        )
+
     def test_first_present_ignore_alias_takes_precedence(self):
         for ignored_layers in ([], None):
             with self.subTest(ignored_layers=ignored_layers):

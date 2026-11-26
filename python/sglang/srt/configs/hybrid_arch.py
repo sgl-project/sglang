@@ -131,6 +131,11 @@ def linear_attn_model_spec(model_config: ModelConfig):
 
 
 def mambaish_config(model_config: ModelConfig):
+    if getattr(model_config.hf_config, "architectures", None) == [
+        "LingV3ForCausalLMDSparkMLA"
+    ]:
+        # The bundle inherits a hybrid target config class, but no linear layers.
+        return None
     existing = (
         mamba2_config(model_config)
         or hybrid_gdn_config(model_config)
