@@ -97,6 +97,10 @@ class TestNpuWeightVersionSpans(CustomTestCase):
         except Exception:
             pass
 
+    def _reset_weight_version(self):
+        # CustomTestCase retries the test method without rerunning setUp.
+        update_weight_version(self.base_url, BASE_VERSION, abort_all_requests=False)
+
     def _stream_all(self, count, *, max_new_tokens, prompt=LONG_PROMPT):
         requests = [
             start_stream(
@@ -126,10 +130,9 @@ class TestNpuWeightVersionSpans(CustomTestCase):
         return results
 
     def test_01_boundary_splits_running_requests(self):
+        self._reset_weight_version()
         base = current_weight_version(self.base_url)
-        self.assertEqual(
-            base, BASE_VERSION, "server started with an unexpected version"
-        )
+        self.assertEqual(base, BASE_VERSION, "unexpected weight version at test start")
 
         requests = self._stream_all(4, max_new_tokens=512)
         pause_generation(self.base_url, mode="in_place")
@@ -171,6 +174,7 @@ class TestNpuWeightVersionSpans(CustomTestCase):
         )
 
     def test_02_reused_prefix_keeps_the_version_that_computed_it(self):
+        self._reset_weight_version()
         flush_cache(self.base_url)
         old_version = current_weight_version(self.base_url)
 
@@ -211,6 +215,7 @@ class TestNpuWeightVersionSpans(CustomTestCase):
         )
 
     def test_03_aborted_requests_keep_their_spans(self):
+        self._reset_weight_version()
         base = current_weight_version(self.base_url)
         requests = self._stream_all(4, max_new_tokens=512)
 
