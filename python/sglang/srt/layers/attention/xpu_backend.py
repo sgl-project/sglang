@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.local_attention import (
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
@@ -173,7 +173,6 @@ class XPUAttentionBackend(AttentionBackend):
         self.forward_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
-        self.max_context_len = model_runner.model_config.context_len
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
         )
@@ -305,7 +304,12 @@ class XPUAttentionBackend(AttentionBackend):
         if self.dcp_size == 1:
             self.kv_layers.layer(layer.layer_id).store(
                 layer,
-                KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                KVWriteLoc(
+                    cache_loc,
+                    window_locs=window_write_locs(
+                        self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                    ),
+                ),
                 k,
                 v,
                 layer.k_scale,
@@ -694,7 +698,7 @@ class XPUAttentionBackend(AttentionBackend):
 
         if self.use_mla:
             workspace_kwargs = dict(
-                max_seq_len=self.max_context_len,
+                max_seq_len=self.req_to_token_pool.row_width,
                 num_batches=batch_size,
                 num_heads=self.num_local_heads,
                 page_size=self.page_size,
@@ -1685,7 +1689,9 @@ class XPUAttentionBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Pre-allocate fixed-size tensors reused across XPU graph captures."""
-        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        max_num_pages = (
+            self.req_to_token_pool.row_width + self.page_size - 1
+        ) // self.page_size
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens_q": torch.arange(
@@ -1698,7 +1704,7 @@ class XPUAttentionBackend(AttentionBackend):
                 max_bs, max_num_pages, dtype=torch.int32, device=self.device
             ),
             "strided_indices": torch.arange(
-                0, self.max_context_len, self.page_size, device=self.device
+                0, self.req_to_token_pool.row_width, self.page_size, device=self.device
             ),
         }
         if self.use_sliding_window_kv_pool:
@@ -1711,7 +1717,10 @@ class XPUAttentionBackend(AttentionBackend):
         if self.is_encoder_decoder:
             self.encoder_metadata = {
                 "encoder_page_table": torch.zeros(
-                    max_bs, self.max_context_len, dtype=torch.int32, device=self.device
+                    max_bs,
+                    self.req_to_token_pool.row_width,
+                    dtype=torch.int32,
+                    device=self.device,
                 ),
                 "encoder_lens_int32": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -1969,7 +1978,7 @@ class XPUAttentionBackend(AttentionBackend):
         - cu_seqlens_q gets its own buffer (never aliased to cu_seqlens_k,
           unlike eager no-prefix path) so prefix replays stay correct;
         - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
-          (num_tokens in this bucket / max_context_len): the kernel reads real
+          (num_tokens in this bucket / req_to_token_row_width): the kernel reads real
           work extents from the cu_seqlens / cache_seqlens device buffers;
         - page_table is page-granularity (one column per `page_size` tokens),
           converted from the token-granularity req_to_token table via strided
@@ -1984,7 +1993,7 @@ class XPUAttentionBackend(AttentionBackend):
         if in_capture and getattr(self, "full_cg_prefill_metadata", None) is None:
             device = forward_batch.seq_lens.device
             max_num_pages = (
-                self.max_context_len + self.page_size - 1
+                self.req_to_token_pool.row_width + self.page_size - 1
             ) // self.page_size
             m = FlashAttentionMetadata()
             m.cache_seqlens_int32 = torch.zeros((bs,), dtype=torch.int32, device=device)
@@ -1995,7 +2004,7 @@ class XPUAttentionBackend(AttentionBackend):
             )
             self.full_cg_prefill_metadata = m
             self.full_cg_prefill_strided_indices = torch.arange(
-                0, self.max_context_len, self.page_size, device=device
+                0, self.req_to_token_pool.row_width, self.page_size, device=device
             )
             if self.use_sliding_window_kv_pool:
                 assert forward_batch.out_cache_loc is not None
@@ -2086,7 +2095,7 @@ class XPUAttentionBackend(AttentionBackend):
         if in_capture:
             # Baked into the captured kernel launches; upper bounds only.
             m.max_seq_len_q = forward_batch.positions.numel()
-            m.max_seq_len_k = self.max_context_len
+            m.max_seq_len_k = self.req_to_token_pool.row_width
         self.forward_metadata = m
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
@@ -2226,7 +2235,6 @@ class XPUMultiStepDraftBackend:
             )
             for i in range(speculative_num_steps - 1)
         ]
-        self.max_context_len = self.attn_backends[0].max_context_len
         self.device = model_runner.device
         self.token_to_kv_pool = model_runner.token_to_kv_pool
 

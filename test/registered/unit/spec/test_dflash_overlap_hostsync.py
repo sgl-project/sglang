@@ -9,17 +9,21 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.runtime_context import get_context
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 _HAS_CUDA = torch.cuda.is_available()
 
 
 def _compact_lens_exact(seq_lens, window, page):
     fake_self = SimpleNamespace(
-        device=seq_lens.device, draft_window_size=window, page_size=page
+        device=seq_lens.device,
+        draft_window_size=window,
+        page_size=page,
+        _draft_compact_page_size=page,
     )
     from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
@@ -27,7 +31,9 @@ def _compact_lens_exact(seq_lens, window, page):
 
 
 def _compact_lens_host(seq_lens, window, page):
-    fake_self = SimpleNamespace(draft_window_size=window, page_size=page)
+    fake_self = SimpleNamespace(
+        draft_window_size=window, page_size=page, _draft_compact_page_size=page
+    )
     out = torch.empty(seq_lens.numel(), dtype=torch.int32)
     from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
@@ -52,7 +58,9 @@ class TestCompactSeqLensHostBound(CustomTestCase):
 
         seq = torch.arange(16385)
         for page in (1, 64):
-            worker = SimpleNamespace(draft_window_size=2048, page_size=page)
+            worker = SimpleNamespace(
+                draft_window_size=2048, page_size=page, _draft_compact_page_size=page
+            )
             bound = torch.empty(seq.numel(), dtype=torch.int32)
             DFlashWorkerV2._fill_compact_seq_lens_cpu_bound(
                 worker, batch_seq_lens_cpu=None, nxt_kv_lens_cpu=None, out=bound
@@ -247,9 +255,8 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
             server_args=SimpleNamespace(speculative_attention_mode=spec_mode),
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,
-            req_to_token_pool=None,
+            req_to_token_pool=SimpleNamespace(row_width=2048),
             runner_ids=None,
-            model_config=SimpleNamespace(context_len=2048),
         )
         # The backend takes the mode from the published configuration, not from
         # the runner it is handed.

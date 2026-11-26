@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.rust_server.server import RustServer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -29,7 +30,7 @@ class _HoldingRustServer(RustServer):
             return
         super().wait_request(timeout_ms)
 
-    def install_sigterm_drain(self, notify=None) -> None:
+    def install_sigterm_drain(self, notify=None, hold_drain_end=False) -> None:
         # The real one installs a process-wide SIGTERM handler on the server's
         # wakeup fd; draining is not what this test checks.
         pass
@@ -46,7 +47,7 @@ class TestRustServerIdleSleep(unittest.TestCase):
                     gather_frontend_cpu_share=lambda _: (0, 1),
                     launch=lambda _scheduler, frontend_cpu_share=None: rust_server,
                 )
-                scheduler._engine_paused = False
+                scheduler.pause_state = PauseState()
                 scheduler.idle_sleeper = None
                 with (
                     get_context().override_server_args(sleep_on_idle=sleep_on_idle),

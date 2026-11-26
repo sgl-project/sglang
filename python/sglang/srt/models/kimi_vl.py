@@ -45,7 +45,6 @@ import copy
 import logging
 import math
 from array import array
-from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -76,13 +75,6 @@ from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_mm
 
 logger = logging.getLogger(__name__)
-
-
-# For dummy input only
-@dataclass
-class MaxImageTokenMeta:
-    width: int = 1024
-    height: int = 1024
 
 
 class KimiVLMultiModalProjector(nn.Module):

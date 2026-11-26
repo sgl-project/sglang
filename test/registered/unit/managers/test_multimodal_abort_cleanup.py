@@ -23,6 +23,7 @@ from sglang.srt.managers.req_types import (
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport import cuda_vmm as vmm
@@ -31,7 +32,10 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import (
+    empty_request_lists,
+    idle_penalty_status_pool,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -92,7 +96,8 @@ def _rank(rank):
 def _queued_scheduler(req):
     scheduler = object.__new__(Scheduler)
     empty_request_lists(scheduler)
-    scheduler.waiting_queue.join([req])
+    if req is not None:
+        move([req], scheduler.waiting_queue)
     scheduler.mm_receiver = None
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.tree_cache = MagicMock()
@@ -102,6 +107,7 @@ def _queued_scheduler(req):
     scheduler.output_streamer = MagicMock()
     scheduler.collect_inflight_reqs = lambda: set()
     scheduler.hisparse_coordinator = None
+    scheduler.penalty_status_pool = idle_penalty_status_pool()
     scheduler.init_request_retirer()
     return scheduler
 

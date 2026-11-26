@@ -17,7 +17,7 @@ from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecutio
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch22, is_npu_arch35
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
 )
@@ -70,20 +70,18 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    builds_confidence_head,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
-from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyMode,
-    read_ragged_verify_mode,
-)
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_gfx1250_supported, is_npu
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
 _is_npu = is_npu()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def apply_rotary_emb(
@@ -141,6 +139,7 @@ class DSparkAttention(MqaAttentionBase):
         )
 
         self.alt_streams = alt_streams
+        self._is_npu_arch22 = is_npu_arch22()
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
         if _is_npu:
             self.register_buffer(
@@ -196,7 +195,8 @@ class DSparkAttention(MqaAttentionBase):
         q = self.q_norm(q)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if not self.q_head_norm:
+        # The no-head-norm path indexes complex RoPE frequencies, unsupported on arch22.
+        if not self.q_head_norm and not self._is_npu_arch22:
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
                 return q_out
@@ -224,7 +224,8 @@ class DSparkAttention(MqaAttentionBase):
 
         from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
-        q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
+        if self.q_head_norm:
+            q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
         cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
             positions,
             q.dtype,
@@ -282,17 +283,17 @@ class DSparkAttention(MqaAttentionBase):
                 dtype=torch.float8_e4m3fn,
                 device=hidden_states.device,
             )
-        elif self.n_local_heads < _PAD_NUM_HEADS:
+        elif self.n_local_heads < _PAD_NUM_HEADS and not self._is_npu_arch22:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
             q_out = q_padded[:, : self.n_local_heads, :]
 
         if enable_multi_stream:
-            current_stream = torch.cuda.current_stream()
+            current_stream = torch.get_device_module().current_stream()
             stream_kv = self.alt_streams[0]
             stream_kv.wait_stream(current_stream)
-            with torch.cuda.stream(stream_kv):
+            with torch.get_device_module().stream(stream_kv):
                 kv = self.kv_proj_only(hidden_states)
                 self._store_block_kv(
                     kv=kv,
@@ -316,7 +317,9 @@ class DSparkAttention(MqaAttentionBase):
 
         if q_padded is not None:
             q = q_padded
-        attn_sink = self._local_attn_sink()
+        attn_sink = self._local_attn_sink(
+            self.n_local_heads if self._is_npu_arch22 else None
+        )
 
         o = attn_backend.forward(
             q=q,
@@ -531,13 +534,8 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
 def build_dspark_v4_confidence_head(
     *, config: DeepSeekV4Config, markov_rank: int
 ) -> Optional[DSparkConfidenceHead]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if not builds_confidence_head(config):
         return None
-    if not hasattr(config, "enable_confidence_head"):
-        logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
-        )
     with_markov_cfg = getattr(config, "confidence_head_with_markov", None)
     with_markov = (
         (markov_rank > 0) if with_markov_cfg is None else bool(with_markov_cfg)
@@ -715,6 +713,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self._is_npu_arch22 = is_npu_arch22()
         self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
@@ -746,12 +745,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.start_layer = 0
         self.end_layer = self.num_stages
         use_multi_stream = (
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            (
+                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+                or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            )
             and envs.SGLANG_DSPARK_ENABLE_MULTI_STREAM.get()
-            and torch.cuda.is_available()
+            and (_is_npu or torch.cuda.is_available())
         )
         self.alt_streams: Optional[List[torch.cuda.Stream]] = (
-            [torch.cuda.Stream()] if use_multi_stream else None
+            [torch.get_device_module().Stream()] if use_multi_stream else None
         )
         self.moe_routed_quant_stream = (
             torch.cuda.Stream()
@@ -956,10 +958,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             if self.hc_pre_from_prev_sublayer:
                 pre, x = x.pre, x.residual
         if self.hc_pre_from_prev_sublayer:
-            from sglang.kernels.ops.layernorm.mhc import mhc_combine
+            if self._is_npu_arch22:
+                x = mhc.combine_premix(x, pre)
+            else:
+                from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-            # The kernel widens each element to fp32 as it loads it.
-            x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
+                # The kernel widens each element to fp32 as it loads it.
+                x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
@@ -967,6 +972,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             assert x.dim() == 2, "V4.1 draft hidden states leave forward() collapsed"
             return x
         last = self.stages[-1]
+        if _is_gfx1250_supported and x.is_cuda and x.numel() > 0:
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                last.hc_head_fn,
+                last.hc_head_scale,
+                last.hc_head_base,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+            )
         return hc_head_torch(
             x,
             last.hc_head_fn,
@@ -1121,7 +1137,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             raise ValueError(
                 f"DSpark V4 confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or disable the confidence head (enable_confidence_head=False)."
+                f"or set SGLANG_DSPARK_USE_ONLINE_ESTIMATOR=1."
             )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:

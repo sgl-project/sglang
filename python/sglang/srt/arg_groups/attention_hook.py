@@ -34,6 +34,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.platform_hook import (
+    handle_mlu_attention_backend_compatibility,
     handle_sail_attention_backend_compatibility,
 )
 from sglang.srt.configs.model_config import uses_kda_attention
@@ -84,11 +85,7 @@ def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
             "--dcp-size."
         )
 
-    attn_tp_size = (
-        tp_size
-        // (view.dp_size if view.enable_dp_attention else 1)
-        // view.attn_cp_size
-    )
+    attn_tp_size = tp_size // view.attn_cp_size
     q_heads = max(1, model_config.get_max_num_attention_heads() // attn_tp_size)
     kv_heads = max(1, model_config.get_num_kv_heads(attn_tp_size, dcp_size))
     q_group = q_heads * dcp_size // kv_heads
@@ -126,6 +123,7 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Split-backend override + default fill.
     run_post_process_pass(server_args, _attention_backend_default)
 
+    handle_mlu_attention_backend_compatibility(server_args)
     handle_sail_attention_backend_compatibility(server_args)
 
     # Torch native and flex attention backends
@@ -458,9 +456,10 @@ def handle_linear_attn_backend(server_args: Any):
     # uses a strictly-lower causal mask, so it is valid ONLY for a linear
     # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP);
     # EAGLE tree verify (topk > 1) must fall back to the recurrent verify.
-    # GDN sizes the window to the draft maximum; KDA (kda_backend) keeps a
-    # --linear-replayssm-cache-len window and folds via its own fused
-    # verify ring-write + commit_kda_replayssm_after_verify.
+    # GDN keeps a --linear-replayssm-cache-len ring that must hold the draft
+    # window (MambaPool checks it); KDA (kda_backend) keeps a window of the
+    # same length and folds via its own fused verify ring-write +
+    # commit_kda_replayssm_after_verify.
     if cfg.enable_linear_replayssm_spec:
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(
@@ -469,6 +468,12 @@ def handle_linear_attn_backend(server_args: Any):
                 "kernel uses a strictly-lower causal mask and is invalid for "
                 "EAGLE tree verify. Got "
                 f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+            )
+        if verify == "aiter":
+            raise ValueError(
+                "--enable-linear-replayssm-spec verifies through its own "
+                "ReplaySSM kernels and cannot use "
+                "--linear-attn-verify-backend aiter."
             )
         if decode not in ("triton", "flashinfer"):
             raise ValueError(

@@ -43,7 +43,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
-    get_bool_env_var,
     is_cuda,
     is_hip,
     is_musa,
@@ -72,7 +71,6 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
 
@@ -304,6 +302,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    # w2's scale block when Fp8MoEMethod refines it apart from block_shape for a
+    # TP shard that splits checkpoint blocks; requantized to per-row UE8M0.
+    w2_block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
     use_mxfp8: bool = False
@@ -324,6 +325,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
         activation_block_size: Optional[int],
         hidden_size: int,
         activation_scale_width: int,
+        down: bool = False,
     ) -> tuple[Optional[tuple[int, int]], Optional[tuple[int, int]]]:
         """Return DeepGEMM A/B scale recipes from explicit layout metadata."""
         if self.use_mxfp8:
@@ -341,6 +343,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
             return (self.block_shape[0], activation_block_size), weight_recipe
         if self.is_fp4_experts:
             return (1, 128), (1, 32)
+        if down and self.w2_block_shape is not None:
+            gran_k = self.w2_block_shape[1]
+            return (1, activation_block_size or gran_k), (1, gran_k)
         return None, None
 
 
@@ -420,7 +425,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_scale = runner_input.hidden_states_scale
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
-        hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
         trace_deepep_v2_contig = (
@@ -431,6 +435,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
         scale_block_size = quant_info.block_shape[1] if quant_info.use_mxfp8 else 128
+        if quant_info.w2_block_shape is not None:
+            scale_block_size = quant_info.w2_block_shape[1]
 
         if all_tokens == 0:
             if trace_deepep_v2_contig:
@@ -631,10 +637,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         # The down activation is quantized here, independently of dispatch.
-        recipe_a_down, _ = quant_info.scale_recipes(
+        recipe_a_down, recipe_b_down = quant_info.scale_recipes(
             activation_block_size=scale_block_size,
             hidden_size=down_input_fp8.shape[-1],
             activation_scale_width=down_input_scale.shape[-1],
+            down=True,
         )
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
@@ -642,7 +649,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output,
             m_indices,
             recipe_a=recipe_a_down,
-            recipe_b=recipe_b,
+            recipe_b=recipe_b_down,
         )
         if trace_deepep_v2_contig:
             torch.cuda.synchronize()
@@ -723,8 +730,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers import deep_gemm_wrapper
-
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
@@ -755,6 +760,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         use_mxfp8 = quant_info.use_mxfp8
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+        if quant_info.w2_block_shape is not None:
+            scale_block_size = quant_info.w2_block_shape[1]
 
         recipe_a, recipe_b = quant_info.scale_recipes(
             activation_block_size=runner_input.activation_scale_block_size,
@@ -872,10 +879,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 down_input_scale
             )
 
-        recipe_a_down, _ = quant_info.scale_recipes(
+        recipe_a_down, recipe_b_down = quant_info.scale_recipes(
             activation_block_size=scale_block_size,
             hidden_size=down_input.shape[-1],
             activation_scale_width=down_input_scale.shape[-1],
+            down=True,
         )
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
@@ -902,7 +910,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             masked_m,
             expected_m,
             recipe_a=recipe_a_down,
-            recipe_b=recipe_b,
+            recipe_b=recipe_b_down,
             **gemm_overlap_args_dict,
         )
         if trace_deepep_v2_masked:
@@ -925,7 +933,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_fwd
-        from sglang.srt.layers import deep_gemm_wrapper
 
         hidden_states = runner_input.hidden_states
         masked_m = runner_input.masked_m
@@ -1011,12 +1018,7 @@ def pre_permute_standard_to_deep_gemm(
     topk_weights, topk_ids, _ = topk_output
     # SM120's DeepGEMM grouped GEMM consumes standard-layout activations only.
     # Feeding it the shared masked/swizzled layout does not raise -- it silently
-    # returns wrong results (GSM8K 0.96 -> 0.06, measured on 4x RTX 6000D), so
-    # refuse the combination rather than corrupt output.
-    assert deep_gemm_sm120.is_supported(), (
-        "--moe-runner-backend deep_gemm on consumer Blackwell (SM120) requires "
-        "the standard-layout MoE path, which is unavailable in this build."
-    )
+    # returns wrong results (GSM8K 0.96 -> 0.06, measured on 4x RTX 6000D).
     sm120_input = deep_gemm_sm120.maybe_pre_permute(
         hidden_states, topk_ids, topk_weights, quant_info, runner_config, running_state
     )
@@ -1027,8 +1029,6 @@ def pre_permute_standard_to_deep_gemm(
     hidden_states_dtype = hidden_states.dtype
     hidden_states_device = hidden_states.device
     hidden_states_ref = hidden_states
-
-    topk_weights, topk_ids = topk_weights, topk_ids
 
     if (
         deep_gemm_sm120.allows_masked_standard_layout()

@@ -58,7 +58,7 @@ _is_npu = is_npu()
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
-def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
+def reserve_rope_cache_for_long_sequences(model, model_config):
     """Pre-expand RoPE cache for long sequences and speculative decoding.
 
     Runs inside `ModelRunner`, past publish, so the three config inputs come
@@ -75,7 +75,6 @@ def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
     base_ctx = (
         get_model().context_length
         or getattr(model_config, "context_len", None)
-        or getattr(model_config, "max_model_len", None)
         or getattr(model_config.hf_text_config, "max_position_embeddings", None)
         or 2048
     )
@@ -227,6 +226,28 @@ def resolve_sliding_window_size(model, model_config: ModelConfig) -> int | None:
     return sliding_window_size
 
 
+def resolve_sliding_layer_window_size(
+    model_cls, model_config: ModelConfig
+) -> int | None:
+    """`resolve_sliding_window_size` from the config alone, before the model is
+    built; a class with ``get_attention_sliding_window_size`` must state
+    ``sliding_layer_window_size(config)``, returning the same value."""
+    if hasattr(model_cls, "get_attention_sliding_window_size"):
+        rule = getattr(model_cls, "sliding_layer_window_size", None)
+        if rule is None:
+            raise ValueError(
+                f"{model_cls.__name__} resolves its attention window only once "
+                "built; state it from the config as `sliding_layer_window_size` "
+                "so storage for its window layers can be placed before it loads"
+            )
+        return rule(model_config.hf_config)
+    if model_config.is_hybrid_swa and model_config.sliding_window_size is not None:
+        return model_config.sliding_window_size
+    if model_config.attention_chunk_size is not None:
+        return model_config.attention_chunk_size
+    return None
+
+
 def report_online_quantization(*, model) -> None:
     # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
     quantized_layers = getattr(
@@ -277,6 +298,7 @@ def build_load_config(
     draft_model_idx: int | None,
     weight_cache_mode: str,
     weight_cache_socket: str | None,
+    weight_cache_transport: str = "auto",
     load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
@@ -307,6 +329,7 @@ def build_load_config(
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
+        weight_cache_transport=weight_cache_transport,
         load_group=load_group,
     )
 
