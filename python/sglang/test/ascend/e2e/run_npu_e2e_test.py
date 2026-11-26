@@ -712,8 +712,6 @@ def run_npu_e2e_test_case(
     accuracy_dataset: str = "",
     use_image_sglang: str = "false",
     test_method: str = "",
-    deepswe_eval_image: str = "",
-    deepswe_dind_image: str = "",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -847,8 +845,6 @@ def run_npu_e2e_test_case(
                 "accuracy_dataset": accuracy_dataset,
                 "use_image_sglang": use_image_sglang,
                 "test_method": test_method,
-                "deepswe_eval_image": deepswe_eval_image,
-                "deepswe_dind_image": deepswe_dind_image,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_SEPARATION_GREEN if env == "green" else kube_job_type
@@ -1096,25 +1092,6 @@ if __name__ == "__main__":
         "case; empty runs every test in the file.",
     )
 
-    parser.add_argument(
-        "--deepswe-eval-image",
-        type=str,
-        required=False,
-        default="",
-        help="Image for the DeepSWE amd64 eval container (empty keeps the "
-        "default in the test framework). Injected into the router pod as "
-        "DEEPSWE_EVAL_IMAGE.",
-    )
-
-    parser.add_argument(
-        "--deepswe-dind-image",
-        type=str,
-        required=False,
-        default="",
-        help="Image for the DeepSWE docker:dind sidecar (empty keeps the "
-        "default). Injected into the router pod as DEEPSWE_DIND_IMAGE.",
-    )
-
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -1135,8 +1112,6 @@ if __name__ == "__main__":
     accuracy_dataset = args.accuracy_dataset
     use_image_sglang = args.use_image_sglang
     test_method = args.test_method
-    deepswe_eval_image = args.deepswe_eval_image
-    deepswe_dind_image = args.deepswe_dind_image
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -1170,6 +1145,4 @@ if __name__ == "__main__":
         accuracy_dataset=accuracy_dataset,
         use_image_sglang=use_image_sglang,
         test_method=test_method,
-        deepswe_eval_image=deepswe_eval_image,
-        deepswe_dind_image=deepswe_dind_image,
     )

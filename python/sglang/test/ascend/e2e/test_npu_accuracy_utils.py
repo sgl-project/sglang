@@ -74,16 +74,13 @@ REMOTE_EVAL_DATASETS = frozenset({"deep_swe"})
 
 # DeepSWE eval pod: an amd64 node (kubernetes.io/arch=amd64) holding a
 # ``docker:dind`` sidecar plus a python container that drives evalscope.
-# Images/arch are overridable through the pod env (the workflow injects the
-# cluster's SWR mirror); an empty value keeps the default.
+# Images are hardcoded for this cluster: the eval container only needs
+# bash + python3 + pip + apt, so we reuse the cluster-pullable x86 sglang image;
+# the dind sidecar is pulled from Docker Hub.
 DEEPSWE_EVAL_IMAGE = (
-    os.environ.get("DEEPSWE_EVAL_IMAGE")
-    or "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/library/python:3.12"
+    "swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main-x86"
 )
-DEEPSWE_DIND_IMAGE = (
-    os.environ.get("DEEPSWE_DIND_IMAGE")
-    or "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/library/docker:dind"
-)
+DEEPSWE_DIND_IMAGE = "docker:dind"
 DEEPSWE_EVAL_NODE_ARCH = os.environ.get("DEEPSWE_EVAL_NODE_ARCH") or "amd64"
 # Time to get the pod scheduled and the eval container up (image pulls, node
 # availability) versus the wall-clock budget of the evaluation itself.

@@ -73,11 +73,6 @@ spec:
             value: "{{ use_image_sglang }}"
           - name: NPU_TEST_METHOD
             value: "{{ test_method }}"
-          # Override the amd64 eval-pod images (empty keeps the code default).
-          - name: DEEPSWE_EVAL_IMAGE
-            value: "{{ deepswe_eval_image }}"
-          - name: DEEPSWE_DIND_IMAGE
-            value: "{{ deepswe_dind_image }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -207,11 +202,6 @@ spec:
             value: "{{ use_image_sglang }}"
           - name: NPU_TEST_METHOD
             value: "{{ test_method }}"
-          # Override the amd64 eval-pod images (empty keeps the code default).
-          - name: DEEPSWE_EVAL_IMAGE
-            value: "{{ deepswe_eval_image }}"
-          - name: DEEPSWE_DIND_IMAGE
-            value: "{{ deepswe_dind_image }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -341,11 +331,6 @@ spec:
             value: "{{ use_image_sglang }}"
           - name: NPU_TEST_METHOD
             value: "{{ test_method }}"
-          # Override the amd64 eval-pod images (empty keeps the code default).
-          - name: DEEPSWE_EVAL_IMAGE
-            value: "{{ deepswe_eval_image }}"
-          - name: DEEPSWE_DIND_IMAGE
-            value: "{{ deepswe_dind_image }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
