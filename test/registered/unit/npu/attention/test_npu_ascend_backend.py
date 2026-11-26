@@ -13,6 +13,7 @@ import torch
 # accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=5, suite="extra-a-test-npu")
 
@@ -562,7 +563,7 @@ class TestGenerateAlibiBias(unittest.TestCase):
         self.assertEqual(result.dtype, torch.bfloat16)
 
 
-class TestMlaPrefixCacheDcp(unittest.TestCase):
+class TestMlaPrefixCacheDcp(CustomTestCase):
     def test_fp8_prefix_dequantized_before_projection_or_dcp_gather(self):
         from sglang.srt.hardware_backend.npu.attention.mla_cache import (
             build_mla_prefix_token_indices,
@@ -704,6 +705,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
         backend.use_quant_flash_attn = False
         backend.device = torch.device("cpu")
         backend.use_mla = True
+        backend.use_int8_quant_indexer = False
         backend.use_dsa = False
         backend.dcp_size, backend.dcp_rank = size, rank
         backend.use_flash_mla = backend.use_paged_mtp = False
@@ -832,7 +834,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
                                 )
 
 
-class TestMlaPrefixFia(unittest.TestCase):
+class TestMlaPrefixFia(CustomTestCase):
     @staticmethod
     def _fia_reference(**kwargs):
         q, k, v = (kwargs[name] for name in ("query", "key", "value"))
@@ -937,6 +939,7 @@ class TestMlaPrefixFia(unittest.TestCase):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
         backend.dcp_size = 1
         backend.use_mla = True
+        backend.use_int8_quant_indexer = False
         backend.use_fia = use_fia
         backend.is_dllm_model = False
         backend.qk_nope_head_dim = 128

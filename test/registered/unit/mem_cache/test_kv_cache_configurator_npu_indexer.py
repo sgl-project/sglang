@@ -43,7 +43,10 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         configurator.server_args = SimpleNamespace(indexer_kv_cache_dtype="int8")
         pool = object()
 
+        from sglang.srt.runtime_context import get_context
+
         with (
+            get_context().override_server_args(),
             patch.object(
                 kcc,
                 "get_parallel",
@@ -127,6 +130,11 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
                     is_draft_worker=False,
                 )
                 with (
+                    get_context().override_server_args(dsa_indexer_kv_dtype="auto"),
+                    patch(
+                        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                        return_value=kv_dtype == torch.float8_e4m3fn,
+                    ),
                     patch.object(pc, "_is_npu", True),
                     patch.object(
                         pc,
@@ -156,7 +164,13 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
         self, dtype, kv_cache_dim=None, indexer_quant_mode=None, hierarchical=False
     ):
         with (
-            get_context().override_server_args(enable_hierarchical_cache=hierarchical),
+            get_context().override_server_args(
+                enable_hierarchical_cache=hierarchical, dsa_indexer_kv_dtype="auto"
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                return_value=dtype == torch.float8_e4m3fn,
+            ),
             patch.object(
                 memory_pool_npu,
                 "get_parallel",

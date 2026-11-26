@@ -210,7 +210,9 @@ class Model(msgspec.Struct):
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. Out-of-tree "
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "
+                '"int8" packs DSA MLA KV on Ascend A2/A3 NPUs. '
+                "Out-of-tree "
                 "platform plugins can register further values for KV cache formats "
                 "that only their KV pool implements; in-tree platforms reject them."
             ),
@@ -240,6 +242,20 @@ class Model(msgspec.Struct):
                 "with fp8 GEMMs (CUDA SM90+). The main KV cache is unaffected."
             ),
             choices=["auto", "bfloat16", "fp8_e4m3"],
+        ),
+    ] = "auto"
+    dsa_indexer_kv_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Data type for the DSA indexer K cache storage, on Ascend NPUs "
+                'only. "auto" preserves the existing indexer precision and uses '
+                'BF16 with packed INT8 main KV. "int8" '
+                "quantizes the indexer K cache with one FP16 scale per token "
+                'and needs the vendor quantized-indexer operator. "fp8_e4m3" '
+                "requires an arch35 NPU."
+            ),
+            choices=["auto", "bf16", "int8", "fp8_e4m3"],
         ),
     ] = "auto"
     modelopt_quant: A[
