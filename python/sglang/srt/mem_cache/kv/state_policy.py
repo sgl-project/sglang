@@ -31,4 +31,4 @@ class StateSlotStrategy(msgspec.Struct, frozen=True, kw_only=True):
         # Prefill can hold an active slot and two radix checkpoints. With
         # tracked buffers, skipping the decode lock removes one checkpoint.
         checkpoints = 1 if self.skip_decode_lock and self.extra_buffer else 2
-        return 1 + checkpoints + self.tracking_slots
+        return 1 + checkpoints + self.initial_tracking_slots
