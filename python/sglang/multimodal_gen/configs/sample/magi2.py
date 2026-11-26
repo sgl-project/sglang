@@ -86,10 +86,9 @@ class Magi2SamplingParams(SamplingParams):
 
     def _adjust(self, server_args: Any) -> None:
         explicit = getattr(self, "_explicit_fields", None) or set()
-        if (
-            not getattr(server_args.pipeline_config, "enable_refiner", True)
-            and not explicit & {"width", "height"}
-        ):
+        if not getattr(
+            server_args.pipeline_config, "enable_refiner", True
+        ) and not explicit & {"width", "height"}:
             self.width = self.preview_width
             self.height = self.preview_height
         super()._adjust(server_args)
@@ -127,10 +126,10 @@ class Magi2SamplingParams(SamplingParams):
 
     def _validate_with_pipeline_config(self, pipeline_config) -> None:
         super()._validate_with_pipeline_config(pipeline_config)
-        if (
-            not getattr(pipeline_config, "enable_refiner", True)
-            and (self.width, self.height) != (self.preview_width, self.preview_height)
-        ):
+        if not getattr(pipeline_config, "enable_refiner", True) and (
+            self.width,
+            self.height,
+        ) != (self.preview_width, self.preview_height):
             raise ValueError(
                 f"This server runs MAGI-2 in preview-only mode and can only deliver "
                 f"{self.preview_width}x{self.preview_height}; "

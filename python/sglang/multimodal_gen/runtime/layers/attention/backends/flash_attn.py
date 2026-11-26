@@ -412,9 +412,7 @@ class FlashAttentionImpl(AttentionImpl):
     ):
         use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
         if use_trtllm:
-            assert self.sinks is None, (
-                "run_skip_softmax does not support sinks"
-            )
+            assert self.sinks is None, "run_skip_softmax does not support sinks"
             if return_softmax_lse:
                 raise NotImplementedError(
                     "Skip Softmax does not support the LSE output required by "
@@ -566,9 +564,7 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
         if use_trtllm:
-            assert self.sinks is None, (
-                "run_skip_softmax does not support sinks"
-            )
+            assert self.sinks is None, "run_skip_softmax does not support sinks"
             bounds = cu_seqlens_host
             used = (
                 trailing_padding_used_len(
