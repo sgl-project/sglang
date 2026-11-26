@@ -340,8 +340,9 @@ kernel runs only on CUDA, so KV is transferred per token instead.
 ## XPU Monokernels for Qwen3.5 / Qwen3.6 MoE [Experimental]
 
 `--enable-xpu-monokernel` runs the decode and speculative-verify steps of
-Qwen3.5 / Qwen3.6 MoE (35B-A3B, block-FP8 checkpoint) at TP2 on two Intel Arc
-Pro B70 cards with one persistent kernel per decoder layer: the mixer, the MoE
+Qwen3.5 / Qwen3.6 MoE (35B-A3B, block-FP8 checkpoint, bfloat16 activations) at
+TP2 on two Intel Arc Pro B70 cards with one persistent kernel per decoder layer:
+the mixer, the MoE
 with the shared expert, and both TP all-reduces run in one kernel, which
 exchanges the all-reduce values with the peer card through P2P mailboxes.
 Other steps (prefill, unsupported batch sizes) use the standard forward.
@@ -356,21 +357,30 @@ Requirements:
 
 - **sgl-kernel-xpu built with the kernels.** They are not compiled by default:
   build sgl-kernel-xpu with `USE_MONO_DECODE=ON` set in the environment.
-- **ptrace permission between the two ranks.** The mailboxes live in torch
-  symmetric memory, and mapping the peer card's buffer needs ptrace permission
-  over the peer process. With `kernel.yama.ptrace_scope` 1 (the Ubuntu default),
-  run the container with `--cap-add SYS_PTRACE` (or set `ptrace_scope` to 0 on
-  the host). Without it, the server stops at startup with an error that says so.
-- Two Xe2 GPUs with at least 20 Xe cores each, `--tp 2`. The kernels are tuned
-  for 32 Xe cores (Arc Pro B70); a GPU with fewer (Arc Pro B60: 20) runs a
-  functional, untuned variant. Up to 8 requests a
+- **`pidfd_getfd` between the two ranks.** The mailboxes live in torch
+  symmetric memory, and mapping the peer card's buffer takes the peer's handle
+  with `pidfd_getfd()`. Docker's default seccomp profile blocks it: run the
+  container with `--cap-add SYS_PTRACE` (or `--privileged`). With
+  `kernel.yama.ptrace_scope` 2 the process also needs `CAP_SYS_PTRACE`. When it
+  is missing, the server stops at startup with an error that says so.
+- Two Xe2 GPUs with at least 20 Xe cores each, `--tp 2`, `--dtype bfloat16` (or
+  `auto`). The kernels are tuned for 32 Xe cores (Arc Pro B70). A GPU with fewer
+  (Arc Pro B60: 20) runs a functional, untuned variant: per layer it takes 2.4 to
+  3.5 times the B70 time, and above one request a step it is slower than the
+  standard path with decode graphs, so it is not recommended there. Up to 8 requests a
   decode step (set `--max-running-requests` and `--cuda-graph-max-bs-decode` to
   the concurrency you serve). MTP speculative decoding: `--speculative-algorithm
   EAGLE` with `--speculative-eagle-topk 1` and 2, 3, 4, 6 or 8 draft tokens.
 
 An unsupported configuration is refused at startup with the list of reasons.
-If a rank stops answering, the in-kernel waits give up after
-`SGLANG_XPU_MONO_DEADLINE_S` seconds (default 2), and the server stops with an
+The server also refuses a `--mem-fraction-static` that leaves too little GPU
+memory outside torch's pools, and names the largest one that fits. On a 24 GB
+card (Arc Pro B60) with MTP that limit can be below what SGLang needs for the
+model; `SGLANG_XPU_MONO_VRAM_RESERVE_GIB=0.5` (default 1.5) lowers the reserve
+it keeps, with less margin against evictions.
+If a rank stops answering, or not all of a kernel's work-groups can run, the
+in-kernel waits give up after `SGLANG_XPU_MONO_DEADLINE_S` seconds (default 2;
+the rank that gives up first tells the peer), and the server stops with an
 error that names the likely cause instead of hanging.
 
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
