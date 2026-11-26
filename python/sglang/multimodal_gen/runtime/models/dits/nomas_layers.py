@@ -139,14 +139,20 @@ class PatchEmbed(nn.Module):
         return self.proj(x).flatten(2).transpose(1, 2)
 
 
+@lru_cache(maxsize=8)
+@torch.inference_mode(False)
+def _timestep_frequencies(half, max_period, device):
+    # Preserve the CPU exponential's rounding and finish the copy before capture.
+    return torch.exp(
+        -math.log(max_period)
+        * torch.arange(half, dtype=torch.float32, device="cpu")
+        / half
+    ).to(device)
+
+
 def timestep_embedding(t, dim=256, max_period=10000):
     """Sinusoidal embedding of fractional timesteps, (*t.shape, dim); dim is even."""
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(max_period)
-        * torch.arange(start=0, end=half, dtype=torch.float32)
-        / half
-    ).to(device=t.device)
+    freqs = _timestep_frequencies(dim // 2, max_period, t.device)
     args = t.flatten()[:, None].float() * freqs[None]
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
     return embedding.view(*t.shape, dim)

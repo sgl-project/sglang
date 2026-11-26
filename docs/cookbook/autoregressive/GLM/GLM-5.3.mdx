@@ -50,12 +50,12 @@ Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environ
 <Tab title="A3">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:cann9.1.0-a3-B080
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 ```
 
-This CANN 9.1.0 image requires a compatible SGLang build, TorchNPU, ATB, and custom operators before serving. Set `SGLANG_ROOT` to that source checkout.
+This CANN 9.2.0 image requires a compatible SGLang build, TorchNPU, ATB, and custom operators before serving. Set `SGLANG_ROOT` to that source checkout.
 
-Run the following setup before copying the generated command (CANN 9.1.0). CPU tuning requires host privileges.
+Run the following setup before copying the generated command (CANN 9.2.0). CPU tuning requires host privileges.
 
 ```bash Command
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
@@ -65,7 +65,7 @@ sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/cann-9.2.0/opp/vendors/customize/bin/set_env.bash
 SGLANG_ROOT=/path/to/sglang
 export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib:${LD_LIBRARY_PATH:-}"

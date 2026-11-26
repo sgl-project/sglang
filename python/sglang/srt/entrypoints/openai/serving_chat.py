@@ -644,6 +644,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 model_path=self.tokenizer_manager.model_path,
                 revision=get_model().revision,
                 default_chat_template_kwargs=get_serving().default_chat_template_kwargs,
+                inkling2_tool_call_author_name_mode=get_model().inkling2_tool_call_author_name_mode,
             )
         )
 
