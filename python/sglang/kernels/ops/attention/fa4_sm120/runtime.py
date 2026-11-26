@@ -1472,6 +1472,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
                 None,
                 None,
                 None,
+                Int32(min(actual_max_seqlen_q or q.shape[0], q.shape[0])),
             )
         return out, None
 
