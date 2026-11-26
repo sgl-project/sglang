@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from sglang.srt.disaggregation.mooncake import conn
 from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -19,7 +20,7 @@ class RoomStates(dict):
         return [self[room], self[room]]
 
 
-class TestMooncakeTransferDeviceFailure(unittest.TestCase):
+class TestMooncakeTransferDeviceFailure(CustomTestCase):
     @contextmanager
     def manager(self, set_device):
         # Keep the real threads, lazy executor initialization and polling. The
