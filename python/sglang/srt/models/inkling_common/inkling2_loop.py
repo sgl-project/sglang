@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.elementwise.inkling2_loop import message_controllers
+from sglang.srt.models.inkling_common.inkling2_arch import supports_fa4
 
 CONTROLLER_MODULES = ("attn", "k", "v", "mlp")
 _SIDE_ROWS = {"attn": slice(0, 3), "mlp": slice(3, 4)}
@@ -55,7 +56,12 @@ class LoopMessageBank:
         weights: tuple[torch.Tensor, ...],
         side: Literal["attn", "mlp"],
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+        if supports_fa4():
+            from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+        else:
+            from sglang.kernels.ops.attention.inkling2_attn_res_ref import (
+                attn_res_ref as attn_res,
+            )
 
         rows = _SIDE_ROWS[side]
         messages = attn_res(

@@ -39,6 +39,10 @@ from sglang.kernels.ops.gemm.inkling2_nvfp4 import (
 )
 from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 from sglang.kernels.ops.moe import inkling2_experts_sm120 as experts_sm120
+from sglang.kernels.ops.moe.inkling2_dequant import (
+    dequantize_mxfp8_experts,
+    dequantize_nvfp4_experts,
+)
 from sglang.kernels.ops.moe.inkling2_moe import (
     routed_partial,
     routed_rows,
@@ -546,6 +550,43 @@ class Inkling2Experts(nn.Module):
             )
         out = y[:tokens]
         return out if combine else RoutedOutput(out, None, 0)
+
+    def dequantize_experts_to_bf16(self) -> None:
+        """Expand quantized expert weights to the default dtype after loading.
+
+        Pre-Hopper GPUs (A100/SM80) have neither block-scaled MMA (SM90) nor
+        tcgen05 (SM100), so none of the routed expert kernels can run and the
+        generic BF16 grouped GEMM is the only option. Hopper/SM120 keep their
+        quantized (or Marlin) layouts and are left untouched.
+        """
+        if self.native_sm120 or self.use_marlin:
+            return
+        dtype = torch.get_default_dtype()
+        expanded_any = False
+        for name in ("w13", "w2"):
+            weight = getattr(self, name + "_weight")
+            if weight.dtype == torch.uint8:
+                expanded = dequantize_nvfp4_experts(
+                    weight.data,
+                    getattr(self, name + "_scale").data,
+                    getattr(self, name + "_amax"),
+                    getattr(self, name + "_outer_scale_denominator"),
+                    dtype,
+                )
+            elif weight.dtype == torch.float8_e4m3fn:
+                expanded = dequantize_mxfp8_experts(
+                    weight.data, getattr(self, name + "_scale").data, dtype
+                )
+            else:
+                continue
+            scale = getattr(self, name + "_scale")
+            weight.data = expanded
+            scale.data = scale.data.new_empty(0)
+            expanded_any = True
+        if expanded_any:
+            self._nvfp4_scale_shapes = {}
+            self._routed_kernels = None
+            self._lacks_routed_kernels = False
 
     def swizzle_nvfp4_scales(self):
         """Convert freshly loaded NVFP4 block scales to the GEMM layout once (on Hopper

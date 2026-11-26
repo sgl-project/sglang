@@ -661,6 +661,7 @@ class Inkling2ForConditionalGeneration(nn.Module):
     def post_load_weights(self) -> None:
         for module in self.modules():
             if isinstance(module, Inkling2Experts):
+                module.dequantize_experts_to_bf16()
                 module.swizzle_nvfp4_scales()
                 module.prepare_mxfp8_cutlass_scales()
                 module.prepare_mega_moe()
