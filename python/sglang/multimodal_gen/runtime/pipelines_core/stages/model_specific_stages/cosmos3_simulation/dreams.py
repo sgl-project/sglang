@@ -1348,6 +1348,7 @@ class _RolloutContext(msgspec.Struct):
     dtype: torch.dtype
     forward_batch: Req | None = None
     row_domain_ids: torch.Tensor | None = None
+    denoise_runner: Any = None
 
     def chunk_domain_ids(
         self, frame_start: int, frame_end: int, action_count: int
@@ -1433,6 +1434,31 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 batch.latents = self._rollout(batch)
         return batch
 
+    def _runner_for_batch(self, batch, device):
+        args = self.server_args
+        if (
+            not args.enable_breakable_cuda_graph
+            or not self.transformer.can_capture_denoise
+            or args.num_gpus != 1
+            or device.type != "cuda"
+            or args.should_start_component_on_cpu("transformer")
+            or args.dit_layerwise_offload
+            or batch.sampling_params.quality != "lossless"
+        ):
+            return None
+        if self.transformer.denoise_runner is None and batch.is_warmup:
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+                DiffusionBreakableCudaGraphRunner,
+            )
+
+            self.transformer.denoise_runner = DiffusionBreakableCudaGraphRunner(
+                self.transformer.denoise_blocks, device
+            )
+        return self.transformer.denoise_runner
+
+    def drop_breakable_cuda_graphs(self, reason: str) -> None:
+        self.transformer.release_cuda_graphs(reason)
+
     def _decode_queue(
         self, device: torch.device, *, quality: str = "exact"
     ) -> "CausalDecodeQueue | None":
@@ -1474,6 +1500,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             device=device,
             dtype=torch.bfloat16,
             forward_batch=batch,
+            denoise_runner=self._runner_for_batch(batch, device),
             row_domain_ids=None if row_domain_ids is None else row_domain_ids.to("cpu"),
         )
         rows: torch.Tensor | None = batch.extra[EXTRA_ACTION_ROWS]
@@ -1699,6 +1726,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             frame_start=frame_start,
             dtype=context.dtype,
             forward_batch=context.forward_batch,
+            denoise_runner=context.denoise_runner,
             text_kv=context.text_kv,
             fps=context.fps,
             action_latents=action,
