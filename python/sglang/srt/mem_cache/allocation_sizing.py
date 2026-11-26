@@ -36,7 +36,7 @@ def get_alloc_page_size() -> int:
     return get_schedule().page_size * get_parallel().attn_dcp_size
 
 
-def get_decode_reserve() -> int:
+def get_spec_decode_reserve() -> int:
     """KV length a speculative decode allocation runs ahead of kv_committed_len:
     twice one step's write, a double buffer for the overlap-mode commit lag.
 
@@ -44,7 +44,7 @@ def get_decode_reserve() -> int:
     draft-token bound after publish, and this runs per decode batch.
     """
     spec = get_spec()
-    return decode_reserve(
+    return spec_decode_reserve(
         speculative_algorithm=spec.speculative_algorithm,
         num_steps=spec.speculative_num_steps,
         eagle_topk=spec.speculative_eagle_topk,
@@ -53,7 +53,7 @@ def get_decode_reserve() -> int:
     )
 
 
-def decode_reserve(
+def spec_decode_reserve(
     *,
     speculative_algorithm: Optional[str],
     num_steps: Optional[int],
@@ -87,11 +87,11 @@ def decode_reserve(
     return 2 * write_len
 
 
-def decode_alloc_lens(reqs, *, page_size: int):
+def spec_decode_alloc_lens(reqs, *, page_size: int):
     """Whole-page speculative decode alloc lens: nxt rounds kv_committed_len +
-    get_decode_reserve() up to a page so allocated == recorded (unaligned tails
+    get_spec_decode_reserve() up to a page so allocated == recorded (unaligned tails
     leak at ps>1)."""
-    reserve = get_decode_reserve()
+    reserve = get_spec_decode_reserve()
     cur_kv_lens = [0] * len(reqs)
     nxt_kv_lens = [0] * len(reqs)
     num_needed_tokens = 0
@@ -107,9 +107,9 @@ def decode_alloc_lens(reqs, *, page_size: int):
     return cur_kv_lens, nxt_kv_lens, num_needed_tokens
 
 
-def get_decode_reach(page_size: int) -> int:
-    """Upper bound of nxt - kv_committed_len in decode_alloc_lens."""
-    return get_decode_reserve() + page_size - 1
+def get_spec_decode_reach(page_size: int) -> int:
+    """Upper bound of nxt - kv_committed_len in spec_decode_alloc_lens."""
+    return get_spec_decode_reserve() + page_size - 1
 
 
 @functools.cache
@@ -140,7 +140,7 @@ def add_spec_decode_headroom_pages(
     if pages == 0:
         return nxt_kv_lens, num_needed_tokens
     row_cap = batch.req_to_token_pool.req_to_token.shape[1] // page_size * page_size
-    reserve = get_decode_reserve()
+    reserve = get_spec_decode_reserve()
     lens = list(nxt_kv_lens)
     extra = 0
     for i, req in enumerate(batch.reqs):
@@ -191,7 +191,7 @@ def req_to_token_headroom(
 ) -> int:
     if speculative_algorithm is None:
         return 1
-    reserve = decode_reserve(
+    reserve = spec_decode_reserve(
         speculative_algorithm=speculative_algorithm,
         num_steps=num_steps,
         eagle_topk=eagle_topk,
@@ -199,3 +199,8 @@ def req_to_token_headroom(
         page_size=page_size,
     )
     return reserve + page_size - 1
+
+
+def get_req_to_token_row_width(context_len: int) -> int:
+    """The req_to_token row width for a model context of context_len."""
+    return context_len + get_req_to_token_headroom()

@@ -221,6 +221,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_amd_specifics,
         handle_cpu_backends,
         handle_hpu_backends,
+        handle_mlu_backends,
         handle_mps_backends,
         handle_nccl_pre_warm,
         handle_npu_backends,
@@ -240,6 +241,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # keys off enable_symm_mem.
     run_hook(handle_symm_mem_device_support, server_args)
 
+    run_hook(handle_mlu_backends, server_args)
     run_hook(handle_platform_defaults, server_args)
 
     from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
