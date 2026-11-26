@@ -54,8 +54,11 @@ def test_asm_sparse_mla_matches_triton(T):
         triton_sparse_mla_decode_splitk,
     )
 
-    if not asm_sparse_mla_dcp_available():
-        pytest.skip("aiter has no non-persistent fp8 gqa64 MLA kernel")
+    # Every gfx950 aiter since ROCm/aiter#6132 ships it; without it the owned
+    # route quietly runs Triton, so fail rather than skip.
+    assert asm_sparse_mla_dcp_available(), (
+        "aiter has no non-persistent fp8 gqa64 MLA kernel"
+    )
     torch.manual_seed(1)
     ctx, sm_scale = 60000, 0.1
     kv = (

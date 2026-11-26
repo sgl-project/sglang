@@ -7,7 +7,7 @@ a natural-log LSE. A row that owns no slot gets a zero output and a -inf LSE.
 
 import functools
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -23,8 +23,32 @@ ASM_ROPE_DIM = 64
 _ASM_KERNEL_ROW = f"fp8,fp8,{ASM_NUM_HEADS},0,1,0,1,0,0,"
 
 
-@functools.cache
-def asm_sparse_mla_dcp_available() -> bool:
+def _query_asm_kernel() -> Optional[bool]:
+    """Ask aiter's own MLA dispatch (ROCm/aiter#6107); None if it cannot answer."""
+    try:
+        from aiter.ops.attention import mla_decode_asm_query
+    except ImportError:
+        return None
+    try:
+        status, gqa, qseqlen, _ = mla_decode_asm_query(
+            "",  # the current device's arch
+            "fp8",
+            "fp8",
+            num_heads=ASM_NUM_HEADS,
+            nhead_kv=1,
+            max_seqlen_q=1,
+            persistent=False,
+            causal=True,
+            has_lse=False,
+            has_cprr=False,
+        )
+    except (RuntimeError, OSError):
+        return None
+    # A remap to another gqa or query length is another kernel and launch ABI.
+    return status == 0 and gqa == ASM_NUM_HEADS and qseqlen == 1
+
+
+def _csv_lists_asm_kernel() -> bool:
     try:
         from aiter.jit.core import get_asm_dir
 
@@ -32,6 +56,12 @@ def asm_sparse_mla_dcp_available() -> bool:
             return any(line.startswith(_ASM_KERNEL_ROW) for line in f)
     except (ImportError, OSError):
         return False
+
+
+@functools.cache
+def asm_sparse_mla_dcp_available() -> bool:
+    found = _query_asm_kernel()
+    return _csv_lists_asm_kernel() if found is None else found
 
 
 def is_asm_q8(q_nope: torch.Tensor, q_rope: torch.Tensor) -> bool:

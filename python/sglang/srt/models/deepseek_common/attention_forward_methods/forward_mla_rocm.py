@@ -80,6 +80,7 @@ from sglang.srt.utils import (
     cdiv,
     get_bool_env_var,
     get_device_core_count,
+    print_warning_once,
 )
 
 logger = logging.getLogger(__name__)
@@ -662,8 +663,13 @@ class DeepseekMLARocmForwardMixin:
                 and self.kv_lora_rank == ASM_KV_LORA_RANK
                 and self.qk_rope_head_dim == ASM_ROPE_DIM
                 and self.w_kc_qrep is not None
-                and asm_sparse_mla_dcp_available()
             )
+            if eligible and not asm_sparse_mla_dcp_available():
+                print_warning_once(
+                    "DCP owned sparse MLA: aiter has no non-persistent fp8 qh64 "
+                    "MLA asm kernel, so the owned route runs the Triton kernel."
+                )
+                eligible = False
             self._dcp_asm_mla_ok = eligible
         return eligible
 
