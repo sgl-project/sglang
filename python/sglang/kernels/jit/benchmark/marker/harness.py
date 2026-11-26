@@ -1,6 +1,7 @@
 import builtins
 import inspect
 import itertools
+from types import EllipsisType
 from typing import (
     Any,
     Callable,
@@ -10,6 +11,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Sequence,
     Tuple,
     TypeAlias,
     TypeVar,
@@ -50,7 +52,7 @@ class Benchmark(Generic[F]):
         line_vals: List[Any],
         *,
         unit: str,
-        gate: Optional[List[Any]],
+        gate: Sequence[Any] | EllipsisType,
         gate_reason: str,
         tolerance: Tolerance,
     ) -> None:
@@ -60,13 +62,13 @@ class Benchmark(Generic[F]):
             f"line_arg {line_arg!r} is not a parameter of {fn.__name__}; "
             f"available: {list(inspect.signature(fn).parameters)}"
         )
-        assert gate is None or all(g in line_vals for g in gate), (
-            f"gate {gate!r} must be a subset of line_vals {line_vals!r}"
+        if gate is ...:
+            gate = line_vals
+        assert isinstance(gate, (list, tuple)), (
+            f"gate must be a list of line_vals, `...` (every line) or [] (none); got {gate!r}"
         )
-        excluded = [v for v in line_vals if gate is not None and v not in gate]
-        assert bool(excluded) == bool(gate_reason), (
-            f"gate_reason must say why {excluded} are not gated, and be empty "
-            f"when every line is gated; got {gate_reason!r}"
+        assert all(g in line_vals for g in gate), (
+            f"gate {gate!r} must be a subset of line_vals {line_vals!r}"
         )
         check_canonical(line_vals)
         source_file = inspect.getsourcefile(fn)
@@ -76,9 +78,7 @@ class Benchmark(Generic[F]):
         self._line_arg = line_arg
         self._line_vals = line_vals
         self._unit = unit
-        self._gated_lines = frozenset(
-            str(v) for v in (line_vals if gate is None else gate)
-        )
+        self._gated_lines = frozenset(str(v) for v in gate)
         self._gate_reason = gate_reason
         self._tolerance = tolerance
         self._source_file = source_file
@@ -208,13 +208,15 @@ def benchmark(
     line_vals: List[Any],
     *,
     unit: str = "us",
-    gate: Optional[List[Any]] = None,
+    gate: Sequence[Any] | EllipsisType = ...,
     gate_reason: str = "",
     tolerance: Tolerance = Tolerance(),
 ):
-    """`gate`: the line_vals a perf-regression check compares (default all;
-    `[]` opts the benchmark out); `gate_reason` says why the other lines are not
-    gated. `tolerance`: the allowed slowdown of every case of this benchmark."""
+    """`gate`: the line_vals a perf-regression check compares; `...` (default) is
+    every line, `[]` none. List only this repo's own implementations when the
+    benchmark also has reference lines (torch, flashinfer, ...), which are then
+    only recorded. `gate_reason`: optional note. `tolerance`: the allowed
+    slowdown of every gated case of this benchmark."""
 
     def decorator(fn: F) -> Benchmark[F]:
         return Benchmark(

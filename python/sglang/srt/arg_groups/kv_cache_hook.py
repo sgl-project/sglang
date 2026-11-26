@@ -19,7 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.platform_kv_cache_dtype import (
     registered_kv_cache_storage_dtype,
 )
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
@@ -109,6 +109,12 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
         raise ValueError(
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
+        )
+    # SM120 kernels read the per-layer pools' interleaved scales; the unified
+    # pool stores them token-major.
+    if get_platform().is_sm120 and cfg.enable_unified_memory:
+        raise ValueError(
+            "--kv-cache-dtype mxfp8 on SM120 does not support --enable-unified-memory."
         )
 
 
@@ -779,7 +785,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         backends = set(attention_backends_of(resolved_view(server_args)))
         backends.discard(None)
         if not backends <= full_cg_backends:
-            _cg_cfg.prefill.backend = Backend.DISABLED
+            declare_resolution(
+                server_args,
+                "handle_unified_memory_pool",
+                cuda_graph_config=with_phase(
+                    _cg_cfg, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             logger.warning(
                 "--enable-unified-memory: disabling the FULL prefill "
                 "cuda-graph backend. It builds its block table in "
