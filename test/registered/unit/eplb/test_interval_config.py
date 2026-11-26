@@ -43,8 +43,7 @@ class TestIntervalConfig(unittest.TestCase):
             "modelslim",
             "--moe-a2a-backend",
             "deepep",
-            "--disaggregation-mode",
-            role,
+            *(("--disaggregation-mode", role) if role is not None else ()),
             *args,
         ]
         inputs = ServerArgs.from_cli_args(self.parser.parse_args(argv))
@@ -121,6 +120,32 @@ class TestIntervalConfig(unittest.TestCase):
                 "--expert-distribution-recorder-buffer-size",
                 "0",
             )
+
+    def test_colocated_interval_uses_one_neutral_starting_value(self):
+        for policy in ("auto", "recommend", "fixed"):
+            with self.subTest(policy=policy):
+                self.assertEqual(
+                    self.resolve(None, "--eplb-interval-policy", policy),
+                    (policy, 1000, 1000),
+                )
+        self.assertEqual(
+            self.resolve(
+                "null",
+                "--eplb-interval-policy",
+                "auto",
+                "--eplb-rebalance-num-iterations",
+                "25",
+                "--expert-distribution-recorder-buffer-size",
+                "50",
+            ),
+            ("auto", 25, 50),
+        )
+        self.assertEqual(
+            self.resolve(
+                None, "--eplb-interval-policy", "auto", "--enable-pd-role-switch"
+            ),
+            ("fixed", 1000, 1000),
+        )
 
     def test_admin_schema_wire_and_handler(self):
         request = TypeAdapter(SetInternalStateReq).validate_json(

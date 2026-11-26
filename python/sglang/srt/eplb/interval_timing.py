@@ -1,7 +1,7 @@
 """Bounded device-time samples for reversible interval trials."""
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite, lcm
 from random import Random
 from statistics import fmean
@@ -12,9 +12,29 @@ import torch.distributed as dist
 from sglang.srt.model_executor.forward_mode import ForwardMode
 
 MIN_TIMINGS = 32
+MIN_PHASE_TIMINGS = 20  # One full P95 rank per observed phase.
 MIN_SHAPE_TIMINGS = 8
 MIN_COVERAGE = 0.75
 MIN_ROUTING_OVERLAP = 0.75
+MIN_PHASE_OVERLAP = 0.75
+
+
+def _forward_phase(shapes):
+    """Classify one shared forward from the modes of its active ranks."""
+    phases = set()
+    for shape in shapes:
+        if shape is None:
+            return "unknown"
+        mode = ForwardMode(shape[0])
+        if mode == ForwardMode.IDLE:
+            continue
+        if mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            phases.add("decode")
+        elif mode == ForwardMode.EXTEND:
+            phases.add("prefill")
+        else:
+            phases.add(mode.name.lower())
+    return next(iter(phases)) if len(phases) == 1 else "mixed"
 
 
 @dataclass
@@ -23,6 +43,19 @@ class TimingWindow:
     incomplete: int = 0
     all_idle: int = 0
     missing_batch_metadata: int = 0
+    incomplete_by_phase: dict[str, int] = field(default_factory=dict)
+
+    def by_phase(self):
+        windows = {
+            phase: TimingWindow({}, incomplete=n)
+            for phase, n in self.incomplete_by_phase.items()
+        }
+        for shape, rows in self.samples.items():
+            phase = _forward_phase(shape)
+            if phase not in windows:
+                windows[phase] = TimingWindow({})
+            windows[phase].samples[shape] = rows
+        return windows
 
     @property
     def active_complete(self):
@@ -76,10 +109,24 @@ class IntervalTrial:
             self.sampled_routes = torch.zeros_like(row, dtype=torch.int64)
         self.sampled_routes.add_(row)
 
-    def decide(self, observed, check_tax, route_overlap):
+    def decide(self, observed, check_tax, route_overlap, *, colocated=False):
         keep, details = compare_trial(
             self.baseline, observed, self.baseline_tax, check_tax
         )
+        if colocated:
+            phases, phase_overlap = _compare_phase_tails(self.baseline, observed)
+            details["by_phase"] = phases
+            details["phase_mix_overlap"] = phase_overlap
+            outcomes = {phase["outcome"] for phase in phases.values()}
+            if (
+                details["outcome"] == "insufficient coverage"
+                or "insufficient coverage" in outcomes
+            ):
+                keep, details["outcome"] = False, "insufficient coverage"
+            elif phase_overlap < MIN_PHASE_OVERLAP:
+                keep, details["outcome"] = False, "phase mix changed"
+            elif "forward P95 regression" in outcomes:
+                keep, details["outcome"] = False, "forward P95 regression"
         details["routing_overlap"] = route_overlap
         if details["outcome"] != "insufficient coverage" and (
             route_overlap is None or route_overlap < MIN_ROUTING_OVERLAP
@@ -103,7 +150,8 @@ class RejectedTrial:
 
 
 class ForwardTimings:
-    def __init__(self):
+    def __init__(self, *, colocated=False):
+        self.colocated = colocated
         self.events = deque(maxlen=256)
         self.stride = 0
         self.block_end = 0
@@ -122,7 +170,7 @@ class ForwardTimings:
         return step == self.sample_step
 
     @staticmethod
-    def _batch_shape(batch):
+    def _batch_shape(batch, *, colocated=False):
         if not isinstance(batch.seq_lens_sum, int) or batch.input_ids is None:
             if batch.forward_mode == ForwardMode.IDLE:
                 return (int(ForwardMode.IDLE),)
@@ -151,13 +199,32 @@ class ForwardTimings:
                 query_tokens += q
                 visible_keys += q * p + q * (q + 1) // 2
             shape += (query_tokens, visible_keys // (128 * max(query_tokens, 1)))
+            if colocated and batch.forward_mode == ForwardMode.MIXED:
+                prefill = batch.mixed_prefill_reqs
+                if not isinstance(prefill, int) or not 0 <= prefill <= size:
+                    return None
+                shape += (prefill,)
         return shape
 
     def begin(self, step, batch):
         # Read host metadata before forward mutates batch sizes for padding.
-        shape = self._batch_shape(batch)
+        shape = self._batch_shape(batch, colocated=self.colocated)
+        mode = batch.forward_mode
+        if (
+            self.colocated
+            and mode == ForwardMode.EXTEND
+            and getattr(batch, "mixed_prefill_reqs", None) == 0
+        ):
+            # DP attention can run decode requests through the extend graph.
+            # Attribute their time to decode, but match the actual execution shape.
+            mode = ForwardMode.DECODE
+            if shape is not None:
+                shape = (int(mode), *shape)
         if shape is None:
-            self.events.append((step, None, None, None))
+            # The batch size or context may be missing while its mode is known.
+            if self.colocated:
+                shape = (int(mode),)
+            self.events.append((step, shape, None, None))
             return None
         module = torch.get_device_module()
         start = module.Event(enable_timing=True)
@@ -178,12 +245,13 @@ class ForwardTimings:
                 ms = start.elapsed_time(end)
                 if not isfinite(ms) or ms <= 0:
                     ms = None
-            local[step] = (shape, ms)
+            local[step] = (shape, ms, end is None)
         ranks = [None] * size if rank == 0 else None
         dist.gather_object(local, ranks, dst=0, group=group)
         if rank != 0:
             return None
         observations = defaultdict(list)
+        incomplete_by_phase = defaultdict(int)
         steps = set().union(*ranks)
         incomplete = 0
         idle = 0
@@ -195,22 +263,41 @@ class ForwardTimings:
                 continue
             if any(row is None or row[1] is None for row in samples):
                 incomplete += 1
-                if any(row is not None and row[0] is None for row in samples):
+                if any(row is not None and row[2] for row in samples):
                     missing_metadata += 1
+                if self.colocated:
+                    phase = _forward_phase(row[0] if row else None for row in samples)
+                    incomplete_by_phase[phase] += 1
                 continue
-            shapes = tuple(shape for shape, _ in samples)
-            observations[shapes].append(max(ms for _, ms in samples))
-        return TimingWindow(dict(observations), incomplete, idle, missing_metadata)
+            shapes = tuple(row[0] for row in samples)
+            observations[shapes].append(max(row[1] for row in samples))
+        return TimingWindow(
+            dict(observations),
+            incomplete,
+            idle,
+            missing_metadata,
+            dict(incomplete_by_phase),
+        )
 
 
-def baseline_hold_reason(baseline, rejected_mix, route_overlap=None):
+def _has_baseline_samples(baseline, minimum):
     covered = sum(
         len(rows)
         for rows in baseline.samples.values()
         if len(rows) >= MIN_SHAPE_TIMINGS
     )
-    if covered < max(MIN_TIMINGS, MIN_COVERAGE * baseline.eligible):
+    return covered >= max(minimum, MIN_COVERAGE * baseline.eligible)
+
+
+def baseline_hold_reason(
+    baseline, rejected_mix, route_overlap=None, *, colocated=False
+):
+    if not _has_baseline_samples(baseline, MIN_TIMINGS):
         return "waiting for comparable baseline device samples"
+    if colocated:
+        for phase, window in sorted(baseline.by_phase().items()):
+            if not _has_baseline_samples(window, MIN_PHASE_TIMINGS):
+                return f"waiting for comparable {phase} baseline samples"
     if rejected_mix:
         overlap = sum(
             min(weight, rejected_mix.get(shape, 0))
@@ -246,7 +333,7 @@ def _baseline_quantiles(groups):
     return (at((size + 1) // 2) + at(size // 2 + 1)) / 2, at(size - size // 20)
 
 
-def compare_trial(baseline, trial, baseline_tax, trial_tax):
+def compare_trial(baseline, trial, baseline_tax, trial_tax, *, minimum=MIN_TIMINGS):
     """Compare matched forward distributions at the trial's batch-shape mix."""
     total = trial.active_complete
     baseline_total = baseline.active_complete
@@ -284,7 +371,7 @@ def compare_trial(baseline, trial, baseline_tax, trial_tax):
         "trial_timing_coverage": trial.coverage(matched),
     }
     if (
-        min(matched, baseline_matched) < MIN_TIMINGS
+        min(matched, baseline_matched) < minimum
         or matched < trial.eligible * MIN_COVERAGE
         or baseline_matched < baseline.eligible * MIN_COVERAGE
     ):
@@ -316,3 +403,35 @@ def compare_trial(baseline, trial, baseline_tax, trial_tax):
             None if worst_common_tail_ratio is None else worst_common_tail_ratio - 1
         ),
     }
+
+
+def _compare_phase_tails(baseline, observed):
+    before, after = baseline.by_phase(), observed.by_phase()
+    empty = TimingWindow({})
+    phases = {}
+    baseline_total, observed_total = baseline.eligible, observed.eligible
+    overlap = 0.0
+    for name in sorted(before.keys() | after.keys()):
+        # Reuse the same shape matching and P95 guards as the pooled decision.
+        # The amortized gain is required across the worker as a whole.
+        reference, trial = before.get(name, empty), after.get(name, empty)
+        if baseline_total and observed_total:
+            overlap += min(
+                reference.eligible / baseline_total,
+                trial.eligible / observed_total,
+            )
+        _, metrics = compare_trial(reference, trial, 0, 0, minimum=MIN_PHASE_TIMINGS)
+        outcome = metrics["outcome"]
+        phases[name] = {
+            "outcome": outcome
+            if outcome in ("insufficient coverage", "forward P95 regression")
+            else "passed",
+            "baseline_timing_coverage": metrics["baseline_timing_coverage"],
+            "trial_timing_coverage": metrics["trial_timing_coverage"],
+            "baseline_forward_p95_ms": metrics.get("baseline_forward_p95_ms"),
+            "trial_forward_p95_ms": metrics.get("trial_forward_p95_ms"),
+            "worst_common_shape_p95_change": metrics.get(
+                "worst_common_shape_p95_change"
+            ),
+        }
+    return phases, overlap

@@ -337,7 +337,80 @@ class TestIntervalReplay(unittest.TestCase):
         self.assertLess(details["normal_forward_p95_change"], 0)
 
 
-def make_endpoint(rank, policy="recommend", interval=4):
+class TestColocatedTrial(unittest.TestCase):
+    prefill = ((ForwardMode.EXTEND,), (ForwardMode.IDLE,))
+    decode = ((ForwardMode.TARGET_VERIFY,), (ForwardMode.DECODE,))
+    mixed = ((ForwardMode.MIXED,), (ForwardMode.IDLE,))
+
+    def decide(self, before, after):
+        trial = IntervalTrial(4, TimingWindow(before), 0, 1, 0, torch.ones(1))
+        return trial.decide(TimingWindow(after), 0, 1.0, colocated=True)
+
+    def test_minority_prefill_tail_can_veto_faster_decode(self):
+        before = {self.decode: [10.0] * 220, self.prefill: [1.0] * 20}
+        after = {self.decode: [5.0] * 220, self.prefill: [2.0] * 20}
+        keep, result = self.decide(before, after)
+        self.assertFalse(keep)
+        self.assertLess(result["normal_forward_p95_change"], 0)
+        self.assertEqual(
+            result["by_phase"]["prefill"]["outcome"], "forward P95 regression"
+        )
+        self.assertEqual(result["by_phase"]["decode"]["outcome"], "passed")
+        self.assertEqual(result["outcome"], "forward P95 regression")
+
+    def test_mixed_shape_matches_scheduler_request_split(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.MIXED,
+            seq_lens_sum=256,
+            input_ids=torch.empty(4),
+            batch_size=4,
+            extend_seq_lens_cpu=[1] * 4,
+            extend_prefix_lens_cpu=[63] * 4,
+            mixed_prefill_reqs=1,
+        )
+        shape = ForwardTimings._batch_shape(batch, colocated=True)
+        batch.mixed_prefill_reqs = 3
+        other = ForwardTimings._batch_shape(batch, colocated=True)
+        self.assertNotEqual(shape, other)
+        keep, result = self.decide({(shape,): [5.0] * 48}, {(other,): [1.0] * 48})
+        self.assertFalse(keep)
+        self.assertEqual(
+            result["by_phase"]["mixed"]["outcome"], "insufficient coverage"
+        )
+        batch.mixed_prefill_reqs = None
+        self.assertIsNone(ForwardTimings._batch_shape(batch, colocated=True))
+
+    def test_workload_shift_or_missing_phase_restores_interval(self):
+        before = {self.prefill: [5.0] * 20, self.decode: [5.0] * 80}
+        keep, result = self.decide(
+            before, {self.prefill: [3.0] * 70, self.decode: [3.0] * 30}
+        )
+        self.assertFalse(keep)
+        self.assertAlmostEqual(result["phase_mix_overlap"], 0.5)
+        self.assertEqual(result["outcome"], "phase mix changed")
+        keep, result = self.decide(before, {self.decode: [3.0] * 100})
+        self.assertFalse(keep)
+        self.assertEqual(
+            result["by_phase"]["prefill"]["outcome"], "insufficient coverage"
+        )
+
+    def test_mixed_batches_and_cross_rank_mixes_are_one_measured_forward(self):
+        heterogeneous = ((ForwardMode.EXTEND,), (ForwardMode.DECODE,))
+        before = {self.mixed: [6.0] * 16, heterogeneous: [4.0] * 16}
+        keep, result = self.decide(
+            before, {self.mixed: [5.0] * 16, heterogeneous: [3.0] * 16}
+        )
+        self.assertTrue(keep)
+        self.assertEqual(list(result["by_phase"]), ["mixed"])
+        self.assertEqual(
+            result["by_phase"]["mixed"]["trial_timing_coverage"]["active_complete"], 32
+        )
+        keep, result = self.decide({self.decode: [2.0] * 40}, {self.decode: [1.0] * 40})
+        self.assertTrue(keep)
+        self.assertEqual(list(result["by_phase"]), ["decode"])
+
+
+def make_endpoint(rank, policy="recommend", interval=4, role="decode"):
     moe = SimpleNamespace(
         eplb_interval_policy=policy,
         eplb_rebalance_num_iterations=interval,
@@ -354,7 +427,7 @@ def make_endpoint(rank, policy="recommend", interval=4):
         patch.object(
             control,
             "get_disagg",
-            return_value=SimpleNamespace(disaggregation_mode="decode"),
+            return_value=SimpleNamespace(disaggregation_mode=role),
         ),
         patch.object(control, "get_parallel", return_value=parallel),
         patch.object(
@@ -496,6 +569,44 @@ def check_timing_coverage(rank):
             "incomplete": 16,
             "missing_batch_metadata": 16,
         }
+
+
+def check_colocated_incomplete_samples(rank):
+    endpoint = make_endpoint(rank, policy="auto", role="null")
+    timings = endpoint.timings
+    start = SimpleNamespace(elapsed_time=lambda end: 2.0)
+    end = SimpleNamespace(query=lambda: True)
+    for step in range(80):
+        mode = ForwardMode.DECODE if step < 60 else ForwardMode.EXTEND
+        timings.events.append((step, (mode,), start, end))
+    for step in range(80, 90):
+        if rank == 0:
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND, seq_lens_sum=None, input_ids=None
+            )
+            assert timings.begin(step, batch) is None
+        else:
+            timings.events.append((step, (ForwardMode.IDLE,), start, end))
+    timings.events.append((90, (ForwardMode.IDLE,), start, end))
+    decode_as_extend = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        mixed_prefill_reqs=0,
+        seq_lens_sum=None,
+        input_ids=None,
+    )
+    assert timings.begin(91, decode_as_extend) is None
+    window = timings.collect(endpoint.group, rank, 2)
+    if rank == 0:
+        assert window.incomplete_by_phase == {"prefill": 10, "decode": 1}
+        assert window.missing_batch_metadata == 11 and window.all_idle == 1
+        assert baseline_hold_reason(window, None) is None
+        assert "prefill" in baseline_hold_reason(window, None, colocated=True)
+        baseline = TimingWindow(window.samples)
+        trial = IntervalTrial(4, baseline, 0, 1, 0, torch.ones(1))
+        keep, details = trial.decide(window, 0, 1.0, colocated=True)
+        assert not keep and details["outcome"] == "insufficient coverage"
+        coverage = details["by_phase"]["prefill"]["trial_timing_coverage"]
+        assert coverage["incomplete"] == 10 and coverage["matched_fraction"] == 20 / 30
 
 
 def check_trial_decisions_and_retries(rank):
@@ -695,7 +806,9 @@ def check_endpoint(rank, rendezvous):
         check_global_replay_scores(rank)
         check_live_pins(rank)
         check_rolling_replay(rank)
+        check_rolling_replay(rank, role="null")
         check_timing_coverage(rank)
+        check_colocated_incomplete_samples(rank)
         check_trial_decisions_and_retries(rank)
         check_recorder_interruptions(rank)
         check_operator_override(rank)
@@ -703,11 +816,11 @@ def check_endpoint(rank, rendezvous):
         dist.destroy_process_group()
 
 
-def check_rolling_replay(rank):
+def check_rolling_replay(rank, role="decode"):
     from sglang.srt.eplb import expert_location
     from sglang.srt.eplb.expert_distribution import _CircularBuffer
 
-    endpoint = make_endpoint(rank)
+    endpoint = make_endpoint(rank, role=role)
     table = SimpleNamespace(
         physical_to_logical_map_cpu=torch.tensor([[0, 1, 2, 3]]),
         logical_to_rank_dispatch_physical_map=torch.arange(4).reshape(1, 4),
@@ -867,7 +980,12 @@ def check_rolling_replay(rank):
                 endpoint.timings.events.append(
                     (
                         endpoint.step,
-                        ("decode", rank + 1),
+                        (
+                            ForwardMode.DECODE
+                            if endpoint.step % 2
+                            else ForwardMode.EXTEND,
+                            rank + 1,
+                        ),
                         SimpleNamespace(elapsed_time=lambda end, ms=ms: ms),
                         SimpleNamespace(query=lambda: True),
                     )
@@ -877,6 +995,9 @@ def check_rolling_replay(rank):
                 break
         assert endpoint.interval == 16 and endpoint.trial is None
         assert endpoint.evidence["device_trial"]["matched_samples"] >= 32
+        if role == "null":
+            assert endpoint.status()["role"] == "colocated"
+            assert set(endpoint.last_trial["by_phase"]) == {"prefill", "decode"}
 
 
 class TestIntervalConsensus(unittest.TestCase):

@@ -862,11 +862,8 @@ def handle_eplb_and_dispatch(server_args: Any):
 
 
 def _interval_replay_fallback(cfg):
-    if (
-        cfg.disaggregation_mode not in ("prefill", "decode")
-        or cfg.enable_pd_role_switch
-    ):
-        return "requires a dedicated prefill or decode worker"
+    if cfg.enable_pd_role_switch:
+        return "does not support switching PD roles at runtime"
     if cfg.device != "npu":
         return f"unsupported device {cfg.device}"
     if (
@@ -940,7 +937,8 @@ def _resolve_eplb_interval(server_args: Any):
     if interval is None:
         interval = 1000
         if (
-            cfg.ep_size == cfg.attn_dp_size == 16
+            cfg.disaggregation_mode in ("prefill", "decode")
+            and cfg.ep_size == cfg.attn_dp_size == 16
             and cfg.ep_num_redundant_experts == 16
             and cfg.quantization == "modelslim"
         ):

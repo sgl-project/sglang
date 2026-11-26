@@ -21,6 +21,7 @@ from sglang.srt.eplb.interval_policy import (
     routing_overlap,
 )
 from sglang.srt.eplb.interval_timing import (
+    MIN_PHASE_TIMINGS,
     MIN_TIMINGS,
     ForwardTimings,
     IntervalTrial,
@@ -45,7 +46,10 @@ class IntervalController:
     def __init__(self, model_config):
         moe = get_exec().moe
         self.policy = moe.eplb_interval_policy
-        self.role = get_disagg().disaggregation_mode
+        mode = get_disagg().disaggregation_mode
+        self.role = "colocated" if mode == "null" else mode
+        # Allow a short interval to collect prefill, decode and mixed forwards.
+        self.minimum_forwards = 3 * MIN_PHASE_TIMINGS if mode == "null" else MIN_TIMINGS
         self.interval = self.anchor_interval = moe.eplb_rebalance_num_iterations
         self.window = moe.expert_distribution_recorder_buffer_size
         self.control_period = min(self.window, 32)
@@ -80,7 +84,7 @@ class IntervalController:
         self.last_trial = None
         self.rejected_trial = None
         self.missed_plans = 0
-        self.timings = ForwardTimings()
+        self.timings = ForwardTimings(colocated=self.role == "colocated")
         self.recommended = None
         self.reason = "waiting for representative traffic"
         self.evidence = {}
@@ -310,7 +314,9 @@ class IntervalController:
         decision = [None]
         if self.rank == 0:
             decision[0] = (
-                baseline_hold_reason(baseline, previous_mix, overlap),
+                baseline_hold_reason(
+                    baseline, previous_mix, overlap, colocated=self.role == "colocated"
+                ),
                 baseline.coverage(),
                 overlap,
             )
@@ -381,7 +387,7 @@ class IntervalController:
             self.ep_size,
             min(2**31 - 1, self.anchor_interval * 4),
             coordinator=self.rank == 0,
-            min_timed_forwards=MIN_TIMINGS if self.policy == "auto" else 0,
+            min_timed_forwards=self.minimum_forwards if self.policy == "auto" else 0,
         )
         if self.policy == "auto":
             # Baseline timings and check costs must describe the traffic
@@ -400,7 +406,9 @@ class IntervalController:
             )
             return
         trial.check_ms += self.last_check_ms
-        if periods < max(4, (MIN_TIMINGS + self.interval - 1) // self.interval):
+        if periods < max(
+            4, (self.minimum_forwards + self.interval - 1) // self.interval
+        ):
             return
 
         observed = self.timings.collect(self.group, self.rank, self.ep_size)
@@ -414,7 +422,9 @@ class IntervalController:
         check_tax = trial.check_ms / (periods * self.interval)
         decision = [None]
         if self.rank == 0:
-            decision[0] = trial.decide(observed, check_tax, overlap)
+            decision[0] = trial.decide(
+                observed, check_tax, overlap, colocated=self.role == "colocated"
+            )
         dist.broadcast_object_list(decision, src=0, group=self.group)
         keep, details = decision[0]
         self.last_trial = {

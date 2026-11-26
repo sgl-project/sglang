@@ -222,20 +222,23 @@ class TestForwardBatchInitialization(CustomTestCase):
             extend_num_tokens=num_tokens,
             extend_logprob_start_lens=[0] * batch_size,
         )
-        with (
-            get_context().override_server_args(device="cpu"),
-            patch(
-                "sglang.srt.model_executor.forward_batch_info.is_mlu",
-                return_value=True,
-            ),
-        ):
-            forward = ForwardBatch.init_new(
-                batch,
-                runner,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                return_hidden_states_before_norm=False,
-            )
-        self.assertEqual(forward.mixed_prefill_reqs, num_prefill)
+        for is_npu in (False, True):
+            with (
+                self.subTest(is_npu=is_npu),
+                get_context().override_server_args(device="cpu"),
+                patch("sglang.srt.model_executor.forward_batch_info._is_npu", is_npu),
+                patch(
+                    "sglang.srt.model_executor.forward_batch_info.is_mlu",
+                    return_value=not is_npu,
+                ),
+            ):
+                forward = ForwardBatch.init_new(
+                    batch,
+                    runner,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    return_hidden_states_before_norm=False,
+                )
+                self.assertEqual(forward.mixed_prefill_reqs, num_prefill)
 
 
 class TestForwardBatchPrefillCompletion(unittest.TestCase):
