@@ -48,7 +48,7 @@ def make_conv_bundle(device, page_size=1, lazy=True, state_slots=40):
         swa_max_total_num_tokens=64,
         max_mamba_cache_size=state_slots,
         model_context_len=64,
-        extra_max_context_len=0,
+        req_to_token_headroom=0,
         max_num_reqs=4,
         enable_memory_saver=False,
         enable_mamba_extra_buffer=False,
