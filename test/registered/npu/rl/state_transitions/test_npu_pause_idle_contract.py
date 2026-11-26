@@ -1,15 +1,13 @@
 """NPU: ``pause()`` must leave the device idle, so the unmap cannot land under it.
 
 ``TorchMemorySaverAdapter.pause()`` hands the region to the memory saver, whose
-``aclrtUnmapMem`` does not wait for the device. The busy work below is queued
-*outside* the paused region on purpose: what this case asserts is the contract
-("pause returns only once the device is idle"), and a missing drain then shows up
-as a stream that is still busy rather than as a silent corruption.
+``aclrtUnmapMem`` does not wait for the device. This case asserts the contract
+behind that: once ``pause()`` returns, the device is idle.
 
-If the drain is missing the device usually reports an aicore exception (507015)
-while the work is being torn down; that error is surfaced as context on the
-assertion message instead of replacing it, so a failing run still reads as
-"pause() returned with work still queued".
+Nothing is allocated inside the region — the matmuls write through a preallocated
+``out`` — so a missing drain cannot fault on unmapped pages. It only leaves the
+stream busy, which is what the assertion reports, and a failing run therefore
+does not put the device into an error state for the tests that follow.
 """
 
 import time
@@ -22,6 +20,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=120, suite="extra-b-test-1-npu-a3")
+register_npu_ci(est_time=120, suite="nightly-test-1-npu-a3", nightly=True)
 
 TAG = "pause_idle"
 MATMUL = 4096
@@ -30,11 +29,25 @@ MATMUL = 4096
 ITERATIONS = 256
 
 
+def _saver_available():
+    # create(enable=True) raises when the package is missing, so availability has
+    # to be decided before the adapter is built.
+    try:
+        import torch_memory_saver  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_SAVER_OK = _saver_available()
+
+
+@unittest.skipUnless(_SAVER_OK, "requires torch_memory_saver")
 class TestPauseLeavesIdleDevice(CustomTestCase):
     def test_pause_waits_for_queued_work(self):
         adapter = TorchMemorySaverAdapter.create(enable=True)
         if not adapter.enabled:
-            self.skipTest("torch_memory_saver is not enabled; nothing would unmap")
+            self.skipTest("torch_memory_saver is enabled but not active")
 
         device_module = torch.get_device_module()
         stream = device_module.current_stream()
@@ -42,10 +55,11 @@ class TestPauseLeavesIdleDevice(CustomTestCase):
 
         left = torch.randn(MATMUL, MATMUL, dtype=torch.float16, device="npu")
         right = torch.randn(MATMUL, MATMUL, dtype=torch.float16, device="npu")
+        out = torch.empty(MATMUL, MATMUL, dtype=torch.float16, device="npu")
         try:
             with adapter.region(TAG, enable_cpu_backup=False):
                 for _ in range(ITERATIONS):
-                    left = left @ right
+                    torch.matmul(left, right, out=out)
                 self.assertFalse(
                     stream.query(),
                     "the queued work drained before pause(); raise ITERATIONS",
@@ -54,24 +68,19 @@ class TestPauseLeavesIdleDevice(CustomTestCase):
                 adapter.pause(TAG)
                 elapsed_ms = (time.time() - start) * 1000
                 idle = stream.query()
-                print(f"\n[pause_idle] pause() {elapsed_ms:.1f} ms, idle={idle}", flush=True)
-                if not idle:
-                    drain_error = None
-                    try:
-                        device_module.synchronize()
-                    except RuntimeError as exc:
-                        drain_error = exc
-                    self.fail(
-                        f"pause() returned after {elapsed_ms:.1f} ms with work still "
-                        "queued -- the unmap raced the in-flight kernels instead of "
-                        f"draining the device (drain raised: {drain_error})"
-                    )
+                print(
+                    f"\n[pause_idle] pause() {elapsed_ms:.1f} ms, idle={idle}",
+                    flush=True,
+                )
+                self.assertTrue(
+                    idle,
+                    f"pause() returned after {elapsed_ms:.1f} ms with work still "
+                    "queued -- it did not drain the device before handing the "
+                    "region to the memory saver",
+                )
                 adapter.resume(TAG)
         finally:
-            try:
-                device_module.synchronize()
-            except RuntimeError:
-                pass
+            device_module.synchronize()
 
 
 if __name__ == "__main__":
