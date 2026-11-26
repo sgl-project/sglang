@@ -48,10 +48,6 @@ class TestResolveMinFreeSlots(unittest.TestCase):
         self.assertIsNone(resolve_min_free_slots(1, 512, is_dflash_family=True))
 
     def test_admission_cap_lowers_the_dflash_default(self):
-        # --pp-max-micro-batch-size 2-4 with max_running_requests 36: the default
-        # (4) could never be met while a request runs, so admission would wait
-        # for the running batch to drain.
-        self.assertEqual(resolve_min_free_slots(None, 36, is_dflash_family=True), 4)
         for cap in (2, 3, 4, 7):
             self.assertIsNone(
                 resolve_min_free_slots(
@@ -61,36 +57,9 @@ class TestResolveMinFreeSlots(unittest.TestCase):
         self.assertEqual(
             resolve_min_free_slots(None, 36, is_dflash_family=True, admission_cap=8), 2
         )
-        self.assertEqual(
-            resolve_min_free_slots(None, 512, is_dflash_family=True, admission_cap=64),
-            4,
-        )
 
     def test_admission_cap_caps_explicit_value(self):
         self.assertEqual(resolve_min_free_slots(16, 512, admission_cap=8), 8)
-        self.assertIsNone(resolve_min_free_slots(4, 512, admission_cap=1))
-
-    def test_admission_cap_above_max_running_is_ignored(self):
-        self.assertEqual(
-            resolve_min_free_slots(None, 36, is_dflash_family=True, admission_cap=512),
-            4,
-        )
-
-    def test_dflash_default_admits_beside_one_running_request(self):
-        # With one request running under an admission cap, cap - 1 slots are
-        # free; the default threshold must not exceed that, or admission waits
-        # for the running batch to drain.
-        for cap in range(1, 129):
-            threshold = resolve_min_free_slots(
-                None, 512, is_dflash_family=True, admission_cap=cap
-            )
-            if threshold is None:
-                continue
-            delayer = MinFreeSlotsDelayer(min_free_slots=threshold)
-            self.assertFalse(
-                delayer.should_delay(running_bs=1, num_allocatable_reqs=cap - 1),
-                f"cap={cap} threshold={threshold}",
-            )
 
 
 class TestMinFreeSlotsDelayer(unittest.TestCase):

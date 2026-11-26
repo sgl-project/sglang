@@ -1302,6 +1302,7 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        # Must precede resolve_min_free_slots, which sizes its threshold to it.
         if not get_parallel().pp_max_micro_batch_size:
             get_context().override(
                 "scheduler.pp_max_micro_batch_size_default",
@@ -1316,8 +1317,6 @@ class Scheduler(
             get_schedule().min_free_slots_delay,
             self.max_running_requests,
             is_dflash_family=self.spec_algorithm.is_dflash_family(),
-            # pp_max_micro_batch_size caps admission below max_running_requests
-            # (get_num_allocatable_reqs); size the threshold to it.
             admission_cap=get_parallel().pp_max_micro_batch_size,
         )
         if min_free_slots is not None:
