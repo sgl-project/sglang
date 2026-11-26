@@ -183,6 +183,28 @@ class TestInitializeFp4GemmConfig(CustomTestCase):
                     self._initialize(backend, is_hip=False)
 
 
+class TestQuarkMxfp4Gfx1250Fallback(CustomTestCase):
+    def test_bf16_fallback_checks_the_layer_device(self):
+        # gfx1250 at index 0, gfx950 at index 1: only the gfx1250 device
+        # dequantizes to bf16; a gfx950 layer keeps its MXFP4 weights.
+        archs = {0: "gfx1250", 1: "gfx950:sramecc+:xnack-"}
+        with (
+            mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
+            mock.patch.object(
+                quark_w4a4_mxfp4.torch.cuda,
+                "get_device_properties",
+                side_effect=lambda d: SimpleNamespace(gcnArchName=archs[d.index]),
+            ),
+        ):
+            self.assertTrue(
+                quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cuda", 0))
+            )
+            self.assertFalse(
+                quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cuda", 1))
+            )
+        self.assertFalse(quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cpu")))
+
+
 class TestQuarkMxfp4BackendSelection(CustomTestCase):
     def setUp(self):
         saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND

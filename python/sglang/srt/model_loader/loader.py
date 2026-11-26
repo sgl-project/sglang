@@ -105,7 +105,7 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.device import is_cuda_alike
+from sglang.srt.utils.device import is_cuda_alike, is_hip
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -1909,15 +1909,38 @@ class PreshardedModelLoader(DefaultModelLoader):
             shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
                 target_device or torch.device(current_platform.device_type)
             )
-        from sglang.srt.layers.quantization.fp4_utils import (
-            get_fp4_gemm_runner_backend,
-        )
+        if is_hip() and model_config.quantization in ("quark", "quark_mxfp4"):
+            from sglang.srt.layers.quantization.fp4_utils import (
+                get_fp4_gemm_runner_backend,
+            )
 
-        # --fp4-gemm-backend aiter preshuffles Quark MXFP4 weights and scales
-        # for gemm_a4w4; a cache dumped in the Triton layout must not be reused.
-        if get_fp4_gemm_runner_backend().is_aiter():
-            shard_config["fp4_gemm_runner_backend"] = "aiter"
+            # The AITER FP4 GEMM stores Quark MXFP4 weights and scales
+            # preshuffled, the Triton GEMM row-major. Key both layouts explicitly
+            # (so caches from before this key existed are rebuilt) and gather
+            # them over the group, since ranks on different GPU architectures
+            # can resolve different layouts but must share one cache directory.
+            local_layout = (
+                "aiter" if get_fp4_gemm_runner_backend().is_aiter() else "triton"
+            )
+            shard_config["rocm_fp4_gemm_layout"] = self._rank_invariant_value(
+                local_layout
+            )
         return shard_config
+
+    @staticmethod
+    def _rank_invariant_value(local: str) -> str:
+        """One value for the whole world group: ``local`` if every rank agrees,
+        else the per-rank values in rank order."""
+        from sglang.srt.runtime_context import get_parallel
+
+        try:
+            group = get_parallel().world_group
+            if group.world_size <= 1:
+                return local
+            values = group.all_gather_object(local)
+        except (AssertionError, AttributeError, RuntimeError):
+            return local
+        return local if len(set(values)) == 1 else ",".join(values)
 
     @staticmethod
     def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:

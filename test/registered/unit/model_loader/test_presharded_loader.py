@@ -874,58 +874,92 @@ class TestShardConfig(unittest.TestCase):
         self.assertTrue(cfg["enable_fp32_lm_head"])
         self.assertEqual(cfg["init_expert_location"], "trivial")
 
-    def test_aiter_fp4_layout_keys_the_cache(self):
-        # --fp4-gemm-backend aiter stores Quark MXFP4 weights and scales
-        # preshuffled; reusing a Triton-layout cache would feed gemm_a4w4 the
-        # wrong bytes, so the key must differ (and stay unchanged otherwise).
+    def _rocm_fp4_shard_config(self, backend, quantization="quark", is_hip=True):
         from sglang.srt.layers.quantization import fp4_utils
-        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 
         loader = object.__new__(PreshardedModelLoader)
-        model_config = SimpleNamespace(quantization="quark", dtype=torch.bfloat16)
+        model_config = SimpleNamespace(quantization=quantization, dtype=torch.bfloat16)
         saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
         self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
+        fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
         override = get_context().override_server_args(
             tp_size=1, pp_size=1, moe_dp_size=1, moe_dense_tp_size=1
         )
         override.install()
         self.addCleanup(override.restore)
-        configs = {}
-        for backend in (Fp4GemmRunnerBackend.TRITON, Fp4GemmRunnerBackend.AITER):
-            fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
-            with (
-                get_parallel().override(
-                    tp_size=1, pp_size=1, moe_dp_size=1, moe_ep_size=1, moe_tp_size=1
-                ),
-                mock.patch(
-                    "sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1
-                ),
-                mock.patch(
-                    "sglang.srt.model_loader.loader.get_exec",
-                    return_value=SimpleNamespace(
-                        features=SimpleNamespace(enable_fp32_lm_head=False),
-                        moe=SimpleNamespace(
-                            ep_num_redundant_experts=0,
-                            enable_eplb=False,
-                            init_expert_location="trivial",
-                        ),
+        with (
+            get_parallel().override(
+                tp_size=1, pp_size=1, moe_dp_size=1, moe_ep_size=1, moe_tp_size=1
+            ),
+            mock.patch(
+                "sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader.get_exec",
+                return_value=SimpleNamespace(
+                    features=SimpleNamespace(enable_fp32_lm_head=False),
+                    moe=SimpleNamespace(
+                        ep_num_redundant_experts=0,
+                        enable_eplb=False,
+                        init_expert_location="trivial",
                     ),
                 ),
-                mock.patch.object(
-                    loader, "_compute_structural_signature", return_value="sig16"
-                ),
-            ):
-                configs[backend] = loader._collect_shard_config(model_config)
-        self.assertNotIn(
-            "fp4_gemm_runner_backend", configs[Fp4GemmRunnerBackend.TRITON]
+            ),
+            mock.patch("sglang.srt.model_loader.loader.is_hip", return_value=is_hip),
+            mock.patch.object(
+                loader, "_compute_structural_signature", return_value="sig16"
+            ),
+        ):
+            return loader, loader._collect_shard_config(model_config)
+
+    def test_rocm_fp4_layout_keys_the_cache(self):
+        # The AITER FP4 GEMM stores Quark MXFP4 weights preshuffled. Both
+        # layouts get an explicit key, so a Triton launch never reuses an AITER
+        # cache, or an unmarked cache written before this key existed.
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        loader, triton = self._rocm_fp4_shard_config(Fp4GemmRunnerBackend.TRITON)
+        _, aiter = self._rocm_fp4_shard_config(Fp4GemmRunnerBackend.AITER)
+        self.assertEqual(triton["rocm_fp4_gemm_layout"], "triton")
+        self.assertEqual(aiter["rocm_fp4_gemm_layout"], "aiter")
+        unmarked = {k: v for k, v in triton.items() if k != "rocm_fp4_gemm_layout"}
+        names = {loader._build_subfolder_name(c) for c in (triton, aiter, unmarked)}
+        self.assertEqual(len(names), 3)
+
+    def test_rocm_fp4_layout_only_keys_rocm_quark(self):
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        for quantization, is_hip in (("fp8", True), ("quark", False)):
+            with self.subTest(quantization=quantization, is_hip=is_hip):
+                _, cfg = self._rocm_fp4_shard_config(
+                    Fp4GemmRunnerBackend.TRITON, quantization, is_hip
+                )
+                self.assertNotIn("rocm_fp4_gemm_layout", cfg)
+
+    def test_rank_invariant_value_is_shared_by_mixed_ranks(self):
+        # Ranks on different architectures can resolve different layouts; all
+        # of them must land in one presharded directory.
+        group = SimpleNamespace(
+            world_size=2, all_gather_object=lambda local: ["aiter", "triton"]
         )
-        self.assertEqual(
-            configs[Fp4GemmRunnerBackend.AITER]["fp4_gemm_runner_backend"], "aiter"
+        with mock.patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=SimpleNamespace(world_group=group),
+        ):
+            for local in ("aiter", "triton"):
+                self.assertEqual(
+                    PreshardedModelLoader._rank_invariant_value(local), "aiter,triton"
+                )
+        same = SimpleNamespace(
+            world_size=2, all_gather_object=lambda local: [local] * 2
         )
-        self.assertNotEqual(
-            loader._build_subfolder_name(configs[Fp4GemmRunnerBackend.TRITON]),
-            loader._build_subfolder_name(configs[Fp4GemmRunnerBackend.AITER]),
-        )
+        with mock.patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=SimpleNamespace(world_group=same),
+        ):
+            self.assertEqual(
+                PreshardedModelLoader._rank_invariant_value("aiter"), "aiter"
+            )
 
     def test_enumerated_fields_change_subfolder_hash(self):
         # Each enumerated content/shape knob must feed the subfolder name.

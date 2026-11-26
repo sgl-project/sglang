@@ -26,7 +26,7 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import direct_register_custom_op
-from sglang.srt.utils.device import is_gfx95_supported, is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx95_supported
 
 NVFP4_BLOCK_SIZE = 16
 
@@ -101,8 +101,12 @@ def _asm_fp4_prequantized_input(
 # plain nn.Linear on this arch, so the (few) MXFP4-quantized linear layers
 # dequantize their FP4 weights to bf16 once at load and run a plain bf16 GEMM.
 # This trades a little memory for correctness on hardware that cannot execute
-# the fp4 kernel at all.
-_dequant_linear_to_bf16 = is_gfx1250_supported()
+# the fp4 kernel at all. Checked per device: a node can mix architectures.
+def _dequant_linear_to_bf16(device: torch.device) -> bool:
+    if not _is_hip or device.type != "cuda":
+        return False
+    return "gfx1250" in torch.cuda.get_device_properties(device).gcnArchName
+
 
 # MXFP4 (OCP MX FP4 / e2m1) decode table, indexed by the 4-bit code.
 _MXFP4_VALUES = [
@@ -403,7 +407,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             assert layer.weight.dtype == torch.uint8
             assert layer.weight_scale.dtype == torch.uint8
 
-        if _dequant_linear_to_bf16:
+        if _dequant_linear_to_bf16(layer.weight.device):
             w_bf16 = _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
             layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)
             # FP4 block scales are folded into the bf16 weight; drop them.
