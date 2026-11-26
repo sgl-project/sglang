@@ -205,12 +205,15 @@ class _GPTQCheckpointMixin:
 
     def _expert_module_state(self, name: str, *, stacked: bool) -> Optional[str]:
         # None: the checkpoint does not carry this tensor name, so it says nothing.
+        manifest = getattr(self, "_checkpoint_tensor_manifest", None)
+        if manifest is not None:
+            state = manifest.classify_module(name)
+            if state is None:
+                return None
+            return "dense" if get_dynamic_override(self, layer_name=name) is False else state
         if get_dynamic_override(self, layer_name=name) is False:
             return "dense"
-        manifest = getattr(self, "_checkpoint_tensor_manifest", None)
-        if manifest is None:
-            return None if stacked else "quantized"
-        return manifest.classify_module(name)
+        return None if stacked else "quantized"
 
     def is_fused_moe_unquantized(self, prefix: str, num_experts: int = 1) -> bool:
         # Exclusion rules and manifests name each expert's projections

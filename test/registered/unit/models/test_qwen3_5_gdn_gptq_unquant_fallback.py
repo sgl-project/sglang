@@ -1450,6 +1450,30 @@ class TestQwen35GptqMoeUnquantFallback(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "mixed dense and quantized"):
                     self._moe(cfg, prefix)
 
+    def test_exclusion_cannot_make_a_tensor_the_checkpoint_lacks_dense(self):
+        prefix = "model.layers.0.mlp.experts"
+        per_expert = [
+            f"{prefix}.{e}.{p}.qweight"
+            for e in range(2)
+            for p in ("gate_proj", "up_proj", "down_proj")
+        ]
+        stacked = [f"{prefix}.gate_up_proj.qweight", f"{prefix}.down_proj.qweight"]
+        for layout, tensors, rule in (
+            ("per_expert", per_expert, r"-:.*experts\.(gate_up|down)_proj.*"),
+            ("stacked", stacked, r"-:.*experts\.\d+\..*"),
+        ):
+            for name, make_cfg in (
+                ("marlin", _make_gptq_marlin_config),
+                ("moe_wna16", self._moe_wna16_gptq),
+            ):
+                with self.subTest(config=name, layout=layout):
+                    cfg = make_cfg({rule: {}})
+                    cfg.set_checkpoint_tensor_names(tensors)
+                    self.assertIsInstance(
+                        self._moe(cfg, prefix).quant_method,
+                        (GPTQMarlinMoEMethod, MoeWNA16Method),
+                    )
+
     def test_stacked_expert_tensors_decide_the_layout(self):
         prefix = "model.layers.0.mlp.experts"
         for name, make_cfg in (
