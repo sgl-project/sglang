@@ -220,5 +220,56 @@ def test_rejects_a_moe_buf_it_cannot_zero():
         _route_sort(scores, bias, m, 32, 0, E, moe_buf=moe_buf)
 
 
+@pytest.mark.parametrize("ep_size, ep_rank", [(1, 0), (4, 1)])
+@pytest.mark.parametrize("m", [1, 12, 64])
+def test_aiter_accepts_the_registered_sort(monkeypatch, ep_size, ep_rank, m):
+    """AITER drops a registered sort whose aux lacks a key it matches on, logs
+    it once and sorts again, so a missing key only shows up as a lost speedup.
+    The aux also has to hold the tensors it is matched on by address."""
+    try:
+        from aiter.presorted_moe import match_plain_presorted_moe
+    except ImportError:
+        pytest.skip("AITER without the plain-layout presort (ROCm/aiter#8045)")
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.moe import glm_aiter_presort
+
+    registrations = []
+    monkeypatch.setattr(glm_aiter_presort, "_registrar", lambda: registrations.append)
+    monkeypatch.setattr(
+        glm_aiter_presort,
+        "get_parallel",
+        lambda: SimpleNamespace(moe_ep_size=ep_size, moe_ep_rank=ep_rank),
+    )
+    scores, bias = _inputs(m, torch.float32, seed=m)
+    hidden = torch.empty((m, MODEL_DIM), dtype=torch.bfloat16, device="cuda")
+    w, ids = glm_aiter_presort.route_and_register(
+        hidden, scores, bias, SCALING, SHARED_WEIGHT, True, None
+    )
+    (aux,) = registrations
+    output = glm_aiter_presort.take_zeroed_output(
+        hidden.shape, hidden.dtype, hidden.device
+    )
+    assert aux["topk_ids"] is ids and aux["topk_weights"] is w
+    assert aux["moe_buf"] is output
+    assert aux["moe_buf_ptr"] == output.data_ptr()
+
+    num_routed = E // ep_size
+    mask = _expert_mask(ep_rank * num_routed, num_routed)
+    assert (
+        match_plain_presorted_moe(
+            aux,
+            ids,
+            w,
+            block_m=aux["block_m"],
+            num_experts=E + 1,
+            topk=TOPK,
+            expert_mask=mask,
+            output=output,
+        )
+        is aux
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

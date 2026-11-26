@@ -120,6 +120,11 @@ def route_and_register(
     _registrar()(
         {
             "layout": "plain",
+            # AITER matches on these addresses; holding the tensors keeps a
+            # later same-size allocation from reusing them while registered.
+            "topk_ids": ids,
+            "topk_weights": weights,
+            "moe_buf": moe_out,
             "topk_ids_ptr": ids.data_ptr(),
             "topk_weights_ptr": weights.data_ptr(),
             "M": M,
