@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     NetworkTransferWaiter,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_flags,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -934,19 +935,6 @@ class SchedulerDisaggregationPrefillMixin:
             )
         return enabled
 
-    def _is_transfer_wait_polling_enabled(self: Scheduler) -> bool:
-        """Check support once on entry to the prefill overlap loop."""
-        if not envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.get():
-            return False
-        enabled = self._supports_result_wait_polling()
-        if not enabled:
-            logger.warning(
-                "Polling KV transfers while a forward result is pending requires "
-                "attention CP=1 and non-speculative autoregressive generation; "
-                "finished transfers retire between forwards."
-            )
-        return enabled
-
     def _is_hicache_wait_polling_enabled(self: Scheduler) -> bool:
         """Check support once on entry to the prefill overlap loop."""
         if not envs.SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING.get():
@@ -985,7 +973,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_continuous_input_polling = (
             self._is_continuous_input_polling_enabled()
         )
-        poll_transfers_while_waiting = self._is_transfer_wait_polling_enabled()
         poll_hicache_while_waiting = self._is_hicache_wait_polling_enabled()
         self.result_queue = deque()
         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
@@ -1085,10 +1072,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if (
                     self.enable_continuous_input_polling
                     or pump_hicache
-                    or (
-                        poll_transfers_while_waiting
-                        and self.disagg_prefill_transfer_queue
-                    )
+                    or self.disagg_prefill_transfer_queue
                 ):
                     oldest_batch_result = self.result_queue[0][1]
                     if (
@@ -1098,8 +1082,7 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     ):
                         waiting_for_batch_result = True
-                        if poll_transfers_while_waiting:
-                            self.process_disagg_prefill_transfer_queue()
+                        self.process_disagg_prefill_transfer_queue()
                         if war_barrier_pending:
                             self._apply_war_barrier()
                             war_barrier_pending = False
@@ -1153,6 +1136,13 @@ class SchedulerDisaggregationPrefillMixin:
                 group=self.dp_tp_cpu_group,
             )
             state = batch_result_completion_status.item()
+        parallel = get_parallel()
+        if parallel.attn_dp_enabled and parallel.attn_cp_size > 1:
+            # The wait's transfer poll also reduces over attention-CP peers, which
+            # sit outside dp_tp_group under attention DP: they leave on one pass too.
+            (state,) = all_reduce_flags(
+                [state], self.attn_cp_cpu_group, torch.distributed.ReduceOp.MIN
+            )
         if state == 0:
             # Every rank must submit delayed sampling before entering this wait.
             raise RuntimeError("Prefill result copy must be submitted before polling")
