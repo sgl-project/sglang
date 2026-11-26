@@ -7,7 +7,6 @@ from functools import partial
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -156,16 +155,27 @@ class NativeMTPBridge:
         self.hidden_by_req = torch.empty(size, self.width, dtype=dtype, device=device)
         self.anchor_by_req = torch.full((size,), -1, dtype=torch.int64, device=device)
         self.token_by_req = torch.full_like(self.anchor_by_req, -1)
+        self.fused_t1_state = (
+            self.controller.two_graphs
+            and os.getenv("SGLANG_DMTP_FUSED_T1_STATE", "0") == "1"
+        )
         if self.controller.two_graphs:
-            k = self.controller.mtp_tail.top_k
-            self.proposal_buffers = (
-                torch.empty(size, 1, dtype=torch.int64, device=device),
-                torch.empty(size, 1, k, dtype=torch.int64, device=device),
-                torch.empty(size, 1, k, dtype=torch.float32, device=device),
-                torch.empty(size, 8, self.width, dtype=dtype, device=device),
-            )
-            self.proposal_temperatures = torch.empty(size, device=device)
-            self.proposal_greedy = torch.empty(size, dtype=torch.bool, device=device)
+            if self.fused_t1_state:
+                from sglang.srt.speculative.dmtp_qsa_state import PrefetchedT1State
+
+                self.proposal_state = PrefetchedT1State(size)
+            else:
+                k = self.controller.mtp_tail.top_k
+                self.proposal_buffers = (
+                    torch.empty(size, 1, dtype=torch.int64, device=device),
+                    torch.empty(size, 1, k, dtype=torch.int64, device=device),
+                    torch.empty(size, 1, k, dtype=torch.float32, device=device),
+                    torch.empty(size, 8, self.width, dtype=dtype, device=device),
+                )
+                self.proposal_temperatures = torch.empty(size, device=device)
+                self.proposal_greedy = torch.empty(
+                    size, dtype=torch.bool, device=device
+                )
             self.proposal_valid = torch.zeros(size, dtype=torch.bool, device=device)
         self.verified_batches = set()
         self.graph_audit_count = 0
@@ -208,12 +218,31 @@ class NativeMTPBridge:
         if self.controller.two_graphs:
             self.proposal_valid.index_fill_(0, reqs.long(), False)
 
-    def seed_proposal(self, reqs, result):
+    def seed_proposal(self, reqs, result, anchors=None, tokens=None):
         indices = reqs.long()
         bs = indices.numel()
+        tail = self.controller.mtp_tail
+        if getattr(self, "fused_t1_state", False):
+            # Explicit values avoid gathers on every commit; prefill can read
+            # the state just initialized by seed(). The bank owns its copies.
+            if anchors is None:
+                anchors = self.anchor_by_req.index_select(0, indices)
+            if tokens is None:
+                tokens = self.token_by_req.index_select(0, indices)
+            self.proposal_state.save(
+                indices,
+                (
+                    *result,
+                    tail.temperatures[:bs],
+                    tail.greedy_mask[:bs],
+                    anchors.long(),
+                    tokens.long(),
+                ),
+            )
+            self.proposal_valid.index_fill_(0, indices, True)
+            return
         for buffer, value in zip(self.proposal_buffers, result):
             buffer.index_copy_(0, indices, value)
-        tail = self.controller.mtp_tail
         self.proposal_temperatures.index_copy_(0, indices, tail.temperatures[:bs])
         self.proposal_greedy.index_copy_(0, indices, tail.greedy_mask[:bs])
         self.proposal_valid.index_fill_(0, indices, True)
@@ -223,14 +252,16 @@ class NativeMTPBridge:
         c.graph_used = {}
         c.req_indices = batch.req_pool_indices.long().clone()
         self.prefix = batch.seq_lens.long().clone()
-        expected = self.anchor_by_req.index_select(0, c.req_indices)
-        tokens = self.token_by_req.index_select(0, c.req_indices)
-        torch._assert_async(
-            ((expected == self.prefix) & (tokens == block_ids[:, 0])).all(),
-            "MTP GPU request/anchor/cache state is not aligned",
-        )
+        fused = getattr(self, "fused_t1_state", False)
+        if not fused:
+            expected = self.anchor_by_req.index_select(0, c.req_indices)
+            tokens = self.token_by_req.index_select(0, c.req_indices)
+            torch._assert_async(
+                ((expected == self.prefix) & (tokens == block_ids[:, 0])).all(),
+                "MTP GPU request/anchor/cache state is not aligned",
+            )
         c.sampling = c.validate_sampling(batch)
-        c.hidden = self.hidden_by_req.index_select(0, c.req_indices)
+        c.hidden = None if fused else self.hidden_by_req.index_select(0, c.req_indices)
         if c.two_graphs:
             from sglang.srt.speculative.dspark_components.dspark_draft import (
                 resolve_greedy_mask,
@@ -249,22 +280,35 @@ class NativeMTPBridge:
                 sampling_info=c.selector_sampling,
                 device=c.req_indices.device,
             )
-            valid = (
-                self.proposal_valid.index_select(0, c.req_indices).all()
-                & (
-                    self.proposal_temperatures.index_select(0, c.req_indices)
-                    == temperature
-                ).all()
-                & (self.proposal_greedy.index_select(0, c.req_indices) == greedy).all()
-            )
-            torch._assert_async(
-                valid, "DMTP prefetched T1 is stale or sampling parameters changed"
-            )
-            tokens, ids, q, c.prepared_embeds = (
-                buffer.index_select(0, c.req_indices)
-                for buffer in self.proposal_buffers
-            )
-            block_ids[:, 1].copy_(tokens[:, 0])
+            if fused:
+                tokens, ids, q, c.prepared_embeds = self.proposal_state.load_checked(
+                    c.req_indices,
+                    batch.req_pool_indices,
+                    self.prefix,
+                    block_ids,
+                    temperature,
+                    greedy,
+                    self.proposal_valid,
+                )
+            else:
+                valid = (
+                    self.proposal_valid.index_select(0, c.req_indices).all()
+                    & (
+                        self.proposal_temperatures.index_select(0, c.req_indices)
+                        == temperature
+                    ).all()
+                    & (
+                        self.proposal_greedy.index_select(0, c.req_indices) == greedy
+                    ).all()
+                )
+                torch._assert_async(
+                    valid, "DMTP prefetched T1 is stale or sampling parameters changed"
+                )
+                tokens, ids, q, c.prepared_embeds = (
+                    buffer.index_select(0, c.req_indices)
+                    for buffer in self.proposal_buffers
+                )
+                block_ids[:, 1].copy_(tokens[:, 0])
             c.t1_sparse = (ids, q)
             c.graph_used.update(t1_head=True, conditioner=True, t1_combined=True)
         else:
@@ -354,7 +398,7 @@ class NativeMTPBridge:
                 if c.graph_used["mtp_append"]
                 else c.mtp_tail.forward(updated)
             )
-            self.seed_proposal(c.req_indices, proposal)
+            self.seed_proposal(c.req_indices, proposal, next_positions, bonus)
         c.final_hidden = None
 
     def _check(self, batch, result, counts):
@@ -399,8 +443,9 @@ class NativeMTPBridge:
         before_hidden = result.clone()
         before_k, before_v = keys[slots].clone(), values[slots].clone()
         runner = self.native.worker.model_runner
-        with scoped_config(**mtp_config(self.owner)), forward_context(
-            ForwardContext(attn_backend=self.backend)
+        with (
+            scoped_config(**mtp_config(self.owner)),
+            forward_context(ForwardContext(attn_backend=self.backend)),
         ):
             self.backend.init_forward_metadata_out_graph(
                 reference_batch, in_capture=True
