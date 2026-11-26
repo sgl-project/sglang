@@ -97,7 +97,6 @@ struct CompletionRequest {
     custom_logit_processor: Option<String>,
     watermark: Option<WatermarkRequestConfig>,
     images_config: Option<ImagesConfig>,
-    data_parallel_rank: Option<i64>,
     rid: Option<OneOrList<String>>,
     extra_key: Option<OneOrList<String>>,
     cache_salt: Option<OneOrList<String>>,
@@ -162,9 +161,6 @@ pub fn lower_completion(
     }
     if let Some(schema) = format_json_schema(request.response_format.as_ref(), false)? {
         request.json_schema = Some(schema);
-    }
-    if request.routed_dp_rank.is_none() {
-        request.routed_dp_rank = request.data_parallel_rank;
     }
 
     let echo_prompts = if request.echo {

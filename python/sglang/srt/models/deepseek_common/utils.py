@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 import logging
-import math
 from typing import Optional
 
 import torch
@@ -23,7 +22,6 @@ from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     get_device_sm,
     get_hip_version,
     is_cpu,
@@ -44,16 +42,16 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 _is_sail = is_sail()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
-# gfx1250 reuses the gfx95 (CDNA4) code paths for MXFP4 q/k-norm kernels, but its
-# aiter rope kernels (ck_tile) do not build, so it runs sglang's native rope which
-# lacks the separate cos_cache/sin_cache buffers the gfx95 fused-rope decode path
-# expects. This flag lets gfx1250 carve out of that fused-rope path.
+# gfx1250 reuses the gfx95 (CDNA4) code paths for MXFP4 q/k-norm kernels, but it
+# runs sglang's rope modules, which lack the separate cos_cache/sin_cache buffers
+# the gfx95 fused-rope decode path expects. This flag lets gfx1250 carve out of
+# that fused-rope path.
 _is_gfx1250_supported = is_gfx1250_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
@@ -68,7 +66,6 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
     "fa4",
     "dsa",
-    "nsa",  # Deprecated alias for "dsa"
     "flashinfer",
     "trtllm_mla",
     "cutedsl_mla",
@@ -106,7 +103,7 @@ def awq_dequantize_func():
         - None if the current device is not supported.
     """
     if _is_cuda:
-        from sglang.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
         from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 
         return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
@@ -216,12 +213,6 @@ def quant_blocks_shared_experts_fusion(
     """
     can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
     return can_fuse_fn is not None and not can_fuse_fn()
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 def _get_llama_4_scaling(
