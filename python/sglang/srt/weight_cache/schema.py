@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import msgspec
 
@@ -27,6 +27,10 @@ class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
     model_arch: str
     hf_config_hash: str  # effective HF config after model overrides, without paths
     dtype: str
+    # "draft" for a speculative-decoding draft model. It can have its target's
+    # checkpoint and config and still load other weights, for example from
+    # another weight file format of the same checkpoint.
+    role: Literal["target", "draft"]
     draft_model_idx: Optional[int]  # layer selected from a multi-layer draft checkpoint
 
     # Quantization config. Equal on every rank.
@@ -72,6 +76,9 @@ class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
     def __post_init__(self):
         if not self.checkpoint_id:
             raise ValueError("A load spec requires a checkpoint ID")
+        # Direct construction and structs.replace skip msgspec's Literal check.
+        if self.role not in ("target", "draft"):
+            raise ValueError(f"Unknown model role {self.role!r}")
 
     def digest(self, *, include_rank: bool = True) -> str:
         """Identify this rank's shard, or without the rank what all ranks share."""
