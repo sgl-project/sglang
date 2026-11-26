@@ -451,6 +451,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             == "minimax_m3_vl"
         )
+        self.is_gigachat4 = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gigachat4"
+        )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
@@ -2072,13 +2077,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
         else:
-            # The M3 template renders tool results by position, not by tool_call_id.
+            # These templates pair tool results by position.
+            sort_text_runs = self.is_minimax_m3 or self.is_gigachat4
             if (
                 self.template_manager.jinja_template_may_reorder_tool_results
-                or self.is_minimax_m3
+                or sort_text_runs
             ):
                 messages = self._canonicalize_tool_message_order(
-                    messages, sort_text_runs=self.is_minimax_m3
+                    messages, sort_text_runs=sort_text_runs
                 )
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:
@@ -2094,9 +2100,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     modalities,
                 )
 
-                processed_msg["content"] = normalize_tool_content(
-                    processed_msg["role"], processed_msg.get("content")
-                )
+                if not self.is_gigachat4:
+                    processed_msg["content"] = normalize_tool_content(
+                        processed_msg["role"], processed_msg.get("content")
+                    )
 
                 openai_compatible_messages.append(processed_msg)
 
@@ -3453,6 +3460,8 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
         elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
+        elif self.reasoning_parser == "gigachat4" and request.separate_reasoning:
+            request.skip_special_tokens = False
 
     def supports_native_reasoning_history(self) -> bool:
         """Whether the chat encoder or template takes history as ``reasoning_content``
@@ -3498,7 +3507,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return config.toggle_param
 
         mode = self._reasoning_default_mode()
-        if mode in ("thinking", "enable_thinking"):
+        if mode in ("thinking", "enable_thinking", "reasoning"):
             return mode
         if mode in ("explicit_thinking", "explicit_enable_thinking"):
             return mode.replace("explicit_", "")
@@ -3648,7 +3657,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.reasoning_effort is not None
                     and request.reasoning_effort != "none"
                 )
-            if mode in ("thinking", "enable_thinking"):
+            if mode in ("thinking", "enable_thinking", "reasoning"):
                 return (
                     not request.chat_template_kwargs
                     or request.chat_template_kwargs.get(mode) is not False
