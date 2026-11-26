@@ -15,6 +15,8 @@ from sglang.kernels.ops.speculative.dflash import (
     _prepare_dflash_draft_block_unchecked,
     _prepare_dflash_mamba_commit,
     compute_dflash_correct_drafts_and_bonus,
+    dflash_chain_accept_indices,
+    dflash_commit_block,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
@@ -276,16 +278,6 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     return out_tokens, accept_len.to(torch.int32) + 1
 
 
-def _chain_accept_indices(commit_lens: torch.Tensor, block_size: int) -> torch.Tensor:
-    """[bs, block_size] flat offsets into the verify out_cache_loc of each
-    committed chain position, -1 past the commit length (EAGLE accept_index
-    layout at topk 1)."""
-    steps = torch.arange(block_size, device=commit_lens.device)
-    row_offsets = torch.arange(commit_lens.numel(), device=commit_lens.device)
-    flat = row_offsets[:, None] * block_size + steps
-    return torch.where(steps < commit_lens[:, None], flat, -1)
-
-
 def _resolve_dflash_embedding_module(draft_model, target_model):
     if getattr(draft_model, "is_nemotron_35_draft", False):
         embed_module = draft_model.get_input_embeddings()
@@ -302,6 +294,8 @@ def _is_all_greedy(sampling_info) -> bool:
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
+    # Row 0 is the anchor, unless shift_label: then row i drafts token i + 1.
+    pred_hidden = pred_hidden[:, :-1] if draft_model.shift_label else pred_hidden[:, 1:]
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
     candidate_ids, unary_logits = draft_model.compute_candidates(
@@ -409,7 +403,7 @@ class _SelectorDraftSampler:
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
-        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
+        hs = hidden_states.view(bs, self.block_size, -1)
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
@@ -1884,13 +1878,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH selector draft returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
-        num_pred = pred_hidden.shape[1]
+        num_pred = int(self.block_size) - 1
 
         candidate_ids, scores = _selector_lattice(
-            draft_model, pred_hidden, anchor_token_ids
+            draft_model, draft_hidden, anchor_token_ids
         )
-        device = pred_hidden.device
+        device = draft_hidden.device
         # Clamped like DSpark so greedy rows don't divide by zero.
         temperatures = (
             torch.ones(bs, dtype=torch.float32, device=device)
@@ -2816,6 +2809,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         """With cutoff_verify_lens, request i accepts at most
         cutoff_verify_lens[i] - 1 drafts and takes its bonus from the last row
         it verified; cap_trim_lens counts the accepted drafts the cutoff cut."""
+        out_tokens = None
         new_seq_lens = None
         cap_trim_lens = None
         # A resolved argmax (vocab-sharded verify) means the accept is greedy.
@@ -2833,7 +2827,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, cap_trim_lens)
-            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif target_predict is None and (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
@@ -2849,7 +2842,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
-            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
             if target_predict is None:
                 target_predict = torch.argmax(next_token_logits, dim=-1)
@@ -2863,7 +2855,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     verify_num_draft_tokens=int(self.block_size),
                     cutoff_verify_lens=cutoff_verify_lens,
                 )
-                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
             elif self._use_triton_accept_bonus:
                 try:
                     (
@@ -2893,17 +2884,31 @@ class DFlashWorkerV2(BaseSpecWorker):
                         candidates=candidates,
                         target_predict=target_predict,
                     )
-                    out_tokens, commit_lens = _commit_accept(
-                        candidates, accept_len, bonus
-                    )
+                    # The buffers may be unwritten; the eager commit below rebuilds.
+                    out_tokens = new_seq_lens = None
             else:
                 accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                     candidates=candidates,
                     target_predict=target_predict,
                 )
+        if out_tokens is None:
+            if self._use_triton_accept_bonus:
+                _, commit_lens, _, out_tokens, new_seq_lens = (
+                    self._next_accept_bonus_buffers(bs)
+                )
+                dflash_commit_block(
+                    candidates=candidates,
+                    num_correct_drafts=accept_len,
+                    bonus_tokens=bonus,
+                    prefix_lens=prefix_lens,
+                    out_tokens=out_tokens,
+                    num_accept_tokens_out=commit_lens,
+                    new_seq_lens_out=new_seq_lens,
+                )
+            else:
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         if SIMULATE_ACC_LEN > 0:
-            # new_seq_lens, if the Triton accept wrote it, holds the real
+            # new_seq_lens, if a Triton kernel wrote it, holds the real
             # accept; it comes back rewritten from the forced lengths, or None.
             new_seq_lens = apply_dflash_simulated_acceptance(
                 candidates=candidates,
@@ -3681,8 +3686,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.hisparse_coordinator is not None:
             batch.hisparse_coordinator.commit_spec_accept_tokens(
                 batch=batch,
-                accept_indices=_chain_accept_indices(
-                    commit_lens=commit_lens, block_size=block_size
+                accept_indices=dflash_chain_accept_indices(
+                    num_accept_tokens=commit_lens, block_size=block_size
                 ),
             )
 
