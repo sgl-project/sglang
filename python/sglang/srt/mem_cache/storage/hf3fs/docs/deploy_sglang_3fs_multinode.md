@@ -17,6 +17,8 @@ vim /sgl-workspace/sglang/benchmark/hf3fs/hf3fs_config.json
 }
 ```
 
+If you split one tensor-parallel group across Pods on the same host and mount the host's `/dev/shm` for USRBIO, see [Message queue broadcaster across Pods](https://docs.sglang.io/docs/references/environment_variables#message-queue-broadcaster-across-pods).
+
 ## node1
 ```bash
 export SGLANG_HICACHE_HF3FS_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hf3fs/hf3fs_config.json
