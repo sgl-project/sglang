@@ -54,6 +54,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_quant_config,
     inspect_safetensors_tensor_names,
 )
+from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration,
@@ -1312,6 +1313,88 @@ class TestQwen35GptqMoeUnquantFallback(CustomTestCase):
                 )
                 torch.testing.assert_close(
                     params["w2_weight"][0], torch.full((256, 256), 3.0)
+                )
+
+    @staticmethod
+    def _gate_qweight_shard():
+        # GPTQ checkpoint layout: (hidden // 8 packed int4 per int32, intermediate)
+        return torch.full((32, 256), 7, dtype=torch.int32)
+
+    def _assert_qwen3_loader_fills_qweight(self, moe, load_weights, name):
+        params = dict(moe.named_parameters())
+        self.assertIn("w13_qweight", params)
+        self.assertNotIn("w13_weight", params)
+        qweight = params["w13_qweight"]
+        qweight.zero_()
+        module = _make_dummy_loader_module(moe, prefix="model.layers.0.mlp.experts")
+        module.config.num_experts = 2
+        with get_parallel().override(tp_group=SimpleNamespace(device=qweight.device)):
+            load_weights(module, [(name, self._gate_qweight_shard())])
+        self.assertTrue(bool((qweight != 0).any()))
+
+    def test_dynamic_rule_matching_only_the_bare_experts_prefix_keeps_them_quantized(
+        self,
+    ):
+        dynamic = {r"-:^(?!.*\.experts\.).*": {}}
+        for name, cfg, quantized_cls in (
+            ("marlin", _make_gptq_marlin_config(dynamic=dynamic), GPTQMarlinMoEMethod),
+            ("moe_wna16", self._moe_wna16_gptq(dynamic), MoeWNA16Method),
+        ):
+            with self.subTest(config=name):
+                moe = self._moe(cfg, "model.layers.0.mlp.experts")
+                self.assertIsInstance(moe.quant_method, quantized_cls)
+                self._assert_qwen3_loader_fills_qweight(
+                    moe,
+                    Qwen3NextForCausalLM.load_weights,
+                    "model.layers.0.mlp.experts.0.gate_proj.qweight",
+                )
+
+    def test_dynamic_rule_excluding_expert_projections_builds_dense_experts(self):
+        dynamic = {r"-:.*\.experts\..*": {}}
+        for name, cfg in (
+            ("marlin", _make_gptq_marlin_config(dynamic=dynamic)),
+            ("moe_wna16", self._moe_wna16_gptq(dynamic)),
+        ):
+            with self.subTest(config=name):
+                moe = self._moe(cfg, "model.layers.0.mlp.experts")
+                self.assertIsInstance(moe.quant_method, UnquantizedFusedMoEMethod)
+
+    def _qwen3_next_mtp_experts(self, cfg, is_nextn):
+        config = Qwen3NextConfig(
+            hidden_size=256,
+            moe_intermediate_size=256,
+            num_experts=2,
+            num_experts_per_tok=1,
+            shared_expert_intermediate_size=0,
+        )
+        block = Qwen2MoeSparseMoeBlock(
+            layer_id=0,
+            config=config,
+            quant_config=cfg,
+            prefix="model.layers.0.mlp",
+            is_nextn=is_nextn,
+        )
+        return block.experts
+
+    def test_qwen3_next_draft_follows_the_mtp_checkpoint_prefix(self):
+        dynamic = {r"-:model\.layers\.0\..*": {}}
+        for name, cfg in (
+            ("marlin", _make_gptq_marlin_config(dynamic=dynamic)),
+            ("moe_wna16", self._moe_wna16_gptq(dynamic)),
+        ):
+            with self.subTest(config=name):
+                target = self._qwen3_next_mtp_experts(cfg, is_nextn=False)
+                self.assertIsInstance(target.quant_method, UnquantizedFusedMoEMethod)
+                draft = self._qwen3_next_mtp_experts(cfg, is_nextn=True)
+                self.assertIsInstance(
+                    draft.quant_method, (GPTQMarlinMoEMethod, MoeWNA16Method)
+                )
+                self._assert_qwen3_loader_fills_qweight(
+                    draft,
+                    lambda module, weights: Qwen3NextForCausalLM.load_weights(
+                        module, weights, is_mtp=True
+                    ),
+                    "mtp.layers.0.mlp.experts.0.gate_proj.qweight",
                 )
 
     def test_moe_wna16_awq_moe_does_not_run_the_gptq_probe(self):

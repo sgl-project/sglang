@@ -344,6 +344,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         )
+        # The nextn draft is built under ``model.layers.N`` but its checkpoint
+        # tensors are ``mtp.layers.N``; quantization exclusions are written
+        # against the checkpoint names.
+        experts_ckpt_prefix = (
+            f"mtp.{prefix.removeprefix('model.')}"
+            if is_nextn and prefix.startswith("model.")
+            else prefix
+        )
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=(
@@ -361,7 +369,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
-            prefix=add_prefix("experts", prefix),
+            prefix=add_prefix("experts", experts_ckpt_prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
             num_fused_shared_experts=self.num_fused_shared_experts,
             inplace=not _needs_hidden_after_experts,

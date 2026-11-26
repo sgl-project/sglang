@@ -203,6 +203,15 @@ class _GPTQCheckpointMixin:
             self, layer_name=prefix
         ) is False or self.is_checkpoint_module_unquantized(prefix)
 
+    def is_fused_moe_unquantized(self, prefix: str) -> bool:
+        # Checkpoints name the experts' projections (``<prefix>.<id>.gate_proj``);
+        # a rule such as ``-:^(?!.*\.experts\.).*`` can match the bare prefix while
+        # keeping those projections quantized.
+        return all(
+            self.is_linear_unquantized(f"{prefix}.0.{proj}")
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        )
+
     def _resolve_unquantized_linear_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> tuple[bool, Optional[QuantizeMethodBase]]:
@@ -665,7 +674,7 @@ class GPTQMarlinConfig(_GPTQCheckpointMixin, QuantizationConfig):
         )
 
         if isinstance(layer, FusedMoE):
-            if self.is_linear_unquantized(prefix):
+            if self.is_fused_moe_unquantized(prefix):
                 from sglang.srt.layers.quantization.unquant import (
                     UnquantizedFusedMoEMethod,
                 )
