@@ -224,6 +224,7 @@ from sglang.srt.utils import (
     get_or_create_event_loop,
     kill_process_tree,
     print_warning_once,
+    write_stderr_signal_safe,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.srt.utils.common import TypeBasedDispatcher
@@ -4689,7 +4690,7 @@ class SignalHandler:
         self.tokenizer_manager.gracefully_exit = True
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):
-        logger.error(
+        write_stderr_signal_safe(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
         # Stop subprocess watchdog before killing processes to prevent false-positive
