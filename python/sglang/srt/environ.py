@@ -1234,6 +1234,15 @@ class Envs:
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
+    # gfx1250 with SGLANG_USE_AITER=1: quantize the BF16 linears a Quark checkpoint excludes, when their module
+    # path ends in one of SGLANG_QUARK_DENSE_FP8_LAYERS, to 128x128 block FP8 (power-of-two scales) after loading.
+    SGLANG_QUARK_DENSE_FP8 = EnvBool(False)
+    # Comma-separated module-path suffixes. The default covers the DeepSeek-V3 / Kimi-K2 attention projections
+    # except kv_b_proj (its absorbed w_kc / w_vc stay BF16), the shared expert and the dense-layer MLP.
+    SGLANG_QUARK_DENSE_FP8_LAYERS = EnvStr(
+        "fused_qkv_a_proj_with_mqa,q_b_proj,o_proj,shared_experts.gate_up_proj,"
+        "shared_experts.down_proj,mlp.gate_up_proj,mlp.down_proj"
+    )
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
