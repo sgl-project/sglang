@@ -68,6 +68,25 @@ install_compose_v2() {
     return 1
 }
 
+negotiate_docker_api() {
+    # Older dind daemons reject the newest docker CLI ("client version X is too
+    # new"). Read the daemon's advertised API version from /_ping and pin the
+    # client to it. Harmless when client and daemon already agree.
+    local api=""
+    if command -v curl >/dev/null 2>&1; then
+        api="$(curl -fsS --max-time 3 -D - -o /dev/null "http://127.0.0.1:2375/_ping" 2>/dev/null \
+            | tr -d '\r' | awk 'tolower($1) == "api-version:" {print $2}' | tail -n1)"
+    fi
+    if [ -n "${api}" ]; then
+        if [ "${DOCKER_API_VERSION:-}" != "${api}" ]; then
+            echo "dind advertises API ${api}; pinning DOCKER_API_VERSION=${api}"
+            export DOCKER_API_VERSION="${api}"
+        fi
+        return 0
+    fi
+    return 1
+}
+
 if ! command -v docker >/dev/null 2>&1; then
     echo "Installing docker CLI and compose plugin ..."
     export DEBIAN_FRONTEND=noninteractive
@@ -84,6 +103,12 @@ fi
 echo "Waiting for the Docker daemon at ${DOCKER_HOST} ..."
 docker_ready=0
 for _ in $(seq 1 150); do
+    # Pin the client to the daemon's advertised API version; otherwise an old
+    # dind (e.g. API 1.38) rejects the newer docker CLI and 'docker version'
+    # keeps failing even though the daemon is up.
+    if [ -z "${DOCKER_API_VERSION:-}" ]; then
+        negotiate_docker_api || true
+    fi
     if docker version >/dev/null 2>&1; then
         docker_ready=1
         break

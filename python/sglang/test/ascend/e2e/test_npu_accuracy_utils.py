@@ -481,7 +481,9 @@ def _build_deepswe_eval_pod(pod_name, namespace, env_vars, share_volume, share_s
     dind_container = k8s.V1Container(
         name="dind",
         image=DEEPSWE_DIND_IMAGE,
-        image_pull_policy="IfNotPresent",
+        # Always: a node may have an old docker:dind cached, whose daemon (e.g.
+        # API 1.38) rejects the eval container's newer docker CLI.
+        image_pull_policy="Always",
         security_context=k8s.V1SecurityContext(privileged=True),
         # Empty TLS cert dir: serve plain HTTP on 2375 so the eval container can
         # talk to it over the pod's shared network namespace.
