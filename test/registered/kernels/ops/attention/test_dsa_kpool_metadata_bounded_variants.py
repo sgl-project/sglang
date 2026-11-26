@@ -159,6 +159,7 @@ def kpool_lens(expanded):
 
 
 class TestKPoolMetadataBoundedVariants(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_verify_matches_reference_for_every_batch_size(self):
         for bs in BATCH_SIZES:
             table, req, seq, _ = inputs(bs, 100 + bs)
@@ -189,6 +190,7 @@ class TestKPoolMetadataBoundedVariants(CustomTestCase):
             )
             out.assert_tails_untouched()
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_decode_batch_equals_single_requests(self):
         for bs in BATCH_SIZES:
             table, req, seq, _ = inputs(bs, 200 + bs)
@@ -259,13 +261,16 @@ class TestKPoolMetadataBoundedVariants(CustomTestCase):
             batch.assert_untouched("dsa_cu_seqlens_k", total + 1)
             batch.assert_tails_untouched()
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_draft_extend_batch_equals_single_requests(self):
         self._check_draft_extend(static=False, seed_base=300)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_static_draft_extend_batch_equals_single_requests(self):
         # The serving replay (dsa_backend draft extend) uses static_extend_len=True.
         self._check_draft_extend(static=True, seed_base=500)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_batch_size_sweep_compiles_no_new_variants(self):
         kernels = (
             decode._fused_dsa_decode_metadata_kpool_kernel,

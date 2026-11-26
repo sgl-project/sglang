@@ -318,6 +318,7 @@ def test_rounded_silu_clamp_graph(dtype, limit):
     torch.testing.assert_close(actual, reference(), rtol=0, atol=0, equal_nan=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_rounded_silu_table_matches_the_computed_kernel(dtype):
     """The table path must reproduce the expf/divide kernel's bytes for every

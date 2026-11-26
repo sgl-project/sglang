@@ -45,6 +45,7 @@ def test_block_locs_match_ring_locs(dcp):
     assert torch.equal(got, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_paged_block_locs_match_ring_locs():
     page = 64
     ring = DFlashDraftKVRing(

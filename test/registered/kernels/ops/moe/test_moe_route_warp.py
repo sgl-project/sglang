@@ -346,6 +346,7 @@ def test_strided_bias_falls_back(config: str) -> None:
     _assert_matches(w, i, _reference(scores, bias, **kwargs), kwargs["topk"])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("config", ["kimi_k2", "qwen3_moe"])
 def test_cpu_offloaded_bias_falls_back(config: str) -> None:
     scores, _ = _inputs(config, 64, seed=12)

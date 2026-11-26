@@ -62,6 +62,7 @@ def test_stays_within_rounding_of_the_reference_chain() -> None:
     torch.testing.assert_close(got.float(), chain.float(), rtol=2**-6, atol=2**-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", [1024, 5376])
 @pytest.mark.parametrize("rows", [1, 37, 8256])
 def test_gated_norm_matches_gate_then_norm_bitwise(rows: int, hidden: int) -> None:

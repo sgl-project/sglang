@@ -15,6 +15,7 @@ register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 class TestMlaContextKV(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_fused_context_kv_matches_per_layer_projection(self):
         """Stacking the layers must not mix one layer's kv_a rows, norm or RoPE into another's."""
         torch.manual_seed(0)

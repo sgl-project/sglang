@@ -182,6 +182,7 @@ def _setup(device, dtype, width, tree, seed, reqs=None):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("tree", [True, False])
 @pytest.mark.parametrize("width", [1, 4, 8])
@@ -194,6 +195,7 @@ def test_kernel_matches_per_row_reference(dtype, tree, width) -> None:
 
 
 # A row stride of VOCAB_SIZE + 3 leaves rows unaligned for vector loads.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("padding", [64, 3])
 def test_kernel_reads_int32_tokens_and_strided_rows(padding) -> None:
     case = _setup("cuda", torch.bfloat16, 6, True, seed=3)
@@ -208,6 +210,7 @@ def test_kernel_reads_int32_tokens_and_strided_rows(padding) -> None:
     assert not padded[:, VOCAB_SIZE:].any()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_kernel_matches_torch_path_on_a_large_batch(dtype, monkeypatch) -> None:
     """Many rows per CTA, against the torch path."""
@@ -231,6 +234,7 @@ def test_kernel_matches_torch_path_on_a_large_batch(dtype, monkeypatch) -> None:
     _assert_bitwise(logits, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("token_dtype", [torch.int32, torch.int64])
 def test_commit_kernel_matches_torch_fallback(token_dtype) -> None:
     """Repeated, out-of-vocab, and masked tokens; strided token columns."""

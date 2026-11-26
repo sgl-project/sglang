@@ -445,6 +445,7 @@ def test_ar_fusion_finalize_push_norm_stress():
         torch.testing.assert_close(x, ref2, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens", [80, 160, 256, 288])
 @pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()

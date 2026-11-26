@@ -544,6 +544,7 @@ def test_qsa_mtp_cuda_graph_padding_stays_below_compression_boundary():
     ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_qsa_indexer_ignores_dp_attention_token_padding():
     calls = {}
 
@@ -1181,6 +1182,7 @@ def test_qsa_extend_rows_take_the_host_lens_without_a_sync():
     assert torch.equal(short, want)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_qsa_mtp_extend_capture_seeds_last_rows_without_a_sync():
     from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
         QSAMTPSharedSparseIndices,

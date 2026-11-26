@@ -44,6 +44,7 @@ def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
     torch.testing.assert_close(cache, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dcp_rank", [0, 1, 2])
 def test_fp4_index_cache_store_dcp_owned_slots(dcp_rank: int) -> None:
     dcp_size, num_pages = 3, 2
@@ -71,6 +72,7 @@ def test_fp4_index_cache_store_dcp_owned_slots(dcp_rank: int) -> None:
     torch.testing.assert_close(cache, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("rne", [False, True])
 def test_fp4_index_cache_fused_store_matches_batched_store(rne: bool) -> None:
     """Below 4096 tokens the store quantizes in the store kernel; the bytes must

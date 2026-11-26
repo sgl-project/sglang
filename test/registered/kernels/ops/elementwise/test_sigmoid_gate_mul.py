@@ -96,6 +96,7 @@ def test_sigmoid_gate_mul_strided_gate_round_sigmoid_is_bit_exact():
     assert torch.equal(fused_sigmoid_mul(x, gate.contiguous(), round_sigmoid=True), ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_sigmoid_gate_mul_head_strided_gate_round_sigmoid_is_bit_exact():
     # Qwen3-Next layout: per head [q | gate] from the QKV GEMM, chunked into a 3D view.
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul

@@ -104,6 +104,7 @@ def _graph_backend(req_to_token, runner_ids, *, drop_wide, bs):
 
 
 class TestDecodeGraphReplayTranslates(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_replayed_tables_hold_physical_ids(self):
         """Capture builds the graph's buffers; each replay refills them with
         the batch's physical ids, out of graph, through the live v2p."""
@@ -158,6 +159,7 @@ class TestDecodeGraphReplayTranslates(CustomTestCase):
 
 
 class TestEagerGatherTranslates(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_gather_matches_the_reference(self):
         req_to_token, v2p = _virtual_pool(4)
         req = torch.tensor([7, 0, 3], device="cuda")
@@ -168,6 +170,7 @@ class TestEagerGatherTranslates(CustomTestCase):
                 expected = _physical(req_to_token[req, :width], v2p)
                 torch.testing.assert_close(table, expected, rtol=0, atol=0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_unmapped_pages_read_the_sink(self):
         req_to_token, v2p = _virtual_pool(5)
         v2p[int(req_to_token[2, 70]) // PAGE] = -1

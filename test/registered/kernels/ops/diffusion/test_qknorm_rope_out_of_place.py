@@ -130,6 +130,7 @@ def test_two_rows_per_warp_match_one_row_per_warp(
     assert torch.equal(q_ref, q_new) and torch.equal(k_ref, k_new)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("T", [1037, 50316])
 @pytest.mark.parametrize("out_of_place", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

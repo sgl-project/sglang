@@ -1,6 +1,11 @@
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100_bias_decode import (
     paged_rel_bias_decode,

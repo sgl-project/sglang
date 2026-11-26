@@ -167,6 +167,7 @@ def _classic_block_verify(*args, target, draft):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(DEVICE == "cpu", reason="needs CUDA")
 @pytest.mark.parametrize("batch", [1, 4, 8, 32, 64])
 @pytest.mark.parametrize("vocab", [163840, 152064, 128256, 32000, 50257])
@@ -228,6 +229,7 @@ def test_vocab_split_matches_classic_bitwise(slots, vocab, batch):
     assert (predicts[indices[kind == 3, 0]] == vocab - 1).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(DEVICE == "cpu", reason="needs CUDA")
 @pytest.mark.parametrize("batch, split", [(127, True), (128, False)])
 def test_block_accept_takes_the_classic_kernel_from_128_requests(batch, split):

@@ -6,6 +6,13 @@ import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import requests
 from PIL import Image
 
