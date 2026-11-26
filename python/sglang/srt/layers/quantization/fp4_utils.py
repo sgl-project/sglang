@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    get_device,
     get_exec,
     get_platform,
 )
@@ -16,7 +17,6 @@ from sglang.srt.utils.custom_op import register_custom_op_from_extern
 from sglang.srt.utils.device import (
     get_device_capability,
     is_cuda,
-    is_gfx95_supported,
     is_hip,
 )
 
@@ -168,13 +168,17 @@ def _warn_legacy_aiter_fp4_asm_gemm_env(message: str) -> None:
     logger.warning(message)
 
 
-def is_mxfp4_gemm_supported() -> bool:
-    """Whether this ROCm GPU has the native MXFP4 GEMM that AITER's a4w4 uses.
+def is_mxfp4_gemm_supported(gpu_id: Optional[int] = None) -> bool:
+    """Whether the ROCm GPU ``gpu_id`` has the native MXFP4 GEMM that AITER's a4w4 uses.
 
-    The one place to extend when more architectures gain it (gfx95, i.e.
-    MI350/MI355, today).
+    ``gpu_id`` defaults to the current device. The one place to extend when more
+    architectures gain it (gfx95, i.e. MI350/MI355, today).
     """
-    return is_gfx95_supported()
+    if not is_hip():
+        return False
+    if gpu_id is None:
+        gpu_id = torch.cuda.current_device()
+    return "gfx95" in torch.cuda.get_device_properties(gpu_id).gcnArchName
 
 
 def resolve_rocm_fp4_gemm_backend(
@@ -220,16 +224,26 @@ def resolve_rocm_fp4_gemm_backend(
     return backend
 
 
-def initialize_fp4_gemm_config() -> None:
-    """Initialize the FP4 GEMM backend from the published configuration."""
+def initialize_fp4_gemm_config(gpu_id: Optional[int] = None) -> None:
+    """Initialize the FP4 GEMM backend from the published configuration.
+
+    ``gpu_id`` is the device this worker runs on (default: the published
+    ``gpu_id``). Workers can run on different architectures, so ROCm checks
+    this device rather than device 0.
+    """
     global FP4_GEMM_RUNNER_BACKEND
 
     backend = get_exec().kernel.fp4_gemm_runner_backend
     if is_hip():
+        if gpu_id is None:
+            try:
+                gpu_id = get_device().gpu_id
+            except (AttributeError, ValueError):  # device namespace not published
+                gpu_id = None
         legacy_env = envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM
         backend = resolve_rocm_fp4_gemm_backend(
             backend=backend,
-            mxfp4_gemm_supported=is_mxfp4_gemm_supported(),
+            mxfp4_gemm_supported=is_mxfp4_gemm_supported(gpu_id),
             legacy_use_aiter_asm=legacy_env.get() if legacy_env.is_set() else None,
         )
     elif backend in _ROCM_ONLY_FP4_GEMM_BACKENDS:

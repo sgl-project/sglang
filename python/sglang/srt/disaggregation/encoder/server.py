@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
     initialize_dp_attention_flags,
 )
+from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -588,6 +589,9 @@ class MMEncoder:
         )
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
+        # The encoder loads its model without a scheduler, so resolve the FP4
+        # GEMM backend for this device before the quantized linears are built.
+        initialize_fp4_gemm_config(self.gpu_id)
 
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),

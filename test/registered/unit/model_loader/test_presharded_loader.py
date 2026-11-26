@@ -874,6 +874,59 @@ class TestShardConfig(unittest.TestCase):
         self.assertTrue(cfg["enable_fp32_lm_head"])
         self.assertEqual(cfg["init_expert_location"], "trivial")
 
+    def test_aiter_fp4_layout_keys_the_cache(self):
+        # --fp4-gemm-backend aiter stores Quark MXFP4 weights and scales
+        # preshuffled; reusing a Triton-layout cache would feed gemm_a4w4 the
+        # wrong bytes, so the key must differ (and stay unchanged otherwise).
+        from sglang.srt.layers.quantization import fp4_utils
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        loader = object.__new__(PreshardedModelLoader)
+        model_config = SimpleNamespace(quantization="quark", dtype=torch.bfloat16)
+        saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
+        self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
+        override = get_context().override_server_args(
+            tp_size=1, pp_size=1, moe_dp_size=1, moe_dense_tp_size=1
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        configs = {}
+        for backend in (Fp4GemmRunnerBackend.TRITON, Fp4GemmRunnerBackend.AITER):
+            fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
+            with (
+                get_parallel().override(
+                    tp_size=1, pp_size=1, moe_dp_size=1, moe_ep_size=1, moe_tp_size=1
+                ),
+                mock.patch(
+                    "sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1
+                ),
+                mock.patch(
+                    "sglang.srt.model_loader.loader.get_exec",
+                    return_value=SimpleNamespace(
+                        features=SimpleNamespace(enable_fp32_lm_head=False),
+                        moe=SimpleNamespace(
+                            ep_num_redundant_experts=0,
+                            enable_eplb=False,
+                            init_expert_location="trivial",
+                        ),
+                    ),
+                ),
+                mock.patch.object(
+                    loader, "_compute_structural_signature", return_value="sig16"
+                ),
+            ):
+                configs[backend] = loader._collect_shard_config(model_config)
+        self.assertNotIn(
+            "fp4_gemm_runner_backend", configs[Fp4GemmRunnerBackend.TRITON]
+        )
+        self.assertEqual(
+            configs[Fp4GemmRunnerBackend.AITER]["fp4_gemm_runner_backend"], "aiter"
+        )
+        self.assertNotEqual(
+            loader._build_subfolder_name(configs[Fp4GemmRunnerBackend.TRITON]),
+            loader._build_subfolder_name(configs[Fp4GemmRunnerBackend.AITER]),
+        )
+
     def test_enumerated_fields_change_subfolder_hash(self):
         # Each enumerated content/shape knob must feed the subfolder name.
         # A silent drop from `_collect_shard_config` would leave this red.

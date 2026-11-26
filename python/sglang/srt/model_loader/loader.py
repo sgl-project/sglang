@@ -1909,6 +1909,14 @@ class PreshardedModelLoader(DefaultModelLoader):
             shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
                 target_device or torch.device(current_platform.device_type)
             )
+        from sglang.srt.layers.quantization.fp4_utils import (
+            get_fp4_gemm_runner_backend,
+        )
+
+        # --fp4-gemm-backend aiter preshuffles Quark MXFP4 weights and scales
+        # for gemm_a4w4; a cache dumped in the Triton layout must not be reused.
+        if get_fp4_gemm_runner_backend().is_aiter():
+            shard_config["fp4_gemm_runner_backend"] = "aiter"
         return shard_config
 
     @staticmethod

@@ -118,7 +118,7 @@ class TestInitializeFp4GemmConfig(CustomTestCase):
             mock.patch.object(fp4_utils, "is_hip", return_value=is_hip),
             mock.patch.object(fp4_utils, "is_mxfp4_gemm_supported", return_value=mxfp4),
         ):
-            initialize_fp4_gemm_config()
+            initialize_fp4_gemm_config(gpu_id=0)
         return fp4_utils.get_fp4_gemm_runner_backend()
 
     def test_rocm_auto(self):
@@ -138,6 +138,43 @@ class TestInitializeFp4GemmConfig(CustomTestCase):
             with self.assertWarns(DeprecationWarning):
                 backend = self._initialize("auto", is_hip=True)
         self.assertEqual(backend, Fp4GemmRunnerBackend.AITER)
+
+    def test_mxfp4_support_checks_the_worker_gpu(self):
+        # gfx942 at index 0, gfx950 at index 1: a worker on GPU 1 must see
+        # MXFP4 support even though device 0 lacks it.
+        archs = {0: "gfx942:sramecc+:xnack-", 1: "gfx950:sramecc+:xnack-"}
+        with (
+            mock.patch.object(fp4_utils, "is_hip", return_value=True),
+            mock.patch.object(
+                fp4_utils.torch.cuda,
+                "get_device_properties",
+                side_effect=lambda i: SimpleNamespace(gcnArchName=archs[i]),
+            ),
+            mock.patch.object(fp4_utils.torch.cuda, "current_device", return_value=1),
+        ):
+            self.assertFalse(fp4_utils.is_mxfp4_gemm_supported(0))
+            self.assertTrue(fp4_utils.is_mxfp4_gemm_supported(1))
+            self.assertTrue(fp4_utils.is_mxfp4_gemm_supported())
+
+    def test_initialize_uses_the_published_gpu_id(self):
+        exec_ctx = SimpleNamespace(
+            kernel=SimpleNamespace(fp4_gemm_runner_backend="aiter")
+        )
+        with (
+            mock.patch.object(fp4_utils, "get_exec", return_value=exec_ctx),
+            mock.patch.object(
+                fp4_utils, "get_device", return_value=SimpleNamespace(gpu_id=1)
+            ),
+            mock.patch.object(fp4_utils, "is_hip", return_value=True),
+            mock.patch.object(
+                fp4_utils, "is_mxfp4_gemm_supported", side_effect=lambda i: i == 1
+            ) as supported,
+        ):
+            initialize_fp4_gemm_config()
+        supported.assert_called_once_with(1)
+        self.assertEqual(
+            fp4_utils.get_fp4_gemm_runner_backend(), Fp4GemmRunnerBackend.AITER
+        )
 
     def test_rocm_only_backends_rejected_off_rocm(self):
         for backend in ("aiter", "triton"):
