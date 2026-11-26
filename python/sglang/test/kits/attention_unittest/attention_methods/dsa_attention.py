@@ -366,7 +366,7 @@ class DSAMockModelRunner(ModelRunner):
         self.max_running_requests = pool_batch_size
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
         )
