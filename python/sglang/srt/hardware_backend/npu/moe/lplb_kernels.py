@@ -1,0 +1,412 @@
+"""Device-only kernels for NPU replica load balancing."""
+
+import torch
+import triton
+import triton.language as tl
+
+_COUNT_BLOCK_SIZE = 1024
+_DISPATCH_BLOCK_SIZE = 32
+_SMALL_DISPATCH_BLOCK_SIZE = 16
+_SMALL_DISPATCH_MAX_ROUTES = 8192
+_LP_PREPARE_BLOCK_ROWS = 32
+
+
+@triton.jit
+def _count_routes(
+    IDs,
+    ValidRows,
+    Counts,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    E: tl.constexpr,
+    HAS_VALID: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BINS: tl.constexpr,
+):
+    x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    rows = tl.load(ValidRows) if HAS_VALID else N
+    ids = tl.load(IDs + (x // K) * S0 + (x % K) * S1, x < N * K, other=-1)
+    valid = (x < N * K) & (x // K < rows) & (ids >= 0) & (ids < E)
+    histogram = tl.histogram(tl.where(valid, ids, -1).to(tl.int32), BINS)
+    bins = tl.arange(0, BINS)
+    if N * K <= BLOCK:
+        # One program owns every bin, including zero-count experts.
+        tl.store(Counts + bins, histogram, bins < E)
+    else:
+        tl.atomic_add(Counts + bins, histogram, bins < E, sem="relaxed")
+
+
+def count_routes(ids, valid_rows, counts):
+    # Multi-program histograms need a cleared accumulator; a single program
+    # overwrites it directly and avoids a separate device memset.
+    if ids.numel() == 0 or ids.numel() > _COUNT_BLOCK_SIZE:
+        counts.zero_()
+    if ids.numel():
+        _count_routes[(triton.cdiv(ids.numel(), _COUNT_BLOCK_SIZE),)](
+            ids,
+            valid_rows,
+            counts,
+            *ids.shape,
+            *ids.stride(),
+            counts.numel(),
+            valid_rows is not None,
+            _COUNT_BLOCK_SIZE,
+            triton.next_power_of_2(counts.numel()),
+        )
+
+
+@triton.jit
+def _prepare_lp(
+    Counts,
+    BaseRowSum,
+    Replicated,
+    SingleRank,
+    A,
+    B,
+    E: tl.constexpr,
+    H: tl.constexpr,
+    NC: tl.constexpr,
+    NV: tl.constexpr,
+    BE: tl.constexpr,
+    BC: tl.constexpr,
+):
+    e = tl.arange(0, BE)
+    count = tl.load(Counts + e, e < E, 0).to(tl.float32)
+    total = tl.maximum(tl.sum(count, 0), 1.0)
+    count /= total
+    single_rank = tl.load(SingleRank + e, e < E, -1)
+    # Bound the rank-by-expert reduction to fit local UB.
+    r = tl.arange(0, BC)
+    if NC > BC:
+        r += tl.program_id(0) * BC
+    replicated = tl.load(Replicated + r, r < H, -1)
+    demand = (
+        tl.load(Counts + replicated, (r < H) & (replicated >= 0), 0).to(tl.float32)
+        / total
+    )
+    fixed_load = tl.sum(
+        tl.where(single_rank[None, :] == (r[:, None] - H), count[None, :], 0.0), 1
+    )
+    b = tl.where(r < H, demand, -fixed_load)
+    b = tl.where(r < NC, b, 0.0)
+    # Placement-dependent columns are filled by update_layout(). Only the
+    # auxiliary column changes with this batch's demand and fixed rank load.
+    aux = b - tl.load(BaseRowSum + r, r < NC, 0.0)
+    tl.store(A + r * NV + NV - 1, aux, r < NC)
+    tl.store(B + r, b, r < NC)
+
+
+@triton.jit
+def _solve_ipm_schur(
+    A,
+    B,
+    X,
+    Diagnostics,
+    H: tl.constexpr,
+    G: tl.constexpr,
+    NV: tl.constexpr,
+    BH: tl.constexpr,
+    BG: tl.constexpr,
+    BV: tl.constexpr,
+    ITERATIONS: tl.constexpr,
+):
+    """Eliminate expert constraints before solving the smaller rank system.
+
+    Each replica belongs to exactly one logical expert. Consequently, the
+    expert block of A diag(x**2) A.T is diagonal except for the auxiliary
+    variable's rank-one term. Its Schur complement leaves a G x G system;
+    recover the expert dual variables after solving for the rank duals.
+
+    H is the reserved expert-row capacity, G the EP rank count, and NV the
+    variable count. Columns are replica masses, rank slack, max load and aux.
+    Five affine-scaling steps use the same feasible start as the CUDA solver.
+    """
+    auxiliary_penalty: tl.constexpr = 1000.0
+    e = tl.arange(0, BH)
+    r = tl.arange(0, BG)
+    v = tl.arange(0, BV)
+    ae = tl.load(
+        A + e[:, None] * NV + v[None, :], (e[:, None] < H) & (v[None, :] < NV), 0.0
+    )
+    ar = tl.load(
+        A + (H + r[:, None]) * NV + v[None, :],
+        (r[:, None] < G) & (v[None, :] < NV),
+        0.0,
+    )
+    be = tl.load(B + e, e < H, 0.0)
+    br = tl.load(B + H + r, r < G, 0.0)
+    aux_e = tl.sum(tl.where(v[None, :] == NV - 1, ae, 0.0), 1)
+    aux_r = tl.sum(tl.where(v[None, :] == NV - 1, ar, 0.0), 1)
+    expert_base = tl.where(v[None, :] < NV - 2, ae, 0.0)
+    rank_base = tl.where(v[None, :] < NV - 2, ar, 0.0)
+    copies = tl.sum(expert_base, 1)
+    uniform_scale = be / tl.maximum(copies, 1.0)
+    uniform = tl.sum(expert_base * uniform_scale[:, None], 0)
+    uniform_load = tl.sum(rank_base * uniform[None, :], 1) - br
+    uniform_max = tl.max(uniform_load, 0)
+    needs_solve = uniform_max > tl.max(-br, 0)
+    dmax = 0.0
+    # Single-copy experts cannot move. If their load already matches uniform's
+    # maximum, uniform reaches a lower bound and no LP can improve that maximum.
+    if needs_solve:
+        c = tl.where(v == NV - 1, auxiliary_penalty, tl.where(v == NV - 2, 1.0, 0.0))
+        x = tl.where(v < NV, 1.0, 0.0)
+        for _ in range(ITERATIONS):
+            x2 = x * x
+            diagonal_e = tl.sum(expert_base * x2[None, :], 1)
+            inv_e = tl.where(
+                diagonal_e > 0.0, 1.0 / tl.maximum(diagonal_e, 1.0e-20), 0.0
+            )
+            cross = tl.dot(
+                expert_base * x2[None, :], tl.trans(rank_base), input_precision="ieee"
+            )
+            diagonal_r = tl.sum(rank_base * x2[None, :], 1)
+            t2 = tl.sum(tl.where(v == NV - 2, x2, 0.0), 0)
+            z2 = tl.sum(tl.where(v == NV - 1, x2, 0.0), 0)
+            beta = z2 / (1.0 + z2 * tl.sum(aux_e * aux_e * inv_e, 0))
+            w = aux_r - tl.sum(cross * (inv_e * aux_e)[:, None], 0)
+            normal = -tl.dot(
+                tl.trans(cross), cross * inv_e[:, None], input_precision="ieee"
+            )
+            normal += t2 + beta * w[:, None] * w[None, :]
+            normal += tl.where(r[:, None] == r[None, :], diagonal_r[:, None], 0.0)
+            real = r < G
+            normal = tl.where(real[:, None] & real[None, :], normal, 0.0)
+            normal += tl.where((r[:, None] == r[None, :]) & ~real[:, None], 1.0, 0.0)
+            rhs = tl.where(real, -t2 + auxiliary_penalty * beta * w, 0.0)
+            for k in range(G):
+                column = tl.sum(tl.where(r[None, :] == k, normal, 0.0), 1)
+                pivot = tl.maximum(tl.sum(tl.where(r == k, column, 0.0), 0), 1.0e-12)
+                row = tl.sum(tl.where(r[:, None] == k, normal, 0.0), 0) / pivot
+                value = tl.sum(tl.where(r == k, rhs, 0.0), 0) / pivot
+                normal = tl.where(
+                    r[:, None] == k,
+                    row[None, :],
+                    normal - column[:, None] * row[None, :],
+                )
+                rhs = tl.where(r == k, value, rhs - column * value)
+            dual_r = rhs
+            auxiliary_scale = beta * (auxiliary_penalty - tl.sum(w * dual_r, 0))
+            dual_e = inv_e * (
+                aux_e * auxiliary_scale - tl.sum(cross * dual_r[None, :], 1)
+            )
+            reduced_cost = (
+                c - tl.sum(ae * dual_e[:, None], 0) - tl.sum(ar * dual_r[:, None], 0)
+            )
+            direction = x * reduced_cost
+            dmax = tl.maximum(tl.max(direction, 0), 0.0)
+            alpha = tl.where(dmax > 1.0e-9, 0.999 / dmax, 1.0)
+            x *= 1.0 - alpha * direction
+    else:
+        # Build a feasible LP state for the existing probability validation:
+        # uniform replica masses, unused rank capacity, max load, and zero aux.
+        slack = tl.maximum(uniform_max - uniform_load, 0.0)
+        rank_slack = tl.sum(
+            tl.where(
+                (r[:, None] < G) & (v[None, :] == NV - G - 2 + r[:, None]),
+                slack[:, None],
+                0.0,
+            ),
+            0,
+        )
+        x = uniform + rank_slack + tl.where(v == NV - 2, uniform_max, 0.0)
+    residual = tl.maximum(
+        tl.max(tl.abs(tl.sum(ae * x[None, :], 1) - be), 0),
+        tl.max(tl.abs(tl.sum(ar * x[None, :], 1) - br), 0),
+    )
+    tl.store(X + v, x, v < NV)
+    tl.store(Diagnostics, residual)
+    tl.store(Diagnostics + 1, tl.sum(tl.where(v == NV - 1, x, 0.0), 0))
+    tl.store(Diagnostics + 2, dmax)
+    # Normalize each expert's replica masses exactly as dispatch will. Finite
+    # LP iterations can satisfy constraints yet balance worse than uniform.
+    positive_x = tl.maximum(x, 0.0)
+    expert_mass = tl.sum(expert_base * positive_x[None, :], 1)
+    scale = be / tl.maximum(expert_mass, 1.0e-20)
+    candidate = tl.sum(
+        expert_base
+        * tl.where(
+            expert_mass[:, None] > 0.0,
+            positive_x[None, :] * scale[:, None],
+            uniform_scale[:, None],
+        ),
+        0,
+    )
+    candidate_load = tl.sum(rank_base * candidate[None, :], 1) - br
+    improvement = tl.where(needs_solve, uniform_max - tl.max(candidate_load, 0), 0.0)
+    tl.store(Diagnostics + 3, improvement)
+
+
+def solve_ipm(
+    base_row_sum, replicated, single_rank, counts, a, b, x, diagnostics, iterations
+):
+    nc, nv = a.shape
+    bc = min(_LP_PREPARE_BLOCK_ROWS, max(16, triton.next_power_of_2(nc)))
+    bv = max(16, triton.next_power_of_2(nv))
+    _prepare_lp[(triton.cdiv(nc, bc),)](
+        counts,
+        base_row_sum,
+        replicated,
+        single_rank,
+        a,
+        b,
+        counts.numel(),
+        replicated.numel(),
+        nc,
+        nv,
+        triton.next_power_of_2(counts.numel()),
+        bc,
+    )
+    h = replicated.numel()
+    g = nc - h
+    _solve_ipm_schur[(1,)](
+        a,
+        b,
+        x,
+        diagnostics,
+        h,
+        g,
+        nv,
+        max(16, triton.next_power_of_2(h)),
+        max(16, triton.next_power_of_2(g)),
+        bv,
+        iterations,
+    )
+
+
+@triton.jit
+def _extract_probabilities(
+    Map,
+    ReplicaIndex,
+    X,
+    Diagnostics,
+    Prob,
+    CDF,
+    LastPositive,
+    Fallbacks,
+    E: tl.constexpr,
+    C: tl.constexpr,
+    BC: tl.constexpr,
+):
+    residual_tolerance: tl.constexpr = 1.0e-3
+    auxiliary_tolerance: tl.constexpr = 1.0e-4
+    direction_tolerance: tl.constexpr = 0.1
+    expert = tl.program_id(0)
+    copy = tl.arange(0, BC)
+    slot = tl.load(Map + expert * C + copy, copy < C, -1)
+    index = tl.load(ReplicaIndex + slot, slot >= 0, -1)
+    mass = tl.load(X + index, (slot >= 0) & (index >= 0), 0.0)
+    mass = tl.where(index < 0, 1.0, tl.maximum(mass, 0.0))
+    residual = tl.load(Diagnostics)
+    auxiliary = tl.load(Diagnostics + 1)
+    dmax = tl.load(Diagnostics + 2)
+    improvement = tl.load(Diagnostics + 3)
+    usable = (
+        (residual < residual_tolerance)
+        & (auxiliary >= 0.0)
+        & (auxiliary < auxiliary_tolerance)
+        & (dmax < direction_tolerance)
+        & (improvement >= 0.0)
+    )
+    finite = (
+        tl.sum(((mass != mass) | (tl.abs(mass) == float("inf"))).to(tl.int32), 0) == 0
+    )
+    mass = tl.where((slot >= 0) & usable & finite, mass, 0.0)
+    total = tl.sum(mass, 0)
+    mass = tl.where(total > 0.0, mass, (slot >= 0).to(tl.float32))
+    probability = mass / tl.maximum(tl.sum(mass, 0), 1.0e-20)
+    tl.store(Prob + expert * C + copy, probability, copy < C)
+    tl.store(CDF + expert * C + copy, tl.cumsum(probability, 0), copy < C)
+    # Preserve the endpoint fallback when the accumulated probability rounds
+    # below one. A trailing zero-probability or padded copy must not be chosen.
+    last = tl.max(tl.where((slot >= 0) & (probability > 0), copy, -1), 0)
+    tl.store(LastPositive + expert, last)
+    if expert == 0:
+        tl.atomic_add(Fallbacks, (~usable).to(tl.int32), sem="relaxed")
+
+
+def extract_probabilities(
+    mapping, replica_index, x, diagnostics, probabilities, cdf, last_positive, fallbacks
+):
+    e, c = mapping.shape
+    _extract_probabilities[(e,)](
+        mapping,
+        replica_index,
+        x,
+        diagnostics,
+        probabilities,
+        cdf,
+        last_positive,
+        fallbacks,
+        e,
+        c,
+        triton.next_power_of_2(c),
+    )
+
+
+@triton.jit
+def _dispatch_cdf(
+    IDs,
+    Map,
+    CDF,
+    LastPositive,
+    Random,
+    Out,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    MAP_STRIDE: tl.constexpr,
+    C: tl.constexpr,
+    BLOCK: tl.constexpr,
+    COPIES: tl.constexpr,
+):
+    route = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    expert = tl.load(IDs + (route // K) * S0 + (route % K) * S1, route < N * K, 0)
+    expert = tl.maximum(expert, 0)
+    u = tl.load(Random + route, route < N * K, 0.0)
+    copy = tl.arange(0, COPIES)
+    mask = (route[:, None] < N * K) & (copy[None, :] < C)
+    slot = tl.load(Map + expert[:, None] * MAP_STRIDE + copy[None, :], mask, -1).to(
+        tl.int32
+    )
+    cumulative = tl.load(CDF + expert[:, None] * C + copy[None, :], mask, 0.0)
+    chosen = tl.min(
+        tl.where((slot >= 0) & (u[:, None] < cumulative), copy[None, :], C), 1
+    )
+    last = tl.load(LastPositive + expert, route < N * K, 0)
+    chosen = tl.where(chosen < C, chosen, last)
+    physical = tl.sum(tl.where(copy[None, :] == chosen[:, None], slot, 0), 1)
+    # Rounding at the CDF's upper edge must never select a padded -1 slot.
+    tl.store(Out + route, physical, route < N * K)
+
+
+def dispatch_cdf(ids, cdf, mapping, last_positive):
+    """Sample this batch's cached CDF without rebuilding it for every route."""
+    output = torch.empty_like(ids, memory_format=torch.contiguous_format)
+    if ids.numel():
+        # Smaller CDF tiles reduce small-batch latency; larger batches benefit
+        # from amortizing each program's setup over more routes.
+        block = (
+            _SMALL_DISPATCH_BLOCK_SIZE
+            if ids.numel() <= _SMALL_DISPATCH_MAX_ROUTES
+            else _DISPATCH_BLOCK_SIZE
+        )
+        random = torch.rand(ids.numel(), device=ids.device)
+        _dispatch_cdf[(triton.cdiv(ids.numel(), block),)](
+            ids,
+            mapping,
+            cdf,
+            last_positive,
+            random,
+            output,
+            *ids.shape,
+            *ids.stride(),
+            mapping.stride(0),
+            cdf.shape[1],
+            block,
+            triton.next_power_of_2(cdf.shape[1]),
+        )
+    return output
