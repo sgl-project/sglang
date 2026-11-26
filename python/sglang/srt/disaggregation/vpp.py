@@ -20,10 +20,19 @@ def check_vpp_transfer_layers(
     prefill_tp,
     decode_tp,
     decode_pp_size,
+    allow_replicated_tp_expansion=False,
 ) -> None:
+    """Allow TP expansion only when the caller verified replicated MLA rows."""
     if prefill_layers is None:
         return
-    if prefill_tp != decode_tp:
+    replicated_expansion = (
+        allow_replicated_tp_expansion
+        and decode_pp_size == 1
+        and prefill_tp > 0
+        and decode_tp > prefill_tp
+        and decode_tp % prefill_tp == 0
+    )
+    if prefill_tp != decode_tp and not replicated_expansion:
         raise RuntimeError("VPP PD requires the same TP size on prefill and decode")
     if decode_pp_size != 1:
         raise RuntimeError("VPP PD requires a PP1 decode peer")

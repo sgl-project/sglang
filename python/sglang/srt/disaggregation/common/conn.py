@@ -1518,6 +1518,15 @@ class CommonKVManager(BaseKVManager):
             prefill_tp=info.attn_tp_size,
             decode_tp=self.attn_tp_size,
             decode_pp_size=self.pp_size,
+            allow_replicated_tp_expansion=(
+                info.attn_tp_size != self.attn_tp_size
+                and self.is_mla_backend
+                and bool(self.kv_args.mla_compression_ratios)
+                and not info.enable_kv_cache_sharding
+                and self.kv_shard_size == 1
+                and info.attn_cp_size == self.attn_cp_size == 1
+                and get_disagg().disaggregation_transfer_backend == "mooncake"
+            ),
         )
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(

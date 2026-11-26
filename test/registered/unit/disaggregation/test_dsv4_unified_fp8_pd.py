@@ -203,6 +203,118 @@ class TestDSV4UnifiedFp8PpSlice(CustomTestCase):
                     selected_by_rank.extend(selected)
                 self.assertEqual(sorted(selected_by_rank), list(range(len(full))))
 
+    def test_replicated_mla_tp_expansion_requires_explicit_opt_in(self):
+        ownership = [[0, 3], [1, 2]]
+        for allowed in (False, True):
+            for prefill, decode, pp in ((4, 8, 1), (4, 6, 1), (8, 4, 1), (4, 8, 2)):
+                with self.subTest(
+                    allowed=allowed, prefill=prefill, decode=decode, pp=pp
+                ):
+                    kwargs = dict(
+                        prefill_tp=prefill,
+                        decode_tp=decode,
+                        decode_pp_size=pp,
+                        allow_replicated_tp_expansion=allowed,
+                    )
+                    if allowed and (prefill, decode, pp) == (4, 8, 1):
+                        check_vpp_transfer_layers(ownership, **kwargs)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            check_vpp_transfer_layers(ownership, **kwargs)
+
+    def test_replicated_mla_tp4_pp2_fans_out_to_all_eight_decode_ranks(self):
+        from sglang.srt.disaggregation.common.conn import PrefillServerInfo
+
+        destinations = {rank: [] for rank in range(4)}
+        for rank in range(8):
+            mgr = object.__new__(CommonKVManager)
+            mgr.is_mla_backend = True
+            mgr.is_hybrid_mla_backend = False
+            mgr.attn_tp_size = 8
+            mgr.attn_cp_size = 1
+            mgr.attn_cp_rank = 0
+            mgr.pp_size = 1
+            mgr.pp_rank = 0
+            mgr.kv_args = SimpleNamespace(engine_rank=rank)
+            info = PrefillServerInfo(
+                attn_tp_size=4,
+                attn_cp_size=1,
+                dp_size=1,
+                pp_size=2,
+                page_size=256,
+                kv_cache_dtype="fp8_e4m3",
+                follow_bootstrap_room=True,
+            )
+            mgr._resolve_rank_mapping(info)
+            self.assertEqual(info.target_tp_ranks, [rank // 2])
+            self.assertEqual(info.target_pp_ranks, [0, 1])
+            self.assertEqual(info.required_dst_info_num, 2)
+            self.assertEqual(info.required_prefill_response_num, 2)
+            destinations[info.target_tp_rank].append(rank)
+        self.assertEqual(list(destinations.values()), [[0, 1], [2, 3], [4, 5], [6, 7]])
+
+    def test_bootstrap_only_opts_in_for_unsharded_compressed_mla_mooncake(self):
+        from unittest.mock import patch
+
+        for excluded in (
+            None,
+            "non_mla",
+            "no_compression",
+            "prefill_sharding",
+            "decode_sharding",
+            "cp",
+            "backend",
+        ):
+            with self.subTest(excluded=excluded):
+                mgr = object.__new__(CommonKVManager)
+                mgr.prefill_info_table = {}
+                mgr.attn_tp_size, mgr.pp_size = 8, 1
+                mgr.attn_cp_size = 2 if excluded == "cp" else 1
+                mgr.is_mla_backend = excluded != "non_mla"
+                mgr.kv_shard_size = 2 if excluded == "decode_sharding" else 1
+                mgr.kv_args = SimpleNamespace(
+                    mla_compression_ratios=(
+                        [] if excluded == "no_compression" else [4, 128]
+                    )
+                )
+                payload = dict(
+                    attn_tp_size=4,
+                    attn_cp_size=1,
+                    dp_size=1,
+                    pp_size=2,
+                    page_size=256,
+                    kv_cache_dtype="fp8_e4m3",
+                    follow_bootstrap_room=True,
+                    vpp_layers=[[0], [1]],
+                    enable_kv_cache_sharding=excluded == "prefill_sharding",
+                )
+                response = SimpleNamespace(status_code=200, json=lambda: payload)
+                cfg = SimpleNamespace(
+                    disaggregation_transfer_backend=(
+                        "nixl" if excluded == "backend" else "mooncake"
+                    )
+                )
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.common.conn.requests.get",
+                        return_value=response,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.common.conn.get_disagg",
+                        return_value=cfg,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.vpp.check_vpp_transfer_layers",
+                        side_effect=RuntimeError("guard reached"),
+                    ) as guard,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "guard reached"):
+                        mgr.try_ensure_parallel_info("127.0.0.1:8765")
+                self.assertEqual(
+                    guard.call_args.kwargs["allow_replicated_tp_expansion"],
+                    excluded is None,
+                )
+
     def test_bootstrap_rejects_pipelined_decode_for_vpp_prefill(self):
         from unittest.mock import patch
 
