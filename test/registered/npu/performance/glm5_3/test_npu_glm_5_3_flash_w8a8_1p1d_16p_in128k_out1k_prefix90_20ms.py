@@ -102,6 +102,10 @@ GLM_5_3_FLASH_PD_SEP_PREFILL_ARGS = [
     300000,
     "--watchdog-timeout",
     9000,
+    # NPU DSA KPool widens the logical page to 512, so the mamba track
+    # interval must be a multiple of 512 to land on the radix grid.
+    "--mamba-track-interval",
+    512,
 ]
 
 GLM_5_3_FLASH_PD_SEP_DECODE_ARGS = [
@@ -159,6 +163,10 @@ GLM_5_3_FLASH_PD_SEP_DECODE_ARGS = [
     8,
     "--watchdog-timeout",
     9000,
+    # NPU DSA KPool widens the logical page to 512, so the mamba track
+    # interval must be a multiple of 512 to land on the radix grid.
+    "--mamba-track-interval",
+    512,
 ]
 
 GLM_5_3_FLASH_PD_SEP_MODEL_CONFIG = {
