@@ -26,6 +26,13 @@ from transformers import (
 from transformers.utils import cached_file
 
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
+from sglang.srt.runtime_context import (
+    get_mm,
+    get_model,
+    get_parallel,
+    get_serving,
+    process_model_config,
+)
 from sglang.srt.utils import logger
 
 from .common import (
@@ -57,6 +64,104 @@ from .tokenizer import (
 )
 
 _IMAGE_PROCESSOR_BACKENDS = {"auto", "torchvision", "pil"}
+
+
+def load_scheduler_tokenizer(*, is_multimodal: bool):
+    """Load the tokenizer and optional processor with the resolved serving options."""
+    serving = get_serving()
+    model = get_model()
+    kwargs = dict(
+        tokenizer_mode=serving.tokenizer_mode,
+        tokenizer_backend=serving.tokenizer_backend,
+        trust_remote_code=model.trust_remote_code,
+        revision=model.revision,
+    )
+    if is_multimodal:
+        processor = get_processor(
+            serving.tokenizer_path,
+            image_processor_backend=get_mm().image_processor_backend,
+            model_name=model.model_path,
+            **kwargs,
+        )
+        return get_tokenizer_from_processor(processor), processor
+    return get_tokenizer(serving.tokenizer_path, **kwargs), None
+
+
+def _warm_dynamic_module_files(model_path: Path) -> int:
+    """Copy the model's remote tokenizer/processor files into HF_MODULES_CACHE.
+
+    Uses transformers' own cache layout and relative-import handling, but only
+    copies files: no remote class is imported or instantiated in this process.
+    """
+    from transformers.dynamic_module_utils import get_cached_module_file
+
+    module_files = set()
+    for config_name in (
+        "tokenizer_config.json",
+        "processor_config.json",
+        "preprocessor_config.json",
+    ):
+        config_path = model_path / config_name
+        if not config_path.is_file():
+            continue
+        auto_map = json.loads(config_path.read_text(encoding="utf-8")).get(
+            "auto_map", {}
+        )
+        for reference in auto_map.values():
+            for item in reference if isinstance(reference, list) else [reference]:
+                if not isinstance(item, str) or "." not in item:
+                    continue
+                # repo_id--module.Class points into another snapshot; that repo
+                # warms its own copy when it is loaded.
+                if "--" in item:
+                    continue
+                module_files.add(item.rsplit(".", 1)[0] + ".py")
+    for module_file in sorted(module_files):
+        get_cached_module_file(str(model_path), module_file)
+    return len(module_files)
+
+
+def maybe_prewarm_scheduler_tokenizer():
+    """Populate the local HF modules cache before concurrent scheduler loads."""
+    # Best effort: a failure here must never block the server launch. The guard
+    # reads the runtime context and the resolved config, so it is inside the
+    # try as well; schedulers load the cache themselves if this is skipped.
+    try:
+        serving = get_serving()
+        parallel = get_parallel()
+        if (
+            serving.skip_tokenizer_init
+            or not get_model().trust_remote_code
+            or parallel.tp_size * parallel.pp_size * parallel.dp_size <= parallel.nnodes
+            or not Path(serving.tokenizer_path).is_dir()
+        ):
+            return
+
+        # huggingface/transformers#50843: a late copier can truncate a module
+        # another scheduler is importing. Copy the files before spawning either.
+        try:
+            warmed = _warm_dynamic_module_files(Path(serving.tokenizer_path))
+            logger.info(
+                "Prewarmed %d HF dynamic module file(s) from %s",
+                warmed,
+                serving.tokenizer_path,
+            )
+        except Exception:
+            # auto_map does not always list every module a processor pulls in;
+            # fall back to a full load so the cache is still complete. This is
+            # the slow path and only runs when the file-level pass fails.
+            logger.warning(
+                "File-level prewarm failed for %s; falling back to a full load.",
+                serving.tokenizer_path,
+                exc_info=True,
+            )
+            load_scheduler_tokenizer(is_multimodal=process_model_config().is_multimodal)
+    except Exception:
+        logger.warning(
+            "Could not prewarm the HF modules cache; schedulers will load it "
+            "during startup.",
+            exc_info=True,
+        )
 
 
 def _normalize_image_processor_backend(
