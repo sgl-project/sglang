@@ -286,7 +286,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         )
         req_pool = ReqToTokenPool(
             size=4,
-            max_context_len=128,
+            row_width=128,
             device="cpu",
             enable_memory_saver=False,
         )

@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
     Derived,
 )
+from sglang.srt.arg_groups.argparse_actions import NoneChoiceAction
 from sglang.srt.arg_groups.choices import (
     ATTENTION_BACKEND_CHOICES,
     FP4_GEMM_RUNNER_BACKEND_CHOICES,
@@ -343,7 +344,7 @@ class ExecKernel(msgspec.Struct):
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; bias-free M <= 16 uses FlashInfer's autotuned CuTe DSL mm_bf16 except on SM107 or with --disable-flashinfer-autotune, other shapes dispatch between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; on SM12x without deterministic inference, BF16 projections of at most 32 rows with at least 2048 output columns, the FP32-output LM head and the DSpark draft vocab projection at up to 32 rows use the SM12x GEMVs; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; bias-free M <= 16 uses FlashInfer's autotuned CuTe DSL mm_bf16 except on SM107 or with --disable-flashinfer-autotune, other shapes dispatch between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=["auto", "cutedsl", "gemv", "torch"],
         ),
@@ -1086,14 +1087,16 @@ class ExecMoe(msgspec.Struct):
         (
             "Configuration for the ascend_ops MoE backend used by the main "
             "model and/or speculative draft as a JSON object, "
-            'for example {"prefill":"alltoallv","decode":"low_latency"}.'
+            'for example {"prefill":"alltoallv","decode":"fused_op"}. '
+            "Either phase can select fused_op to use MegaMoE."
         ),
     ] = None
     elastic_ep_backend: A[
         Literal[None, "mooncake", "nixl"],
         Arg(
             help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
-            choices=["none", "mooncake", "nixl"],
+            action=NoneChoiceAction,
+            action_kwargs={"choices": ["none", "mooncake", "nixl"]},
         ),
     ] = None
     enable_elastic_expert_backup: A[
