@@ -65,6 +65,7 @@ _SPEC_DECODE_SNAPSHOT_ALGORITHMS = (
     SpeculativeAlgorithm.EAGLE3,
     SpeculativeAlgorithm.DFLASH,
     SpeculativeAlgorithm.DSPARK,
+    SpeculativeAlgorithm.STANDALONE,
 )
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
@@ -241,9 +242,6 @@ class SchedulerMetricsReporter:
         )
         self.current_scheduler_metrics_enabled = (
             self.metrics_collector_context.current_scheduler_metrics_enabled
-        )
-        self.enable_kv_cache_events = (
-            self.metrics_collector_context.enable_kv_cache_events
         )
         parallel = get_parallel()
         # The max/mean token ratio is engine-wide; one scheduler reports it.
@@ -466,8 +464,13 @@ class SchedulerMetricsReporter:
             for req in batch.decoding_reqs or []:
                 decode_kv.add(req.seqlen)
         elif batch.forward_mode.is_decode():
-            for sl in batch.seq_lens_cpu:
-                decode_kv.add(int(sl))
+            # Sync-free spec-v2 lens leave decode batches without a host mirror.
+            if batch.seq_lens_cpu is None:
+                for req in batch.reqs:
+                    decode_kv.add(req.seqlen)
+            else:
+                for sl in batch.seq_lens_cpu:
+                    decode_kv.add(int(sl))
 
         return ScheduledRequestMetrics(
             num_prefill_requests=num_prefill_requests,
@@ -1207,9 +1210,7 @@ class SchedulerMetricsReporter:
         if not self.scheduler.enable_hierarchical_cache:
             return
 
-        host_pool = getattr(
-            self.scheduler.tree_cache, "token_to_kv_pool_host", None
-        ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
+        host_pool = getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
         assert host_pool is not None, "Host pool not found"
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
@@ -1467,6 +1468,10 @@ class SchedulerMetricsReporter:
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
             host_reqs, priority_enabled
         )
+        self.stats.pending_prealloc_token_usage = (
+            self.scheduler.disagg_decode_prealloc_queue.num_tokens_pending_prealloc
+            / self.scheduler.max_total_num_tokens
+        )
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         full_tokens, window_tokens = (
             self.scheduler.disagg_decode_prealloc_queue.pre_allocated_token_counts(
@@ -1503,6 +1508,10 @@ class SchedulerMetricsReporter:
         self._reset_device_timer_window()
         if not self.current_scheduler_metrics_enabled:
             return
+        if self.scheduler_status_logger is not None:
+            self.scheduler_status_logger.maybe_dump(
+                self.scheduler.running_batch, self.scheduler.waiting_queue
+            )
         # The running-reqs gauge holds the last batch report until the next
         # one (on PD prefill that is the last forward-batch snapshot, which
         # no later report zeroes). If it disagrees with running_batch -- the

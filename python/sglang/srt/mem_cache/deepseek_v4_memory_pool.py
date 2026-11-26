@@ -17,6 +17,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dsv4 import (
     fused_k_norm_rope_flashmla,
     fused_store_cache,
@@ -37,6 +38,9 @@ from sglang.kernels.ops.kvcache.dsv4_main_kv_store import NopeFp8RopeBf16Pack
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
+from sglang.srt.mem_cache.base_hisparse_memory_pool import (
+    HiSparseDevicePoolMappingMixin,
+)
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4CheckpointBufferInfo,
@@ -58,8 +62,12 @@ _is_hip = is_hip()
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
-def get_dsv4_indexer_bytes_per_token(index_head_dim: int, use_fp4_indexer: bool) -> int:
-    """Return payload and quant-scale bytes for one compressed indexer token."""
+def get_dsv4_indexer_bytes_per_token(
+    index_head_dim: int, use_fp4_indexer: bool, *, use_bf16_indexer: bool = False
+) -> int:
+    """Return payload and any quant-scale bytes for one compressed indexer token."""
+    if use_bf16_indexer:
+        return index_head_dim * torch.bfloat16.itemsize
     if use_fp4_indexer:
         return index_head_dim // 2 + index_head_dim // 32
     return index_head_dim + index_head_dim // 128 * 4
@@ -219,11 +227,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
     assert mode in ("v41", "v41_new", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
-    is_sm100 = (
-        torch.cuda.is_available()
-        and torch.version.cuda is not None
-        and torch.cuda.get_device_capability()[0] == 10
-    )
+    is_sm100 = current_arch().is_sm(10)
     if _is_hip:
         supported = (
             is_gfx95_supported() and resolve_hip_flashmla_backend() == "aiter_sparse"
@@ -454,7 +458,7 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
         ] = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
 
 
-class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
+class HiSparseC4DevicePool(HiSparseDevicePoolMappingMixin, DeepSeekV4SingleKVPool):
     def __init__(
         self,
         size: int,
@@ -496,27 +500,14 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         )
         self.compress_ratio = 4
 
-    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
-        self.full_to_hisparse_device_index_mapping = (
-            full_to_hisparse_device_index_mapping
-        )
-
     def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
         mask = (full_indices + 1) % self.compress_ratio == 0
         compressed_indices = full_indices[mask] // self.compress_ratio
         return compressed_indices
 
     def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
-            torch.int32
-        )
-
-    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices]
-
-    def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
-        return self._translate_loc_to_hisparse_device(
-            self.translate_loc_from_full_to_compressed(full_indices)
+        return (
+            super().translate_loc_to_hisparse_device(compressed_indices).to(torch.int32)
         )
 
     def set_key_buffer(
@@ -1247,7 +1238,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     self.sliding_window,
                     online_mtp_max_draft_tokens or 0,
                 ),
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
             )
             self.request_window_memory = RequestWindowMemory(
                 window_spec,
@@ -1271,7 +1262,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
                 cls=kv_pool_cls,
             )
         elif self._unified_kv:
@@ -1316,7 +1307,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
                 cls=kv_pool_cls,
             )
 
@@ -1877,6 +1868,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             kv_layout=kv_layout,
         )
 
+    def _window_kv_layout(self) -> KVLayout:
+        """kv_layout of the non-compressed (full/swa/window) pools. Mirrors
+        :func:`compressed_kv_layout` so backends resolve their row format per
+        pool role; the default keeps the model-level value."""
+        return self.kv_layout
+
     def compressed_kv_layout(self, compress_ratio: int) -> KVLayout:
         """See :func:`resolve_compressed_kv_layout`."""
         layout = resolve_compressed_kv_layout(
@@ -2141,7 +2138,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 
-        bs = req_pool_indices.numel()
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue
@@ -2475,17 +2471,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
         return compress_kv_pool.set_key_buffer_fused(
             compress_layer_id, loc, cache_k, freqs_cis
-        )
-
-    def set_index_k_fused(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-    ) -> None:
-        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
-        return self._indexer_pool(compress_ratio).set_index_fused(
-            compress_layer_id, loc, cache_k
         )
 
     def set_index_k_fp4(

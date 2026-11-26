@@ -9,6 +9,7 @@ from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
+    ascend_allgather_row_sizes_for_batch,
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -19,6 +20,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_tbo_comm_stream,
     get_global_dp_buffer,
     get_global_dp_buffer_len,
+    get_is_extend_in_batch,
     get_local_dp_buffer,
     get_local_dp_buffer_len,
     get_tbo_persistent_buffer,
@@ -27,7 +29,11 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
 from sglang.srt.layers.layer_boundary.output import DeferredFinalize
 from sglang.srt.layers.layer_boundary.row_transport import ComputeTransport
-from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    get_moe_ascend_ops_config,
+    should_use_dp_reduce_scatterv,
+)
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip
 
@@ -167,8 +173,10 @@ class MoeRowTransport(ComputeTransport):
                     moe_a2a_backend.is_deepep()
                     or moe_a2a_backend.is_megamoe()
                     or moe_a2a_backend.is_mori()
+                    or moe_a2a_backend.is_ascend_ops()
                 ), (
-                    "CP requires moe_a2a_backend in ('deepep', 'megamoe', 'mori'), "
+                    "CP requires moe_a2a_backend in "
+                    "('deepep', 'megamoe', 'mori', 'ascend_ops'), "
                     f"got {moe_a2a_backend.value!r}."
                 )
         elif _use_tp_moe_gather:
@@ -286,13 +294,31 @@ class MoeRowTransport(ComputeTransport):
 
     @contextmanager
     def scope(self):
+        row_layout = nullcontext()
+        if (
+            get_is_extend_in_batch()
+            and get_moe_a2a_backend().is_ascend_ops()
+            and get_moe_ascend_ops_config().prefill == "allgather"
+        ):
+            row_layout = get_forward().scoped(
+                ascend_allgather_row_sizes=self._ascend_allgather_row_sizes()
+            )
         with (
             get_forward().scoped(
                 mlp_reduce_scatter=self.mlp_reduce_scatter, defer_moe_finalize=False
             ),
             self.gathered_rows,
+            row_layout,
         ):
             yield
+
+    def _ascend_allgather_row_sizes(self) -> list[int] | None:
+        """Derive the layout only when the batch describes the entire TP group."""
+        return ascend_allgather_row_sizes_for_batch(
+            self.batch,
+            use_cp=self._use_cp,
+            use_tp_attn_a2a_scatter=self._use_tp_attn_a2a_scatter,
+        )
 
     def release(self):
         self.input = self._shared_local = self._a2a_scatter_chunks = None

@@ -20,6 +20,7 @@ from sglang.srt.arg_groups.arg_utils import (
     nullable_str,
 )
 from sglang.srt.arg_groups.choices import (
+    KV_CACHE_DTYPE_CHOICES,
     LOAD_FORMAT_CHOICES,
     QUANTIZATION_CHOICES,
 )
@@ -117,6 +118,13 @@ class Model(msgspec.Struct):
         bool,
         "Whether to use a CausalLM as an embedding model.",
     ] = False
+    disable_normalize_embedding: A[
+        bool,
+        "Disable the L2 normalization the embedding Pooler applies after pooling, "
+        "returning the raw pooled vector. Only affects models whose Pooler is built "
+        "with normalize=True; custom poolers (cross-encoder, BERT pooler, vision "
+        "pooler) are unaffected.",
+    ] = False
     revision: A[
         Optional[str],
         "The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
@@ -151,6 +159,37 @@ class Model(msgspec.Struct):
         str,
         "A dictionary in JSON string format used to override default model configurations.",
     ] = "{}"
+    inkling2_loop_num_passes: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Number of loop passes for an inkling2_loop checkpoint with "
+                "loop_config.is_varloop=true. Default: the checkpoint's num_passes."
+            ),
+        ),
+    ] = None
+    inkling2_loop_share_cache: A[
+        bool,
+        "Share one K/V cache per loop core layer across passes for an inkling2_loop "
+        "checkpoint with loop_config.is_varloop=true. Every pass writes the shared "
+        "cache, so later tokens read the last pass's K/V. By default each pass "
+        "keeps its own cache.",
+    ] = False
+    inkling2_tool_call_author_name_mode: A[
+        Optional[Literal["tool_name", "independent", "drop_name"]],
+        Arg(
+            help=(
+                "The tool-call header an inkling2 checkpoint writes, which chat "
+                "prompts render past tool calls with, between <|message_model|> and "
+                "<|content_invoke_tool_json|>. 'tool_name': the tool's name "
+                "(Inkling-2-Mini, Inkling-2-Small). 'independent': the assistant "
+                "message's own name, empty when it has none. 'drop_name': assistant "
+                "message names are dropped, so the header is always empty. Default: the "
+                "checkpoint's config.json text_config.tool_call_author_name_mode, else "
+                "'tool_name', as Inkling-2-Mini and Inkling-2-Small. Other models ignore it."
+            ),
+        ),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Quantization and data type
@@ -202,21 +241,27 @@ class Model(msgspec.Struct):
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. Out-of-tree "
+                "platform plugins can register further values for KV cache formats "
+                "that only their KV pool implements; in-tree platforms reject them."
             ),
-            choices=[
-                "auto",
-                "fp8_e5m2",
-                "fp8_e4m3",
-                "mxfp8",
-                "bf16",
-                "bfloat16",
-                "nvfp4",
-                "fp4_mx_block16",
-            ],
+            choices=KV_CACHE_DTYPE_CHOICES,
             resolvable=True,
         ),
     ] = "auto"
+    indexer_kv_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Quantization recipe for the DSA lightning-indexer KV cache "
+                "(Ascend NPU only). None disables the quantized indexer cache "
+                'and keeps the default indexer behavior. "int8" stores the '
+                "indexer keys in INT8 with FP16 scales to speed up the "
+                "lightning indexer."
+            ),
+            choices=["int8"],
+        ),
+    ] = None
     qsa_indexer_dtype: A[
         str,
         Arg(
@@ -399,3 +444,17 @@ class Model(msgspec.Struct):
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
     ] = 1800
+    weight_cache_transport: A[
+        str,
+        Arg(
+            help="How the weight cache daemon shares weights with engines: "
+            "'torch_ipc' (CUDA IPC handles; the engine dies with the daemon) or "
+            "'vmm_fd' (CUDA VMM allocations passed as file descriptors; the "
+            "engine maps them at addresses it reserves and keeps them if the "
+            "daemon exits). The daemon's setting picks the transport, and "
+            "'auto' means torch_ipc there for now. On an engine, 'auto' accepts "
+            "whatever the daemon serves, while 'torch_ipc' or 'vmm_fd' refuses "
+            "a daemon serving the other.",
+            choices=["auto", "torch_ipc", "vmm_fd"],
+        ),
+    ] = "auto"

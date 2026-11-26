@@ -6,15 +6,34 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     is_attention_backend_not_set,
+    model_config_of,
     resolving_view,
 )
+from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
 
+def _mega_moe_fits(text_config: Any) -> bool:
+    from sglang.srt.layers.moe.mega_moe import check_mega_moe_shapes
+
+    # NVFP4 has the strictest MegaMoE alignment of the expert precisions;
+    # Inkling2Experts pads the intermediate width to a multiple of 256 for it.
+    try:
+        check_mega_moe_shapes(
+            hidden=text_config.hidden_size,
+            intermediate=-(-text_config.intermediate_size // 256) * 256,
+            mma_type="nvfp4xnvfp4",
+        )
+    except ValueError:
+        return False
+    return True
+
+
 @_register_for(
     "InklingForConditionalGeneration",
+    *INKLING2_ARCHS,
     "InklingForConditionalGenerationMTP",
 )
 def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
@@ -33,6 +52,61 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
 
     overrides: Dict[str, Any] = {}
+    inkling2 = any(arch in INKLING2_ARCHS for arch in hf_config.architectures)
+    if inkling2:
+        if cfg.tool_call_parser is None:
+            overrides["tool_call_parser"] = "inkling2"
+        if cfg.reasoning_parser is None:
+            overrides["reasoning_parser"] = "inkling"
+        moe_ranks = cfg.tp_size // cfg.moe_dp_size
+        # On SM100 / SM103 / SM107, quantized experts above the routed-kernel batch
+        # run only on MegaMoE at full speed.
+        if (
+            cfg.moe_a2a_backend == "none"
+            and moe_ranks > 1
+            and get_platform().is_cuda
+            and get_platform().device_sm in (100, 103, 107)
+            and not cfg.encoder_only
+            and not (cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap)
+            and model_config_of(server_args).quantization == "inkling2"
+            and _mega_moe_fits(hf_config.get_text_config())
+        ):
+            overrides["moe_a2a_backend"] = "megamoe"
+        # Inkling2's MegaMoE path slices the replicated attention-TP tokens itself;
+        # the scheduler-side attn-TP gather would only pad batches to attn_tp_size.
+        megamoe = overrides.get("moe_a2a_backend", cfg.moe_a2a_backend) == "megamoe"
+        if megamoe and cfg.attn_dp_size == 1:
+            overrides["disable_attn_tp_gather"] = True
+        # NVFP4 experts need expert parallelism. ep_size == 1 is the field
+        # default; any other value is the user's and wins.
+        if cfg.ep_size == 1 and moe_ranks > 1:
+            overrides["ep_size"] = moe_ranks
+        # SM120 hosts may lack PCIe P2P, and the default assumes it works:
+        # custom all-reduce would exchange IPC handles before finding out.
+        if get_platform().is_sm120:
+            overrides["enable_p2p_check"] = True
+            # Page size 1 left 0.5 GB after the KV pool; requests ran out of memory.
+            if cfg.page_size is None:
+                overrides["page_size"] = 128
+            # MXFP8 verify runs only on the bias decode kernel, which gives every
+            # request the same draft count, not compact ragged verify's own.
+            if cfg.kv_cache_dtype == "mxfp8":
+                from sglang.srt.speculative.ragged_verify import (
+                    RaggedVerifyMode,
+                    read_ragged_verify_mode,
+                )
+                from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+                algorithm = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+                if (
+                    algorithm.supports_ragged_verify()
+                    and read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
+                ):
+                    raise ValueError(
+                        "Inkling2 with --kv-cache-dtype mxfp8 on SM120 verifies "
+                        "every request's whole draft block; use "
+                        "SGLANG_RAGGED_VERIFY_MODE=static or cap-accept."
+                    )
     # NOTE: the full-graph prefill default is NOT set here. cuda-graph config is
     # resolved in __post_init__ before declarations are materialized, so a
     # cuda_graph_backend_prefill declared here lands too late (the breakable
@@ -66,7 +140,12 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
     # --attention-backend / --prefill/decode-attention-backend still wins.
     if is_attention_backend_not_set(cfg):
-        if get_platform().is_sm90 or get_platform().is_sm100:
+        # Inkling2 attention asserts fa4, which SM120 runs on its FA4 forward host.
+        if (
+            get_platform().is_sm90
+            or get_platform().is_sm100
+            or (inkling2 and get_platform().is_sm120)
+        ):
             inkling_attn_backend = "fa4"
         else:
             inkling_attn_backend = "triton"

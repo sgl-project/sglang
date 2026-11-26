@@ -47,6 +47,22 @@ def chain_snapshot(allocator) -> ChainSnapshot:
     )
 
 
+def largest_take(allocator, *sub_pools: str) -> int:
+    """The most units each of ``sub_pools`` (default: the token sub-pool and every
+    window) can take together now, by binary search over `units_fit`; a test oracle."""
+    owner, windows, state = allocator.sub_pool_roles()
+    if not sub_pools:
+        sub_pools = (owner, *windows)
+    low, high = 0, max(band.num_pages for band in allocator.bands)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if allocator.units_fit(dict.fromkeys(sub_pools, mid)):
+            low = mid
+        else:
+            high = mid - 1
+    return low if sub_pools == (state,) else low * allocator.page_size
+
+
 def open_float_side(flt, side: str, min_bytes: int) -> int:
     """Move a float's live pages, as a planned layout does (`relocate_into`
     of one packed block), so the gap on ``side`` holds at least ``min_bytes``;
@@ -162,7 +178,7 @@ def build_tri_pool(
         mamba2_cache_params=config,
         max_mamba_cache_size=8,
         model_context_len=256 * page_size,
-        extra_max_context_len=1,
+        req_to_token_row_width=256 * page_size + 1,
         max_num_reqs=4,
         enable_mamba_extra_buffer=False,
         enable_mamba_extra_buffer_lazy=False,
@@ -486,7 +502,7 @@ def build_swa_cache(
     )
     req_pool = ReqToTokenPool(
         size=4,
-        max_context_len=256 * page_size,
+        row_width=256 * page_size,
         device="cpu",
         enable_memory_saver=False,
     )
@@ -595,6 +611,8 @@ class UnifiedGeometry(msgspec.Struct, frozen=True, kw_only=True):
     state_slots: int = 8
     byte_budget: Optional[int] = None
     context_len: int = 256
+    # The request table's row width; unset is context_len + 1.
+    req_to_token_row_width: Optional[int] = None
     max_num_reqs: int = 4
     lazy: bool = True
     # Paged extend and decode launch device kernels; their callers need "cuda".
@@ -645,7 +663,7 @@ def build_test_unified_pools(
     total_bytes=None,
     unified_total_bytes=None,
     model_context_len=None,
-    extra_max_context_len=0,
+    req_to_token_row_width=0,
     max_num_reqs=1,
     enable_memory_saver=False,
     post_capture_active=False,
@@ -706,6 +724,7 @@ def build_test_unified_pools(
         window_tokens=swa_max_total_num_tokens,
         state_slots=max_mamba_cache_size,
         context_len=model_context_len,
+        req_to_token_row_width=req_to_token_row_width,
         floor_window=sliding_window_size,
         alignment=1,
     )
@@ -722,8 +741,6 @@ def build_test_unified_pools(
         head_num=head_num,
         head_dim=head_dim,
         max_num_reqs=max_num_reqs,
-        model_context_len=model_context_len or 0,
-        extra_max_context_len=extra_max_context_len,
         state_cache_params=mamba2_cache_params,
         enable_mamba_extra_buffer=enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
@@ -782,12 +799,18 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         checkpoint_interval=mamba_cache_chunk_size() if g.state_layer_ids else None,
     )
     by_tokens = g.byte_budget is None or bool(g.state_layer_ids)
+    req_to_token_row_width = (
+        g.req_to_token_row_width
+        if g.req_to_token_row_width is not None
+        else g.context_len + 1
+    )
     sizing = KVSizingInputs(
         budget_bytes=g.byte_budget,
         full_tokens=g.full_tokens if by_tokens else None,
         window_tokens=g.swa_tokens if by_tokens and g.swa_layer_ids else None,
         state_slots=g.state_slots if g.state_layer_ids else 0,
         context_len=g.context_len,
+        req_to_token_row_width=req_to_token_row_width,
         floor_window=g.window if g.swa_layer_ids else None,
         alignment=1,
     )
@@ -801,8 +824,6 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         head_num=g.head_num,
         head_dim=g.head_dim,
         max_num_reqs=g.max_num_reqs,
-        model_context_len=g.context_len,
-        extra_max_context_len=1,
         state_cache_params=cache_params,
         disable_overlap_schedule=True,
     )
@@ -817,7 +838,7 @@ def build_unified_bundle(geometry: UnifiedGeometry):
     )
 
 
-def build_mamba_pool(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
+def build_mamba_pool(*, page_size=1, lazy=True, mla=False, ratio=(1, 1), state_slots=8):
     """Full + state composite over real CPU pools; returns the pool bundle and
     its allocator."""
     full_layers, state_layers = ratio
@@ -831,14 +852,17 @@ def build_mamba_pool(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
             full_tokens=100 * page_size,
             context_len=256 * page_size,
             lazy=lazy,
+            state_slots=state_slots,
         )
     )
     return bundle, bundle.token_to_kv_pool_allocator
 
 
-def build_mamba_cache(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
+def build_mamba_cache(
+    *, page_size=1, lazy=True, mla=False, ratio=(1, 1), state_slots=8
+):
     bundle, allocator = build_mamba_pool(
-        page_size=page_size, lazy=lazy, mla=mla, ratio=ratio
+        page_size=page_size, lazy=lazy, mla=mla, ratio=ratio, state_slots=state_slots
     )
     cache = UnifiedRadixCache(
         CacheInitParams(
@@ -993,7 +1017,7 @@ def _layer_maps(bundle) -> dict:
 def _capacity_summary(bundle) -> dict:
     allocator = bundle.token_to_kv_pool_allocator
     out = {
-        "available": allocator.available_size(),
+        "available": largest_take(allocator),
         "size_full": allocator.size_full,
         "draft_virtual_id_space": allocator.draft_virtual_id_space,
     }

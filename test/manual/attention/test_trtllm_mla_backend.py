@@ -255,6 +255,7 @@ class MockModelRunner:
             (),
             {
                 "size": max_bs,
+                "row_width": max_ctx,
                 "req_to_token": req_to_token,
             },
         )

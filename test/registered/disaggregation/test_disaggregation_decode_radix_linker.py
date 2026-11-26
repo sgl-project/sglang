@@ -129,6 +129,18 @@ class TestDisaggregationDecodeRadixLinker(PDDisaggregationServerBase):
                 self._flush_device_caches()
 
 
+def _mooncake_reuses_registrations() -> bool:
+    try:
+        from mooncake.engine import TransferEngine
+    except ImportError:
+        return False
+    return hasattr(TransferEngine, "enable_memory_registration_reuse")
+
+
+@unittest.skipUnless(
+    _mooncake_reuses_registrations(),
+    "Mooncake lacks enable_memory_registration_reuse",
+)
 class TestDisaggregationDecodeRadixLinkerSharedEngine(
     TestDisaggregationDecodeRadixLinker
 ):
@@ -151,11 +163,13 @@ class TestDisaggregationDecodeRadixLinkerSharedEngine(
             ("prefill", self._prefill_stdout_buf, self._prefill_stderr_buf),
             ("decode", self._decode_stdout_buf, self._decode_stderr_buf),
         ):
+            logs = stdout.getvalue() + stderr.getvalue()
             self.assertIn(
                 "Reuse initialized mooncake transfer engine",
-                stdout.getvalue() + stderr.getvalue(),
+                logs,
                 f"{side} store did not run on the PD transfer engine",
             )
+            self.assertNotIn("Mooncake refused memory registration reuse", logs)
 
 
 if __name__ == "__main__":
