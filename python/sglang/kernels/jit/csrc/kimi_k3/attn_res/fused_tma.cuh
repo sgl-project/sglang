@@ -275,6 +275,9 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
     if (warp_id == kNumConsumerWarps && warp::elect_one_lane()) {
       uint32_t global_chunks = 0;
       constexpr uint32_t kRowBytes = kDim * sizeof(bf16_t);
+      // The immediately-preceding kernel may write the bank too (a PP stage's entry copies the inherited rows
+      // into it), so wait before this CTA's first load of anything.
+      PDLWaitPrimary<true>();
       for (auto token = blockIdx.x; token < params.num_tokens; token += gridDim.x) {
 #pragma unroll
         for (uint32_t ci = 0; ci < kNumChunks; ++ci, ++global_chunks) {
@@ -292,9 +295,6 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
             const auto row = base_row + r;
             const auto src = row == kNumRows ? params.prefix_sum + token * kDim  //
                                              : params.bank + token * params.stride_bm + row * kDim;
-            // Only prefix_sum is written by the immediately-preceding kernel;
-            // one wait before the first token's prefix load covers the rest.
-            if (token == blockIdx.x && row == kNumRows) PDLWaitPrimary<true>();
             ptx::cp_async_bulk_1d_load(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
           }
         }
@@ -309,6 +309,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
     const auto tmem_ow = tmem_cw + kNumGroups * kTmemColsPerGroup;
 
     // Stage this thread's cw / ow slices into TMEM (read once from gmem).
+    // Read before any PDL wait, so the immediately-preceding kernel must not write them (K3 computes cw after load).
     {
       float staged[kAccPerThread];
 #pragma unroll

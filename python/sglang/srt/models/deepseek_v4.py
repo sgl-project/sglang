@@ -1575,7 +1575,9 @@ class MQALayer(MqaAttentionBase):
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
-        if self.indexer is not None and hasattr(self.indexer.compressor, "fp4_cos"):
+        if isinstance(self.indexer, C4Indexer) and hasattr(
+            self.indexer.compressor, "fp4_cos"
+        ):
             self.indexer.compressor.fp4_cos = self.cos_cache[:, 0, 0, :]
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
