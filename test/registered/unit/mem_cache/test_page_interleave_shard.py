@@ -1362,6 +1362,7 @@ class _GraftReq:
         self.finished_reason = None
         self.session = None
         self.session_id = None
+        self.bidir_prefix_len = -1
 
     def get_fill_ids(self):
         return array("q", self.fill_ids)

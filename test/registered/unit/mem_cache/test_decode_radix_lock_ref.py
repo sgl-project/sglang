@@ -106,6 +106,7 @@ class MockReq:
         self.lock = lock
         self.extra_key = None
         self.cache_salt = None
+        self.bidir_prefix_len = -1
         self.prefix_len = 0
         self.priority = 0
         self.kv = ReqKvInfo(
