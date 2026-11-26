@@ -1,6 +1,9 @@
 """CPU-only tests for how the JIT toolchain finds libcudart under a CUDA root."""
 
 import pathlib
+import sys
+
+import pytest
 
 from sglang.kernels.jit.utils.compile import toolchain
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -54,3 +57,7 @@ def test_missing_cudart_keeps_old_flags(tmp_path):
         f"-L{tmp_path / 'lib64'}",
         "-lcudart",
     ]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
