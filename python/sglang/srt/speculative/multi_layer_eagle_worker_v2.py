@@ -193,6 +193,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        self.target_embed_and_head_shared = False
+        # Share the target's embedding and lm_head across all draft runners before
+        # the scheduler sizes the KV pool, freeing each step's duplicate vocabulary
+        # tensors before free-VRAM profiling.
+        self._share_target_embed_and_head()
+
+    def _share_target_embed_and_head(self):
+        self.init_lm_head()
+        self.target_embed_and_head_shared = True
+
     @property
     def draft_runners(self) -> List[ModelRunner]:
         # One runner per draft step (len == speculative_num_steps).
@@ -215,7 +225,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         check_draft_branch_tail_copy(
             self.draft_runner.token_to_kv_pool, self.topk, get_schedule().page_size
         )
-        self.init_lm_head()
+        if not self.target_embed_and_head_shared:
+            self._share_target_embed_and_head()
         self._init_boundary_kv_fix_state()
 
     def init_attention_backends(self):
