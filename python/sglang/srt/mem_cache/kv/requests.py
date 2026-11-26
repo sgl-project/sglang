@@ -109,7 +109,7 @@ class RequestTable:
         *,
         size: int,
         pre_alloc_size: int,
-        max_context_len: int,
+        row_width: int,
         state_sub_pool: Optional[str],
         tracking: Optional[StateTracking],
         device: str,
@@ -126,7 +126,6 @@ class RequestTable:
             reserved_rows if reserved_rows is not None else size + pre_alloc_size + 1
         )
         assert self._num_rows >= size + pre_alloc_size + 1
-        self.max_context_len = max_context_len
         self.device = device
         self.state_sub_pool = state_sub_pool
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -134,7 +133,7 @@ class RequestTable:
         )
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._num_rows, max_context_len), dtype=torch.int32, device=device
+                (self._num_rows, row_width), dtype=torch.int32, device=device
             )
         self._reset_rows()
         # Run by `clear`, after every row went back: what keeps per-row or
@@ -181,6 +180,11 @@ class RequestTable:
     def holds_state_slots(self) -> bool:
         """Whether a row names its request's state slot."""
         return self.state_sub_pool is not None
+
+    @property
+    def row_width(self) -> int:
+        """See ReqToTokenPool.row_width."""
+        return self.req_to_token.shape[1]
 
     # -- rows --
 
