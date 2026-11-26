@@ -319,7 +319,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         # The previous pre-mix is folded in and the pre-mix is requested back.
         self.assertIs(seen["kwargs"]["pre_mix"], pre_prev)
         self.assertIs(seen["kwargs"]["return_pre"], True)
-        self.assertNotIn("impl", seen["kwargs"])
+        self.assertEqual(seen["kwargs"]["impl"], "cann_ops_transformers_cann920_v2")
         # ``mix_stats`` is skipped: the post reads the stashed coefficients.
         pre, post_mix, comb = state.stats
         torch.testing.assert_close(pre, torch.full((2, self.MULT), 0.5))
@@ -359,6 +359,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         pre_mix = seen["kwargs"]["pre_mix"]
         self.assertEqual(pre_mix.dtype, torch.float32)
         torch.testing.assert_close(pre_mix, expected)
+        self.assertEqual(seen["kwargs"]["impl"], "cann_recipes_infer_cann920")
 
     def test_npu_empty_batch_skips_the_kernel(self):
         hc = self._sub_layer()

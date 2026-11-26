@@ -590,6 +590,11 @@ def _npu_combine_premix(
         cfg.rms_eps,
         pre_mix=apply_pre,
         return_pre=True,
+        impl=(
+            "cann_recipes_infer_cann920"
+            if is_npu_arch35()
+            else "cann_ops_transformers_cann920_v2"
+        ),
     )
     state.stats = (pre, post_mix, comb)
     return hc.norm(y)
