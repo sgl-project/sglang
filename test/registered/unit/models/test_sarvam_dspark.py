@@ -7,7 +7,7 @@ from torch import nn
 
 from sglang.srt.layers.moe.topk import TopKOutputFormat
 from sglang.srt.layers.moe.utils import RoutingMethodType
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.sarvam_moe import (
     AttnForwardMethod,
     SarvamMLAForCausalLM,
@@ -330,8 +330,10 @@ class TestSarvamDSpark(CustomTestCase):
                 )
                 self.routing_method_type = kwargs["routing_method_type"]
                 self.moe_runner_config = SimpleNamespace(
-                    routed_scaling_factor=kwargs["routed_scaling_factor"]
+                    routed_scaling_factor=kwargs["routed_scaling_factor"],
+                    inplace=False,
                 )
+                self.quant_method = None
 
         runtime = SimpleNamespace(moe=SimpleNamespace(ep_num_redundant_experts=0))
         with (
@@ -378,8 +380,6 @@ class TestSarvamDSpark(CustomTestCase):
         ):
 
             class FakeExperts(nn.Module):
-                # Mirrors FusedMoE: the layer owns the quant method that the
-                # fused-op compile protocol toggles.
                 def __init__(self, **kwargs):
                     super().__init__()
                     self.runner_backend = SimpleNamespace(
