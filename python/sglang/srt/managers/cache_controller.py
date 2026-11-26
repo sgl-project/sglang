@@ -1738,7 +1738,7 @@ class HiCacheController:
                     continue
 
                 delay = envs.SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY.get()
-                if delay > 0:
+                if delay:
                     time.sleep(delay)
 
                 if not self.backup_skip:
