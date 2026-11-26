@@ -95,10 +95,11 @@ Data prefetching is one of HiCache’s core optimization techniques, designed to
 **Prefetch Trigger Conditions**:
 After local matching, for the parts not found in L1 or L2, the system queries L3 to retrieve metadata for the next continuous matching KV caches. If the length of hit cache in L3 exceeds a threshold (default: 256 tokens, configurable), a prefetch operation is triggered.
 
-**Prefetch Strategies**: HiCache provides three different prefetch termination strategies to address different scenario needs:
+**Prefetch Strategies**: HiCache provides four different prefetch termination strategies to address different scenario needs:
 - **best_effort**: Terminates immediately when GPU can execute prefill computation, with no waiting time, suitable for scenarios extremely sensitive to latency.
 - **wait_complete**: Must wait for all prefetch operations to complete, suitable for scenarios requiring high cache hit rates.
 - **timeout**: Terminates after specified time or when complete, balancing latency and cache hit rate needs.
+- **earliest_completion**: Once per L3 hit, when the hit becomes known, compares the estimated time for the read to finish (the pages queued ahead of it on the reader plus its own, at the measured read rate) with the estimated time to prefill the same tokens (the prefill work already released plus its own, at the measured prefill rate). The request waits for the read only when the read is estimated to finish first; otherwise it is prefilled at once. The `timeout` budget still caps every wait, and until both rates have been measured the policy behaves like `timeout`.
 
 After prefetching stops, the data already fetched is used together with the local data for the prefill computation.
 
@@ -198,10 +199,11 @@ The startup handshake and `GET /get_hicache_l3_cache_layout` use the same layout
 
 - **`--page-size PAGE_SIZE`**: The number of tokens per page. This parameter determines the granularity of KV cache storage and retrieval. Larger page sizes reduce metadata overhead and improve I/O efficiency for storage backends, but may lower the cache hit rate when only part of a page matches the stored KV cache. For workloads with long common prefixes, larger pages can improve performance, while workloads with more diverse prefixes may benefit from smaller pages. See [Data Transfer Optimization](#data-transfer-optimization) for how page granularity affects I/O performance.
 
-- **`--hicache-storage-prefetch-policy {best_effort,wait_complete,timeout}`**: Controls when prefetching from storage should stop. See [Prefetch from L3](#prefetch-from-l3) for details.
+- **`--hicache-storage-prefetch-policy {best_effort,wait_complete,timeout,earliest_completion}`**: Controls when prefetching from storage should stop. See [Prefetch from L3](#prefetch-from-l3) for details.
   - `best_effort`: Prefetch as much as possible without blocking
   - `wait_complete`: Wait for prefetch to complete before proceeding
   - `timeout`: Terminates after specified time or when complete (Recommended for production environments, as setting an appropriate timeout helps the system meet required SLOs)
+  - `earliest_completion`: Decide once per storage hit; wait for the read when it is estimated to finish before prefilling the same tokens would, within the `timeout` budget
 
 - **`--hicache-write-policy {write_back,write_through,write_through_selective}`**: Controls how data is written from faster to slower memory tiers. See [Data Write-back](#data-write-back) for details.
   - `write_through`: Immediately writes data to all tiers (strongest caching benefits)

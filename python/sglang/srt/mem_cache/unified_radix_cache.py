@@ -203,6 +203,17 @@ class _OngoingLoadBack(NamedTuple):
     host_lock_params: DecLockRefParams
 
 
+# Prefetch policies whose waits end by the per-tick deadline vote.
+_DEADLINE_PREFETCH_POLICIES = ("timeout", "earliest_completion")
+# Prefill batches that feed the earliest_completion rate estimate. Arbitrary:
+# large enough that fixed per-batch costs do not dominate, and close enough
+# to the previous batch that the gap is forward time.
+_PREFILL_RATE_MIN_TOKENS = 1024
+_PREFILL_RATE_MAX_GAP_S = 2.0
+# Weight of the newest sample in the rate averages. Arbitrary.
+_RATE_EWMA_ALPHA = 0.3
+
+
 class _StoragePrefetchWait(msgspec.Struct):
     timer: PollTimer = msgspec.field(default_factory=PollTimer)
     timeout_s: float = 0.0
@@ -227,6 +238,12 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # earliest_completion prefetch policy: EWMA of the prefill rate, and the
+    # prefill tokens released to the GPU that it has not worked off yet.
+    _prefill_tokens_per_s: Optional[float] = None
+    _prefill_observed_at: float = 0.0
+    _prefill_backlog_tokens: float = 0.0
+    _prefill_backlog_at: float = 0.0
 
     def __init__(
         self,
@@ -2926,7 +2943,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
         if (
-            self.prefetch_stop_policy == "timeout"
+            self.prefetch_stop_policy in _DEADLINE_PREFETCH_POLICIES
             and operation.handle not in self._storage_prefetch_wait
         ):
             # Start at the first blocked admission poll; refetches keep this budget.
@@ -2944,6 +2961,11 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             # KV landed: cutting the pending sidecar read would salvage nothing.
             return False
+        if (
+            self.prefetch_stop_policy == "earliest_completion"
+            and operation.fetch_decided is False
+        ):
+            return True
         wait = self._storage_prefetch_wait.get(operation.handle)
         return wait is not None and (
             wait.expired
@@ -2967,7 +2989,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # Completion is committed by the ACK drain (sync-thread MIN-reduced
             # progress, rank-min queue drain); a vote here only adds collectives.
             return False
-        if self.prefetch_stop_policy == "timeout":
+        if self.prefetch_stop_policy in _DEADLINE_PREFETCH_POLICIES:
             # The verdict is agreed once per tick by _vote_prefetch_deadlines,
             # which also terminates the operation (the poll then takes the
             # is_terminated path); a poll only reads it, so ranks may poll
@@ -2977,8 +2999,73 @@ class UnifiedRadixCache(BasePrefixCache):
             return wait is not None and wait.expired
         return True
 
+    def observe_prefill_tokens(self, num_tokens: int) -> None:
+        now = time.monotonic()
+        gap = now - self._prefill_observed_at
+        self._prefill_observed_at = now
+        # Small batches and batches after an idle gap say little about the rate.
+        if num_tokens >= _PREFILL_RATE_MIN_TOKENS and gap < _PREFILL_RATE_MAX_GAP_S:
+            sample = num_tokens / gap
+            previous = self._prefill_tokens_per_s
+            self._prefill_tokens_per_s = (
+                sample
+                if previous is None
+                else (1 - _RATE_EWMA_ALPHA) * previous + _RATE_EWMA_ALPHA * sample
+            )
+
+    def _decide_fetch_or_prefill(self, operations: list[PrefetchOperation]) -> None:
+        """Decide once per storage hit, when the hit becomes known, whether
+        its request waits for the read.
+
+        The reader serves the hits in order, so a read finishes after the
+        pages queued ahead of it; prefilling the same tokens finishes after
+        the prefill work already released here. The hit is read when that is
+        estimated to finish first, and otherwise released to prefill at once.
+        Without a measured read rate and prefill rate nothing is decided and
+        the timeout budget alone applies.
+        """
+        seconds_per_page = self.cache_controller.prefetch_seconds_per_page
+        tokens_per_s = self._prefill_tokens_per_s
+        if seconds_per_page is None or tokens_per_s is None:
+            return
+        now = time.monotonic()
+        backlog = max(
+            0.0,
+            self._prefill_backlog_tokens
+            - tokens_per_s * (now - self._prefill_backlog_at),
+        )
+        pages_ahead = 0
+        for operation in operations:
+            pages = len(operation.hash_value)
+            if operation.fetch_decided is False or operation.is_terminated():
+                # Released to prefill, or cut by the timeout budget.
+                continue
+            if operation.fetch_decided:
+                pages_ahead += max(
+                    0, pages - operation.completed_tokens // self.page_size
+                )
+                continue
+            if operation.host_indices is None or pages == 0:
+                # The storage hit is not known yet.
+                continue
+            tokens = pages * self.page_size
+            if operation.completed_tokens >= tokens:
+                # Already read.
+                operation.fetch_decided = True
+                continue
+            read_s = (pages_ahead + pages) * seconds_per_page
+            prefill_s = (backlog + tokens) / tokens_per_s
+            operation.fetch_decided = read_s <= prefill_s
+            if operation.fetch_decided:
+                pages_ahead += pages
+            else:
+                backlog += tokens
+        self._prefill_backlog_tokens = backlog
+        self._prefill_backlog_at = now
+
     def _vote_prefetch_deadlines(self) -> None:
-        """One MAX vote per tick over every live prefetch's `timeout` budget.
+        """One MAX vote per tick over every live prefetch's `timeout` budget
+        and, under `earliest_completion`, its read-or-prefill decision.
 
         Wall clocks differ across ranks: PP0 decides per operation, TP takes
         MAX (any rank timed out) and _all_reduce relays the verdict along PP.
@@ -2991,11 +3078,16 @@ class UnifiedRadixCache(BasePrefixCache):
         here so the transfer worker and the hit drain stop spending on it;
         its retirement stays with the admission poll or the drain.
         """
-        if self.prefetch_stop_policy != "timeout" or not self.ongoing_prefetch:
+        if (
+            self.prefetch_stop_policy not in _DEADLINE_PREFETCH_POLICIES
+            or not self.ongoing_prefetch
+        ):
             return
         operations = [info.operation for info in self.ongoing_prefetch.values()]
         expired = [0] * len(operations)
         if self.pp_rank == 0:
+            if self.prefetch_stop_policy == "earliest_completion":
+                self._decide_fetch_or_prefill(operations)
             expired = [
                 int(self._prefetch_deadline_expired(operation))
                 for operation in operations
@@ -3018,7 +3110,7 @@ class UnifiedRadixCache(BasePrefixCache):
         digest = self.tree_core.write_back_duplicate_reclaim_digest
         if (
             self.enable_storage
-            and self.prefetch_stop_policy == "timeout"
+            and self.prefetch_stop_policy in _DEADLINE_PREFETCH_POLICIES
             and self.ongoing_prefetch
         ):
             live = "\0".join(
@@ -3153,7 +3245,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if not self._can_terminate_prefetch(operation):
                 self._start_storage_prefetch_wait(operation)
                 return False
-            if self.prefetch_stop_policy == "timeout":
+            if self.prefetch_stop_policy in _DEADLINE_PREFETCH_POLICIES:
                 self._mark_prefetch_deadline_expired(operation)
 
         self.cache_controller.terminate_prefetch(operation)

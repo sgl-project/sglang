@@ -554,6 +554,190 @@ class TestStoragePrefetchTimeout(unittest.TestCase):
             )
 
 
+def _decision_fixture(seconds_per_page, tokens_per_s):
+    """A bare cache with the two rates the earliest_completion decision reads."""
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.tree_core = SimpleNamespace(page_size=1)
+    cache.cache_controller = SimpleNamespace(prefetch_seconds_per_page=seconds_per_page)
+    cache._prefill_tokens_per_s = tokens_per_s
+    return cache
+
+
+def _hit(
+    pages, completed_tokens=0, fetch_decided=None, resolved=True, terminated=False
+):
+    return SimpleNamespace(
+        hash_value=["h"] * pages,
+        host_indices=torch.arange(pages) if resolved else None,
+        completed_tokens=completed_tokens,
+        fetch_decided=fetch_decided,
+        is_terminated=lambda: terminated,
+    )
+
+
+class TestEarliestCompletionPrefetch(unittest.TestCase):
+    def test_a_burst_is_split_between_the_reader_and_prefill(self):
+        # 100-page hits, read at 0.001 s per page, prefill at 400 tokens/s.
+        # Read ends at 0.1, 0.2, 0.3 s; prefill of one hit takes 0.25 s. The
+        # third hit prefills, and the fourth reads (0.3 s) before the prefill
+        # queued behind the third would end (0.5 s).
+        cache = _decision_fixture(0.001, 400.0)
+        hits = [_hit(100) for _ in range(4)]
+        cache._decide_fetch_or_prefill(hits)
+        self.assertEqual([h.fetch_decided for h in hits], [True, True, False, True])
+        self.assertEqual(cache._prefill_backlog_tokens, 100.0)
+
+    def test_a_decision_is_made_once_and_read_progress_shortens_the_queue(self):
+        cache = _decision_fixture(0.001, 400.0)
+        reading = _hit(100, completed_tokens=60, fetch_decided=True)
+        queued = _hit(100, fetch_decided=True)
+        released = _hit(100, fetch_decided=False)
+        # 40 + 100 pages ahead: the read ends at 0.24 s, prefill at 0.25 s.
+        new = _hit(100)
+        cache._decide_fetch_or_prefill([reading, queued, released, new])
+        self.assertEqual(
+            [h.fetch_decided for h in (reading, queued, released, new)],
+            [True, True, False, True],
+        )
+        # A hit released earlier is not charged to the prefill work again.
+        self.assertEqual(cache._prefill_backlog_tokens, 0.0)
+        # Without the progress 200 pages are ahead and the read ends at 0.3 s.
+        cache = _decision_fixture(0.001, 400.0)
+        late = _hit(100)
+        cache._decide_fetch_or_prefill(
+            [_hit(100, fetch_decided=True), _hit(100, fetch_decided=True), late]
+        )
+        self.assertIs(late.fetch_decided, False)
+        # A read cut by the timeout budget is no longer ahead of anything.
+        cache = _decision_fixture(0.001, 400.0)
+        after_cut = _hit(100)
+        cache._decide_fetch_or_prefill(
+            [
+                _hit(100, fetch_decided=True),
+                _hit(100, fetch_decided=True, terminated=True),
+                after_cut,
+            ]
+        )
+        self.assertIs(after_cut.fetch_decided, True)
+
+    def test_released_prefill_work_is_worked_off_at_the_prefill_rate(self):
+        # 1000 tokens released 1 s ago at 400 tokens/s leave 600. Prefill
+        # ends at (600 + 100) / 400 = 1.75 s, before the 2 s read.
+        cache = _decision_fixture(0.02, 400.0)
+        cache._prefill_backlog_tokens = 1000.0
+        cache._prefill_backlog_at = 50.0
+        hit = _hit(100)
+        with patch("time.monotonic", return_value=51.0):
+            cache._decide_fetch_or_prefill([hit])
+        self.assertIs(hit.fetch_decided, False)
+        self.assertEqual(cache._prefill_backlog_tokens, 700.0)
+        self.assertEqual(cache._prefill_backlog_at, 51.0)
+
+        # Released just now, the same work would end at 2.75 s: the read wins.
+        cache._prefill_backlog_tokens = 1000.0
+        cache._prefill_backlog_at = 51.0
+        hit = _hit(100)
+        with patch("time.monotonic", return_value=51.0):
+            cache._decide_fetch_or_prefill([hit])
+        self.assertIs(hit.fetch_decided, True)
+
+    def test_nothing_is_decided_without_both_rates_or_before_the_hit_is_known(self):
+        for seconds_per_page, tokens_per_s in ((None, 400.0), (0.001, None)):
+            cache = _decision_fixture(seconds_per_page, tokens_per_s)
+            hit = _hit(100)
+            cache._decide_fetch_or_prefill([hit])
+            self.assertIsNone(hit.fetch_decided)
+        # A tie goes to the read: one page at 0.25 s against 1 token at 4 tokens/s.
+        cache = _decision_fixture(0.25, 4.0)
+        tie = _hit(1)
+        cache._decide_fetch_or_prefill([tie])
+        self.assertIs(tie.fetch_decided, True)
+        # 100 pages at 0.002 s end at 0.2 s, before 0.25 s of prefill; they
+        # would not if the unresolved hit counted as queued ahead.
+        cache = _decision_fixture(0.002, 400.0)
+        unresolved, empty, known = _hit(100, resolved=False), _hit(0), _hit(100)
+        cache._decide_fetch_or_prefill([unresolved, empty, known])
+        self.assertEqual(
+            [unresolved.fetch_decided, empty.fetch_decided, known.fetch_decided],
+            [None, None, True],
+        )
+
+    def test_the_prefill_rate_comes_from_back_to_back_batches_of_some_size(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        with patch("time.monotonic", return_value=10.0):
+            cache.observe_prefill_tokens(4096)  # first batch after an idle gap
+        self.assertIsNone(cache._prefill_tokens_per_s)
+        with patch("time.monotonic", return_value=10.5):
+            cache.observe_prefill_tokens(4096)
+        self.assertEqual(cache._prefill_tokens_per_s, 8192.0)
+        with patch("time.monotonic", return_value=11.0):
+            cache.observe_prefill_tokens(512)  # too small to say much
+        self.assertEqual(cache._prefill_tokens_per_s, 8192.0)
+        with patch("time.monotonic", return_value=12.0):
+            cache.observe_prefill_tokens(4096)
+        # 0.7 * 8192 + 0.3 * 4096
+        self.assertAlmostEqual(cache._prefill_tokens_per_s, 6963.2)
+
+    def test_the_read_rate_is_an_average_over_read_batches(self):
+        cc = HybridCacheController.__new__(HybridCacheController)
+        self.assertIsNone(cc.prefetch_seconds_per_page)
+        cc._observe_prefetch_read(100, 0.2)
+        self.assertAlmostEqual(cc.prefetch_seconds_per_page, 0.002)
+        cc._observe_prefetch_read(100, 0.4)
+        # 0.7 * 0.002 + 0.3 * 0.004
+        self.assertAlmostEqual(cc.prefetch_seconds_per_page, 0.0026)
+
+    def _vote(self, seconds_per_page, policy="earliest_completion", completed=0):
+        cache, operation = _timeout_fixture(policy=policy)
+        operation.host_indices = torch.arange(8)
+        operation.hash_value = ["a", "b", "c", "d"]
+        operation.completed_tokens = completed
+        cache.cache_controller.prefetch_seconds_per_page = seconds_per_page
+        cache._prefill_tokens_per_s = 1000.0
+        _arm_tick(cache)
+        reduces = []
+        cache._all_reduce = lambda tensor, op: reduces.append(tensor.tolist())
+        cache.check_hicache_events()
+        return cache, operation, reduces
+
+    def test_a_hit_released_to_prefill_expires_in_the_same_vote(self):
+        # 4 pages at 1 s per page against 8 tokens at 1000 tokens/s.
+        cache, operation, reduces = self._vote(seconds_per_page=1.0)
+        self.assertEqual(reduces, [[1]])
+        self.assertIs(operation.fetch_decided, False)
+        self.assertTrue(operation.is_terminated())
+        self.assertTrue(cache._storage_prefetch_wait[_REQ].expired)
+
+    def test_a_hit_that_is_already_read_is_kept(self):
+        cache, operation, reduces = self._vote(seconds_per_page=1.0, completed=8)
+        self.assertEqual(reduces, [[0]])
+        self.assertFalse(operation.is_terminated())
+        self.assertEqual(cache._prefill_backlog_tokens, 0.0)
+
+    def test_the_timeout_policy_makes_and_reads_no_decision(self):
+        cache, operation, reduces = self._vote(seconds_per_page=1.0, policy="timeout")
+        self.assertEqual(reduces, [[0]])
+        self.assertIsNone(operation.fetch_decided)
+        operation.fetch_decided = False
+        cache.check_hicache_events()
+        self.assertEqual(reduces, [[0], [0]])
+        self.assertFalse(operation.is_terminated())
+
+    def test_a_hit_that_reads_first_keeps_waiting_under_the_timeout_budget(self):
+        # 4 pages at 0.001 s per page end before 8 ms of prefill.
+        cache, operation, reduces = self._vote(seconds_per_page=0.001)
+        self.assertEqual(reduces, [[0]])
+        self.assertIs(operation.fetch_decided, True)
+        self.assertFalse(operation.is_terminated())
+        with patch("time.perf_counter", return_value=100.0):
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+        # Budget 1.0 + 4 pages * 0.25 still caps the wait.
+        with patch("time.perf_counter", return_value=200.0):
+            cache.check_hicache_events()
+        self.assertEqual(reduces, [[0], [1]])
+        self.assertTrue(operation.is_terminated())
+
+
 def _two_rank_retry_trace(rank, rendezvous):
     torch.distributed.init_process_group(
         "gloo",

@@ -369,6 +369,10 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
 
 
 class HiCacheController:
+    # EWMA of the storage read time per page over fully read batches, written
+    # by the prefetch reader; None until a batch has been read.
+    prefetch_seconds_per_page: Optional[float] = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -1378,6 +1382,14 @@ class HiCacheController:
             count += 1
         return count
 
+    def _observe_prefetch_read(self, num_pages: int, seconds: float) -> None:
+        sample = seconds / num_pages
+        previous = self.prefetch_seconds_per_page
+        self.prefetch_seconds_per_page = (
+            # Weight of the newest sample: arbitrary.
+            sample if previous is None else 0.7 * previous + 0.3 * sample
+        )
+
     def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
@@ -1407,6 +1419,7 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
+                read_start = time.monotonic()
                 try:
                     hit_pages = self._page_transfer_kv_batch(
                         operation,
@@ -1415,6 +1428,10 @@ class HiCacheController:
                         extra_info,
                         kv_derived_transfers,
                     )
+                    if hit_pages == len(batch_hashes):
+                        self._observe_prefetch_read(
+                            hit_pages, time.monotonic() - read_start
+                        )
                 except Exception:
                     logger.exception(
                         "HiCache prefetch transfer failed for request %s",
