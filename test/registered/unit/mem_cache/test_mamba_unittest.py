@@ -27,8 +27,8 @@ from sglang.test.ci.ci_register import (
 )
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
-register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
+register_amd_ci(est_time=9, suite="base-b-test-1-gpu-small-amd")
+register_xpu_ci(est_time=20, suite="extra-test-1-gpu-xpu")
 
 
 class TestMamba(unittest.TestCase):
@@ -120,7 +120,7 @@ class TestMamba(unittest.TestCase):
             size=max_num_reqs,
             mamba_size=mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
@@ -188,7 +188,7 @@ class TestMamba(unittest.TestCase):
             cache_params = Mamba2CacheParams(shape=shape, layers=[0, 1])
         common = dict(
             size=4,
-            max_context_len=128,
+            row_width=128,
             device=get_device(),
             enable_memory_saver=False,
             cache_params=cache_params,
@@ -312,7 +312,7 @@ class TestMamba(unittest.TestCase):
             size=max_num_reqs,
             mamba_size=mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
@@ -379,7 +379,7 @@ class TestMamba(unittest.TestCase):
             size=10,
             mamba_size=20,
             mamba_spec_state_size=10,
-            max_context_len=128,
+            row_width=128,
             device=get_device(),
             enable_memory_saver=False,
             cache_params=cache_params,

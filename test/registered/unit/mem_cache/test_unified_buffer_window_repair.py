@@ -111,7 +111,7 @@ class TestUnifiedBufferWindowRepairAdmission(CustomTestCase):
         ).token_to_kv_pool_allocator
         params = CacheInitParams(
             req_to_token_pool=ReqToTokenPool(
-                size=4, max_context_len=tokens, device="cuda", enable_memory_saver=False
+                size=4, row_width=tokens, device="cuda", enable_memory_saver=False
             ),
             token_to_kv_pool_allocator=allocator,
             page_size=PAGE,

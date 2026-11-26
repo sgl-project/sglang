@@ -30,7 +30,7 @@ from sglang.srt.server_args import prepare_server_args
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=20, suite="extra-test-1-gpu-xpu")
 
 
 def reference_block_fp8_matmul(
