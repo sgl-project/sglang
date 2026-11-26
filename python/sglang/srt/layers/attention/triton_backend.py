@@ -343,7 +343,7 @@ class TritonAttnBackend(AttentionBackend):
         self.lean_v_head_dim = triton.next_power_of_2(
             max((self.v_head_dim, *self.extra_v_head_dims))
         )
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         # Lean decode persistent-grid size (depends only on head architecture).
