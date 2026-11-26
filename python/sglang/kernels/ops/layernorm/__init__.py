@@ -152,3 +152,18 @@ register_kernel(
         ),
     )
 )
+_SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
+for _fn in (
+    "attn_res_norm_bf16",
+    "loop_pre_attn_rmsnorm",
+    "loop_pre_mlp_rmsnorm",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.inkling2_{_fn}_sm120",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.layernorm.inkling2_norm_ctrl_sm120:{_fn}",
+            capabilities=_SM12X,
+        )
+    )
+del _fn
