@@ -222,8 +222,6 @@ def _dflash_commit_block_kernel(
     tl.store(num_accept_tokens_out_ptr + row * num_accept_stride, num_accept)
     tl.store(new_seq_lens_out_ptr + row * new_seq_lens_stride, prefix_len + num_accept)
 
-    # The drafts shifted left by one, zero in the last column, the bonus at the
-    # first rejected column.
     drafts = tl.load(
         candidates_ptr
         + row * candidates_row_stride

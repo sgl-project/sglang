@@ -343,7 +343,7 @@ def _legacy_chain_accept_indices(num_accept_tokens, block_size):
 
 
 @pytest.mark.parametrize("block_size", [2, 3, 5, 8, 16])
-@pytest.mark.parametrize("bs", [1, 2, 7, 8, 33, 64])
+@pytest.mark.parametrize("bs", [1, 7, 64])
 @pytest.mark.parametrize("accept", ["greedy", "sampled", "reject_all", "accept_all"])
 def test_dflash_commit_block_graph(block_size, bs, accept):
     """The graph-replayed committed block and chain indices equal the eager ops

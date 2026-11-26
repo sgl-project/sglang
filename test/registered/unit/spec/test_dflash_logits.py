@@ -450,9 +450,7 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
 def test_accept_commits_the_block_in_one_launch_into_the_accept_ring(
     monkeypatch, branch
 ):
-    """Every accept the greedy Triton kernel does not build commits through one
-    dflash_commit_block launch into the double-buffered accept outputs; once
-    that kernel fails, the eager commit returns no stale sequence lengths."""
+    """Once the greedy Triton kernel fails, the eager commit returns no stale lengths."""
     from types import MethodType
 
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod

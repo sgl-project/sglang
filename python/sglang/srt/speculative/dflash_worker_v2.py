@@ -2922,7 +2922,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         if SIMULATE_ACC_LEN > 0:
-            # new_seq_lens, if the Triton accept wrote it, holds the real
+            # new_seq_lens, if a Triton kernel wrote it, holds the real
             # accept; it comes back rewritten from the forced lengths, or None.
             new_seq_lens = apply_dflash_simulated_acceptance(
                 candidates=candidates,
