@@ -593,5 +593,10 @@ POSITIONAL_FIELD_ORDER = (
     "inkling2_loop_num_passes",
     "inkling2_loop_share_cache",
     "inkling2_tool_call_author_name_mode",
+    "prefill_delayer_mode",
+    "prefill_delayer_fill_ratio",
+    "prefill_delayer_stall_ticks",
+    "prefill_delayer_ttft_ticks",
+    "prefill_delayer_kv_high_watermark",
 )
 # fmt: on
