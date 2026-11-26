@@ -49,6 +49,29 @@ logger = logging.getLogger(__name__)
 _LORA_ID_LEN = 32
 
 
+def _normalize_lora_extra_key(extra_key: Optional[str]) -> Optional[str]:
+    """Drop the per-state bidir header so LoRA lookup stays bounded."""
+    if (
+        not extra_key
+        or not extra_key.startswith("bidir")
+        or extra_key.startswith("bidir-")
+    ):
+        return extra_key
+    parts = extra_key.split("|", 2)
+    if len(parts) == 3 and parts[1].isdigit():
+        return parts[2]
+    return extra_key
+
+
+def _extract_adapter_id_suffix(extra_key: str) -> str:
+    if extra_key.startswith("bidir") and not extra_key.startswith("bidir-"):
+        parts = extra_key.split("|", 2)
+        if len(parts) == 3 and parts[1].isdigit():
+            caller_key = parts[2][: int(parts[1])]
+            return caller_key[-_LORA_ID_LEN:]
+    return extra_key[-_LORA_ID_LEN:]
+
+
 class LoRANameTable:
     """Find the LoRA adapter name from the lora_id at the end of extra_key.
 
@@ -76,7 +99,7 @@ class LoRANameTable:
     def resolve(self, extra_key: Optional[str]) -> Optional[str]:
         if not extra_key:
             return None
-        return self._names.get(extra_key[-_LORA_ID_LEN:])
+        return self._names.get(_extract_adapter_id_suffix(extra_key))
 
 
 class KvEventLoraNames(LoRANameTable):
@@ -108,17 +131,17 @@ class KvEventLoraNames(LoRANameTable):
         lora_name = lora_name or self._adapter_names.get(req.lora_id)
         if not lora_name:
             return
-        self._names[req.extra_key] = lora_name
+        self._names[_normalize_lora_extra_key(req.extra_key)] = lora_name
 
     def get(self, extra_key: Optional[str]) -> Optional[str]:
-        return self._names.get(extra_key)
+        return self._names.get(_normalize_lora_extra_key(extra_key))
 
     def resolve(self, extra_key: Optional[str]) -> Optional[str]:
         if not extra_key:
             return None
-        return self._names.get(extra_key) or self._adapter_names.get(
-            extra_key[-_LORA_ID_LEN:]
-        )
+        return self._names.get(
+            _normalize_lora_extra_key(extra_key)
+        ) or self._adapter_names.get(_extract_adapter_id_suffix(extra_key))
 
 
 class MmRoutingLabels:
