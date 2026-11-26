@@ -767,5 +767,69 @@ def test_multimodal_requires_explicit_enable(tmp_path):
     assert enabled.hf_config.vision_config == _RELEASE_CONFIG["vision_config"]
 
 
+def test_project_sources_gates_3src_gemv_to_captured_decode_and_verify(monkeypatch):
+    """Keep eager short extends/decodes and captured extends on the stacked path."""
+    from sglang.kernels.ops.gemm import sm12x_bf16_gemv
+    from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+    from sglang.srt.models.inkling_common import inkling2_attn
+    from sglang.srt.models.inkling_common.inkling2_attn import (
+        AttentionSources,
+        Inkling2Attention,
+    )
+
+    split_sizes = [32, 32, 32, 32, 32, 32]
+    total_n = sum(split_sizes)
+    calls = []
+
+    class _StubQKVR:
+        def __init__(self):
+            self.weight = torch.zeros(total_n, 64, dtype=torch.bfloat16)
+            self.bias = None
+
+        def __call__(self, x):
+            calls.append("stacked")
+            return torch.zeros(x.shape[0], total_n, dtype=x.dtype), None
+
+    attn = Inkling2Attention.__new__(Inkling2Attention)
+    nn.Module.__init__(attn)
+    attn.split_sizes = split_sizes
+    attn.qkvr = _StubQKVR()
+    monkeypatch.setattr(attn, "_can_use_qkvr_fast_path", lambda: True)
+    monkeypatch.setattr(
+        inkling2_attn, "get_platform", lambda: SimpleNamespace(is_sm120=True)
+    )
+    monkeypatch.setattr(
+        inkling2_attn, "current_arch", lambda: SimpleNamespace(is_sm=lambda *_: True)
+    )
+    monkeypatch.setattr(sm12x_bf16_gemv, "use_sm12x_bf16_gemv_3src", lambda **_: True)
+
+    def _fake_3src(*, xq, weight, **_):
+        calls.append("gemv_3src")
+        return torch.zeros(xq.shape[0], weight.shape[0], dtype=xq.dtype)
+
+    monkeypatch.setattr(sm12x_bf16_gemv, "sm12x_bf16_gemv_3src", _fake_3src)
+
+    sources = AttentionSources(
+        torch.zeros(4, 64, dtype=torch.bfloat16),
+        torch.zeros(4, 64, dtype=torch.bfloat16),
+        torch.zeros(4, 64, dtype=torch.bfloat16),
+    )
+
+    for mode in (ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+        calls.clear()
+        attn._project_sources(sources, mode)
+        assert calls == ["stacked"], f"eager {mode} should stay on stacked path"
+
+    with model_capture_mode():
+        for mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            calls.clear()
+            attn._project_sources(sources, mode)
+            assert calls == ["stacked"], f"captured {mode} should stay on stacked path"
+        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            calls.clear()
+            attn._project_sources(sources, mode)
+            assert calls == ["gemv_3src"], f"captured {mode} should use 3-source GEMV"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

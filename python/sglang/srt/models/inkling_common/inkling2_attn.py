@@ -4,6 +4,7 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.inkling2_attn import (
     combine_gate_sink,
     compute_log_scaling_tau,
@@ -21,11 +22,17 @@ from sglang.kernels.ops.gemm.inkling2_linear import (
     linear_k_group_partials_pair,
     uses_k_groups,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.inkling_common.attn import (
     RelLogitsProj,
     get_inkling_relative_attention_score_mod,
@@ -33,7 +40,13 @@ from sglang.srt.models.inkling_common.attn import (
 )
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
-from sglang.srt.runtime_context import get_model, get_parallel, get_platform
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_model,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import get_device_core_count
 
 PADDED_DECODE_MIN_TOKENS = 8
@@ -420,8 +433,57 @@ class Inkling2Attention(nn.Module):
         projected, _ = self.qkvr(x)
         return projected.split(self.split_sizes, dim=-1)[:6]
 
-    def _project_sources(self, sources):
+    def _can_use_qkvr_fast_path(self) -> bool:
+        return not (
+            type(self.qkvr) is not MergedColumnParallelLinear
+            or type(self.qkvr.quant_method) is not UnquantizedLinearMethod
+            or type(self.qkvr.weight.data) is not torch.Tensor
+            or self.qkvr.gather_output
+            or self.qkvr.skip_bias_add
+            or self.qkvr._forward_hooks
+            or self.qkvr._forward_pre_hooks
+            or (get_forward().sp_active and self.tp_size > 1)
+            or torch.compiler.is_compiling()
+            or is_batch_invariant_mode_enabled()
+            or get_exec().deterministic.enable_deterministic_inference
+            or not get_bf16_gemm_backend().is_auto()
+        )
+
+    def _project_sources(self, sources, forward_mode=None):
         if len({id(sources.q), id(sources.k), id(sources.v)}) == 3:
+            if (
+                get_platform().is_sm120
+                and get_is_capture_mode()
+                and (
+                    forward_mode is None
+                    or forward_mode.is_decode()
+                    or forward_mode.is_target_verify()
+                )
+                and self._can_use_qkvr_fast_path()
+            ):
+                from sglang.kernels.ops.gemm.sm12x_bf16_gemv import (
+                    sm12x_bf16_gemv_3src,
+                    use_sm12x_bf16_gemv_3src,
+                )
+
+                k_lo = self.split_sizes[0]
+                v_lo = k_lo + self.split_sizes[1]
+                r_lo = v_lo + self.split_sizes[2]
+                gemv_kwargs = dict(
+                    xq=sources.q,
+                    xk=sources.k,
+                    xv=sources.v,
+                    weight=self.qkvr.weight,
+                    k_lo=k_lo,
+                    v_lo=v_lo,
+                    r_lo=r_lo,
+                    bias=self.qkvr.bias,
+                )
+                if use_sm12x_bf16_gemv_3src(**gemv_kwargs):
+                    projected = sm12x_bf16_gemv_3src(
+                        **gemv_kwargs, use_pdl=current_arch().is_sm(12, 0)
+                    )
+                    return projected.split(self.split_sizes, dim=-1)[:6]
             q_proj, k_proj, v_proj = (
                 projected.split(self.split_sizes, dim=-1)[:6]
                 for projected in self.qkvr(_stacked(sources))[0].chunk(3)
@@ -468,9 +530,9 @@ class Inkling2Attention(nn.Module):
             if isinstance(hidden_states, torch.Tensor)
             else hidden_states
         )
-        q, k, v, r, gate, sinks = self._project_sources(sources)
-        tokens = q.shape[0]
         mode = forward_batch.forward_mode
+        q, k, v, r, gate, sinks = self._project_sources(sources, mode)
+        tokens = q.shape[0]
         verify = mode.is_target_verify()
         compact = (
             not fa4_mxfp8

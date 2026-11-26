@@ -437,6 +437,14 @@ register_kernel(
         capabilities=_SM12X,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.sm12x_bf16_gemv_3src",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.sm12x_bf16_gemv:sm12x_bf16_gemv_3src",
+        capabilities=_SM12X,
+    )
+)
 for _name, _backend in (
     ("nvfp4_expert_matmul", KernelBackend.FLASHINFER),
     ("mxfp8_expert_matmul", KernelBackend.FLASHINFER),
