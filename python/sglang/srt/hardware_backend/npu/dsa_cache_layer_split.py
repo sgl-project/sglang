@@ -16,7 +16,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool, NPUDSATokenToKVPool
+from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+    NPUMLATokenToKVPool,
+    NPUDSATokenToKVPool,
+)
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
 from sglang.srt.runtime_context import get_parallel
@@ -823,9 +826,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         torch.npu.synchronize()
 
 
-class LayerSplitNPUDSATokenToKVPool(
-    LayerSplitNPUMLATokenToKVPool, NPUDSATokenToKVPool
-):
+class LayerSplitNPUDSATokenToKVPool(LayerSplitNPUMLATokenToKVPool, NPUDSATokenToKVPool):
     """Hybrid DSA constructor/layout with the NPU layer-split storage contract.
 
     The DSA constructor translates skipped indexer layers before the common

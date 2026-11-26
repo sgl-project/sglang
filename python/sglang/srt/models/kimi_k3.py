@@ -33,6 +33,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers import layernorm_sp, zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
+from sglang.srt.layers.attention.dsa.utils import maybe_prefetch_next_full_attention_kv
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
@@ -3203,6 +3204,7 @@ class KimiK3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self._is_moe_layer = _is_moe_layer(config, layer_idx)
+        self.next_full_attention_layer_id = None
         # SP-MoE: with an EP a2a backend and attention TP, a MoE layer runs on
         # this rank's attention-TP shard of the rows.
         self._sp_moe = self._is_moe_layer and _shards_moe_rows()
@@ -3395,6 +3397,9 @@ class KimiK3DecoderLayer(nn.Module):
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
 
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, self.next_full_attention_layer_id
+        )
         return result
 
     def forward(
@@ -3568,6 +3573,17 @@ class KimiK3LinearModel(nn.Module):
                 config, idx, sp_collective=sp_collective
             ),
         )
+        local_full_layers = [
+            i
+            for i in config.full_attention_layer_ids
+            if self.start_layer <= i < self.end_layer
+        ]
+        for layer_id, next_layer_id in zip(local_full_layers, local_full_layers[1:]):
+            self.layers[layer_id].next_full_attention_layer_id = next_layer_id
+        # A leading KDA layer can prefetch the first local Full Attention layer.
+        if local_full_layers and self.start_layer < local_full_layers[0]:
+            first_layer = self.layers[self.start_layer]
+            first_layer.next_full_attention_layer_id = local_full_layers[0]
         if self.kda_dwdp is not None:
             self.kda_dwdp.build()
         if _is_gfx95:

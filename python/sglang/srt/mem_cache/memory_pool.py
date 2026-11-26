@@ -4547,6 +4547,26 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+    def prefetch_kv_buffer(self, layer_id: int, **kwargs):
+        if not getattr(self.full_kv_pool, "layer_shard_enabled", False):
+            return
+        self.full_kv_pool.prefetch_kv_buffer(
+            self._transfer_full_attention_id(layer_id),
+            layer_transfer_counter=self.layer_transfer_counter,
+            layer_transfer_idx=layer_id - self.start_layer,
+            **kwargs,
+        )
+
+    def prefetch_index_k_buffer(self, layer_id: int, **kwargs):
+        prefetch = getattr(self.full_kv_pool, "prefetch_index_k_buffer", None)
+        if (
+            not getattr(self.full_kv_pool, "layer_shard_enabled", False)
+            or prefetch is None
+        ):
+            return
+        self._wait_for_layer(layer_id)
+        prefetch(self._transfer_full_attention_id(layer_id), **kwargs)
+
     def get_combined_kv_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         return self.full_kv_pool.get_combined_kv_buffer(
@@ -4640,6 +4660,9 @@ class HybridLinearKVPool(KVCache):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
+        *,
+        cp_gathered_full: bool = False,
+        cp_gathered_chunk: bool = False,
     ):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
         # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
@@ -4665,11 +4688,20 @@ class HybridLinearKVPool(KVCache):
             # MLA pools whose set_kv_buffer takes no layer_id_override (the
             # FP4 and NPU ones) address the layer by `layer.layer_id`.
             with self._transfer_id_context(layer):
+                cp_kwargs = (
+                    dict(
+                        cp_gathered_full=cp_gathered_full,
+                        cp_gathered_chunk=cp_gathered_chunk,
+                    )
+                    if cp_gathered_full or cp_gathered_chunk
+                    else {}
+                )
                 self.full_kv_pool.set_kv_buffer(
                     layer,
                     write_loc,
                     cache_k,
                     cache_v,
+                    **cp_kwargs,
                 )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
