@@ -2777,6 +2777,11 @@ class DeepseekV2DecoderLayer(nn.Module):
                 reduce_results=False,
                 allow_fused_down=False,
             )
+        # Start the next layer's layer-split KV broadcast after the MoE when the
+        # MoE kernel cannot overlap another collective; otherwise before it.
+        self.prefetch_kv_after_mlp = (
+            self.is_layer_sparse and get_moe_a2a_backend().runs_persistent_kernel()
+        )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -2951,9 +2956,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
 
-        maybe_prefetch_next_full_attention_kv(
-            forward_batch, next_full_attention_layer_id
-        )
+        if not self.prefetch_kv_after_mlp:
+            maybe_prefetch_next_full_attention_kv(
+                forward_batch, next_full_attention_layer_id
+            )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
@@ -2981,6 +2987,11 @@ class DeepseekV2DecoderLayer(nn.Module):
                 gemm_output_zero_allocator,
             )
         hidden_states = ffn_exit.finish(hidden_states)
+
+        if self.prefetch_kv_after_mlp:
+            maybe_prefetch_next_full_attention_kv(
+                forward_batch, next_full_attention_layer_id
+            )
 
         return (hidden_states, topk_indices)
 

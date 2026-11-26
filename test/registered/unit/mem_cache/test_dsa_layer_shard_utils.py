@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -29,36 +30,56 @@ class TestDSALayerShardUtils(CustomTestCase):
         ranges = [get_layer_shard_range(rank, 4, 2) for rank in range(4)]
         self.assertEqual(ranges, [(0, 1), (1, 2), (2, 2), (2, 2)])
 
-    def test_prefetch_uses_sync_fallback_without_dedicated_communicator(self):
-        broadcasts = []
-        counter = SimpleNamespace(wait_until=lambda _: self.fail("unexpected wait"))
+    @staticmethod
+    def _prefetch_stand_in(events, layer_broadcast_comm):
+        # A lightweight stand-in for the real pool so prefetch_kv_buffer can be
+        # exercised on CPU; it records the HiCache load wait and the broadcast.
         pool = SimpleNamespace(
             remote_kv_layer_id=None,
             pending_remote_kv_broadcast=False,
             pending_remote_kv_layer_id=None,
-            layer_broadcast_comm=None,
+            layer_broadcast_comm=layer_broadcast_comm,
+            layer_transfer_counter=SimpleNamespace(
+                wait_until=lambda idx: events.append(("wait", idx))
+            ),
             remote_kv_buffer=object(),
-            kv_buffer=[object()],
-            start_layer=0,
-            _local_layer_idx=lambda layer_id: layer_id,
+            kv_buffer=[object(), object(), object()],
+            start_layer=10,
+            _local_layer_idx=lambda layer_id: layer_id - 10,
             _is_layer_owned=lambda _: True,
+            kv_broadcast_stream=SimpleNamespace(wait_stream=lambda _stream: None),
+            device_module=SimpleNamespace(
+                current_stream=lambda: object(),
+                stream=lambda _stream: nullcontext(),
+            ),
         )
 
         def broadcast(tensor, layer_id, *, src_tensor, use_layer_broadcast_comm):
-            broadcasts.append((tensor, layer_id, src_tensor, use_layer_broadcast_comm))
+            events.append(("broadcast", layer_id))
 
         pool._broadcast_tensor_from_owner = broadcast
-        # Bind the real method against a lightweight stand-in so the sync
-        # (no dedicated NCCL comm) fallback path can be exercised on CPU.
-        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(
-            pool,
-            layer_id=0,
-            layer_transfer_counter=counter,
-            layer_transfer_idx=3,
-        )
+        return pool
 
-        self.assertEqual(len(broadcasts), 1)
-        self.assertEqual(pool.remote_kv_layer_id, 0)
+    def test_prefetch_sync_fallback_waits_for_layer_load(self):
+        # Without the dedicated NCCL comm the broadcast runs on the caller's
+        # stream; it must still wait for HiCache to load the prefetched layer.
+        events = []
+        pool = self._prefetch_stand_in(events, layer_broadcast_comm=None)
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, layer_id=12)
+
+        self.assertEqual(events, [("wait", 2), ("broadcast", 12)])
+        self.assertEqual(pool.remote_kv_layer_id, 12)
+
+    def test_prefetch_async_waits_for_layer_load(self):
+        # The prefetch is issued one layer ahead, when the caller has only waited
+        # for the layers it has read, so the broadcast must wait for this layer.
+        events = []
+        pool = self._prefetch_stand_in(events, layer_broadcast_comm=object())
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, layer_id=11)
+
+        self.assertEqual(events, [("wait", 1), ("broadcast", 11)])
+        self.assertTrue(pool.pending_remote_kv_broadcast)
+        self.assertEqual(pool.pending_remote_kv_layer_id, 11)
 
     def test_finalize_pending_broadcast_promotes_layer_id(self):
         # After an async prefetch, finalizing must promote pending -> remote so a

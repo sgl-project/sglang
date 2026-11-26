@@ -96,6 +96,11 @@ class MoeA2ABackend(Enum):
     def is_flashinfer_megamoe(self):
         return self == MoeA2ABackend.FLASHINFER_MEGAMOE
 
+    def runs_persistent_kernel(self) -> bool:
+        # The MoE kernel keeps its whole grid resident and syncs across ranks in
+        # kernel, so it must not overlap a collective issued on another stream.
+        return self.is_megamoe() or self.is_flashinfer_megamoe()
+
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
 

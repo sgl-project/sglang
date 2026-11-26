@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 
@@ -47,9 +47,6 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.async_probe import maybe_detect_oob
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
 
@@ -410,17 +407,14 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.remote_kv_layer_id = self.pending_remote_kv_layer_id
         self.pending_remote_kv_layer_id = None
 
-    def prefetch_kv_buffer(
-        self,
-        layer_id: int,
-        layer_transfer_counter: Optional[LayerDoneCounter] = None,
-        layer_transfer_idx: Optional[int] = None,
-    ) -> None:
+    def prefetch_kv_buffer(self, layer_id: int) -> None:
         """Kick off an async owner-broadcast of ``layer_id``'s latent KV.
 
         Called ahead of the layer's attention so the remote scratch buffer is
         ready by the time a non-owner rank reads it (see the prefetch wiring in
-        ``DeepseekV2DecoderLayer``).
+        ``DeepseekV2DecoderLayer``). The broadcast first waits for HiCache to
+        finish loading this layer, since the caller has only waited for the
+        layers it has already read.
         """
         if self.remote_kv_layer_id == layer_id:
             return
@@ -433,7 +427,10 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         src_tensor = (
             self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
         )
+        counter = self.layer_transfer_counter
         if self.layer_broadcast_comm is None:
+            if counter is not None:
+                counter.wait_until(local_idx)
             self._broadcast_tensor_from_owner(
                 self.remote_kv_buffer,
                 layer_id,
@@ -445,8 +442,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
         self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.kv_broadcast_stream):
-            if layer_transfer_counter is not None and layer_transfer_idx is not None:
-                layer_transfer_counter.wait_until(layer_transfer_idx)
+            if counter is not None:
+                counter.wait_until(local_idx)
             self._broadcast_tensor_from_owner(
                 self.remote_kv_buffer,
                 layer_id,
