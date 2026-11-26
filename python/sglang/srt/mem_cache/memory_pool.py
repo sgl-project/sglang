@@ -1455,6 +1455,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
+        mamba_pool_cls: type[MambaPool] | None = None,
     ):
         super().__init__(
             size=size,
@@ -1462,6 +1463,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
+
+        if mamba_pool_cls is not None:
+            self.mamba_pool_cls = mamba_pool_cls
 
         self.mamba_ping_pong_track_buffer_size = get_mamba_tracking_slots(
             extra_buffer=True, overlap=enable_overlap_schedule
