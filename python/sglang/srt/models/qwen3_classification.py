@@ -52,7 +52,6 @@ class Qwen3ForPooledOutput(nn.Module):
         self.model = Qwen3Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        self.eos_token_id = config.eos_token_id
         # Subclasses must set self.score and self.pooler
 
     def get_input_embeddings(self) -> nn.Embedding:
