@@ -32,6 +32,41 @@ class TestSchedulerWeightPuller(CustomTestCase):
     def tearDownClass(cls):
         torch.distributed.destroy_process_group()
 
+    def test_snapshot_after_reload_uses_the_launch_checkpoint_as_version_zero(self):
+        req = PullWeightsReqInput(
+            local_checkpoint_dir="/local",
+            source_dir="/published",
+            target_version=2,
+            snapshot=True,
+        )
+        initial = SimpleNamespace(model_path="/base")
+        live = SimpleNamespace(
+            model_path="/local/.weight_sync/snapshots/v000001",
+            download_dir=None,
+            revision=None,
+            custom_pull_weights_pre_read_hook=None,
+        )
+        puller = weight_puller.SchedulerWeightPuller(
+            tp_cpu_group=None, ipc_channels=None
+        )
+        with (
+            patch.object(
+                weight_puller,
+                "get_context",
+                return_value=SimpleNamespace(server_args=initial),
+            ),
+            patch.object(weight_puller, "get_model", return_value=live),
+            patch.object(
+                weight_puller,
+                "download_weights_from_hf",
+                side_effect=lambda path, **_: path,
+            ),
+            patch.object(local_checkpoint, "pull") as materialize,
+        ):
+            puller._pull(req)
+        self.assertIsNone(puller._error)
+        self.assertEqual(materialize.call_args.kwargs["base_dir"], initial.model_path)
+
     def test_pull_runs_off_the_event_loop_and_replies_once_done(self):
         """The event loop must keep iterating while a pull copies weights, and reply only once it finishes."""
         release = threading.Event()
