@@ -126,7 +126,9 @@ def glm_route_sort(
     moe_buf: Optional[torch.Tensor] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-    """Returns (weights [M, 9] fp32, ids [M, 9] int32, sort) where sort holds
+    """Routes 1 to 64 tokens.
+
+    Returns (weights [M, 9] fp32, ids [M, 9] int32, sort) where sort holds
     sorted_token_ids, sorted_weights, sorted_expert_ids and num_valid_ids in
     aiter moe_sorting's layout for the mask keeping global experts
     [routed_begin, routed_begin + num_routed) and the shared expert 256.

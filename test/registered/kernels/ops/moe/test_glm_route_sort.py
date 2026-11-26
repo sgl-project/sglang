@@ -75,6 +75,7 @@ def _aiter_route_and_sort(scores, bias, n_real, block_m, routed_begin, num_route
     aiter_biased_grouped_topk(scores.float(), bias, weights, ids, 1, 1, True, SCALING)
     ids, weights = fused_append_shared_experts(ids, weights, 1, SHARED_WEIGHT, E)
     ids, weights = ids.clone(), weights.clone()
+    n_real = max(n_real, 0)
     ids[n_real:, : TOPK - 1] = 0
     weights[n_real:] = 0.0
     sort = aiter_moe_sorting(
@@ -162,11 +163,13 @@ def test_matches_aiter_route_and_sort(m, dtype, block_m, ep):
     _assert_matches_aiter(m, m, dtype, block_m, *ep, seed=m * 131 + block_m)
 
 
-@pytest.mark.parametrize("m, n_real", [(4, 1), (12, 7), (64, 33), (9, 0), (1, 0)])
+@pytest.mark.parametrize(
+    "m, n_real", [(4, 1), (12, 7), (64, 33), (9, 0), (1, 0), (8, -3), (33, -1)]
+)
 def test_padded_rows_route_like_the_hip_mask(m, n_real):
     """select_experts masks CUDA-graph padding rows to expert 0 and weight 0 on
     HIP, and AITER matches the sort by tensor address, so the sort has to
-    describe the masked rows."""
+    describe the masked rows. A negative count pads every row."""
     _assert_matches_aiter(m, n_real, torch.bfloat16, 32, 64, 64, seed=m + n_real)
 
 
@@ -208,6 +211,13 @@ def test_multi_block_waits_for_an_eager_counter_under_capture():
     with torch.cuda.graph(graph, stream=stream):
         assert not glm_route_sort.ready(scores.device, m)
         assert glm_route_sort.ready(scores.device, 8)
+
+
+def test_rejects_an_empty_batch():
+    """An empty batch would leave num_valid_ids unwritten for fused_moe."""
+    scores, bias = _inputs(0, torch.float32, seed=0)
+    with pytest.raises(Exception):
+        _route_sort(scores, bias, None, 32, 0, E)
 
 
 def test_rejects_a_moe_buf_it_cannot_zero():

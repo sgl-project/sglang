@@ -246,7 +246,7 @@ SGL_DEVICE void route_token(
 }
 
 SGL_DEVICE void zero_row(void* buf, int row, int dim) {
-  int4* v = reinterpret_cast<int4*>(buf) + static_cast<long long>(row) * dim / 8;
+  int4* v = reinterpret_cast<int4*>(buf) + static_cast<int64_t>(row) * dim / 8;
   const int nvec = dim / 8;
   const int4 zero = make_int4(0, 0, 0, 0);
   for (int i = threadIdx.x; i < nvec; i += kGlmBlock)
@@ -281,8 +281,9 @@ __global__ void __launch_bounds__(kGlmBlock) glm_route_sort_kernel(const GlmRout
   const int wave = tid / kGlmWave;
   const int M = p.num_tokens;
   const int num_local = p.num_routed + 1;
+  // A negative count pads every row, as the HIP mask in select_experts does.
   int n_real = M;
-  if (p.num_non_padded != nullptr) n_real = *p.num_non_padded < M ? *p.num_non_padded : M;
+  if (p.num_non_padded != nullptr) n_real = min(max(*p.num_non_padded, 0), M);
   const int t_begin = static_cast<int>(blockIdx.x) * p.tokens_per_block;
   const int t_end = t_begin + p.tokens_per_block < M ? t_begin + p.tokens_per_block : M;
 
@@ -336,7 +337,9 @@ __global__ void __launch_bounds__(kGlmBlock) glm_route_sort_kernel(const GlmRout
       s_ids[tid] = p.out_i[tid];
       s_w[tid] = p.out_w[tid];
     }
-    if (tid == 0) p.sort_ws[0] = 0;
+    // Stored through at agent scope, so the next launch's arrivals on other XCDs
+    // see the reset without depending on this XCD's L2 write-back.
+    if (tid == 0) __hip_atomic_store(&p.sort_ws[0], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   }
   __syncthreads();
 
@@ -443,7 +446,8 @@ struct GlmRouteSortKernel {
 
     RuntimeCheck(N_.unwrap() == kGlmExperts, "glm_route_sort is specialized for 256 routed experts");
     const int64_t M = M_.unwrap();
-    RuntimeCheck(M <= kGlmMaxTokens, "glm_route_sort routes at most 64 tokens");
+    // An empty batch would return num_valid_ids unwritten.
+    RuntimeCheck(M >= 1 && M <= kGlmMaxTokens, "glm_route_sort routes 1 to 64 tokens");
     RuntimeCheck(
         routed_begin >= 0 && num_routed >= 1 && routed_begin + num_routed <= kGlmExperts,
         "local routed experts must be a range of the 256");
@@ -456,7 +460,6 @@ struct GlmRouteSortKernel {
     const int64_t capacity = (padded_rows + block_m - 1) / block_m * block_m;
     RuntimeCheck(S_.unwrap() == capacity, "sorted rows must be sized as aiter's moe_sorting sizes them");
     RuntimeCheck(sorted_expert_ids.size(0) * block_m == capacity, "one expert id per block_m sorted rows");
-    if (M == 0) return;
 
     void* moe_ptr = nullptr;
     uint32_t moe_dim = 0;
