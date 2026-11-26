@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
+    _is_mlu,
     _is_musa,
     _is_npu,
     _use_aiter_gfx95,
@@ -668,6 +669,7 @@ class DeepseekMHAForwardMixin:
         if (
             _is_cuda
             or _use_aiter_gfx95
+            or _is_mlu
             or getattr(get_token_to_kv_pool(), "mla_seg_page_layout", False)
         ):
             kv_a, k_pe = (
