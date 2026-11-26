@@ -195,6 +195,7 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
     quant_blocks_shared_experts_fusion,
 )
+from sglang.srt.models.deepseek_common.v4_weight_names import remap_v4_weight_name
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
@@ -1076,16 +1077,8 @@ class MqaAttentionBase(nn.Module):
         fuse: bool = (
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
-        # Separate ModelSlim projections carry their own INT8 quantization
-        # parameters, which the native weight/FP8-scale fusion cannot merge.
-        if (
-            fuse
-            and quant_config is not None
-            and quant_config.get_name() == "modelslim"
-            and add_prefix("wqkv_a.weight", prefix)
-            not in quant_config.quant_description
-        ):
-            fuse = False
+        if fuse and quant_config is not None:
+            fuse = quant_config.supports_fused_projection(add_prefix("wqkv_a", prefix))
         fp8: bool = (
             wo_a_fp8_gemm_enabled(quant_config) if wo_a_fp8 is None else wo_a_fp8
         )
@@ -1238,17 +1231,11 @@ class MqaAttentionBase(nn.Module):
             or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
         )
 
-    def _kernel_num_heads(self, num_tokens: int) -> int:
-        if self.attn_tp_size == 1:
+    def _kernel_num_heads(self, num_tokens: int, attn_backend) -> int:
+        if self.attn_tp_size == 1 or (
+            self.is_dsv41 and getattr(attn_backend, "supports_unpadded_dsv41_q", False)
+        ):
             return self.n_local_heads
-
-        if _is_npu and self.is_dsv41:
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-            # A3 BF16 SMLA accepts the per-rank width (e.g. TP16/DP8: 32).
-            # The A5 mixed-quant kernel retains its existing 64-head padding.
-            if not is_npu_arch35():
-                return self.n_local_heads
 
         if get_platform().is_sm120:
             # Prefill already accepts the native per-rank query width.
@@ -2848,7 +2835,7 @@ class MQALayer(MqaAttentionBase):
             kernel_num_heads = (
                 self.n_local_heads
                 if _is_hip and not unified and _hip.skip_head_pad(self)
-                else self._kernel_num_heads(x.shape[0])
+                else self._kernel_num_heads(x.shape[0], attn_backend)
             )
             if kernel_num_heads != self.n_local_heads:
                 # Backends without an exact-head specialization retain the existing
@@ -4387,9 +4374,7 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     input_ids=input_ids,
                     cp_all_tokens=cp_extend,
-                    gate_basis=(
-                        getattr(self, "engram_gate_basis", None) if _is_npu else None
-                    ),
+                    gate_basis=getattr(self, "engram_gate_basis", None),
                 )
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
@@ -5335,81 +5320,6 @@ class DeepseekV4ForCausalLM(
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
-    def _load_npu_engram_gate_basis(self) -> None:
-        """Load the ModelSlim sidecar once, shared by this rank's Engram layers."""
-        if (
-            not _is_npu
-            or self.quant_config is None
-            or self.quant_config.get_name() != "modelslim"
-        ):
-            return
-        rotation = getattr(self.config, "engram_rotation_config", None)
-        if not rotation:
-            return
-        expected = {
-            "value_projection_rotated": True,
-            "value_basis": "quarot_global",
-            "key_and_gate_basis": "original",
-            "runtime_delta_rotation": False,
-        }
-        if not isinstance(rotation, dict) or any(
-            rotation.get(key) != value for key, value in expected.items()
-        ):
-            raise ValueError(f"Unsupported ModelSlim Engram rotation: {rotation}")
-        if getattr(self.model, "engram_gate_basis", None) is not None:
-            return
-        engram = next(
-            (
-                layer.engram
-                for layer in self.model.layers
-                if getattr(layer, "engram", None) is not None
-            ),
-            None,
-        )
-        if engram is None:
-            return
-        if engram.q_weight.is_meta:
-            raise ValueError("Load Engram weights before loading the gate rotation")
-
-        from pathlib import Path
-
-        from safetensors import safe_open
-
-        from sglang.srt.runtime_context import get_context, get_model
-
-        if get_context().is_config_namespace_published("model"):
-            from sglang.srt.model_loader.loader import loaded_checkpoint_files
-
-            # A checkpoint's config can still name a different, existing directory.
-            config = get_model()
-            loaded = loaded_checkpoint_files(config.model_path, config.revision)
-            model_path = loaded[0] if loaded is not None else config.model_path
-        else:
-            model_path = getattr(self.config, "_name_or_path", None)
-        if not model_path:
-            raise ValueError("ModelSlim Engram rotation requires the checkpoint path")
-        path = Path(model_path) / "optional" / "quarot.safetensors"
-        if not path.is_file():
-            raise FileNotFoundError(f"ModelSlim Engram rotation requires {path}")
-        with safe_open(str(path), framework="pt", device="cpu") as tensors:
-            if "global_rotation" not in tensors.keys():
-                raise ValueError(f"Missing global_rotation in {path}")
-            basis = tensors.get_tensor("global_rotation")
-        dim = self.config.hidden_size
-        if basis.shape != (dim, dim) or not basis.is_floating_point():
-            raise ValueError(
-                f"global_rotation must be a floating-point [{dim}, {dim}] tensor"
-            )
-        basis = basis.float()
-        if not torch.isfinite(basis).all():
-            raise ValueError("global_rotation contains non-finite values")
-        self.model.register_buffer(
-            "engram_gate_basis",
-            basis.to(device=engram.q_weight.device),
-            persistent=False,
-        )
-        logger.info("Loaded ModelSlim Engram gate rotation from %s", path)
-
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
@@ -5420,7 +5330,9 @@ class DeepseekV4ForCausalLM(
 
         if is_nextn:
             return
-        self._load_npu_engram_gate_basis()
+        load_gate_basis = getattr(self.quant_config, "load_engram_gate_basis", None)
+        if load_gate_basis is not None:
+            load_gate_basis(self.config, self.model)
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
@@ -5464,76 +5376,7 @@ class DeepseekV4ForCausalLM(
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
 
-    @staticmethod
-    def remap_weight_name_to_dpsk_hf_format(
-        name: str,
-        is_nextn: bool = False,
-        num_hidden_layers: Optional[int] = None,
-    ) -> str:
-        if name.startswith("vision."):
-            return name.replace(".attn.wqkv.", ".attn.qkv_proj.").replace(
-                ".attn.wo.", ".attn.proj."
-            )
-        if name.startswith(("aligner.", "image_")):
-            return name
-        if name.startswith("embed."):
-            return "model.embed_tokens." + name.removeprefix("embed.")
-        if name.startswith("head."):
-            return "lm_head." + name.removeprefix("head.")
-        if name == "norm.weight":
-            return "model.norm.weight"
-        if name.startswith("hc_head_"):
-            return "model." + name
-
-        if is_nextn and name.startswith("mtp."):
-            parts = name.split(".", 2)
-            if len(parts) >= 3:
-                rest = parts[2]
-                nextn_spec_prefixes = [
-                    "e_proj",
-                    "h_proj",
-                    "emb",
-                    "enorm",
-                    "hnorm",
-                    "norm",
-                    "head",
-                    "hc_head",
-                ]
-                is_nextn_spec = any(rest.startswith(p) for p in nextn_spec_prefixes)
-                if is_nextn_spec:
-                    if rest.startswith("emb.tok_emb"):
-                        rest = rest.replace("emb.tok_emb", "embed_tokens")
-                    elif rest == "norm.weight":
-                        rest = "shared_head.norm.weight"
-                    elif rest.startswith("head."):
-                        rest = "shared_head.head.weight"
-                    elif rest == "e_proj.scale":
-                        rest = "e_proj.weight_scale_inv"
-                    elif rest == "h_proj.scale":
-                        rest = "h_proj.weight_scale_inv"
-                name = f"model.layers.{num_hidden_layers}." + rest
-
-        if name.startswith("layers."):
-            name = "model." + name
-        name = name.replace(".attn.", ".self_attn.")
-        name = name.replace(".ffn.", ".mlp.")
-        name = name.replace(".attn_norm.", ".input_layernorm.")
-        name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
-
-        if "self_attn" in name and name.endswith(".scale"):
-            name = name.removesuffix(".scale") + ".weight_scale_inv"
-        if ".engram.wkv." in name and name.endswith(".scale"):
-            name = name.removesuffix(".scale") + ".weight_scale_inv"
-
-        name = name.replace(".gate.tid2eid", ".topk.tid2eid")
-        name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
-        name = name.replace(".w1.", ".gate_proj.")
-        name = name.replace(".w2.", ".down_proj.")
-        name = name.replace(".w3.", ".up_proj.")
-        if "mlp" in name and name.endswith(".scale"):
-            name = name.removesuffix(".scale") + ".weight_scale_inv"
-
-        return name
+    remap_weight_name_to_dpsk_hf_format = staticmethod(remap_v4_weight_name)
 
     def _prewarm_mhc_kernels(self) -> None:
         """One-shot MHC JIT prewarm at load time, synced across ranks.

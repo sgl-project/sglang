@@ -1,7 +1,10 @@
 """ModelSlim name resolution and weight dtypes, using small CPU layers."""
 
+import json
 import unittest
 from copy import copy, deepcopy
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,6 +27,63 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestModelSlimMapping(CustomTestCase):
+    def test_sidecar_uses_model_context_without_heuristic_markers(self):
+        from sglang.srt.configs.load_config import LoadConfig
+        from sglang.srt.model_loader.weight_utils import get_quant_config
+
+        raw = "layers.0.attn.wq_a.weight"
+        # Exercise the loader's sidecar path without depending on the CI CPU's
+        # device-specific quantization registry.
+        with (
+            TemporaryDirectory() as path,
+            patch(
+                "sglang.srt.model_loader.weight_utils.get_quantization_config",
+                return_value=ModelSlimConfig,
+            ),
+        ):
+            Path(path, "quant_model_description.json").write_text(
+                json.dumps({raw: "W8A8_DYNAMIC"})
+            )
+            for arch, expected in (
+                ("DeepseekV4ForCausalLM", "model.layers.0.self_attn.wq_a.weight"),
+                ("OtherModel", raw),
+            ):
+                with self.subTest(arch=arch):
+                    model = SimpleNamespace(
+                        quantization="modelslim",
+                        hf_config={"architectures": [arch]},
+                        model_path=path,
+                        is_draft_model=False,
+                    )
+                    cfg = get_quant_config(model, LoadConfig(), {})
+                    self.assertEqual(cfg.quant_description[expected], "W8A8_DYNAMIC")
+
+    def test_v4_export_names_follow_the_model_not_the_quantization_dtype(self):
+        weight = "layers.0.ffn.experts.0.w1.weight"
+        target = "model.layers.0.mlp.experts.0.gate_proj.weight"
+        draft = "mtp.0.ffn.experts.0.w1.weight"
+        for scheme in ("W4A8_DYNAMIC", "W8A8_DYNAMIC"):
+            desc = {weight: scheme, draft: scheme}
+            for arch in ("DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMDSpark"):
+                with self.subTest(scheme=scheme, arch=arch):
+                    cfg = ModelSlimConfig.from_config(
+                        {**desc, "hf_config": SimpleNamespace(architectures=[arch])}
+                    )
+                    self.assertEqual(cfg.quant_description[target], scheme)
+                    self.assertEqual(
+                        cfg.quant_description[
+                            "stages.0.mlp.experts.0.gate_proj.weight"
+                        ],
+                        scheme,
+                    )
+            # Explicit non-V4 models must not be inferred from the spelling of a key.
+            other = ModelSlimConfig.from_config(
+                {**desc, "hf_config": SimpleNamespace(architectures=["OtherModel"])}
+            )
+            self.assertIn(weight, other.quant_description)
+            self.assertNotIn(target, other.quant_description)
+            self.assertIn(target, ModelSlimConfig.from_config(desc).quant_description)
+
     def make_linear(self, config, prefix):
         """Build a small CPU layer: input width 4, output width 6."""
         with torch.device("cpu"):
@@ -35,6 +95,88 @@ class TestModelSlimMapping(CustomTestCase):
                 quant_config=config,
                 prefix=prefix,
             )
+
+    def test_engram_table_and_projection_follow_checkpoint_entries(self):
+        table = {
+            "format": "int8_sym",
+            "weight_dtype": "I8",
+            "layout": "row_major",
+            "group_size": 32,
+            "axis": 1,
+            "scale_suffix": "scale",
+            "scale_dtype": "F8_E8M0",
+            "weight_shape": [8, 64],
+            "scale_shape": [8, 2],
+        }
+        modules = {"layers.1.engram.embed": table}
+        for scheme in ("W4A8_DYNAMIC", "W8A8_DYNAMIC"):
+            cfg = ModelSlimConfig(
+                {
+                    "x.wqkv_a.weight": scheme,
+                    "y.wq_a.weight": scheme,
+                    "optional": {"embedding_storage": {"modules": modules}},
+                }
+            )
+            self.assertTrue(cfg.supports_fused_projection("x.wqkv_a"))
+            self.assertFalse(cfg.supports_fused_projection("y.wqkv_a"))
+            native = torch.float8_e4m3fn
+            with patch(
+                "sglang.srt.layers.quantization.modelslim.modelslim.is_npu",
+                return_value=True,
+            ):
+                self.assertEqual(
+                    cfg.get_engram_table_dtype(1, 8, 64, native), torch.int8
+                )
+                self.assertEqual(cfg.get_engram_table_dtype(2, 8, 64, native), native)
+                with self.assertRaisesRegex(ValueError, "storage"):
+                    cfg.get_engram_table_dtype(1, 8, 96, native)
+                with self.assertRaisesRegex(ValueError, "MXFP4"):
+                    cfg.get_engram_table_dtype(1, 8, 64, torch.uint8)
+
+    def test_engram_gate_basis_comes_from_weight_snapshot(self):
+        from safetensors.torch import save_file
+
+        from sglang.srt.layers.quantization.modelslim import engram
+
+        net = torch.nn.Module()
+        net.layers = [SimpleNamespace(engram=SimpleNamespace(q_weight=torch.ones(2)))]
+        cfg = SimpleNamespace(hidden_size=2, _name_or_path="stale/config/path")
+        engram.load_gate_basis(cfg, net)
+        self.assertFalse(hasattr(net, "engram_gate_basis"))
+        cfg.engram_rotation_config = dict(
+            value_projection_rotated=True,
+            value_basis="quarot_global",
+            key_and_gate_basis="original",
+            runtime_delta_rotation=False,
+        )
+        with (
+            TemporaryDirectory() as snapshot,
+            patch.object(engram, "get_context") as ctx,
+            patch.object(
+                engram,
+                "get_model",
+                return_value=SimpleNamespace(model_path="org/model", revision="rev"),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader.loaded_checkpoint_files",
+                return_value=(snapshot, ()),
+            ) as resolve,
+        ):
+            ctx.return_value.is_config_namespace_published.return_value = True
+            with self.assertRaises(FileNotFoundError):
+                engram.load_gate_basis(cfg, net)
+            resolve.assert_called_once_with("org/model", "rev")
+            path = Path(snapshot) / "optional" / "quarot.safetensors"
+            path.parent.mkdir()
+            basis = torch.tensor([[0.0, 1.0], [-1.0, 0.0]])
+            save_file({"global_rotation": basis.bfloat16()}, path)
+            engram.load_gate_basis(cfg, net)
+            torch.testing.assert_close(net.engram_gate_basis, basis)
+            self.assertNotIn("engram_gate_basis", net.state_dict())
+            # Repeated post-load on this rank reuses the buffer.
+            loaded = net.engram_gate_basis
+            engram.load_gate_basis(cfg, net)
+            self.assertIs(net.engram_gate_basis, loaded)
 
     def test_qwen_qkvz_uses_model_mapping_and_creates_int8_weights(self):
         """Use qkv + z descriptions to create an INT8 qkvz weight."""

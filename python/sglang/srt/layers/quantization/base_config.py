@@ -164,6 +164,8 @@ class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
     weight_block_size: Optional[List[int]] = None
+    # Opt in when keys in a separate quantization file use model-specific names.
+    needs_hf_config_for_sidecar = False
     # None means the global default applies; a config sets it to decide for
     # itself whether its MXFP8 weights are converted to block-FP8 at load.
     convert_mxfp8_to_block_fp8: Optional[bool] = None
@@ -299,6 +301,10 @@ class QuantizationConfig(ABC):
             self.get_quant_method(LinearBase(1, 1), prefix=prefix),
             UnquantizedLinearMethod,
         )
+
+    def supports_fused_projection(self, prefix: str) -> bool:
+        """Whether a model may construct its fused projection for these weights."""
+        return True
 
     @abstractmethod
     def get_scaled_act_names(self) -> List[str]:
