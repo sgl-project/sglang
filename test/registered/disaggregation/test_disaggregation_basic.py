@@ -206,6 +206,20 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         )
         self.assertEqual(result["meta_info"]["output_token_sampling_logprobs"], [[0.0]])
 
+        empty = requests.post(
+            self.prefill_url + "/generate",
+            json={
+                **payload,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 0},
+            },
+            timeout=60,
+        )
+        self.assertEqual(empty.status_code, 200, empty.text)
+        result = empty.json()
+        self.assertEqual(result["output_ids"], [])
+        self.assertEqual(result["meta_info"]["output_token_sampling_mask"], [])
+        self.assertEqual(result["meta_info"]["output_token_sampling_logprobs"], [])
+
         response = requests.post(
             self.decode_url + "/generate",
             json={

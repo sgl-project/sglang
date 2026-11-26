@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
@@ -23,15 +23,19 @@ from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _handle_pd_request(mode, req):
+def _handle_pd_request(
+    mode, req, *, enable_sampling_mask=False, backend=TransferBackend.MOONCAKE
+):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.enable_session_radix_cache = False
     scheduler.model_config = SimpleNamespace(
         hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=120
     )
     scheduler.disaggregation_mode = mode
-    scheduler.transfer_backend = TransferBackend.MOONCAKE
-    scheduler.disagg_metadata_buffers = SimpleNamespace(enable_sampling_mask=False)
+    scheduler.transfer_backend = backend
+    scheduler.disagg_metadata_buffers = SimpleNamespace(
+        enable_sampling_mask=enable_sampling_mask
+    )
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
     scheduler.tokenizer = None
     scheduler.dllm_config = None
@@ -72,8 +76,34 @@ def _handle_pd_request(mode, req):
 
 
 class TestSchedulerSamplingMaskValidation(CustomTestCase):
+    def test_fake_decode_has_no_prefill_distribution_even_with_wire_buffers(self):
+        for backend, host in (
+            (TransferBackend.MOONCAKE, FAKE_BOOTSTRAP_HOST),
+            (TransferBackend.FAKE, None),
+        ):
+            with (
+                self.subTest(backend=backend),
+                get_context().override_server_args(
+                    disaggregation_transfer_backend=backend.value
+                ),
+            ):
+                req = MagicMock(
+                    bootstrap_host=host, return_sampling_mask=True, return_logprob=False
+                )
+                abort, add_to_queue, _ = _handle_pd_request(
+                    DisaggregationMode.DECODE,
+                    req,
+                    enable_sampling_mask=True,
+                    backend=backend,
+                )
+                self.assertIn("synthesizes its first token", abort.call_args.args[1])
+                self.assertEqual(
+                    abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
+                )
+                add_to_queue.assert_not_called()
+
     def test_disabled_pd_masks_return_bad_request_before_admission(self):
-        """Neither PD role may queue mask requests without metadata buffers."""
+        """Neither end of a real handoff may queue masks without wire buffers."""
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
                 abort, add_to_queue, make_req = _handle_pd_request(

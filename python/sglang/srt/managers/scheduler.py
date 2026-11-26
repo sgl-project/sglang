@@ -3628,17 +3628,19 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self._lacks_decode_peer(req) and req.sampling_params.max_new_tokens not in (
-            0,
-            1,
-        ):
-            self._reject_bad_request(
-                req,
-                "A prefill request without a bootstrap host has no decode to "
-                "continue it, so max_new_tokens must be 0 or 1; got "
-                f"max_new_tokens={req.sampling_params.max_new_tokens}.",
-            )
-            return
+        if self._lacks_decode_peer(req):
+            if req.sampling_params.max_new_tokens not in (0, 1):
+                self._reject_bad_request(
+                    req,
+                    "A prefill request without a bootstrap host has no decode to "
+                    "continue it, so max_new_tokens must be 0 or 1; got "
+                    f"max_new_tokens={req.sampling_params.max_new_tokens}.",
+                )
+                return
+            if req.sampling_params.max_new_tokens == 0:
+                # The client still gets empty output rows from the tokenizer.
+                # Prefill has no output token for the sampler to capture.
+                req.return_sampling_mask = False
 
         if (
             self.disaggregation_mode != DisaggregationMode.NULL

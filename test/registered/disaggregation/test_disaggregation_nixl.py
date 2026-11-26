@@ -226,7 +226,7 @@ class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
         cls.launch_all()
 
     def test_sampling_mask_across_prefill_and_decode(self):
-        def generate(url, biased_ids, mode, tokens):
+        def generate(url, biased_ids, mode, tokens, return_logprob=False):
             # Equal float32 logits give a known distribution on both workers.
             return requests.post(
                 url + "/generate",
@@ -241,6 +241,7 @@ class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
                     },
                     "return_sampling_mask": True,
                     "sampling_logprobs_mode": mode,
+                    "return_logprob": return_logprob,
                 },
                 timeout=90,
             )
@@ -250,8 +251,13 @@ class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
         direct = generate(self.prefill_url, [10, 11, 12], "support", 1)
         self.assertEqual(direct.status_code, 400, direct.text)
         self.assertIn("Sampling support exceeds", direct.text)
-        overflow = generate(self.lb_url, [10, 11, 12], "support", 3)
-        self.assertFalse(overflow.ok, overflow.text)
+        # Merging prompt logprobs makes the router wait for prefill and pass its
+        # rejection through even if decode reports the failed transfer first.
+        overflow = generate(
+            self.lb_url, [10, 11, 12], "support", 3, return_logprob=True
+        )
+        self.assertEqual(overflow.status_code, 400, overflow.text)
+        self.assertIn("Sampling support exceeds", overflow.text)
         self.assertNotIn("output_token_sampling_mask", overflow.text)
 
         for mode in ("selected", "support"):
