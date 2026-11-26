@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.common import (
     restore_kv_cache,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -66,6 +67,33 @@ class TestDecodeRetractionBackup(CustomTestCase):
     num_tokens = 8
     dtype = torch.bfloat16
     device = "cuda"
+
+    def test_retry_reset_returns_each_restored_slot_once(self):
+        slots = LogicalHostPool(size=2, page_size=1)
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        released_transfers = Mock()
+        cache.host_pool_group = SimpleNamespace(
+            free=slots.free, release_transfers=released_transfers
+        )
+        first, second = Mock(), Mock()
+        second.synchronize.side_effect = [RuntimeError("restore fence"), None]
+        cache._pending_restore_backups = [
+            (event, SimpleNamespace(host_indices=slots.alloc(1), pool_transfers=[name]))
+            for event, name in ((first, "first"), (second, "second"))
+        ]
+        with self.assertRaisesRegex(RuntimeError, "restore fence"):
+            cache._discard_restore_backups()
+        self.assertEqual(slots.available_size(), 1)
+        cache._discard_restore_backups()
+        self.assertEqual(slots.available_size(), slots.size)
+        self.assertEqual(torch.unique(slots.alloc(slots.size)).numel(), slots.size)
+        self.assertEqual(
+            [c.args[0] for c in released_transfers.call_args_list],
+            [["first"], ["second"]],
+        )
+        first.synchronize.assert_called_once()
+        self.assertEqual(second.synchronize.call_count, 2)
+        self.assertEqual(cache._pending_restore_backups, [])
 
     def test_host_receive_dense_subclass_checks_actual_buffer_geometry(self):
         class DensePool(MHATokenToKVPool):
