@@ -76,6 +76,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
+    MambaPool,
     MHATokenToKVPool,
     MHATokenToKVPoolMXFP8,
     MiniMaxSparseKVPool,
@@ -1794,12 +1795,35 @@ class KVCacheConfigurator:
                     or self.hybrid_kda_config is not None
                 )
             ),
+            enable_replayssm_int8_checkpoint=get_exec().mamba.enable_replayssm_int8_checkpoint,
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
+        self._configure_gdn_replayssm_commit(req_to_token_pool)
         return req_to_token_pool
+
+    def _configure_gdn_replayssm_commit(self, req_to_token_pool) -> None:
+        if not get_exec().mamba.enable_replayssm_int8_checkpoint:
+            return
+        from sglang.srt.mem_cache.gdn_replayssm_commit import DeferredGDNState
+
+        pool = req_to_token_pool.mamba_pool
+        if not (
+            self.hybrid_gdn_config is not None
+            and isinstance(pool, MambaPool)
+            and pool.replayssm_spec_write_pos is not None
+            and pool.mamba_cache.temporal.dtype == torch.int8
+            and pool.mamba_cache.temporal.is_contiguous()
+        ):
+            raise ValueError(
+                "INT8 ReplaySSM requires a static contiguous GDN checkpoint and a request ring"
+            )
+        pool.replayssm_deferred_state = DeferredGDNState(pool)
+        logger.info(
+            "Using INT8 GDN ReplaySSM checkpoints with deferred materialization"
+        )
 
     def _build_default_req_pool(
         self,
@@ -3733,6 +3757,17 @@ class KVCacheConfigurator:
             else fused_state_entry
         )
         stage_per_req = int(per_req * pp_layer_scale)
+        if (
+            get_exec().mamba.enable_replayssm_int8_checkpoint
+            and get_exec().mamba.enable_linear_replayssm_spec
+            and self.hybrid_gdn_config is not None
+        ):
+            cp = config.mamba2_cache_params
+            hv, v_dim, k_dim = cp.shape.temporal
+            temporal_delta = (
+                hv * v_dim * k_dim * (cp.dtype.temporal.itemsize - 1) - hv * v_dim * 4
+            ) * len(cp.layers)
+            stage_per_req = max(0, stage_per_req - int(temporal_delta * pp_layer_scale))
 
         has_spec_dec = not self.spec_algorithm.is_none()
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
@@ -3747,11 +3782,23 @@ class KVCacheConfigurator:
         )
         if replayssm_active:
             record_len = get_exec().mamba.linear_replayssm_cache_len
-            replayssm_ring_per_req = (
-                config.mamba2_cache_params.replayssm_ring_bytes_per_req(
-                    record_len=record_len
-                )
+            cp = config.mamba2_cache_params
+            replayssm_ring_per_req = cp.replayssm_ring_bytes_per_req(
+                record_len=record_len
             )
+            if (
+                get_exec().mamba.enable_replayssm_int8_checkpoint
+                and not cp.is_kda
+                and cp.dtype.conv != torch.float32
+            ):
+                hv, v_dim, k_dim = cp.shape.temporal
+                h_k = cp.shape.num_k_heads_per_tp
+                low_part_bytes = (
+                    (hv * record_len * v_dim + h_k * record_len * k_dim)
+                    * cp.dtype.conv.itemsize
+                    * len(cp.layers)
+                )
+                replayssm_ring_per_req = max(0, replayssm_ring_per_req - low_part_bytes)
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)

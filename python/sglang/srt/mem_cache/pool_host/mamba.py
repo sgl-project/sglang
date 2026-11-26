@@ -908,12 +908,9 @@ class MambaPoolHost(HostKVCache):
 
         Only page-first layouts are supported for mamba storage zero-copy because
         each page slot in temporal/conv buffers is directly addressable.
+        Registered slot side states (e.g. INT8 checkpoint scales) are packed as
+        multi-buffer segments onto the temporal object key.
         """
-        if self.slot_state_device_tensors:
-            raise NotImplementedError(
-                "Mamba storage zero-copy does not carry registered slot side "
-                "states; use a whole-page storage backend."
-            )
         assert len(indices) % self.page_size == 0
         if self.layout not in ["page_first", "page_first_direct"]:
             raise ValueError(
@@ -926,6 +923,7 @@ class MambaPoolHost(HostKVCache):
         # Compute base pointers once; each page pointer is offset from these bases.
         temporal_base_ptr = self.temporal_buffer.data_ptr()
         conv_base_ptrs = [buf.data_ptr() for buf in self.conv_buffer]
+        slot_state_base_ptrs = [buf.data_ptr() for buf in self.slot_state_buffers]
         # Component sizes are constant across pages, so precompute once as well.
         temporal_element_size = (
             self.page_size
@@ -942,6 +940,10 @@ class MambaPoolHost(HostKVCache):
             )
             for i in range(len(self.conv_state_shapes))
         ]
+        slot_state_elem_sizes = [
+            self.page_size * int(np.prod(buf.shape[1:])) * buf.dtype.itemsize
+            for buf in self.slot_state_buffers
+        ]
 
         for i in range(0, len(indices), self.page_size):
             # Emit component pointers in stable order: temporal first (dropped
@@ -956,8 +958,19 @@ class MambaPoolHost(HostKVCache):
                     * self.temporal_state_elem_size
                     * self.temporal_dtype.itemsize
                 )
-                ptr_list.append(temporal_ptr)
-                element_size_list.append(temporal_element_size)
+                if slot_state_base_ptrs:
+                    t_ptrs = [temporal_ptr] + [
+                        base + indices[i] * elem_size
+                        for base, elem_size in zip(
+                            slot_state_base_ptrs, slot_state_elem_sizes
+                        )
+                    ]
+                    t_sizes = [temporal_element_size, *slot_state_elem_sizes]
+                    ptr_list.append(t_ptrs)
+                    element_size_list.append(t_sizes)
+                else:
+                    ptr_list.append(temporal_ptr)
+                    element_size_list.append(temporal_element_size)
             for j in range(len(self.conv_buffer)):
                 conv_ptr = (
                     conv_base_ptrs[j]

@@ -531,12 +531,37 @@ def handle_linear_attn_backend(server_args: Any):
                 "_handle_linear_attn_backend",
                 mamba_ssm_dtype="float32",
             )
-        elif cfg.mamba_ssm_dtype != "float32":
+        elif (
+            cfg.mamba_ssm_dtype != "float32"
+            and not cfg.enable_replayssm_int8_checkpoint
+        ):
             logger.warning(
                 "--enable-linear-replayssm-spec with --mamba-ssm-dtype=%s: the "
                 "compact checkpoint is materialized after each accepted "
                 "verify window; validate long-sequence accuracy and throughput.",
                 cfg.mamba_ssm_dtype,
+            )
+
+    if cfg.enable_replayssm_int8_checkpoint:
+        if not (
+            cfg.enable_linear_replayssm_spec
+            and (cfg.speculative_algorithm or "").upper() == "DFLASH"
+            and cfg.mamba_ssm_dtype == "bfloat16"
+            and cfg.linear_attn_verify_backend == "triton"
+            and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
+            and cfg.disaggregation_mode == "null"
+            and not cfg.enable_pd_role_switch
+            and not cfg.enable_streaming_session
+            and not cfg.enable_session_radix_cache
+            and cfg.pp_size == 1
+            and not cfg.enable_unified_memory
+            and not cfg.enable_int8_mamba_checkpoint
+            and os.environ.get("SGLANG_RAGGED_VERIFY_MODE", "static") == "static"
+        ):
+            raise ValueError(
+                "INT8 GDN ReplaySSM requires DFLASH, BF16 activations, Triton "
+                "verify, PP1, extra_buffer_lazy and a static pool; it is "
+                "incompatible with PD, unified memory and INT8 Mamba checkpoints."
             )
 
 

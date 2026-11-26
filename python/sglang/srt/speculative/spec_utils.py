@@ -1388,7 +1388,8 @@ def commit_mamba_states_after_verify(
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
             max_spec_len=draft_token_num,
-            fold_every_commit=spec_state.temporal.dtype != torch.float32,
+            fold_every_commit=spec_state.temporal.dtype
+            not in (torch.float32, torch.int8),
             mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
