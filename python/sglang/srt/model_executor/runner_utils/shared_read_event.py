@@ -1,7 +1,6 @@
 """Shared-read-done event utilities for graph and eager runners."""
 
 import logging
-from typing import Optional
 
 import torch
 
@@ -12,8 +11,14 @@ from sglang.srt.utils import is_cuda
 logger = logging.getLogger(__name__)
 
 
-def make_external_event(device_module) -> Optional[torch.cuda.Event]:
+def make_external_event(device_module):
     """Create a persistent external event, e.g., for CUDA graph capture."""
+    if hasattr(torch, "npu") and device_module is torch.npu:
+        from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
+            NPUSharedReadEvent,
+        )
+
+        return NPUSharedReadEvent.create(device_module)
     if not is_cuda():
         return None
     try:

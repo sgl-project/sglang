@@ -23,6 +23,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
     BuildOutTokens,
     BuildRaggedVerifyWindow,
+    CommitInjectLayoutResult,
     RaggedVerifyWindow,
     ScatterCompactToStrided,
     build_ring_commit_inject_layout,
@@ -395,9 +396,10 @@ class TargetVerifyExecutor:
         commit_lens: torch.Tensor,
         bs: int,
         run_compact: bool,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         assert self.kv_injector is not None, "commit_hidden needs a kv_injector"
-        if run_compact:
+        if run_compact and swa_loc is None:
             self.kv_injector.inject_ragged(
                 batch=batch,
                 layout=layout,
@@ -407,7 +409,7 @@ class TargetVerifyExecutor:
                 iteration_ids=verify_window.iteration_ids,
             )
             return
-        hidden = logits_output.hidden_states
+        hidden = hidden_strided if run_compact else logits_output.hidden_states
         if hidden is None:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
@@ -430,6 +432,7 @@ class TargetVerifyExecutor:
             commit_lens=commit_lens,
             state_slot=state_slot,
             iteration_ids=verify_window.iteration_ids,
+            swa_loc=swa_loc,
         )
 
     def _run_ragged(
@@ -679,6 +682,8 @@ class DsparkVerifyEpilogue:
         self.simulated_correct_len = simulated_correct_len
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
+        # Enabled before capture by the NPU worker; every replay keeps this address.
+        self.commit_swa_loc_buf: Optional[torch.Tensor] = None
         self._static_step_state: Optional[tuple[int, bool]] = None
         # Set when a captured static epilogue recorded the engram history commit.
         self.folds_engram_commit = False
@@ -818,6 +823,11 @@ class DsparkVerifyEpilogue:
             positions=io.positions,
             commit_lens=gated_commit_lens,
             state_slot=state_slot,
+            swa_loc=(
+                self.commit_swa_loc_buf[:bs].reshape(-1)
+                if self.commit_swa_loc_buf is not None
+                else None
+            ),
         )
         return committed_engram
 
@@ -1118,7 +1128,16 @@ class DsparkVerifyEpilogue:
             torch.minimum(commit_lens, verify_lens.to(torch.int32))
             * self.inject_gate_buf
         )
-        if pool.swa_req_ring_size is not None:
+        if self.commit_swa_loc_buf is not None:
+            inject_layout = CommitInjectLayoutResult(
+                swa_loc=ctx.kv_injector.mask_committed_swa_loc(
+                    self.commit_swa_loc_buf[:bs].reshape(-1), gated_commit_lens
+                ),
+                positions=(
+                    seq_lens[:bs, None] + ctx.block_pos_offsets[: self.stride]
+                ).reshape(-1),
+            )
+        elif pool.swa_req_ring_size is not None:
             inject_layout = build_ring_commit_inject_layout(
                 req_pool_indices=req_pool_indices,
                 prefix_lens=seq_lens[:bs],

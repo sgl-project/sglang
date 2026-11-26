@@ -13,6 +13,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -651,6 +652,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
+        self._snapshot_verify_swa = _is_npu and getattr(
+            self.model_runner.attn_backend, "shared_read_enabled", False
+        )
+        if self._snapshot_verify_swa and self._verify_epilogue is not None:
+            epilogue = self._verify_epilogue
+            epilogue.commit_swa_loc_buf = epilogue.verify_lens_buf.new_full(
+                (epilogue.max_bs, epilogue.stride), -1
+            )
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
             target_model=self.target_worker.model_runner.model,
             draft_model=self.draft_model,
@@ -1169,6 +1178,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                         else simulate_bonus_sampling_info.temperatures[:bs]
                     ),
                 )
+        verify_swa_loc = None
+        if _is_npu and self._snapshot_verify_swa:
+            # Snapshot the whole draft write window before target metadata publishes
+            # read-done. Acceptance later only masks these addresses.
+            verify_swa_loc = verify_window.iteration_ids.write_ids(
+                self.draft_model_runner.runner_ids, kind=IdSpaceKind.SLIDING_WINDOW
+            )
+            if self._verify_epilogue is not None and bs <= self._verify_epilogue.max_bs:
+                buf = self._verify_epilogue.commit_swa_loc_buf
+                buf[:bs].copy_(verify_swa_loc.view(bs, -1))
+                buf[bs:].fill_(-1)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -1351,6 +1371,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     commit_lens=accept.commit_lens,
                     bs=bs,
                     run_compact=run_compact,
+                    swa_loc=verify_swa_loc,
                 )
         logits_output.hidden_states = None
 

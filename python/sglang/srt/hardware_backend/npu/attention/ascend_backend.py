@@ -36,7 +36,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
@@ -53,13 +56,18 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import has_forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
+    get_schedule,
     get_spec,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_info import (
+    SpecInput,
+    SpecInputType,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     next_power_of_2,
@@ -558,6 +566,52 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = get_parallel().attn_cp_size
+        self.shared_read_enabled = self._supports_shared_read(model_runner)
+        self._shared_read_runner = model_runner
+
+    def _supports_shared_read(self, model_runner: ModelRunner) -> bool:
+        if not self.use_dsa:
+            return False
+        # Hybrid targets and their drafts share the state-bearing request pool.
+        if model_runner.req_to_token_pool.holds_state_slots:
+            return False
+        return (
+            envs.SGLANG_ENABLE_WAR_BARRIER.get()
+            and not get_schedule().disable_overlap_schedule
+        )
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        if not self.shared_read_enabled:
+            return SharedReadEnds.UNKNOWN
+        if fm == ForwardMode.EXTEND:
+            return SharedReadEnds.PRE_REPLAY
+        if fm.is_decode() or fm.is_target_verify() or fm.is_draft_extend_v2():
+            return SharedReadEnds.PRE_REPLAY
+        return SharedReadEnds.UNKNOWN
+
+    def _publish_eager_shared_read_done(self, forward_batch: ForwardBatch) -> None:
+        # The final eager preparation replaces any earlier phase's event.
+        runner = self._shared_read_runner
+        runner.shared_read_done_event = None
+        mode = forward_batch.forward_mode
+        if mode.is_draft_extend_v2() and not has_forward_context():
+            # NPU always re-plans draft extend after padding on the forward
+            # stream; its plan-stream preparation is not the publication point.
+            return
+        if mode == ForwardMode.EXTEND:
+            # Ordinary target prefill publishes through the shared EagerRunner path.
+            if (
+                not self.is_draft_worker
+                or not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+            ):
+                return
+        elif not (
+            mode.is_decode() or mode.is_target_verify() or mode.is_draft_extend_v2()
+        ):
+            return
+        event = torch.get_device_module(self.device).Event()
+        event.record()
+        runner.shared_read_done_event = event
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -661,7 +715,9 @@ class AscendAttnBackend(AttentionBackend):
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(
+        self, forward_batch: ForwardBatch, *, publish_read_done: bool = True
+    ):
         """Init the metadata for a forward pass."""
         self.forward_metadata = self._create_forward_metadata()
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (
@@ -976,6 +1032,9 @@ class AscendAttnBackend(AttentionBackend):
                 self.forward_metadata, forward_batch.seq_lens
             )
         self.graph_mode = False
+
+        if self.shared_read_enabled and publish_read_done:
+            self._publish_eager_shared_read_done(forward_batch)
 
     def _create_forward_metadata(self) -> ForwardMetadata:
         """Create the metadata object for one forward pass."""
