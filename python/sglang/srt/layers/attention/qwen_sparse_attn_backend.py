@@ -329,6 +329,36 @@ class QSAPoolView(msgspec.Struct, frozen=True):
     token_topk: int
 
 
+def _is_hnd_kv_pool(pool) -> bool:
+    if pool is None:
+        return False
+    full_pool = getattr(pool, "full_kv_pool", pool)
+    return bool(
+        getattr(full_pool, "use_hnd", False)
+        or getattr(full_pool, "kv_cache_layout", None) == "hnd"
+    )
+
+
+def _require_nhd_kv_pool(pool) -> None:
+    if _is_hnd_kv_pool(pool):
+        raise ValueError(
+            "QwenSparseAttnBackend requires NHD KV cache layout; "
+            "SGLANG_USE_HND_KVCACHE=1 (HND layout) is not supported."
+        )
+
+
+def _resolve_prewarm_kv_dtype(pool) -> torch.dtype:
+    full_pool = getattr(pool, "full_kv_pool", pool)
+    quant_method = getattr(full_pool, "quant_method", None)
+    if (
+        getattr(full_pool, "is_quantized_kv_cache", False)
+        and quant_method is not None
+        and quant_method.needs_plain_kv_dequant_read()
+    ):
+        return quant_method.plain_attention_kv_dtype() or torch.bfloat16
+    return getattr(full_pool, "dtype", None) or getattr(pool, "dtype", torch.bfloat16)
+
+
 class QwenSparseAttnBackend(AttentionBackend):
     """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
 
@@ -340,6 +370,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
+        _require_nhd_kv_pool(self.token_to_kv_pool)
         self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
             self.token_to_kv_pool
         )
@@ -1013,6 +1044,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch):
+        _require_nhd_kv_pool(
+            getattr(self, "token_to_kv_pool", None)
+            or getattr(forward_batch, "token_to_kv_pool", None)
+        )
         if self._cp_kv_pending is not None:
             # Left by a forward that failed before its attention: join it
             # before this stream issues further collectives on the CP group.
@@ -1164,6 +1199,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
                 self.token_to_kv_pool
             )
+        _require_nhd_kv_pool(self.token_to_kv_pool)
         if self.req_to_token is None:
             req_pool = getattr(self.runner, "req_to_token_pool", None)
             self.req_to_token = getattr(req_pool, "req_to_token", None)
@@ -1755,6 +1791,10 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
+        _require_nhd_kv_pool(
+            getattr(self, "token_to_kv_pool", None)
+            or getattr(forward_batch, "token_to_kv_pool", None)
+        )
         if getattr(
             forward_batch, "attn_cp_metadata", None
         ) is not None and is_cp_active(forward_batch):
@@ -2330,6 +2370,10 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
+        _require_nhd_kv_pool(
+            getattr(self, "token_to_kv_pool", None)
+            or getattr(forward_batch, "token_to_kv_pool", None)
+        )
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(
                 q, k, v, layer, forward_batch, topk_indices
@@ -2705,22 +2749,25 @@ def prewarm_qsa_prefill_kernels(
     pool = getattr(sparse_backend, "token_to_kv_pool", None)
     if pool is None or not hasattr(pool, "qsa_token_topk"):
         return
+    _require_nhd_kv_pool(pool)
 
     tic = time.perf_counter()
     device = torch.device(sparse_backend.device or "cuda")
-    # Collect unique QSA attention layer geometries and first layer id for real pool strides.
+    # Collect unique QSA attention layer geometries directly from RadixAttention
+    # modules without calling layer_router.read(id).key()/value(), which would
+    # dequantize whole layers under --kv-cache-dtype fp4_mx_block16.
+    router = getattr(pool, "layer_router", None)
+    routed_layer_ids = (
+        set(router.layer_ids())
+        if router is not None and hasattr(router, "layer_ids")
+        else None
+    )
     attn_geoms: dict[tuple[int, int, int], int] = {}
     for module in model.modules():
         if isinstance(module, RadixAttention) and module.layer_id >= 0:
-            try:
-                kv = pool.layer_router.read(module.layer_id)
-                k_buf = kv.key()
-                v_buf = kv.value()
-            except Exception:
+            if routed_layer_ids is not None and module.layer_id not in routed_layer_ids:
                 continue
-            if k_buf is None or v_buf is None:
-                continue
-            geom = (module.tp_q_head_num, k_buf.shape[1], module.head_dim)
+            geom = (module.tp_q_head_num, module.tp_k_head_num, module.head_dim)
             attn_geoms.setdefault(geom, module.layer_id)
 
     final_topk = pool.qsa_token_topk + pool.qsa_compress_ratio - 1
@@ -2736,6 +2783,15 @@ def prewarm_qsa_prefill_kernels(
         else 16
     )
     slot_dtype = req_to_token.dtype if req_to_token is not None else torch.int32
+    kv_dtype = _resolve_prewarm_kv_dtype(pool)
+    raw_q_dtype = getattr(sparse_backend, "dtype", None) or getattr(
+        getattr(sparse_backend, "runner", None), "dtype", None
+    )
+    q_dtype = (
+        raw_q_dtype
+        if raw_q_dtype in (torch.bfloat16, torch.float16)
+        else torch.bfloat16
+    )
 
     def _unique_bucket_qs(is_fp8: bool) -> list[int]:
         seen = set()
@@ -2748,16 +2804,7 @@ def prewarm_qsa_prefill_kernels(
         return qs
 
     runs = 0
-    for (num_q_heads, num_kv_heads, head_dim), layer_id in attn_geoms.items():
-        kv_layer = pool.layer_router.read(layer_id)
-        k_pool = kv_layer.key()
-        v_pool = kv_layer.value()
-        # Use bfloat16/float16 query dtype matching the runner (fallback bfloat16).
-        q_dtype = (
-            getattr(sparse_backend, "dtype", None)
-            if getattr(sparse_backend, "dtype", None) in (torch.bfloat16, torch.float16)
-            else torch.bfloat16
-        )
+    for (num_q_heads, num_kv_heads, head_dim), _layer_id in attn_geoms.items():
         scale = head_dim**-0.5
         # Warm non-prefix (_sparse_gqa_prefill) for BF16/FP16 configs.
         for total_q in _unique_bucket_qs(is_fp8=False):
@@ -2778,11 +2825,16 @@ def prewarm_qsa_prefill_kernels(
             )
             runs += 1
         # Warm paged-prefix (_resolve_prefill_slots + _sparse_gqa_chunk_prefill)
-        # for real KV pool dtype/strides (int32 cu_q matching forward_extend).
+        # with a 2-slot contiguous NHD scratch buffer (same per-slot/head strides
+        # and dtype as the full NHD pool, without touching or dequantizing it).
+        k_scratch = torch.zeros(
+            (2, num_kv_heads, head_dim), dtype=kv_dtype, device=device
+        )
+        v_scratch = torch.zeros_like(k_scratch)
         slot_table = torch.zeros((2, slot_width), dtype=slot_dtype, device=device)
         seq_lens = torch.ones((2,), dtype=torch.int32, device=device)
         cu_q_2 = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
-        for total_q in _unique_bucket_qs(is_fp8=k_pool.element_size() == 1):
+        for total_q in _unique_bucket_qs(is_fp8=k_scratch.element_size() == 1):
             q = torch.zeros(
                 (total_q, num_q_heads, head_dim), dtype=q_dtype, device=device
             )
@@ -2792,8 +2844,8 @@ def prewarm_qsa_prefill_kernels(
             indices[:, 0] = 0
             sparse_gqa_paged_prefill_triton(
                 q,
-                k_pool,
-                v_pool,
+                k_scratch,
+                v_scratch,
                 slot_table,
                 indices,
                 cu_q_2,

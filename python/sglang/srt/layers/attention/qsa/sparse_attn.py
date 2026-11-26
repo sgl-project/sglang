@@ -563,6 +563,12 @@ def sparse_gqa_paged_prefill_triton(
     The slots are resolved in a pass of their own: looking them up inside the
     attention loop puts a second dependent load in front of every K/V load and
     made the kernel 1.5x slower."""
+    if k_cache.ndim != 3 or v_cache.ndim != 3:
+        raise ValueError(
+            "sparse_gqa_paged_prefill_triton requires a 3D NHD KV cache "
+            f"(slots, kv_heads, head_dim); got k={tuple(k_cache.shape)}, "
+            f"v={tuple(v_cache.shape)} (HND layout is not supported)."
+        )
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     group_size = num_q_heads // num_kv_heads
