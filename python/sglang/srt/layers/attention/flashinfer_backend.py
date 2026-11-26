@@ -72,7 +72,7 @@ from sglang.srt.speculative.spec_utils import (
     fill_draft_window_rail,
     resolve_draft_decode_window,
 )
-from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
+from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -374,6 +374,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_backend = "fa2"
 
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
         self._swa_kv_pool = resolve_window_kv_pool(model_runner)
@@ -439,7 +440,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
         )
-        self.max_context_len = model_runner.model_config.context_len
         self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -481,11 +481,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self.disable_cuda_graph_kv_split = False
         if self.enable_deterministic:
             self.decode_use_tensor_cores = True
-            self.prefill_split_tile_size = get_int_env_var(
-                "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096
+            self.prefill_split_tile_size = (
+                envs.SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE.get()
             )
-            self.decode_split_tile_size = get_int_env_var(
-                "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
+            self.decode_split_tile_size = (
+                envs.SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE.get()
             )
             self.disable_cuda_graph_kv_split = True
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
@@ -1251,7 +1251,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len,),
+                (max_num_tokens * self.max_kv_len,),
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -1285,7 +1285,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (max_num_tokens * self.max_kv_len),
                 dtype=torch.uint8,
                 device="cuda",
             )
@@ -1410,7 +1410,7 @@ class FlashInferAttnBackend(AttentionBackend):
         captured bucket. The request-slot count is fixed at capture (the
         runner pads real batches up to it with zero-length sentinel
         requests); kv indices cover up to num_slots sequences of
-        max_context_len.
+        max_kv_len.
         """
         device = self.workspace_buffer.device
         self.full_cg_prefill_req_slots = num_slots
@@ -1445,7 +1445,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # indices; size the fixed buffer for the worst case.
         self.full_cg_prefill_kv_indices = [
             torch.zeros(
-                (num_slots * self.max_context_len + 256,),
+                (num_slots * self.max_kv_len + 256,),
                 dtype=torch.int32,
                 device=device,
             )
@@ -1851,7 +1851,6 @@ class FlashInferIndicesUpdaterDecode:
         plan: IterationIds,
         req_pool_indices: torch.Tensor,
     ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
             decode_wrappers[0],
             seq_lens,
@@ -2731,11 +2730,9 @@ class FlashInferMultiStepDraftBackend:
                 )
             )
 
-        self.max_context_len = self.attn_backends[0].max_context_len
-
         # Cached variables for generate_draft_decode_kv_indices
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.attn_backends[0].max_kv_len
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
             model_runner
         )
@@ -2767,17 +2764,15 @@ class FlashInferMultiStepDraftBackend:
         assert_buffer_fits(
             required_kv_indices_len,
             kv_indices_buffer.shape[1],
-            "EAGLE draft kv_indices row (size max_bs * topk * max_context_len)",
+            "EAGLE draft kv_indices row (size max_bs * topk * req_to_token_row_width)",
             bs=bs,
             seq_lens_sum=seq_lens_sum,
         )
 
         # Blocks from the length sum (upper bound on the longest live row),
-        # capped by the draft window, not from the table width. pool_len is
-        # the req_to_token row width, the same table width the other call
-        # sites size from.
+        # capped by the draft window, not from the table width.
         num_token_blocks = spec_kv_index_token_blocks(
-            table_width=self.pool_len,
+            table_width=self.max_kv_len,
             kv_lens_sum=seq_lens_sum,
             batch_size=num_seqs,
             base_programs=self.speculative_num_steps * num_seqs * self.topk,
@@ -2902,7 +2897,7 @@ class FlashInferMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
-            forward_batch.batch_size, self.topk, self.max_context_len
+            forward_batch.batch_size, self.topk, self.max_kv_len
         )
         kv_indices = torch.empty(
             (self.speculative_num_steps, kv_indices_width),
@@ -2948,9 +2943,9 @@ class FlashInferMultiStepDraftBackend:
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         # generate_draft_decode_kv_indices packs topk per-branch sequences per row,
         # so the row needs the topk factor -- same as the eager init_forward_metadata
-        # (batch_size * topk * max_context_len). Dropping it overflows the buffer.
+        # (batch_size * topk * max_kv_len). Dropping it overflows the buffer.
         kv_indices_width = draft_kv_indices_buffer_width(
-            max_bs, self.topk, self.max_context_len
+            max_bs, self.topk, self.max_kv_len
         )
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),

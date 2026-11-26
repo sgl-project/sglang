@@ -53,9 +53,10 @@ def _unique_keys(pairs: list) -> dict:
     return dict(pairs)
 
 
-# Every HTTP route sglang serves, by the Python and the Rust server alike, and
-# its auth level; the Rust server compiles the same file in. A route it does not
-# declare (an extension's, or one whose path an env var sets) is NORMAL.
+# Every HTTP route sglang serves, by the Python, the Rust, and the diffusion
+# server alike, and its auth level; the Rust server compiles the same file in. A
+# route it does not declare (an extension's, or one whose path an env var sets)
+# is NORMAL.
 AUTH_LEVELS: dict[str, AuthLevel] = {
     path: AuthLevel(level)
     for path, level in json.loads(
@@ -133,7 +134,7 @@ def decide_request_auth(
       it must be rejected (403) even if api_key is provided.
 
     NOTE :
-    - Health/readiness/metrics endpoints are always allowed (even when
+    - Health/liveness/readiness/metrics endpoints are always allowed (even when
       api_key/admin_api_key is set), to support k8s probes and Prometheus
       scraping without embedding secrets.
     - We match them by prefix to cover common variants like /health_generate.
@@ -143,6 +144,7 @@ def decide_request_auth(
 
     if (
         path.startswith("/health")
+        or path.startswith("/liveness")
         or path.startswith("/ready")
         or path.startswith("/metrics")
     ):

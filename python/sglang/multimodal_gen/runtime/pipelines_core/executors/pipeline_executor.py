@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+    IPC_A2A_MULTI,
+)
 from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     get_progress_reporter,
 )
@@ -144,6 +147,15 @@ class PipelineExecutor(ABC):
                         stage, payload, server_args, run_stage
                     )
         return payload
+
+    @staticmethod
+    def _check_peer_waits(stage: "PipelineStage") -> None:
+        """Fail the request if a Ulysses peer wait expired in a denoising stage,
+        before anything decodes or saves its incomplete output. A group
+        collective: call it where every rank arrives, whichever ranks ran the
+        stage."""
+        if stage.role_affinity == RoleType.DENOISER:
+            IPC_A2A_MULTI.check_timeout()
 
     @staticmethod
     def _step_stage_profiler() -> None:
@@ -334,5 +346,8 @@ class PipelineExecutor(ABC):
         )
         try:
             yield
-        finally:
+        except BaseException:
+            profiler.stop_on_error(dump_rank=dump_rank)
+            raise
+        else:
             profiler.stop(dump_rank=dump_rank)
