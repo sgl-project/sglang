@@ -2067,6 +2067,12 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # Opt-out: keep TOKENIZERS_PARALLELISM=false (set for multimodal models) for
+    # the long-prompt encode_batch too, i.e. encode serially.
+    SGLANG_PARALLEL_PROMPT_ENCODE_FORCE_POOL_DISABLE = EnvBool(False)
+    # Opt-out: on /v1/chat/completions, decode the prompt ids back to text for
+    # multimodal models even when the ids are sent as-is (the text is unused).
+    SGLANG_CHAT_LAZY_PROMPT_DECODE_DISABLE = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

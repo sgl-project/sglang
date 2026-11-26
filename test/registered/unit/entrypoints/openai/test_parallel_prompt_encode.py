@@ -16,6 +16,7 @@ runner is free to make; `_parallel_ok` is pinned per test so the id
 comparisons do not depend on it.
 """
 
+import os
 import random
 import sys
 import unittest
@@ -209,6 +210,100 @@ class _EncodeCase(CustomTestCase):
                 tokenizer.encode(text, **encode_kwargs),
                 f"{encode_kwargs} on {text[:60]!r}",
             )
+
+
+class _RecordingBackend:
+    """Duck-types the one method `_encode_batch_on_pool` calls, recording the
+    TOKENIZERS_PARALLELISM value visible to each call."""
+
+    def __init__(self):
+        self.seen = []
+
+    def encode_batch(self, chunks, add_special_tokens=False):
+        self.seen.append(os.environ.get(ppe._PARALLELISM_ENV))
+        return [f"encoded:{c}" for c in chunks]
+
+
+class TestEncodeBatchOnPoolForcesSglangsOwnDisable(_EncodeCase):
+    """Bug regression for musespark-curve-c1/m-ttft-tokenize: a multimodal
+    model's TokenizerManager sets TOKENIZERS_PARALLELISM=false, which before
+    this fix silently sent every chunked `encode_batch` call down the
+    single-thread path in every tokenizer worker. `_encode_batch_on_pool`
+    must force the pool back on for the duration of its own call, only in
+    the process that disabled parallelism itself, and must restore the
+    prior value afterwards either way.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(
+            setattr,
+            ppe,
+            "_parallelism_disabled_by_sglang_pid",
+            ppe._parallelism_disabled_by_sglang_pid,
+        )
+        self.addCleanup(setattr, ppe, "_pool_logged", ppe._pool_logged)
+
+    def test_forces_the_pool_only_in_the_disabling_process(self):
+        backend = _RecordingBackend()
+        with unittest.mock.patch.dict(os.environ, {ppe._PARALLELISM_ENV: "false"}):
+            ppe.disable_tokenizers_parallelism()
+            result = ppe._encode_batch_on_pool(backend, ["a", "b"])
+            self.assertEqual(result, ["encoded:a", "encoded:b"])
+            self.assertEqual(backend.seen, ["true"])
+            self.assertEqual(os.environ[ppe._PARALLELISM_ENV], "false")
+
+    def test_a_forked_child_leaves_the_encode_serial(self):
+        backend = _RecordingBackend()
+        with unittest.mock.patch.dict(os.environ, {ppe._PARALLELISM_ENV: "false"}):
+            ppe.disable_tokenizers_parallelism()
+            with unittest.mock.patch.object(
+                ppe.os, "getpid", return_value=os.getpid() + 1
+            ):
+                ppe._encode_batch_on_pool(backend, ["a"])
+            self.assertEqual(backend.seen, ["false"])
+
+    def test_the_opt_out_disables_the_force(self):
+        backend = _RecordingBackend()
+        with (
+            unittest.mock.patch.dict(os.environ, {ppe._PARALLELISM_ENV: "false"}),
+            envs.SGLANG_PARALLEL_PROMPT_ENCODE_FORCE_POOL_DISABLE.override(True),
+        ):
+            ppe.disable_tokenizers_parallelism()
+            ppe._encode_batch_on_pool(backend, ["a"])
+        self.assertEqual(backend.seen, ["false"])
+
+
+class TestIdsMatchWhenSglangDisabledParallelism(_EncodeCase):
+    """musespark-curve-c1 evidence: same ids on several prompt lengths (9k to
+    476k tokens in the campaign) whether or not the long-prompt encode ran
+    on the tokenizers pool. Here, `disable_tokenizers_parallelism` stands in
+    for the multimodal model flag TokenizerManager flips for every
+    multimodal model."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(
+            setattr,
+            ppe,
+            "_parallelism_disabled_by_sglang_pid",
+            ppe._parallelism_disabled_by_sglang_pid,
+        )
+        self.addCleanup(setattr, ppe, "_pool_logged", ppe._pool_logged)
+        self._no_min_chars()
+        self.tokenizer = _tokenizer()
+
+    def test_ids_match_serial_encode_at_several_prompt_lengths(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            ppe.disable_tokenizers_parallelism()
+            for repeats in (1, 10, 100, 1000):
+                text = "the quick brown fox jumps over the lazy dog\n" * repeats
+                reference = self.tokenizer.encode(text)
+                self.assertEqual(
+                    ppe.parallel_prompt_encode(self.tokenizer, text, {}),
+                    reference,
+                    f"repeats={repeats}",
+                )
 
 
 class TestSafePipelineIdsAreIdentical(_EncodeCase):
