@@ -31,6 +31,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.shm_flag_reduce import get_flag_reducer
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
@@ -536,6 +537,11 @@ def all_reduce_flags(
     if not flags or dist.get_world_size(group) == 1:
         return flags
 
+    reducer = get_flag_reducer(group)
+    if reducer is not None:
+        reduced = reducer.reduce(flags, op)
+        if reduced is not None:
+            return reduced
     tensor_to_reduce = torch.tensor(flags, dtype=torch.int32, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=op, group=group)
     return tensor_to_reduce.tolist()
