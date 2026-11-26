@@ -5,10 +5,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use sgl_router::discovery::{ModelId, WorkerMode};
-use sgl_router::policies::request_tokens_for;
 use sgl_router::state::kv_events::{
     compute_block_hashes, BlockStored, HashTree, KvEventIndex, KvWorkerId,
 };
+use sgl_router::tokenizer::prompt::request_tokens_for;
 use sgl_router::tokenizer::TokenizerRegistry;
 use std::time::Duration;
 use tower::ServiceExt;

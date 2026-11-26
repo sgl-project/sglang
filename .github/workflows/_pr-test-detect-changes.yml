@@ -1,0 +1,191 @@
+name: Detect Changes
+# Path filters, defined once. On a PR event dorny/paths-filter lists files through the
+# API and needs no checkout, so no PR code runs; other events diff a checkout of the tested ref.
+
+on:
+  workflow_call:
+    inputs:
+      git_ref:
+        type: string
+        default: ''
+      run_all_tests:
+        type: boolean
+        default: false
+    outputs:
+      run_all_tests:
+        value: ${{ jobs.detect.outputs.run_all_tests }}
+      main_package:
+        value: ${{ jobs.detect.outputs.main_package }}
+      simulator:
+        value: ${{ jobs.detect.outputs.simulator }}
+      sgl_kernel:
+        value: ${{ jobs.detect.outputs.sgl_kernel }}
+      jit_kernel:
+        value: ${{ jobs.detect.outputs.jit_kernel }}
+      multimodal_gen:
+        value: ${{ jobs.detect.outputs.multimodal_gen }}
+      multimodal_gen_server:
+        value: ${{ jobs.detect.outputs.multimodal_gen_server }}
+      diffusion_sm103:
+        value: ${{ jobs.detect.outputs.diffusion_sm103 }}
+      processor:
+        value: ${{ jobs.detect.outputs.processor }}
+      server_args_docs:
+        value: ${{ jobs.detect.outputs.server_args_docs }}
+
+jobs:
+  detect:
+    name: detect-changes
+    runs-on: ubuntu-latest
+    outputs:
+      run_all_tests: ${{ steps.run-mode.outputs.run_all_tests }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      simulator: ${{ steps.filter.outputs.simulator || steps.run-mode.outputs.run_all_tests }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+      jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
+      multimodal_gen_server: ${{ steps.filter.outputs.multimodal_gen_server || steps.run-mode.outputs.run_all_tests }}
+      diffusion_sm103: ${{ steps.filter.outputs.diffusion_sm103 || steps.run-mode.outputs.run_all_tests }}
+      processor: ${{ steps.filter.outputs.processor || steps.run-mode.outputs.run_all_tests }}
+      server_args_docs: ${{ steps.filter.outputs.server_args_docs || steps.run-mode.outputs.run_all_tests }}
+    steps:
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          # Under workflow_call, github.event_name is the caller's event.
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
+
+      - name: Checkout code
+        if: >-
+          steps.run-mode.outputs.run_all_tests != 'true'
+          && github.event_name != 'pull_request_target'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          filters: |
+            main_package:
+              - ".github/workflows/pr-test.yml"
+              - ".github/workflows/_pr-test-*.yml"
+              - ".github/workflows/pr-gate.yml"
+              - ".github/actions/**"
+              - "python/pyproject.toml"
+              - "python/setup.py"
+              - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
+              # ops/diffusion/common stays since kda_kernels (an srt path) imports it.
+              - "python/sglang/kernels/{,ops/,jit/,jit/csrc/}!(*.md)"
+              - "python/sglang/kernels/!(aot|ops|jit)/**/!(*.md)"
+              - "python/sglang/kernels/jit/!(csrc)/**/!(*.md)"
+              - "python/sglang/kernels/{ops,jit/csrc}/!(diffusion)/**/!(*.md)"
+              - "python/sglang/kernels/ops/diffusion/common/**/!(*.md)"
+              - "scripts/ci/cuda/*"
+              - "scripts/ci/utils/*"
+              - "test/{,registered/,registered/kernels/}!(*.md)"
+              - "test/!(registered)/**/!(*.md)"
+              - "test/registered/!(kernels|unit|e2e)/**/!(*.md)"
+              - "test/registered/kernels/!(ops|benchmark)/**/!(*.md)"
+              - "test/registered/{kernels/ops,kernels/benchmark,unit,e2e}/!(*.md)"
+              - "test/registered/{kernels/ops,kernels/benchmark,unit,e2e}/!(diffusion)/**/!(*.md)"
+              # rust/Cargo.lock also changes for processor-only edits, so it gates the processor
+              # filter; `/**/*` keeps the per-crate glob from matching it.
+              - "rust/!(Cargo.lock)"
+              - "rust/!(sglang-processor)/**/*"
+              - "proto/**"
+            processor:
+              - "rust/sglang-processor/**"
+              - "rust/Cargo.lock"
+            server_args_docs:
+              # Only the CPU stage reads this: test_server_args_docs_coverage.py diffs these
+              # against the CLI, and main_package would gate every GPU stage.
+              - "docs/docs/advanced_features/server_arguments.mdx"
+              - "docs/docs/advanced_features/server_arguments_undocumented.txt"
+            simulator:
+              - ".github/workflows/pr-test-extra.yml"
+              - ".github/workflows/_pr-test-simulator-cpu.yml"
+              - ".github/workflows/_pr-test-simulator-gpu.yml"
+              - "benchmark/simulator/**/!(*.md)"
+              - "tools/sglang-simulator/**/!(*.md)"
+            multimodal_gen:
+              - ".github/actions/**"
+              - ".github/workflows/pr-test.yml"
+              - ".github/workflows/_pr-test-check-changes.yml"
+              - ".github/workflows/_pr-test-detect-changes.yml"
+              - ".github/workflows/pr-test-multimodal-gen.yml"
+              - ".github/workflows/_diffusion-pr-test-stage.yml"
+              - "scripts/ci/cuda/ci_install_dependency.sh"
+              - "scripts/ci/cuda/ci_install_dependency_diffusion.sh"
+              - "scripts/ci/runner_configs.yml"
+              - "python/pyproject.toml"
+              - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
+              - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
+              - "python/sglang/srt/observability/**"
+              - "python/sglang/kernels/ops/diffusion/**"
+              - "python/sglang/kernels/jit/csrc/diffusion/**"
+              - "test/registered/kernels/ops/diffusion/**"
+              - "test/registered/kernels/benchmark/diffusion/**"
+              - "test/registered/unit/diffusion/**"
+              - "test/registered/e2e/diffusion/**"
+              - "python/sglang/cli/**"
+            # multimodal_gen minus the ComfyUI plugin: no server, runtime or GPU suite imports it.
+            multimodal_gen_server:
+              - ".github/actions/**"
+              - ".github/workflows/pr-test.yml"
+              - ".github/workflows/_pr-test-check-changes.yml"
+              - ".github/workflows/_pr-test-detect-changes.yml"
+              - ".github/workflows/pr-test-multimodal-gen.yml"
+              - ".github/workflows/_diffusion-pr-test-stage.yml"
+              - "scripts/ci/cuda/ci_install_dependency.sh"
+              - "scripts/ci/cuda/ci_install_dependency_diffusion.sh"
+              - "scripts/ci/runner_configs.yml"
+              - "python/pyproject.toml"
+              - "python/sglang/multimodal_gen/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/!(apps|test|*.md|*.ipynb)/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/{apps,test}/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/apps/!(ComfyUI_SGLDiffusion)/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/test/!(unit)/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/test/unit/!(test_comfyui_*|*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/test/unit/**/*/!(*.md|*.ipynb)"
+              - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
+              - "python/sglang/srt/observability/**"
+              - "python/sglang/kernels/ops/diffusion/**"
+              - "python/sglang/kernels/jit/csrc/diffusion/**"
+              - "test/registered/kernels/ops/diffusion/**"
+              - "test/registered/kernels/benchmark/diffusion/**"
+              - "test/registered/unit/diffusion/**"
+              - "test/registered/e2e/diffusion/**"
+              - "python/sglang/cli/**"
+            diffusion_sm103:
+              - ".github/workflows/{pr-test*,_pr-test*,_diffusion*}.yml"
+              - ".github/actions/**"
+              - "scripts/ci/**"
+              - "python/{pyproject.toml,setup.py}"
+              - "python/sglang/{__init__.py,utils.py}"
+              - "python/sglang/multimodal_gen/{__init__.py,envs.py}"
+              - "python/sglang/multimodal_gen/{runtime,configs}/**/!(*.md|*.ipynb)"
+              - "python/sglang/kernels/**/!(*.md)"
+              - "python/sglang/srt/**/!(*.md)"
+              - "python/sglang/{utils,distributed,test}/**/!(*.md)"
+              - "test/registered/kernels/ops/diffusion/**"
+            jit_kernel:
+              - ".github/workflows/pr-test.yml"
+              - ".github/workflows/pr-test-jit-kernel.yml"
+              - "python/pyproject.toml"
+              - "test/registered/kernels/**"
+              # The base-b-kernel suites import sglang.kernels directly.
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(aot)/**"
+            sgl_kernel:
+              # Excludes pr-test-sgl-kernel.yml: an edit there would force a 20-30 min wheel rebuild.
+              - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"

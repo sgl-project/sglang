@@ -28,7 +28,7 @@ UPDATE_FN_MAP = {"jit": jit_causal_conv1d_update, "aot": aot_causal_conv1d_updat
 @marker.parametrize("seqlen", [128, 512, 2048, 8192], [512])
 @marker.parametrize("dim", [2048, 4096, 8192], [4096])
 @marker.parametrize("dtype", [torch.float16, torch.bfloat16])
-@marker.benchmark("impl", ["jit", "aot"])
+@marker.benchmark("impl", ["jit", "aot"], gate=["jit"])
 def benchmark_fwd(seqlen: int, dim: int, dtype: torch.dtype, impl: str):
     """Prefill: one varlen batch of four sequences, conv state written back."""
     batch = 4
@@ -68,7 +68,7 @@ def benchmark_fwd(seqlen: int, dim: int, dtype: torch.dtype, impl: str):
 @marker.parametrize("batch", [1, 8, 64, 256], [64])
 @marker.parametrize("dim", [2048, 4096, 8192], [4096])
 @marker.parametrize("dtype", [torch.float16, torch.bfloat16])
-@marker.benchmark("impl", ["jit", "aot"])
+@marker.benchmark("impl", ["jit", "aot"], gate=["jit"])
 def benchmark_update(batch: int, dim: int, dtype: torch.dtype, impl: str):
     """Decode: one token per sequence, conv state gathered by slot index."""
     entries = max(batch * 4, 64)

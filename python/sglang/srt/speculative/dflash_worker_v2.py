@@ -302,6 +302,8 @@ def _is_all_greedy(sampling_info) -> bool:
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
+    # Row 0 is the anchor, unless shift_label: then row i drafts token i + 1.
+    pred_hidden = pred_hidden[:, :-1] if draft_model.shift_label else pred_hidden[:, 1:]
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
     candidate_ids, unary_logits = draft_model.compute_candidates(
@@ -409,7 +411,7 @@ class _SelectorDraftSampler:
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
-        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
+        hs = hidden_states.view(bs, self.block_size, -1)
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
@@ -527,7 +529,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
@@ -789,10 +790,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         # budget.
         self._runtime = bind_dflash_runtime(self, target_model)
         # Side stream only where KV frees wait on it (overlap scheduler, no unified
-        # memory or HiCache) and the stock round owns the draft KV writes.
+        # memory or HiCache), and beside a bound runtime only if it joins the aux.
         self._aux_overlap = (
             self._use_aux_graph
-            and self._runtime is None
+            and (self._runtime is None or "join_aux" in self._runtime.bindings)
             and envs.SGLANG_OPT_DFLASH_AUX_OVERLAP.get()
             and not get_schedule().disable_overlap_schedule
             and not get_memory().enable_unified_memory
@@ -930,13 +931,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         return SIMULATE_ACC_LEN > 0 or (
             self._selector_sample is None and not is_dflash_sampling_verify_available()
         )
-
-    @property
-    def draft_worker(self):
-        # DFLASH drives the draft model through a plain TpModelWorker: the
-        # draft KV is materialized from target hidden states, so there is no
-        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
-        return self._draft_worker
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -1500,13 +1494,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
-    def clear_cache_pool(self):
-        # The target worker owns the shared KV allocator/cache. For the compact
-        # sliding-window path, the draft req->token view is rebuilt from committed
-        # target state before each draft forward, so there is nothing persistent
-        # to flush here.
-        pass
-
     def _gather_req_to_token_masked(
         self,
         *,
@@ -1899,13 +1886,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH selector draft returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
-        num_pred = pred_hidden.shape[1]
+        num_pred = int(self.block_size) - 1
 
         candidate_ids, scores = _selector_lattice(
-            draft_model, pred_hidden, anchor_token_ids
+            draft_model, draft_hidden, anchor_token_ids
         )
-        device = pred_hidden.device
+        device = draft_hidden.device
         # Clamped like DSpark so greedy rows don't divide by zero.
         temperatures = (
             torch.ones(bs, dtype=torch.float32, device=device)
@@ -3151,13 +3137,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     # Matches the active ranks, which go eager when any DP rank is idle.
                     idle_verify_forward_batch.can_run_decode_cuda_graph = False
                     idle_can_run_cuda_graph = False
+                    idle_verify_forward_batch.mark_forward_metadata_ready()
                 # On CUDA every rank pads to max(original_global_num_tokens_cpu), so
                 # the idle rank replays the active ranks' graph with zero real rows.
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
-                    skip_attn_backend_init=True if _is_npu else None,
                 )
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
@@ -3620,13 +3606,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
                 verify_forward_batch.can_run_decode_cuda_graph = False
 
+            if not (_is_npu or get_parallel().attn_dp_enabled):
+                verify_forward_batch.mark_forward_metadata_ready()
             target_out = self.target_worker.forward_batch_generation(
                 batch=None,
                 forward_batch=verify_forward_batch,
                 is_verify=True,
-                skip_attn_backend_init=(
-                    None if _is_npu or get_parallel().attn_dp_enabled else True
-                ),
             )
             routed_experts_output = target_out.routed_experts_output
             indexer_topk_output = target_out.indexer_topk_output
