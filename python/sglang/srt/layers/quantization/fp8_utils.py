@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from enum import Enum
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -45,6 +46,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    get_device_name,
     get_device_sm,
     get_hip_version,
     is_cuda,
@@ -54,6 +56,7 @@ from sglang.srt.utils import (
     is_gfx1250_supported,
     is_hip,
     is_musa,
+    is_npu,
     is_xpu,
 )
 from sglang.srt.utils.common import torch_release
@@ -72,13 +75,12 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
+_is_npu = is_npu()
 
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
 # pure-triton block-fp8 path on gfx1250.
-_use_aiter = (
-    get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_gfx1250_supported
-)
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip and not _is_gfx1250_supported
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_gfx942 = _use_aiter and is_gfx942_supported()
 # Conservative, not a tuned crossover: ptpc beat block-fp8 up to M=512 on
@@ -361,7 +363,7 @@ if _use_aiter:
     )
 
 _use_aiter_mxfp8_gfx1250 = False
-if get_bool_env_var("SGLANG_USE_AITER") and _is_hip and _is_gfx1250_supported:
+if envs.SGLANG_USE_AITER.get() and _is_hip and _is_gfx1250_supported:
     try:
         from aiter import dtypes as aiter_dtypes
         from aiter.ops.gemm_op_a8w8 import (
@@ -731,9 +733,57 @@ if get_platform().is_blackwell and is_flashinfer_available():
         )
 
 
+_HAS_FLASHINFER_SM90_SWAPAB = False
 if get_platform().is_sm90 and is_flashinfer_available():
     # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
-    from flashinfer.gemm import fp8_blockscale_gemm_sm90
+    try:
+        from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
+        _HAS_FLASHINFER_SM90_SWAPAB = True
+    except ImportError:
+        pass
+
+
+# H20 is Hopper silicon cut down to 78 SMs; the next smallest Hopper SKU is the
+# 114-SM H100 PCIe and SXM H100/H200 are 132. Per byte of weights streamed that
+# leaves H20 with roughly a third of their compute, which is the whole reason a
+# narrow-M block-FP8 GEMM is compute-bound there and bandwidth-bound elsewhere.
+# Matched on the product name rather than the SM count: a MIG slice reports far
+# fewer SMs than its parent, and a sliced H100 is memory-bound like the whole
+# card, so an SM-count test would hand it a default that only helps H20.
+# "H20" is a substring of "H200", so the family needs an SKU boundary instead of
+# `"H20" in name` (as layers/attention/qsa/sparse_attn.py does): "NVIDIA H20" and
+# "NVIDIA H20-3e" match, "NVIDIA H200" does not.
+_H20_NAME = re.compile(r"NVIDIA H20($|[-\s])")
+
+
+def _h20_swapab_opt_out() -> bool:
+    """Whether an opt-in feature pins block-FP8 GEMM to one kernel for every M."""
+    if _fp8_block_gemv_enabled():
+        return True
+    # Deferred import: the batch-invariant helpers are read lazily everywhere else
+    # in this file too (see the [32, 32] path), so do not pull them in at import.
+    from sglang.srt.layers.quantization.mxfp8_input import (
+        batch_invariant_or_deterministic,
+    )
+
+    try:
+        return batch_invariant_or_deterministic()
+    except ValueError:
+        # No runtime context: a standalone FP8 linear (diffusion, unit construction)
+        # has no server to have enabled deterministic inference either.
+        return False
+
+
+def _is_h20() -> bool:
+    """Whether this is an H20-family Hopper part: few SMs, compute-starved."""
+    if not get_platform().is_sm90:
+        return False
+    try:
+        name = get_device_name(torch.cuda.current_device())
+    except Exception:
+        return False
+    return bool(_H20_NAME.match(name))
 
 
 def dispatch_w8a8_block_fp8_linear(
@@ -764,7 +814,7 @@ def dispatch_w8a8_block_fp8_linear(
         )
 
     # Other non-128 layouts still require Triton or the separate MXFP8 route.
-    if weight_block_size is not None and weight_block_size[1] != 128:
+    if weight_block_size is not None and weight_block_size[1] != 128 and not _is_npu:
         if backend.is_deep_gemm():
             print_warning_once(
                 f"--fp8-gemm-backend=deep_gemm cannot serve {weight_block_size} "
@@ -1265,11 +1315,17 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_flashinfer_deepgemm():
-        if not (get_platform().is_sm90 and is_flashinfer_available()):
+        # _HAS_FLASHINFER_SM90_SWAPAB also guards the import: without the symbol
+        # this callable would raise NameError on the first small-M forward.
+        if not (
+            get_platform().is_sm90
+            and is_flashinfer_available()
+            and _HAS_FLASHINFER_SM90_SWAPAB
+        ):
             raise RuntimeError(
                 "FlashInfer DeepGEMM with swapAB requested via --fp8-gemm-backend=flashinfer_deepgemm, "
-                "but it's not available. This backend requires Hopper (SM90) GPUs and FlashInfer "
-                "to be installed."
+                "but it's not available. This backend requires Hopper (SM90) GPUs, FlashInfer, "
+                "and flashinfer.gemm.fp8_blockscale_gemm_sm90."
             )
         return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
 
@@ -1330,7 +1386,8 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 def _dispatch_auto_backend(act_scale_ue8m0: bool = False) -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
-    # 1. DeepGEMM (if enabled and available)
+    # 1. DeepGEMM (if enabled and available); on H20 the FlashInfer hybrid, which
+    #    routes 1 <= M < 32 to the swapAB kernel
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
@@ -1339,6 +1396,33 @@ def _dispatch_auto_backend(act_scale_ue8m0: bool = False) -> Callable:
     # 7. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        # On H20 the FlashInfer entry point is a strict superset of plain
+        # DeepGEMM: 1 <= M < 32 takes the swapAB kernel and every other M is
+        # handed to DeepGEMM. Decode sits in that band, and on H20 it is
+        # compute-bound, so narrow-M is where the queue lives (17.51 -> 10.53 ms
+        # TPOT at M=1). H100/H200 make the same call bandwidth-bound, measure
+        # within noise, and keep the DeepGEMM default.
+        # ue8m0 activation scales stay on DeepGEMM: that path binds
+        # act_scale_ue8m0 through this exact callable below, and the FlashInfer
+        # entry point quantizes the activation itself with fp32 scales.
+        # --fp8-gemm-backend=deep_gemm still selects plain DeepGEMM everywhere.
+        # ...but not when something below depends on one fixed kernel for every M:
+        #   act_scale_ue8m0 is bound through deepgemm_w8a8_block_fp8_linear_with_fallback
+        #     (this callable has no such parameter and quantizes the activation
+        #     itself with fp32 scales), so returning the hybrid would drop it.
+        #   SGLANG_ENABLE_FP8_BLOCK_GEMV routes M=1 to hopper_fp8_block_gemv inside
+        #     deepgemm_w8a8_block_fp8_linear_with_fallback; taking the hybrid here
+        #     would silently skip that opt-in.
+        #   batch-invariant / deterministic inference promises that a request's
+        #     output does not depend on what else is in the batch, which a kernel
+        #     that switches at M=32 would break.
+        if (
+            _HAS_FLASHINFER_SM90_SWAPAB
+            and _is_h20()
+            and not act_scale_ue8m0
+            and not _h20_swapab_opt_out()
+        ):
+            return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     elif get_platform().is_blackwell and is_flashinfer_available():
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
@@ -1484,7 +1568,24 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     For SM90 (Hopper), this uses the DeepGEMM JIT with automatic swapAB selection.
     """
-    assert input_scale is None
+    # fp8_blockscale_gemm_sm90 quantizes the activation itself and takes no static
+    # per-tensor input scale, and its scale tensor is per-token (block 1x128) or
+    # per-block (128x128) -- the call below passes no block size, so any other
+    # layout would index the wrong scales. DeepGEMM is the runner `auto` used for
+    # those checkpoints before this change, and falls back to Triton on its own;
+    # without JIT DeepGEMM, go straight to Triton rather than assert inside it.
+    # Unpacked and compared as ints because this runs on every call, not just at
+    # runner selection: allocating `list(block_size)` here shows up on the eager
+    # decode path.
+    block_n, block_k = block_size
+    if input_scale is not None or block_k != 128 or block_n not in (1, 128):
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            return deepgemm_w8a8_block_fp8_linear_with_fallback(
+                input, weight, block_size, weight_scale, input_scale, bias
+            )
+        return triton_w8a8_block_fp8_linear(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
 
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16

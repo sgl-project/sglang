@@ -577,6 +577,8 @@ def get_quant_config(
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path
+        elif model_config.quantization == "modelslim":
+            config["hf_config"] = model_config.hf_config
         elif model_config.quantization.startswith("modelopt") and (
             config.get("producer", {}).get("name", "").startswith("modelopt")
         ):
@@ -1194,8 +1196,12 @@ def _prefetch_all_checkpoints(
     # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
         world_group = get_parallel().world_group
-        local_rank = world_group.local_rank
-        local_world_size = world_group.local_size or get_parallel().launch_world_size
+        # Only the CPU backend sets LOCAL_SIZE; otherwise use ranks per node.
+        local_world_size = world_group.local_size or (
+            get_parallel().launch_world_size // get_parallel().nnodes
+        )
+        # Ranks are numbered node by node, so this is the rank's index on its node.
+        local_rank = world_group.rank % local_world_size
     else:
         local_rank = 0
         local_world_size = 1
@@ -1549,12 +1555,18 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    max_inflight_bytes: Optional[int] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
     At most (max_workers + 1) shard files are in-flight at any time:
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+    ``max_inflight_bytes`` also caps the summed size of the files submitted
+    but not yet handed out; one file is always admitted, even above the cap.
+    Peak RAM is a small multiple of max(cap, largest shard): the shard being
+    yielded is not counted, and with ``disable_mmap`` a shard is held as
+    bytes and then as tensors (measured 2-3x with ``disable_mmap``).
     """
     prefetch_handle = None
     if prefetch and not disable_mmap:
@@ -1581,9 +1593,26 @@ def buffered_multi_thread_safetensors_weights_iterator(
         file_iter = iter(hf_weights_files)
         pending: collections.deque = collections.deque()
 
-        # Seed the buffer.
-        for st_file in itertools.islice(file_iter, buffer_size):
-            pending.append((st_file, executor.submit(_load_file, st_file)))
+        next_file = next(file_iter, None)
+        inflight_bytes = 0
+
+        def fill_window():
+            nonlocal next_file, inflight_bytes
+            while next_file is not None and len(pending) < buffer_size:
+                size = os.path.getsize(next_file)
+                if (
+                    max_inflight_bytes is not None
+                    and pending
+                    and inflight_bytes + size > max_inflight_bytes
+                ):
+                    break
+                pending.append(
+                    (next_file, size, executor.submit(_load_file, next_file))
+                )
+                inflight_bytes += size
+                next_file = next(file_iter, None)
+
+        fill_window()
 
         with tqdm(
             total=len(hf_weights_files),
@@ -1593,14 +1622,13 @@ def buffered_multi_thread_safetensors_weights_iterator(
             position=tqdm._get_free_pos(),
         ) as pbar:
             while pending:
-                st_file, future = pending.popleft()
+                st_file, size, future = pending.popleft()
                 state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
 
-                # Replenish: submit the next file to keep the buffer full.
-                next_file = next(file_iter, None)
-                if next_file is not None:
-                    pending.append((next_file, executor.submit(_load_file, next_file)))
+                # Replenish the window.
+                inflight_bytes -= size
+                fill_window()
 
                 for name in sorted(state_dict.keys()):
                     yield name, state_dict[name]

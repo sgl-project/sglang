@@ -125,7 +125,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
         self.req_to_token_pool = runner.req_to_token_pool  # pool obj for TboAttnBackend
         self.req_to_token = runner.req_to_token_pool.req_to_token
-        self.max_context_len = int(runner.model_config.context_len)
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
         self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(
@@ -201,7 +200,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if self.is_npu:
             self.use_msa = False
             # Prime the native sparse op probe before cuda-graph capture.
-            from sgl_kernel_npu.attention.gqa_share_sparse_attention import (
+            from sgl_kernel_npu.operators.attention.flash_decode_bnsd_with_gqa_share_sparse import (
                 _get_native_sparse_op,
             )
 
@@ -258,7 +257,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
             self.num_kv_heads = self.kv_pool.main_pool.head_num
             self._msa_nb_max = (
-                self.max_context_len + self.block_size_k - 1
+                self.req_to_token_pool.row_width + self.block_size_k - 1
             ) // self.block_size_k
             self._msa_cg: dict[int, tuple] = {}
 
@@ -467,7 +466,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
-            self._max_seqlen_k = self.max_context_len
+            self._max_seqlen_k = self.req_to_token_pool.row_width
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
             if self._linear_verify and forward_batch.forward_mode.is_target_verify():
@@ -745,7 +744,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # Fused prefill topk already appended the causal local block ([..., topk+1]); decode/verify still need the append.
             if topk_idx.shape[2] == self.topk_blocks + 1:
                 return topk_idx
-            from sgl_kernel_npu.indexer.flash_block_score_decode import (
+            from sgl_kernel_npu.operators.indexer import (
                 append_local_block_to_topk_idx,
             )
 
@@ -792,10 +791,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         NHD paged KV reshapes to [pages, block_size, H, D]; block table from
         req_to_token.
         """
-        from sgl_kernel_npu.attention.gqa_share_sparse_attention import (
+        from sgl_kernel_npu.operators.attention import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
-        from sgl_kernel_npu.indexer.flash_block_score_decode import (
+        from sgl_kernel_npu.operators.indexer import (
             flash_decode_bnsd_with_topk_idx,
         )
 
@@ -925,10 +924,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ndt queries per request, each causal (j attends KV[0:prefix+j+1]). Flatten
         to per-query rows, reuse the decode kernels (device ops only, no .item()).
         """
-        from sgl_kernel_npu.attention.gqa_share_sparse_attention import (
+        from sgl_kernel_npu.operators.attention import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
-        from sgl_kernel_npu.indexer.flash_block_score_decode import (
+        from sgl_kernel_npu.operators.indexer import (
             flash_decode_bnsd_with_topk_idx,
         )
 
@@ -1147,11 +1146,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         block_size_q = self._choose_block_size_q(max_seqlen)
 
         # Score-path qblock mappings (layer-invariant), built once per forward.
-        from sgl_kernel_npu.indexer.flash_block_score_prefill import (
-            _build_qblock_mappings as _build_score_qblock_mappings,
+        from sgl_kernel_npu.operators.indexer.indexer_utils import (
+            build_qblock_mappings,
         )
 
-        qblock_mappings = _build_score_qblock_mappings(
+        qblock_mappings = build_qblock_mappings(
             cu_seqlens,
             seq_lens,
             self.req_to_token,
@@ -1206,7 +1205,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         Generalizes verify to variable per-request extend lengths: each token becomes
         a per-query row with a causal seq_len; decode kernels attend selected blocks.
         """
-        from sgl_kernel_npu.attention.gqa_share_sparse_attention import (
+        from sgl_kernel_npu.operators.attention import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
 
@@ -1251,10 +1250,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # scores every query-block x kv-block in one 2D dot. Fused topk +
         # causal-local append yields [..., topk+1]; the prepare helper skips
         # the duplicate append.
-        from sgl_kernel_npu.indexer.flash_block_score_prefill import (
+        from sgl_kernel_npu.operators.indexer import (
             flash_prefill_bnsd_indexer,
         )
-        from sgl_kernel_npu.indexer.flash_block_score_prefill import (
+        from sgl_kernel_npu.operators.indexer import (
             flash_prefill_bnsd_with_topk_idx as _flash_prefill_score_topk,
         )
 
@@ -1342,7 +1341,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         def _fia_main():
             # Native Ascend FA (FIA) with a per-query custom block_table.
-            from sgl_kernel_npu.attention.fia_blockq_attention import (
+            from sgl_kernel_npu.operators.attention import (
                 flash_prefill_bnsd_blockq_sparse_fia,
             )
 
