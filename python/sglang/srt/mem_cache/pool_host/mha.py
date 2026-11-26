@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _cuda_host_unregister,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -1022,18 +1023,28 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self._post_init_host_buffers()
 
     def _post_init_host_buffers(self) -> None:
-        if self.layout == "page_first":
-            transposed = self.k_buffer.transpose(0, 1)
-            self.k_data_refs = [transposed[i] for i in range(self.layer_num)]
-        elif self.layout == "layer_first":
-            self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
-        else:
+        try:
+            if self.layout == "page_first":
+                transposed = self.k_buffer.transpose(0, 1)
+                self.k_data_refs = [transposed[i] for i in range(self.layer_num)]
+            elif self.layout == "layer_first":
+                self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+            else:
+                self.k_data_refs = []
+            self.k_data_ptrs = make_kernel_ptr_table(
+                self.k_data_refs,
+                self._transfer_device,
+                host_memory_registered=self.pin_memory,
+            )
+        except Exception:
+            # A failed pointer-table allocation must leave room to retry the pool.
             self.k_data_refs = []
-        self.k_data_ptrs = make_kernel_ptr_table(
-            self.k_data_refs,
-            self._transfer_device,
-            host_memory_registered=self.pin_memory,
-        )
+            self.k_data_ptrs = None
+            if self.pin_memory and (_is_cuda or _is_hip):
+                _cuda_host_unregister(self.kv_buffer)
+            self.kv_buffer = None
+            self.fd = None
+            raise
 
     def destroy(self):
         self.k_data_refs = []

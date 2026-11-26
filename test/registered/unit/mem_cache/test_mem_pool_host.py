@@ -298,6 +298,16 @@ class TestHostKVCache(CustomTestCase):
                 self.assertEqual(host.size, self.host_pool.size)
                 # Keep the original allocation alive to make stale pointers observable.
                 original = host.k_buffer
+                with unittest.mock.patch(
+                    "sglang.srt.mem_cache.pool_host.mha.make_kernel_ptr_table",
+                    side_effect=RuntimeError("pointer table allocation failed"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "pointer table"):
+                        host._allocate_host_buffer()
+                self.assertIsNone(host.k_buffer)
+                self.assertIsNone(host.k_data_ptrs)
+                self.assertEqual(host.k_data_refs, [])
+
                 host._allocate_host_buffer()
                 self.assertIs(host.k_buffer, host.kv_buffer)
                 self.assertNotEqual(host.k_buffer.data_ptr(), original.data_ptr())
