@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from transformers import (
     dynamic_module_utils,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import processor
 from sglang.srt.hf_transformers.processor import (
     load_scheduler_tokenizer,
@@ -28,6 +30,31 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
+@contextmanager
+def isolated_hf_modules_cache(cache):
+    prefix = dynamic_module_utils.TRANSFORMERS_DYNAMIC_MODULE_NAME
+
+    def pop_dynamic_modules():
+        return {
+            name: sys.modules.pop(name)
+            for name in tuple(sys.modules)
+            if name == prefix or name.startswith(prefix + ".")
+        }
+
+    with (
+        patch.object(dynamic_module_utils, "HF_MODULES_CACHE", str(cache)),
+        patch.object(sys, "path", sys.path.copy()),
+    ):
+        # A package from another cache can still resolve relative imports via
+        # its old __path__. Restore that package after this fixture is done.
+        previous = pop_dynamic_modules()
+        try:
+            yield
+        finally:
+            pop_dynamic_modules()
+            sys.modules.update(previous)
+
+
 class TestLocalModulePrewarm(CustomTestCase):
     def test_prewarm_failure_preserves_scheduler_launch(self):
         from sglang.srt.entrypoints.engine import Engine
@@ -35,7 +62,9 @@ class TestLocalModulePrewarm(CustomTestCase):
         self.addCleanup(reset_context)
         with (
             tempfile.TemporaryDirectory() as model,
-            patch.object(dynamic_module_utils, "HF_MODULES_CACHE", model),
+            patch.object(
+                dynamic_module_utils, "HF_MODULES_CACHE", str(Path(model) / "modules")
+            ),
         ):
             args = ServerArgs(
                 model_path="dummy",
@@ -79,13 +108,17 @@ class TestLocalModulePrewarm(CustomTestCase):
                 dynamic_module_utils, "HF_MODULES_CACHE", str(Path(model) / "modules")
             ),
         ):
-            for overrides in (
-                {"trust_remote_code": False},
-                {"skip_tokenizer_init": True},
-                {"nnodes": 2, "node_rank": 1},  # A single reader on a follower.
-                {"tokenizer_path": "org/remote-tokenizer"},
+            for overrides, rust_server in (
+                ({"trust_remote_code": False}, False),
+                ({"skip_tokenizer_init": True}, False),
+                ({"nnodes": 2, "node_rank": 1}, False),  # One reader on a follower.
+                ({"tokenizer_path": "org/remote-tokenizer"}, False),
+                ({"tp_size": 1}, True),  # No Python frontend on the Rust head node.
             ):
-                with self.subTest(overrides=overrides):
+                with (
+                    self.subTest(overrides=overrides, rust_server=rust_server),
+                    envs.SGLANG_RUST_SERVER.override(rust_server),
+                ):
                     options = dict(
                         model_path="dummy",
                         tokenizer_path=model,
@@ -129,10 +162,7 @@ class TestLocalModulePrewarm(CustomTestCase):
             )
             (model / "helper.py").write_text("MARKER = 'warm'\n")
 
-            with (
-                patch.object(dynamic_module_utils, "HF_MODULES_CACHE", str(cache)),
-                patch.object(sys, "path", sys.path.copy()),
-            ):
+            with isolated_hf_modules_cache(cache):
                 args = ServerArgs(
                     model_path=str(model),
                     trust_remote_code=True,
@@ -142,6 +172,13 @@ class TestLocalModulePrewarm(CustomTestCase):
                 publish(args, role="tokenizer")
 
                 def check_at_spawn():
+                    package = f"{dynamic_module_utils.TRANSFORMERS_DYNAMIC_MODULE_NAME}.{model.name}"
+                    self.assertFalse(
+                        any(
+                            name == package or name.startswith(package + ".")
+                            for name in sys.modules
+                        )
+                    )
                     with patch(
                         "shutil.copyfile", side_effect=AssertionError("cold cache")
                     ):
@@ -183,11 +220,7 @@ class TestLocalModulePrewarm(CustomTestCase):
                 node_rank=1,
             )
             publish(args, role="tokenizer")
-            with (
-                patch.dict(os.environ),
-                patch.object(dynamic_module_utils, "HF_MODULES_CACHE", str(cache)),
-                patch.object(sys, "path", sys.path.copy()),
-            ):
+            with patch.dict(os.environ), isolated_hf_modules_cache(cache):
                 os.environ.pop("SGLANG_TEST_PREWARM_PID", None)
                 with self.assertLogs(processor.logger, level="WARNING"):
                     maybe_prewarm_scheduler_tokenizer()
