@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.layers.flux3_fused_ops import (
     flux3_qkv_qknorm_rope,
     flux3_shared_activation,
 )
+from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.quantization import flux3_prims_ts
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
@@ -55,6 +56,7 @@ from sglang.multimodal_gen.runtime.models.dits.flux3_image import (
 from sglang.multimodal_gen.runtime.pipelines.flux3_image_weights import (
     resolve_flux3_image_dit_quant_config,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _TINY = dict(
     hidden_size=256,
@@ -198,10 +200,18 @@ def test_packed_cfg_forward_matches_flux3_transformer_per_sample(
         packed.rope = {mode: native.rope(ids) for mode, ids in packed.ids.items()}
         cached = native(packed)["image"].float()
         torch.testing.assert_close(cached, predicted, rtol=0, atol=0)
-        packed.static_hidden = {}
-        for _ in range(2):
-            reused = native(packed)["image"].float()
-            torch.testing.assert_close(reused, predicted, rtol=0, atol=0)
+        packed.static = flux3_image.StaticStreams()
+        modulation = native.single_stream_modulations["txt"]
+        with (
+            mock.patch.object(
+                native.txt_in, "forward", wraps=native.txt_in.forward
+            ) as embed,
+            mock.patch.object(modulation, "forward", wraps=modulation.forward) as mod,
+        ):
+            for _ in range(2):
+                reused = native(packed)["image"].float()
+                torch.testing.assert_close(reused, predicted, rtol=0, atol=0)
+        assert embed.call_count == mod.call_count == 1
         for mode, rows in packed.sample(1).rope.items():
             start, end = packed.mode_indices[mode][1]
             assert torch.equal(rows, packed.rope[mode][start:end])
@@ -231,9 +241,23 @@ def test_packed_cfg_forward_matches_flux3_transformer_per_sample(
         packed.timesteps["image"].fill_(0.3)
         packed.data["image"].mul_(0.9)
         reused = native(packed)["image"]
-        packed.static_hidden = None
+        packed.static = None
         uncached = native(packed)["image"]
         torch.testing.assert_close(reused, uncached, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="needs the CUDA kernels")
+def test_native_swiglu_is_within_one_bf16_step_of_the_eager_pair():
+    torch.manual_seed(0)
+    packed = (torch.randn(1, 37, 2 * 96, device="cuda") * 3).bfloat16()
+    gate, value = packed.chunk(2, dim=-1)
+    eager = torch.nn.functional.silu(gate) * value
+    torch.testing.assert_close(
+        flux3_fused_ops._SILU_AND_MUL(packed).float(),
+        eager.float(),
+        rtol=2**-7,
+        atol=1e-6,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA kernels")
@@ -391,12 +415,16 @@ class TestFlux3ImageDiTContract(unittest.TestCase):
         )
         with mock.patch(metadata, return_value=object()):
             with self.assertRaisesRegex(ValueError, "do not also set --quantization"):
-                resolve_flux3_image_dit_quant_config("dit.safetensors", "kitchen_int8")
+                resolve_flux3_image_dit_quant_config("dit.safetensors", "convrot_int8")
 
         with mock.patch(metadata, return_value=None):
+            with self.assertRaisesRegex(
+                ValueError, "Invalid quantization method: kitchen_int8"
+            ):
+                resolve_flux3_image_dit_quant_config("dit.safetensors", "kitchen_int8")
             config = resolve_flux3_image_dit_quant_config(
                 "dit.safetensors",
-                "kitchen_int8",
+                "convrot_int8",
                 ignored_layers=["adaln.linear"],
             )
         self.assertIsInstance(config, ConvRotInt8Config)
@@ -420,6 +448,15 @@ class _StubLinear:
     def __call__(self, x):
         self.inputs.append(x)
         return self.output, None
+
+
+def _stub_lora(base_layer, delta):
+    """A LoRA wrapper around a FLUX.3 linear whose adapter adds ``delta``."""
+    stub = mock.NonCallableMock(spec=BaseLayerWithLoRA)
+    stub.base_layer = base_layer
+    stub.lora_active = True
+    stub.fused_lora_delta.return_value = delta
+    return stub
 
 
 class TestFlux3FusedOps(unittest.TestCase):
@@ -522,6 +559,71 @@ class TestFlux3FusedOps(unittest.TestCase):
         self.assertEqual(result, "down_from_packed")
         swiglu.assert_called_with(mlp_in, self._CUDA_X, "shared", packed_output=True)
         from_packed.assert_called_once_with(mlp_out, hidden)
+
+    def test_lora_wrapped_layers_pass_their_delta_to_the_prims_ts_epilogue(self):
+        x = self._CUDA_X
+        linear = mock.Mock(return_value="prims_ts")
+        planned = _StubLinear(Flux3PrimsTsRole.LINEAR, apply_prims_ts_linear=linear)
+        epilogue = mock.Mock(return_value=torch.randn(1, 3, 3 * 2 * 4))
+        qkv = _StubLinear(
+            Flux3PrimsTsRole.QKV_QKNORM_ROPE, apply_prims_ts_qkv_qknorm_rope=epilogue
+        )
+        norm = SimpleNamespace(
+            query_norm=SimpleNamespace(weight="q_w"),
+            key_norm=SimpleNamespace(weight="k_w"),
+        )
+        wrapped = _stub_lora(planned, "delta")
+        with self._platform(10, 0):
+            self.assertEqual(flux3_linear(wrapped, x, "shared"), "prims_ts")
+            flux3_qkv_qknorm_rope(_stub_lora(qkv, "qkv_delta"), x, norm, "c", "p", 2)
+            # A zero runtime LoRA scale adds nothing: the plain kernel runs.
+            flux3_linear(_stub_lora(planned, None), x)
+        wrapped.fused_lora_delta.assert_called_once_with(x, swiglu_rows=False)
+        self.assertEqual(
+            linear.call_args_list,
+            [
+                mock.call(planned, x, "shared", delta="delta"),
+                mock.call(planned, x, None),
+            ],
+        )
+        epilogue.assert_called_once_with(
+            qkv, x, "q_w", "k_w", "c", "p", None, delta="qkv_delta"
+        )
+
+    def test_gated_mlp_with_lora_skips_the_packed_handoff(self):
+        """Either projection's LoRA needs the BF16 SwiGLU output: MLP-up adds its
+        delta in SwiGLU column order, MLP-down computes its delta from it."""
+        x, hidden = self._CUDA_X, SimpleNamespace(is_cuda=True)
+        swiglu = mock.Mock(return_value=hidden)
+        down = mock.Mock(return_value="down")
+        from_packed = mock.Mock(return_value="down_from_packed")
+        mlp_in = _StubLinear(Flux3PrimsTsRole.SWIGLU, apply_prims_ts_swiglu=swiglu)
+        mlp_out = _StubLinear(
+            Flux3PrimsTsRole.LINEAR,
+            apply_prims_ts_linear=down,
+            apply_prims_ts_linear_from_packed=from_packed,
+        )
+        for layer in (mlp_in, mlp_out):
+            layer.quant_method.packed_activation_format = "nvfp4"
+        up_lora = _stub_lora(mlp_in, "up_delta")
+        down_lora = _stub_lora(mlp_out, "down_delta")
+        with self._platform(10, 0):
+            self.assertEqual(flux3_gated_mlp(up_lora, mlp_out, x), "down")
+            self.assertEqual(flux3_gated_mlp(mlp_in, down_lora, x), "down")
+        up_lora.fused_lora_delta.assert_called_once_with(x, swiglu_rows=True)
+        down_lora.fused_lora_delta.assert_called_once_with(hidden, swiglu_rows=False)
+        self.assertEqual(
+            swiglu.call_args_list,
+            [mock.call(mlp_in, x, None, delta="up_delta"), mock.call(mlp_in, x, None)],
+        )
+        self.assertEqual(
+            down.call_args_list,
+            [
+                mock.call(mlp_out, hidden, None),
+                mock.call(mlp_out, hidden, None, delta="down_delta"),
+            ],
+        )
+        from_packed.assert_not_called()
 
     def test_shared_activation_requires_matching_prims_ts_consumers(self):
         x = self._CUDA_X

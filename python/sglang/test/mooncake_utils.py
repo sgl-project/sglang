@@ -2,10 +2,20 @@ import os
 import signal
 import socket
 import subprocess
+import tempfile
 import time
+from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.disaggregation.mooncake.buffers import (
+    PEER_STAGING_KEY,
+    BufferKeys,
+    BufferKind,
+    MooncakeBufferKey,
+)
+from sglang.srt.disaggregation.mooncake.conn import PeerBuffers
+from sglang.srt.disaggregation.mooncake.transport import MooncakeTransport, Registration
 from sglang.test.server_fixtures.disaggregation_fixture import (
     get_rdma_devices_args,
 )
@@ -39,6 +49,7 @@ class MooncakeTestServices:
         self.metadata_process = None
         self.master_process = None
         self.store_process = None
+        self._log_paths: dict[str, str] = {}
 
     @staticmethod
     def _default_device(protocol: str) -> str:
@@ -51,26 +62,31 @@ class MooncakeTestServices:
 
     def start(self):
         self.metadata_process = self._launch(
+            "metadata service",
             [
                 "python3",
                 "-m",
                 "mooncake.http_metadata_server",
+                "--host",
+                "127.0.0.1",
                 "--port",
                 str(self.metadata_port),
-            ]
+            ],
         )
         try:
             self.master_process = self._launch(
+                "master service",
                 [
                     "mooncake_master",
                     "--port",
                     str(self.master_port),
                     "--metrics_port",
                     str(self.master_metrics_port),
-                ]
+                ],
             )
             self._wait_for_core_services()
             self.store_process = self._launch(
+                "store service",
                 [
                     "mooncake_client",
                     f"--host={self.local_hostname}",
@@ -123,15 +139,19 @@ class MooncakeTestServices:
                 return float(line.split()[1])
         raise AssertionError(f"{name} is missing from Mooncake master metrics")
 
-    @staticmethod
-    def _launch(command, env=None):
-        return subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
-            env=env,
+    def _launch(self, name: str, command, env=None):
+        log = tempfile.NamedTemporaryFile(
+            prefix=f"mooncake-{name.split()[0]}-", suffix=".log", delete=False
         )
+        self._log_paths[name] = log.name
+        with log:
+            return subprocess.Popen(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+                env=env,
+            )
 
     def _wait_for_core_services(self, timeout: int = 30):
         deadline = time.monotonic() + timeout
@@ -164,11 +184,15 @@ class MooncakeTestServices:
                 time.sleep(1)
         raise TimeoutError("Timed out waiting for Mooncake store")
 
-    @staticmethod
-    def _raise_if_exited(process, name: str):
+    def _raise_if_exited(self, process, name: str):
         returncode = process.poll()
-        if returncode is not None:
-            raise RuntimeError(f"Mooncake {name} exited with code {returncode}")
+        if returncode is None:
+            return
+        with open(self._log_paths[name], errors="replace") as f:
+            tail = "".join(f.readlines()[-30:])
+        raise RuntimeError(
+            f"Mooncake {name} exited with code {returncode}; log tail:\n{tail}"
+        )
 
     @staticmethod
     def _stop_process_group(process):
@@ -183,3 +207,61 @@ class MooncakeTestServices:
                 process.wait(timeout=5)
             except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
                 pass
+
+
+def engine_writes(fn):
+    """A Mooncake engine stand-in whose batch_transfer_sync hands `fn`
+    (session, [(src, dst, length), ...]) and returns what `fn` returns."""
+    return SimpleNamespace(
+        batch_register=lambda ptrs, lengths: 0,
+        batch_transfer_sync=lambda session, srcs, dsts, lengths, intent=None: fn(
+            session, list(zip(srcs, dsts, lengths))
+        ),
+    )
+
+
+def attach_mooncake_transport(
+    manager,
+    engine,
+    *,
+    kv=(),
+    aux=(),
+    state=(),
+    staging=(),
+    peer_kv=(),
+    peer_aux=(),
+    peer_state=(),
+    peer_staging=0,
+    sessions=("session",),
+):
+    """Give `manager` a real MooncakeTransport over `engine`: this side's buffers
+    registered, and every session in `sessions` importing the peer's."""
+    transport = MooncakeTransport(engine=engine)
+    staging_keys = {
+        ptr: MooncakeBufferKey(BufferKind.STAGING, i) for i, ptr in enumerate(staging)
+    }
+    local = (list(kv), list(aux), [list(s) for s in state])
+    local_keys = BufferKeys.for_buffers(*local)
+    local_buffers = local_keys.pair(*local)
+    local_buffers += [(key, ptr) for ptr, key in staging_keys.items()]
+    transport.register_all(
+        [
+            Registration(key=key, ptr=ptr, length=1, device=0)
+            for key, ptr in local_buffers
+        ]
+    )
+    peer = (list(peer_kv), list(peer_aux), [list(s) for s in peer_state])
+    peer_keys = BufferKeys.for_buffers(*peer)
+    peer_bases = dict(peer_keys.pair(*peer))
+    if peer_staging:
+        peer_bases[PEER_STAGING_KEY] = peer_staging
+    manager.transport = transport
+    manager._staging_keys = staging_keys
+    manager._local_keys = local_keys
+    manager._peers = {
+        session: PeerBuffers(
+            remote=transport.import_registration(session_id=session, bases=peer_bases),
+            keys=peer_keys,
+        )
+        for session in sessions
+    }

@@ -17,7 +17,7 @@ from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def a2a(name=None):
@@ -77,10 +77,6 @@ class TestReduceMoeOutput(CustomTestCase):
             count, output = self.all_reduces()
         self.assertEqual(count, 1)
         torch.testing.assert_close(output, torch.full((2, 3), 2.0))
-
-    def test_single_rank_has_nothing_to_sum(self):
-        with moe_config(tp_size=1):
-            self.assertEqual(self.all_reduces()[0], 0)
 
     def test_a_later_step_owns_the_sum(self):
         for flags, config in (

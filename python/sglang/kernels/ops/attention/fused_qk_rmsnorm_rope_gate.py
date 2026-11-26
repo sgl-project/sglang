@@ -14,19 +14,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
-
-def _pdl_supported() -> bool:
-    """Check if Programmatic Dependent Launch is supported (NVIDIA SM >= 90)."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        major, _ = torch.cuda.get_device_capability()
-        return major >= 9
-    except Exception:
-        return False
-
-
-_ENABLE_PDL = _pdl_supported()
+from sglang.kernels.arch import current_arch
 
 
 @triton.jit
@@ -64,6 +52,8 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     WEIGHT_SHIFT: tl.constexpr = 1.0,
     EXPLICIT_ROPE_FMA: tl.constexpr = False,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0)
     head = tl.program_id(1)
     is_k = head >= NUM_Q_HEADS
@@ -199,6 +189,8 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     rot_half_block = triton.next_power_of_2(half_rotary)
 
     grid = (T, num_q_heads + num_kv_heads)
+    use_pdl = current_arch().supports_pdl
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     _fused_qk_rmsnorm_rope_gate_kernel[grid](
         q_gate,
         k,
@@ -229,7 +221,8 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         HAS_PASS=rotary_dim < head_dim,
         HAS_GATE=has_gate,
         MROPE=mrope,
-        ENABLE_PDL=_ENABLE_PDL,
+        ENABLE_PDL=use_pdl,
+        **pdl_kwargs,
     )
 
     return q_out, k_out, gate_out if has_gate else None

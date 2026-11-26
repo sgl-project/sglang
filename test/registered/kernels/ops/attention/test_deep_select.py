@@ -13,6 +13,7 @@ from typing import Optional
 import pytest
 import torch
 
+from sglang.kernels.ops.attention import deep_select
 from sglang.kernels.ops.attention.deep_select import (
     get_input_stride_alignment_bytes,
     get_output_stride_alignment_bytes,
@@ -20,13 +21,14 @@ from sglang.kernels.ops.attention.deep_select import (
     topk,
     topk_page_transform,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
-    not is_deep_select_supported(), reason="requires CUDA SM90, SM100, or SM103"
+    not is_deep_select_supported(), reason="requires CUDA SM90, SM100, SM103, or SM107"
 )
 
 DEFAULT_IDX_FILL = 2147483647
@@ -203,6 +205,101 @@ def test_page_transform_matches_reference(k, rows, width, with_end):
     logical = inverse[(wide // page_size).clamp(min=0)] * page_size + wide % page_size
     logical = torch.where(valid, logical, torch.full_like(logical, -1))
     _check_topk(input, k, logical, end=end, idx_fill=-1)
+
+
+def test_page_transform_denser_tier():
+    """Just past 2 * SMs rows, where `TopkNormal` moves to its 3-CTA config."""
+    rows = 2 * torch.cuda.get_device_properties(0).multi_processor_count + 1
+    k, width, page_size = 512, 33000, 64
+    input = _make_input(rows, width, torch.bfloat16)
+    table, inverse = _random_page_table(rows, width, page_size)
+
+    slots = topk_page_transform(input, k, page_table=table, page_size=page_size)
+
+    assert slots.dtype == torch.int32 and slots.shape == (rows, k)
+    valid = slots != -1
+    wide = slots.long()
+    logical = inverse[(wide // page_size).clamp(min=0)] * page_size + wide % page_size
+    logical = torch.where(valid, logical, torch.full_like(logical, -1))
+    _check_topk(input, k, logical, idx_fill=-1)
+
+
+def test_denser_tier_with_end_and_offset():
+    """The same 3-CTA config without a page table: ragged ends and per-row offsets."""
+    rows = 2 * torch.cuda.get_device_properties(0).multi_processor_count + 1
+    k, width = 512, 33000
+    input = _make_input(rows, width, torch.bfloat16)
+    g = torch.Generator(device="cuda").manual_seed(2)
+    end = torch.randint(
+        k, width + 1, (rows,), dtype=torch.int32, device="cuda", generator=g
+    )
+    offset = torch.randint(
+        0, 1 << 20, (rows,), dtype=torch.int32, device="cuda", generator=g
+    )
+
+    _, indices = topk(
+        input, k, end=end, output_idx_offset=offset, idx_oob_fill_value=-1
+    )
+
+    _check_topk(input, k, indices, end=end, idx_fill=-1, offset=offset)
+
+
+@pytest.mark.parametrize("page_transform", [False, True])
+def test_multiwave_cluster_matches_reference(monkeypatch, page_transform):
+    """SGLANG_DEEP_SELECT_MULTIWAVE=1: rows past the widest one-wave tier run that
+    tier's cluster kernel over several waves, here on long-tailed row ends."""
+    tiers = deep_select._cluster_tiers()
+    if not tiers:
+        pytest.skip("no cluster tier on this GPU")
+    widest = max(rows for rows, _ in tiers)
+    rows = min(2 * widest + 3, deep_select._MULTIWAVE_MAX_ROWS)
+    k, width, page_size = 512, 300_000, 64
+    # A fresh dispatch per call, so it reads the env override below.
+    precompile = deep_select._precompile.__wrapped__
+    dispatches = []
+
+    def fresh_precompile(**kwargs):
+        dispatches.append(precompile(**kwargs))
+        return dispatches[-1]
+
+    monkeypatch.setattr(deep_select, "_precompile", fresh_precompile)
+    input = _make_input(rows, width, torch.bfloat16)
+    g = torch.Generator(device="cuda").manual_seed(3)
+    end = (
+        torch.empty(rows, device="cuda")
+        .log_normal_(mean=10.5, std=0.9, generator=g)
+        .clamp_(1, width)
+        .to(torch.int32)
+    )
+    end[0] = width
+    with envs.SGLANG_DEEP_SELECT_MULTIWAVE.override(True):
+        if page_transform:
+            table, inverse = _random_page_table(rows, width, page_size)
+            slots = topk_page_transform(
+                input, k, page_table=table, page_size=page_size, end=end
+            )
+            valid = slots != -1
+            wide = slots.long()
+            logical = (
+                inverse[(wide // page_size).clamp(min=0)] * page_size + wide % page_size
+            )
+            logical = torch.where(valid, logical, torch.full_like(logical, -1))
+            _check_topk(input, k, logical, end=end, idx_fill=-1)
+        else:
+            values, indices = topk(
+                input,
+                k,
+                end=end,
+                idx_oob_fill_value=-1,
+                value_oob_fill_value=-5.0,
+                return_value=True,
+            )
+            _check_topk(
+                input, k, indices, end=end, values=values, idx_fill=-1, value_fill=-5.0
+            )
+    dispatch = dispatches[-1]
+    assert dispatch._multiwave is not None
+    assert dispatch(rows, width) is dispatch._multiwave
 
 
 if __name__ == "__main__":

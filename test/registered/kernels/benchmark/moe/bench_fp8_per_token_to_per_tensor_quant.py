@@ -114,7 +114,7 @@ SHAPES = [(7168, 8, 1024), (3584, 8, 1024), (3584, 56, 256)]
 @marker.parametrize("hidden,num_experts,m", SHAPES, [(7168, 8, 1024), (3584, 56, 256)])
 @marker.parametrize("rows", [8, 32, 128, 256], [8, 32, 256])
 @marker.parametrize("skew", [1, 4, 16], [1, 16])
-@marker.benchmark("impl", ["tuned", "legacy-geometry"])
+@marker.benchmark("impl", ["tuned", "legacy-geometry"], gate=["tuned"])
 def benchmark(hidden: int, num_experts: int, m: int, rows: int, skew: int, impl: str):
     if skew > num_experts:
         marker.skip("one expert cannot hold more than the whole dispatch")

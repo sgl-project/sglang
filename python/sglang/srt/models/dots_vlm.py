@@ -24,12 +24,13 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
+from sglang.srt.layers.attention.vision_utils import pad_vit_attn_dummy_heads
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -38,16 +39,29 @@ from sglang.srt.runtime_context import get_parallel
 from .dots_vlm_vit import DotsVisionTransformer
 
 
+def _fused_moe_text_config(hf_config):
+    """Return the nested fusable MoE config, or None for other branches."""
+    return None if hf_config.encoder_only else hf_config.language_config
+
+
 class DotsVLMForCausalLM(nn.Module):
     """DotsVLM model for sglang inference"""
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        if hf_config.encoder_only:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
             return None
         return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
-            hf_config.language_config, quant_config
+            text_config, quant_config
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return 0
+        return DeepseekV2ForCausalLM.num_fusable_shared_experts(text_config)
 
     def __init__(
         self, config: DotsVLMConfig, quant_config: Optional[QuantizationConfig] = None
@@ -66,36 +80,6 @@ class DotsVLMForCausalLM(nn.Module):
 
         # Initialize vision tower (matching transformers naming for weight compatibility)
         self.vision_tower = DotsVisionTransformer(config.vision_config)
-
-    def _pad_vit_attn_dummy_heads(self, name: str, loaded_weight: torch.Tensor):
-        """pad attn qkv weights for dummy heads"""
-        num_dummy_heads = self.config.vision_config.num_dummy_heads
-        if num_dummy_heads == 0:
-            return loaded_weight
-        head_dim = self.config.vision_config.head_dim
-
-        if "attn.qkv_proj" in name:
-            wq, wk, wv = loaded_weight.chunk(3, dim=0)
-            if name.endswith(".weight"):
-                dummy_shape = [num_dummy_heads, head_dim, wq.shape[-1]]
-            elif name.endswith(".bias"):
-                dummy_shape = [num_dummy_heads, head_dim]
-            else:
-                raise RuntimeError(f"Unsupported weight with name={name}")
-            pad_func = lambda x: torch.cat(
-                [x.unflatten(0, (-1, head_dim)), x.new_zeros(dummy_shape)], dim=0
-            ).flatten(0, 1)
-            wq, wk, wv = pad_func(wq), pad_func(wk), pad_func(wv)
-            loaded_weight = torch.cat([wq, wk, wv], dim=0)
-        if "attn.proj.weight" in name:
-            padded_weight = loaded_weight.new_zeros(
-                loaded_weight.shape[0], head_dim * num_dummy_heads
-            )
-            loaded_weight = torch.cat([loaded_weight, padded_weight], dim=-1)
-        if "attn.q_norm.weight" in name or "attn.k_norm.weight" in name:
-            padded_weight = loaded_weight.new_zeros(head_dim * num_dummy_heads)
-            loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
-        return loaded_weight
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
@@ -122,7 +106,9 @@ class DotsVLMForCausalLM(nn.Module):
                     raise ValueError(f"Weight {name} not found in params_dict")
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
+                loaded_weight = pad_vit_attn_dummy_heads(
+                    self.config, name, loaded_weight
+                )
                 weight_loader(param, loaded_weight)
 
         # Load language model weights
@@ -136,8 +122,7 @@ class DotsVLMForCausalLM(nn.Module):
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input_ids with multimodal tokens"""
         # Get image token ID for padding pattern
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        padded_input_ids = pattern.pad_input_tokens(input_ids, mm_inputs)
+        padded_input_ids = pad_mm_tokens(input_ids, mm_inputs)
         return padded_input_ids
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

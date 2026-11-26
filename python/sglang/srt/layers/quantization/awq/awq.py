@@ -23,7 +23,6 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import get_scalar_types
-from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
     AWQAscendLinearScheme,
@@ -500,19 +499,12 @@ class AWQMoEMethod(FusedMoEMethodBase):
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
+
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         return layer.scheme.apply_weights(layer, dispatch_output)
-
-
-# Register fake implementations for torch.compile support
-if _is_cuda:
-
-    @register_fake_if_exists("sgl_kernel::awq_marlin_repack")
-    def _(b_q_weight, size_k, size_n, num_bits):
-        return b_q_weight.new_empty(
-            (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
-        )

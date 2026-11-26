@@ -7,6 +7,7 @@ namespace sglang {
 namespace canary {
 
 constexpr uint64_t kCanaryChainAnchor = 0xC0FFEE1234567890ULL;
+constexpr uint64_t kU64Mask = 0xFFFFFFFFFFFFFFFFULL;
 
 // Mirrors SGLang's TokenToKVPoolAllocator contract: token-to-KV slot 0 is reserved for padded-token dummy
 // writes. Since req_to_token stores token-to-KV slot ids and is zero-initialized, canary slot 0 is skipped
@@ -19,6 +20,8 @@ constexpr int kCanaryFieldToken = 0;
 constexpr int kCanaryFieldPosition = 1;
 constexpr int kCanaryFieldPrevHash = 2;
 constexpr int kCanaryFieldRealKvHash = 3;
+
+constexpr uint64_t kCanaryInfoSamplingDigestSalt = 1ULL;
 
 constexpr int kViolationFields = 8;
 constexpr int kViolationFieldKernelKind = 0;

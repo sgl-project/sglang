@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=578, stage="base-c", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=818, stage="extra-b", runner_config="8-gpu-b300")
 
 MODEL_PATH = "moonshotai/Kimi-K3"
 DSPARK_DRAFT_MODEL = "RadixArk/Kimi-K3-DSpark"
@@ -76,7 +76,7 @@ class TestKimiK3B300Balanced(GSM8KMixin, CustomTestCase):
 
 
 class TestKimiK3B300MegaMoE(GSM8KMixin, CustomTestCase):
-    """TP8/EP8/DCP8 MegaMoE recipe with DSPARK speculation."""
+    """TP8/EP8/DCP8 MegaMoE recipe with DSPARK speculation and online EPLB."""
 
     gsm8k_score_threshold = 0.95
     gsm8k_num_examples = 200
@@ -98,6 +98,9 @@ class TestKimiK3B300MegaMoE(GSM8KMixin, CustomTestCase):
                 "megamoe",
                 "--ep",
                 "8",
+                "--enable-eplb",
+                "--eplb-rebalance-num-iterations",
+                "200",
                 "--dcp-size",
                 "8",
                 "--mem-fraction-static",

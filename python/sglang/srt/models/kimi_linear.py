@@ -9,13 +9,22 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.layernorm.fused_kda_output_quant import (
+    fused_kda_output_quant,
+)
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_split_before_forward,
+    is_cp_active,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layer_boundary import (
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -36,8 +45,15 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    can_use_fused_kda_output_quant,
+    fp8_block_gemv_with_side,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -52,9 +68,13 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import is_xpu, make_pp_layers
-from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_stream,
+    linear_attn_parallel_group,
+)
+from sglang.srt.utils import is_xpu
+from sglang.srt.utils.common import BumpAllocator
 
 
 def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:
@@ -110,7 +130,9 @@ class KimiMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        self.gate.e_score_correction_bias = nn.Parameter(torch.empty(num_experts))
+        self.gate.e_score_correction_bias = nn.Parameter(
+            torch.empty(num_experts, dtype=torch.float32)
+        )
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts,
@@ -141,6 +163,7 @@ class KimiMoE(nn.Module):
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         if self.num_shared_experts is not None:
             intermediate_size = moe_intermediate_size * self.num_shared_experts
@@ -334,7 +357,7 @@ class KimiDeltaAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                parallel_group="attn_tp",
+                parallel_group=parallel_group,
                 v_head_size=self.head_v_dim,
                 prefix=f"{prefix}.qkv_proj",
             )
@@ -459,17 +482,84 @@ class KimiDeltaAttention(nn.Module):
             g_proj_states,
         )
 
+    def _fused_qkvbfg_with_beta(self, hidden_states: torch.Tensor):
+        proj = self.fused_qkvbfg_proj
+        method = proj.quant_method
+        if not (
+            hidden_states.ndim == 2
+            and isinstance(method, Fp8LinearMethod)
+            and method.block_quant
+            and not method.use_marlin
+            and not method.use_mxfp8
+            and not method.block_fp8_as_mxfp8
+        ):
+            return None
+        return fp8_block_gemv_with_side(
+            hidden_states,
+            proj.weight,
+            proj.weight_scale_inv,
+            method.weight_block_size,
+            self.b_proj.weight,
+            act_scale_ue8m0=isinstance(method.quant_config, Fp8Config)
+            and method.quant_config.scale_fmt == "ue8m0",
+        )
+
+    def _can_fuse_output_quant(
+        self,
+        forward_batch: ForwardBatch,
+        core_attn_out: torch.Tensor,
+        norm_gate: torch.Tensor,
+    ) -> bool:
+        num_tokens = norm_gate.shape[0]
+        o_norm = self.o_norm
+        if not (
+            forward_batch.forward_mode.is_target_verify()
+            and self.head_dim == 128
+            and self.head_v_dim == 128
+            and core_attn_out.dtype == torch.bfloat16
+            and core_attn_out.is_cuda
+            and core_attn_out.shape
+            == (1, num_tokens, self.local_num_heads, self.head_v_dim)
+            and core_attn_out.stride(-1) == 1
+            and norm_gate.dtype == torch.bfloat16
+            and norm_gate.device == core_attn_out.device
+            and norm_gate.shape == (num_tokens, self.local_num_heads, self.head_v_dim)
+            and norm_gate.stride(-1) == 1
+            and o_norm.activation == "sigmoid"
+            and o_norm.bias is None
+            and o_norm.weight.dtype == torch.bfloat16
+            and o_norm.weight.device == core_attn_out.device
+            and o_norm.weight.shape == (self.head_v_dim,)
+            and o_norm.weight.stride(0) == 1
+        ):
+            return False
+        return can_use_fused_kda_output_quant(
+            self.o_proj,
+            m=num_tokens,
+            k=self.local_num_heads * self.head_v_dim,
+            input_dtype=core_attn_out.dtype,
+        )
+
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.no_kda_lora:
             # Full-rank f/g: everything comes out of one GEMM, no batched
             # second-stage matmul.
-            fused_states, _ = self.fused_qkvbfg_proj(hidden_states)
+            fused = (
+                self._fused_qkvbfg_with_beta(hidden_states)
+                if not self.fuse_no_lora_beta
+                else None
+            )
+            if fused is None:
+                fused_states, _ = self.fused_qkvbfg_proj(hidden_states)
+            else:
+                fused_states, beta = fused
             split_states = torch.split(fused_states, self.split_sizes, dim=-1)
             if self.fuse_no_lora_beta:
                 qkv, beta, forget_gate, g_proj_states = split_states
             else:
                 qkv, forget_gate, g_proj_states = split_states
-                beta = self.b_proj(hidden_states)[0]
+                if fused is None:
+                    beta = self.b_proj(hidden_states)[0]
             return (
                 qkv,
                 beta,
@@ -514,8 +604,8 @@ class KimiDeltaAttention(nn.Module):
             )
 
         if (
-            not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
+            not forward_batch.logical_forward_mode.is_decode()
+            and not forward_batch.logical_forward_mode.is_target_verify()
         ):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
@@ -533,8 +623,16 @@ class KimiDeltaAttention(nn.Module):
         norm_gate = g_proj_states.unflatten(
             -1, (-1, self.head_dim)
         )  # ... (h d) -> ... h d
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
+        if self._can_fuse_output_quant(forward_batch, core_attn_out, norm_gate):
+            core_attn_out = fused_kda_output_quant(
+                core_attn_out,
+                norm_gate,
+                self.o_norm.weight,
+                self.o_norm.eps,
+            )
+        else:
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
+            core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
 
         return self.o_proj(core_attn_out)[0]
 
@@ -617,7 +715,15 @@ class KimiDecoderLayer(nn.Module):
             config, layer_idx + 1
         )
         return (
-            declare_attn(),
+            declare_attn(
+                tp_group=(
+                    SumGroup.TP
+                    if config.is_kda_layer(layer_idx)
+                    and linear_attn_parallel_group() == "tp"
+                    else SumGroup.ATTN_TP
+                ),
+                in_token_order=config.is_kda_layer(layer_idx),
+            ),
             declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
         )
 
@@ -714,6 +820,14 @@ class KimiLinearModel(nn.Module):
                 pp_proxy_tensors, forward_batch
             )
 
+        cp_active = get_parallel().enable_cp_tp_group_sharing and is_cp_active(
+            forward_batch
+        )
+        if cp_active:
+            hidden_states, positions = cp_split_before_forward(
+                hidden_states, positions, forward_batch
+            )
+
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
         zero_allocator = BumpAllocator(
@@ -755,6 +869,12 @@ class KimiLinearModel(nn.Module):
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
         )
+        if cp_active:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
+            aux_hidden_states = [
+                cp_gather_after_forward(hidden, forward_batch)
+                for hidden in aux_hidden_states
+            ]
 
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states

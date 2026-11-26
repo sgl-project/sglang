@@ -219,7 +219,6 @@ class GroupCoordinator:
         assert self.cpu_group is not None, f"{group_ranks=}, {local_rank=}"
         assert self.device_group is not None
 
-        # TODO: fix it for other platforms
         self.device = get_local_torch_device()
         self.shm_handle = None
         global_world_size = torch.distributed.get_world_size()
@@ -379,6 +378,12 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         if self.world_size == 1:
             return input_
+        if (scatter_dim, gather_dim) in ((2, 1), (1, 2)):
+            from .device_communicators.flashinfer_ulysses import exchange
+
+            out = exchange(input_, self.device_group, scatter=scatter_dim == 2)
+            if out is not None:
+                return out
         return self.device_communicator.all_to_all_4D(input_, scatter_dim, gather_dim)
 
     def all_reduce(
@@ -915,6 +920,25 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             raise RuntimeError(
                 "Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
             )
+        self._bind_sequence_groups(ulysses_group, ring_group)
+
+    @classmethod
+    def over_group(
+        cls, group: GroupCoordinator, ring_group: ProcessGroup
+    ) -> "SequenceParallelGroupCoordinator":
+        """Pure-Ulysses SP over ``group``'s ranks that reuses its communicators.
+
+        ``ring_group`` is this rank's single-rank group. The result owns no
+        process group: destroying ``group`` releases it, never destroy it itself.
+        """
+        sp_group = cls.__new__(cls)
+        sp_group.__dict__.update(vars(group))
+        sp_group._bind_sequence_groups(group.device_group, ring_group)
+        return sp_group
+
+    def _bind_sequence_groups(
+        self, ulysses_group: ProcessGroup, ring_group: ProcessGroup
+    ) -> None:
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group
 

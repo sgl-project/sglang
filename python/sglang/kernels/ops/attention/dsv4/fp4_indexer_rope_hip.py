@@ -21,9 +21,11 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_index_k_split_module(
-    head_dim: int, rope_dim: int, page_size: int, ratio: int
+    head_dim: int, rope_dim: int, page_size: int, ratio: int, page8: bool
 ) -> Module:
-    args = make_cpp_args(head_dim, rope_dim, page_size, ratio, is_arch_support_pdl())
+    args = make_cpp_args(
+        head_dim, rope_dim, page_size, ratio, page8, is_arch_support_pdl()
+    )
     return load_jit(
         make_name("index_k_rope_pack_split"),
         *args,
@@ -43,16 +45,18 @@ def index_k_norm_rope_pack_store_split(
     scale: torch.Tensor,
     *,
     ratio: int,
+    page8: bool = False,
 ) -> None:
     """`fp4_indexer_rope.index_k_norm_rope_pack_store` into the split
     FlyDSL K layout (payload [npages, 1, 4, page_size, 16], scale [npages, 1, 4,
-    page_size] uint8); the bytes equal store_fp4_index_k_cache_split's."""
+    page_size] uint8), with page8 each page as eight row-group 8-slot pages; the bytes
+    equal store_fp4_index_k_cache_split's."""
     head_dim = input.shape[-1]
     page_size = payload.shape[3]
     assert payload.shape[1:] == (1, 4, page_size, 16), payload.shape
     assert scale.shape[1:] == (1, 4, page_size), scale.shape
     _jit_index_k_split_module(
-        head_dim, freqs_cis.shape[-1], page_size, ratio
+        head_dim, freqs_cis.shape[-1], page_size, ratio, page8
     ).index_k_split(
         input,
         norm_weight,

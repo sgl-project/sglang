@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
+import gc
 import importlib.util
 import os
 import subprocess
@@ -7,6 +9,7 @@ import sys
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import psutil
 
@@ -16,6 +19,7 @@ assert SPEC is not None and SPEC.loader is not None
 PROCESS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROCESS)
 kill_process_tree = PROCESS.kill_process_tree
+defer_full_gc_for_imports = PROCESS.defer_full_gc_for_imports
 
 
 @unittest.skipUnless(os.name == "posix", "requires POSIX process semantics")
@@ -89,6 +93,79 @@ class TestKillProcessTree(unittest.TestCase):
 
     def test_missing_parent_is_noop(self):
         kill_process_tree(0x7FFFFFFF)
+
+
+class TestDeferFullGcForImports(unittest.TestCase):
+    def full_collections_while_allocating(self, block):
+        gc.collect()
+        threshold0, threshold1, threshold2 = gc.get_threshold()
+        # Enough survivors that the collector's own rule makes a full one due.
+        count = len(gc.get_objects()) + 2 * threshold0 * threshold1 * threshold2
+        before = gc.get_stats()[2]["collections"]
+        with block():
+            kept = [[] for _ in range(count)]
+            full = gc.get_stats()[2]["collections"] - before
+        del kept
+        return full
+
+    @unittest.skipIf(
+        (3, 14) <= sys.version_info < (3, 14, 5),
+        "incremental GC does not use threshold2",
+    )
+    def test_no_full_collection_inside_and_thresholds_restored(self):
+        thresholds = gc.get_threshold()
+
+        self.assertGreater(
+            self.full_collections_while_allocating(contextlib.nullcontext), 0
+        )
+        self.assertEqual(
+            self.full_collections_while_allocating(defer_full_gc_for_imports), 0
+        )
+        with self.assertRaises(ImportError):
+            with defer_full_gc_for_imports():
+                raise ImportError
+        self.assertEqual(gc.get_threshold(), thresholds)
+
+    def test_incremental_gc_is_unchanged(self):
+        thresholds = gc.get_threshold()
+        for version in ((3, 14, 0), (3, 14, 4)):
+            with (
+                self.subTest(version=version),
+                patch.object(PROCESS.sys, "version_info", version),
+            ):
+                with defer_full_gc_for_imports():
+                    self.assertEqual(gc.get_threshold(), thresholds)
+                self.assertEqual(gc.get_threshold(), thresholds)
+
+    def test_nested_exception_preserves_disabled_collector(self):
+        thresholds = gc.get_threshold()
+        self.addCleanup(gc.enable if gc.isenabled() else gc.disable)
+        self.addCleanup(gc.set_threshold, *thresholds)
+        gc.disable()
+        with defer_full_gc_for_imports():
+            deferred = gc.get_threshold()
+            with self.assertRaises(ImportError):
+                with defer_full_gc_for_imports():
+                    raise ImportError
+            self.assertEqual(gc.get_threshold(), deferred)
+            self.assertFalse(gc.isenabled())
+        self.assertEqual(gc.get_threshold(), thresholds)
+        self.assertFalse(gc.isenabled())
+
+    @unittest.skipUnless(os.name == "posix", "requires fork")
+    def test_fork_restores_child_without_changing_parent(self):
+        thresholds = gc.get_threshold()
+        with defer_full_gc_for_imports():
+            deferred = gc.get_threshold()
+            pid = os.fork()
+            if pid == 0:
+                restored = gc.get_threshold() == thresholds
+        if pid == 0:
+            with defer_full_gc_for_imports():
+                restored &= gc.get_threshold() == deferred
+            os._exit(int(not (restored and gc.get_threshold() == thresholds)))
+        self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), 0)
+        self.assertEqual(gc.get_threshold(), thresholds)
 
 
 if __name__ == "__main__":

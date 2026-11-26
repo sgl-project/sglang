@@ -1,10 +1,13 @@
 import unittest
 from unittest import mock
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_fused_mhc
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -77,10 +80,10 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
                     )
 
     @mock.patch.object(deepseek_v4_fused_mhc, "is_gfx95_supported", return_value=True)
-    @mock.patch.object(deepseek_v4_fused_mhc, "get_bool_env_var", return_value=True)
     @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
-    def test_aiter_gfx95_enables_cross_layer_fusion(self, _mock_aiter, _mock_gfx95):
+    def test_aiter_gfx95_enables_cross_layer_fusion(self, _mock_gfx95):
         with (
+            envs.SGLANG_USE_AITER.override(True),
             envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(False),
             envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(False),
             envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(False),
@@ -88,10 +91,10 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
             self.assertTrue(deepseek_v4_fused_mhc.is_cross_layer_mhc_fusion_enabled())
 
     @mock.patch.object(deepseek_v4_fused_mhc, "is_gfx95_supported", return_value=False)
-    @mock.patch.object(deepseek_v4_fused_mhc, "get_bool_env_var", return_value=True)
     @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
-    def test_aiter_cross_layer_disabled_without_gfx95(self, _mock_aiter, _mock_gfx95):
+    def test_aiter_cross_layer_disabled_without_gfx95(self, _mock_gfx95):
         with (
+            envs.SGLANG_USE_AITER.override(True),
             envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(False),
             envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(False),
             envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(False),
@@ -99,25 +102,39 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
             self.assertFalse(deepseek_v4_fused_mhc.is_cross_layer_mhc_fusion_enabled())
 
     @mock.patch.object(deepseek_v4_fused_mhc, "is_gfx95_supported", return_value=True)
-    @mock.patch.object(deepseek_v4_fused_mhc, "get_bool_env_var", return_value=False)
     @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
-    def test_aiter_path_skips_without_sglang_use_aiter(self, _mock_aiter, _mock_gfx95):
-        result = deepseek_v4_fused_mhc.try_aiter_fused_mhc_post_pre(
-            layer_input=mock.Mock(shape=(32, 7168), dim=2, device="cpu"),
-            residual=mock.Mock(dim=3),
-            post=mock.Mock(),
-            comb=mock.Mock(),
-            hc_fn=mock.Mock(),
-            hc_scale=mock.Mock(),
-            hc_base=mock.Mock(),
-            rms_eps=1e-6,
-            hc_eps=1e-6,
-            hc_post_mult=2.0,
-            sinkhorn_iters=20,
-            norm_weight=mock.Mock(),
-            norm_eps=1e-6,
-        )
+    def test_aiter_path_skips_without_sglang_use_aiter(self, _mock_gfx95):
+        with envs.SGLANG_USE_AITER.override(False):
+            result = deepseek_v4_fused_mhc.try_aiter_fused_mhc_post_pre(
+                layer_input=mock.Mock(shape=(32, 7168), dim=2, device="cpu"),
+                residual=mock.Mock(dim=3),
+                post=mock.Mock(),
+                comb=mock.Mock(),
+                hc_fn=mock.Mock(),
+                hc_scale=mock.Mock(),
+                hc_base=mock.Mock(),
+                rms_eps=1e-6,
+                hc_eps=1e-6,
+                hc_post_mult=2.0,
+                sinkhorn_iters=20,
+                norm_weight=mock.Mock(),
+                norm_eps=1e-6,
+            )
         self.assertIsNone(result)
+
+    @mock.patch.object(deepseek_v4_fused_mhc, "is_gfx95_supported", return_value=True)
+    @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
+    def test_aiter_switch_accepts_every_declared_boolean_spelling(self, _mock_gfx95):
+        """SGLANG_USE_AITER is a declared boolean: "yes" must enable the aiter
+        mHC path here as it does in the readers that go through envs."""
+        for value, expected in (("yes", True), ("1", True), ("no", False)):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict("os.environ", {"SGLANG_USE_AITER": value}),
+            ):
+                self.assertEqual(
+                    deepseek_v4_fused_mhc._is_aiter_gfx95_mhc_available(), expected
+                )
 
     @mock.patch.object(
         deepseek_v4_fused_mhc,
@@ -322,6 +339,33 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
         # layernorm before attention. Pre-fix this was never called on the
         # fused-success path.
         layer.input_layernorm.assert_called_once_with(fused_hs)
+
+
+class TestAmdFusedMhcBufferCache(CustomTestCase):
+    def test_cache_keeps_only_decode_sized_batches(self):
+        """Only batches up to the M threshold may stay cached; larger ones are
+        allocated per call, or every distinct prefill size stays alive forever."""
+        threshold = deepseek_v4_fused_mhc._FUSED_HC_POST_PRE_M_THRESHOLD
+        fake_ops = (None, lambda *args, **kwargs: ({"BLOCK_K": 64}, False))
+        cache = deepseek_v4_fused_mhc._FUSED_HC_POST_PRE_CACHE
+        with (
+            mock.patch.object(
+                deepseek_v4_fused_mhc,
+                "_get_triton_mhc_post_pre_ops",
+                return_value=fake_ops,
+            ),
+            mock.patch.dict(cache, clear=True),
+        ):
+            for num_tokens in (1, threshold, threshold + 1, 2048):
+                bufs = deepseek_v4_fused_mhc._get_fused_hc_post_pre_buffers(
+                    num_tokens=num_tokens,
+                    hidden_size=64,
+                    hc_mult=4,
+                    dtype=torch.bfloat16,
+                    device=torch.device("cpu"),
+                )
+                self.assertIsNotNone(bufs)
+            self.assertEqual(sorted(key[0] for key in cache), [1, threshold])
 
 
 def _hardware_available() -> bool:

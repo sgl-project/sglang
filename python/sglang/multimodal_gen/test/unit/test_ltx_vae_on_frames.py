@@ -17,10 +17,8 @@ from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.sample.joy_echo import JoyEchoSamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     _sample_to_uint8_frames,
     _save_video_ffmpeg,
@@ -111,6 +109,26 @@ def test_frames_are_final_and_match_legacy_decode(batch_size, slicing, temporal)
     for frames, snapshot in zip(chunks, snapshots):
         torch.testing.assert_close(frames, snapshot, rtol=0, atol=0)
     assert len(chunks) > 1 if temporal and batch_size == 1 else len(chunks) == 1
+
+
+@pytest.mark.parametrize(
+    "framewise_encoding,framewise_decoding", [(True, False), (False, True)]
+)
+@torch.no_grad()
+def test_temporal_tiled_encode_follows_the_encoding_flag(
+    framewise_encoding, framewise_decoding
+):
+    """use_framewise_encoding alone selects temporal-tiled encoding; the
+    decoding flag must not switch the encode path."""
+    vae = tiny_vae()
+    vae.use_framewise_encoding = framewise_encoding
+    vae.use_framewise_decoding = framewise_decoding
+    video = torch.randn(1, 3, 13, 8, 8)
+    with patch.object(
+        vae, "_temporal_tiled_encode", wraps=vae._temporal_tiled_encode
+    ) as tiled_encode:
+        vae.encode(video)
+    assert tiled_encode.called is framewise_encoding
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA encoder")
@@ -257,13 +275,9 @@ def test_memory_bank_retains_decoded_frames(enable_memory_bank):
     server_args = SimpleNamespace(
         enable_torch_compile=False, pipeline_config=PipelineConfig()
     )
-    with mock.patch(
-        "sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding.current_platform.is_cuda",
-        return_value=True,
-    ):
-        assert can_encode_while_decoding(request, server_args, 1) == (
-            not enable_memory_bank
-        )
+    assert can_encode_while_decoding(request, server_args, 1) == (
+        not enable_memory_bank
+    )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA video transfer")

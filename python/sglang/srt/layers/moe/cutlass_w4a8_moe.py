@@ -5,7 +5,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_cuda_alike
 
 _is_cuda = is_cuda()
@@ -19,10 +18,14 @@ if _is_cuda_alike:
 
 if _is_cuda:
     from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.moe.cutlass_prepare_moe_input import (
+        cutlass_prepare_moe_input,
+    )
 else:
     from sgl_kernel import silu_and_mul
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
+    compute_cutlass_w4a8_moe_input_scale,
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
@@ -35,10 +38,7 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
-from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-    per_tensor_absmax_fp8,
-    per_tensor_quant_fp8,
-)
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
 
 def cutlass_w4a8_moe(
@@ -86,6 +86,7 @@ def cutlass_w4a8_moe(
         Shape: [num_experts, N // 512, K * 4]
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - topk_ids (torch.Tensor): The ids of each token->expert mapping.
+        Noncontiguous IDs are materialized once for the native flat-pointer consumers.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
     - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
     - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
@@ -103,7 +104,7 @@ def cutlass_w4a8_moe(
         applied directly on the inputs. This is only applicable when topk is 1.
 
     Returns:
-    - torch.Tensor: The fp8 output tensor after applying the MoE layer.
+    - torch.Tensor: The output tensor after applying the MoE layer, in the dtype of a.
     """
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.int8
@@ -127,24 +128,48 @@ def cutlass_w4a8_moe(
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
-    device = a.device
-    if get_parallel().moe_ep_size > 1:
-        topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
+    # Native expert counts and reorder kernels read contiguous int32 IDs.
+    topk_ids = topk_ids.contiguous()
 
-    src2dst = cutlass_w4_run_moe_ep_preproess(
-        topk_ids,
-    )
+    device = a.device
+    if a1_scale is None:
+        a1_scale = torch.full(
+            (1,),
+            1e-10 / torch.finfo(torch.float8_e4m3fn).max,
+            dtype=torch.float32,
+            device=device,
+        )
+        compute_cutlass_w4a8_moe_input_scale(
+            input=a,
+            topk_ids=topk_ids,
+            output_s=a1_scale,
+            num_local_experts=num_local_experts,
+        )
+
+    if _is_cuda:
+        a_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        c_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        cutlass_prepare_moe_input(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            num_local_experts,
+            n,
+            k,
+            transpose_problem_sizes=True,
+        )
+        src2dst = c_map
+    else:
+        src2dst = cutlass_w4_run_moe_ep_preproess(topk_ids)
 
     gateup_input = torch.empty(
         (m * topk, k),
         device=device,
         dtype=torch.float8_e4m3fn,
     )
-
-    # TODO: fuse per_tensor_absmax_fp8 and pre_reorder_for_cutlass_moe
-    if a1_scale is None:
-        a1_scale = torch.zeros(1, dtype=torch.float32, device=device)
-        per_tensor_absmax_fp8(a, a1_scale)
 
     pre_reorder_for_cutlass_moe(
         a,
@@ -158,22 +183,20 @@ def cutlass_w4a8_moe(
         k,
     )
 
-    # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
-    # they are kept to allow for a quick switch of the permutation logic
-    # from the current triton kernel implementation to the cutlass-based one if needed.
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    get_cutlass_w4a8_moe_mm_data(
-        topk_ids,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        a_map,
-        c_map,
-        num_local_experts,
-        n,
-        k,
-    )
+    if not _is_cuda:
+        a_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        c_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        get_cutlass_w4a8_moe_mm_data(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            num_local_experts,
+            n,
+            k,
+        )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
@@ -296,11 +319,9 @@ def cutlass_w4a8_moe_deepep_normal(
     - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
         quantize the intermediate result between the gemms.
         Shape: scalar or [1, N]
-    - apply_router_weight_on_input (bool): When true, the topk weights are
-        applied directly on the inputs. This is only applicable when topk is 1.
 
     Returns:
-    - torch.Tensor: The fp8 output tensor after applying the MoE layer.
+    - torch.Tensor: The bf16 output tensor after applying the MoE layer.
     """
     assert topk_weights.shape == topk_ids_.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.int8
@@ -319,12 +340,6 @@ def cutlass_w4a8_moe_deepep_normal(
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1)
-
-    num_experts = w1_q.size(0)
-    m = a.size(0)
-    k = w1_q.size(2) * 2
-    n = w2_q.size(2) * 2
     topk = topk_ids_.size(1)
     device = a.device
 
@@ -465,7 +480,7 @@ def cutlass_w4a8_moe_deepep_ll(
     grouped gemm.
 
     Parameters:
-    - a (torch.Tensor): The input tensor to the MoE layer.
+    - a_states (torch.Tensor): The input tensor to the MoE layer.
         Shape: [num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, K]
     - w1_q (torch.Tensor): The first set of int4-quantized expert weights.
         Shape: [num_experts, N * 2,  K // 2]
@@ -477,7 +492,6 @@ def cutlass_w4a8_moe_deepep_ll(
         Shape: [num_experts, K // 512, N * 8]
     - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
         Shape: [num_experts, N // 512, K * 4]
-    - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
     - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
     - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
@@ -491,13 +505,11 @@ def cutlass_w4a8_moe_deepep_ll(
     - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
         quantize the intermediate result between the gemms.
         Shape: scalar or [1, N]
-    - apply_router_weight_on_input (bool): When true, the topk weights are
-        applied directly on the inputs. This is only applicable when topk is 1.
     - expected_m (Optional[int]): Dispatcher's expected rows per expert; a
         requant launch hint only, any value is correct.
 
     Returns:
-    - torch.Tensor: The fp8 output tensor after applying the MoE layer.
+    - torch.Tensor: The bf16 output tensor after applying the MoE layer.
     """
     assert w1_q.dtype == torch.int8
     assert w2_q.dtype == torch.int8

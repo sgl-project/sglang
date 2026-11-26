@@ -14,10 +14,8 @@ from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     get_channelwise_decode_scale_and_shift,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ImagePipelineConfig,
-    ModelTaskType,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 def joy_image_postprocess_text(
@@ -49,8 +47,6 @@ class JoyImageEditPipelineConfig(ImagePipelineConfig):
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Qwen3VLConfig(),)
     )
-
-    enable_torch_compile: bool = False
 
     # Precision for each component
     precision: str = "bf16"

@@ -2,7 +2,7 @@
 
 This test benchmarks Grok-2 with FP8 quantization on 8 GPUs.
 
-Registry: nightly-perf-8-gpu-mi35x-grok2 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-grok2 suite
 """
 
 import os
@@ -15,7 +15,9 @@ from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - Grok-2 benchmark on MI35x (~25 min)
-register_amd_ci(est_time=1500, suite="nightly-perf-8-gpu-mi35x-grok2", nightly=True)
+register_amd_ci(
+    est_time=1500, suite="nightly-perf-test-8-gpu-amd-mi35x-grok2", nightly=True
+)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:

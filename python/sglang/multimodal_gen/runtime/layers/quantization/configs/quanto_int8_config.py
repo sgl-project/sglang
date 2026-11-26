@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Config and checkpoint admission for Optimum Quanto qint8 weights."""
+"""Weight-only INT8 configuration and Optimum Quanto checkpoint admission."""
 
 from __future__ import annotations
 
@@ -33,13 +33,23 @@ _FLOAT_DTYPES = {"BF16", "F16", "F32"}
 
 
 class QuantoInt8Config(QuantizationConfig):
-    """Dispatch linears declared qint8 in an Optimum Quanto quantization map."""
+    """Select per-channel or groupwise weight-only INT8 linear methods."""
 
     supports_srt_linear_layers = True
 
-    def __init__(self, layer_prefixes: set[str]) -> None:
+    def __init__(
+        self,
+        layer_prefixes: set[str],
+        *,
+        group_size: int | None = None,
+        scale_dtype: torch.dtype | None = None,
+        compute_dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.layer_prefixes = layer_prefixes
+        self.group_size = group_size
+        self.scale_dtype = scale_dtype
+        self.compute_dtype = compute_dtype
         self.selected: set[str] = set()
 
     @classmethod
@@ -76,7 +86,11 @@ class QuantoInt8Config(QuantizationConfig):
         if prefix not in self.layer_prefixes:
             return unquantized_method()
         self.selected.add(prefix)
-        return QuantoInt8LinearMethod()
+        return QuantoInt8LinearMethod(
+            group_size=self.group_size,
+            scale_dtype=self.scale_dtype,
+            compute_dtype=self.compute_dtype,
+        )
 
 
 def inspect_quanto_int8_checkpoint(

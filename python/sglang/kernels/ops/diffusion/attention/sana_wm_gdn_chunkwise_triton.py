@@ -166,7 +166,7 @@ _CHUNKWISE_TUNING: dict[tuple[str, str], _ChunkwiseCfg] = {
         # nw=16 OOMs the 102 KB SRAM cap at TF32 (needs 131 KB); nw=8 fits and is
         # within noise. The D-tile path (auto-enabled on spark, see
         # `_pick_phase_b_d_splits`) is ~2.6× faster at TF32 / ~13% at IEEE — these
-        # baseline params only apply when PHASE_B_D_SPLITS=1 is forced.
+        # baseline params only apply where that picks d_splits=1.
         B=_PhaseCfg(nw=8, use_acc=False, ns=1),
         C=_PhaseCfg(nw=8, BS=16, ns=1),  # binding constraint: M.fp32 64 KB + Q stage
     ),
@@ -1206,20 +1206,7 @@ def _pick_phase_b_d_splits(BLOCK_D: int, dot_precision: int = 0):
     `d_splits>1` → `_phase_b_dtile_kernel` with nw/ns/acc overrides.
     Per-arch optima from a 96-config sweep (2026-04-29, T=11 B=1 IEEE) and a
     multi-arch bf16/TF32 sweep (2026-05-06, F=11 S=920); see inline cfg comments.
-    Env overrides: PHASE_B_D_SPLITS, PHASE_B_DTILE_NW/NS/ACC (1=True / 0=False).
     """
-    import os
-
-    env_d = os.environ.get("PHASE_B_D_SPLITS", None)
-    if env_d is not None:
-        d = int(env_d)
-        if d < 1 or BLOCK_D % d != 0:
-            return (1, None, None, None)
-        nw = int(os.environ.get("PHASE_B_DTILE_NW", "0")) or None
-        ns = int(os.environ.get("PHASE_B_DTILE_NS", "0")) or None
-        acc_env = os.environ.get("PHASE_B_DTILE_ACC", None)
-        acc = bool(int(acc_env)) if acc_env is not None else None
-        return (d, nw, ns, acc)
     try:
         import torch
 
@@ -1617,18 +1604,6 @@ def fused_bigdn_bidi_chunkwise(
     return out
 
 
-def _default_dot_prec() -> int:
-    try:
-        from sglang.kernels.ops.diffusion.attention.sana_wm_gdn_triton import (
-            _resolve_launch_config,
-        )
-
-        _, dot_prec, _, _ = _resolve_launch_config()
-        return dot_prec
-    except Exception:
-        return 0
-
-
 def _cam_identity_tables(
     *,
     B: int,
@@ -1683,7 +1658,7 @@ def cam_scan_bidi_chunkwise(
     assert decay.shape == (B, H, F)
 
     if dot_precision is None:
-        dot_precision = _default_dot_prec()
+        dot_precision = 0
 
     qkv = torch.empty(B, N, 3, H, D, device=q.device, dtype=q.dtype)
     qkv[:, :, 0].copy_(q.permute(0, 3, 1, 2))
