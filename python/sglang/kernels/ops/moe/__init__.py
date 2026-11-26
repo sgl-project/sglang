@@ -433,4 +433,16 @@ for _fn in (
             capabilities=_SM12X,
         )
     )
+for _fn in (
+    "route_topk_meta_lowm",
+    "route_metadata_lowm",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"moe.inkling2_{_fn}_sm120",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.moe.inkling2_moe_lowm_sm120:{_fn}",
+            capabilities=_SM12X,
+        )
+    )
 del _fn
