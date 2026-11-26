@@ -12,6 +12,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
+from sglang.multimodal_gen.configs.post_training.denoising_env import (
+    register_denoising_env_args,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -28,6 +31,16 @@ def _decode_scale_and_shift(latents_mean, latents_std, z_dim, device, dtype):
     return std.reciprocal(), mean
 
 
+@register_denoising_env_args(
+    [
+        "encoder_hidden_states",
+        "condition_latents",
+        "layouts",
+        # The DiT ignores it but miles_diffusion's Qwen-Image 2.1 training reads it.
+        # TODO(Rockdu): drop once that training reads the text length from layouts.
+        "encoder_hidden_states_mask",
+    ]
+)
 @dataclass
 class QwenImage21PipelineConfig(ImagePipelineConfig):
     native_only_components: tuple[str, ...] = ("transformer", "text_encoder", "vae")

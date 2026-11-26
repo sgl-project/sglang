@@ -26,6 +26,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     SpatialImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.post_training.denoising_env import (
+    register_denoising_env_args,
+)
 
 
 def sd3_clip_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -92,6 +95,7 @@ class SD3T5Config(T5Config):
     arch_config: TextEncoderArchConfig = field(default_factory=SD3T5ArchConfig)
 
 
+@register_denoising_env_args(["encoder_hidden_states", "pooled_projections"])
 @dataclass
 class StableDiffusion3PipelineConfig(SpatialImagePipelineConfig):
     """Configuration for SD3 image generation pipeline.

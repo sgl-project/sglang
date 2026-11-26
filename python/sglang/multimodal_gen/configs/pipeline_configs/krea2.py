@@ -14,6 +14,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
+from sglang.multimodal_gen.configs.post_training.denoising_env import (
+    register_denoising_env_args,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
@@ -27,6 +30,16 @@ _MU_Y1 = 0.5
 _MU_Y2 = 1.15
 
 
+@register_denoising_env_args(
+    [
+        "encoder_hidden_states",
+        "pos",
+        "mask",
+        # The DiT ignores it but miles_diffusion's Krea-2 training reads it.
+        # TODO(Rockdu): drop once that training derives its text mask from "mask".
+        "encoder_hidden_states_mask",
+    ]
+)
 @dataclass
 class Krea2PipelineConfig(ImagePipelineConfig):
     """Krea-2 single-stream MMDiT, text-to-image.

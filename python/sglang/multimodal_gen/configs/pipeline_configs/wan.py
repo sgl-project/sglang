@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.post_training.denoising_env import (
+    register_denoising_env_args,
+)
 from sglang.multimodal_gen.runtime.utils.condition_expansion import (
     PromptToSampleBatchExpander,
 )
@@ -72,6 +75,7 @@ class WanI2VCommonConfig(PipelineConfig):
         return num_frames
 
 
+@register_denoising_env_args(["encoder_hidden_states", "encoder_hidden_states_image"])
 @dataclass
 class WanT2V480PConfig(PipelineConfig):
     """Base configuration for Wan T2V 1.3B pipeline architecture."""
@@ -317,6 +321,8 @@ class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
         )
 
 
+# A different DiT from the Wan base, so the base env args do not apply.
+@register_denoising_env_args(None)
 @dataclass
 class Wan_Animate_2_14B_Config(WanI2V720PConfig):
     """Wan-Animate-2 14B (Wan2.2): reference image + reference video -> video.
@@ -456,6 +462,8 @@ class Wan_Animate_2_14B_Distilled_Config(Wan_Animate_2_14B_Config):
 # =============================================
 # ============= Causal Self-Forcing =============
 # =============================================
+# A different DiT from the Wan base, so the base env args do not apply.
+@register_denoising_env_args(None)
 @dataclass
 class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
     is_causal: bool = True

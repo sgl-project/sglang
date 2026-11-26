@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.post_training.denoising_env import (
+    register_denoising_env_args,
+)
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
@@ -146,6 +149,16 @@ def _shard_qwen_edit_freqs_cis_for_sp(freqs_cis, noisy_img_seq_len, device):
     )
 
 
+_QWEN_IMAGE_ENV_ARGS = [
+    "encoder_hidden_states",
+    "encoder_hidden_states_mask",
+    "txt_seq_lens",
+    "freqs_cis",
+    "img_shapes",
+]
+
+
+@register_denoising_env_args(_QWEN_IMAGE_ENV_ARGS)
 @dataclass
 class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig):
     """Configuration for the QwenImage pipeline."""
@@ -743,6 +756,7 @@ class QwenImageEditPlus_2511_PipelineConfig(QwenImageEditPlusPipelineConfig):
     dit_config: DiTConfig = field(default_factory=QwenImageEditPlus_2511_DitConfig)
 
 
+@register_denoising_env_args([*_QWEN_IMAGE_ENV_ARGS, "additional_t_cond"])
 @dataclass
 class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     resolution: int = 640
