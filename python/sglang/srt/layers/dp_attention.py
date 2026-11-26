@@ -415,6 +415,50 @@ def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
 
 
+def ascend_allgather_row_sizes_for_batch(
+    forward_batch,
+    *,
+    use_cp: bool,
+    use_tp_attn_a2a_scatter: Optional[bool],
+) -> Optional[List[int]]:
+    """Per-TP-rank row counts for the ascend_ops prefill allgather path.
+
+    ``use_tp_attn_a2a_scatter`` describes the MoE input layout when
+    ``attn_tp_size > 1``: True means each attention-TP rank holds a contiguous
+    slice of the DP shard, False means the full shard is gathered on every
+    rank, and None means the layout is unknown. ``None`` is also returned when
+    the counts cannot be derived from the batch alone, so the dispatcher must
+    exchange row counts on the fly.
+    """
+    parallel = get_parallel()
+    if use_cp:
+        if parallel.attn_cp_size == parallel.tp_size:
+            metadata = forward_batch.attn_cp_metadata
+            return getattr(metadata, "per_rank_actual_token", None)
+        return None
+
+    if parallel.attn_cp_size != 1 or parallel.attn_dp_size == 1:
+        return None
+    dp_rows = forward_batch.global_num_tokens_padded_cpu
+    if dp_rows is None or len(dp_rows) != parallel.attn_dp_size:
+        return None
+    attn_tp_size = parallel.attn_tp_size
+    if attn_tp_size == 1:
+        return dp_rows
+    if use_tp_attn_a2a_scatter is None:
+        return None
+    if use_tp_attn_a2a_scatter:
+        # Match tensor_split(attn_tp_size)[attn_tp_rank]: the first
+        # ``rows % attn_tp_size`` ranks take one extra row.
+        row_sizes = []
+        for rows in dp_rows:
+            base, extra = divmod(rows, attn_tp_size)
+            row_sizes.extend(base + (rank < extra) for rank in range(attn_tp_size))
+        return row_sizes
+    # Gathered: every attention-TP rank holds the whole DP shard.
+    return [rows for rows in dp_rows for _ in range(attn_tp_size)]
+
+
 def get_dp_hidden_size() -> int:
     return _DpGatheredBufferWrapper.get_dp_hidden_size()
 

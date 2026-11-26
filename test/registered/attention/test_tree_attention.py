@@ -143,6 +143,7 @@ class TestTreeAttention(CustomTestCase):
         backend.use_sliding_window_kv_pool = backend.is_prefill_aware_swa = False
         backend._decode_uses_static_max_seqlen_k = False
         backend.local_attn_builder = backend.full_cg_prefill_metadata = None
+        backend.mxfp8_via_bf16 = False
         backend.num_splits = backend.decode_num_splits = 1
         backend.topk = queries
         backend.flash_attn_with_kvcache = flash_attn_with_kvcache
