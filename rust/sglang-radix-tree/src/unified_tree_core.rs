@@ -8,7 +8,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use tch::{Device, Kind, Tensor};
+use tch::{Kind, Tensor};
 
 use crate::components::{
     self, ComponentSet, FullComponent, MambaComponent, SwaComponent, TreeComponent,
@@ -546,8 +546,8 @@ pub struct CacheInitParams {
     pub enable_hicache: bool,
     /// Hit count at which a node earns a host write-through backup.
     pub write_through_threshold: i64,
-    /// Device the KV indices live on.
-    pub device: Device,
+    /// Empty int64 index tensor supplied on the cache's device.
+    pub empty_device_indices: Tensor,
     /// SWA sliding window size in tokens; None when SWA is disabled.
     pub swa_sliding_window_size: Option<usize>,
     /// Whether SWA lives in a per-request ring rather than cached paged slots.
@@ -582,7 +582,7 @@ impl Default for CacheInitParams {
             is_write_back: false,
             enable_hicache: false,
             write_through_threshold: 256,
-            device: Device::Cpu,
+            empty_device_indices: Tensor::empty([0], (Kind::Int64, tch::Device::Cpu)),
             swa_sliding_window_size: None,
             swa_req_ring: false,
             has_swa_host_pool: false,
@@ -682,8 +682,6 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
 
     /// Per-component monotonic sources for lock-segment UUIDs.
     pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
-    /// Device the KV indices live on.
-    pub(crate) device: Device,
     /// Shared empty device-index tensor (an empty match's indices).
     pub(crate) empty_device_indices: Tensor,
     /// The single in-flight resumable insert, if suspended at a barrier.
@@ -1068,8 +1066,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
-            device: params.device,
-            empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
+            empty_device_indices: params.empty_device_indices,
             ongoing_insert_walk_state: None,
             joint_lru: params.joint_lru.then(JointLRU::default),
             joint_walk: None,
@@ -5313,6 +5310,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Publish loaded SWA slots into an existing tombstoned span.
     /// Validate the entire operation before splitting or publishing any values.
+    /// The caller must supply values on the tree's device; Python bindings check this.
     pub fn attach_swa_window(
         &mut self,
         key: &K,
@@ -5323,11 +5321,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Result<CacheActions, String> {
         self.validate_swa_span_(key, window_start, window_end)?;
         let window = self.family_slot_(Family::Window);
-        if swa_values.kind() != Kind::Int64 || swa_values.device() != self.device {
-            return Err(format!(
-                "attach_swa_window requires int64 values on {:?}",
-                self.device
-            ));
+        if swa_values.kind() != Kind::Int64 {
+            return Err("attach_swa_window requires int64 values".to_owned());
         }
         if swa_values.size() != [((window_end - window_start) as i64)] {
             return Err(format!(
@@ -6573,7 +6568,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let node_slots: Vec<i64> = node
                 .try_device_value(FULL)
                 .map(|value| {
-                    Vec::<i64>::try_from(&value.to(Device::Cpu))
+                    Vec::<i64>::try_from(&value.to(tch::Device::Cpu))
                         .expect("device values are 1-D int64 tensors")
                 })
                 .unwrap_or_default();
