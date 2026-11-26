@@ -48,7 +48,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.mem_cache.allocation_sizing import (
     get_mamba_tracking_slots,
-    get_req_to_token_extra_context_len,
+    get_req_to_token_headroom,
 )
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -214,7 +214,9 @@ def _pd_prefill_skips_mamba_spec_state() -> bool:
 def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
     """Per-pool fp8 layout. DSpark draft writers scatter bf16, so that pool
     stays a bf16 ring; MTP/EAGLE NextN follows the env."""
-    from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_fp8
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+        is_unified_kv_fp8,
+    )
 
     return is_unified_kv_fp8() and not (is_draft_worker and spec_algorithm.is_dspark())
 
@@ -286,7 +288,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
         SpecAuxHiddenStateConfig,
     )
-    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.model_executor.pool_configurator import (
+        MemoryPoolConfig,
+    )
 
 
 def runner_state(table, allocator, *, table_owns_state: bool) -> Optional[StateStorage]:
@@ -472,6 +476,7 @@ class KVCacheConfigurator:
                 draft_model_config=aux.draft_model_config,
                 draft_num_layers=aux.dflash_draft_num_layers,
                 attn_tp_size=self.draft_attn_tp_size,
+                algo_label="DFLASH" if self.spec_algorithm.is_dflash() else None,
             )
             self.dflash_draft_loc_space_scale = draft_loc_space_scale(
                 hf_config=aux.draft_model_config.hf_config,
@@ -1257,7 +1262,7 @@ class KVCacheConfigurator:
             raise RuntimeError("unified storage must be sized before construction")
         from sglang.srt.mem_cache.kv.decl import StateLifetime
 
-        extra_max_context_len, decode_pre_alloc_size = self._unified_request_rows(
+        req_to_token_headroom, decode_pre_alloc_size = self._unified_request_rows(
             has_state=StateLifetime in self._unified_plan.lifetime_types()
         )
         storage = build_kv_storage(
@@ -1281,7 +1286,7 @@ class KVCacheConfigurator:
                 head_dim=self.model_config.head_dim,
                 max_num_reqs=sizes.max_running_requests,
                 model_context_len=self.model_config.context_len,
-                extra_max_context_len=extra_max_context_len,
+                req_to_token_headroom=req_to_token_headroom,
                 state_cache_params=(
                     self.mambaish_config.mamba2_cache_params if has_state else None
                 ),
@@ -1305,17 +1310,14 @@ class KVCacheConfigurator:
         running set, by the rules the static request pools follow."""
         disagg = get_disagg()
         if has_state:
-            extra_max_context_len = 4
-            draft_tokens = max_speculative_num_draft_tokens()
-            if draft_tokens is not None:
-                extra_max_context_len += draft_tokens
             pre_alloc_size = (
                 disagg.disaggregation_decode_extra_slots
                 if disagg.disaggregation_mode == "decode"
                 else 0
             )
-            return extra_max_context_len, pre_alloc_size
-        return get_req_to_token_extra_context_len(), self._req_pool_pre_alloc_size()
+        else:
+            pre_alloc_size = self._req_pool_pre_alloc_size()
+        return get_req_to_token_headroom(), pre_alloc_size
 
     def _unified_swa_head_geometry(self) -> _UnifiedSWAHeadGeometry:
         """Head geometry of a hybrid-SWA host's full and SWA sub-pools."""
@@ -1625,7 +1627,7 @@ class KVCacheConfigurator:
         return 0
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
-        extra_max_context_len = get_req_to_token_extra_context_len()
+        req_to_token_headroom = get_req_to_token_headroom()
 
         disagg = get_disagg()
         if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
@@ -1633,23 +1635,23 @@ class KVCacheConfigurator:
             if self.mambaish_config:
                 return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
+                    req_to_token_headroom=req_to_token_headroom,
                     pre_alloc_size=pre_alloc_size,
                 )
             return self._build_decode_req_pool(
                 max_num_reqs=max_num_reqs,
-                extra_max_context_len=extra_max_context_len,
+                req_to_token_headroom=req_to_token_headroom,
                 pre_alloc_size=pre_alloc_size,
             )
 
         if self.mambaish_config:
             return self._build_hybrid_req_pool(
                 max_num_reqs=max_num_reqs,
-                extra_max_context_len=extra_max_context_len,
+                req_to_token_headroom=req_to_token_headroom,
             )
         return self._build_default_req_pool(
             max_num_reqs=max_num_reqs,
-            extra_max_context_len=extra_max_context_len,
+            req_to_token_headroom=req_to_token_headroom,
         )
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
@@ -1688,14 +1690,17 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        req_to_token_headroom: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
-        from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
+        from sglang.srt.disaggregation.decode import (
+            HybridMambaDecodeReqToTokenPool,
+        )
+        from sglang.srt.layers.attention.linear.utils import max_verify_batch_size
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            max_context_len=self.model_config.context_len + req_to_token_headroom,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
@@ -1725,6 +1730,7 @@ class KVCacheConfigurator:
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
+            max_verify_batch_size=max_verify_batch_size(max_num_reqs),
         )
         return req_to_token_pool
 
@@ -1732,7 +1738,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        req_to_token_headroom: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
         if _is_npu and is_deepseek_v4(self.model_config.hf_config):
@@ -1744,7 +1750,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = DecodeReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            max_context_len=self.model_config.context_len + req_to_token_headroom,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
@@ -1755,13 +1761,13 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        req_to_token_headroom: int,
     ) -> ReqToTokenPool:
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            max_context_len=self.model_config.context_len + req_to_token_headroom,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
@@ -1802,7 +1808,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        req_to_token_headroom: int,
     ) -> ReqToTokenPool:
         # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
         # swa/c4/c128/c{4,128}_state tables; others stay on the stock one.
@@ -1816,7 +1822,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = req_to_token_pool_cls(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            max_context_len=self.model_config.context_len + req_to_token_headroom,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
         )
@@ -2151,7 +2157,9 @@ class KVCacheConfigurator:
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
         if self.is_draft_worker:
-            from sglang.srt.models.deepseek_v4_nextn import COMPRESS_RATIO_NEXTN_LAYER
+            from sglang.srt.models.deepseek_v4_nextn import (
+                COMPRESS_RATIO_NEXTN_LAYER,
+            )
 
             compression_ratios = [
                 COMPRESS_RATIO_NEXTN_LAYER
@@ -2296,7 +2304,9 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
     ) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
 
         kwargs = {}
         if self.is_hybrid_swa_compress:
@@ -2366,7 +2376,9 @@ class KVCacheConfigurator:
         max_running_requests: int,
         is_dsa_model: bool,
     ) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMLATokenToKVPool,
+        )
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
         from sglang.srt.mem_cache.kv_cache_dtype import resolve_indexer_quant_mode
 
@@ -2442,7 +2454,6 @@ class KVCacheConfigurator:
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
             index_size=index_size,
-            index_page_size=get_schedule().page_size,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=(
                 calculate_mla_kv_cache_dim(
@@ -2468,7 +2479,9 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
 
         token_to_kv_pool = NPUMHATokenToKVPool(
             max_total_num_tokens,
@@ -2484,8 +2497,7 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             modelslim_cache_layout=self.modelslim_cache_layout,
-            # Encoder-decoder FIA must expose per-layer views to the compiler;
-            # indexing the all-layer cache inside capture retains the full pool.
+            # Keep per-layer views available during encoder-decoder graph capture.
             use_fia=True if self.model_config.is_encoder_decoder else None,
         )
         return token_to_kv_pool
@@ -2727,7 +2739,9 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.configs.model_config import uses_minimax_m3_packed_nvfp4_kv
+        from sglang.srt.configs.model_config import (
+            uses_minimax_m3_packed_nvfp4_kv,
+        )
         from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
         _hf_config = self.model_config.hf_config
@@ -2883,7 +2897,9 @@ class KVCacheConfigurator:
             extra_args["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
             )
-        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+        from sglang.srt.layers.attention.qsa.config import (
+            parse_qsa_profile,
+        )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
             resolve_qsa_indexer_dtype,
@@ -3183,7 +3199,9 @@ class KVCacheConfigurator:
                     )
                 else:
                     if get_memory().enable_hisparse:
-                        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+                        from sglang.srt.mem_cache.sparsity import (
+                            parse_hisparse_config,
+                        )
 
                         hisparse_cfg = parse_hisparse_config()
                         token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
@@ -3405,7 +3423,7 @@ class KVCacheConfigurator:
         # Apply user-specified upper bound
         if user_limit is not None:
             if user_limit > token_capacity:
-                logging.warning(
+                logger.warning(
                     f"max_total_tokens={user_limit} is larger than the profiled value "
                     f"{token_capacity}. Use the profiled value instead."
                 )
@@ -3571,33 +3589,31 @@ class KVCacheConfigurator:
                 self._kv_layer_decls(),
                 page_size=self.page_size,
                 fused_draft=placement,
-                speculative_num_draft_tokens=(
-                    None
-                    if _pd_prefill_skips_mamba_spec_state()
-                    else max_speculative_num_draft_tokens()
-                ),
+                speculative_num_draft_tokens=None
+                if _pd_prefill_skips_mamba_spec_state()
+                else max_speculative_num_draft_tokens(),
             )
         from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 
         has_state = StateLifetime in self._unified_plan.lifetime_types()
         has_window = WindowLifetime in self._unified_plan.lifetime_types()
-        extra_context, pre_alloc = self._unified_request_rows(has_state=has_state)
+        req_to_token_headroom, pre_alloc = self._unified_request_rows(
+            has_state=has_state
+        )
         ratio = schedule.mamba_full_memory_ratio
         requested = schedule.max_running_requests
         inp = KVSizingInputs(
             budget_bytes=budget_bytes,
             context_len=self.model_config.context_len,
-            extra_context_len=extra_context,
+            req_to_token_headroom=req_to_token_headroom,
             pre_alloc_rows=pre_alloc,
-            max_running_requests=(
-                None if requested is None else max(1, requested // self.attn_dp_size)
-            ),
+            max_running_requests=None
+            if requested is None
+            else max(1, requested // self.attn_dp_size),
             max_total_tokens=schedule.max_total_tokens,
-            state_slots=(
-                None
-                if schedule.max_mamba_cache_size is None
-                else schedule.max_mamba_cache_size // self.attn_dp_size
-            ),
+            state_slots=None
+            if schedule.max_mamba_cache_size is None
+            else schedule.max_mamba_cache_size // self.attn_dp_size,
             state_share=ratio / (1 + ratio),
             state_strategy=StateSlotStrategy(
                 radix_cache=not get_memory().disable_radix_cache,
@@ -3887,7 +3903,6 @@ def calculate_mla_kv_cache_dim(
     *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
-    kv_cache_dtype = kv_cache_dtype
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
