@@ -81,6 +81,9 @@ class MatchPrefixParams:
     # matched state, and the slot is bound with the request's row.
     defer_cow_slot: bool = False
     req: Optional[Req] = None
+    # The match only orders the waiting queue and no load follows it, so an
+    # external store may answer from the request's last lookup.
+    probe: bool = False
 
 
 @dataclasses.dataclass

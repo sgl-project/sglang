@@ -728,7 +728,9 @@ class UnifiedRadixCache(BasePrefixCache):
             and params.req is not None
             and get_disagg().disaggregation_mode != "decode"
         ):
-            result = self.linker.match(params.key, params.req, result)
+            result = self.linker.match(
+                params.key, params.req, result, probe=params.probe
+            )
         return result
 
     def _linker_offload_skip_prefix(self, req: Req, token_ids):

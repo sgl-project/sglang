@@ -222,7 +222,7 @@ class TestUniboostMatching(UniboostTestBase):
     def run_pass(self, policy, queue):
         matched = []
 
-        def fake_match(req, tree_cache, token_ids=None):
+        def fake_match(req, tree_cache, token_ids=None, probe=False):
             matched.append(req.rid)
             req.last_node = object()
 
