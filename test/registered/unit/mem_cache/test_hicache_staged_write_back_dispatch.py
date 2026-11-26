@@ -773,10 +773,12 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             mock.patch(
                 f"{MHA_POOL_HOST_MODULE}.transfer_kv_all_layer_kv_split_lf_pf",
                 side_effect=lambda **kw: transfer(direction="D2H", **kw),
+                create=True,
             ) as backup,
             mock.patch(
                 f"{MHA_POOL_HOST_MODULE}.transfer_kv_per_layer_kv_split_pf_lf",
                 side_effect=lambda **kw: transfer(direction="H2D", **kw),
+                create=True,
             ) as load,
         ):
             host.backup_from_device_all_layer(
@@ -802,10 +804,11 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
     def test_npu_mha_rejects_layer_first(self):
         host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
-        host._transfer_device = SimpleNamespace(type="npu")
         host.layout = "layer_first"
-        with self.assertRaisesRegex(ValueError, "does not support layer_first"):
-            host.init_kv_buffer()
+        with self.assertRaisesRegex(ValueError, "Unsupported layout: layer_first"):
+            host.backup_from_device_all_layer(
+                object(), _indices(0, 1), _indices(0, 1), "kernel_ascend"
+            )
 
     def test_mla_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2

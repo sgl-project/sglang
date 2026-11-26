@@ -112,8 +112,12 @@ class TestNPUMambaStateTransfer(unittest.TestCase):
                 pool = _pool(side_shape=shape)
                 pool.slot_state_buffers[0][1].fill_(7)
                 with (
-                    patch.object(mamba, "transfer_kv_per_layer_direct_pf_lf", create=True),
-                    patch.object(mamba, "transfer_kv_all_layer_direct_lf_pf", create=True),
+                    patch.object(
+                        mamba, "transfer_kv_per_layer_direct_pf_lf", create=True
+                    ),
+                    patch.object(
+                        mamba, "transfer_kv_all_layer_direct_lf_pf", create=True
+                    ),
                 ):
                     _load(pool)
                     self.assertTrue(
