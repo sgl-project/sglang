@@ -11,11 +11,12 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kits.unified_radix_cache.config import CacheConfig
 from sglang.test.kits.unified_radix_cache.fixtures import build_fixture, match_prefix
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestFullLeafTailEviction(unittest.TestCase):
+class TestFullLeafTailEviction(CustomTestCase):
     def make_cache(self, chunk=8, *, session_cache=False):
         with (
             envs.SGLANG_PYTHON_RADIX_EVICT_TAIL_CHUNK_SIZE.override(chunk),
