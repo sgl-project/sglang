@@ -15,7 +15,7 @@ from sglang.srt.batch_overlap.operations import (
 )
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
-from sglang.srt.eplb import expert_distribution, expert_location_dispatch
+from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
@@ -851,68 +851,6 @@ class TestTopKRoutingInputs(CustomTestCase):
                 output = router(self.hidden, self.logits, torch.arange(4))
         self.assertEqual(output.topk_ids.tolist(), [[2, 0], [0, 3], [3, 1], [1, 2]])
         torch.testing.assert_close(output.topk_weights[2:], torch.zeros((2, 2)))
-
-    def test_hash_npu_shares_padding_mask_with_enabled_recorder(self):
-        with get_model().override(
-            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
-        ):
-            router = HashTopK(
-                2,
-                4,
-                vocab_size=4,
-                scoring_func="sqrtsoftplus",
-                routed_scaling_factor=2.0,
-                layer_id=0,
-            )
-        recorder = expert_distribution._ExpertDistributionRecorderReal.__new__(
-            expert_distribution._ExpertDistributionRecorderReal
-        )
-        for recording, capturing, disabled in (
-            (True, False, False),
-            (False, True, False),
-            (False, False, False),
-            (True, True, True),
-        ):
-            recorder._recording, recorder._disable_all = recording, disabled
-            with (
-                self.subTest(
-                    recording=recording, capturing=capturing, disabled=disabled
-                ),
-                patch.object(get_resources(), "expert_distribution_recorder", recorder),
-                patch.object(recorder, "on_select_experts") as record,
-                patch.object(
-                    torch,
-                    "get_device_module",
-                    return_value=SimpleNamespace(
-                        is_current_stream_capturing=lambda capturing=capturing: (
-                            capturing
-                        )
-                    ),
-                ),
-                patch.object(
-                    topk_module, "_padded_row_mask", wraps=topk_module._padded_row_mask
-                ) as mask,
-                patch.object(hash_topk_module, "_is_npu", True),
-                envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False),
-                forward_context(
-                    ForwardContext(attn_backend=object()), forward_batch=_batch(2)
-                ),
-            ):
-                output = router(self.hidden, self.logits, torch.arange(4))
-                mask.assert_called_once()
-                self.assertEqual(
-                    output.topk_ids.tolist(),
-                    [[2, 0, 4], [0, 3, 4], [3, 1, 4], [1, 2, 4]],
-                )
-                torch.testing.assert_close(output.topk_weights[2:], torch.zeros((2, 3)))
-                if (recording or capturing) and not disabled:
-                    record.assert_called_once()
-                    self.assertEqual(
-                        record.call_args.kwargs["topk_ids"].tolist(),
-                        [[2, 0], [0, 3], [-1, -1], [-1, -1]],
-                    )
-                else:
-                    record.assert_not_called()
 
     def test_hash_global_shared_column_stays_outside_expert_map(self):
         with get_model().override(

@@ -45,6 +45,35 @@ ROUTING_QUANT_MODES = {
 }
 
 
+def mask_topk_padding(
+    topk_weights: torch.Tensor,
+    recorder_ids: Optional[torch.Tensor],
+    num_token_non_padded: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    from sglang.srt.eplb.expert_distribution import (
+        get_global_expert_distribution_recorder,
+    )
+
+    # NPU dispatch consumes valid IDs even on padding. Only the recorder
+    # needs a copy with those rows marked -1, while all dispatch weights
+    # (including shared experts) must be zero there.
+    if num_token_non_padded is None:
+        return recorder_ids
+    rows = torch.arange(
+        topk_weights.shape[0],
+        device=topk_weights.device,
+        dtype=num_token_non_padded.dtype,
+    )
+    padded = (rows >= num_token_non_padded)[:, None]
+    topk_weights.masked_fill_(padded, 0.0)
+    if (
+        recorder_ids is None
+        or not get_global_expert_distribution_recorder().hooks_enabled()
+    ):
+        return None
+    return recorder_ids.masked_fill(padded, -1)
+
+
 def quant_mode_dtype(quant_mode: int) -> torch.dtype:
     """Payload dtype a quant mode puts on the wire.
 

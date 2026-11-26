@@ -54,7 +54,9 @@ class EPLBManager:
         self._rebalance_disabled_logged = False
         self.interval_controller = None
         if get_exec().moe.eplb_interval_policy != "fixed":
-            from sglang.srt.eplb.interval_controller import IntervalController
+            from sglang.srt.hardware_backend.npu.eplb_interval.controller import (
+                IntervalController,
+            )
 
             self.interval_controller = IntervalController(model_config)
 

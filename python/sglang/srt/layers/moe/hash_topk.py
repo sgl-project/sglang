@@ -17,7 +17,6 @@ from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
     TopKConfig,
-    _mask_npu_topk_padding,
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
     remap_topk_for_per_rank_shared_slots,
@@ -308,7 +307,9 @@ class HashTopK(nn.Module):
             topk_ids = routed_cols
         recorder_topk_ids = routed_cols
         if _is_npu:
-            recorder_topk_ids = _mask_npu_topk_padding(
+            from sglang.srt.hardware_backend.npu.moe.routing import mask_topk_padding
+
+            recorder_topk_ids = mask_topk_padding(
                 topk_weights, routed_cols, num_token_non_padded
             )
         elif _is_hip:

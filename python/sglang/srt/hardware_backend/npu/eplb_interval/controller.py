@@ -14,13 +14,16 @@ from sglang.srt.eplb.expert_location import (
     ModelConfigForExpertLocation,
     get_global_expert_location_metadata,
 )
-from sglang.srt.eplb.interval_planner import ReplayStatus, ShadowPlanner
-from sglang.srt.eplb.interval_policy import (
+from sglang.srt.hardware_backend.npu.eplb_interval.planner import (
+    ReplayStatus,
+    ShadowPlanner,
+)
+from sglang.srt.hardware_backend.npu.eplb_interval.replay import (
     IntervalReplay,
     ShadowLayout,
     routing_overlap,
 )
-from sglang.srt.eplb.interval_timing import (
+from sglang.srt.hardware_backend.npu.eplb_interval.timing import (
     MIN_PHASE_TIMINGS,
     MIN_TIMINGS,
     ForwardTimings,
@@ -219,7 +222,8 @@ class IntervalController:
         self.evidence = {}
         self.reason = reason
 
-    def _sample(self, recorder, proposed):
+    def _observe(self, recorder, proposed=None):
+        start = time.monotonic()
         ring = recorder.peek_interval_window()
         block = self.step - self.last_sample
         # External recorder stop/reset must invalidate every candidate equally.
@@ -270,6 +274,13 @@ class IntervalController:
             self.reset_observation()
             return
         self._schedule_next_sample(ring)
+        if self.rank == 0:
+            now = time.monotonic()
+            self.observer_seconds += now - start
+            # The next readiness vote communicates cooldown to every rank.
+            self.over_budget = self.observer_seconds > 0.02 * (
+                now - self.observation_start
+            )
 
     def _schedule_next_sample(self, ring):
         # The next block must have exactly one new recorder row per forward.
@@ -278,9 +289,8 @@ class IntervalController:
         self.next_sample = self.step + self.replay.next_block()
 
     def _complete_replay(self, recorder_generation):
-        result = [self.replay.result() if self.rank == 0 else None]
-        dist.broadcast_object_list(result, src=0, group=self.group)
-        target, self.reason, self.evidence = result[0]
+        result = self.replay.result() if self.rank == 0 else None
+        target, self.reason, self.evidence = self._broadcast_decision(result)
         if self.check_costs and target is not None:
             # Cost of checking more often, stated in service ms/forward.
             # This is a break-even estimate, not a measured speedup.
@@ -311,17 +321,16 @@ class IntervalController:
             overlap = routing_overlap(
                 rejected.routing_counts, self.replay.routing_counts, self.group
             )
-        decision = [None]
+        decision = None
         if self.rank == 0:
-            decision[0] = (
+            decision = (
                 baseline_hold_reason(
                     baseline, previous_mix, overlap, colocated=self.role == "colocated"
                 ),
                 baseline.coverage(),
                 overlap,
             )
-        dist.broadcast_object_list(decision, src=0, group=self.group)
-        hold_reason, coverage, rejected_overlap = decision[0]
+        hold_reason, coverage, rejected_overlap = self._broadcast_decision(decision)
         self.evidence["baseline_timing_coverage"] = coverage
         if rejected_overlap is not None:
             self.evidence["rejected_routing_overlap"] = rejected_overlap
@@ -420,13 +429,12 @@ class IntervalController:
         )
         overlap = routing_overlap(trial.routing_counts, counts, self.group)
         check_tax = trial.check_ms / (periods * self.interval)
-        decision = [None]
+        decision = None
         if self.rank == 0:
-            decision[0] = trial.decide(
+            decision = trial.decide(
                 observed, check_tax, overlap, colocated=self.role == "colocated"
             )
-        dist.broadcast_object_list(decision, src=0, group=self.group)
-        keep, details = decision[0]
+        keep, details = self._broadcast_decision(decision)
         self.last_trial = {
             "previous_interval": trial.previous,
             "trial_interval": self.interval,
@@ -465,18 +473,6 @@ class IntervalController:
         if self.rank == 0:
             logger.info("EPLB interval trial: %s", self.status())
 
-    def _observe(self, recorder, proposed=None):
-        start = time.monotonic()
-        self._sample(recorder, proposed)
-        if self.replay is None or self.rank != 0:
-            return
-        self.observer_seconds += time.monotonic() - start
-        # The next sample's existing readiness vote communicates a cooldown
-        # before any rank performs more shadow work.
-        self.over_budget = self.observer_seconds > 0.02 * (
-            time.monotonic() - self.observation_start
-        )
-
     def advance(self, recorder):
         self.step += 1
         # Fixed, deterministic control points independent of arrival order.
@@ -498,6 +494,11 @@ class IntervalController:
         if self.step < self.next_ready_check:
             return False
         return self._ready_for_live_check(recorder)
+
+    def _broadcast_decision(self, decision):
+        message = [decision]
+        dist.broadcast_object_list(message, src=0, group=self.group)
+        return message[0]
 
     def _min_across_ranks(self, value):
         vote = torch.tensor(int(value), dtype=torch.int32, device="cpu")

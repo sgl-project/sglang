@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.eplb.expert_location import compute_static_dispatch_maps
-from sglang.srt.eplb.interval_policy import ShadowLayout
+from sglang.srt.hardware_backend.npu.eplb_interval.replay import ShadowLayout
 
 logger = logging.getLogger(__name__)
 

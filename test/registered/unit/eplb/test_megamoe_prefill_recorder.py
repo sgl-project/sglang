@@ -152,7 +152,7 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         recorder._single_pass_gatherers = {"primary": gatherer}
         recorder._current_layer_idx = SimpleNamespace(value=1)
         local = dict(num_experts=8, ep_rank=2, ep_size=4)
-        with patch.object(recorder, "hooks_enabled", return_value=True):
+        with patch.object(recorder, "_hook_enabled", return_value=True):
             recorder.get_current_pass_local_count_buffer(**local).fill_(1)
             expected = torch.zeros((3, 8), dtype=torch.int32)
             expected[1, 4:6] = 1
@@ -165,7 +165,7 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
             recorder._current_layer_idx = SimpleNamespace(value=None)
             self.assertIsNone(recorder.get_current_pass_local_count_buffer(**local))
         recorder._current_layer_idx = SimpleNamespace(value=1)
-        with patch.object(recorder, "hooks_enabled", return_value=False):
+        with patch.object(recorder, "_hook_enabled", return_value=False):
             self.assertIsNone(recorder.get_current_pass_local_count_buffer(**local))
 
     def _make_recorder(self):

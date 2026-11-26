@@ -5,9 +5,9 @@ from sgl_kernel_npu.operators.moe import moe_gating_top_k
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
+from sglang.srt.hardware_backend.npu.moe.routing import mask_topk_padding
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
-    _mask_npu_topk_padding,
     apply_routing_simulation,
     capture_routed_experts_if_allowed,
     routing_simulation_enabled,
@@ -156,9 +156,7 @@ def _finalize_topk_npu(
         if num_shared
         else routed_ids
     )
-    recorder_ids = _mask_npu_topk_padding(
-        topk_weights, routed_ids, num_token_non_padded
-    )
+    recorder_ids = mask_topk_padding(topk_weights, routed_ids, num_token_non_padded)
     if recorder_ids is not None:
         get_global_expert_distribution_recorder().on_select_experts(
             topk_ids=recorder_ids

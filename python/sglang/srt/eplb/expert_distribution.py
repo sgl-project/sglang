@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import math
-import random
 import time
 from abc import ABC
 from collections import deque
@@ -301,7 +300,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def get_current_pass_count_buffer(self):
-        if not self.hooks_enabled():
+        if not self._hook_enabled():
             return None
         gatherer = self._single_pass_gatherers.get(_SINGLE_PASS_GATHERER_KEY_PRIMARY)
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
@@ -345,6 +344,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         )
 
     def hooks_enabled(self) -> bool:
+        return self._hook_enabled()
+
+    def _hook_enabled(self) -> bool:
         if self._disable_all:
             return False
         if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
@@ -354,7 +356,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         )
 
     def _on_hook(self, hook_name: str, **kwargs):
-        if not self.hooks_enabled():
+        if not self._hook_enabled():
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
@@ -1000,18 +1002,22 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.preserve_window_on_dump = get_exec().moe.eplb_interval_policy != "fixed"
-        self._counts = _Buffer.init_new(
-            item_shape=(
-                self._expert_location_metadata.num_layers,
-                # Cannot use local_physical_count to support select_experts
-                self._expert_location_metadata.num_logical_experts
-                if self.preserve_window_on_dump
-                else self._expert_location_metadata.num_physical_experts,
-            ),
-            buffer_size=get_exec().moe.expert_distribution_recorder_buffer_size,
-            dtype=torch.int32,
-            device=get_device_namespace().device,
-        )
+        metadata = self._expert_location_metadata
+        size = get_exec().moe.expert_distribution_recorder_buffer_size
+        device = get_device_namespace().device
+        if self.preserve_window_on_dump:
+            from sglang.srt.hardware_backend.npu.eplb_interval.window import (
+                IntervalWindow,
+            )
+
+            self._counts = IntervalWindow(metadata, size, device)
+        else:
+            self._counts = _Buffer.init_new(
+                (metadata.num_layers, metadata.num_physical_experts),
+                size,
+                torch.int32,
+                device,
+            )
         self._first_dump = True
 
     def append(
@@ -1024,24 +1030,14 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         if self.preserve_window_on_dump and _is_model_capture_mode():
             return
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
-        # Can optimize if overhead here is large
-        counts = single_pass_data["global_physical_count"]
-        if self.preserve_window_on_dump:
-            # Later forwards may install another map while this row is retained.
-            self._counts.append_physical(
-                counts, self._expert_location_metadata.physical_to_logical_map
-            )
-        else:
-            self._counts.append(counts)
+        self._counts.append(single_pass_data["global_physical_count"])
 
     def reset(self):
         super().reset()
         self._counts.reset()
 
     def interval_window(self):
-        assert self.preserve_window_on_dump and isinstance(
-            self._counts, _CircularBuffer
-        )
+        assert self.preserve_window_on_dump
         return self._counts
 
     def _to_logical(self, counts):
@@ -1153,64 +1149,16 @@ class _CircularBuffer(_Buffer):
             (buffer_size, *item_shape), dtype=dtype, device=device
         )
         self._curr_index = 0
-        self.samples_written = 0
-        self.generation = 0
 
     def append(self, value: torch.Tensor):
         self._buffer[self._curr_index] = value
-        self._advance()
-
-    def append_physical(self, counts, physical_to_logical):
-        row = self._buffer[self._curr_index]
-        row.zero_().scatter_add_(1, physical_to_logical.long(), counts.to(row.dtype))
-        self._advance()
-
-    def _advance(self):
         self._curr_index = (self._curr_index + 1) % len(self._buffer)
-        self.samples_written += 1
-
-    def sum_steps(self):
-        # Some device backends widen the entire input before reducing. Bound
-        # that temporary to 8 MiB (or one row) even for a long decode window.
-        rows = max(1, (8 << 20) // (8 * self._buffer[0].numel()))
-        chunks = iter(self._buffer.split(rows))
-        total = next(chunks).sum(dim=0, dtype=torch.int64)
-        for chunk in chunks:
-            total.add_(chunk.sum(dim=0, dtype=torch.int64))
-        return total
-
-    def latest(self):
-        """Borrow the last appended row until the next forward."""
-        if not self.samples_written:
-            raise ValueError("The recorder window is empty")
-        return self._buffer[self._curr_index - 1]
-
-    def sample_recent(self, steps: int, sample_count: int, seed: int = 0):
-        """Stratified rows from the last block, in chronological order."""
-        if not 0 < steps <= min(len(self._buffer), self.samples_written):
-            raise ValueError("Requested steps are outside the recorder window")
-        n = min(steps, sample_count)
-        rng = random.Random(seed)
-        offsets = (
-            range(steps)
-            if steps == n
-            else [rng.randrange(i * steps // n, (i + 1) * steps // n) for i in range(n)]
-        )
-        indices = [(self._curr_index - steps + i) % len(self._buffer) for i in offsets]
-        return self._buffer[indices]
-
-    def snapshot(self):
-        """Owned chronological rows for export; unused rows follow the valid prefix."""
-        oldest = self._curr_index - min(self.samples_written, len(self._buffer))
-        return self._buffer.roll(-oldest, dims=0)
 
     def get_all(self) -> torch.Tensor:
         return self._buffer
 
     def reset(self):
         self._buffer[...] = 0
-        self.samples_written = 0
-        self.generation += 1
 
 
 class _InfiniteBuffer(_Buffer):

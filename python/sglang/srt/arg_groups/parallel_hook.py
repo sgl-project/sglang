@@ -861,128 +861,26 @@ def handle_eplb_and_dispatch(server_args: Any):
         assert resolved_view(server_args).ep_size > 1
 
 
-def _interval_replay_fallback(cfg):
-    if cfg.enable_pd_role_switch:
-        return "does not support switching PD roles at runtime"
-    if cfg.device != "npu":
-        return f"unsupported device {cfg.device}"
-    if (
-        cfg.pp_size != 1
-        or cfg.nnodes != 1
-        or cfg.dp_size != 1
-        or cfg.tp_size != cfg.ep_size
-        or cfg.ep_size <= 1
-        or cfg.elastic_ep_backend is not None
-    ):
-        return "requires a single non-elastic TP=EP=WORLD group with PP=1"
-    if (
-        cfg.expert_distribution_recorder_mode != "stat"
-        or cfg.ep_dispatch_algorithm != "static"
-    ):
-        return f"requires stat recording and static dispatch (got {cfg.expert_distribution_recorder_mode}, {cfg.ep_dispatch_algorithm})"
-    if cfg.moe_a2a_backend not in ("ascend_ops", "ascend_fuseep", "deepep"):
-        return f"unsupported dispatcher {cfg.moe_a2a_backend}"
-    if cfg.eplb_algorithm not in ("auto", "deepseek", "deepseek_hierarchical"):
-        return f"unsupported layout algorithm {cfg.eplb_algorithm}"
-    if (
-        cfg.eplb_rebalance_layers_per_chunk is not None
-        or cfg.eplb_min_rebalancing_utilization_threshold != 1.0
-    ):
-        return "requires full-model updates and the default rebalance threshold"
-    return None
-
-
-def _resolve_eplb_interval(server_args: Any):
+def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
-    source = "_handle_expert_distribution_metrics"
     if (
         cfg.enable_eplb
         and cfg.eplb_rebalance_num_iterations is not None
         and cfg.eplb_rebalance_num_iterations < 1
     ):
         raise ValueError("The EPLB interval must be a positive integer.")
-    if cfg.eplb_interval_policy == "fixed":
-        if cfg.eplb_rebalance_num_iterations is None:
-            declare_resolution(server_args, source, eplb_rebalance_num_iterations=1000)
-        return
-    if cfg.eplb_interval_policy not in ("recommend", "auto") or not cfg.enable_eplb:
-        raise ValueError(
-            "EPLB interval tuning requires --enable-eplb and recommend or auto."
+    if cfg.eplb_interval_policy != "fixed":
+        from sglang.srt.hardware_backend.npu.eplb_interval.config import (
+            resolve_interval,
         )
-    fallback = _interval_replay_fallback(cfg)
-    if fallback is not None:
-        interval = cfg.eplb_rebalance_num_iterations
-        if interval is None:
-            interval = max(1000, cfg.expert_distribution_recorder_buffer_size or 0)
-        if (cfg.expert_distribution_recorder_buffer_size or 0) > interval:
-            raise ValueError(
-                "This configuration requires fixed EPLB checks. Set the interval at least as large as the recorder window."
-            )
-        logger.warning(
-            "EPLB interval replay %s. Using fixed interval %d.",
-            fallback,
-            interval,
-        )
+
+        resolve_interval(server_args, cfg)
+    elif cfg.eplb_rebalance_num_iterations is None:
         declare_resolution(
             server_args,
-            source,
-            eplb_interval_policy="fixed",
-            eplb_rebalance_num_iterations=interval,
+            "_handle_expert_distribution_metrics",
+            eplb_rebalance_num_iterations=1000,
         )
-        return
-
-    window = cfg.expert_distribution_recorder_buffer_size
-    interval = cfg.eplb_rebalance_num_iterations
-    explicit_interval = interval is not None
-    if interval is None:
-        interval = 1000
-        if (
-            cfg.disaggregation_mode in ("prefill", "decode")
-            and cfg.ep_size == cfg.attn_dp_size == 16
-            and cfg.ep_num_redundant_experts == 16
-            and cfg.quantization == "modelslim"
-        ):
-            from sglang.srt.utils.device import get_device_name
-
-            hf = model_config_of(server_args).hf_config
-            if (
-                "DeepseekV4ForCausalLM" in (hf.architectures or [])
-                and getattr(hf, "n_routed_experts", None) == 256
-                and (get_device_name() or "")
-                .lower()
-                .startswith(("ascend910_93", "ascend910c"))
-            ):
-                source = "ascend_pd_eplb_interval"
-                interval, default_window = (
-                    (50, 50) if cfg.disaggregation_mode == "prefill" else (4000, 1000)
-                )
-                if window is None:
-                    window = default_window
-    if window is None:
-        window = interval
-    if window <= 0 or not 0 < interval <= 2**31 - 1:
-        raise ValueError(
-            "EPLB interval tuning requires a positive recorder window and an interval in [1, 2147483647]."
-        )
-    declare_resolution(
-        server_args,
-        source,
-        eplb_rebalance_num_iterations=interval,
-        expert_distribution_recorder_buffer_size=window,
-    )
-    logger.info(
-        "EPLB %s %s starts at interval=%d window=%d (%s)",
-        cfg.disaggregation_mode,
-        cfg.eplb_interval_policy,
-        interval,
-        window,
-        "explicit interval" if explicit_interval else source,
-    )
-
-
-def handle_expert_distribution_metrics(server_args: Any):
-    _resolve_eplb_interval(server_args)
-    cfg = resolving_view(server_args)
     if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):
@@ -993,18 +891,11 @@ def handle_expert_distribution_metrics(server_args: Any):
         )
 
     if cfg.expert_distribution_recorder_buffer_size is None:
-        if (x := cfg.eplb_rebalance_num_iterations) is not None:
-            declare_resolution(
-                server_args,
-                "_handle_expert_distribution_metrics",
-                expert_distribution_recorder_buffer_size=x,
-            )
-        elif cfg.expert_distribution_recorder_mode is not None:
-            declare_resolution(
-                server_args,
-                "_handle_expert_distribution_metrics",
-                expert_distribution_recorder_buffer_size=1000,
-            )
+        declare_resolution(
+            server_args,
+            "_handle_expert_distribution_metrics",
+            expert_distribution_recorder_buffer_size=cfg.eplb_rebalance_num_iterations,
+        )
 
 
 def validate_prefill_cp_platform(server_args: Any):
