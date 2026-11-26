@@ -185,10 +185,6 @@ def create_npu_async_eplb(
             use_prefill_admission=use_prefill_admission,
         )
         initial_layout = metadata.physical_to_logical_map_cpu.contiguous()
-        if any(t.shape[0] != spec.local_experts for t in runtime.staging):
-            raise ValueError(
-                "Async EPLB weight rows do not match the local expert count"
-            )
         # Vote on local allocations before any rank posts a device collective.
         tp_probe = torch.zeros(1, dtype=torch.int32, device=runtime.device)
         warmup_buffers = (

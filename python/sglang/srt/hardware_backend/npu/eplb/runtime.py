@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import time
 from collections import defaultdict
 from concurrent.futures import Future
@@ -379,18 +378,22 @@ class NpuEplbRuntime:
             "SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS"
         )
         self.layer_ids = tuple(sorted(weights.keys()))
-        adapter = _ExpertWeightAdapter(weights, list(self.layer_ids), rank)
-        weight_formats = hashlib.sha256()
-        for layer in self.layer_ids:
-            fields = adapter.transfer_signature(weights[layer])
-            weight_formats.update(repr(fields).encode("ascii"))
-        self.weight_format_digest = weight_formats.digest()
+        adapter = _ExpertWeightAdapter(
+            weights, list(self.layer_ids), rank, compute_format_digest=True
+        )
+        self.weight_format_digest = adapter.weight_format_digest
         self.weights = {
             layer: adapter.make_weight_views(weights[layer]) for layer in self.layer_ids
         }
-        self.staging = adapter.create_temp_buffers()
+        self._weight_staging = adapter.create_temp_buffers()
+        if any(buffer.size(0) != spec.local_experts for buffer in self._weight_staging):
+            raise ValueError(
+                "Async EPLB weight rows do not match the local expert count"
+            )
         self._packed_fields = (
-            _PackedExpertFields.create(self.staging) if pack_small_fields else None
+            _PackedExpertFields.create(self._weight_staging)
+            if pack_small_fields
+            else None
         )
         # Reserve one layer before KV sizing. The owner event fences its reuse
         # after writes from the preceding layer have been enqueued.
@@ -407,7 +410,7 @@ class NpuEplbRuntime:
             )
             narrowed = (visible_slots < spec.physical_experts).nonzero().flatten()
             self.narrowed_replica_layers.update(narrowed.tolist())
-        self.device = self.staging[0].device
+        self.device = self._weight_staging[0].device
         self.device_module = torch.get_device_module(self.device)
         self._p2p_stream = self.device_module.Stream(device=self.device)
         self._owner_stream = self.device_module.current_stream()
@@ -594,7 +597,7 @@ class NpuEplbRuntime:
         self.interleaved_layers += p2p_expert_order is not None
         expert_order = p2p_expert_order or range(len(old_layout))
 
-        weights, staging = self.weights[layer], self.staging
+        weights, staging = self.weights[layer], self._weight_staging
         send_fields, receive_buffers = weights, staging
         packed = self._packed_fields
         packed_for_local_copy = False
@@ -661,7 +664,7 @@ class NpuEplbRuntime:
 
     def staging_memory(self) -> tuple[int, int, int]:
         """Return weight bytes, routing bytes, and the number of packed fields."""
-        weight_bytes = sum(tensor.nbytes for tensor in self.staging)
+        weight_bytes = sum(tensor.nbytes for tensor in self._weight_staging)
         routing_bytes = sum(
             tensor.nbytes for tensor in self._routing_buffers if tensor is not None
         )

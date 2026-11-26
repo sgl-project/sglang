@@ -20,6 +20,7 @@ Import torch_npu only when an NPU operation actually needs it.
 
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import torch
@@ -176,9 +177,13 @@ def _rank_may_send_experts(
 
 
 def _validate_migration_weights(
-    weights_by_layer: dict[int, list[torch.Tensor]], layer_ids: list[int], rank: int
-) -> list[_ExpertStorageLayout]:
-    """Validate the whole chunk once and return reusable per-weight layouts."""
+    weights_by_layer: dict[int, list[torch.Tensor]],
+    layer_ids: list[int],
+    rank: int,
+    *,
+    compute_format_digest: bool,
+) -> tuple[list[_ExpertStorageLayout], bytes | None]:
+    """Validate the chunk and optionally digest the wire format of each layer."""
     sample_layer = layer_ids[0]
     num_weights = len(weights_by_layer[sample_layer])
     if not num_weights:
@@ -186,6 +191,7 @@ def _validate_migration_weights(
             f"[NPU EPLB] rank={rank} layer={sample_layer}: no expert weights"
         )
     layouts = []
+    format_digest = hashlib.sha256() if compute_format_digest else None
     for layer_index, layer in enumerate(layer_ids):
         weights = weights_by_layer[layer]
         if len(weights) != num_weights:
@@ -193,9 +199,10 @@ def _validate_migration_weights(
                 f"[NPU EPLB] rank={rank} layer={layer}: expected {num_weights} "
                 f"weight tensors as in layer {sample_layer}, got {len(weights)}"
             )
+        layer_signature = []
         for weight_index, weight in enumerate(weights):
             try:
-                layout = _expert_storage_layout(weight)
+                layout, backing = _inspect_expert_storage(weight)
             except ValueError as error:
                 raise ValueError(
                     f"[NPU EPLB] rank={rank} layer={layer} "
@@ -209,7 +216,13 @@ def _validate_migration_weights(
                     f"weight_index={weight_index}: storage layout {layout} "
                     f"does not match layer {sample_layer}: {layouts[weight_index]}"
                 )
-    return layouts
+            if format_digest is not None:
+                layer_signature.append(
+                    _transfer_field_signature(weight, layout, backing)
+                )
+        if format_digest is not None:
+            format_digest.update(repr(tuple(layer_signature)).encode("ascii"))
+    return layouts, format_digest.digest() if format_digest is not None else None
 
 
 class _ExpertStorageLayout(NamedTuple):
@@ -251,7 +264,9 @@ def _validate_routed_expert_view(weight: torch.Tensor) -> None:
         raise ValueError("NPU EPLB requires an outermost, contiguous expert axis.")
 
 
-def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
+def _inspect_expert_storage(
+    weight: torch.Tensor,
+) -> tuple[_ExpertStorageLayout, torch.Tensor]:
     """Check that raw storage can be split into equal, complete expert blocks."""
     import torch_npu
 
@@ -293,7 +308,7 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
         total_experts = _validate_nz_expert_blocks(weight, backing, physical_elements)
     if weight.shape[0] > total_experts:
         raise ValueError("NPU EPLB expert prefix exceeds the backing storage.")
-    return _ExpertStorageLayout(
+    layout = _ExpertStorageLayout(
         shape=tuple(weight.shape),
         dtype=weight.dtype,
         device=weight.device,
@@ -301,6 +316,24 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
         storage_bytes=physical_bytes,
         npu_format=npu_format,
         needs_storage_alias=not is_base_format or not weight.is_contiguous(),
+    )
+    return layout, backing
+
+
+def _transfer_field_signature(
+    weight: torch.Tensor, layout: _ExpertStorageLayout, backing: torch.Tensor
+) -> tuple:
+    """Describe how a rank interprets an expert's bytes, independent of device ID."""
+    nz_backing_row = None
+    if layout.npu_format not in _BASE_FORMATS:
+        nz_backing_row = (backing.dtype, tuple(backing.shape[1:]))
+    return (
+        layout.shape,
+        weight.stride(),
+        layout.dtype,
+        layout.npu_format,
+        layout.expert_byte_shape,
+        nz_backing_row,
     )
 
 
@@ -374,8 +407,15 @@ class _ExpertWeightAdapter:
         weights_by_layer: dict[int, list[torch.Tensor]],
         layer_ids: list[int],
         rank: int,
+        *,
+        compute_format_digest: bool = False,
     ):
-        self._layouts = _validate_migration_weights(weights_by_layer, layer_ids, rank)
+        self._layouts, self.weight_format_digest = _validate_migration_weights(
+            weights_by_layer,
+            layer_ids,
+            rank,
+            compute_format_digest=compute_format_digest,
+        )
 
     def create_temp_buffers(self) -> list[torch.Tensor]:
         return [
@@ -386,30 +426,6 @@ class _ExpertWeightAdapter:
             )
             for layout in self._layouts
         ]
-
-    def transfer_signature(self, weights: list[torch.Tensor]) -> tuple:
-        """Describe how each expert's bytes are interpreted, independent of rank."""
-        fields = []
-        for weight, layout in zip(weights, self._layouts, strict=True):
-            nz_backing_row = None
-            if layout.npu_format not in _BASE_FORMATS:
-                import torch_npu
-
-                backing = torch_npu._C._tensor_construct_from_storage(
-                    weight.untyped_storage()
-                )
-                nz_backing_row = (backing.dtype, tuple(backing.shape[1:]))
-            fields.append(
-                (
-                    layout.shape,
-                    weight.stride(),
-                    layout.dtype,
-                    layout.npu_format,
-                    layout.expert_byte_shape,
-                    nz_backing_row,
-                )
-            )
-        return tuple(fields)
 
     def make_weight_views(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         """Return writable aliases of the routed experts, without copying weights."""
