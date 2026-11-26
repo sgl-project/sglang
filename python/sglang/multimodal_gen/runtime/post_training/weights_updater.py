@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     invalidate_conditioning_caches,
 )
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
+from sglang.multimodal_gen.runtime.layers.linear import standard_linear_weight_layout
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     get_param_names_mapping,
@@ -190,7 +191,7 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     "Inplace update to inference tensor outside InferenceMode is not allowed"
     and returns an HTTP error.
     """
-    with torch.inference_mode():
+    with torch.inference_mode(), standard_linear_weight_layout(module):
         restore_weight_snapshot(module)
         model_params = dict(module.named_parameters())
         weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)

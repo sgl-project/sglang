@@ -7,6 +7,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     get_world_group,
 )
+from sglang.multimodal_gen.runtime.layers.linear import standard_linear_weight_layout
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     iter_materialized_weights,
@@ -158,9 +159,11 @@ class GPUWorkerPostTrainingMixin:
             if module is None:
                 checksums[name] = "not_found"
                 continue
-            checksums[name] = compute_weights_checksum(
-                iter_materialized_weights(module)
-            )
+            # Hash the checkpoint layout that refit sources are compared against.
+            with standard_linear_weight_layout(module):
+                checksums[name] = compute_weights_checksum(
+                    iter_materialized_weights(module)
+                )
         return checksums
 
     def _select_own_gpu_payload(

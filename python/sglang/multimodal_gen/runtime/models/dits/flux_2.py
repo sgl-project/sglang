@@ -1500,6 +1500,7 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     """
 
+    _transposed_linear_weight_archs = ("gfx942",)
     param_names_mapping = {
         # ModelOpt FP8 exports separate Diffusers projections. Merge Q/K/V and
         # their static scales into the runtime MergedColumnParallelLinear.

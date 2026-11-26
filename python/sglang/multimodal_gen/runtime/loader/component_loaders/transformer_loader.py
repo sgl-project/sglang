@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
+from sglang.multimodal_gen.runtime.layers.linear import transpose_linear_weights
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
 )
@@ -34,6 +35,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_quant_load_spec,
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
 )
@@ -96,6 +98,13 @@ def _warn_if_expected_param_dtype_missing(
             param_dtypes,
             expected_dtype,
         )
+
+
+def _gemm_prefers_transposed_linear_weights(model: torch.nn.Module) -> bool:
+    if not (isinstance(model, BaseDiT) and current_platform.is_rocm()):
+        return False
+    arch = current_platform.get_gcn_arch_name().split(":")[0]
+    return arch in model._transposed_linear_weight_archs
 
 
 def _server_args_for_transformer_component(
@@ -606,5 +615,20 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             post_load_hook(model)
 
         _warn_if_expected_param_dtype_missing(model, quant_spec.param_dtype)
+
+        # Weights that move between devices or are sharded keep the checkpoint layout.
+        if (
+            not component_starts_on_cpu
+            and not use_fsdp
+            and _gemm_prefers_transposed_linear_weights(model)
+        ):
+            count = transpose_linear_weights(model)
+            # Release the [out, in] copies so later allocations do not split around them.
+            torch.get_device_module().empty_cache()
+            logger.info(
+                "%s: stored the weights of %d linears as [in, out]",
+                component_name,
+                count,
+            )
 
         return model
