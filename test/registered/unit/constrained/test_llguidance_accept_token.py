@@ -7,8 +7,8 @@ import unittest
 import torch
 from llguidance import LLTokenizer, grammar_from
 from llguidance.hf import from_tokenizer
-from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
+from tokenizers import Tokenizer, decoders
+from tokenizers.models import BPE
 from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.constrained.llguidance_backend import GuidanceGrammar
@@ -47,9 +47,11 @@ class TestGuidanceAcceptTokenReject(CustomTestCase):
         # Token "z" occupies bit 31 of the last word, which a -1 index aliases.
         words = ["<eos>", *"abcdefghijklmnopqrstuvwxy01234z"]
         vocab = {word: i for i, word in enumerate(words)}
+        backend = Tokenizer(BPE(vocab, []))
+        backend.decoder = decoders.ByteLevel()
         tokenizer = from_tokenizer(
             PreTrainedTokenizerFast(
-                tokenizer_object=Tokenizer(WordLevel(vocab)),
+                tokenizer_object=backend,
                 eos_token="<eos>",
             )
         )
