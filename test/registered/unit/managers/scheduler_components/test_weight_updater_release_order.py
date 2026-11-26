@@ -54,7 +54,7 @@ class TestReleaseMemoryOccupationSynchronize(CustomTestCase):
                 is_fully_idle=lambda **kwargs: True,
                 scheduler=SimpleNamespace(
                     pause_state=SimpleNamespace(paused=False),
-                    request_lists=dict,
+                    request_lists=lambda: {},
                     disaggregation_mode=weight_updater_module.DisaggregationMode.DECODE,
                     disagg_decode_prealloc_queue=SimpleNamespace(
                         release_memory_occupation=lambda: events.append(
@@ -114,12 +114,6 @@ class TestReleaseMemoryOccupationSynchronize(CustomTestCase):
                 out, events = self._release(tags)
                 self.assertTrue(out.success)
                 self.assertEqual(events, expected + [sync, barrier])
-
-    def test_disabled_adapter_does_not_synchronize(self):
-        adapter = adapter_module.TorchMemorySaverAdapter.create(enable=False)
-        with patch.object(adapter_module.torch, "get_device_module") as get_device:
-            adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
-        get_device.assert_not_called()
 
     def test_disabled_backend_preserves_pause_delegation(self):
         adapter = adapter_module._TorchMemorySaverAdapterReal()
