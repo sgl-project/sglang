@@ -8,7 +8,8 @@ Each GPU runs one daemon process for its TP rank. The daemon:
    (--weight-cache-transport): CUDA IPC handles (torch_ipc), or CUDA VMM
    allocations shared as file descriptors (vmm_fd)
 3. Serves transport entries over a Unix socket to requesting engine processes
-4. Validates CacheConfig compatibility before serving
+4. Serves only an engine whose model (WeightCacheConfig) and load spec
+   (LoadSpec) match its own
 
 Usage:
     # Single-node: launch all TP rank daemons with a single command:
@@ -63,17 +64,16 @@ from sglang.srt.runtime_context import (
 )
 
 from .protocol import (
-    CacheConfig,
+    cache_config_message,
+    cache_config_mismatches,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
-    compute_env_stamp,
     compute_global_rank,
     compute_local_gpu_id,
-    get_quant_method_name,
     get_ready_path,
     get_socket_path,
-    hash_quant_config,
     recv_msg,
+    resolve_cache_quantization,
     send_msg,
 )
 from .transport import (
@@ -173,19 +173,10 @@ class WeightCacheDaemon:
         self.tp_rank = tp_rank
         self.pp_size = cfg.pp_size
         self.pp_rank = pp_rank
-        self.ep_size = cfg.ep_size
-        self.moe_dp_size = cfg.moe_dp_size
-        self.enable_dp_lm_head = cfg.enable_dp_lm_head
-        self.attn_cp_size = cfg.attn_cp_size
-        self.moe_dense_tp_size = cfg.moe_dense_tp_size
         self.moe_a2a_backend = cfg.moe_a2a_backend
         self.deepep_mode = cfg.deepep_mode
         self.load_format = cfg.load_format
-        self.dtype = cfg.dtype
-        self.quantization = cfg.quantization
         self.model_loader_extra_config = cfg.model_loader_extra_config
-        self.trust_remote_code = cfg.trust_remote_code
-        self.revision = cfg.revision
         self.dist_init_method = dist_init_method
         self.transport_name = resolve_daemon_transport(cfg.weight_cache_transport)
 
@@ -194,7 +185,7 @@ class WeightCacheDaemon:
         self.ready_path = get_ready_path(device_uuid)
 
         self.model = None
-        self.config: Optional[CacheConfig] = None
+        self.config: Optional[Dict[str, Any]] = None  # see cache_config_message
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
@@ -309,32 +300,37 @@ class WeightCacheDaemon:
         )
 
         from sglang.srt.layers.moe import initialize_moe_config
+        from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
+        from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+        from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 
+        from .config import (
+            build_load_spec,
+            build_weight_cache_config,
+            path_checkpoint_id,
+        )
+
+        # Resolve the kernel backends as the engine's scheduler does: they decide
+        # post-processing, and LoadSpec compares them.
         initialize_moe_config()
+        initialize_fp8_gemm_config()
+        initialize_fp4_gemm_config()
+        initialize_bf16_gemm_config()
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
-        # Build model config first, then init distributed
-        model_config = ModelConfig(
-            model_path=self.model_path,
-            trust_remote_code=self.trust_remote_code,
-            revision=self.revision,
-            dtype=self.dtype,
-            quantization=self.quantization,
-        )
+        # Build model config first, then init distributed. Build it from the
+        # same server args as the engine, so both hash the same HF config.
+        model_config = ModelConfig.from_server_args(server_args)
 
-        # Build cache config fingerprint before loading the model.
-        # Loading may mutate hf_config.quantization_config (e.g. via
-        # process_weights_after_loading), which would produce a different
-        # hash than what the engine computes from the original config.
-        # ModelConfig always exposes hf_config/quantization directly;
-        # quantization_config is the only genuinely-optional attribute.
-        quant_config = getattr(model_config.hf_config, "quantization_config", None)
-        quant_method = get_quant_method_name(
-            self.quantization or model_config.quantization
+        # Describe the model before loading it. Loading may mutate
+        # hf_config.quantization_config (e.g. via process_weights_after_loading),
+        # which would produce a different hash than what the engine computes
+        # from the original config.
+        weight_config = build_weight_cache_config(
+            model_config, checkpoint_id=path_checkpoint_id()
         )
-        if not quant_method and quant_config is not None:
-            quant_method = get_quant_method_name(quant_config)
+        quant_method, quant_config = resolve_cache_quantization(model_config)
 
         # Refuse unsupported quant methods before creating distributed groups
         # or touching model weights.
@@ -344,34 +340,11 @@ class WeightCacheDaemon:
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
         self._initialize_eplb_expert_location_metadata(model_config)
-        moe_dp_rank = get_parallel().moe_dp_rank
-        moe_ep_rank = get_parallel().moe_ep_rank
-        self.config = CacheConfig(
-            model_path=self.model_path,
-            model_arch=(
-                model_config.hf_config.architectures[0]
-                if model_config.hf_config.architectures
-                else ""
+        self.config = cache_config_message(
+            weight_config,
+            build_load_spec(
+                device=torch.device(current_platform.device_type, self.gpu_id)
             ),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            pp_size=self.pp_size,
-            pp_rank=self.pp_rank,
-            dp_size=get_parallel().dp_size,
-            ep_size=self.ep_size,
-            moe_dp_size=self.moe_dp_size,
-            moe_dp_rank=moe_dp_rank,
-            moe_ep_rank=moe_ep_rank,
-            attn_dp_size=get_parallel().attn_dp_size,
-            enable_dp_lm_head=self.enable_dp_lm_head,
-            attn_cp_size=self.attn_cp_size,
-            moe_dense_tp_size=self.moe_dense_tp_size,
-            moe_a2a_backend=self.moe_a2a_backend,
-            quant_method=quant_method,
-            quant_config_hash=hash_quant_config(quant_config),
-            dtype=str(model_config.dtype),
-            revision=self.revision or "",
-            **compute_env_stamp(),
         )
 
         current_platform.empty_cache()
@@ -566,7 +539,7 @@ class WeightCacheDaemon:
         # Write ready file
         with open(self.ready_path, "w") as f:
             f.write(f"pid={os.getpid()}\n")
-            f.write(f"config={self.config.to_dict()}\n")
+            f.write(f"config={self.config}\n")
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] Listening on {self.socket_path}"
@@ -619,27 +592,18 @@ class WeightCacheDaemon:
 
         if req.get("type") == "query_config":
             # Client asks for config without requesting handles
-            send_msg(conn, {"status": "ok", "config": self.config.to_dict()})
+            send_msg(conn, {"status": "ok", "config": self.config})
 
         elif req.get("type") == "fetch_state":
             # Client requests full state with IPC handles
-            engine_config = CacheConfig.from_dict(req["config"])
-            if not self.config.matches(engine_config):
-                # Log detailed mismatch info for debugging
-                daemon_dict = self.config.to_dict()
-                engine_dict = engine_config.to_dict()
-                mismatches = {
-                    k: (daemon_dict.get(k), engine_dict.get(k))
-                    for k in daemon_dict
-                    if daemon_dict.get(k) != engine_dict.get(k)
-                }
+            # (daemon, engine) value of every field that differs.
+            mismatches = cache_config_mismatches(self.config, req["config"])
+            if mismatches:
                 logger.warning(
                     f"[WeightCacheDaemon gpu={self.gpu_id}] "
                     f"Config mismatch: {mismatches}"
                 )
-                send_msg(
-                    conn, {"status": "mismatch", "daemon_config": self.config.to_dict()}
-                )
+                send_msg(conn, {"status": "mismatch", "daemon_config": self.config})
                 return
 
             logger.info(
@@ -649,7 +613,7 @@ class WeightCacheDaemon:
             )
             self.transport_backend.send_fetch_state_response(
                 conn,
-                config=self.config.to_dict(),
+                config=self.config,
                 entries=self.state_entries,
                 # PID so the client can watch daemon liveness: with
                 # torch_ipc, if this process dies while clients hold IPC

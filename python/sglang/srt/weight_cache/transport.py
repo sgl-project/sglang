@@ -17,6 +17,7 @@ import torch
 from sglang.srt.utils import MultiprocessingSerializer, is_npu
 
 from .protocol import send_msg
+from .schema import SnapshotManifest
 from .vmm_layout import pack_slot, plan_vmm_pack, validate_vmm_layout, view_from_entry
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,35 @@ def _prefix_offsets(sizes: Sequence[int]) -> List[int]:
         offsets.append(total)
         total += size
     return offsets
+
+
+class WeightTransport(ABC):
+    """Moves one rank's storages from an owner to a reader, and withdraws them.
+
+    It knows nothing about models or other ranks. A reader's transport is made by
+    the loader's lookup for one load, so it may hold that load's session, such as
+    the daemon connection that vmm_fd sends its file descriptors over.
+    """
+
+    @abstractmethod
+    def publish(self, *, storages: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        """Owner: make ``storages`` readable; returns the manifest's ``source``.
+
+        It may consume ``storages`` (vmm_fd repacks them), so nothing reads them after.
+        """
+
+    @abstractmethod
+    def fetch(
+        self, *, manifest: SnapshotManifest, device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Reader: every storage of ``manifest`` as uint8 bytes, all or nothing.
+
+        Returns once the bytes are visible on the current stream; raises otherwise.
+        """
+
+    @abstractmethod
+    def close(self) -> None:
+        """Withdraw what publish or fetch set up. Idempotent."""
 
 
 class WeightCacheTransportBackend(ABC):
