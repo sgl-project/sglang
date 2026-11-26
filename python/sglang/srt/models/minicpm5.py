@@ -21,8 +21,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
-from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -69,7 +67,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeMLP
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel, get_stream
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
@@ -295,8 +293,6 @@ class MiniCPM5Moe(nn.Module):
                 ),
             )
 
-        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
-
     def _forward_routed(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -463,7 +459,6 @@ class MiniCPM5Model(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.vocab_size = config.vocab_size
-        self.first_k_dense_replace = config.first_k_dense_replace
         self.embed_dim = config.hidden_size
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -517,13 +512,7 @@ class MiniCPM5Model(nn.Module):
             )
 
         aux_hidden_states = AuxHiddenStateList()
-        tbo_start = self.end_layer
-        if forward_batch.can_run_tbo and not self.layers_to_capture:
-            tbo_start = min(
-                self.end_layer, max(self.start_layer, self.first_k_dense_replace)
-            )
-
-        for layer_id in range(self.start_layer, tbo_start):
+        for layer_id in range(self.start_layer, self.end_layer):
             capture = (
                 aux_hidden_states.capture
                 if layer_id in self.layers_to_capture
@@ -533,23 +522,20 @@ class MiniCPM5Model(nn.Module):
                 positions, hidden_states, forward_batch, capture_output=capture
             )
 
-        if tbo_start < self.end_layer:
-            hidden_states = model_forward_stages(
-                layers=self.layers[tbo_start : self.end_layer],
-                enable_tbo=True,
-                positions=positions,
-                forward_batch=forward_batch,
-                hidden_states=hidden_states,
-            )
-
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
 
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-        if not forward_batch.forward_mode.is_idle():
-            hidden_states = residual_batch.final_norm(
-                hidden_states, forward_batch, self.norm
-            )
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self.norm,
+            capture=(
+                aux_hidden_states.capture
+                if self.end_layer in self.layers_to_capture
+                else None
+            ),
+            skip_empty=True,
+        )
         if len(aux_hidden_states):
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -563,6 +549,13 @@ class MiniCPM5ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if config.tie_word_embeddings:
+            raise ValueError("MiniCPM5 requires tie_word_embeddings=False.")
+        if get_exec().overlap.enable_two_batch_overlap:
+            raise ValueError("MiniCPM5 does not support --enable-two-batch-overlap.")
+        if get_lora().enable_lora or get_lora().lora_paths:
+            raise ValueError("MiniCPM5 does not support LoRA.")
+
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.tp_size = get_parallel().tp_size
@@ -716,7 +709,7 @@ class MiniCPM5ForCausalLM(nn.Module):
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
         self.capture_aux_hidden_states = True
-        # Capture the post-layer residual at the next attention boundary.
+        # Capture each updated residual at the next attention boundary or final norm.
         self.model.layers_to_capture = [layer_id + 1 for layer_id in layer_ids]
 
 
