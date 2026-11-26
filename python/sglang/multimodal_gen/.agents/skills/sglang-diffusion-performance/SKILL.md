@@ -158,6 +158,10 @@ the model's page and apply the options above to it:
 | LTX-2 / LTX-2.3 / LTX-2.5 | `docs/cookbook/diffusion/LTX/LTX2 & LTX2.3.mdx`, `docs/cookbook/diffusion/LTX/LTX2.5.mdx` |
 | Other families | `docs/cookbook/diffusion/<Family>/` |
 
+"Per-model tuning starting points" in
+`docs/docs/sglang-diffusion/performance-optimization.mdx` maps model families
+to the lever worth trying first.
+
 The recipes below are patterns for a class of model, plus baselines for models
 that have no cookbook page yet.
 
