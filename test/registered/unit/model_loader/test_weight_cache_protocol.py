@@ -210,7 +210,7 @@ class TestLoadSpec(CustomTestCase):
                 # Parallel config: the layout.
                 *("tp_size", "pp_size", "dp_size", "ep_size", "moe_dp_size"),
                 *("attn_dp_size", "attn_cp_size", "moe_cp_size", "moe_dense_tp_size"),
-                "enable_dp_lm_head",
+                *("enable_dp_lm_head", "pp_layer_partition"),
                 # Parallel config: this rank's shard.
                 *("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"),
                 # Expert placement config.
@@ -320,6 +320,33 @@ class TestLoadSpec(CustomTestCase):
         spec = _make_load_spec(tp_size=4, tp_rank=3)
         self.assertEqual((spec.tp_size, spec.tp_rank), (4, 3))
         self.assertEqual((spec.pp_size, spec.pp_rank), (1, 0))
+
+    def test_pp_layer_partition_is_part_of_the_layout(self):
+        def spec(partition, pp_size=2):
+            with mock.patch.dict(os.environ):
+                os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
+                if partition is not None:
+                    os.environ["SGLANG_PP_LAYER_PARTITION"] = partition
+                return _make_load_spec(pp_size=pp_size)
+
+        even, uneven = spec("2,2"), spec("1,3")
+        self.assertEqual(
+            (even.pp_layer_partition, uneven.pp_layer_partition), ("2,2", "1,3")
+        )
+        for include_rank in (True, False):
+            self.assertNotEqual(
+                even.digest(include_rank=include_rank),
+                uneven.digest(include_rank=include_rank),
+            )
+        # Read as get_pp_indices reads it: the same integers are the same layout,
+        # a single stage ignores the variable, and a malformed list is an error.
+        self.assertEqual(spec("+1, 03"), uneven)
+        self.assertIsNone(spec(None).pp_layer_partition)
+        self.assertIsNone(spec("1,3", pp_size=1).pp_layer_partition)
+        for malformed in ("1 2,3", "1,3,", "4"):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(ValueError):
+                    spec(malformed)
 
     def test_moe_backends_come_from_the_published_config(self):
         # A dense model's engine never initializes the MoE flags; the daemon does.

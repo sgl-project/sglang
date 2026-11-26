@@ -48,6 +48,9 @@ class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
     moe_cp_size: int
     moe_dense_tp_size: Optional[int]
     enable_dp_lm_head: bool
+    # SGLANG_PP_LAYER_PARTITION as get_pp_indices reads it: the layer count of each
+    # pipeline stage, e.g. "1,3". None if it is unset or there is a single stage.
+    pp_layer_partition: Optional[str]
 
     # Parallel config: this rank's shard. The only fields that differ across ranks.
     tp_rank: int

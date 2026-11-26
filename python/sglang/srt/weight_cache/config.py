@@ -7,6 +7,7 @@ import hashlib
 import json
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.distributed.utils import get_pp_layer_partition
 from sglang.srt.layers import dp_attention
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import use_cutedsl_moe_swap_ab
 from sglang.srt.layers.moe.utils import MoeA2ABackend, resolve_moe_runner_backend
@@ -66,6 +67,7 @@ def build_load_spec(
     architectures = model_config.hf_config.architectures
     parallel = get_parallel()
     execution = get_exec()
+    pp_partition = get_pp_layer_partition(parallel.pp_size)
     # From the published config: a dense model's process never sets the MoE flags.
     moe_runner = resolve_moe_runner_backend(execution.moe.moe_runner_backend)
     a2a_backend = MoeA2ABackend(execution.moe.moe_a2a_backend)
@@ -98,6 +100,9 @@ def build_load_spec(
         moe_cp_size=dp_attention.get_moe_cp_size(),
         moe_dense_tp_size=parallel.moe_dense_tp_size,
         enable_dp_lm_head=parallel.enable_dp_lm_head,
+        pp_layer_partition=(
+            None if pp_partition is None else ",".join(map(str, pp_partition))
+        ),
         # Parallel config: this rank's shard.
         tp_rank=parallel.tp_rank,
         pp_rank=parallel.pp_rank,

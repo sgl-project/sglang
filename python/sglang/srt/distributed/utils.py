@@ -107,6 +107,28 @@ def split_tensor_along_last_dim(
     return tensor_list
 
 
+def get_pp_layer_partition(pp_size: int) -> Optional[Tuple[int, ...]]:
+    """The layer count of each pipeline stage set by SGLANG_PP_LAYER_PARTITION,
+    or None for the even split."""
+    # partition_list_str can be set to None in sglang
+    partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
+    if pp_size == 1:
+        # A singleton draft PP group owns every layer and must ignore the target's
+        # process-global pipeline partition list.
+        partition_list_str = None
+    if partition_list_str is None:
+        return None
+    try:
+        partitions = tuple(int(layer) for layer in partition_list_str.split(","))
+    except ValueError as err:
+        raise ValueError(
+            "Invalid partition string: {}".format(partition_list_str)
+        ) from err
+    if len(partitions) != pp_size:
+        raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
+    return partitions
+
+
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int
 ) -> Tuple[int, int]:
@@ -114,21 +136,8 @@ def get_pp_indices(
     If the number of layers is not divisible by the number of partitions,
     the last N partitions will have one extra layer, where N = remainder.
     """
-    # partition_list_str can be set to None in sglang
-    partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
-    if pp_size == 1:
-        # A singleton draft PP group owns every layer and must ignore the target's
-        # process-global pipeline partition list.
-        partition_list_str = None
-    if partition_list_str is not None:
-        try:
-            partitions = [int(layer) for layer in partition_list_str.split(",")]
-        except ValueError as err:
-            raise ValueError(
-                "Invalid partition string: {}".format(partition_list_str)
-            ) from err
-        if len(partitions) != pp_size:
-            raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
+    partitions = get_pp_layer_partition(pp_size)
+    if partitions is not None:
         if sum(partitions) != num_hidden_layers:
             raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
         start_layer = sum(partitions[:pp_rank])
