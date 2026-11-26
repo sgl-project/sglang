@@ -7,8 +7,12 @@ name: PR Test Stage (Diffusion)
 on:
   workflow_call:
     inputs:
+      job_display_name:
+        description: 'Diffusion lane name shown in GitHub; independent of the internal suite key.'
+        required: true
+        type: string
       stage:
-        description: 'Diffusion stage (base-b-diffusion, base-b-diffusion-unit, ...); its kind picks the install. The suite run is <stage>-test-<runner_config>, which also names the lane in job and artifact names.'
+        description: 'Diffusion stage (base-b-diffusion, base-b-diffusion-unit, ...); its kind picks the install. The suite run is <stage>-test-<runner_config>, which also names its artifacts.'
         required: true
         type: string
       runner_config:
@@ -53,12 +57,12 @@ env:
   SGLANG_IS_IN_CI: true
   NCCL_NVLS_ENABLE: "0"
   SGLANG_CUDA_COREDUMP: "1"
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_PR_TEST_HEALTH_CHECK: ${{ fromJson(inputs.caller_inputs).skip_pr_test_health_check == 'true' }}
 
 jobs:
   run:
-    name: ${{ inputs.stage }}-test-${{ inputs.runner_config }} (${{ matrix.part }})
+    name: ${{ inputs.job_display_name }} (${{ matrix.part }})
     runs-on: ${{ fromJson(fromJson(inputs.caller_inputs).runs_on_map)[inputs.runner_config] }}
     timeout-minutes: ${{ inputs.job_timeout_minutes }}
     strategy:
@@ -76,7 +80,38 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
+
+      # Under pull_request_target, HF_TOKEN reaches only the prefetch action, run
+      # from this checkout of the workflow's own commit before any step runs PR code.
+      - name: Check out the prefetch scripts
+        id: prefetch_scripts
+        if: inputs.partition_plan != ''
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .ci-prefetch
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            .github/actions/prefetch-hf-models/
+            scripts/ci/utils/prefetch_hf_models.py
+            scripts/ci/utils/prefetch_policy.json
+            scripts/ci/utils/prefetch_requirements.txt
+
+      - name: Prefetch Hugging Face models
+        if: steps.prefetch_scripts.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 30
+        uses: ./.ci-prefetch/.github/actions/prefetch-hf-models
+        with:
+          hf-token: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          repo-ids: ${{ join(fromJson(inputs.partition_plan).partitions[matrix.part].repo_ids, ' ') }}
 
       - name: Resolve runner_config
         id: rc
@@ -120,10 +155,12 @@ jobs:
       - name: Run diffusion suite
         timeout-minutes: ${{ inputs.run_timeout_minutes }}
         env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          # Never to pull_request_target runs: they carry PR code.
+          HF_TOKEN: ${{ github.event_name != 'pull_request_target' && (secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN) || '' }}
+          HUGGING_FACE_HUB_TOKEN: ${{ github.event_name != 'pull_request_target' && (secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN) || '' }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ fromJson(inputs.caller_inputs).continue_on_error }}
+          # Finish independent files sharing a shard. The suite returns the first failure.
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.partition_plan != '' && 'true' || fromJson(inputs.caller_inputs).continue_on_error }}
           # Empty when unpartitioned, so diffusion_suite_bridge.py omits the flags;
           # format() keeps part 0 from reading as false.
           DIFFUSION_PARTITION_ID: ${{ inputs.partition_plan != '' && format('{0}', matrix.part) || '' }}
