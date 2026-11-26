@@ -11,12 +11,14 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("page_size", [1, 48, 64])
 @pytest.mark.parametrize("topk", [512, 2048, 2052])
 def test_matches_page_size_1_table(page_size: int, topk: int) -> None:
     _check(page_size, topk, repeat=1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_more_rows_than_grid_y() -> None:
     # 65536 rows, past the 65535 limit of a grid's y dimension.
     _check(page_size=64, topk=512, repeat=8192)

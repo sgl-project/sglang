@@ -57,6 +57,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         cls.eager_on_graph = staticmethod(eager_on_graph)
         cls.device = torch.device(f"{get_device()}:0")
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_no_break_capture_replay(self):
         """Capture and replay without any graph breaks should work like normal CUDA graph."""
         x = torch.zeros(4, device=self.device)
@@ -73,6 +74,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         get_device_module().synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 6.0, device=self.device)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_single_break(self):
         """A single graph break should split capture into two segments."""
         x = torch.zeros(4, device=self.device)
@@ -98,6 +100,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         # x=10 -> intermediate=11 -> eager: 11*2=22 -> y=22+3=25
         self.assertTrue(torch.allclose(y, torch.full((4,), 25.0, device=self.device)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_multiple_breaks(self):
         """Multiple graph breaks should produce correct chained results."""
         x = torch.zeros(4, device=self.device)
@@ -128,6 +131,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         get_device_module().synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_eager_on_graph_disabled(self):
         """@eager_on_graph(enable=False) should be a no-op passthrough."""
 
@@ -142,6 +146,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             torch.allclose(result, torch.tensor([2.0, 3.0], device=self.device))
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_eager_on_graph_outside_capture(self):
         """@eager_on_graph called outside capture should run the function directly."""
 
@@ -156,6 +161,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             torch.allclose(result, torch.tensor([2.0, 3.0], device=self.device))
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_replay_updates_output(self):
         """Replay should produce different results when input buffers change."""
         x = torch.zeros(4, device=self.device)
@@ -204,6 +210,7 @@ class TestBreakGraphHelper(CustomTestCase):
         cls.break_graph = staticmethod(break_graph)
         cls.device = torch.device(f"{get_device()}:0")
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_break_graph_inserts_segment(self):
         """break_graph() should insert a graph break even though it does nothing."""
         x = torch.zeros(4, device=self.device)
@@ -231,6 +238,7 @@ class TestXPUBreakableGraph(CustomTestCase):
     XPU stack, so a small explicit set keeps capture within device limits.
     """
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_breakable_graph_runs(self):
         args = [
             *_COMMON_ARGS,

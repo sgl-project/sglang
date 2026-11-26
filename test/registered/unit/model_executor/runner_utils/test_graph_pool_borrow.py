@@ -82,6 +82,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             self.assertEqual(pool.graph_pool_borrow_largest_run(), 0)
             self.assertEqual(snapshot.call_count, 3)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_graph_replay_fails_during_active_pool_borrow(self):
         graph = Mock()
         backend = object.__new__(FullCudaGraphBackend)

@@ -26,6 +26,7 @@ def _pack_weight_scale(scale_u8: torch.Tensor) -> torch.Tensor:
     return scale_fp32
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("T", [1, 7, 64, 256, 1024])
 @pytest.mark.parametrize("N1,N2,K", [(1280, 256, 6144), (1024, 128, 2048)])
 def test_fused_equals_separate(T, N1, N2, K):

@@ -3,8 +3,13 @@
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn.functional as F
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     compute_cutlass_w4a8_moe_input_scale,
@@ -23,6 +28,7 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_input_scale_excludes_inactive_rows(self):
         """Only local-route rows affect the scale, without changing strided inputs."""
         experts, rows, width = 2, 11, 257
@@ -107,6 +113,7 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                         value = values[:, :0]
                     prepare(value, route_ids, floor)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_input_scale_and_raw_route_packing_graph_replay(self):
         """Replays compact only live routes and reset the scale as routes change."""
         experts, rows, width = 2, 13, 257

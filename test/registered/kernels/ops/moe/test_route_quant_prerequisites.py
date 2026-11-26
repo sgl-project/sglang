@@ -67,12 +67,14 @@ def _route_oracle(
 
 
 class TestRouteQuant(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_moe_auxiliary_kernels(self):
         x = torch.randn(2, TOPK, 7168, device="cuda", dtype=torch.bfloat16)
         out = torch.empty(2, 7168, device="cuda", dtype=torch.bfloat16)
         self.assertIs(moe_topk_sum(x, out), out)
         self.assertTrue(torch.equal(out, x.float().sum(1).to(torch.bfloat16)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_moe_topk_sum_scale_and_block_width(self):
         """Routed scaling lands before the bf16 store, and a narrower block (the decode width,
         grid = ceil(K/8/threads) x M) sums in the same order."""
@@ -91,6 +93,7 @@ class TestRouteQuant(CustomTestCase):
         self.assertTrue(torch.equal(wide, ref))
         self.assertTrue(torch.equal(narrow, wide))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_moe_route_and_quant(self):
         torch.manual_seed(1)
         scores = torch.randn(8, NUM_EXPERTS, device="cuda", dtype=torch.bfloat16)
@@ -137,6 +140,7 @@ class TestRouteQuant(CustomTestCase):
         )
         torch.testing.assert_close(scale, ref_scale, rtol=0, atol=0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_route_radix_ties_and_nan(self):
         """The cases the self-comparison could not see.
 

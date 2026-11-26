@@ -14,6 +14,13 @@ import time
 import unittest
 from typing import Tuple
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import numpy as np
 
 from sglang.srt.utils import kill_process_tree

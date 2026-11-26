@@ -7,6 +7,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.layers.attention import qwen_sparse_attn_backend
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.layers.cp import base as cp_base

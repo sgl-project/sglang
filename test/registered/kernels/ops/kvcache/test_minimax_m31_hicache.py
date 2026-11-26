@@ -27,6 +27,7 @@ def _indices(pages):
     return backing[::2]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("layout", ["layer_first", "page_first", "page_first_direct"])
 @pytest.mark.parametrize(
     "backend",

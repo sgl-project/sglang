@@ -3,7 +3,12 @@
 import unittest
 from unittest import mock
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 import torch_npu  # noqa: F401
 from torch_npu.contrib import transfer_to_npu  # noqa: F401
 

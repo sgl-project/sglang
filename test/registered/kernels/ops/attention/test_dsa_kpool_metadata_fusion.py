@@ -14,6 +14,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 
 class TestKPoolMetadataFusion(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_verify_replay_boundaries_and_request_remapping(self):
         device = "cuda"
         bs, next_n, width, topk, kpool = 4, 6, 16384, 2048, 4

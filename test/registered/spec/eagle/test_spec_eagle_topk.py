@@ -7,6 +7,13 @@ flashinfer is pinned because this runs on the cheap (5090) runner, where fa3
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.abort_timeout_kit import AbortAllMixin

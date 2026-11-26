@@ -37,6 +37,7 @@ def _inputs(rows: int, hidden: int, seed: int):
     return x, weight, shift, scale, indices
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", [1024, 5376])
 @pytest.mark.parametrize("rows", [1, 37, 1025])
 def test_matches_fp32_single_rounding(rows: int, hidden: int) -> None:
@@ -50,6 +51,7 @@ def test_matches_fp32_single_rounding(rows: int, hidden: int) -> None:
     torch.testing.assert_close(got.float(), ref, rtol=2**-7, atol=2**-7)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_stays_within_rounding_of_the_reference_chain() -> None:
     x, weight, shift, scale, indices = _inputs(1025, 5376, 7)
     norm = nn.RMSNorm(5376, eps=EPS, device="cuda", dtype=torch.bfloat16)
@@ -60,6 +62,7 @@ def test_stays_within_rounding_of_the_reference_chain() -> None:
     torch.testing.assert_close(got.float(), chain.float(), rtol=2**-6, atol=2**-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", [1024, 5376])
 @pytest.mark.parametrize("rows", [1, 37, 8256])
 def test_gated_norm_matches_gate_then_norm_bitwise(rows: int, hidden: int) -> None:

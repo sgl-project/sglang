@@ -85,6 +85,7 @@ def _prefilled_state(prompts, with_marker: bool):
     return page_state, coord_state, bt, lens.to(torch.int32)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("with_marker", [True, False])
 def test_fused_decode_meta_matches_torch_path(with_marker):
     # Prompt ends land mid-block, exactly on a block edge, and one past it.
@@ -144,6 +145,7 @@ def test_fused_decode_meta_matches_torch_path(with_marker):
             assert torch.equal(fused[live], ref[live])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("local_blocks", [1, 3])
 @pytest.mark.parametrize("max_block", [5, 16, 300])
 def test_local_union(local_blocks, max_block):
@@ -171,6 +173,7 @@ def test_local_union(local_blocks, max_block):
     assert bool((out[:, max_block:] == 3).all())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "dim,page_pairs,mode,page_mod,dtype",
     [
@@ -208,6 +211,7 @@ def test_cos_sin_2d(dim, page_pairs, mode, page_mod, dtype):
     torch.testing.assert_close(sin, ref_sin, **tol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "tokens,heads_x,heads_y,head_dim", [(1, 8, 1, 64), (33, 16, 2, 128)]
 )
@@ -262,6 +266,7 @@ def _decode_backend(prompts, page_state, coord_state, bt, *, graph: bool):
     return b
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_eager_decode_metadata_matches_graph_path():
     """Decode without CUDA graphs must build the same step geometry as replay.
 

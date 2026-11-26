@@ -48,6 +48,7 @@ def _tolerance(fp8: bool):
     return dict(atol=6e-2, rtol=6e-2) if fp8 else dict(atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize("local_blocks", [0, 1, 2])
 @pytest.mark.parametrize("with_bias", [True, False])
@@ -101,6 +102,7 @@ def test_prefill_matches_reference(block_size, local_blocks, with_bias, fp8):
     torch.testing.assert_close(out.float(), ref, **_tolerance(fp8))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("decode_query_len", [1, 2])
 @pytest.mark.parametrize("local_blocks", [0, 1])
 @pytest.mark.parametrize("chunk_width", [None, 1, 64])

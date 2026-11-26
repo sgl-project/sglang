@@ -10,6 +10,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.managers.scheduler_components import (
     weight_updater as weight_updater_module,
 )
@@ -82,6 +84,7 @@ def _make_manager(events):
 
 
 class TestNpuDeviceBarrier(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_release_synchronizes_before_return(self):
         events = []
         manager = _make_manager(events)
@@ -151,6 +154,7 @@ class TestNpuDeviceBarrier(CustomTestCase):
         # resume_memory_occupation has no device-wide synchronize today; this
         # test locks the barrier/restore ordering that the current code provides.
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_02_dp_pause_returns_after_all_ranks_drain(self):
         with npu_server(MODEL, extra_args=DP_ARGS, env=npu_rl_env()) as base_url:
             requests_ = [
@@ -204,6 +208,7 @@ class TestNpuDeviceBarrier(CustomTestCase):
             continue_generation(base_url)
             self.assertTrue(generate(base_url, PROMPT, max_new_tokens=4))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_pause_update_continue_is_stable_over_rounds(self):
         tensor_index = checkpoint_tensor_index(MODEL)
         original = load_checkpoint_tensor(tensor_index, NORM_WEIGHT)

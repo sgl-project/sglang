@@ -88,9 +88,11 @@ class TestFusedKvNormRopeWrite(CustomTestCase):
             self.assertEqual(got_k[~committed].abs().sum().item(), 0)
             self.assertEqual(got_v[~committed].abs().sum().item(), 0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_partial_rope_gemma_norm(self):
         self._run(rotary_dim=64, is_neox_style=True)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_full_rope_interleaved(self):
         self._run(rotary_dim=HEAD_DIM, is_neox_style=False)
 

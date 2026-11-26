@@ -2,7 +2,15 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import requests
+import torch
 
 from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA
 from sglang.srt.utils import kill_process_tree
@@ -103,6 +111,7 @@ mtp_args = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPureDP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -147,6 +156,7 @@ class TestPureDP(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNormal(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -194,6 +204,7 @@ class TestNormal(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTBOwithNormal(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -242,6 +253,7 @@ class TestTBOwithNormal(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMTPwithTBONormal(CustomTestCase):
     @classmethod
     def setUpClass(cls):

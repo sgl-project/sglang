@@ -3,7 +3,12 @@ import json
 import os
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 

@@ -18,6 +18,7 @@ def torch_reference(query, sink_key, attn_output, lse, scale):
 
 
 class TestIQuestQ1LearnedSink(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_matches_torch_across_layouts_and_dtypes(self):
         torch.manual_seed(17)
         # (tokens, heads, kv_heads, head_dim): empty batch, row-tail mask, model GQA,
@@ -66,6 +67,7 @@ class TestIQuestQ1LearnedSink(CustomTestCase):
                 self.assertEqual(actual.dtype, output.dtype)
                 self.assertTrue(actual.is_contiguous())
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_extreme_lse(self):
         q = torch.ones(5, 6, 128, device="cuda")
         sink = torch.zeros(1, 128, device="cuda")
@@ -81,6 +83,7 @@ class TestIQuestQ1LearnedSink(CustomTestCase):
             actual, output * factors[:, None, None], rtol=0, atol=0
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_torch_compile_fullgraph_preserves_outputs(self):
         torch.manual_seed(41)
         compiled = torch.compile(_apply_learned_sink, fullgraph=True)

@@ -21,6 +21,10 @@ from typing import Optional
 import pytest
 import torch
 import torch.nn.functional as F
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from sgl_kernel import causal_conv1d_fwd as aot_causal_conv1d_fwd
 from sgl_kernel import causal_conv1d_update as aot_causal_conv1d_update
 

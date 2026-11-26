@@ -45,6 +45,7 @@ TP_SIZE = 1
 KL_THRESHOLD = 4e-3
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAQwen3_5_4BLogprobDiff(CustomTestCase):
     def test_lora_qwen3_5_4b_logprob_accuracy(self):
         adapter_path = snapshot_download(

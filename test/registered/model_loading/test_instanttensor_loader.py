@@ -2,7 +2,12 @@ import multiprocessing as mp
 import os
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_cuda_ci

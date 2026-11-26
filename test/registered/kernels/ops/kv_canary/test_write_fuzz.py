@@ -239,6 +239,7 @@ def _summarize(inputs: WriteFuzzInputs) -> str:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("seed", FUZZ_SEEDS_PR)
 def test_write_fuzz_full_combo(seed: int) -> None:
     """Multi-dim write fuzzer: random pseudo/hash/kernel/page/source × N iters, byte-equal."""

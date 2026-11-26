@@ -63,6 +63,7 @@ def _check_contract(out, seq_lens, block_size, topk, S):
             assert torch.all(o[:nvalid] < nb)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype_sl", [torch.int32, torch.int64])
 @pytest.mark.parametrize("H", [2])
 @pytest.mark.parametrize("B", [1, 32])
@@ -92,6 +93,7 @@ def test_decode_topk_distinct(dtype_sl, H, B, topk, max_ctx):
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("kind", ["ties", "negative", "neg_inf_padding", "all_equal"])
 def test_decode_topk_adversarial(kind):
     torch.manual_seed(7)
@@ -118,6 +120,7 @@ def test_decode_topk_adversarial(kind):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("nb", [300, 512, 2000, 3000, 9000])
 @pytest.mark.parametrize("levels", [2, 4, 1])
 def test_decode_topk_ties_pick_lowest_ids(nb, levels):
@@ -141,6 +144,7 @@ def test_decode_topk_ties_pick_lowest_ids(nb, levels):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("seq_len", [1, 128, 129, 2048, 2049])
 def test_decode_topk_small_num_blocks(seq_len):
     # num_blocks around / below topk -> naive identity path and boundary.
@@ -155,6 +159,7 @@ def test_decode_topk_small_num_blocks(seq_len):
         assert out[0, 0, :nb].tolist() == list(range(nb))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("S", [4096, 4097, 8192, 8193, 16384])
 def test_decode_topk_register_buckets(S):
     """Cover both sides of every register-bucket boundary.
@@ -182,6 +187,7 @@ def test_decode_topk_register_buckets(S):
     assert torch.equal(sel, torch.sort(sel).values), f"not ascending: {sel}"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_decode_topk_rejects_over_cap():
     """Above the largest bucket both the wrapper and the kernel must raise.
 
@@ -202,6 +208,7 @@ def test_decode_topk_rejects_over_cap():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_decode_topk_out_param():
     block_size = 128
     H, B, S, topk = 1, 4, 1024, 16

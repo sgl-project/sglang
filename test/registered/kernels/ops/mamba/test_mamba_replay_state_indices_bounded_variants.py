@@ -44,6 +44,7 @@ class TestMambaReplayStateIndices(CustomTestCase):
         torch.testing.assert_close(out, expected)
         torch.testing.assert_close(req, expected_req)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_matches_reference_and_compiles_once_up_to_floor(self):
         sizes = [1, 2, 3, 5, 8, 13, 16, 17, 31, 32, 33, 48, 63, 64]
         for v2p in (False, True):
@@ -59,6 +60,7 @@ class TestMambaReplayStateIndices(CustomTestCase):
         # The batch size no longer specializes up to the 64-row floor (it was value-specialized before).
         self.assertEqual(after, before)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_matches_reference_above_floor(self):
         for total_bs in [65, 100, 128, 129, 200, 256, 300]:
             self._check(total_bs, total_bs - 3, False)

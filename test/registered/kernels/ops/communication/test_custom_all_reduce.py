@@ -251,6 +251,7 @@ def _init_hier_ring_once(buffer_size: int) -> HierRingSimpleAllReduce | None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
 @pytest.mark.parametrize("algo", TEST_ALGOS)
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
@@ -265,6 +266,7 @@ def test_custom_all_reduce(
     _check_custom_all_reduce(size, dtype, algo, use_graph, _init_comm_once())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
 @pytest.mark.parametrize("nbytes", [32, 288 * 1024])
@@ -280,6 +282,7 @@ def test_two_shot_push_single_block(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
 @pytest.mark.parametrize("size", TEST_SIZES)
@@ -288,6 +291,7 @@ def test_ring_simple(size: int, dtype: torch.dtype, use_graph: bool) -> None:
     _check_ring(size, dtype, use_graph, _init_ring_once(RING_SIMPLE_BUFFER_SIZE))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
 @pytest.mark.parametrize("size", TEST_SIZES)
@@ -304,6 +308,7 @@ def _check_ring(size: int, dtype: torch.dtype, use_graph: bool, ring) -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "buffer_size", [HIER_RING_SIMPLE_BUFFER_SIZE, RING_SMALL_FIFO_BYTES]
 )
@@ -355,6 +360,7 @@ def _init_hier_comm_once() -> CustomAllReduceV2 | None:
     return comm
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
 @pytest.mark.parametrize("nbytes", HIER_TEST_BYTES)
@@ -438,6 +444,7 @@ def _eager_all_reduce(comm: CustomAllReduceV2, x: torch.Tensor) -> torch.Tensor:
     return torch.stack(outs)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
 @pytest.mark.parametrize("size", TEST_SIZES)
 @torch.inference_mode()
@@ -461,6 +468,7 @@ def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_custom_all_reduce_tuned_ring() -> None:
     """Where the tuned table picks ring_simple (or hier_ring_simple), eager calls launch it."""
@@ -483,6 +491,7 @@ def test_custom_all_reduce_tuned_ring() -> None:
     torch.testing.assert_close(expected, _eager_all_reduce(comm, inp), atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_custom_all_reduce_eager_plan_follows_config() -> None:
     """The cached eager launch is rebuilt when the config object is replaced."""

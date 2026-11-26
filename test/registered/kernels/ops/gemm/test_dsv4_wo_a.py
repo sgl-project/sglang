@@ -4,6 +4,10 @@ import sys
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from flashinfer import mxfp8_quantize
 
 from sglang.kernels.ops.gemm.dsv4_wo_a import (
@@ -31,6 +35,7 @@ HIDDEN = 5120
 STREAMS = 4
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_wo_a_partial_quant_matches_quantize():
     torch.manual_seed(0)
     for rows in range(2, 9):

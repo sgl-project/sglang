@@ -256,6 +256,7 @@ def _fused() -> DcpFusedTopK:
     return fused
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("kind", ["real_like", "ties", "zero_nan", "short"])
 @torch.inference_mode()
 def test_dcp_fused_topk(kind: str) -> None:
@@ -266,6 +267,7 @@ def test_dcp_fused_topk(kind: str) -> None:
     _check(case)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_dcp_fused_topk_forced_fallback() -> None:
     """A one-rank window fails the certificate: the exact fallback runs."""
@@ -278,6 +280,7 @@ def test_dcp_fused_topk_forced_fallback() -> None:
     assert bool((fused.fallbacks[: case.rows] > before).all())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("lagging", [False, True])
 @torch.inference_mode()
 def test_dcp_fused_topk_short_call_between_exchanges(lagging: bool) -> None:
@@ -305,6 +308,7 @@ def test_dcp_fused_topk_short_call_between_exchanges(lagging: bool) -> None:
         _check(case)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_dcp_fused_topk_graph() -> None:
     """Graph replays on three alternating inputs, across both buffer parities."""

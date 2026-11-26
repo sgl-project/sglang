@@ -43,6 +43,7 @@ def check(x, weight, freq, pos, loc, cache, eps=1e-6):
     assert torch.equal(x, original)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("n", [0, 1, 5, 6, 63, 64, 65, 315, 378, 384, 1024, 16384])
 @pytest.mark.parametrize(
     "strided,index_dtype", [(False, torch.int64), (True, torch.int32)]
@@ -51,11 +52,13 @@ def test_parity(n, strided, index_dtype):
     check(*inputs(n, strided=strided, index_dtype=index_dtype))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_other_input_dtypes(dtype):
     check(*inputs(65, dtype=dtype, strided=True))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_zero_and_negative_slots():
     x, weight, freq, pos, loc, cache = inputs(65)
     x.zero_()
@@ -63,12 +66,14 @@ def test_zero_and_negative_slots():
     check(x, weight, freq, pos, loc, cache)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_fp8_overflow():
     x, weight, freq, pos, loc, cache = inputs(65)
     weight.mul_(400)
     check(x, weight, freq, pos, loc, cache)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_graph_replay_updates():
     x, weight, freq, pos, loc, cache = inputs(65, strided=True, index_dtype=torch.int32)
     fused_k_norm_rope_uniform_fp8(x, weight, 1e-6, freq, pos, loc, cache)
@@ -88,6 +93,7 @@ def test_graph_replay_updates():
         assert torch.equal(cache.view(torch.uint8), expected.view(torch.uint8))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_large_cache_offset():
     x, weight, freq, pos, _, _ = inputs(2)
     # Sparse writes cross the signed 32-bit byte-offset boundary.

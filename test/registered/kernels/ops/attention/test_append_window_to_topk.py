@@ -44,6 +44,7 @@ def _reference(topk_slots, seq_lens, page_table, page_rows, window, alignment):
     return out, lengths
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("use_page_rows", [False, True])
 @pytest.mark.parametrize("seq_lens", [[1, 5, 128, 129, 700, 3000], [2200, 4096]])
 def test_append_window_to_topk(seq_lens, use_page_rows):
@@ -80,6 +81,7 @@ def test_append_window_to_topk(seq_lens, use_page_rows):
     assert (lengths.cpu()[live:] == 0).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_append_window_to_topk_ragged():
     torch.manual_seed(0)
     topk, window, alignment = 2048, 128, 128

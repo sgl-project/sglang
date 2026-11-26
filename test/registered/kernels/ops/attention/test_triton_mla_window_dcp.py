@@ -184,6 +184,7 @@ def _assert_matches(out, lse, ref_out, ref_lse):
     torch.testing.assert_close(lse, ref_lse, rtol=0, atol=2e-3)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_ring_rows_read_as_the_request_window():
     req_to_token, pool_idx, positions, keys, q = _inputs(CONTEXTS)
     ring = DFlashDraftKVRing(

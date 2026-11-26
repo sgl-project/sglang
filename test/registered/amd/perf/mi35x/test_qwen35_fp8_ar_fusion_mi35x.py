@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -125,6 +126,7 @@ def _parse_gsm8k_metrics(stdout: str) -> Dict[str, float]:
     return metrics
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
     """Validate Qwen3.5-FP8 AR-fusion accuracy and throughput on MI35x."""
 

@@ -62,6 +62,7 @@ def awq_dequantize_torch(
     return (iweights - zeros) * scales
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "qweight_row,qweight_col,is_bf16_act",
     list(

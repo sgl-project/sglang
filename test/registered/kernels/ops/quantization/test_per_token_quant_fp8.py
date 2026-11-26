@@ -2,6 +2,10 @@ import sys
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from sgl_kernel import sgl_per_token_quant_fp8 as aot_per_token_quant_fp8
 
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant

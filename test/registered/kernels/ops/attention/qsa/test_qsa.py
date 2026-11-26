@@ -544,6 +544,7 @@ def test_qsa_mtp_cuda_graph_padding_stays_below_compression_boundary():
     ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_qsa_indexer_ignores_dp_attention_token_padding():
     calls = {}
 
@@ -1181,6 +1182,7 @@ def test_qsa_extend_rows_take_the_host_lens_without_a_sync():
     assert torch.equal(short, want)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_qsa_mtp_extend_capture_seeds_last_rows_without_a_sync():
     from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
         QSAMTPSharedSparseIndices,
@@ -1428,6 +1430,7 @@ def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
     assert torch.equal(backend._step_out_cache_loc(fb, 0), flat)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("max_pages", [32, 129, 2048, 8193])
 def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
     """For decode rows and target-verify fan-out (boundary and non-boundary),
@@ -1596,6 +1599,7 @@ def _qsa_expected_graph_layout(
     return row_lens, row_prefix, row_reqs
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("seq_offset", [0, 1, 3])
 def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
     """The layout kernel must rebuild speculative row fan-out and the padded dummy tail;
@@ -1744,6 +1748,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bs", [1, 3, 128])
 @pytest.mark.parametrize("padding", [0, 1])
 def test_qsa_draft_metadata_multi_step_graph(bs, padding):

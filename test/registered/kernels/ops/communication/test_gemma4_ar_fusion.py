@@ -157,6 +157,7 @@ def _scales_view(scales_buf, rows: int, layout: str) -> torch.Tensor:
     return fusion_glue.scales_view(scales_buf.tensor, scales_buf.tensor.shape[1], rows)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", HIDDENS)
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("round_a", [True, False])
@@ -214,6 +215,7 @@ def test_site(hidden: int, rows: int, round_a: bool, layout: str):
             assert torch.equal(other, t), f"{name} differs on rank {i}"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", HIDDENS[:1])
 @pytest.mark.parametrize("rows", ROWS)
 def test_final(hidden: int, rows: int):

@@ -1,5 +1,12 @@
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_MM_CUSTOM_GEN,
     BENCHMARK_TOOL_DEFAULT,

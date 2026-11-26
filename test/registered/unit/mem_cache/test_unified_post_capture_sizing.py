@@ -28,6 +28,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import msgspec
 import torch
 

@@ -33,6 +33,7 @@ def inputs(batch, rank, dim=512):
     return output, lse
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dim", [128, 512])
 def test_peer_exchange_bits_and_replay(dim):
     fixture._init_world()
@@ -78,6 +79,7 @@ def test_peer_exchange_bits_and_replay(dim):
         torch.testing.assert_close(combined, expected, rtol=0, atol=0, equal_nan=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dim", [128, 512])
 def test_flashinfer_dispatch_and_fallback(dim):
     fixture._init_world()
@@ -138,6 +140,7 @@ def test_flashinfer_dispatch_and_fallback(dim):
         comm._FI_A2A_STATE["direct"] = direct
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_request_ordered_byte_gather():
     from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import dcp_gather_request_rows
 
@@ -180,6 +183,7 @@ def test_request_ordered_byte_gather():
             assert torch.equal(actual, full)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_candidate_merge_scratch_and_graph_replay():
     from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
     from sglang.srt.layers.attention.dsa import dsa_dcp_sharded as dsa_dcp
@@ -236,6 +240,7 @@ def test_candidate_merge_scratch_and_graph_replay():
                 assert workspace.merge_buffer.data_ptr() == scratch_ptr
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_token_packing_after_dcp_gather():
     fixture._init_world()
     group = ps._WORLD

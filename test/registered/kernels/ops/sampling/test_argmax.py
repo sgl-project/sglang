@@ -25,6 +25,7 @@ def _check(logits: torch.Tensor, **kwargs) -> None:
     torch.testing.assert_close(got.cpu().to(torch.int32), _reference(logits))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("batch_size,vocab_size", [(1, 262144), (17, 32000)])
 def test_argmax_index_dtype(index_dtype, batch_size, vocab_size) -> None:
@@ -36,6 +37,7 @@ def test_argmax_index_dtype(index_dtype, batch_size, vocab_size) -> None:
     torch.testing.assert_close(out.cpu().to(torch.int32), _reference(logits))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch_size", [1, 3, 32, 257])
 @pytest.mark.parametrize("vocab_size", [32, 1024, 32000, 128256])
@@ -43,6 +45,7 @@ def test_argmax_correctness(dtype, batch_size, vocab_size) -> None:
     _check(torch.randn(batch_size, vocab_size, dtype=dtype, device="cuda"))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch_size,vocab_size", [(1, 262144), (2, 262144)])
 def test_argmax_multi_split(dtype, batch_size, vocab_size) -> None:
@@ -50,6 +53,7 @@ def test_argmax_multi_split(dtype, batch_size, vocab_size) -> None:
     _check(torch.randn(batch_size, vocab_size, dtype=dtype, device="cuda"))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("vocab_size,padded", [(1024, 2048), (128256, 151936)])
 def test_argmax_padded_rows(dtype, vocab_size, padded) -> None:
@@ -62,6 +66,7 @@ def test_argmax_padded_rows(dtype, vocab_size, padded) -> None:
     _check(full[:, :vocab_size])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_argmax_ties_take_lowest_index(dtype) -> None:
     logits = torch.zeros(4, 4096, dtype=dtype, device="cuda")
@@ -70,6 +75,7 @@ def test_argmax_ties_take_lowest_index(dtype) -> None:
     assert torch.all(got == 100)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_argmax_signed_zero_ties_across_splits(dtype) -> None:
     # -0.0 and +0.0 tie; the row is long enough to be split across CTAs.
@@ -79,6 +85,7 @@ def test_argmax_signed_zero_ties_across_splits(dtype) -> None:
     _check(logits)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_argmax_misaligned_view_falls_back() -> None:
     # Row stride and vocab size are vector multiples, but the base address is not.
     logits = torch.randn(2, 1032, device="cuda")[:, 1:1025]
@@ -87,12 +94,14 @@ def test_argmax_misaligned_view_falls_back() -> None:
     torch.testing.assert_close(got.cpu().to(torch.int32), _reference(logits))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_argmax_all_equal(dtype) -> None:
     got = argmax(torch.full((8, 8192), -2.5, dtype=dtype, device="cuda"))
     assert torch.all(got == 0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_argmax_masked_rows(dtype) -> None:
     """Grammar masking drives whole rows to -inf; the one live token must win."""
@@ -102,18 +111,21 @@ def test_argmax_masked_rows(dtype) -> None:
     torch.testing.assert_close(argmax(logits).cpu(), live.to(torch.int32).cpu())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_argmax_all_neg_inf(dtype) -> None:
     got = argmax(torch.full((4, 4096), float("-inf"), dtype=dtype, device="cuda"))
     assert torch.all(got == 0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_argmax_repeated_calls_reuse_workspace() -> None:
     """The finalize kernel must hand each slot back zeroed, or call N+1 sees stale maxima."""
     for _ in range(8):
         _check(torch.randn(2, 262144, dtype=torch.bfloat16, device="cuda"))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_argmax_out_param() -> None:
     logits = torch.randn(64, 32000, dtype=torch.bfloat16, device="cuda")
     out = torch.empty(64, dtype=torch.int32, device="cuda")
@@ -121,6 +133,7 @@ def test_argmax_out_param() -> None:
     torch.testing.assert_close(out.cpu(), _reference(logits))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_argmax_explicit_workspace() -> None:
     logits = torch.randn(2, 262144, dtype=torch.bfloat16, device="cuda")
     # Zeroed int64 slots, one per row; the kernel hands every slot back zeroed.

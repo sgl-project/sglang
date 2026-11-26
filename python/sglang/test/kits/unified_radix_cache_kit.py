@@ -1,8 +1,10 @@
 import random
+import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import requests
+import torch
 
 from sglang.test.kl_multiturn_utils import (
     test_input_output_logprobs_match_decode_cache_hit_helper,
@@ -17,6 +19,7 @@ def _random_suffixes(n, length, seed):
     return [[rng.randint(1, 30000) for _ in range(length)] for _ in range(n)]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class UnifiedRadixTreeTestMixin:
     """Mixin: gsm8k and multi-turn KL tests with multi-branch interleaving."""
 

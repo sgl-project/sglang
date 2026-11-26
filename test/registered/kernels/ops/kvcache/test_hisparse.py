@@ -3,6 +3,10 @@ import sys
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.utils import (
     get_device,
     get_device_module,

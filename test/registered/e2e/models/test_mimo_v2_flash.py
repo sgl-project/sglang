@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.srt.utils import is_blackwell
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
@@ -9,6 +11,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 register_cuda_ci(est_time=258, stage="weekly", runner_config="8-gpu-h200")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.75
     model = "XiaomiMiMo/MiMo-V2-Flash"

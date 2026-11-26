@@ -18,6 +18,7 @@ register_cuda_ci(est_time=3, stage="base-b-kernel-unit", runner_config="4-gpu-b2
 ROWS, HIDDEN = 333, 5376  # rows and scale columns both need padding
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_quantize_swizzled_is_byte_exact() -> None:
     g = torch.Generator(device="cuda").manual_seed(1)
     x = (torch.randn((ROWS, HIDDEN), device="cuda", generator=g) * 3).to(torch.bfloat16)
@@ -26,6 +27,7 @@ def test_quantize_swizzled_is_byte_exact() -> None:
     assert_matches_flashinfer_mxfp8(mxfp8_quantize_swizzled(x), x)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_predicates_reject_unsupported_input() -> None:
     assert not can_use_mxfp8_swizzled(
         torch.randn(4, 64, device="cuda", dtype=torch.float16)

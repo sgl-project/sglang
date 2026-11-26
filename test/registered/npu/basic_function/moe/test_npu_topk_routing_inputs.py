@@ -3,7 +3,12 @@
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata

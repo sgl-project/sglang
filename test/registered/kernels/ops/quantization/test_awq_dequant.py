@@ -10,7 +10,12 @@ Run with:
 
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.kernels.ops.quantization.awq_triton import (
     AWQ_TRITON_SUPPORTED_GROUP_SIZES,
@@ -64,6 +69,7 @@ def awq_dequantize_torch(
 
 
 class TestAWQTriton(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_dequantize(self):
         rows_list = [3584, 18944, 128, 256, 512, 1024]
         cols_list = [448, 576, 4736, 16, 32, 64, 128]

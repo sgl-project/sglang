@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -33,6 +34,7 @@ SPEC_SHAPES = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPPSpecConsistency(CustomTestCase):
     """PP x speculative decoding must match plain speculative decoding.
 
@@ -127,6 +129,7 @@ class TestPPSpecConsistency(CustomTestCase):
         self._assert_matches("tree")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPPSpecHybridConsistency(TestPPSpecConsistency):
     """Hybrid GDN target with its own MTP head: every non-last stage must commit
     the accepted recurrent state, or accuracy drops while acceptance looks normal."""

@@ -82,6 +82,7 @@ def _get_block_table_reference(
     return torch.where(valid, gathered * head_group + heads, 0).flatten(2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_get_block_table_supports_tp_local_head_group():
     inputs = _make_valid_inputs(64, 64, 96, head_group=1)
     expected = _get_block_table_reference(*inputs)
@@ -113,6 +114,7 @@ def _golden_check_blockwise(out_block_table, block_table, token_num):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("topk", [96, 128])
 def test_get_block_table_blockwise_golden(topk):
     token_num, seqlen_q_max = 8192, 8192
@@ -122,6 +124,7 @@ def test_get_block_table_blockwise_golden(topk):
     _golden_check_blockwise(out, inputs[1], token_num)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("topk", [96, 128])
 def test_get_block_table_strategies_match_reference(topk):
     """Both expansion strategies match the Torch reference, including -1."""
@@ -132,6 +135,7 @@ def test_get_block_table_strategies_match_reference(topk):
     assert torch.equal(expected, get_block_table(*inputs, elementwise=True))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(("topk", "block_size"), [(10, 32), (7, 128)])
 def test_get_block_table_supports_configured_layout(topk, block_size):
     token_num = seqlen_q_max = 256

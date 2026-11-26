@@ -68,6 +68,7 @@ DTYPE = torch.bfloat16
 # so we allow a small rel/abs tolerance in correctness test.
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(is_hip(), reason="The AOT reference requires CUDA")
 @pytest.mark.parametrize(
     "batch_size,n_k,n_q,head_dim",
@@ -86,6 +87,7 @@ def test_qknorm(batch_size: int, n_k: int, n_q: int, head_dim: int) -> None:
     triton.testing.assert_close(q_k_aot[1], q_k_jit[1], atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "dtype,pad", [(torch.bfloat16, 0), (torch.float16, 0), (torch.bfloat16, 4)]
 )
@@ -112,6 +114,7 @@ def test_two_rows_per_warp_match_one_row_per_warp(dtype: torch.dtype, pad: int) 
     assert torch.equal(outputs[0], outputs[1])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("head_dim", [128, 512])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_qknorm_packed_qkv(head_dim: int, dtype: torch.dtype) -> None:
@@ -142,6 +145,7 @@ def test_qknorm_packed_qkv(head_dim: int, dtype: torch.dtype) -> None:
     torch.testing.assert_close(v, v_ref, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_apply_qk_norm_empty_batch() -> None:
     """An idle DP-attention rank passes zero tokens, which cannot be viewed per head."""
     from sglang.srt.layers.layernorm import RMSNorm

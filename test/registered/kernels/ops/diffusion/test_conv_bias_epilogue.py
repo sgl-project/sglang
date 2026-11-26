@@ -32,6 +32,7 @@ def _bias_view(bias, ndim):
     return bias.view(1, -1, *([1] * (ndim - 2)))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.no_grad()
 @pytest.mark.parametrize(
     "x_dtype,bias_dtype",
@@ -64,6 +65,7 @@ def test_conv_bias_epilogue_matches_aten(x_dtype, bias_dtype, shape):
     assert torch.equal(out_res, ref_res)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.no_grad()
 def test_conv_bias_epilogue_equals_conv_with_bias():
     # End-to-end oracle: F.conv3d with bias vs conv without bias + epilogue.
@@ -76,6 +78,7 @@ def test_conv_bias_epilogue_equals_conv_with_bias():
     assert torch.equal(conv_bias_epilogue(raw, conv.bias), ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.no_grad()
 def test_conv_bias_epilogue_rejects_unsupported_inputs():
     x = _dense((1, 96, 2, 6, 6), torch.bfloat16)

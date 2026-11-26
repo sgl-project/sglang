@@ -37,6 +37,7 @@ def _unit_scales(m: int, n: int, k: int):
 
 
 class TestBlockMatmulLargeM(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_fp8_rows_of_a_past_2_pow_31(self):
         n, k = 16, WIDE
         a = _fp8_full(M, k, FP8_2_POW_NEG6)
@@ -48,6 +49,7 @@ class TestBlockMatmulLargeM(CustomTestCase):
         # 2^16 products of 2^-6 * 1.0
         self.assertTrue((out[-1] == 1024.0).all().item())
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_fp8_rows_of_c_past_2_pow_31(self):
         n, k = WIDE, 128
         a = _fp8_full(M, k, FP8_ONE)
@@ -58,6 +60,7 @@ class TestBlockMatmulLargeM(CustomTestCase):
         )
         self.assertTrue((out[-1] == 128.0).all().item())
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_int8_linear_rows_of_a_past_2_pow_31(self):
         # Serving path: per-token-group activation quantization, then the matmul
         n, k = 16, WIDE

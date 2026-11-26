@@ -18,6 +18,13 @@ import os
 import random
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import numpy as np
 import requests
 import torch
@@ -365,6 +372,7 @@ def test_load_weights_from_remote_instance(
     torch.npu.empty_cache()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoadWeightsFromRemoteInstance(CustomTestCase):
     def test_load_weights_from_remote_instance(self):
 

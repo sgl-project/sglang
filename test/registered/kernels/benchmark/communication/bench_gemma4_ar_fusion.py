@@ -17,8 +17,13 @@ from __future__ import annotations
 import atexit
 import os
 
+import pytest
 import torch
 import torch.distributed as dist
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from sgl_kernel import rmsnorm
 from torch._C._distributed_c10d import _SymmetricMemory
 

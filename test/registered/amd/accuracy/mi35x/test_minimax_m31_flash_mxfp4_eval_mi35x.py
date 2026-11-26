@@ -15,6 +15,13 @@ Registry: nightly-test-4-gpu-amd-mi35x-minimax-m31-flash-mxfp4 suite
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase

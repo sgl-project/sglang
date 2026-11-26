@@ -63,6 +63,7 @@ def _reference(req_to_token, pool_idx, positions, q_len, window_left, dcp, rank,
     return rows
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dcp", [1, 8])
 @pytest.mark.parametrize("window_left", [4095, 127])
 @pytest.mark.parametrize("with_v2p", [False, True])
@@ -103,6 +104,7 @@ def test_window_indices(dcp, window_left, with_v2p):
         assert len(union[r]) == min(p, window_left) + 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dcp", [1, 8])
 def test_ring_window_reads_the_rows_the_ring_writes(dcp):
     window_left, q_len, req_to_token_rows = 1023, 8, 9

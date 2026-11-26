@@ -19,6 +19,13 @@ import unittest
 import uuid
 from contextlib import contextmanager
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import requests
 from test_hicache_storage_mooncake_unified import l3_loaded_tokens, run_gsm8k
 

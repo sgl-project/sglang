@@ -17,6 +17,8 @@ import os
 import unittest
 from typing import List
 
+import torch
+
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     BACKENDS,
@@ -29,6 +31,7 @@ from sglang.test.lora_utils import (
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRABackend(CustomTestCase):
     def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
         for model_case in model_cases:

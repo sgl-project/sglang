@@ -15,6 +15,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 
 class TestImagePatchify(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_normalize_and_patchify(self):
         torch.manual_seed(5)
         image = torch.randn(2, 3, 17, 19, device="cuda")

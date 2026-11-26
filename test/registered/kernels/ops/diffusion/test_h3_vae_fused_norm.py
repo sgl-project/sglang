@@ -12,6 +12,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_rmsnorm_matches_pytorch_fp32_accumulation():
     rows, dim = 128, 2048
@@ -27,6 +28,7 @@ def test_rmsnorm_matches_pytorch_fp32_accumulation():
     torch.testing.assert_close(actual_half, expected_half, rtol=1e-3, atol=1e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_scale_add_residual_matches_eager_product():
     rows, dim = 64, 256

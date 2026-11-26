@@ -11,6 +11,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=12, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "shape", [(3, 128), (7, 2048), (3, 130), (2, 1), (0, 128), (3, 0)]
 )
@@ -31,6 +32,7 @@ def test_group_boundaries_and_alignment(shape, offset):
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_fp32_multiply_before_bf16_rounding():
     """Early BF16 scale rounding or flushing FP32 subnormals changes output bits."""
     weight = torch.arange(-128, 128, device="cuda", dtype=torch.int16).to(torch.int8)
@@ -49,6 +51,7 @@ def test_fp32_multiply_before_bf16_rounding():
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_compile_and_cuda_graph():
     """The allocating facade must retain its output and current-stream dependency."""
     weight = torch.full((2, 256), 127, dtype=torch.int8, device="cuda")

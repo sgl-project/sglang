@@ -12,6 +12,7 @@ register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-sm
 
 
 class TestAdd3(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_add3_bit_exact(self):
         torch.manual_seed(0)
         tensors = [

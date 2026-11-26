@@ -120,6 +120,7 @@ def _run_per_row(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_three_slot_chain_matches_host_golden() -> None:
     out_kernel, out_ref = _run_per_row(
         canary_buf=_stamped_buf(),
@@ -132,6 +133,7 @@ def test_three_slot_chain_matches_host_golden() -> None:
     assert out_ref.tolist() == expected
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_kernel_output_is_accepted_by_checker() -> None:
     params = SamplingParams(
         temperature=0.7, top_p=0.9, top_k=50, min_p=0.05, sampling_seed=1234
@@ -146,6 +148,7 @@ def test_kernel_output_is_accepted_by_checker() -> None:
     assert checker.advance(_TOKEN, int(out_kernel[0, 0].item())) is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_intermediate_slot_gives_prefix_of_that_length() -> None:
     out_kernel, out_ref = _run_per_row(
         canary_buf=_stamped_buf(),
@@ -160,6 +163,7 @@ def test_intermediate_slot_gives_prefix_of_that_length() -> None:
     assert out_ref.tolist() == expected
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_negative_last_slot_outputs_zero() -> None:
     out_kernel, out_ref = _run_per_row(
         canary_buf=_stamped_buf(),
@@ -171,6 +175,7 @@ def test_negative_last_slot_outputs_zero() -> None:
     assert out_ref.tolist() == expected
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_each_sampler_value_changes_output() -> None:
     num_variants = 5
     sampler = _sampler_tensors(num_variants)
@@ -189,6 +194,7 @@ def test_each_sampler_value_changes_output() -> None:
     assert len(set(values)) == len(values)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_token_and_prefix_change_output() -> None:
     buf = _stamped_buf()
     out_kernel, _ = _run_per_row(
@@ -208,6 +214,7 @@ def test_token_and_prefix_change_output() -> None:
     assert tampered[0, 0].item() != out_kernel[0, 0].item()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_empty_batch_is_noop() -> None:
     out_kernel, out_ref = _run_per_row(
         canary_buf=_stamped_buf(),
@@ -218,6 +225,7 @@ def test_empty_batch_is_noop() -> None:
     assert out_ref.numel() == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_linear_accept_lengths_mask_padding() -> None:
     """Keep accepted prefixes and zero all rejected or invalid slots."""
     buf = _stamped_buf()

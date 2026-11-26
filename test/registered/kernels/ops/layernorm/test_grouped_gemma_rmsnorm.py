@@ -32,6 +32,7 @@ _TOLERANCES = {
 }
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_empty_dp_rank():
     x = torch.empty(0, 10240, device="cuda", dtype=torch.bfloat16)
     weight = torch.ones(10240, device=x.device, dtype=x.dtype)
@@ -40,6 +41,7 @@ def test_empty_dp_rank():
     assert out.shape == x.shape and out.dtype == x.dtype
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "num_tokens,hidden_size,group_size",
@@ -68,6 +70,7 @@ def test_grouped_gemma_rmsnorm_correctness(
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_grouped_gemma_rmsnorm_out_param():
     x = torch.randn(64, 10240, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(10240, dtype=torch.bfloat16, device="cuda") * 0.2

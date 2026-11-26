@@ -14,6 +14,7 @@ from typing import NamedTuple
 from unittest.mock import patch
 
 import requests
+import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import kill_process_tree
@@ -119,6 +120,7 @@ class TestUnoLoraPathResolution(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnoCudaGraph(CustomTestCase):
     @classmethod
     def setUpClass(cls):

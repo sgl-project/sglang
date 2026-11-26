@@ -75,6 +75,7 @@ def _backend(wrappers, kv_cache, *, use_ragged=False):
 
 
 class TestFlashInferWindowForward(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_forward_preserves_the_planned_window(self):
         """A mask-owned window must not become a row-indexed kernel window
         when the backend forwards a paged tree or a ragged prefix."""

@@ -2,7 +2,12 @@
 
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 import torch_mlu  # noqa: F401 -- registers the MLU device backend
 
 from sglang.test.ci.ci_register import register_mlu_ci

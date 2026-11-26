@@ -9,6 +9,10 @@ import unittest
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from einops import rearrange, repeat
 
 from sglang.kernels.ops.attention.flash_attention import (
@@ -44,7 +48,10 @@ register_cuda_ci(est_time=420, stage="base-b-kernel-unit", runner_config="1-gpu-
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 # Existing tests below target SM100+; the SM90 regression class has its own guard.
-skip_condition = torch.cuda.get_device_capability() < (10, 0)
+skip_condition = not torch.cuda.is_available() or torch.cuda.get_device_capability() < (
+    10,
+    0,
+)
 
 
 def test_shear_bias_workspace_is_stream_local_and_clearable():

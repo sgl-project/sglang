@@ -27,6 +27,7 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 
 class TestDSAMetadataReplay(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_fusion_matches_ordinary_metadata(self):
         for mode in (
             ForwardMode.DECODE,
@@ -72,6 +73,7 @@ class TestDSAMetadataReplay(CustomTestCase):
                             atol=0,
                         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_precomputed_verify_retains_live_tail(self):
         mode = ForwardMode.TARGET_VERIFY
         seq, req = inputs(*ROUNDS[0])
@@ -93,6 +95,7 @@ class TestDSAMetadataReplay(CustomTestCase):
             )
             self.assertEqual(pointers, addresses(fused.forward_metadata))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_precomputed_and_sibling_copy_refresh_derived_metadata(self):
         mode = ForwardMode.DECODE
         seq, req = inputs(*ROUNDS[0])

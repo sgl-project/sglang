@@ -3,6 +3,10 @@ import sys
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # CUDA and ROCm both build this kernel through the JIT launcher; MUSA still

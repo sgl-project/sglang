@@ -4,7 +4,12 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa_backend import (

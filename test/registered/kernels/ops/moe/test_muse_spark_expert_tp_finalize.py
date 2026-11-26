@@ -38,6 +38,7 @@ def _permute(rows, topk_ids):
     return permuted, idx
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 9, 72, 300])
 @pytest.mark.parametrize("weight_first", [True, False])
 def test_expert_tp_finalize_fallback_matches_unsharded(num_tokens, weight_first):

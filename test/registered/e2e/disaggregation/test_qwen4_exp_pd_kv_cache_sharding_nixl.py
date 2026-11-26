@@ -7,6 +7,13 @@ also sends the GDN/QSA/PLE state and the aux, then all report completion.
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import test_qwen4_exp_pd_kv_cache_sharding as mooncake_case
 
 from sglang.test.ci.ci_register import register_cuda_ci

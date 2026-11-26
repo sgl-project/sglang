@@ -30,6 +30,7 @@ def _split(x):
     return q, latent[..., :KV_LORA]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("m", [0, 1, 4, 8192])
 def test_strided_slices_match_torch(m):
     """Rows are addressed through the input row stride and written densely."""
@@ -47,6 +48,7 @@ def test_strided_slices_match_torch(m):
     torch.testing.assert_close(out_k, ref_k, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_3d_and_column_strided_inputs():
     """Inputs the kernel cannot read in place are flattened or copied first."""
     x, q_w, k_w = _fused_qkv_a(48, torch.bfloat16)

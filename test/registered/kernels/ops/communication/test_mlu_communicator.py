@@ -5,9 +5,14 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 import torch_mlu  # noqa: F401
 
 from sglang.test.ci.ci_register import register_mlu_ci

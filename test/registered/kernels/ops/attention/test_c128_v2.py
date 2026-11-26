@@ -61,6 +61,7 @@ def _make_inputs(
 # -----------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("seq_len", [128, 256, 512])
 def test_prefill_no_context(mode: str, seq_len: int) -> None:
@@ -91,6 +92,7 @@ def test_prefill_no_context(mode: str, seq_len: int) -> None:
         triton.testing.assert_close(out[plan_id].cpu(), gt, atol=ATOL, rtol=RTOL)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("prefix_len", [0, 128, 256])
 def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
@@ -139,6 +141,7 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
     triton.testing.assert_close(final_out[0].cpu(), gt, atol=ATOL, rtol=RTOL)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("prefix_len", [128, 120, 256])
 @pytest.mark.parametrize("extend_len", [128, 256])
@@ -191,6 +194,7 @@ def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> Non
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 def test_prefill_multibatch(mode: str) -> None:
     """Multi-batch prefill, each batch ending at a different chunk count."""

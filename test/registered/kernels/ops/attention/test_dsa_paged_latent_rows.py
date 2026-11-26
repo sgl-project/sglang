@@ -135,11 +135,13 @@ class TestPagedWrites(CustomTestCase):
         rest_view[ids // PAGE, ids % PAGE, 0] = 0
         self.assertEqual(int(rest.count_nonzero()), 0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_jit_writer(self):
         self._check_paged_write(
             lambda buf, ids, nope, rope: set_mla_kv_buffer_triton(buf, ids, nope, rope)
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_triton_writer(self):
         with patch(
             "sglang.kernels.ops.kvcache.mla_buffer.is_arch_support_pdl",
@@ -151,6 +153,7 @@ class TestPagedWrites(CustomTestCase):
                 )
             )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_norope_writer(self):
         """NoPE-only rows (no RoPE tail) through the paged addressing."""
         pages, row, page_stride = PAGES, 512, 3 * PAGE * 512
@@ -179,6 +182,7 @@ class TestPagedGathers(CustomTestCase):
         set_mla_kv_buffer_triton(self.flat, ids, nope, rope)
         self.gather = ids[torch.randperm(300, device="cuda")[:200]].to(torch.int32)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_dequant(self):
         actual = dequantize_k_cache_paged_dsa(
             self.paged.view(torch.float8_e4m3fn), self.gather
@@ -189,6 +193,7 @@ class TestPagedGathers(CustomTestCase):
         self.assertTrue(torch.isfinite(expected).all())
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_dequant_requant(self):
         actual = gather_dequant_requant_fp8_paged_dsa(
             self.paged.view(torch.float8_e4m3fn), self.gather, extra_rows=16
