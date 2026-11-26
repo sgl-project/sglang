@@ -48,7 +48,23 @@ def dsa_token_shard_enabled() -> bool:
     ``is_npu()``: ``deepseek_v2.py`` is shared by every backend, and a true
     answer builds an extra full-head ``RadixAttention`` only NPU ever uses.
     """
-    return is_npu() and get_parallel().attn_tp_size > 1
+    # Disabled by policy for this deployment.
+    #
+    # Every supported extend batch takes the shard with no runtime flag, and on
+    # Ascend950DT (A5) + CANN 9.2.0 every sharded prefill kills the device:
+    #   fault kernel_name=KvQuantSparseFlashAttention_<hash>_33926
+    #   errorStr: timeout or trap error, subErrType 0x4
+    #   core0 at +0x21b4 / other cores at +0x260c (the exit BAR.ALL)
+    # Reproduced on sglang main, with the megakernel off, with fp8 and bf16 KV,
+    # and with an unpadded batch (128 tokens = 8*16), so it is the token shard
+    # itself rather than the KV dtype, padding or the megakernel.
+    # PR #42978 only reports A3 validation.
+    #
+    # Danger: this function is also consulted at model build, so turning it off
+    # removes the full-head RadixAttention.  get_dsa_token_shard_plan() therefore
+    # returns None without building a plan -- otherwise the layer refuses a plan
+    # it was never built for.
+    return False
 
 
 # Distinguishes "no plan cached yet" from "cached, and it is None".
@@ -63,6 +79,11 @@ def get_dsa_token_shard_plan(
     Extend only: decode is already fast under graph capture. Every refusal is
     logged once, because a silent refusal looks the same as the feature running.
     """
+    if not dsa_token_shard_enabled():
+        # The layer was built without the full-head attention; a plan here would
+        # be refused by the attention core.
+        forward_batch.npu_dsa_token_shard_plan = None
+        return None
     cached = getattr(forward_batch, "npu_dsa_token_shard_plan", _MISSING)
     if cached is not _MISSING:
         return cached
