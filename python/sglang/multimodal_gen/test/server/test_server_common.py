@@ -77,6 +77,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     gt_exists,
     image_bytes_to_numpy,
+    is_in_ci,
     load_action_consistency_gt,
     load_audio_consistency_gt,
     load_consistency_gt,
@@ -160,8 +161,12 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
-    extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-    extra_args = f"--model-type diffusion {extra_args}".strip()
+    extra_args = "--model-type diffusion"
+    if is_in_ci():
+        # Capture the seed for reproducibility without emitting prompt text.
+        extra_args += " --log-requests --log-requests-level 1"
+    if overrides := os.environ.get("SGLANG_TEST_SERVE_ARGS"):
+        extra_args += f" {overrides}"
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
