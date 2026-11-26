@@ -208,12 +208,26 @@ def _get_quantization_config(
         if quant_config is None:
             return None
         if _is_npu and model_config.quantization == "modelslim":
+            from sglang.srt.mem_cache.kv_cache_dtype import draft_reads_packed_dsa_kv
+
             draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
             requested_dtype = (
                 draft_kv_cache_dtype
                 if model_config.is_draft_model and draft_kv_cache_dtype is not None
                 else get_model().kv_cache_dtype
             )
+            if (
+                model_config.is_draft_model
+                and requested_dtype == "int8"
+                and not draft_reads_packed_dsa_kv(
+                    draft_model_config=model_config,
+                    draft_attention_backend=(
+                        get_spec().speculative_draft_attention_backend
+                    ),
+                )
+            ):
+                # The draft keeps its compute dtype (configure_kv_cache_dtype).
+                requested_dtype = "auto"
             quant_config.configure_kv_cache_quantization(requested_dtype)
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 

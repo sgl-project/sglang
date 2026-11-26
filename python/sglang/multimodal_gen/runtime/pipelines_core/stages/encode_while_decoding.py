@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -133,7 +133,7 @@ class EncodeWhileDecoding:
         except Exception:
             self._fail()
             return None
-        logger.info(f"Output saved to {CYAN}{self.save_file_path}{RESET}")
+        logger.info("Output saved")
         return [self.save_file_path]
 
     def abort(self) -> None:

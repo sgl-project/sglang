@@ -92,6 +92,7 @@ def _storage(
             state_slots=0,
             max_running_requests=4,
             context_len=_CONTEXT,
+            req_to_token_row_width=_CONTEXT,
             alignment=1,
         ),
     )
@@ -102,7 +103,6 @@ def _storage(
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=4,
-        model_context_len=_CONTEXT,
         lazy_compaction=True,
     )
     return build_kv_storage(plan, sized, ctx)
