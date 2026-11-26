@@ -38,7 +38,9 @@ class ShortestPrefillWaitGuard:
             )
         # The wall clock belongs to the sole scheduler of each attention DP queue.
         # Replicated scheduling would require a shared decision at the thresholds.
-        if not (parallel.attn_tp_size == parallel.attn_cp_size == parallel.pp_size == 1):
+        if not (
+            parallel.attn_tp_size == parallel.attn_cp_size == parallel.pp_size == 1
+        ):
             raise ValueError(
                 "The SPF wait guard requires attention TP=1, attention CP=1 and PP=1"
             )
