@@ -8,8 +8,7 @@ Each GPU runs one daemon process for its TP rank. The daemon:
    (--weight-cache-transport): CUDA IPC handles (torch_ipc), or CUDA VMM
    allocations shared as file descriptors (vmm_fd)
 3. Serves transport entries over a Unix socket to requesting engine processes
-4. Serves only an engine whose model (WeightCacheConfig) and load spec
-   (LoadSpec) match its own
+4. Serves only an engine whose LoadSpec equals its own
 
 Usage:
     # Single-node: launch all TP rank daemons with a single command:
@@ -49,6 +48,7 @@ import socket
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
+import msgspec
 import torch
 import torch.distributed as dist
 
@@ -64,14 +64,13 @@ from sglang.srt.runtime_context import (
 )
 
 from .protocol import (
-    cache_config_message,
-    cache_config_mismatches,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
     compute_global_rank,
     compute_local_gpu_id,
     get_ready_path,
     get_socket_path,
+    load_spec_mismatches,
     recv_msg,
     resolve_cache_quantization,
     send_msg,
@@ -185,7 +184,7 @@ class WeightCacheDaemon:
         self.ready_path = get_ready_path(device_uuid)
 
         self.model = None
-        self.config: Optional[Dict[str, Any]] = None  # see cache_config_message
+        self.config: Optional[Dict[str, Any]] = None  # this rank's LoadSpec, as a dict
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
@@ -304,11 +303,7 @@ class WeightCacheDaemon:
         from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
         from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 
-        from .config import (
-            build_load_spec,
-            build_weight_cache_config,
-            path_checkpoint_id,
-        )
+        from .config import build_load_spec, path_checkpoint_id
 
         # Resolve the kernel backends as the engine's scheduler does: they decide
         # post-processing, and LoadSpec compares them.
@@ -323,13 +318,6 @@ class WeightCacheDaemon:
         # same server args as the engine, so both hash the same HF config.
         model_config = ModelConfig.from_server_args(server_args)
 
-        # Describe the model before loading it. Loading may mutate
-        # hf_config.quantization_config (e.g. via process_weights_after_loading),
-        # which would produce a different hash than what the engine computes
-        # from the original config.
-        weight_config = build_weight_cache_config(
-            model_config, checkpoint_id=path_checkpoint_id()
-        )
         quant_method, quant_config = resolve_cache_quantization(model_config)
 
         # Refuse unsupported quant methods before creating distributed groups
@@ -340,11 +328,16 @@ class WeightCacheDaemon:
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
         self._initialize_eplb_expert_location_metadata(model_config)
-        self.config = cache_config_message(
-            weight_config,
+        # Describe the weights before loading them. Loading may mutate
+        # hf_config.quantization_config (e.g. via process_weights_after_loading),
+        # which would produce a different hash than what the engine computes
+        # from the original config.
+        self.config = msgspec.to_builtins(
             build_load_spec(
-                device=torch.device(current_platform.device_type, self.gpu_id)
-            ),
+                model_config,
+                checkpoint_id=path_checkpoint_id(),
+                device=torch.device(current_platform.device_type, self.gpu_id),
+            )
         )
 
         current_platform.empty_cache()
@@ -597,7 +590,7 @@ class WeightCacheDaemon:
         elif req.get("type") == "fetch_state":
             # Client requests full state with IPC handles
             # (daemon, engine) value of every field that differs.
-            mismatches = cache_config_mismatches(self.config, req["config"])
+            mismatches = load_spec_mismatches(self.config, req["config"])
             if mismatches:
                 logger.warning(
                     f"[WeightCacheDaemon gpu={self.gpu_id}] "

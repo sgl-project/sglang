@@ -15,6 +15,7 @@ import threading
 import time
 from typing import List, Optional
 
+import msgspec
 import torch
 import torch.nn as nn
 
@@ -25,12 +26,11 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.platforms import current_platform
 
-from .config import build_load_spec, build_weight_cache_config, path_checkpoint_id
+from .config import build_load_spec, path_checkpoint_id
 from .protocol import (
-    cache_config_message,
-    cache_config_mismatches,
     check_ipc_quant_support,
     get_socket_path,
+    load_spec_mismatches,
     recv_msg,
     resolve_cache_quantization,
     send_msg,
@@ -560,29 +560,29 @@ class WeightCacheModelLoader(BaseModelLoader):
             ) from e
 
         try:
-            model = build_weight_cache_config(
+            spec = build_load_spec(
                 model_config,
                 checkpoint_id=path_checkpoint_id(),
+                device=device_config.device,
                 draft_model_idx=self.load_config.draft_model_idx,
             )
-            spec = build_load_spec(device=device_config.device)
 
             logger.info(
                 f"[WeightCacheModelLoader] Requesting weights from daemon at "
                 f"{self.socket_path} with config: "
-                f"model={model.checkpoint_id}, "
-                f"arch={model.model_arch}, "
+                f"model={spec.checkpoint_id}, "
+                f"arch={spec.model_arch}, "
                 f"tp={spec.tp_size}/{spec.tp_rank}, "
-                f"quant={model.quant_method}, "
-                f"dtype={model.dtype}"
+                f"quant={spec.quant_method}, "
+                f"dtype={spec.dtype}"
             )
 
-            engine_config = cache_config_message(model, spec)
+            engine_config = msgspec.to_builtins(spec)
             send_msg(sock, {"type": "fetch_state", "config": engine_config})
             result = recv_msg(sock)
 
             if result.get("status") == "mismatch":
-                mismatches = cache_config_mismatches(
+                mismatches = load_spec_mismatches(
                     result["daemon_config"], engine_config
                 )
                 raise RuntimeError(

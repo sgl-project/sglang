@@ -197,8 +197,8 @@ class _TinyModel(torch.nn.Module):
         )
 
 
-# The daemon serves a request whose config message equals its own.
-_CACHE_CONFIG = {"model": {"checkpoint_id": "tiny"}, "spec": {"tp_rank": 0}}
+# The daemon serves a request whose LoadSpec dict equals its own.
+_CACHE_CONFIG = {"checkpoint_id": "tiny", "tp_rank": 0}
 
 
 def _make_daemon(model, backend) -> WeightCacheDaemon:

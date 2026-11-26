@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Protocol definitions for the weight cache daemon.
 
-Defines the config message and the socket message protocol helpers.
+The daemon and its engines compare LoadSpec dicts (msgspec.to_builtins) with
+load_spec_mismatches. Also: quantization checks, the environment stamp, rank and
+GPU ids, and the socket paths and messages.
 """
 
 from __future__ import annotations
@@ -15,12 +17,8 @@ import signal
 import struct
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-import msgspec
-
 from sglang.srt.environ import envs
 from sglang.srt.utils.serialization import safe_pickle_loads
-
-from .schema import LoadSpec, WeightCacheConfig
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -28,22 +26,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def cache_config_message(model: WeightCacheConfig, spec: LoadSpec) -> Dict[str, Any]:
-    """What a daemon and its engines compare: the model, and how this rank loads it."""
-    return {"model": msgspec.to_builtins(model), "spec": msgspec.to_builtins(spec)}
-
-
-def cache_config_mismatches(
+def load_spec_mismatches(
     ours: Dict[str, Any], theirs: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Every field where two config messages differ, e.g. {"spec.tp_rank": (0, 1)}."""
-    mismatches = {}
-    for part in ("model", "spec"):
-        a, b = ours.get(part, {}), theirs.get(part, {})
-        for name in sorted(a.keys() | b.keys()):
-            if name not in a or name not in b or a[name] != b[name]:
-                mismatches[f"{part}.{name}"] = (a.get(name), b.get(name))
-    return mismatches
+    """Every field where two LoadSpec dicts differ, e.g. {"tp_rank": (0, 1)}."""
+    return {
+        name: (ours.get(name), theirs.get(name))
+        for name in sorted(ours.keys() | theirs.keys())
+        if name not in ours or name not in theirs or ours[name] != theirs[name]
+    }
 
 
 def hash_quant_config(quant_config: Any) -> str:
@@ -98,7 +89,7 @@ def get_quant_method_name(quant_config: Any) -> str:
 
 
 def resolve_cache_quantization(model_config: ModelConfig) -> tuple[str, Any]:
-    """Resolve the method and config used by IPC checks and WeightCacheConfig."""
+    """Resolve the method and config used by IPC checks and LoadSpec."""
     config = getattr(model_config.hf_config, "quantization_config", None)
     method = get_quant_method_name(model_config.quantization)
     return method or get_quant_method_name(config), config

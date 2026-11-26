@@ -14,43 +14,26 @@ from typing import Any, Optional
 import msgspec
 
 
-def _digest(fields: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    """Everything that decides the weights one rank loads; see build_load_spec.
 
-
-class WeightCacheConfig(
-    msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
-):
-    """The model: its checkpoint and the model options that decide its weights.
-
-    Built from ModelConfig, the checkpoint ID and the draft layer, and equal on
-    every rank. How a rank loads the model is in LoadSpec.
+    A cache daemon serves an engine only with an equal spec. A snapshot is looked
+    up by digest(), and the ranks of one load agree on digest(include_rank=False).
     """
 
-    # A content digest or pinned commit; the cache daemon uses path_checkpoint_id.
+    # Model config: the checkpoint and how it is read. Equal on every rank.
+    # A content digest or pinned commit; the cache daemon passes path[@revision].
     checkpoint_id: str
     model_arch: str
     hf_config_hash: str  # effective HF config after model overrides, without paths
     dtype: str
-    quant_method: str  # "" for unquantized
-    quant_config_hash: str
     draft_model_idx: Optional[int]  # layer selected from a multi-layer draft checkpoint
 
-    def __post_init__(self):
-        if not self.checkpoint_id:
-            raise ValueError("A weight cache config requires a checkpoint ID")
+    # Quantization config. Equal on every rank.
+    quant_method: str  # "" for unquantized
+    quant_config_hash: str
 
-    def digest(self) -> str:
-        return _digest(msgspec.to_builtins(self))
-
-
-class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
-    """How this rank loads the model: everything that is not in WeightCacheConfig.
-
-    Built from the runtime context alone.
-    """
-
-    # Parallel layout, equal on every rank.
+    # Parallel config: the layout. Equal on every rank.
     tp_size: int
     pp_size: int
     dp_size: int
@@ -62,18 +45,18 @@ class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
     moe_dense_tp_size: Optional[int]
     enable_dp_lm_head: bool
 
-    # This rank's shard.
+    # Parallel config: this rank's shard. The only fields that differ across ranks.
     tp_rank: int
     pp_rank: int
     moe_dp_rank: int
     moe_ep_rank: int
 
-    # Expert placement.
+    # Expert placement config.
     ep_num_redundant_experts: int
     enable_eplb: bool
     init_expert_location: Optional[str]
 
-    # Kernels and features that post-process the weights differently.
+    # Kernel config: backends and features that post-process the weights differently.
     moe_a2a_backend: str
     moe_runner_backend: str
     fp4_gemm_runner_backend: str
@@ -82,20 +65,21 @@ class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
     flashinfer_cutedsl_swap_ab: Optional[bool]
     enable_fp32_lm_head: bool
 
-    # The process that post-processes the weights.
+    # Environment: the process that post-processes the weights.
     device_capability: str
     torch_version: str
 
-    def digest(self, *, include_rank: bool = True) -> str:
-        """Identify how this rank loads the model, or without the rank what all ranks share.
+    def __post_init__(self):
+        if not self.checkpoint_id:
+            raise ValueError("A load spec requires a checkpoint ID")
 
-        A shard is named by this digest together with WeightCacheConfig.digest().
-        """
+    def digest(self, *, include_rank: bool = True) -> str:
+        """Identify this rank's shard, or without the rank what all ranks share."""
         fields = msgspec.to_builtins(self)
         if not include_rank:
             for name in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
                 del fields[name]
-        return _digest(fields)
+        return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
 
 class StorageMeta(msgspec.Struct, frozen=True, kw_only=True):
