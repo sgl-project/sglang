@@ -7,6 +7,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+from sglang.srt.models.gpt_oss import GptOssForCausalLM
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -81,14 +82,58 @@ class TestMxfp4CutlassTpShard(CustomTestCase):
             (3072, 576),
         ):
             with self.subTest(config_intermediate=config_inter):
-                # Mirrors the cutoff in _load_mxfp4_experts_weights (gpt_oss.py).
-                per_rank = loader_rank_intermediate(config_inter, tp_size)
-                loaded = (
-                    min((tp_rank + 1) * per_rank, GPT_OSS_INTERMEDIATE)
-                    - tp_rank * per_rank
+                self._check_humming_inputs(
+                    config_inter, tp_size, tp_rank, expect_loaded
                 )
-                self.assertEqual(loaded, expect_loaded)
-                self._check_humming_inputs(config_inter, tp_size, tp_rank, loaded)
+
+    def _load_through_gpt_oss_loader(self, layer, config_inter, loaded, tp_rank):
+        gen = torch.Generator().manual_seed(0)
+
+        def checkpoint(*shape):
+            return torch.randint(100, 111, shape, generator=gen).to(torch.uint8)
+
+        n = GPT_OSS_INTERMEDIATE
+        e = layer.num_local_experts
+        ckpt_w13 = checkpoint(e, 2 * n, GPT_OSS_HIDDEN // MXFP4_BLOCK)
+        ckpt_w2 = checkpoint(e, GPT_OSS_HIDDEN, n // MXFP4_BLOCK)
+
+        def copy_into_leading_slice(param, loaded_weight, **kwargs):
+            param.data[tuple(slice(0, d) for d in loaded_weight.shape)] = loaded_weight
+
+        mlp = torch.nn.Module()
+        mlp.experts = layer
+        model = GptOssForCausalLM.__new__(GptOssForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.config = types.SimpleNamespace(
+            intermediate_size=config_inter,
+            original_intermediate_size=n,
+            num_local_experts=e,
+        )
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        model.model.layers[0].mlp = mlp
+        layer.moe_ep_rank, layer.moe_ep_size = 0, 1
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            param = getattr(layer, name)
+            param.data.fill_(127)
+            param.weight_loader = copy_into_leading_slice
+        model._load_mxfp4_experts_weights(
+            iter(
+                [
+                    ("model.layers.0.mlp.experts.gate_up_proj_scales", ckpt_w13),
+                    ("model.layers.0.mlp.experts.down_proj_scales", ckpt_w2),
+                ]
+            )
+        )
+
+        start = tp_rank * loader_rank_intermediate(config_inter, 4)
+        w13_src = torch.full_like(layer.w13_weight_scale.data, 127)
+        w2_src = torch.full_like(layer.w2_weight_scale.data, 127)
+        w13_src[:, : 2 * loaded] = ckpt_w13[:, 2 * start : 2 * (start + loaded)]
+        w2_src[:, :, : loaded // MXFP4_BLOCK] = ckpt_w2[
+            :, :, start // MXFP4_BLOCK : (start + loaded) // MXFP4_BLOCK
+        ]
+        return w13_src, w2_src
 
     def _check_humming_inputs(self, config_inter, tp_size, tp_rank, loaded):
         captured = []
@@ -106,21 +151,12 @@ class TestMxfp4CutlassTpShard(CustomTestCase):
 
         layer = self._create_weights("cutlass_sm90", tp_size, tp_rank, config_inter)
         layer.moe_runner_config = types.SimpleNamespace(gate_up_interleaved=True)
-        layer.loaded_intermediate_size = loaded
-        gen = torch.Generator().manual_seed(0)
-        n_groups = -(-loaded // MXFP4_BLOCK)
-        w13_real = layer.w13_weight_scale.data
-        w2_real = layer.w2_weight_scale.data
-        w13_real.fill_(127)
-        w2_real.fill_(127)
-        w13_real[:, : 2 * loaded, :] = torch.randint(
-            100, 111, w13_real[:, : 2 * loaded, :].shape, generator=gen
-        ).to(torch.uint8)
-        w2_real[:, :, :n_groups] = torch.randint(
-            100, 111, w2_real[:, :, :n_groups].shape, generator=gen
-        ).to(torch.uint8)
-        w13_src = w13_real.clone()
-        w2_src = w2_real.clone()
+        w13_src, w2_src = self._load_through_gpt_oss_loader(
+            layer, config_inter, loaded, tp_rank
+        )
+        n_groups = loaded // MXFP4_BLOCK
+        self.assertTrue(torch.equal(layer.w13_weight_scale.data, w13_src))
+        self.assertTrue(torch.equal(layer.w2_weight_scale.data, w2_src))
 
         method = self.method
         method._use_sm90_humming = True
@@ -133,11 +169,8 @@ class TestMxfp4CutlassTpShard(CustomTestCase):
         w13_in, w2_in = captured
         n_pad = method._padded_intermediate
         k_groups = GPT_OSS_HIDDEN // MXFP4_BLOCK
-        for name, got, src, expected_fill in (
-            ("w13", w13_in, w13_src, w13_src[:, 0, 0]),
-            ("w2", w2_in, w2_src, w2_src[:, 0, 0]),
-        ):
-            expected = expected_fill.view(-1, 1, 1).expand_as(got).clone()
+        for name, got, src in (("w13", w13_in, w13_src), ("w2", w2_in, w2_src)):
+            expected = src[:, 0, 0].view(-1, 1, 1).expand_as(got).clone()
             if name == "w13":
                 expected[:, :loaded, :k_groups] = src[:, 1 : 2 * loaded : 2, :k_groups]
                 expected[:, n_pad : n_pad + loaded, :k_groups] = src[
