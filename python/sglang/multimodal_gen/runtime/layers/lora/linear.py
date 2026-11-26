@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_rank,
     split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -34,6 +33,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
+    request_allows,
     request_allows_lossless,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -84,11 +84,25 @@ def _lora_compute_dtype(x: torch.Tensor, lora_dtype: torch.dtype) -> torch.dtype
     An fp16 adapter on bf16/fp32 activations computes in the activations'
     dtype (the autocast dtype under autocast, e.g. Wan), as a bf16 adapter
     would: cast to fp16, DiT activations beyond 65504 overflow to inf and the
-    output turns into NaN (a black image). Other adapters compute in their own
-    dtype, as before.
+    output turns into NaN (a black image).
+
+    An fp32 adapter on 16-bit activations computes in their dtype at
+    quality="high", exactly as the same adapter saved in that dtype would
+    (e.g. the fp32 and bf16 files of a Lightning LoRA); in fp32 its matmuls
+    miss the tensor cores and cast every activation. Rounding the factors to
+    16 bits loses precision, so "exact" and "lossless" keep fp32. Other
+    adapters compute in their own dtype, as before.
     """
-    if lora_dtype != torch.float16 or x.dtype == torch.float16:
-        return lora_dtype
+    if lora_dtype == torch.float16 and x.dtype != torch.float16:
+        return _activation_dtype(x)
+    if lora_dtype == torch.float32 and request_allows("high"):
+        activation_dtype = _activation_dtype(x)
+        if activation_dtype in (torch.bfloat16, torch.float16):
+            return activation_dtype
+    return lora_dtype
+
+
+def _activation_dtype(x: torch.Tensor) -> torch.dtype:
     if torch.is_autocast_enabled(x.device.type):
         return torch.get_autocast_dtype(x.device.type)
     return x.dtype
@@ -251,9 +265,13 @@ class BaseLayerWithLoRA(nn.Module):
         if runtime_lora_scale == 0.0:
             return self.base_layer(x)
 
-        out, output_bias = self.base_layer(x)
-        out = self._add_lora_delta(out, x, runtime_lora_scale)
-        return self._add_lora_output_offset(out), output_bias
+        input_parallel = self.base_layer.parallel_input(x)
+        out, output_bias = self.base_layer.apply_quant_method(
+            input_parallel, self.base_layer.bias
+        )
+        out = self._add_lora_delta(out, input_parallel, runtime_lora_scale)
+        out = self._add_lora_output_offset(out)
+        return self.base_layer.collect_output(out), output_bias
 
     def _add_lora_delta(
         self, out: torch.Tensor, x: torch.Tensor, runtime_lora_scale: float
@@ -891,8 +909,13 @@ class BaseLayerWithLoRA(nn.Module):
         weight = self.base_layer.weight
         if isinstance(weight, DTensor):
             weight = weight.to_local()
+        else:
+            # Under layerwise offload the parameter is a (1,) placeholder; the
+            # merged weight lives in the manager's CPU view.
+            weight, _ = self._materialized_weight_src()
         # clone(): to("cpu") may alias storage; we must not mutate this backup.
         self.cpu_weight = weight.detach().to("cpu").clone()
+        self._base_is_view = False
         self.merged = False
         self.disable_lora = True
         self.lora_weights_list = []
@@ -905,29 +928,17 @@ class BaseLayerWithLoRA(nn.Module):
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        if self.disable_lora or (self.merged and not self.has_lora_output_offset):
-            return self.base_layer(input_)
+    def __init__(
+        self,
+        base_layer: ColumnParallelLinear,
+        lora_rank: int | None = None,
+        lora_alpha: int | None = None,
+        snapshot_base: bool = True,
+    ) -> None:
+        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
-        runtime_lora_scale = self._runtime_lora_scale()
-        if runtime_lora_scale == 0.0:
-            return self.base_layer(input_)
-
-        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_, bias
-        )
-        if not self.merged and not self.disable_lora:
-            output_parallel = self._add_lora_delta(
-                output_parallel, input_, runtime_lora_scale
-            )
-        output_parallel = self._add_lora_output_offset(output_parallel)
-        if self.base_layer.gather_output:
-            output = tensor_model_parallel_all_gather(output_parallel)
-        else:
-            output = output_parallel
-        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
-        return output, output_bias
+    def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
+        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
@@ -936,6 +947,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         end_idx = (tp_rank + 1) * shard_size
         B = B[start_idx:end_idx, :]
         return B
+
+    # disable the shared body itself, without re-entering its compile wrapper
+    _forward_with_delta = torch.compiler.disable(BaseLayerWithLoRA._forward_with_delta)
 
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):

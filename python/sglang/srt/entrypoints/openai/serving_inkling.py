@@ -3,6 +3,7 @@ Chat Completions and Responses APIs."""
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -26,11 +27,14 @@ from sglang.srt.parser.inkling_output import (
 )
 from sglang.srt.parser.inkling_renderer import (
     check_served_tokenizer,
+    check_tool_call_author_name_mode,
     load_tml_renderers,
     render_inkling_assistant_prefix,
     render_inkling_messages,
 )
 from sglang.srt.runtime_context import get_serving
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.chat_encoding_adapters import ChatOutputHooks
@@ -54,6 +58,7 @@ class InklingChatEncodingAdapter:
         tool_call_parser: str | None,
         chat_hooks: ChatOutputHooks,
         spec: str = "inkling",
+        tool_call_author_name_mode: str = "tool_name",
     ):
         # Validate the frozen effort default at startup,
         # so configuration errors fail before requests.
@@ -62,6 +67,12 @@ class InklingChatEncodingAdapter:
         if tokenizer is not None:
             check_served_tokenizer(tokenizer, spec=spec)
         self._spec = spec
+        check_tool_call_author_name_mode(tool_call_author_name_mode, spec=spec)
+        self._tool_call_author_name_mode = tool_call_author_name_mode
+        if spec == "inkling2":
+            logger.info(
+                "Inkling2 tool-call header mode: %s", tool_call_author_name_mode
+            )
         reasoning_is_token = reasoning_parser == "inkling"
         tool_call_is_token = tool_call_parser in _TOKEN_TOOL_CALL_PARSERS
         self._token_output = reasoning_is_token or tool_call_is_token
@@ -111,6 +122,7 @@ class InklingChatEncodingAdapter:
             parallel_tool_calls=request.parallel_tool_calls,
             reasoning_effort=reasoning_effort,
             spec=self._spec,
+            tool_call_author_name_mode=self._tool_call_author_name_mode,
         )
         if assistant_prefix is not None:
             prompt_ids += render_inkling_assistant_prefix(
