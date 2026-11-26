@@ -1932,7 +1932,7 @@ class TestSkipTokenizerInit(unittest.TestCase):
                 )
 
 
-class TestHiSparseDsaBackendPolicy(unittest.TestCase):
+class TestHiSparseDsaBackendPolicy(CustomTestCase):
     # The backend selection moved to the resolution pipeline; these policy
     # tests drive the pass through its read-only view.
     @staticmethod
