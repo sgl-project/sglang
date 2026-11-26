@@ -238,13 +238,13 @@ class BudgetPlan:
         if (
             key.dtype != torch.bfloat16
             or key.ndim != 4
-            or tuple(key.shape[1:]) != (self.page_size, 1, self.index_head_dim)
+            or tuple(key.shape[1:])
+            != (self.page_size, self.kv_head_num, self.index_head_dim)
         ):
             raise ValueError(
                 "Indexer K pool layout does not match the model budget plan."
             )
-        # get_index_k_buffer returns one layer: [pages, page_size, 1, head_dim].
-        # Its pages already include the Indexer K allocator's dummy page.
+        # The page count already includes the Indexer K allocator's dummy page.
         host_token_capacity = key.shape[0] * self.page_size
         self.host_token_capacity = host_token_capacity
         self.host_kv_spec = BufferSpec(
@@ -365,18 +365,14 @@ def fit_sparse_running_requests(
     # The map includes the dummy resident row and one additional row.
     fixed_slot_map_bytes = (1 + _SLOT_MAP_EXTRA_ROWS) * slot_map_bytes_per_request
     fitting_rows = (available_bytes - fixed_slot_map_bytes) // bytes_per_request
+    if max_total_tokens is not None:
+        fitting_rows = min(fitting_rows, max_total_tokens // context_len)
     if fitting_rows < 1:
         raise RuntimeError(
             "Cannot fit one sparse KV resident row: "
             f"need {bytes_per_request + fixed_slot_map_bytes} bytes including fixed "
-            f"slot-map rows, have {available_bytes} bytes "
-            f"(C={cache_tokens}, context_len={context_len})."
+            f"slot-map rows, have {available_bytes} bytes (C={cache_tokens}). "
+            f"One full sparse KV context requires context_len={context_len} tokens "
+            f"after page alignment (max_total_tokens={max_total_tokens})."
         )
-    if max_total_tokens is not None:
-        fitting_rows = min(fitting_rows, max_total_tokens // context_len)
-        if fitting_rows < 1:
-            raise RuntimeError(
-                f"max_total_tokens={max_total_tokens} cannot fit one full sparse KV "
-                f"context of {context_len} tokens after page alignment."
-            )
     return fitting_rows

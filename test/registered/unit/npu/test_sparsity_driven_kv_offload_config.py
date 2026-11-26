@@ -275,7 +275,7 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
         for mode, cap, rows in (
             ("null", None, 1),
             ("null", 8, 8),
-            ("null", 0, 0),
+            ("null", 0, 1),
             ("decode", 8, 0),
         ):
             with (

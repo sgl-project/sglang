@@ -282,9 +282,7 @@ def get_sparse_kv_budget(
         prefill_rows = 0
     else:
         request_rows = resident_rows
-        prefill_rows = schedule.prefill_max_requests
-        if prefill_rows is None:
-            prefill_rows = 1
+        prefill_rows = schedule.prefill_max_requests or 1
 
     query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
     # Native SFA accepts 1..64 or 128 query heads per KV head.
