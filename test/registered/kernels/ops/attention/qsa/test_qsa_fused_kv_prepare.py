@@ -473,7 +473,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
         token_to_kv_pool=routed(pool),
         device="cuda",
         is_draft_worker=False,
-        req_to_token_pool=SimpleNamespace(req_to_token=table),
+        req_to_token_pool=SimpleNamespace(req_to_token=table, max_context_len=64),
         model_config=SimpleNamespace(hf_config=config, context_len=64),
     )
     backend = QwenSparseAttnBackend(runner)
