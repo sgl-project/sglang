@@ -38,7 +38,7 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
         self.token_to_kv_pool = self.kv_pool
         self.req_to_token_pool = runner.req_to_token_pool
         self.req_to_token = runner.req_to_token_pool.req_to_token
-        self.max_context_len = int(runner.model_config.context_len)
+        self.max_kv_len = self.req_to_token_pool.row_width
         self.page_size = self.kv_pool.page_size
         self.idx_head_dim = 128
         sparse_cfg = get_minimax_sparse_attention_config(runner.model_config.hf_config)
@@ -119,7 +119,9 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
             return
         if mode.is_decode_or_idle() or mode.is_target_verify():
             self._prepare_msa_v1_decode_plan(
-                forward_batch, use_cuda_graph=True, max_seq_len=self.max_context_len
+                forward_batch,
+                use_cuda_graph=True,
+                max_seq_len=self.max_kv_len,
             )
             return
         lens = forward_batch.extend_seq_lens_cpu

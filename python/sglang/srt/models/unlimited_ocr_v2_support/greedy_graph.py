@@ -1,6 +1,6 @@
 """Greedy argmax recorded inside Unlimited-OCR v2 decode CUDA graphs.
 
-The decode graph I/O (``runner/uocr_decode_graph_io.py``) relays these ids to the
+The decode graph I/O (``decode_graph_io.py`` in this package) relays these ids to the
 next step's inputs on device, so all-greedy decode skips the eager sampler.
 """
 

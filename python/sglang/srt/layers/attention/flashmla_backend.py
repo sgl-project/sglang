@@ -31,8 +31,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-logger = logging.getLogger(__name__)
-
 PAGE_SIZE = 64
 
 
@@ -44,18 +42,6 @@ class FlashMLADecodeMetadata:
     # K lens the kernel reads for draft-extend (window-aligned, device int32).
     # Decode/verify compute theirs inline from forward_batch.seq_lens.
     seq_lens_k: Optional[torch.Tensor] = None
-
-    def __init__(
-        self,
-        flashmla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        num_splits: Optional[torch.Tensor] = None,
-        block_kv_indices: Optional[torch.Tensor] = None,
-        seq_lens_k: Optional[torch.Tensor] = None,
-    ):
-        self.flashmla_metadata = flashmla_metadata
-        self.num_splits = num_splits
-        self.block_kv_indices = block_kv_indices
-        self.seq_lens_k = seq_lens_k
 
 
 class FlashMLABackend(FlashInferMLAAttnBackend):
@@ -172,9 +158,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # else the static bound (kernel reads are capped by seq_lens_k).
         seq_lens_cpu = forward_batch.seq_lens_cpu
         eager_max_k = (
-            seq_lens_cpu.max().item()
-            if seq_lens_cpu is not None
-            else self.max_context_len
+            seq_lens_cpu.max().item() if seq_lens_cpu is not None else self.max_kv_len
         )
         if forward_batch.forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(eager_max_k, PAGE_SIZE)
@@ -290,7 +274,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     ):
         if block_kv_indices is None:
             self.cuda_graph_kv_indices = torch.full(
-                (max_bs, (self.max_context_len + PAGE_SIZE) // PAGE_SIZE),
+                (max_bs, (self.max_kv_len + PAGE_SIZE) // PAGE_SIZE),
                 1,
                 dtype=torch.int32,
                 device="cuda",
@@ -326,7 +310,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 is_draft_runner=self.is_draft_runner,
                 skip_prefill=self.skip_prefill,
                 max_bs=max_bs,
-                max_context_len=self.max_context_len,
+                max_context_len=self.max_kv_len,
                 num_draft_tokens=self.num_draft_tokens,
                 device=self.device,
                 is_read=False,
@@ -346,98 +330,95 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_mode: ForwardMode,
     ):
         """Shared decode/target-verify/draft-extend capture+replay body."""
-        if True:
-            seq_lens = seq_lens[:bs]
-            seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
+        seq_lens = seq_lens[:bs]
+        seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
 
-            if forward_mode.is_target_verify():
-                seq_lens = seq_lens + self.num_draft_tokens
-                if seq_lens_cpu is not None:
-                    seq_lens_cpu = seq_lens_cpu + self.num_draft_tokens
-            # draft_extend_v2 graph batches arrive with the padded q window
-            # already included in seq_lens; use them as-is.
-
-            # Tight block-table slice when the CPU mirror is free; static
-            # bound otherwise (no D2H; kernel reads are capped by seq_lens_k).
+        if forward_mode.is_target_verify():
+            seq_lens = seq_lens + self.num_draft_tokens
             if seq_lens_cpu is not None:
-                max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
-            else:
-                max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
+                seq_lens_cpu = seq_lens_cpu + self.num_draft_tokens
+        # draft_extend_v2 graph batches arrive with the padded q window
+        # already included in seq_lens; use them as-is.
 
-            if self.runner_ids.reads_are_translated:
-                assert self.page_size == PAGE_SIZE
-                # The plan's table reaches a verify's draft tail.
-                self.runner_ids.copy_page_table(
-                    plan, out=self.cuda_graph_kv_indices[:bs]
+        # Tight block-table slice when the CPU mirror is free; static
+        # bound otherwise (no D2H; kernel reads are capped by seq_lens_k).
+        if seq_lens_cpu is not None:
+            max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
+        else:
+            max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
+
+        if self.runner_ids.reads_are_translated:
+            assert self.page_size == PAGE_SIZE
+            # The plan's table reaches a verify's draft tail.
+            self.runner_ids.copy_page_table(plan, out=self.cuda_graph_kv_indices[:bs])
+        else:
+            create_flashmla_kv_indices_triton[
+                (
+                    bs,
+                    get_num_kv_index_blocks_flashmla(
+                        self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
+                    ),
                 )
-            else:
-                create_flashmla_kv_indices_triton[
-                    (
-                        bs,
-                        get_num_kv_index_blocks_flashmla(
-                            self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
-                        ),
-                    )
-                ](
-                    self.req_to_token,
-                    req_pool_indices[:bs],
-                    seq_lens,
-                    None,
-                    self.cuda_graph_kv_indices,
-                    self.req_to_token.stride(0),
-                    self.cuda_graph_kv_indices.stride(0),
+            ](
+                self.req_to_token,
+                req_pool_indices[:bs],
+                seq_lens,
+                None,
+                self.cuda_graph_kv_indices,
+                self.req_to_token.stride(0),
+                self.cuda_graph_kv_indices.stride(0),
+            )
+
+        q_head_mult = (
+            self.num_draft_tokens
+            if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+            else 1
+        )
+        mla_metadata, num_splits = self._call_get_mla_metadata(
+            seq_lens.to(torch.int32),
+            q_head_mult * self.num_q_heads,
+            1,
+            is_fp8_kvcache=self.is_fp8_kvcache,
+        )
+
+        actual_num_sm_parts = mla_metadata.shape[0]
+        assert actual_num_sm_parts <= self.cuda_graph_mla_metadata.shape[0], (
+            f"num_sm_parts {actual_num_sm_parts} exceeds preallocated max "
+            f"{self.cuda_graph_mla_metadata.shape[0]}"
+        )
+
+        if (
+            self.cuda_graph_mla_metadata_view is None
+            or actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]
+        ):
+            if self.cuda_graph_mla_metadata_view is not None:
+                logger.warning(
+                    f"num_sm_parts mismatch in CUDA Graph replay: "
+                    f"capture={self.cuda_graph_mla_metadata_view.shape[0]}, "
+                    f"replay={actual_num_sm_parts}. "
+                    f"This may indicate batch size changed between capture and replay."
                 )
+            self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
+                :actual_num_sm_parts
+            ]
+        # num_splits has shape (bs+1,) — always update for the current bs.
+        self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
 
-            q_head_mult = (
-                self.num_draft_tokens
-                if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
-                else 1
-            )
-            mla_metadata, num_splits = self._call_get_mla_metadata(
-                seq_lens.to(torch.int32),
-                q_head_mult * self.num_q_heads,
-                1,
-                is_fp8_kvcache=self.is_fp8_kvcache,
-            )
+        self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
+        self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
 
-            actual_num_sm_parts = mla_metadata.shape[0]
-            assert actual_num_sm_parts <= self.cuda_graph_mla_metadata.shape[0], (
-                f"num_sm_parts {actual_num_sm_parts} exceeds preallocated max "
-                f"{self.cuda_graph_mla_metadata.shape[0]}"
-            )
+        seq_lens_k = None
+        if forward_mode.is_draft_extend_v2():
+            # The graph kernel binds this static buffer; refresh per replay.
+            self.cuda_graph_draft_extend_seq_lens_k[:bs].copy_(seq_lens)
+            seq_lens_k = self.cuda_graph_draft_extend_seq_lens_k[:bs]
 
-            if (
-                self.cuda_graph_mla_metadata_view is None
-                or actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]
-            ):
-                if self.cuda_graph_mla_metadata_view is not None:
-                    logger.warning(
-                        f"num_sm_parts mismatch in CUDA Graph replay: "
-                        f"capture={self.cuda_graph_mla_metadata_view.shape[0]}, "
-                        f"replay={actual_num_sm_parts}. "
-                        f"This may indicate batch size changed between capture and replay."
-                    )
-                self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
-                    :actual_num_sm_parts
-                ]
-            # num_splits has shape (bs+1,) — always update for the current bs.
-            self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
-
-            self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-
-            seq_lens_k = None
-            if forward_mode.is_draft_extend_v2():
-                # The graph kernel binds this static buffer; refresh per replay.
-                self.cuda_graph_draft_extend_seq_lens_k[:bs].copy_(seq_lens)
-                seq_lens_k = self.cuda_graph_draft_extend_seq_lens_k[:bs]
-
-            self.forward_metadata = FlashMLADecodeMetadata(
-                self.cuda_graph_mla_metadata_view,
-                self.cuda_graph_num_splits_view,
-                self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
-                seq_lens_k,
-            )
+        self.forward_metadata = FlashMLADecodeMetadata(
+            self.cuda_graph_mla_metadata_view,
+            self.cuda_graph_num_splits_view,
+            self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+            seq_lens_k,
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1

@@ -610,7 +610,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 is_write_back=False,
                 enable_hicache=False,
                 write_through_threshold=256,
-                device=str(self.device),
+                empty_device_indices=torch.empty(
+                    0, dtype=torch.int64, device=self.device
+                ),
                 # The window slot's history, as SWAComponent keeps it, the
                 # fused draft's front rows included.
                 swa_sliding_window_size=window,
