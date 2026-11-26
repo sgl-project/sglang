@@ -1,7 +1,13 @@
 import unittest
 
 from sglang.srt.entrypoints.http_server import app
-from sglang.srt.utils.auth import AUTH_LEVELS, _iter_leaf_routes, undeclared_routes
+from sglang.srt.utils.auth import (
+    AUTH_LEVELS,
+    AuthLevel,
+    _iter_leaf_routes,
+    decide_request_auth,
+    undeclared_routes,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -75,6 +81,42 @@ class TestAuthLevels(CustomTestCase):
 
     def test_api_key_middleware_is_outermost_on_the_module_level_app(self):
         self.assertEqual(app.user_middleware[0].cls.__name__, "_ApiKeyASGIMiddleware")
+
+
+class TestHiCacheClearRequiresAdminApiKey(CustomTestCase):
+    """POST /hicache/storage-backend/clear erases the persistent
+    hierarchical cache backend, so it is admin_force like the attach/detach
+    endpoints for the same backend (issue #44191): an ordinary API key must
+    not unlock it, and it is refused outright when the server was started
+    without --admin-api-key.
+    """
+
+    PATH = "/hicache/storage-backend/clear"
+
+    def _decide(self, authorization_header, api_key, admin_api_key):
+        return decide_request_auth(
+            method="POST",
+            path=self.PATH,
+            authorization_header=authorization_header,
+            api_key=api_key,
+            admin_api_key=admin_api_key,
+            auth_level=AUTH_LEVELS[self.PATH],
+        )
+
+    def test_clear_is_admin_force(self):
+        self.assertEqual(AUTH_LEVELS[self.PATH], AuthLevel.ADMIN_FORCE)
+
+    def test_clear_refused_without_admin_api_key_configured(self):
+        decision = self._decide("Bearer user-key", "user-key", None)
+        self.assertFalse(decision.allowed)
+
+    def test_clear_refused_with_only_api_key(self):
+        decision = self._decide("Bearer user-key", "user-key", "admin-key")
+        self.assertFalse(decision.allowed)
+
+    def test_clear_allowed_with_admin_api_key(self):
+        decision = self._decide("Bearer admin-key", "user-key", "admin-key")
+        self.assertTrue(decision.allowed)
 
 
 if __name__ == "__main__":
