@@ -163,13 +163,11 @@ class TestDisaggregationDecodeRadixLinkerSharedEngine(
             ("prefill", self._prefill_stdout_buf, self._prefill_stderr_buf),
             ("decode", self._decode_stdout_buf, self._decode_stderr_buf),
         ):
-            logs = stdout.getvalue() + stderr.getvalue()
             self.assertIn(
                 "Reuse initialized mooncake transfer engine",
-                logs,
+                stdout.getvalue() + stderr.getvalue(),
                 f"{side} store did not run on the PD transfer engine",
             )
-            self.assertNotIn("Mooncake refused memory registration reuse", logs)
 
 
 if __name__ == "__main__":

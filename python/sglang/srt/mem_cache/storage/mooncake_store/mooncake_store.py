@@ -733,16 +733,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # PD may already have created an NVLink engine even when
                 # storage opted out of sharing in order to use RDMA.
                 # A TENT engine has no classic engine object for the store to drive.
+                # Without registration reuse the store and PD would register the
+                # same buffers twice on one engine, so the store builds its own.
                 if (
                     envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
                     and isinstance(shared_engine, MooncakeTransferEngine)
                     and device_name == shared_engine.get_ib_device()
                     and self.config.metadata_server == "P2PHANDSHAKE"
                     and self.config.protocol == "rdma"
+                    and shared_engine.enable_memory_registration_reuse()
                 ):
                     client_hostname = shared_engine.get_session_id()
                     transfer_engine = shared_engine.get_engine()
-                    shared_engine.enable_memory_registration_reuse()
                     logger.info(
                         f"Reuse initialized mooncake transfer engine: {shared_engine}"
                     )
