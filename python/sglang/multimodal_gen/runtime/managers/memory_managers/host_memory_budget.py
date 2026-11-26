@@ -274,6 +274,7 @@ class HostPinBudget:
         available_bytes: int | None = None,
         *,
         reserve_bytes: int | None = None,
+        node_local_ranks: int = 1,
     ) -> None:
         if available_bytes is None:
             if host_copies_are_redundant():
@@ -283,9 +284,12 @@ class HostPinBudget:
                 available_bytes = 0
             else:
                 available_bytes = host_memory_available_bytes()
-        self.available_bytes = available_bytes
+        # Every GPU worker process on this node constructs its own budget from
+        # the same host-wide reading, with no cross-rank coordination; without
+        # the divisor N ranks book N times the real headroom.
+        self.available_bytes = available_bytes // max(1, node_local_ranks)
         self.reserve_bytes = (
-            host_pin_reserve_bytes(available_bytes)
+            host_pin_reserve_bytes(self.available_bytes)
             if reserve_bytes is None
             else reserve_bytes
         )

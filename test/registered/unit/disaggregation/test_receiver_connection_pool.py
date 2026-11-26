@@ -61,6 +61,7 @@ def _manager(manager_class=CommonKVManager):
     manager.enable_staging = False
     manager.customized_info_enabled = False
     manager.exchange_aux_item_lens = False
+    manager.decode_enable_radix_cache = False
     return manager
 
 
@@ -189,7 +190,7 @@ class TestReceiverControlMessages(CustomTestCase):
         manager.kv_mem_descs = [SimpleNamespace(pack=lambda: b"kv-desc")]
         manager.aux_mem_descs = [SimpleNamespace(pack=lambda: b"aux-desc")]
         manager.state_mem_descs = [[SimpleNamespace(pack=lambda: b"state-desc")]]
-        manager.engine = SimpleNamespace(get_session_id=lambda: "mooncake-peer")
+        manager.transport = SimpleNamespace(session_id="mooncake-peer")
         receiver = CommonKVReceiver(manager, "prefill:8998", 17)
         receiver.required_dst_info_num = 3
         receiver.bootstrap_infos = [
@@ -239,6 +240,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"",
                 struct.pack("Q", 16),
                 b"1",
+                b"0",
                 b"0",
             ],
             "nixl": [
@@ -326,10 +328,10 @@ class TestReceiverControlMessages(CustomTestCase):
                 if backend == "mooncake":
                     self.assertEqual(info.num_draft_entries, 0)
                     # A peer that predates the draft-count field parses None.
-                    legacy = registration_type.from_zmq(frames[:-1])
+                    legacy = registration_type.from_zmq(frames[:-2])
                     self.assertIsNone(legacy.num_draft_entries)
                     self.assertEqual(legacy.dst_kv_item_lens, [16])
-                    with_draft = registration_type.from_zmq(frames[:-1] + [b"1"])
+                    with_draft = registration_type.from_zmq(frames[:-2] + [b"1"])
                     self.assertEqual(with_draft.num_draft_entries, 1)
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])
