@@ -1,13 +1,18 @@
 import base64
 import io
+import traceback
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import requests
 from PIL import Image, UnidentifiedImageError
 
 from sglang.multimodal_gen.runtime.utils import common, vision
 from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
+
+# A public literal avoids DNS; the tests mock the HTTP transfer.
+_GIF_URL = "https://93.184.216.34/fixture.gif"
 
 
 def _gif_bytes() -> bytes:
@@ -15,6 +20,48 @@ def _gif_bytes() -> bytes:
     frames = [Image.new("RGB", (4, 4), color) for color in ("red", "blue")]
     frames[0].save(buffer, format="GIF", save_all=True, append_images=frames[1:])
     return buffer.getvalue()
+
+
+@pytest.mark.parametrize(
+    "loader, dependency, category",
+    [
+        (vision.load_image, "srt_get_image_bytes", requests.HTTPError),
+        (vision.load_video, "requests.get", requests.Timeout),
+        (vision.load_video, "requests.get", requests.TooManyRedirects),
+    ],
+)
+def test_media_download_errors_keep_category_not_request(loader, dependency, category):
+    marker = "synthetic-media-marker"
+    url = f"{_GIF_URL}?ticket={marker}"
+    request = requests.Request("GET", url).prepare()
+    response = None
+    if category is requests.HTTPError:
+        response = requests.Response()
+        response.status_code = 403
+    original = category(url, request=request, response=response)
+    original.__cause__ = OSError(marker)
+    with patch(f"{vision.__name__}.{dependency}", side_effect=original):
+        with pytest.raises(category) as caught:
+            loader(url)
+    error = caught.value
+    if response is not None:
+        assert "HTTP 403" in str(error)
+    assert marker not in "".join(traceback.format_exception(error))
+    assert (
+        error.request is error.response is error.__cause__ is error.__context__ is None
+    )
+
+
+def test_invalid_media_source_does_not_echo_user_input():
+    marker = "synthetic-media-marker"
+    with patch.object(vision, "srt_get_image_bytes", side_effect=ValueError(marker)):
+        with pytest.raises(ValueError, match="image source") as caught:
+            vision.load_image(marker)
+    assert marker not in "".join(traceback.format_exception(caught.value))
+    assert caught.value.__context__ is None
+    with pytest.raises(ValueError, match="existing video file") as caught:
+        vision.load_video(marker)
+    assert marker not in "".join(traceback.format_exception(caught.value))
 
 
 @pytest.mark.parametrize(
@@ -32,6 +79,7 @@ def test_load_video_removes_downloaded_temp_file(
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
     closed = []
     response = SimpleNamespace(
+        headers={},
         status_code=status_code,
         iter_content=lambda chunk_size: iter([payload]),
         close=lambda: closed.append(True),
@@ -39,14 +87,14 @@ def test_load_video_removes_downloaded_temp_file(
     monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
 
     if error is None:
-        frames = vision.load_video("https://example.com/clip.gif")
+        frames = vision.load_video(_GIF_URL)
         assert [frame.convert("RGB").getpixel((0, 0)) for frame in frames] == [
             (255, 0, 0),
             (0, 0, 255),
         ]
     else:
         with pytest.raises(error):
-            vision.load_video("https://example.com/clip.gif")
+            vision.load_video(_GIF_URL)
 
     assert list(tmp_path.iterdir()) == []
     assert closed == [True]

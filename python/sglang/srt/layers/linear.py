@@ -43,7 +43,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu
+from sglang.srt.utils import is_cpu, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -53,9 +53,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
-_disable_hip_linear_quant = _is_hip and get_bool_env_var(
-    "SGLANG_ROCM_DISABLE_LINEARQUANT"
-)
+_disable_hip_linear_quant = _is_hip and envs.SGLANG_ROCM_DISABLE_LINEARQUANT.get()
 
 logger = logging.getLogger(__name__)
 
@@ -144,19 +142,10 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
     "BlockInt8LinearMethod",
-    "QQQLinearMethod",
-    "GPTQMarlin24LinearMethod",
-    "TPUInt8LinearMethod",
     "GPTQLinearMethod",
-    "GPTQLinearAscendMethod",
-    "GPTQLinearIntelAMXMethod",
-    "GPTQMoEAscendMethod",
-    "GPTQMoEIntelAMXMethod",
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
-    "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
-    "QuarkInt4Fp8LinearMethod",
     "HummingLinearMethod",
     "QuarkLinearMethod",
 ]
@@ -245,6 +234,11 @@ class LinearBase(torch.nn.Module):
     # Module value under self._modules, which this default then shadows on read.
     # VocabParallelEmbedding and FusedMoE carry the same default.
     scheme = None
+    # Set on a layer whose input producer hands it an already-quantized NVFP4
+    # (fp4, swizzled block scale) tuple instead of an activation; the quant
+    # method then skips its own input quantization. An explicit opt-in, so a
+    # stray tuple cannot silently bypass quantization.
+    _accepts_prequantized_fp4: bool = False
     tp_group: GroupCoordinator | _LogicalGroup | _ReplicatedGroup | None = None
 
     def __init__(
@@ -748,8 +742,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
-        # Special case for AQLM codebooks.
-        is_metadata = getattr(param, "is_metadata", False)
         # Special case for per-tensor scale to load scalar into fused array.
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
@@ -872,13 +864,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                             output_dim, start_idx, shard_size
                         )
 
-        # Special case for AQLM codebooks.
-        elif is_metadata:
-            # metadata indicates fixed size concatenated along dim 0
-            shard_size = loaded_weight.shape[0]
-            shard_offset = loaded_shard_id * shard_size
-            param_data = param_data.narrow(0, shard_offset, shard_size)
-
         # Special case for per-tensor scales in fused case.
         elif needs_scalar_to_array:
             param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -924,8 +909,19 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 pad_loaded_weight,
             )
 
+            pad_output_sizes = output_sizes
+            if (
+                isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
+                and param.packed_dim == param.output_dim
+            ):
+                pad_output_sizes = [
+                    param.adjust_shard_indexes_for_packing(
+                        shard_size=size, shard_offset=0
+                    )[0]
+                    for size in output_sizes
+                ]
             loaded_weight = pad_loaded_weight(
-                loaded_weight, param.output_dim, output_sizes
+                loaded_weight, param.output_dim, pad_output_sizes
             )
 
         for shard_id, shard_offset, shard_size in shard_offsets:
@@ -1367,8 +1363,6 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
-        # Special case for AQLM codebooks.
-        is_metadata = getattr(param, "is_metadata", False)
 
         # Special case for per-tensor scales in fused case.
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
@@ -1527,12 +1521,6 @@ class QKVParallelLinear(ColumnParallelLinear):
                         output_dim, start_idx, shard_size
                     )
 
-        # Special case for AQLM codebooks.
-        elif is_metadata:
-            # metadata indicates fixed size concatenated along dim 0
-            shard_size = loaded_weight.shape[0]
-            shard_index = ["q", "k", "v"].index(loaded_shard_id)
-            param_data = param_data.narrow(0, shard_index * shard_size, shard_size)
         # Special case for per-tensor scales in fused case.
         elif needs_scalar_to_array:
             param_data, loaded_weight = adjust_scalar_to_fused_array(

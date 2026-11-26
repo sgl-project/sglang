@@ -19,6 +19,16 @@ if TYPE_CHECKING:
 
 register_kernel(
     KernelSpec(
+        op="quantization.groupwise_int8_dequant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.groupwise_int8_dequant:groupwise_int8_dequant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
         op="quantization.sgl_per_token_quant_fp8",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.quantization.per_token_quant_fp8:per_token_quant_fp8",
@@ -135,6 +145,24 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="quantization.mxfp8_group_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.mxfp8_group_quant:mxfp8_group_quant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.mxfp4_dequant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.mxfp4_dequant:mxfp4_dequant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="quantization.quantize_fp4_indexer_tensor",
         backend=KernelBackend.TRITON,
         target=(
@@ -182,3 +210,13 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
+register_kernel(
+    KernelSpec(
+        op="quantization.inkling2_mxfp8_weight_scales_sm120",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.quantization.inkling2_mxfp8_scales_sm120:mxfp8_weight_scales",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
+        ),
+    )
+)

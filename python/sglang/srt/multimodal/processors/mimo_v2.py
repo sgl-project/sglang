@@ -5,12 +5,12 @@ import base64
 import copy
 import logging
 import math
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import List, Literal, Optional, Union
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
@@ -24,7 +24,14 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
-from sglang.srt.multimodal.media_io import ImageData, VideoData, download_remote_media
+from sglang.srt.multimodal.media_io import (
+    ImageData,
+    VideoData,
+    check_local_media_file,
+    download_remote_media,
+    media_url_timeout,
+    read_local_media_file,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -469,7 +476,7 @@ class MiMoProcessor:
         if isinstance(path_or_data, str) and path_or_data.startswith(
             ("http://", "https://")
         ):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            timeout = media_url_timeout(10)
             path_or_data = download_remote_media(path_or_data, timeout=timeout)
 
         if isinstance(path_or_data, bytes):
@@ -483,6 +490,10 @@ class MiMoProcessor:
         else:
             source = path_or_data  # local path or file://
         try:
+            if isinstance(source, str):
+                if source.startswith("file://"):
+                    source = unquote(urlparse(source).path)
+                source = check_local_media_file(source)
             AudioDecoder(source)
             return True
         except Exception:
@@ -880,11 +891,6 @@ class MiMoProcessor:
     def _process_video_content(self, content_idx, video_results, verbose):
         visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
         grid_t, grid_h, grid_w = thw_grid
-        num_media_tokens = (
-            (grid_t * grid_h * grid_w)
-            // (self.merge_size**2)
-            // self.temporal_compression_ratio
-        )
 
         assert len(timestamps) == grid_t * self.temporal_patch_size, (
             f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
@@ -1425,10 +1431,13 @@ class MiMoProcessor:
             image_obj = image
         elif isinstance(image, str):
             if image.startswith("http://") or image.startswith("https://"):
-                with BytesIO(download_remote_media(image, timeout=3)) as bio:
+                timeout = media_url_timeout(3)
+                with BytesIO(download_remote_media(image, timeout=timeout)) as bio:
                     image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("file://"):
-                image_obj = Image.open(image[7:])
+                image_obj = Image.open(
+                    BytesIO(read_local_media_file(unquote(urlparse(image).path)))
+                )
             elif image.startswith("data:image"):
                 if "base64," in image:
                     _, base64_data = image.split("base64,", 1)
@@ -1436,7 +1445,7 @@ class MiMoProcessor:
                     with BytesIO(data) as bio:
                         image_obj = copy.deepcopy(Image.open(bio))
             else:
-                image_obj = Image.open(image)
+                image_obj = Image.open(BytesIO(read_local_media_file(image)))
         else:
             image_obj = Image.open(BytesIO(image))
         if image_obj is None:
@@ -1645,198 +1654,6 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             raise HTTPException(
                 status_code=432, detail="Video file is corrupted or cannot be decoded"
             )
-
-    def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None, **kwargs
-    ) -> dict:
-        if audios and not self.AUDIO_TOKEN_REGEX.search(input_text or ""):
-            input_text = f"{self.mm_tokens.audio_token}{input_text or ''}"
-
-        processed_images = []
-        processed_videos = []
-        processed_audios = []
-
-        if images:
-            processed_images = list(images)
-
-        if videos:
-            for video in videos:
-                preprocess_kwargs = {}
-                audio_source = None
-                raw_video_source = video
-                if isinstance(video, VideoData):
-                    preprocess_kwargs = getattr(video, "preprocess_kwargs", {}) or {}
-                    raw_video_source = video.url
-                    audio_source = video.url
-                    video = video.url
-                elif isinstance(video, dict):
-                    preprocess_kwargs = video.get("preprocess_kwargs", {}) or {}
-                    audio_source = video.get("audio") or video.get("url")
-                    video = video.get("url", video)
-                    raw_video_source = video
-                elif isinstance(video, str):
-                    raw_video_source = video
-                    audio_source = None
-
-                if "use_audio" in preprocess_kwargs:
-                    use_audio = preprocess_kwargs["use_audio"]
-                elif isinstance(raw_video_source, str):
-                    use_audio = self.mimo_processor.has_audio_track(raw_video_source)
-                else:
-                    use_audio = False
-
-                if (
-                    use_audio
-                    and audio_source is None
-                    and isinstance(raw_video_source, (str, bytes, torch.Tensor))
-                ):
-                    audio_source = raw_video_source
-
-                processed_videos.append(
-                    (raw_video_source, use_audio, audio_source, preprocess_kwargs)
-                )
-
-        if audios:
-            for audio in audios:
-                if isinstance(audio, np.ndarray):
-                    audio_tensor = torch.from_numpy(audio).float()
-                elif isinstance(audio, torch.Tensor):
-                    audio_tensor = audio.float()
-                else:
-                    processed_audios.append(audio)
-                    continue
-                if audio_tensor.ndim == 1:
-                    processed_audios.append(
-                        (audio_tensor.cpu().contiguous(), self.audio_sample_rate)
-                    )
-                else:
-                    processed_audios.append(audio_tensor.cpu().contiguous())
-
-        contents = []
-
-        if input_text and (processed_images or processed_videos or processed_audios):
-            multimodal_tokens_pattern = self.mm_tokens.get_combined_regex()
-            text_parts = re.split(multimodal_tokens_pattern, input_text)
-            self._validate_placeholder_counts(
-                text_parts,
-                multimodal_tokens_pattern,
-                len(processed_images),
-                len(processed_videos),
-                len(processed_audios),
-            )
-
-            image_iter = iter(processed_images)
-            video_iter = iter(processed_videos)
-            audio_iter = iter(processed_audios)
-
-            for text_part in text_parts:
-                if multimodal_tokens_pattern.match(text_part):
-                    modality = self.mm_tokens.get_modality_of_token(text_part)
-                    if modality == Modality.IMAGE:
-                        img = next(image_iter)
-                        contents.append(
-                            Content(type="image", content=ImageInput(image=img))
-                        )
-                    elif modality == Modality.VIDEO:
-                        video_data = next(video_iter)
-                        contents.append(self._make_video_content(*video_data))
-                    elif modality == Modality.AUDIO:
-                        audio = next(audio_iter)
-                        contents.append(
-                            Content(type="audio", content=AudioInput(audio=audio))
-                        )
-                else:
-                    if text_part:
-                        contents.append(Content(type="text", content=text_part))
-        else:
-            contents.extend(
-                Content(type="image", content=ImageInput(image=image))
-                for image in processed_images
-            )
-            contents.extend(
-                self._make_video_content(*video_data) for video_data in processed_videos
-            )
-            contents.extend(
-                Content(type="audio", content=AudioInput(audio=audio))
-                for audio in processed_audios
-            )
-
-        if not contents:
-            input_ids = self.mimo_processor.tokenizer(
-                input_text or "",
-                return_tensors="pt",
-                add_special_tokens=True,
-            ).input_ids
-            return {"input_ids": input_ids}
-
-        input_sample = self.mimo_processor.process(contents, verbose=False)
-
-        ret = {
-            "input_ids": input_sample.input_ids,
-            "mrope_positions": getattr(input_sample, "position_ids", None),
-            "mrope_position_delta": getattr(input_sample, "rope_deltas", None),
-        }
-        if getattr(input_sample, "pixel_values", None):
-            pixel_values = torch.cat(input_sample.pixel_values, dim=0)
-            image_grids = torch.stack(input_sample.image_thw_grids)
-            ret.update(
-                {
-                    "pixel_values": pixel_values,
-                    "image_grid_thw": image_grids,
-                }
-            )
-        if getattr(input_sample, "pixel_values_videos", None):
-            pixel_values_videos = torch.cat(input_sample.pixel_values_videos, dim=0)
-            video_grids = torch.stack(input_sample.video_thw_grids)
-            ret.update(
-                {
-                    "pixel_values_videos": pixel_values_videos,
-                    "video_grid_thw": video_grids,
-                }
-            )
-            second_per_grid_ts = getattr(input_sample, "second_per_grid_ts", None)
-            if second_per_grid_ts is None:
-                second_per_grid_ts = getattr(
-                    input_sample, "video_second_per_grid", None
-                )
-            if second_per_grid_ts is not None:
-                ret["second_per_grid_ts"] = second_per_grid_ts
-            ret["video_start_token_id"] = getattr(
-                self.mimo_processor, "video_start_token_id", None
-            )
-            ret["video_end_token_id"] = getattr(
-                self.mimo_processor, "video_end_token_id", None
-            )
-        audio_inputs = getattr(input_sample, "audio_inputs", None)
-        if audio_inputs is not None and len(audio_inputs) > 0:
-            ret["audio_features"] = audio_inputs
-            audio_attention_mask = getattr(
-                input_sample, "audio_attention_mask", None
-            ) or getattr(input_sample, "feature_attention_mask", None)
-            if audio_attention_mask is not None:
-                ret["audio_attention_mask"] = audio_attention_mask
-            audio_feature_lens = getattr(input_sample, "audio_feature_lens", None)
-            if audio_feature_lens is None:
-                audio_feature_lens = audio_attention_mask
-                if audio_feature_lens is not None:
-                    audio_feature_lens = audio_feature_lens.sum(dim=-1)
-            if audio_feature_lens is not None:
-                ret["audio_feature_lens"] = audio_feature_lens
-
-        device = kwargs.get("device")
-        if device:
-            for key in (
-                "pixel_values",
-                "image_grid_thw",
-                "pixel_values_videos",
-                "video_grid_thw",
-                "audio_features",
-                "audio_feature_lens",
-            ):
-                if key in ret and isinstance(ret[key], torch.Tensor):
-                    ret[key] = ret[key].to(device)
-
-        return ret
 
     async def process_mm_data_async(
         self,

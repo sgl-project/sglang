@@ -15,6 +15,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import alloc_tracking_slots
 from sglang.srt.mem_cache.kv.advance import advance_tracking
@@ -51,7 +55,9 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     req.kv.kv_committed_len = 2
 
     batch = ScheduleBatch(reqs=[req])
-    batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
+    batch.token_to_kv_pool_allocator = SimpleNamespace(
+        storage=None, state=SimpleNamespace(tracks_decode_state=True)
+    )
     batch.tree_cache = SimpleNamespace(
         page_size=TRACK_INTERVAL, supports_mamba=lambda: False
     )
@@ -59,9 +65,6 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     batch.model_config = SimpleNamespace(is_encoder_decoder=False)
     batch.enable_overlap = True
     batch.spec_algorithm = SimpleNamespace(is_none=lambda: True)
-    batch.sampling_info = SimpleNamespace(
-        penalizer_orchestrator=SimpleNamespace(is_required=False)
-    )
     batch.hisparse_coordinator = None
     batch.seq_lens = torch.tensor([2], dtype=torch.int64)
     batch.seq_lens_cpu = torch.tensor([2], dtype=torch.int64)
@@ -97,6 +100,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         output_streamer=MagicMock(),
         abort_request=lambda *args, **kwargs: None,
         still_in_batch=lambda req: True,
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
     )
 
 
@@ -290,7 +294,8 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         batch.token_to_kv_pool_allocator = SimpleNamespace(
             storage=storage,
             state=SimpleNamespace(
-                slots=SimpleNamespace(slots_fit=lambda count: count <= int(took))
+                slots=SimpleNamespace(slots_fit=lambda count: count <= int(took)),
+                tracks_decode_state=True,
             ),
         )
         return req, batch

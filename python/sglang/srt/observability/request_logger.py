@@ -17,10 +17,11 @@ import dataclasses
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
+from sglang.srt.constants import ROUTING_KEY_HEADER
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.runtime_context import get_context, get_exec
-from sglang.srt.sampling.watermarking.core import (
+from sglang.srt.sampling.watermarking.redaction import (
     WATERMARK_CONTAINER_FIELD_NAMES,
     WATERMARK_SECRET_FIELD_NAMES,
     redact_watermark_secrets,
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_WHITELISTED_HEADERS = ["x-smg-routing-key"]
+_DEFAULT_WHITELISTED_HEADERS = [ROUTING_KEY_HEADER]
 WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
     h.lower() for h in envs.SGLANG_LOG_REQUEST_HEADERS.get()
 ]
@@ -169,6 +170,10 @@ class RequestLogger:
 
         self.metadata = self._compute_metadata()
         self.targets = self._setup_targets()
+
+    def logs_field_on_finish(self, name: str) -> bool:
+        _, skip_names, _ = self.metadata
+        return self.log_requests and name not in (skip_names or ())
 
     def log_received_request(
         self,
