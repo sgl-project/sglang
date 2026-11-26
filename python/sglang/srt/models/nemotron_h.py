@@ -1037,6 +1037,14 @@ class NemotronHForCausalLM(nn.Module):
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
+    @property
+    def start_layer(self) -> int:
+        return self.model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.model.end_layer
+
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.model.embed_tokens
 
