@@ -8,10 +8,7 @@ from contextlib import contextmanager
 import torch
 
 from sglang.srt.mem_cache.device_pool_info import PageEnvelopeBufferInfo
-from sglang.srt.mem_cache.pool_host.base import (
-    _trim_host_allocator,
-    host_memory_preflight,
-)
+from sglang.srt.mem_cache.pool_host.base import host_memory_preflight
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
@@ -278,7 +275,6 @@ class _SharedPageEnvelopeHostBacking:
                 self.fd = None
             finally:
                 self._finish_compaction()
-            _trim_host_allocator()
 
     def resume_memory_occupation(self, name: str) -> None:
         """Re-map the backing if an earlier resume did not, then rejoin it."""

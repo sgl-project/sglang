@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import abc
-import ctypes
-import ctypes.util
-import gc
 import logging
 import threading
 from collections.abc import Iterable
@@ -401,57 +398,12 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     return synced_size
 
 
-try:
-    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
-    _libc.malloc_trim.argtypes = [ctypes.c_size_t]
-    _libc.malloc_trim.restype = ctypes.c_int
-except (AttributeError, OSError):
-    # No glibc malloc_trim (e.g. a musl host): release still drops the buffers,
-    # the freed pages just stay in the allocator instead of going back to the OS.
-    _libc = None
-
-
 def _iter_tensors(value):
     if isinstance(value, torch.Tensor):
         yield value
     elif isinstance(value, (list, tuple)):
         for item in value:
             yield from _iter_tensors(item)
-
-
-def _npu_host_cache_stats() -> tuple[object, object] | None:
-    """(hostMemoryStats, hostEmptyCache) of torch_npu, if this build has them."""
-    try:
-        import torch_npu
-    except ImportError:
-        return None
-    stats = getattr(torch_npu._C, "_npu_hostMemoryStats", None)
-    empty = getattr(torch_npu._C, "_npu_hostEmptyCache", None)
-    if stats is None or empty is None:
-        return None
-    return stats, empty
-
-
-def _trim_host_allocator() -> int:
-    """Return host pages freed by dropped buffers to the OS.
-
-    Returns the bytes the allocator actually handed back, which is what tells
-    the operator whether the DRAM of an offloaded pool is really gone.
-    """
-    gc.collect()
-    if _libc is not None:
-        _libc.malloc_trim(0)
-    # glibc cannot see torch_npu's pinned host blocks: freeing the tensors only
-    # parks them in that allocator's cache, so the pool's DRAM stays resident
-    # until the cache is emptied.
-    npu = _npu_host_cache_stats()
-    if npu is None:
-        return 0
-    stats, empty = npu
-    before = int(stats()["allocated_bytes"]["current"])
-    empty()
-    after = int(stats()["allocated_bytes"]["current"])
-    return max(before - after, 0)
 
 
 def synchronized(func):
@@ -683,13 +635,10 @@ class HostKVCache(abc.ABC):
         self.num_release_slots = 0
         self.slot_used = torch.empty((0,), dtype=torch.bool)
         self._host_memory_released = True
-        returned = _trim_host_allocator()
         logger.info(
-            "Released %.2f GB host memory of HiCache pool %s (allocator returned "
-            "%.2f GB to the OS).",
+            "Released %.2f GB of HiCache host buffers for pool %s.",
             self._requested_host_memory_bytes() / 1e9,
             self._host_pool_label,
-            returned / 1e9,
         )
 
     @synchronized
