@@ -452,11 +452,12 @@ def _get_config_info(
     load_external_model_package()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
-    # 0. Explicit model_id override: match by short name
+    # 0. Explicit model_id override: match a complete repo ID or its short name
     if model_id is not None:
         model_id_lower = model_id.lower()
         for registered_hf_id in all_model_hf_paths:
-            if get_model_short_name(registered_hf_id).lower() == model_id_lower:
+            hf_id = registered_hf_id.lower()
+            if model_id_lower in (hf_id, get_model_short_name(hf_id)):
                 logger.debug(
                     f"Resolved model via explicit --model-id '{model_id}' → '{registered_hf_id}'."
                 )
