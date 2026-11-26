@@ -119,8 +119,8 @@ class NgramCorpus:
         Find all leaf paths according to the binary tree_mask (i.e., paths that are not prefixes of any other path).
 
         Args:
-            mask   : List[List[int]]   # nxn binary matrix
-            tokens : List[int]         # token list corresponding to columns
+            tree_mask : List[List[int]]   # nxn binary matrix
+            tokens    : List[int]         # token list corresponding to columns
 
         Returns:
             List[List[int]]            # token lists of only the leaf paths, preserving their order of appearance

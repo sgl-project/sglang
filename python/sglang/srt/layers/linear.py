@@ -220,7 +220,6 @@ class LinearBase(torch.nn.Module):
     Args:
         input_size: input dimension of the linear layer.
         output_size: output dimension of the linear layer.
-        bias: If true, add bias.
         skip_bias_add: If true, skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.

@@ -405,7 +405,7 @@ class MoonVision3dPatchEmbed(nn.Module):
         """
         Args:
             x (L, Channels): input tensor
-            grid_hws (N, 3): temporal, height and width
+            grid_thws (N, 3): temporal, height and width
         Returns:
             (L, Cout) tensor
         """
