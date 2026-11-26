@@ -1346,9 +1346,7 @@ def _tree_accept(
         accept_lens = num_correct_drafts + 1
     if mask_rows is not None:
         from sglang.srt.runtime_context import get_exec
-        from sglang.srt.speculative.spec_sampling_mask import (
-            SpeculativeSamplingMaskCapture,
-        )
+        from sglang.srt.speculative.spec_sampling_mask import build_ngram_sampling_mask
 
         # NGRAM has a branching tree and supplies no compact UNO top-k, so the
         # sampling path above must have captured the dense verifier's target.
@@ -1356,16 +1354,13 @@ def _tree_accept(
             raise RuntimeError(
                 "Missing target probabilities for the NGRAM sampling mask."
             )
-        # -1 marks unused positions; commit_lens discards them at materialization.
-        rows = accept_index.clamp_min(0)
-        capture = SpeculativeSamplingMaskCapture(
-            target_probs=mask_target_probs,
-            batch_indices=mask_rows,
-            max_top_k=get_exec().features.sampling_mask_max_tokens,
-            support_capture_indices=batch.sampling_info.sampling_support_logprobs_capture_indices,
-        )
-        logits_output.sampling_mask_output = capture.build_output(
-            out_tokens=predict[rows].long(), commit_lens=accept_lens, accept_index=rows
+        logits_output.sampling_mask_output = build_ngram_sampling_mask(
+            batch.sampling_info,
+            mask_target_probs,
+            predict,
+            accept_index,
+            accept_lens,
+            get_exec().features.sampling_mask_max_tokens,
         )
         # Every replica must make the same request-abort decision.
         tp_group = (

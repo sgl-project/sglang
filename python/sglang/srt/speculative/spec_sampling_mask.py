@@ -143,17 +143,11 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
                 # both the committed token and the target row that emitted it.
                 rows = accept_index.index_select(0, batch_indices)
                 target_probs = self.target_probs.flatten(0, 1)[rows]
-            # A tree verifier can keep cutoff ties beyond the packing limit.
-            # One extra value detects overflow without scanning the whole row.
-            pack_width = min(
-                max_top_k + int(accept_index is not None), target_probs.shape[-1]
-            )
             support_probs, support_tokens = torch.topk(
-                target_probs, k=pack_width, dim=-1
+                target_probs, k=max_top_k, dim=-1
             )
+            support_tokens = support_tokens.to(torch.int32)
             support_lens = (support_probs > 0).sum(dim=-1, dtype=torch.int32)
-            support_probs = support_probs[..., :max_top_k]
-            support_tokens = support_tokens[..., :max_top_k].to(torch.int32)
             selected_logprobs = torch.log(
                 target_probs.gather(-1, output_tokens.unsqueeze(-1)).squeeze(-1)
             )
@@ -192,11 +186,6 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
             int(SamplingMaskStatus.OK),
             int(SamplingMaskStatus.INVALID),
         ).to(torch.int8)
-        if accept_index is not None:
-            statuses.masked_fill_(
-                (statuses == SamplingMaskStatus.OK) & (support_lens > self.max_top_k),
-                SamplingMaskStatus.OVERFLOW,
-            )
         return SamplingMaskOutput(
             token_ids=support_tokens,
             lengths=support_lens,
@@ -205,3 +194,33 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
             statuses=statuses,
             num_accept_tokens=num_accept_tokens,
         )
+
+
+def build_ngram_sampling_mask(
+    sampling_info, target_probs, predict, accept_index, accept_lens, max_tokens
+):
+    # Unused tree slots are -1. Materialization discards them using accept_lens.
+    rows = accept_index.clamp_min(0)
+    # Until shared speculative packing detects truncated support (#51653),
+    # ask for a sentinel column so ties cannot silently exceed the server cap.
+    capture = SpeculativeSamplingMaskCapture(
+        target_probs=target_probs,
+        batch_indices=sampling_info.sampling_mask_batch_indices,
+        max_top_k=max_tokens + 1,
+        support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
+    )
+    output = capture.build_output(
+        out_tokens=predict[rows].long(), commit_lens=accept_lens, accept_index=rows
+    )
+    if output.token_ids.shape[-1] > max_tokens:
+        output.statuses.masked_fill_(
+            (output.statuses == SamplingMaskStatus.OK) & (output.lengths > max_tokens),
+            SamplingMaskStatus.OVERFLOW,
+        )
+        output.lengths.clamp_max_(max_tokens)
+        output.token_ids = output.token_ids[..., :max_tokens].contiguous()
+        if output.support_logprobs is not None:
+            output.support_logprobs = output.support_logprobs[
+                ..., :max_tokens
+            ].contiguous()
+    return output
