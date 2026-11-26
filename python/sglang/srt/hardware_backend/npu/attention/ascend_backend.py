@@ -2016,11 +2016,13 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv = actual_seq_lengths_kv.to(
             device=q_nope.device, dtype=torch.int32
         )
-        if packed_kv.dtype == torch.int8 and self.qk_rope_head_dim == 0:
+        if self.qk_rope_head_dim == 0:
             from sgl_kernel_npu.operators.attention import (
                 kv_quant_sparse_flash_attention,
             )
 
+            if packed_kv.dtype == torch.float8_e4m3fn:
+                packed_kv = packed_kv.view(torch.uint8)
             # The indexer supplies causal indices for the packed operator.
             return kv_quant_sparse_flash_attention(
                 query=q_nope,
@@ -2171,9 +2173,10 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        # The native SFA path requires 64-dimensional query_rope for NoPE.
-        if self.qk_rope_head_dim == 0 and not (
-            self.token_to_kv_pool.dsa_kv_cache_store_fp8 and k_nope.dtype == torch.int8
+        # Non-packed SFA requires 64-dimensional RoPE for NoPE.
+        if (
+            self.qk_rope_head_dim == 0
+            and not self.token_to_kv_pool.dsa_kv_cache_store_fp8
         ):
             if is_npu_arch35():
                 k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
