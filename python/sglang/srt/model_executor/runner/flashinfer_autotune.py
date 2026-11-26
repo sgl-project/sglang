@@ -580,19 +580,20 @@ def maybe_flashinfer_autotune_extend(
 ) -> None:
     """Also autotune kernels at the prefill token ceiling.
 
-    The decode-shaped autotune only covers token counts up to the decode
-    batch size, so larger prefill/extend batches fall outside the tuned
-    buckets and run flashinfer's default heuristic — which can be far
-    slower than the tuned tactic (e.g. trtllm-gen fp4 MoE is ~30% slower
-    untuned at >=8k tokens on sm100). One extra forward at the largest
-    per-rank extend token count tunes all buckets up to it.
+    The decode-shaped autotune only covers token counts up to
+    ``decode_num_tokens`` (decode or speculative verify rows), so larger
+    prefill/extend batches fall outside the tuned buckets and run flashinfer's
+    default heuristic — which can be far slower than the tuned tactic (e.g.
+    trtllm-gen fp4 MoE is ~30% slower untuned at >=8k tokens on sm100). One
+    extra forward at the largest per-rank extend token count tunes all buckets
+    up to it. A model-owned ``autotune_prefill_kernels`` hook instead receives
+    the larger of the prefill ceiling and ``decode_num_tokens``, so it also
+    covers the widest verify-row bucket.
     """
     mr = runner.model_runner
     # Prefer the per-rank scheduler buffer while preserving the legacy ceiling
     # when chunked prefill is disabled.
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
-    if num_tokens <= (decode_num_tokens or 0):
-        return  # decode-shaped autotune already covered these buckets
     # DSpark's dummy forward is TARGET_VERIFY-shaped and misses large prefill GEMMs.
     prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
     wants_prefill_autotune = getattr(mr.model, "wants_prefill_autotune", None)
@@ -602,10 +603,14 @@ def maybe_flashinfer_autotune_extend(
         prefill_autotune = None
     if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
         with flashinfer_autotune_context(mr, run_lm_head=False):
-            tuned = prefill_autotune(num_tokens, dtype=mr.dtype)
+            tuned = prefill_autotune(
+                max(num_tokens, decode_num_tokens or 0), dtype=mr.dtype
+            )
         if tuned:
             return
 
+    if num_tokens <= (decode_num_tokens or 0):
+        return  # decode-shaped autotune already covered these buckets
     if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
         return
     if not mr.is_generation or mr.is_draft_worker:
