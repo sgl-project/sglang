@@ -817,32 +817,25 @@ class MiMoAudioTokenizer(PreTrainedModel):
 
 
 def group_by_length(features: torch.Tensor, lengths: torch.Tensor, max_length: int):
-    if features.size(0) != lengths.sum().item():
-        raise ValueError(
-            f"Feature size mismatch: {features.size(0)} vs {lengths.sum().item()}"
-        )
-
-    split_points = []
-    current_sum = 0
-
-    for i, seq_len in enumerate(lengths):
-        if current_sum + seq_len > max_length and current_sum > 0:
-            split_points.append(i)
-            current_sum = seq_len.item()
-        else:
-            current_sum += seq_len.item()
-
-    # Convert split points to group sizes
     group_sizes = []
-    prev = 0
-    for point in split_points:
-        group_sizes.append(point - prev)
-        prev = point
-    if prev < len(lengths):
-        group_sizes.append(len(lengths) - prev)
+    feature_sizes = []
+    count = frames = 0
+    for length in lengths.tolist():
+        if frames > 0 and frames + length > max_length:
+            group_sizes.append(count)
+            feature_sizes.append(frames)
+            count = frames = 0
+        count += 1
+        frames += length
+    if count:
+        group_sizes.append(count)
+        feature_sizes.append(frames)
+
+    total_frames = sum(feature_sizes)
+    if features.size(0) != total_frames:
+        raise ValueError(f"Feature size mismatch: {features.size(0)} vs {total_frames}")
 
     len_groups = torch.split(lengths, group_sizes)
-    feature_sizes = [group.sum().item() for group in len_groups]
     feature_groups = torch.split(features, feature_sizes)
 
     return feature_groups, len_groups
@@ -860,7 +853,9 @@ def encode_batch(
     encoded_parts = []
     for features, lengths in zip(feature_groups, len_groups):
         codes, _ = audio_tokenizer_encoder.encode(  # codes are also packed
-            input_features=features, input_lens=lengths, return_codes_only=True
+            input_features=features,
+            input_lens=lengths.to(features.device),
+            return_codes_only=True,
         )
         encoded_parts.append(codes)
 
@@ -890,7 +885,7 @@ def tokenize_audio_batch(mels, audio_tokenizer_encoder, segment_size=6000, devic
     input_len_seg_per_mel = [_segment_lengths_for_mel(m, segment_size) for m in mels]
     input_lens_flat = [s for segs in input_len_seg_per_mel for s in segs]
     input_features = torch.cat([m.to(device) for m in mels], dim=0)
-    input_lens_t = torch.tensor(input_lens_flat, dtype=torch.long, device=device)
+    input_lens_t = torch.tensor(input_lens_flat, dtype=torch.long, device="cpu")
     codes_packed = encode_batch(
         audio_tokenizer_encoder,
         input_features=input_features,
@@ -898,15 +893,12 @@ def tokenize_audio_batch(mels, audio_tokenizer_encoder, segment_size=6000, devic
     )
     codes = codes_packed.transpose(0, 1).detach()  # [total_code_T, C]
     # Code length per mel: must match encoder's actual output (get_output_length + optional avg_pooler downsampling)
-    code_lengths = []
-    for segs in input_len_seg_per_mel:
-        out_len = audio_tokenizer_encoder.get_output_length(
-            torch.tensor(segs, dtype=torch.long, device=device)
-        )
-        if getattr(audio_tokenizer_encoder, "down_sample_layer", None) is not None:
-            avg = audio_tokenizer_encoder.config.avg_pooler
-            out_len = out_len // avg + (out_len % avg != 0).long()
-        code_lengths.append(out_len.sum().item())
+    out_len = audio_tokenizer_encoder.get_output_length(input_lens_t)
+    if getattr(audio_tokenizer_encoder, "down_sample_layer", None) is not None:
+        avg = audio_tokenizer_encoder.config.avg_pooler
+        out_len = out_len // avg + (out_len % avg != 0).long()
+    segments_per_mel = [len(segs) for segs in input_len_seg_per_mel]
+    code_lengths = [part.sum().item() for part in out_len.split(segments_per_mel)]
     code_list = torch.split(codes, code_lengths)
     return list(code_list)
 
