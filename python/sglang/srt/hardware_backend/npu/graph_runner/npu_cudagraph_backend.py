@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
@@ -67,13 +68,19 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
         self._tp_group = get_parallel().tp_group
+        if (
+            self._tp_group.world_size > 1
+            and is_deepseek_v4(cuda_graph_runner.model_runner.model_config.hf_config)
+            and not is_npu_arch35()
+        ):
+            # On A3, initialize HCCP before the graph's first AICPU metadata op.
+            warmup = torch.zeros(1, device=f"npu:{self._device_id}")
+            torch.distributed.all_reduce(warmup, group=self._tp_group.device_group)
+            self._device_module.synchronize()
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
-        )
-        self._enable_torch_compile = getattr(
-            cuda_graph_runner, "enable_torch_compile", False
         )
         # Reuse one device-bound worker for graph input updates.
         self._update_executor = ThreadPoolExecutor(
@@ -345,9 +352,12 @@ class NPUCudaGraphBackend(BaseGraphBackend):
     def prepare_capture_forward(self, model, enable_compile, **kwargs):
         """Yield the capture forward callable; restore temporary state on exit."""
         if enable_compile:
+            # fullgraph=False: holding it would mean reworking the msgspec
+            # state objects on the shared model execution path, which Dynamo
+            # cannot construct, for +0.07%..+1.25%.
             yield torch.compile(
                 torch.no_grad()(model.forward),
-                fullgraph=True,
+                fullgraph=False,
                 dynamic=False,
                 backend=get_compiler_backend("npugraph_ex"),
             )
@@ -434,11 +444,6 @@ class NPUCudaGraphBackend(BaseGraphBackend):
 
         graph = torch.npu.NPUGraph()
 
-        if self._enable_torch_compile:
-            skip_guard_context = torch.compiler.set_stance(skip_guard_eval_unsafe=True)
-        else:
-            skip_guard_context = empty_context()
-
         graph_ctx: Callable[..., AbstractContextManager]
         if (
             self._memory_saver_adapter is not None
@@ -451,14 +456,11 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         else:
             graph_ctx = torch.npu.graph
 
-        with (
-            skip_guard_context,
-            graph_ctx(
-                graph,
-                pool=self._pool,
-                stream=self._capture_stream,
-                auto_dispatch_capture=True,
-            ),
+        with graph_ctx(
+            graph,
+            pool=self._pool,
+            stream=self._capture_stream,
+            auto_dispatch_capture=True,
         ):
             out = forward_fn()
 

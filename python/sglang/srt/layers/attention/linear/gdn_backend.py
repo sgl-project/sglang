@@ -266,15 +266,8 @@ if is_cuda():
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_npu():
-    from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
-    )
-
-    fused_gdn_gating = fused_gdn_gating_npu
-    causal_conv1d_fn = causal_conv1d_fn_npu
-    causal_conv1d_update = causal_conv1d_update_npu
+    from sgl_kernel_npu.operators.attention.gdn import fused_gdn_gating
+    from sgl_kernel_npu.operators.mamba import causal_conv1d_fn, causal_conv1d_update
 elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
 
@@ -378,8 +371,12 @@ class GDNKernelDispatcher:
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: Optional[LinearAttnKernelBackend] = None,
+        *,
+        round_beta_to_input_dtype: bool = False,
     ):
-        triton_kernel = TritonGDNKernel()
+        triton_kernel = TritonGDNKernel(
+            round_beta_to_input_dtype=round_beta_to_input_dtype
+        )
         self.tree_verify_kernel = triton_kernel
         xpu_kernel = None
         if any(
@@ -472,6 +469,8 @@ class GDNKernelDispatcher:
         # supports MTP verify) only applies when no explicit choice was made.
         # SM90 FlashInfer verify requires a fp32 SSM state, so e.g.
         # --mamba-ssm-dtype bfloat16 setups must be able to force Triton here.
+        self.verify_kernel_is_aiter = False
+        self.verify_conv_update = causal_conv1d_update
         if verify_backend is not None and verify_backend.is_triton():
             self.verify_kernel = triton_kernel
             self.verify_kernel_is_flashinfer = False
@@ -479,6 +478,24 @@ class GDNKernelDispatcher:
             self.verify_kernel = xpu_kernel
             self.tree_verify_kernel = xpu_kernel
             self.verify_kernel_is_flashinfer = False
+        elif verify_backend is not None and verify_backend.is_aiter():
+            if not (is_hip() and envs.SGLANG_USE_AITER.get()):
+                raise ValueError(
+                    "--linear-attn-verify-backend aiter requires ROCm with "
+                    "SGLANG_USE_AITER=1"
+                )
+            from aiter.ops.flydsl.causal_conv1d_update_kernels import (
+                causal_conv1d_update_sglang_flydsl,
+            )
+
+            from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
+                AiterGDNKernel,
+            )
+
+            self.verify_kernel = AiterGDNKernel()
+            self.verify_kernel_is_flashinfer = False
+            self.verify_kernel_is_aiter = True
+            self.verify_conv_update = causal_conv1d_update_sglang_flydsl
         elif (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:
@@ -655,7 +672,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
 
     def _create_kernel_dispatcher(self, backends):
-        return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+        self._round_beta_to_input_dtype = (
+            not is_cpu()
+            and not is_npu()
+            and backends.decode.is_triton()
+            and getattr(
+                self._model_runner.model_config.hf_config,
+                "gdn_round_beta_to_input_dtype",
+                False,
+            )
+        )
+        return GDNKernelDispatcher(
+            backends.decode,
+            backends.prefill,
+            backends.verify,
+            round_beta_to_input_dtype=self._round_beta_to_input_dtype,
+        )
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
@@ -670,6 +702,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
         backends = model_runner.linear_attn_backends
+        self._replayssm_verify_num_stages = (
+            envs.SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES.get()
+        )
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
@@ -1444,7 +1479,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_state_indices = select_verify_intermediate_state_indices(
                 self.verify_intermediate_state_indices,
                 forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                lambda: cache_indices[: query_start_loc.shape[0] - 1] >= 0,
                 self.req_to_token_pool.size,
             )
             mamba_pool = self.state_pool
@@ -1486,7 +1521,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
+            mixed_qkv_processed = self.kernel_dispatcher.verify_conv_update(
                 mixed_qkv_reshaped,
                 conv_states,
                 layer.conv_weights,
@@ -1893,6 +1928,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             is_kda=False,
             disable_state_update=True,
             cache_ring=True,
+            round_beta_to_input_dtype=self._round_beta_to_input_dtype,
             replayssm_rawv=layer_cache.replayssm_rawv,
             replayssm_rawk=layer_cache.replayssm_rawk,
             replayssm_g=layer_cache.replayssm_g,
@@ -1983,6 +2019,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            num_stages=self._replayssm_verify_num_stages,
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)

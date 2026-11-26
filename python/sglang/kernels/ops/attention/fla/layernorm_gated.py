@@ -385,14 +385,13 @@ def _layer_norm_fwd(
 
 
 if _is_npu:
-    from sgl_kernel_npu.fla import layernorm_gated as _npu_layernorm_gated
-    from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
+    import sgl_kernel_npu.operators.norm as _npu_norm
+    from sgl_kernel_npu.operators.norm import layer_norm_fwd as _layer_norm_fwd
 
-    # The NPU kernels only started honoring the gate activation in
-    # sgl-project/sgl-kernel-npu#1042; older packages accept the argument and
-    # silently apply swish, so fall back to allowing swish alone.
-    _NPU_GATE_ACTIVATIONS = getattr(
-        _npu_layernorm_gated, "SUPPORTED_GATE_ACTIVATIONS", ("swish",)
+    # Older sgl-kernel-npu wheels ignore `activation` and always compute swish;
+    # newer wheels export SUPPORTED_GATE_ACTIVATIONS on sgl_kernel_npu.operators.norm.
+    _NPU_FUSED_GATE_ACTIVATIONS = getattr(
+        _npu_norm, "SUPPORTED_GATE_ACTIVATIONS", ("swish",)
     )
 
 
@@ -408,7 +407,10 @@ def rms_norm_gated(
     is_rms_norm=False,
     activation: str = "swish",
 ):
-    """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+    """If z is None, return norm(x). Otherwise, return norm(x) * gate(z)
+    if norm_before_gate is True, or norm(x * gate(z)) if False,
+    where gate is the function selected by activation.
+    """
 
     x_shape_og = x.shape
     # reshape input data into 2D tensor
@@ -430,10 +432,42 @@ def rms_norm_gated(
     if bias is not None:
         bias = bias.contiguous()
     if _is_npu:
-        assert activation in _NPU_GATE_ACTIVATIONS, (
-            f"NPU gated RMSNorm supports {_NPU_GATE_ACTIVATIONS}, got {activation!r}; "
-            "a newer sgl-kernel-npu is required for this activation"
+        if activation == "sigmoid" and activation not in _NPU_FUSED_GATE_ACTIVATIONS:
+            # Fallback for older sgl-kernel-npu wheels whose layer_norm_fwd
+            # ignores `activation` and always computes swish(z) = z * sigmoid(z).
+            # Pass z=None so the kernel only normalizes, then apply sigmoid(z):
+            #   norm_before_gate=True:  y = norm(x); output = y * sigmoid(z)
+            #   norm_before_gate=False: output = norm(x * sigmoid(z))
+            gate = None
+            if z is not None:
+                gate = torch.sigmoid(z.reshape_as(x).float())
+
+            norm_input = x
+            if gate is not None and not norm_before_gate:
+                norm_input = (x.float() * gate).to(x.dtype)
+
+            y, _, _ = _layer_norm_fwd(
+                norm_input,
+                weight,
+                bias,
+                eps,
+                z=None,
+                group_size=group_size,
+                norm_before_gate=norm_before_gate,
+                is_rms_norm=is_rms_norm,
+            )
+            if gate is not None and norm_before_gate:
+                y = (y.float() * gate).to(x.dtype)
+
+            return y.reshape(x_shape_og)
+        assert activation in _NPU_FUSED_GATE_ACTIVATIONS, (
+            f"NPU only supports {_NPU_FUSED_GATE_ACTIVATIONS} or 'sigmoid' "
+            f"activation, got {activation!r}"
         )
+        if z is not None and z.shape != x.shape:
+            z = z.reshape_as(x)
+            if z.stride(-1) != 1:
+                z = z.contiguous()
     y, mean, rstd = _layer_norm_fwd(
         x,
         weight,
