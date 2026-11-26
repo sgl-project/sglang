@@ -75,8 +75,9 @@ REMOTE_EVAL_DATASETS = frozenset({"deep_swe"})
 # DeepSWE eval pod: an amd64 node (kubernetes.io/arch=amd64) holding a
 # ``docker:dind`` sidecar plus a python container that drives evalscope.
 # The eval image is the multi-arch sglang image (pulls the amd64 variant on the
-# eval node) which ships Python 3.12, so datacurve-pier installs without the
-# Miniconda fallback. The dind sidecar is pulled from Docker Hub.
+# eval node) which ships Python 3.12 and evalscope, so datacurve-pier is added
+# into a --system-site-packages venv without reinstalling evalscope. The dind
+# sidecar is pulled from Docker Hub.
 DEEPSWE_EVAL_IMAGE = (
     "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050"
 )

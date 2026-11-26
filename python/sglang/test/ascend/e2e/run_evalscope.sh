@@ -13,15 +13,9 @@ pip_mirror_source="${EVALSCOPE_PIP_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/
 # system environment (SGLang pins openai==2.6.1).
 EVALSCOPE_WITH_PIER="${EVALSCOPE_WITH_PIER:-0}"
 
-# datacurve-pier requires Python >= 3.12. The base images we can pull ship an
-# older interpreter, so provision a matching one when needed.
+# datacurve-pier requires Python >= 3.12; the eval image (multi-arch sglang)
+# ships it. Fail clearly if a future image regresses below this.
 EVALSCOPE_MIN_PYTHON="${EVALSCOPE_MIN_PYTHON:-3.12}"
-# Miniconda installer / conda channel (Tsinghua mirror; the pip mirror above is
-# already served from there).
-CONDA_INSTALLER_URL="${CONDA_INSTALLER_URL:-https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-$(uname -m).sh}"
-CONDA_CHANNEL="${CONDA_CHANNEL:-https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main}"
-CONDA_PREFIX="${CONDA_PREFIX:-/opt/py312}"
-CONDA_HOME="${CONDA_HOME:-/opt/miniconda3}"
 
 # Bound key deps so the resolver cannot fall back to ancient versions.
 EVALSCOPE_CONSTRAINTS=(
@@ -53,33 +47,6 @@ find_python_ge_min() {
     done
     if [ -n "${first}" ]; then
         echo "${first}"
-        return 0
-    fi
-    return 1
-}
-
-install_python_via_conda() {
-    if [ -x "${CONDA_PREFIX}/bin/python" ] && py_ge_min "${CONDA_PREFIX}/bin/python"; then
-        echo "${CONDA_PREFIX}/bin/python"
-        return 0
-    fi
-    local installer=/tmp/miniconda.sh
-    # Diagnostics must go to stderr: this function's stdout is captured as the
-    # interpreter path by the caller.
-    echo "No Python >= ${EVALSCOPE_MIN_PYTHON} found; installing Miniconda from ${CONDA_INSTALLER_URL}" >&2
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 3 --connect-timeout 15 -o "${installer}" "${CONDA_INSTALLER_URL}" >&2 || return 1
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "${installer}" "${CONDA_INSTALLER_URL}" >&2 || return 1
-    else
-        echo "Neither curl nor wget is available to download Miniconda" >&2
-        return 1
-    fi
-    bash "${installer}" -b -p "${CONDA_HOME}" >/dev/null 2>&1 || return 1
-    "${CONDA_HOME}/bin/conda" create -y --override-channels -c "${CONDA_CHANNEL}" \
-        -p "${CONDA_PREFIX}" "python=${EVALSCOPE_MIN_PYTHON}" >/dev/null 2>&1 || return 1
-    if [ -x "${CONDA_PREFIX}/bin/python" ] && py_ge_min "${CONDA_PREFIX}/bin/python"; then
-        echo "${CONDA_PREFIX}/bin/python"
         return 0
     fi
     return 1
@@ -148,10 +115,8 @@ BASE_PYTHON="python"
 if [ "${EVALSCOPE_WITH_PIER}" = "1" ]; then
     if BASE_PYTHON="$(find_python_ge_min)"; then
         echo "Using ${BASE_PYTHON} (>= ${EVALSCOPE_MIN_PYTHON})"
-    elif BASE_PYTHON="$(install_python_via_conda)"; then
-        echo "Using conda python ${BASE_PYTHON} (>= ${EVALSCOPE_MIN_PYTHON})"
     else
-        echo "ERROR: datacurve-pier requires Python >= ${EVALSCOPE_MIN_PYTHON} and none could be provisioned." >&2
+        echo "ERROR: datacurve-pier requires Python >= ${EVALSCOPE_MIN_PYTHON}; none found in this image." >&2
         exit 1
     fi
     if ! printf '%s' "${BASE_PYTHON}" | grep -Eq '^[^[:space:]]+$'; then
