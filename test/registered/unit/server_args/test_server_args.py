@@ -1734,7 +1734,7 @@ class TestLoraForwardDomains(unittest.TestCase):
                     check_lora_server_args(args)
 
 
-class TestLoadBalanceMethod(unittest.TestCase):
+class TestLoadBalanceMethod(CustomTestCase):
     def test_decode_session_tokens_requires_decode(self):
         for role in ("null", "prefill"):
             with (
