@@ -19,6 +19,7 @@ from sglang.srt.configs.inkling2 import (
     Inkling2MMConfig,
     Inkling2ModelConfig,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_config
 from sglang.srt.layers import logits_processor as logits_module
 from sglang.srt.layers.logits_processor import LogitsMetadata
@@ -30,6 +31,7 @@ from sglang.srt.models.inkling2 import (
     Inkling2LogitsProcessor,
 )
 from sglang.srt.models.inkling2_vision import Inkling2VisionEncoder
+from sglang.srt.models.inkling_common import inkling2_expert_placement as placement
 from sglang.srt.models.inkling_common import inkling2_moe as moe
 from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
 from sglang.srt.multimodal.media_io import ImageData
@@ -769,3 +771,94 @@ def test_multimodal_requires_explicit_enable(tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ===== Static expert placement =====
+PLACE_EXPERTS, PLACE_EP, PLACE_HIDDEN, PLACE_TOPK = 16, 4, 8, 2
+
+
+def _placement_experts(full, slots):
+    """Concatenate every rank's loaded rows, i.e. the model's experts in slot order."""
+    rows = []
+    for rank in range(PLACE_EP):
+        shard = SimpleNamespace(
+            expert_slots=slots,
+            num_global_experts=PLACE_EXPERTS,
+            ep_size=PLACE_EP,
+            ep_rank=rank,
+        )
+        rows.append(moe.Inkling2Experts._local_expert_rows(shard, full))
+    return torch.cat(rows)
+
+
+def _placement_moe(gate_weight, experts, x):
+    """Reference routed MoE: top-k over gate scores, weighted sum of expert outputs."""
+    scores = x @ gate_weight.T
+    weights, ids = scores.softmax(-1).topk(PLACE_TOPK, dim=-1)
+    return torch.einsum(
+        "tk,tkd->td", weights, torch.einsum("tkdh,th->tkd", experts[ids], x)
+    )
+
+
+def test_placement_preserves_routed_output():
+    """Slot s must hold logical expert slots[s] in BOTH the gate rows and the expert
+    shards; using the inverse permutation in either place routes to the wrong expert."""
+    torch.manual_seed(0)
+    gate_weight = torch.randn(PLACE_EXPERTS, PLACE_HIDDEN)
+    experts = torch.randn(PLACE_EXPERTS, PLACE_HIDDEN, PLACE_HIDDEN)
+    x = torch.randn(32, PLACE_HIDDEN)
+    slots = torch.randperm(PLACE_EXPERTS)
+
+    config = SimpleNamespace(
+        num_experts_per_tok=PLACE_TOPK,
+        route_scale=1.0,
+        n_routed_experts=PLACE_EXPERTS,
+        hidden_size=PLACE_HIDDEN,
+        use_gate_bias=False,
+    )
+    gate = moe.Inkling2Gate(config, expert_slots=slots)
+    gate._load_placed_rows(gate.weight, gate_weight)
+
+    placed = _placement_moe(gate.weight.data, _placement_experts(experts, slots), x)
+    torch.testing.assert_close(placed, _placement_moe(gate_weight, experts, x))
+
+
+def test_contiguous_when_unset():
+    with envs.SGLANG_OPT_INKLING2_EXPERT_PLACEMENT_FILE.override(None):
+        assert (
+            placement.expert_slots_for_layer(
+                layer_id=0, num_experts=PLACE_EXPERTS, ep_size=PLACE_EP
+            )
+            is None
+        )
+
+
+def test_rejects_non_permutation(tmp_path):
+    """A slot list that repeats or drops an expert would load silently and misroute."""
+    path = tmp_path / "placement.json"
+    order = list(range(PLACE_EXPERTS))
+    order[-1] = 0
+    path.write_text(json.dumps({"slots": {"0": order}}))
+    placement._load_placement.cache_clear()
+    with envs.SGLANG_OPT_INKLING2_EXPERT_PLACEMENT_FILE.override(str(path)):
+        with pytest.raises(ValueError, match="not a permutation"):
+            placement.expert_slots_for_layer(
+                layer_id=0, num_experts=PLACE_EXPERTS, ep_size=PLACE_EP
+            )
+
+
+def test_balance_keeps_shard_size_and_lowers_max_load():
+    """Kernels assume E/ep experts per rank; balancing must hold that while it
+    lowers the most loaded rank of an index-correlated popularity."""
+    counts = [1000 // (e + 1) for e in range(PLACE_EXPERTS)]
+    slots = placement.balance_slots(counts, PLACE_EP)
+    per_rank = PLACE_EXPERTS // PLACE_EP
+    assert sorted(slots) == list(range(PLACE_EXPERTS))
+
+    def max_load(order):
+        return max(
+            sum(counts[e] for e in order[r * per_rank : (r + 1) * per_rank])
+            for r in range(PLACE_EP)
+        )
+
+    assert max_load(slots) < max_load(list(range(PLACE_EXPERTS)))
