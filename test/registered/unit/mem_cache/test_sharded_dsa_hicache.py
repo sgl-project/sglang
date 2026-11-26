@@ -77,6 +77,7 @@ class TestShardedDSAHiCache(CustomTestCase):
             l2_transfer_engine=SimpleNamespace(submit_host_to_device=submit),
             transfer_layer_id_max=3,
             mem_pool_device_allocator=Mock(),
+            kv_storage=None,
             _num_tokens_by_pool=lambda op: {"kv": 64},
             _transfer_num_bytes=lambda op: 0,
         )

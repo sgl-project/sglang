@@ -43,13 +43,16 @@ def _head(*, depth, local_layer_ids=(1,), local_extent=64, window=128):
     """A stand-in for the MTP head: only what the window method reads."""
     from sglang.srt.models.inkling import InklingForConditionalGenerationMTP
 
+    text_config = SimpleNamespace(
+        mtp_local_layer_ids=list(local_layer_ids),
+        mtp_local_extent=local_extent,
+        sliding_window_size=window,
+    )
     head = SimpleNamespace(
         draft_model_idx=depth,
-        text_config=SimpleNamespace(
-            mtp_local_layer_ids=list(local_layer_ids),
-            mtp_local_extent=local_extent,
-            sliding_window_size=window,
-        ),
+        text_config=text_config,
+        config=SimpleNamespace(text_config=text_config),
+        sliding_layer_window_size=InklingForConditionalGenerationMTP.sliding_layer_window_size,
     )
     head.get_attention_sliding_window_size = (
         InklingForConditionalGenerationMTP.get_attention_sliding_window_size.__get__(

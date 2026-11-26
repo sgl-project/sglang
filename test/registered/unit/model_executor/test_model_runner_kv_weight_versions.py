@@ -146,12 +146,17 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
             out_cache_loc=None,
             has_grammar=False,
             return_logprob=False,
+            sampling_info=SimpleNamespace(step_penalties=None),
         )
         tokens = torch.tensor([1])
         post = (tokens, tokens, tokens, tokens, tokens, None)
         target_worker = SimpleNamespace(
             forward_batch_generation=lambda **_: output,
-            model_runner=SimpleNamespace(canary_manager=None),
+            model_runner=SimpleNamespace(
+                canary_manager=None,
+                watermark=None,
+                attn_backend=SimpleNamespace(verify_mask=None),
+            ),
         )
 
         with (
@@ -165,6 +170,7 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
         ):
             result = eagle_worker_common.run_eagle_verify(
                 batch=batch,
+                speculative_runtime_hooks=eagle_worker_common.STOCK_SPECULATIVE_RUNTIME_HOOKS,
                 target_worker=target_worker,
                 req_to_token_pool=None,
                 token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: None),
@@ -173,7 +179,6 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
                 topk=1,
                 num_draft_tokens=2,
                 device="cpu",
-                metadata_ready_pre_pad=False,
                 finalize_tree_path=True,
                 post_verify_graphs=SimpleNamespace(run=lambda **_: post),
             )

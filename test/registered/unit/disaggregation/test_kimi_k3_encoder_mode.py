@@ -20,10 +20,10 @@ from sglang.srt.disaggregation.encoder.receiver import (
     WaitingZmqRequest,
 )
 from sglang.srt.disaggregation.encoder.server import MMEncoder
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -302,8 +302,7 @@ def test_epd_encoder_reuses_scheduler_zmq_peer():
         config_override = get_context().override_server_args(
             encoder_transfer_backend="zmq_to_scheduler"
         )
-        with config_override as server_args:
-            encoder.server_args = server_args
+        with config_override:
             encoder.transfer_backend = "zmq_to_scheduler"
             encoder.use_mooncake = False
             encoder.send_timeout = 3
@@ -378,8 +377,7 @@ def test_epd_encoder_pipelines_zero_copy_sends_per_peer():
         config_override = get_context().override_server_args(
             encoder_transfer_backend="zmq_to_scheduler"
         )
-        with config_override as server_args:
-            encoder.server_args = server_args
+        with config_override:
             encoder.transfer_backend = "zmq_to_scheduler"
             encoder.use_mooncake = False
             encoder.send_timeout = 1

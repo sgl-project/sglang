@@ -7,7 +7,7 @@ import torch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
@@ -372,6 +372,9 @@ class EagleDraftExtendInput(SpecInput):
 
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
     dsa_seed_topk_select: Optional[torch.Tensor] = None
+
+    # Only write the draft KV cache; the forward returns no logits or hidden states.
+    kv_only: bool = False
 
     # Flat per-req index of each request's last accepted window row
     # (i * window + front + num_correct_drafts[i]). When set, the logits

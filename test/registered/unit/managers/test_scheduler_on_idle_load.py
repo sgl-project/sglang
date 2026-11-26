@@ -2,7 +2,8 @@
 
 A non-storage no-batch stall spins on_idle without sleeping, so the gate must
 cap the O(queue) get_loads for both the DP-balancing writer and the load
-socket. Work held outside the admitted request queues (async SHM
+socket, while an attention-DP rank stepping only idle batches must publish
+every step. Work held outside the admitted request queues (async SHM
 materialization) must keep the scheduler non-idle. CPU-only: builds a bare
 Scheduler with mocked collaborators, like test_scheduler_flush_cache.
 """
@@ -18,9 +19,25 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import AsyncShmMaterializer
+from sglang.srt.models.unlimited_ocr_v2_support.request_receiver import (
+    UocrRequestReceiver,
+)
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
 )
@@ -31,8 +48,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class TestOnIdleStallPublish(CustomTestCase):
     def _stalled_scheduler(self) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
+        s.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            request_retirer=None,
+            send_abort=None,
+        )
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.disaggregation_mode = DisaggregationMode.NULL
         s.enable_lmcache = False
         s.maybe_send_health_check_signal = MagicMock()
@@ -42,6 +66,7 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.load_inquirer = MagicMock()
         s.metrics_reporter = MagicMock()
         s.dp_attn_adapter = MagicMock()
+        s.request_receiver = object.__new__(SchedulerRequestReceiver)
         s._last_stall_publish_ts = float("-inf")
         return s
 
@@ -58,6 +83,42 @@ class TestOnIdleStallPublish(CustomTestCase):
             mono.return_value = 100.10  # > LOAD_STALL_REFRESH_S
             s.on_idle()
         self.assertEqual(s.publish_load_snapshot.call_count, 2)
+
+
+class TestBatchResultPublish(CustomTestCase):
+    def test_idle_and_extend_results_publish_every_step_decode_is_throttled(self):
+        """An idle batch only joins the attention-DP collectives while other
+        ranks work, so it is the rank's only chance to publish its queues."""
+        s = Scheduler.__new__(Scheduler)
+        s.deferred_responses = MagicMock()
+        s.scheduler_stage_metrics = None
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.publish_load_snapshot = MagicMock(return_value=None)
+        s.load_publisher = MagicMock()
+        s.load_inquirer = MagicMock()
+        s.batch_result_processor = MagicMock()
+        s._on_step_processed = MagicMock()
+        s.tree_cache = MagicMock()
+        s._record_step_counters = MagicMock()
+        s.metrics_reporter = MagicMock()
+        s.enable_fpm = False
+        s._maybe_clear_mm_inputs = MagicMock()
+        s.maybe_send_health_check_signal = MagicMock()
+        for mode, forced in [
+            (ForwardMode.IDLE, True),
+            (ForwardMode.EXTEND, True),
+            (ForwardMode.DECODE, False),
+        ]:
+            with self.subTest(mode=mode):
+                batch = SimpleNamespace(
+                    reqs=[], forward_mode=mode, is_dllm=lambda: False
+                )
+                s.process_batch_result(batch, MagicMock())
+                s.publish_load_snapshot.assert_called_with(force=forced)
+                self.assertIs(
+                    s.load_publisher.publish_load_stat.call_args.kwargs["force"],
+                    forced,
+                )
 
 
 class TestAsyncShmIdleAccounting(CustomTestCase):
@@ -82,6 +143,12 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
 
     def _idle_scheduler(self, materializer):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            request_retirer=None,
+            send_abort=None,
+        )
         scheduler.scheduler_stage_metrics = SchedulerStageMetricsRecorder(enabled=False)
         scheduler.maybe_send_health_check_signal = MagicMock()
         scheduler.is_fully_idle = Scheduler.is_fully_idle.__get__(scheduler)
@@ -89,9 +156,8 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.metrics_reporter = MagicMock()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.dllm_manager = MagicMock()
-        scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.last_batch = None
         scheduler.enable_overlap = False
         scheduler._pp_microbatches_drained = MagicMock(return_value=True)
@@ -99,19 +165,32 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.enable_hisparse = False
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        scheduler.running_reqs = []
+        scheduler.dllm_config = None
+        scheduler.disagg_prefill_bootstrap_queue = None
+        scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
+        scheduler.disagg_decode_prealloc_queue = None
+        scheduler.disagg_decode_transfer_queue = None
+        scheduler.hisparse_coordinator = None
+        scheduler.decode_offload_manager = None
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_hicache_storage = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_lmcache = False
         scheduler.dp_attn_adapter = MagicMock()
-        scheduler._engine_paused = False
-        scheduler.async_shm_materializer = materializer
+        scheduler.pause_state = PauseState()
+        receiver = object.__new__(UocrRequestReceiver)
+        object.__setattr__(receiver, "async_shm_materializer", materializer)
+        scheduler.request_receiver = receiver
         scheduler._last_stall_publish_ts = 0.0
         scheduler.publish_load_snapshot = MagicMock(return_value=None)
         scheduler.load_publisher = MagicMock()
         scheduler.load_inquirer = MagicMock()
         scheduler.enable_unified_memory = False
         scheduler.invariant_checker = MagicMock()
-        scheduler.invariant_checker._check_all_pools.return_value = (False, [])
+        scheduler.gc_freezer = MagicMock()
+        scheduler.forward_ct = 0
         scheduler.pool_stats_observer = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.verify_byte_accounting.return_value = []

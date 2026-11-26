@@ -77,7 +77,6 @@ class _StubFusedMoE:
     _load_w13 = FusedMoE._load_w13
     _load_w2 = FusedMoE._load_w2
 
-    use_triton_kernels = False
     quant_config = None
     quant_method = None
     # Recorded by the scheme's create_weights on the real layer.

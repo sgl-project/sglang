@@ -12,7 +12,7 @@ from sglang.srt.lora.backend.base_backend import (
     _compute_token_lora_mapping,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -23,10 +23,10 @@ from sglang.test.ci.ci_register import (
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: ROCm's Triton build of _compute_moe_lora_info_kernel,
 # graph-padding clear included.
-register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=5, stage="base-b", runner_config="1-gpu-small-amd")
 # backend-specific: XPU takes the native torch mapping path instead of the
 # Triton launch.
-register_xpu_ci(est_time=20, suite="stage-a-test-1-gpu-xpu")
+register_xpu_ci(est_time=20, suite="extra-test-1-gpu-xpu")
 
 DEVICE = get_device()
 

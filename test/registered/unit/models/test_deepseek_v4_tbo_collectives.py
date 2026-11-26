@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import _model_forward_tbo_merge_key
 from sglang.srt.layers.dp_attention import DpPaddingMode
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import deepseek_v4
 from sglang.srt.models.deepseek_common import moe_transport
 from sglang.srt.models.deepseek_v4 import _tbo_collective_sizes

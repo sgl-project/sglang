@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -121,6 +121,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
     ) -> PrecomputedMetadata:
         """Precompute metadata for normal decode mode."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
+        seq_lens = self._with_draft_chain(seq_lens)
 
         if (
             (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1
@@ -159,7 +160,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 bs=bs,
                 max_len=max_len,
                 dsa_index_topk=self.dsa_index_topk,
-                physical_page_size=self.physical_page_size,
+                physical_page_size=self.real_page_span,
             )
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
@@ -294,7 +295,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 bs=bs,
                 max_seqlen_k=max_seqlen_k,
                 dsa_index_topk=self.dsa_index_topk,
-                physical_page_size=self.physical_page_size,
+                physical_page_size=self.real_page_span,
                 next_n=self.speculative_num_draft_tokens,
             )
 

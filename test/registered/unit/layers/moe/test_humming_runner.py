@@ -183,6 +183,63 @@ def test_workspace_uses_each_sublayers_dtype(
         )
 
 
+def _byte_range(tensor):
+    start = tensor.data_ptr()
+    return start, start + tensor.numel() * tensor.element_size()
+
+
+def _overlaps(first, second):
+    first_start, first_end = _byte_range(first)
+    second_start, second_end = _byte_range(second)
+    return first_start < second_end and second_start < first_end
+
+
+@pytest.mark.parametrize(
+    "gemm_type_name", ["INDEXED", "GROUPED_CONTIGUOUS", "GROUPED_MASKED"]
+)
+@pytest.mark.parametrize(
+    "gate_up_dtype,down_dtype",
+    [
+        ("bfloat16", "bfloat16"),
+        ("float8e4m3", "float8e4m3"),
+        ("float8e4m3", "bfloat16"),
+        ("bfloat16", "float4e2m1"),
+    ],
+)
+def test_workspace_buffers_keep_producer_and_consumer_apart(
+    runner_module, gemm_type_name, gate_up_dtype, down_dtype
+):
+    runner = make_runner(runner_module)
+    for sublayer, dtype in (("w13", gate_up_dtype), ("w2", down_dtype)):
+        runner.layer.humming_metas[sublayer].a_dtype = getattr(
+            runner_module.dtypes, dtype
+        )
+    gemm_type = getattr(runner_module.HummingGemmType, gemm_type_name)
+    is_masked = gemm_type == runner_module.HummingGemmType.GROUPED_MASKED
+    num_tokens = 5
+    num_rows = runner.num_experts * num_tokens if is_masked else num_tokens
+    inputs = torch.ones(num_rows, 256, dtype=torch.bfloat16)
+    routes = torch.zeros(num_tokens, 2, dtype=torch.int32)
+
+    metas, required = runner.get_buffer_metas(inputs, routes, gemm_type)
+    buffers = runner.prepare_buffers(inputs, routes, gemm_type)
+
+    for name in required:
+        assert tuple(buffers[name].shape) == tuple(metas[name]["shape"])
+        assert buffers[name].dtype == metas[name]["dtype"]
+    # Each stage reads the previous buffer while it writes the next one.
+    for producer, consumer in zip(required, required[1:]):
+        assert not _overlaps(buffers[producer], buffers[consumer])
+
+    if is_masked:
+        # The masked path returns down_output; "output" only aliases it.
+        assert "output" not in required
+        assert buffers["output"].shape == buffers["down_output"].shape
+        assert buffers["output"].data_ptr() == buffers["down_output"].data_ptr()
+    else:
+        assert required[-1] == "output"
+
+
 def test_hadamard_matches_each_sublayers_weight_transform(runner_module):
     runner = make_runner(runner_module)
     runner.layer.weight_schemas = {

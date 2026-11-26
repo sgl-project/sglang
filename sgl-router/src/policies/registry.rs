@@ -110,15 +110,14 @@ impl PdPoolResolver {
     /// at this layer so the policy never has to re-check.
     ///
     /// Returns `Err(NoHealthyWorkers)` only when the model has zero
-    /// **registered** workers (healthy or not). When the model is
-    /// registered as PD but every PD worker is currently unhealthy
-    /// (any failure path that flips `breaker.allow()` to false),
-    /// returns `Ok(Pd { prefill: [], decode: [] })` so
-    /// `prefill_candidates` / `decode_candidates` can surface the more
-    /// specific `NoPrefillWorkersAvailable` / `NoDecodeWorkersAvailable`
-    /// code — operators alerting on partial-pool failures see the same
-    /// code whether the empty pool is empty by registration or by
-    /// transient health state.
+    /// **registered** workers (healthy or not). When every registered
+    /// worker's breaker is open, `healthy_workers_for` fails open and the
+    /// whole pool comes back. When only one PD tier is breaker-open, its
+    /// pool is empty so `prefill_candidates` / `decode_candidates` surface
+    /// the specific `NoPrefillWorkersAvailable` / `NoDecodeWorkersAvailable`
+    /// code. The all-empty PD branch below still covers a model whose
+    /// eligible workers were all excluded (retries) or are awaiting a
+    /// bootstrap port.
     pub fn resolve(&self, model: &ModelId) -> Result<PdPools, PdResolveError> {
         let mut all = self.workers.healthy_workers_for(model);
         all.retain(|w| !self.excluded.contains(&w.id));
@@ -442,13 +441,11 @@ mod tests {
         assert_eq!(decode.len(), 2);
     }
 
-    /// PD mode where every breaker is open (e.g. the upstream pool went
-    /// hard down) must NOT collapse to the generic `NoHealthyWorkers`
-    /// code. Both `prefill_candidates` and `decode_candidates` should
-    /// still surface the per-pool variant so operators can alert on
-    /// "prefill tier degraded" independently from "model misconfigured".
+    /// PD mode where every breaker is open fails open (see
+    /// `WorkerRegistry::healthy_workers_for`): both tiers come back whole
+    /// instead of every request failing with a per-pool "unavailable" code.
     #[test]
-    fn pd_mode_all_breakers_open_keeps_per_pool_codes() {
+    fn pd_mode_all_breakers_open_fails_open() {
         let r = registry(&[
             spec("p1", WorkerMode::Prefill, "m"),
             spec("d1", WorkerMode::Decode, "m"),
@@ -463,25 +460,15 @@ mod tests {
                 w.breaker.record_failure();
             }
         }
-        // resolve() still returns a PD shape (both pools empty) — the
-        // PD intent is preserved across the breaker-open state.
         match resolver.resolve(&model).unwrap() {
             PdPools::Pd { prefill, decode } => {
-                assert!(prefill.is_empty());
-                assert!(decode.is_empty());
+                assert_eq!(prefill.len(), 1, "prefill tier fails open");
+                assert_eq!(decode.len(), 1, "decode tier fails open");
             }
             other => panic!("expected Pd, got {other:?}"),
         }
-        // prefill dispatch → NoPrefillWorkersAvailable (not NoHealthyWorkers).
-        assert_eq!(
-            resolver.prefill_candidates(&model).unwrap_err(),
-            PdResolveError::NoPrefillWorkersAvailable,
-        );
-        // decode dispatch → NoDecodeWorkersAvailable (not NoHealthyWorkers).
-        assert_eq!(
-            resolver.decode_candidates(&model).unwrap_err(),
-            PdResolveError::NoDecodeWorkersAvailable,
-        );
+        assert_eq!(resolver.prefill_candidates(&model).unwrap().len(), 1);
+        assert_eq!(resolver.decode_candidates(&model).unwrap().len(), 1);
     }
 
     /// Symmetric: PD mode with no decode workers → decode dispatch
@@ -805,19 +792,16 @@ mod tests {
         );
     }
 
-    /// All decode peers' breakers are open → `decode_with_affinity`
-    /// surfaces `NoDecodeWorkersAvailable` (the per-pool variant), not
-    /// the generic `NoHealthyWorkers`. The PD intent is preserved
-    /// through `resolve` so operators alerting on "decode tier down"
-    /// see the same code regardless of whether the pool is empty by
-    /// registration or by breaker state.
+    /// All of the model's breakers are open → the registry fails open
+    /// (`WorkerRegistry::healthy_workers_for`), so `decode_with_affinity`
+    /// still returns a decode peer rather than `NoDecodeWorkersAvailable`.
     ///
     /// The lower-level helper [`select_decode_with_affinity`] is total
     /// even when every candidate's breaker is open (rule 3 in the
     /// docstring): tests that call it directly with breaker-open
     /// candidates get a min-load result.
     #[test]
-    fn decoder_with_affinity_errors_when_all_breakers_open() {
+    fn decoder_with_affinity_fails_open_when_all_breakers_open() {
         let r = registry(&[
             spec_with_url("d1", "http://host_a:30001", WorkerMode::Decode, "m"),
             spec_with_url("d2", "http://host_b:30001", WorkerMode::Decode, "m"),
@@ -836,15 +820,6 @@ mod tests {
                 w.breaker.record_failure();
             }
         }
-        // resolver path: healthy_workers_for returns empty, but the
-        // model is registered as PD (decode peers exist), so resolve()
-        // preserves PD shape and decode_with_affinity surfaces the
-        // per-pool code.
-        let err = resolver
-            .decode_with_affinity(&ModelId("m".into()), "http://host_a:30000")
-            .unwrap_err();
-        assert_eq!(err, PdResolveError::NoDecodeWorkersAvailable);
-
         // helper path with a non-empty (but all-breaker-open) slice
         // returns Some via the last-resort branch — selection function
         // stays total, caller sees `BreakerOpen` on dispatch.
@@ -853,6 +828,16 @@ mod tests {
             any.url == "http://host_a:30001" || any.url == "http://host_b:30001",
             "last-resort path must return some candidate, got: {}",
             any.url,
+        );
+
+        // resolver path: every decode breaker open → the registry fails
+        // open, so the PD pick still lands on an admissible decode peer.
+        let picked = resolver
+            .decode_with_affinity(&ModelId("m".into()), "http://host_a:30000")
+            .expect("all-open decode tier fails open");
+        assert!(
+            picked.breaker.allow(),
+            "fail-open must leave the pick admissible"
         );
     }
 }

@@ -9,7 +9,7 @@ import torch
 from sglang.srt.layers.attention.graph_variants import (
     create_dsv41_candidate_graph_variants,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

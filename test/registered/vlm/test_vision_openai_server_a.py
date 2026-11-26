@@ -17,16 +17,16 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 from sglang.test.vlm_utils import (
     IMAGE_MAN_IRONING_URL,
     AudioOpenAITestMixin,
-    CustomTestCase,
     ImageOpenAITestMixin,
     TestOpenAIMLLMServerBase,
     VideoOpenAITestMixin,
-    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=641, stage="extra-a", runner_config="1-gpu-large")
@@ -62,6 +62,9 @@ def _make_grounding_image() -> str:
 
 class TestLlavaServer(ImageOpenAITestMixin):
     model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
+    # llava's CPU preprocessing times out after REQUEST_TIMEOUT (default 10 s);
+    # the server's startup warmup image overruns that on some 1-gpu-large CI runners.
+    extra_env = {"REQUEST_TIMEOUT": "60"}
 
 
 class TestLfm2VlServer(ImageOpenAITestMixin):

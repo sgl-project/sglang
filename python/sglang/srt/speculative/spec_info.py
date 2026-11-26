@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
     _RESERVED_ALIASES,
@@ -160,7 +160,7 @@ class SpeculativeAlgorithm(Enum):
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
         graphs in the decode cuda graph runner."""
-        return self.is_dspark()
+        return self.is_dflash_family()
 
     def supports_grammar_overlap(self) -> bool:
         # Whether the worker advances the grammar FSM inside verify() (via the
@@ -173,7 +173,7 @@ class SpeculativeAlgorithm(Enum):
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
-        per-topk page rounding; see get_alloc_len_per_decode."""
+        per-topk page rounding; see get_decode_reserve."""
         return not self.is_ngram()
 
     def carries_draft_hidden_states(self) -> bool:
@@ -268,7 +268,7 @@ class SpeculativeAlgorithm(Enum):
         self, server_args: ServerArgs
     ) -> Optional[int]:
         """Return the largest draft-token width this algorithm may use."""
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
 
         cfg = resolving_view(server_args)
         if cfg.speculative_num_draft_tokens is None:
@@ -333,6 +333,15 @@ class SpeculativeAlgorithm(Enum):
             return UnoWorkerV2
 
         if self.is_dspark():
+            from sglang.srt.arg_groups.model_override_base import model_config_of
+            from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
+            if model_config_of(server_args).hf_config.architectures in [
+                [a] for a in INKLING2_ARCHS
+            ]:
+                from sglang.srt.speculative.inkling2_mtp_worker import Inkling2MTPWorker
+
+                return Inkling2MTPWorker
             from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
                 DSparkWorkerV2,
             )
@@ -482,7 +491,7 @@ def create_dummy_verify_input(
     being captured; adaptive spec captures each candidate with that config's
     leaves overridden.
     """
-    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 
     spec = get_spec_config()
 

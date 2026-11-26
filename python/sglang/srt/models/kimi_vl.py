@@ -45,7 +45,6 @@ import copy
 import logging
 import math
 from array import array
-from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -58,15 +57,12 @@ from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -75,17 +71,10 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_mm
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
-
-
-# For dummy input only
-@dataclass
-class MaxImageTokenMeta:
-    width: int = 1024
-    height: int = 1024
 
 
 class KimiVLMultiModalProjector(nn.Module):

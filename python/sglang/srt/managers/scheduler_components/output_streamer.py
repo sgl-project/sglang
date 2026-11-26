@@ -22,7 +22,7 @@ from sglang.srt.beam_search.output import (
     beam_completion_tokens,
     pack_beam_search_output,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.incremental_detokenize import build_detokenize_header
 from sglang.srt.managers.io_struct import (
@@ -33,10 +33,9 @@ from sglang.srt.managers.io_struct import (
     RequestOutputStats,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import (
-    BaseFinishReason,
-    Req,
-)
+from sglang.srt.managers.req_types import BaseFinishReason
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import (
     get_observability,
@@ -53,7 +52,9 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
-    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
+    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+        UocrSchedulerRuntime,
+    )
     from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
     from sglang.srt.rust_server.server import RustServer
 
@@ -102,7 +103,7 @@ class SchedulerOutputStreamer:
     rust_server: Optional[RustServer] = None
     # Set when the scheduler first defers a response; see deferred_output.
     defer_outputs: bool = False
-    uocr_doc_hooks: Optional[UocrDocHooks] = None
+    uocr_runtime: Optional[UocrSchedulerRuntime] = None
     _test_stream_output_count: int = 0
     output_sink: OutputSink = field(init=False)
     enable_metrics: bool = field(init=False)
@@ -137,12 +138,13 @@ class SchedulerOutputStreamer:
         """Whether Rust egress frames carry each request's cached tokens by
         tier, from which the frontend reports what
         ``get_cached_tokens_details`` would. Only a cache with a host or
-        storage tier, or a PD decode server (which takes the split from
-        prefill), serves hits from anywhere but the device; otherwise the
-        frontend reports every cached token on device."""
+        storage tier, an external cache linker, or a PD decode server (which
+        takes the split from prefill), serves hits from anywhere but the
+        device; otherwise the frontend reports every cached token on device."""
         return self.rust_server is not None and (
             self.server_args.enable_hierarchical_cache
             or self.server_args.enable_lmcache
+            or self.server_args.enable_unified_cache_external_linker
             or self.disaggregation_mode == DisaggregationMode.DECODE
         )
 
@@ -293,7 +295,7 @@ class SchedulerOutputStreamer:
             ),
             output_sink=self.output_sink,
             current_weight_version=get_serving().weight_version,
-            uocr_doc_hooks=self.uocr_doc_hooks,
+            uocr_runtime=self.uocr_runtime,
             cached_tokens_split=(
                 [] if self._rust_frames_split_cached_tokens() else None
             ),
@@ -304,9 +306,9 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            # Kept for the PD decode queue paths, which stream requests that are
+            # not in any step's batch yet.
             if req.finished() and req.finished_output:
-                # With the overlap schedule, a request will try to output twice and hit this line twice
-                # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
 
             acc.accept(req=req)
@@ -390,6 +392,7 @@ class SchedulerOutputStreamer:
         has_phs = False
         for req in reqs:
             if req.finished():
+                record_send(req, "stream")
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
@@ -491,7 +494,7 @@ class _GenerationStreamAccumulator:
     spec_cap_lens_histogram: list = field(default_factory=list)
     # Spliced document-overlap tokens per request (Unlimited-OCR v2 only).
     uocr_forced_tokens: list = field(default_factory=list)
-    uocr_doc_hooks: Optional[UocrDocHooks] = None
+    uocr_runtime: Optional[UocrSchedulerRuntime] = None
     weight_versions: list = field(default_factory=list)
     prefill_weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
@@ -511,6 +514,8 @@ class _GenerationStreamAccumulator:
     input_top_logprobs_idx_flat: Optional[list] = None
     input_top_logprobs_flat_null_prefix: Optional[list] = None
     has_input_top_logprobs_flat: bool = False
+    input_top_logprobs_weights: Optional[list] = None
+    has_input_top_logprobs_weights: bool = False
     output_top_logprobs_val: Optional[list] = None
     output_top_logprobs_idx: Optional[list] = None
     input_token_ids_logprobs_val: Optional[list] = None
@@ -558,6 +563,7 @@ class _GenerationStreamAccumulator:
             self.input_top_logprobs_val_flat = []
             self.input_top_logprobs_idx_flat = []
             self.input_top_logprobs_flat_null_prefix = []
+            self.input_top_logprobs_weights = []
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
             self.input_token_ids_logprobs_val = []
@@ -577,6 +583,7 @@ class _GenerationStreamAccumulator:
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
+            record_send(req, "stream")
             if req.finished_len is None:
                 req.finished_len = len(req.output_ids)
             should_output = True
@@ -648,8 +655,8 @@ class _GenerationStreamAccumulator:
             self.http_worker_ipcs.append(req.http_worker_ipc)
 
         forced_tokens = 0
-        if self.uocr_doc_hooks is not None:
-            forced_tokens = self.uocr_doc_hooks.forced_tokens(req)
+        if self.uocr_runtime is not None:
+            forced_tokens = self.uocr_runtime.forced_tokens(req)
             self.uocr_forced_tokens.append(forced_tokens)
 
         if self.output_sink is OutputSink.RUST:
@@ -746,6 +753,11 @@ class _GenerationStreamAccumulator:
                 )
                 if req.logprob.input_top_logprobs_val_flat is not None:
                     self.has_input_top_logprobs_flat = True
+                self.input_top_logprobs_weights.append(
+                    req.logprob.input_top_logprobs_weights
+                )
+                if req.logprob.input_top_logprobs_weights is not None:
+                    self.has_input_top_logprobs_weights = True
                 self.input_token_ids_logprobs_val.append(
                     req.logprob.input_token_ids_logprobs_val
                 )
@@ -761,6 +773,7 @@ class _GenerationStreamAccumulator:
                 self.input_top_logprobs_val_flat.append(None)
                 self.input_top_logprobs_idx_flat.append(None)
                 self.input_top_logprobs_flat_null_prefix.append(None)
+                self.input_top_logprobs_weights.append(None)
                 self.input_token_ids_logprobs_val.append([])
                 self.input_token_ids_logprobs_idx.append([])
 
@@ -877,8 +890,8 @@ class _GenerationStreamAccumulator:
         if not (self.rids or is_idle_batch):
             return None
         customized_info = self.customized_info
-        if self.uocr_doc_hooks is not None:
-            customized_info = self.uocr_doc_hooks.with_forced_tokens(
+        if self.uocr_runtime is not None:
+            customized_info = self.uocr_runtime.with_forced_tokens(
                 customized_info, self.uocr_forced_tokens
             )
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
@@ -932,6 +945,11 @@ class _GenerationStreamAccumulator:
             input_top_logprobs_flat_null_prefix=(
                 self.input_top_logprobs_flat_null_prefix
                 if self.has_input_top_logprobs_flat
+                else None
+            ),
+            input_top_logprobs_weights=(
+                self.input_top_logprobs_weights
+                if self.has_input_top_logprobs_weights
                 else None
             ),
             output_top_logprobs_val=self.output_top_logprobs_val,

@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import sglang.srt.model_executor.runner_backend_utils.hicache_graph_events as events
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph as bcg,
 )
@@ -191,6 +192,35 @@ class TestHiCacheGraphEvents(unittest.TestCase):
             graph._append_segment(raw, True)
         raw.instantiate.assert_called_once_with()
         self.assertEqual(graph._hicache_wait_nodes, self.bindings[:1])
+
+
+class TestCapturedKdaWaitGate(unittest.TestCase):
+    def _needs_capture(self, *, hicache, linker, captured=True):
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.model_executor.runner_backend import utils
+
+        backend = SimpleNamespace(
+            use_captured_forward_metadata_for_breakable_cuda_graph=captured,
+            linear_attn_backend=object.__new__(KDAAttnBackend),
+        )
+        memory = SimpleNamespace(
+            enable_hierarchical_cache=hicache,
+            enable_unified_cache_external_linker=linker,
+        )
+        with patch.object(utils, "get_memory", return_value=memory):
+            return utils._needs_hicache_event_capture(
+                SimpleNamespace(attn_backend=backend)
+            )
+
+    def test_layer_wise_loaders_need_capture(self):
+        self.assertTrue(self._needs_capture(hicache=True, linker=False))
+        self.assertTrue(self._needs_capture(hicache=False, linker=True))
+
+    def test_no_capture_without_a_layer_wise_loader_or_captured_extend(self):
+        self.assertFalse(self._needs_capture(hicache=False, linker=False))
+        self.assertFalse(
+            self._needs_capture(hicache=False, linker=True, captured=False)
+        )
 
 
 if __name__ == "__main__":

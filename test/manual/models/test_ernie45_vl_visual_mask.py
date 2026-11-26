@@ -34,7 +34,8 @@ def _make_model():
 
 
 def _make_forward_batch(*, decode: bool, image: bool, video: bool):
-    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
+    from sglang.srt.multimodal.modality import Modality
 
     item = MultimodalDataItem(modality=Modality.VIDEO, pad_value=VIDEO_PAD)
     fb = MagicMock()

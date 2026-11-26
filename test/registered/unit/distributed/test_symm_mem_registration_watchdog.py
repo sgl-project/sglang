@@ -44,7 +44,9 @@ class TestSymmMemRegistrationWatchdog(CustomTestCase):
     def test_dump_names_registration_during_init(self):
         # A stall in NCCL's window registration has no error of its own; the
         # watchdog dump must name it, also while CUDA graphs are captured.
-        scheduler = SimpleNamespace(is_initializing=True, forward_ct=0)
+        scheduler = SimpleNamespace(
+            is_initializing=True, forward_ct=0, dump_requests_before_crash=lambda: None
+        )
         watchdog = create_scheduler_watchdog(scheduler, watchdog_timeout=3600)
         self.assertEqual(watchdog.dump_info(), "")
 

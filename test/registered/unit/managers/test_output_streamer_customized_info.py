@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from sglang.api.v1.api_types import GenerateMetaInfo
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskOutput,
@@ -26,7 +26,8 @@ from sglang.srt.managers.io_struct import (
     row_output_ids,
     unwrap_from_pickle,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -39,7 +40,9 @@ from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
     hide_forced_text,
     req_state,
 )
-from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
+from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+    UocrSchedulerRuntime,
+)
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -49,6 +52,7 @@ from sglang.srt.utils.weight_versions import (
     record_weight_version_events,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -65,7 +69,7 @@ _REQUEST_STATS = RequestOutputStats(
 )
 
 
-class _FakeReq:
+class _FakeReq(FakeReq):
     def __init__(
         self,
         rid,
@@ -590,7 +594,9 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
             send_to_detokenizer=None,
             tree_cache=None,
             server_args=SimpleNamespace(
-                enable_hierarchical_cache=False, enable_lmcache=False
+                enable_hierarchical_cache=False,
+                enable_lmcache=False,
+                enable_unified_cache_external_linker=False,
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -780,6 +786,7 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
         self,
         *,
         hierarchical_cache,
+        external_linker=False,
         storage_backend=None,
         disaggregation_mode=DisaggregationMode.NULL,
     ):
@@ -792,7 +799,9 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
                 cache_controller=SimpleNamespace(storage_backend=storage_backend)
             ),
             server_args=SimpleNamespace(
-                enable_hierarchical_cache=hierarchical_cache, enable_lmcache=False
+                enable_hierarchical_cache=hierarchical_cache,
+                enable_lmcache=False,
+                enable_unified_cache_external_linker=external_linker,
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -811,7 +820,7 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
         return rust_server.push_generation.call_args.args[2:4]
 
     def test_rust_frames_split_cached_tokens_by_tier(self):
-        """A cache with a host or storage tier, or a PD decode server, sends
+        """A cache with a host or storage tier, an external linker, or PD decode sends
         each request's cached tokens by tier and the attached storage
         backend's type; a device-only cache sends neither."""
 
@@ -828,6 +837,10 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
                 hierarchical_cache=False,
                 disaggregation_mode=DisaggregationMode.DECODE,
             ),
+            ([(1, 2, 3)], None),
+        )
+        self.assertEqual(
+            self._split_sent(hierarchical_cache=False, external_linker=True),
             ([(1, 2, 3)], None),
         )
         self.assertEqual(self._split_sent(hierarchical_cache=False), (None, None))
@@ -861,7 +874,9 @@ class TestOutputStreamerRustRequestStats(unittest.TestCase):
             send_to_detokenizer=None,
             tree_cache=None,
             server_args=SimpleNamespace(
-                enable_hierarchical_cache=False, enable_lmcache=False
+                enable_hierarchical_cache=False,
+                enable_lmcache=False,
+                enable_unified_cache_external_linker=False,
             ),
             is_generation=True,
             spec_algorithm=(
@@ -1141,7 +1156,7 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
     def test_skipped_output_prefix_becomes_detokenizer_context(self):
         outputs = []
         streamer = _streamer(outputs)
-        streamer.uocr_doc_hooks = object.__new__(UocrDocHooks)
+        streamer.uocr_runtime = object.__new__(UocrSchedulerRuntime)
         req = self._req()
         req.output_ids.extend(array("q", [900, 901]))
         req_state(req).forced_len = 2

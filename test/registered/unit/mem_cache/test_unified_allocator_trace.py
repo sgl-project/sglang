@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.mem_cache.kv.alloc import band as band_module
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_trace import (
@@ -73,7 +74,7 @@ class TestUnifiedAllocatorTrace(CustomTestCase):
         scenario = json.loads(
             (_MANUAL / "unified_trace_scenarios/state_slots_exhausted.json").read_text()
         )
-        config = TraceConfig(chain="mamba", page_size=16, lazy=True, device="cpu")
+        config = TraceConfig(chain="mamba", page_size=16, device="cpu")
         with patch.dict(ADAPTERS, trace_test=_SharedCapacityAdapter):
             records = record_run(
                 config, ops=scenario["ops"], adapter_name="trace_test", full=True
@@ -101,7 +102,7 @@ class TestUnifiedAllocatorTrace(CustomTestCase):
 
     def test_state_full_corner_exhausts_more_than_512_slots(self):
         """The state-full prefix must leave no further slot available."""
-        config = TraceConfig(chain="mamba", page_size=64, lazy=False, device="cpu")
+        config = TraceConfig(chain="mamba", page_size=64, device="cpu")
         adapter, model = _SharedCapacityAdapter(config), HostModel()
         for op in corner_states(config)["state_full"]:
             apply_op(adapter, model, op)
@@ -116,12 +117,12 @@ class TestUnifiedAllocatorTrace(CustomTestCase):
         cli = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cli)
         cases = (
-            ("mamba", "16", "1", {"state_slots_exhausted"}),
-            ("swa", "64", "0", set()),
+            ("mamba", "16", {"state_slots_exhausted", "segment_frees_state_chain"}),
+            ("swa", "64", {"window_retirement_p64"}),
+            ("swa", "1", set()),
             (
                 "mamba,tri",
                 "1,16",
-                "0,1",
                 {
                     "state_slots_exhausted",
                     "segment_frees_state_chain",
@@ -130,12 +131,11 @@ class TestUnifiedAllocatorTrace(CustomTestCase):
                 },
             ),
         )
-        for chains, pages, lazy, expected_scenarios in cases:
-            with self.subTest(chains=chains, pages=pages, lazy=lazy):
+        for chains, pages, expected_scenarios in cases:
+            with self.subTest(chains=chains, pages=pages):
                 args = SimpleNamespace(
                     chains=chains,
                     page_sizes=pages,
-                    lazy=lazy,
                     seeds="0-1",
                     scenarios=str(_MANUAL / "unified_trace_scenarios"),
                 )
@@ -149,6 +149,33 @@ class TestUnifiedAllocatorTrace(CustomTestCase):
                     expected_scenarios,
                 )
                 self.assertEqual(len(seeded), 2 * len(selected))
+
+
+class TestBuilderAdapterRoundTrip(CustomTestCase):
+    """A short seeded trace records through the real allocator and replays
+    clean on every chain, its pending pages read from the band's ledger."""
+
+    def test_a_seeded_trace_records_and_replays(self):
+        # On the CPU there is no stream to order behind a forward: a settle's
+        # wait has nothing to do (`FakeEvent` completion stays the trace's).
+        no_stream_wait = patch.object(
+            band_module, "wait_signals", lambda *args, **kwargs: None
+        )
+        with no_stream_wait:
+            self._record_and_replay()
+
+    def _record_and_replay(self):
+        for chain in ("swa", "mamba", "tri"):
+            for page_size in (1, 4):
+                config = TraceConfig(chain=chain, page_size=page_size, device="cpu")
+                with self.subTest(config=config.key()):
+                    records = record_run(config, seed=7, steps=60, full=True)
+                    self.assertEqual(len(records), 60)
+                    pending = [
+                        key for key in records[-1]["obs"] if key.endswith(".pending")
+                    ]
+                    self.assertTrue(pending)
+                    self.assertIsNone(replay_run(config, records, full=True))
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from sglang.srt.multimodal.inkling.image_processing import (
     _load_image_bytes,
 )
 from sglang.srt.multimodal.inkling.image_processing_rust import _pil_decode
+from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.multimodal.processors.inkling import _resolve_media_item
 from sglang.test.test_utils import CustomTestCase
 
@@ -80,6 +81,27 @@ class TestResolveMediaItemIsClientError(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "empty media URL"):
                     _resolve_media_item({"url": whitespace_url})
 
+    def test_download_uses_media_url_timeout(self):
+        configure_media_url_security([], timeout=7)
+        self.addCleanup(configure_media_url_security, [], max_file_size_mb=64)
+        with patch(
+            "sglang.srt.multimodal.processors.inkling.download_remote_media",
+            return_value=b"x",
+        ) as download:
+            _resolve_media_item("https://media.host/a.png")
+        download.assert_called_once_with("https://media.host/a.png", timeout=7.0)
+
+    def test_local_path_follows_local_media_policy(self):
+        configure_media_url_security([], allow_local_files=False)
+        self.addCleanup(configure_media_url_security, [], max_file_size_mb=64)
+        with tempfile.NamedTemporaryFile(suffix=".png") as f:
+            for load in (_load_image_bytes, _load_audio_bytes):
+                with (
+                    self.subTest(load=load.__name__),
+                    self.assertRaisesRegex(ValueError, "not allowed"),
+                ):
+                    load(_resolve_media_item(f.name))
+
     def test_unfetchable_url_every_request_exception(self):
         # download_remote_media() fetches through get_mm_http_session(); HTTPError,
         # ConnectionError and Timeout all subclass RequestException.
@@ -90,7 +112,7 @@ class TestResolveMediaItemIsClientError(CustomTestCase):
         ):
             with self.subTest(exc=type(exc).__name__):
                 with patch(
-                    "sglang.srt.utils.common.get_mm_http_session",
+                    "sglang.srt.multimodal.media_io.get_mm_http_session",
                     return_value=_session_raising(exc),
                 ):
                     with self.assertRaises(ValueError) as ctx:
@@ -109,7 +131,7 @@ class TestResolveMediaItemIsClientError(CustomTestCase):
         # base64 (a long run of "A"s decodes cleanly and wouldn't raise).
         huge_url = "https://media.host/" + ("a" * 1_000_000)
         with patch(
-            "sglang.srt.utils.common.get_mm_http_session",
+            "sglang.srt.multimodal.media_io.get_mm_http_session",
             return_value=_session_raising(requests.exceptions.ConnectionError("x")),
         ):
             with self.assertRaises(ValueError) as ctx:
@@ -195,20 +217,20 @@ class TestLoadImageBytesIsClientError(CustomTestCase):
     def test_missing_local_path_raises_value_error(self):
         with self.assertRaises(ValueError) as ctx:
             _load_image_bytes("/nonexistent/path/that/does/not/exist.png")
-        self.assertIn("Could not read image from path", str(ctx.exception))
+        self.assertIn("Could not read media from path", str(ctx.exception))
         self.assertIsInstance(ctx.exception.__cause__, OSError)
 
     def test_path_component_that_is_not_a_directory_raises_value_error(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             not_a_directory = Path(temp_dir) / "file"
             not_a_directory.write_bytes(b"x")
-            with self.assertRaisesRegex(ValueError, "Could not read image from path"):
+            with self.assertRaisesRegex(ValueError, "Could not read media from path"):
                 _load_image_bytes(str(not_a_directory / "child.png"))
 
     def test_directory_path_raises_value_error(self):
         with (
             tempfile.TemporaryDirectory() as temp_dir,
-            self.assertRaisesRegex(ValueError, "Could not read image from path"),
+            self.assertRaisesRegex(ValueError, "Could not read media from path"),
         ):
             _load_image_bytes(temp_dir)
 
@@ -217,7 +239,7 @@ class TestLoadImageBytesIsClientError(CustomTestCase):
         # _resolve_media_item() as a "plain path" and ends up here.
         with self.assertRaises(ValueError) as ctx:
             _load_image_bytes("a" * 300)
-        self.assertIn("Could not read image from path", str(ctx.exception))
+        self.assertIn("Could not read media from path", str(ctx.exception))
         self.assertLess(len(str(ctx.exception)), 200)
 
     def test_server_os_error_is_not_reclassified_as_client_error(self):
@@ -239,27 +261,27 @@ class TestLoadAudioBytesIsClientError(CustomTestCase):
     def test_missing_local_path_raises_value_error(self):
         with self.assertRaises(ValueError) as ctx:
             _load_audio_bytes("/nonexistent/path/that/does/not/exist.wav")
-        self.assertIn("Could not read audio from path", str(ctx.exception))
+        self.assertIn("Could not read media from path", str(ctx.exception))
         self.assertIsInstance(ctx.exception.__cause__, OSError)
 
     def test_path_component_that_is_not_a_directory_raises_value_error(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             not_a_directory = Path(temp_dir) / "file"
             not_a_directory.write_bytes(b"x")
-            with self.assertRaisesRegex(ValueError, "Could not read audio from path"):
+            with self.assertRaisesRegex(ValueError, "Could not read media from path"):
                 _load_audio_bytes(str(not_a_directory / "child.wav"))
 
     def test_directory_path_raises_value_error(self):
         with (
             tempfile.TemporaryDirectory() as temp_dir,
-            self.assertRaisesRegex(ValueError, "Could not read audio from path"),
+            self.assertRaisesRegex(ValueError, "Could not read media from path"),
         ):
             _load_audio_bytes(temp_dir)
 
     def test_overlong_path_raises_value_error(self):
         with self.assertRaises(ValueError) as ctx:
             _load_audio_bytes("a" * 300)
-        self.assertIn("Could not read audio from path", str(ctx.exception))
+        self.assertIn("Could not read media from path", str(ctx.exception))
         self.assertLess(len(str(ctx.exception)), 200)
 
     def test_server_os_error_is_not_reclassified_as_client_error(self):

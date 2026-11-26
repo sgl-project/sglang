@@ -16,11 +16,13 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     build_dspark_swa_page_indices,
     compute_dspark_window_gather,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillKVBuffer,
 )
+from sglang.srt.mem_cache import deepseek_v4_memory_pool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     KVAndScore,
@@ -32,6 +34,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4UniformFP8KVPool,
     _CompressedPoolConfig,
     _num_dsv4_physical_kv_pages,
+    select_dsv4_kv_layout,
 )
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -40,7 +43,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -662,6 +665,45 @@ class TestV41KVPoolLayouts(CustomTestCase):
             self.assertIs(actual, expected)
         self.assertEqual(len(swa.host_pool.device_buffers), 5)
 
+    def test_draft_swa_sidecar_moves_whole_v41_pages(self):
+        """A separate V4.1 draft SWA sidecar must not take the token-granular copy,
+        which assumes the 576-byte V4 value plus 8-byte scale row."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+        from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+        class UnpinnedHostPool(DeepSeekV4PagedHostPool):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs, pin_memory=False)
+
+        draft = self.make_pool([0, 0], [], KVLayout.V41)
+        target_swa = UnpinnedHostPool.__new__(UnpinnedHostPool)
+        target_swa.slot_page_size = draft.swa_kv_pool.page_size
+        target_swa.num_host_pages = 2
+        target_swa.layout = "layer_first"
+        tree_cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(
+                    entry_map={PoolName.SWA: SimpleNamespace(host_pool=target_swa)}
+                )
+            )
+        )
+        with (
+            patch.object(assembler, "_get_allocator_type", return_value="default"),
+            patch.object(assembler, "DeepSeekV4PagedHostPool", UnpinnedHostPool),
+        ):
+            _, entries = assembler.build_swa_draft_pools(
+                draft_kv_pool=draft,
+                tree_cache=tree_cache,
+                target_window_host=PoolName.SWA,
+            )
+        host = entries[0].host_pool
+        self.assertTrue(host.page_aligned_only)
+        for actual, expected in zip(
+            host.device_buffers, draft.swa_kv_pool.kv_buffer, strict=True
+        ):
+            self.assertIs(actual, expected)
+
     def test_v41_pool_buffers(self):
         for main in (KVLayout.V41, KVLayout.V41_NEW):
             for option, encoding in (
@@ -1052,6 +1094,51 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         self.assertIs(cache.swa_lengths, layout.lengths)
         self.assertIs(combine.call_args.kwargs["swa_indices"], layout.indices)
         torch.testing.assert_close(cache.query_pos, layout.pos.to(torch.int32))
+
+
+class TestSelectDSV4KVLayoutArchGate(CustomTestCase):
+    """The packed V4.1 KV layouts are SM100 / SM103 FlashMLA formats: ``auto``
+    picks them on that family only, and asking for them elsewhere fails."""
+
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(dsv4_attn_backend="flashmla")
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _select(self, capability, mode):
+        def is_sm(major, minor=None):
+            return capability is not None and (
+                capability[0] == major and (minor is None or capability[1] == minor)
+            )
+
+        with (
+            patch.object(
+                deepseek_v4_memory_pool,
+                "current_arch",
+                return_value=SimpleNamespace(is_sm=is_sm),
+            ),
+            patch.object(deepseek_v4_memory_pool, "_is_hip", False),
+            envs.SGLANG_DSV4_KV_LAYOUT.override(mode),
+            envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.override("auto"),
+        ):
+            return select_dsv4_kv_layout()[0]
+
+    def test_auto_picks_v41_on_the_sm100_family_only(self):
+        for capability, layout in (
+            ((10, 0), KVLayout.V41),
+            ((10, 3), KVLayout.V41),
+            ((9, 0), KVLayout.V4),
+            ((12, 0), KVLayout.V4),
+            ((12, 1), KVLayout.V4),
+            (None, KVLayout.V4),
+        ):
+            with self.subTest(capability=capability):
+                self.assertEqual(self._select(capability, "auto"), layout)
+
+    def test_explicit_v41_off_the_sm100_family_is_rejected(self):
+        with self.assertRaises(AssertionError):
+            self._select((12, 0), "v41")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 
+import msgspec
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -43,6 +45,29 @@ class DsaGraphVariants:
         return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
 
 
+class SeqLenBucketGraphVariants(msgspec.Struct, frozen=True):
+    """Graphs keyed by the batch's longest request: the first bucket whose limit
+    covers it, else the fallback, which must serve any length."""
+
+    # (label, max_seq_len it serves), ascending.
+    graph_limits: tuple[tuple[str, int], ...]
+    fallback_label: str
+
+    @property
+    def capture_labels(self) -> tuple[str, ...]:
+        return tuple(label for label, _ in self.graph_limits) + (self.fallback_label,)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        # Only the host mirror is read: a device max would sync every replay.
+        lengths = forward_batch.seq_lens_cpu
+        if lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:
+            max_seq_len = int(lengths.max())
+            for label, limit in self.graph_limits:
+                if max_seq_len <= limit:
+                    return label
+        return self.fallback_label
+
+
 def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
     from sglang.srt.configs.model_config import (
         get_dsa_index_kpool,
@@ -70,9 +95,10 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
 
 DSV41_CANDIDATE_FILTERED = "candidate_filtered"
 DSV41_CANDIDATE_UNFILTERED = "candidate_unfiltered"
-# SGLANG_OPT_DSV41_TARGET_METADATA_EARLY serves these target verify variants (requests
-# up to the candidate span); longer ones keep the in-graph metadata upgrade.
-DSV41_EARLY_VERIFY_VARIANTS = frozenset({DSV41_CANDIDATE_UNFILTERED})
+# SGLANG_OPT_DSV41_TARGET_METADATA_EARLY serves these target verify variants.
+DSV41_EARLY_VERIFY_VARIANTS = frozenset(
+    {DSV41_CANDIDATE_UNFILTERED, DSV41_CANDIDATE_FILTERED}
+)
 
 
 @dataclass(frozen=True)
@@ -115,7 +141,7 @@ def create_dsv41_candidate_graph_variants(
 ) -> Optional[Dsv41CandidateGraphVariants]:
     import torch
 
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.utils import is_gfx95_supported, is_hip
 
     text_config = model_runner.model_config.hf_text_config

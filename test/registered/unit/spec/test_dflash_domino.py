@@ -66,6 +66,27 @@ def _projector_weights(model):
 
 
 class TestDFlashDominoConfig(CustomTestCase):
+    def test_shift_label_resolution(self):
+        for shift_label in (True, False):
+            with self.subTest(shift_label=shift_label):
+                config = _domino_config(dflash_config={"shift_label": shift_label})
+                self.assertIs(
+                    parse_dflash_draft_config(draft_hf_config=config).shift_label,
+                    shift_label,
+                )
+
+                del config.dflash_config["shift_label"]
+                config.shift_label = shift_label
+                self.assertIs(
+                    parse_dflash_draft_config(draft_hf_config=config).shift_label,
+                    shift_label,
+                )
+
+        config = _domino_config()
+        del config.dflash_config["shift_label"]
+        with self.assertRaisesRegex(ValueError, "shift_label.*bool"):
+            parse_dflash_draft_config(draft_hf_config=config)
+
     def test_top_level_emb_dim_fallback(self):
         config = _domino_config()
         del config.dflash_config["emb_dim"]

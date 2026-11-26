@@ -279,8 +279,6 @@ def test_lightning_backend_reads_structural_linear_config(monkeypatch):
         model_config=SimpleNamespace(
             hf_config=config,
             is_encoder_decoder=False,
-            context_len=128,
-            block=256,
         ),
         device="cpu",
         kv_cache_dtype=torch.float32,

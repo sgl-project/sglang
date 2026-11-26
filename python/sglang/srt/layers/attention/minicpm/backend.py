@@ -204,10 +204,12 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.sparse_topk = topk + (self.window_size // self.block_size)
         self.num_sparse_topk_tokens = self.block_size * self.sparse_topk
         required_context_len = max(self.config_dense_len, self.num_sparse_topk_tokens)
-        if self.max_context_len < required_context_len:
+        # The model's context, not the table row width, which carries headroom.
+        model_context_len = model_runner.model_config.context_len
+        if model_context_len < required_context_len:
             raise ValueError(
                 "MiniCPM sparse attention requires context_length >= "
-                f"{required_context_len}, got {self.max_context_len}."
+                f"{required_context_len}, got {model_context_len}."
             )
 
         # Head group number derived from model configuration
@@ -658,6 +660,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 logical_batch_size=forward_batch.batch_size,
                 kv_head_num=layer.tp_k_head_num,
                 is_prefill=True,
+                ver=self.flash_attn_backend.fa_impl_ver,
             )
         )
         page_table = metadata.base.page_table
@@ -791,6 +794,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 logical_batch_size=bs,
                 kv_head_num=layer.tp_k_head_num,
                 is_prefill=False,
+                ver=self.flash_attn_backend.fa_impl_ver,
             )
         )
         key_cache, value_cache = self.flash_attn_backend.get_paged_mha_kv_cache(

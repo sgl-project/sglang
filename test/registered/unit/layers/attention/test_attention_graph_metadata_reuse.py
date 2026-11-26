@@ -10,7 +10,7 @@ import torch
 from sglang.srt.layers.attention import flashinfer_mla_backend as mla
 from sglang.srt.layers.attention import trtllm_mla_backend as trtllm_mla
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -167,15 +167,10 @@ class TestTRTLLMMLAGraphMetadata(unittest.TestCase):
         ):
             with self.subTest(mode=mode):
                 lengths = torch.ones(2, dtype=torch.int64)
-                num_tokens = 2 if mode.is_decode_or_idle() else 6
-                backend._init_cuda_graph_metadata(
-                    2, num_tokens, mode, lengths, lengths.device
-                )
+                backend._init_cuda_graph_metadata(2, mode, lengths.device)
                 first = backend.forward_decode_metadata
                 captured.append(first.seq_lens_k)
-                backend._init_cuda_graph_metadata(
-                    2, num_tokens, mode, lengths, lengths.device
-                )
+                backend._init_cuda_graph_metadata(2, mode, lengths.device)
                 page_table = (
                     torch.arange(8, dtype=torch.int32).reshape(2, 4) + 8 * index
                 )
@@ -191,14 +186,10 @@ class TestTRTLLMMLAGraphMetadata(unittest.TestCase):
                 torch.testing.assert_close(first.block_kv_indices, page_table)
 
         lengths = torch.ones(4, dtype=torch.int64)
-        backend._init_cuda_graph_metadata(
-            4, 4, ForwardMode.DECODE, lengths, lengths.device
-        )
+        backend._init_cuda_graph_metadata(4, ForwardMode.DECODE, lengths.device)
         captured.append(backend.forward_decode_metadata.seq_lens_k)
         self.assertEqual(len({buffer.data_ptr() for buffer in captured}), 4)
-        backend._init_cuda_graph_metadata(
-            2, 2, ForwardMode.IDLE, lengths[:2], lengths.device
-        )
+        backend._init_cuda_graph_metadata(2, ForwardMode.IDLE, lengths.device)
         self.assertEqual(
             backend.forward_decode_metadata.seq_lens_k.data_ptr(),
             captured[0].data_ptr(),

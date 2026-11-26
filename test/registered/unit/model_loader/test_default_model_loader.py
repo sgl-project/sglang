@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -6,7 +9,8 @@ from unittest.mock import Mock, patch
 import torch
 
 import sglang.srt.model_loader.loader as loader_mod
-from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.model_loader.loader import DefaultModelLoader, ModelOptModelLoader
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -40,6 +44,34 @@ class TestDefaultModelLoader(CustomTestCase):
             )
 
         self.assertEqual(events, ["load", "postprocess"])
+
+    def test_mistral_honors_index_opt_out(self):
+        """safetensors_index_file=None must skip the consolidated index too."""
+        with tempfile.TemporaryDirectory() as model_path:
+            files = [
+                os.path.join(model_path, f"consolidated-0000{i}.safetensors")
+                for i in (1, 2)
+            ]
+            for path in files:
+                open(path, "w").close()
+            with open(
+                os.path.join(model_path, "consolidated.safetensors.index.json"), "w"
+            ) as f:
+                json.dump({"weight_map": {"w": os.path.basename(files[0])}}, f)
+            loader = DefaultModelLoader(LoadConfig(load_format=LoadFormat.MISTRAL))
+            with patch.object(loader_mod, "get_server_args", return_value=None):
+                for index_file, expected in (
+                    ("model.safetensors.index.json", files[:1]),
+                    (None, files),
+                ):
+                    with self.subTest(index_file=index_file):
+                        _, weight_files, _ = loader._prepare_weights(
+                            model_path,
+                            None,
+                            fall_back_to_pt=False,
+                            safetensors_index_file=index_file,
+                        )
+                        self.assertEqual(sorted(weight_files), expected)
 
     def test_reload_requires_explicit_initial_load_marker(self):
         self.assertFalse(loader_mod.QuantizedRLModelLoader.is_reload_scenario(Mock()))
@@ -127,6 +159,26 @@ class TestDefaultModelLoader(CustomTestCase):
                     resolved_source=resolved_source,
                     startup_prefetch_started=True,
                     startup_prefetch_active=True,
+                )
+
+
+class TestModelOptLoaderSelection(CustomTestCase):
+    def test_every_modelopt_quantization_selects_the_modelopt_loader(self):
+        """A pre-quantized checkpoint under any ModelOpt quantization value must
+        load through ModelOptModelLoader, not fall through to the default loader."""
+        for quantization in (
+            "modelopt",
+            "modelopt_fp8",
+            "modelopt_fp4",
+            "modelopt_mixed",
+        ):
+            with self.subTest(quantization=quantization):
+                model_config = SimpleNamespace(
+                    quantization=quantization, _is_already_quantized=lambda: True
+                )
+                self.assertIsInstance(
+                    loader_mod.get_model_loader(LoadConfig(), model_config),
+                    ModelOptModelLoader,
                 )
 
 

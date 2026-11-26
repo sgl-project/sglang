@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import init_custom_process_group
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -115,9 +115,8 @@ class WeightExporter:
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
-        if self._weights_send_group[group_name] is not None:
-            send_group = self._weights_send_group[group_name]
-        else:
+        send_group = self._weights_send_group.get(group_name)
+        if send_group is None:
             message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
             logger.error(message)
             return False, message

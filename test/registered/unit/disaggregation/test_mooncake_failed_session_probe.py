@@ -30,15 +30,15 @@ def _manager(probe_rc: int = -1, idle_timeout: float = 600.0) -> MooncakeKVManag
     manager.failed_session_probe_interval = 30.0
     manager.failed_session_probe_max_interval = 300.0
     manager.failed_session_idle_timeout = idle_timeout
-    manager.engine = SimpleNamespace(send_probe=Mock(return_value=probe_rc))
+    manager.transport = SimpleNamespace(send_probe=Mock(return_value=probe_rc))
     return manager
 
 
 def _run_passes(manager, until: float, step: float = 30.0) -> list:
     """Run the probe loop every `step` seconds; return when probes were sent."""
     sent = []
-    manager.engine.send_probe.side_effect = lambda session_id: (
-        sent.append(now) or manager.engine.send_probe.return_value
+    manager.transport.send_probe.side_effect = lambda session_id: (
+        sent.append(now) or manager.transport.send_probe.return_value
     )
     now = 0.0
     while now <= until:
@@ -83,7 +83,7 @@ def _request_blacklisted_session(manager, now: float) -> None:
         }
     }
     manager._send_multipart_locked = Mock()
-    manager._transfer_data = Mock(return_value=0)
+    manager._transfer_copies = Mock(return_value=0)
     queue = FastQueue()
     queue.put(
         TransferKVChunk(
@@ -99,7 +99,7 @@ def _request_blacklisted_session(manager, now: float) -> None:
     with patch(CLOCK, return_value=now):
         manager.transfer_worker(queue, executor=None)
     assert manager.request_status[ROOM] == KVPoll.Failed
-    manager._transfer_data.assert_not_called()
+    manager._transfer_copies.assert_not_called()
 
 
 class TestMooncakeFailedSessionProbe(CustomTestCase):
@@ -116,7 +116,7 @@ class TestMooncakeFailedSessionProbe(CustomTestCase):
         _run_passes(manager, until=60)
         self.assertEqual(manager.failed_session_probes[SESSION].interval, 120)
 
-        manager.engine.send_probe.return_value = 0
+        manager.transport.send_probe.return_value = 0
         with patch(CLOCK, return_value=180):
             manager._run_one_probe_pass()
         self.assertFalse(manager.failed_sessions)
@@ -125,11 +125,11 @@ class TestMooncakeFailedSessionProbe(CustomTestCase):
 
         # Blacklisted again later: probed on the next pass, from the base interval.
         manager.failed_sessions.add(SESSION)
-        manager.engine.send_probe.return_value = -1
-        manager.engine.send_probe.reset_mock()
+        manager.transport.send_probe.return_value = -1
+        manager.transport.send_probe.reset_mock()
         with patch(CLOCK, return_value=500):
             manager._run_one_probe_pass()
-        manager.engine.send_probe.assert_called_once_with(SESSION)
+        manager.transport.send_probe.assert_called_once_with(SESSION)
         self.assertEqual(manager.failed_session_probes[SESSION].interval, 60)
 
     def test_unrequested_session_is_dropped(self):

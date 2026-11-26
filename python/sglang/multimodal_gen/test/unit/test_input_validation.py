@@ -8,13 +8,13 @@ import torch
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from PIL import Image
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanI2V480PConfig,
     WanI2V720PConfig,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
@@ -222,12 +222,6 @@ class TestFlux2ConditionImagePreprocess(unittest.TestCase):
 
         processor = mock_add_stages.call_args.kwargs["vae_image_processor"]
         self.assertIsInstance(processor, Flux2ImageProcessor)
-        self.assertIs(
-            processor,
-            mock_add_stages.call_args.kwargs["image_vae_stage_kwargs"][
-                "vae_image_processor"
-            ],
-        )
 
 
 class TestFlux2TI2ISizeResolution(unittest.TestCase):
@@ -262,6 +256,37 @@ class TestFlux2TI2ISizeResolution(unittest.TestCase):
         )
 
         self.assertEqual((batch.width, batch.height), (768, 512))
+
+
+class TestFlux2EditOutputSize(unittest.TestCase):
+    def _output_size(self, image_size, vae_arch=None):
+        image = Image.new("RGB", image_size, color="red")
+        batch = _make_batch(image, width=1024, height=1024)
+        batch.extra = {"explicit_fields": []}
+        config = Flux2PipelineConfig()
+        if vae_arch is None:
+            vae_arch = {"block_out_channels": [128, 256, 512, 512]}
+        config.vae_config.update_model_arch(vae_arch)
+        config.vae_config.post_init()
+        InputValidationStage().preprocess_condition_image(
+            batch, _make_server_args(config), image.width, image.height
+        )
+        return batch.width, batch.height
+
+    def test_output_follows_aligned_input_image(self):
+        self.assertEqual(self._output_size((768, 1344)), (768, 1344))
+
+    def test_output_follows_unaligned_input_image(self):
+        self.assertEqual(self._output_size((770, 1344)), (768, 1344))
+
+    def test_tiny_vae_without_block_out_channels_uses_resolved_scale(self):
+        vae_arch = {
+            "encoder_block_out_channels": [64, 64, 64, 64],
+            "decoder_block_out_channels": [64, 64, 64, 64],
+            "latent_channels": 128,
+            "upsampling_scaling_factor": 2,
+        }
+        self.assertEqual(self._output_size((770, 1344), vae_arch), (768, 1344))
 
 
 class TestPerRequestTask(unittest.TestCase):
