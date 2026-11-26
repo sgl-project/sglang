@@ -21,13 +21,11 @@ export SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY='{
     "overlay_revision": "main"
   }
 }'
-
-sglang generate \
-  --model-path Wan-AI/Wan2.2-S2V-14B \
-  --config configs/wan_s2v.yaml
 ```
 
-The overlay repo should be a complete diffusers-style/componentized repo
+Use a trusted overlay: it can run a custom materializer when preparing the model.
+See the [Wan2.2 speech-to-video example](/cookbook/diffusion/Wan/Wan2.2#speech-to-video-offline)
+for a pinned overlay and a complete offline generation command.
 
 You can also pass the overlay repo itself as `--model-path` if it contains `_overlay/overlay_manifest.json`.
 
