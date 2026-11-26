@@ -117,7 +117,7 @@ from sglang.srt.mem_cache.allocation import (
     alloc_tracking_slots,
     retire_window,
 )
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.allocation_sizing import decode_alloc_lens
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -715,8 +715,6 @@ class Req(ReqDllmMixin):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
         )
-        self.temp_scaled_logprobs = False
-        self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
         self.sampling_logprobs_mode = sampling_logprobs_mode
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
@@ -2990,18 +2988,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             return new_pages * page_size + num_beam_member_rows(requests)
 
-        return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
-
-    def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
-        """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
-        reserve = get_alloc_reserve_per_decode()
-        total = 0
-        for r in requests:
-            x = max(0, r.kv.kv_committed_len + reserve - r.kv.kv_allocated_len)
-            cur = r.kv.kv_allocated_len
-            nxt = cur + x
-            total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
-        return total
+        cur_kv_lens, nxt_kv_lens, _ = decode_alloc_lens(requests, page_size=page_size)
+        return sum(
+            ceil_align(nxt, page_size) - ceil_align(cur, page_size)
+            for cur, nxt in zip(cur_kv_lens, nxt_kv_lens)
+        )
 
     @capacity_decision
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
@@ -3303,10 +3294,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
-
-        # Clear context parallel metadata - CP is only for prefill, not decode
-        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
-            self.attn_cp_metadata = None
 
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).

@@ -53,6 +53,7 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
+from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.configs.quant_utils import (
     LOADER_RESOLVED_QUANT_METHODS,
     get_quantization_config,
@@ -251,8 +252,7 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
 
     ``load_format`` overrides the config's: a draft runner loading under
     ``--speculative-draft-load-format`` needs its own transfer engine. Every
-    input is a ``model`` leaf, so this serves both the pre-publish member and
-    the post-publish accessor."""
+    input is a ``model`` leaf, so the published ``model`` bag answers it."""
     if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
         return True
     if (load_format or cfg.load_format) != "remote_instance":
@@ -444,7 +444,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
-        "Inkling2ForConditionalGeneration",
+        *INKLING2_ARCHS,
     }
 )
 
@@ -936,6 +936,8 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "Dots3NoteForCausalLM",
         "Xing4_0ForCausalLM",
         "KimiK31ForConditionalGeneration",
+        "GigaChat4ForCausalLM",
+        "GigaChat4ForCausalLMNextN",
     }
 )
 
