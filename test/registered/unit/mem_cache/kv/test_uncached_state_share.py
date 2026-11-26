@@ -25,6 +25,7 @@ class TestUncachedStateShare(CustomTestCase):
         inp = KVSizingInputs(
             budget_bytes=4096 * state_bytes,
             context_len=16,
+            req_to_token_row_width=16,
             radix_cache=False,
             state_share=0.5,
             alignment=1,

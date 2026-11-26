@@ -18,7 +18,7 @@ QWEN3_5_397B_A17B_ENVS = {
     "ASCEND_USE_FIA": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
-    "HCCL_BUFFSIZE": "0",
+    "DEEPEP_HCCL_BUFFSIZE": "2200",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "6",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "GDN_ATTN_BACKEND_TRITON": "1",
@@ -27,11 +27,7 @@ QWEN3_5_397B_A17B_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ZBAL_LOCAL_MEM_SIZE": "59648",
     "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
-    "SGLANG_ZBAL_BOOTSTRAP_URL": "tcp://127.0.0.1:24669",
-    "ZBAL_NPU_ALLOC_CONF": "use_vmm_for_static_memory:True",
-    "ZBAL_ENABLE_GRAPH": "1",
 }
 
 QWEN3_5_397B_A17B_3K5_1K5_OTHER_ARGS = [
@@ -123,9 +119,8 @@ class TestNPUQwen3_5_397B_A17B_3K5_1K5_50ms(TestNpuPerformanceTestCaseBase):
     tpot = 50
     output_token_throughput = 5415
     request_rate = float("inf")
-    # Disabled to work around DTS2026091033366; re-enable after the fix.
-    # temperature = 0.6
-    # top_p = 0.95
+    temperature = 0.6
+    top_p = 0.95
 
     def test_npu_qwen3_5_397b_a17b_3k5_1k5(self):
         """Run NPU performance test for Qwen3.5-397B-A17B in3k5 out1k5"""
