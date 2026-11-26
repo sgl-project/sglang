@@ -330,6 +330,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.multimodal.modality import Modality
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
+        manager.mm_processor = None
         manager.rid_to_state = {}
         manager.encoder_dispatch_ready = {}
         transport = MagicMock()
@@ -348,7 +349,9 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager.positional_embeds_transport = MagicMock()
 
         with (
-            patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
+            patch.object(
+                tokenizer_manager, "wrap_shm_features", lambda obj, **kwargs: obj
+            ),
             self.assertRaisesRegex(RuntimeError, "send failed"),
         ):
             asyncio.run(manager._send_one_request(tokenized_obj))
@@ -387,7 +390,9 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager.positional_embeds_transport = MagicMock()
 
         with (
-            patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
+            patch.object(
+                tokenizer_manager, "wrap_shm_features", lambda obj, **kwargs: obj
+            ),
             self.assertRaisesRegex(RuntimeError, "bookkeeping failed"),
         ):
             asyncio.run(manager._send_one_request(tokenized_obj))
