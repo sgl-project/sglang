@@ -70,6 +70,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         read_only_state_rows: Optional[torch.Tensor] = None,
         beam_replay_group_ids: Optional[torch.Tensor] = None,
         beam_replay_slots: Optional[torch.Tensor] = None,
+        beam_replay_window_rows: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Packed decode fast path: fuse QKV extraction + gating + recurrent
@@ -113,9 +114,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
             and replayssm_g is not None
             and replayssm_write_pos is not None
         ):
-            assert read_only_state_rows is None and beam_replay_group_ids is None, (
-                "ReplaySSM decode needs private state"
-            )
+            assert (
+                read_only_state_rows is None
+                and beam_replay_group_ids is None
+                and beam_replay_window_rows is None
+            ), "ReplaySSM decode needs private state"
             fused_recurrent_linear_replayssm_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -149,6 +152,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             read_only_state_rows=read_only_state_rows,
             beam_replay_group_ids=beam_replay_group_ids,
             beam_replay_slots=beam_replay_slots,
+            beam_replay_window_rows=beam_replay_window_rows,
         )
 
         # Convert [B, 1, HV, V] → [1, B, HV, V] to match existing output

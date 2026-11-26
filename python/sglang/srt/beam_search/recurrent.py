@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import logging
+from math import ceil
 from typing import TYPE_CHECKING
 
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.fla.beam_replay_layout import (
+    GDN_BEAM_REPLAY_WINDOW,
+    records_per_state_slot,
+)
+from sglang.srt.beam_search.fork import plan_state_forks
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_memory, get_parallel
 from sglang.srt.utils import is_cuda
@@ -13,6 +19,7 @@ from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.batch_tail import BeamTail
+    from sglang.srt.beam_search.beam_group import BeamGroup
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -21,8 +28,98 @@ logger = logging.getLogger(__name__)
 
 
 class GdnBeamReplayInputs(msgspec.Struct, frozen=True):
-    group_ids: torch.Tensor
-    slots: torch.Tensor
+    group_ids: torch.Tensor | None = None
+    slots: torch.Tensor | None = None
+    window_rows: torch.Tensor | None = None
+
+
+class GdnBeamReplayWindow:
+    """A bounded tape with a dense checkpoint per live ancestor."""
+
+    def __init__(
+        self,
+        checkpoints: torch.Tensor,
+        arena: torch.Tensor,
+        records_per_slot: int,
+        num_record_steps: int = GDN_BEAM_REPLAY_WINDOW,
+    ):
+        self.checkpoints = checkpoints.to(dtype=torch.int32)
+        width = checkpoints.numel()
+        self.rows = torch.arange(width, device=checkpoints.device)
+        self.anchor_rows = torch.zeros_like(self.rows)
+        records = torch.arange(num_record_steps * width, device=checkpoints.device)
+        self.records = (
+            arena[records // records_per_slot].to(torch.int32) * records_per_slot
+            + (records % records_per_slot).to(torch.int32)
+        ).view(num_record_steps, width)
+        self.history: torch.Tensor | None = None
+
+    @staticmethod
+    def depth(num_generated: int) -> int:
+        return (num_generated - 1) % (GDN_BEAM_REPLAY_WINDOW + 1)
+
+    def rows_for_decode(self, group: BeamGroup) -> torch.Tensor:
+        depth = self.depth(group.num_generated)
+        state_slots = self.checkpoints[self.anchor_rows]
+        padding = state_slots.new_full(
+            (state_slots.numel(), GDN_BEAM_REPLAY_WINDOW - depth), -1
+        )
+        records = (
+            self.records[depth]
+            if depth < GDN_BEAM_REPLAY_WINDOW
+            and not group.terminal_state_is_read_only()
+            else torch.full_like(state_slots, -1)
+        )
+        return torch.cat(
+            (
+                state_slots[:, None],
+                records[:, None],
+                self.history.transpose(0, 1)
+                if self.history is not None
+                else padding[:, :0],
+                padding,
+            ),
+            dim=1,
+        )
+
+    def advance(
+        self, group: BeamGroup, parents: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        depth = self.depth(group.num_generated)
+        if depth == 0:
+            self.history = None
+        else:
+            selected = self.records[depth - 1, parents][None, :]
+            self.history = (
+                selected
+                if self.history is None
+                else torch.cat((self.history[:, parents], selected), dim=0)
+            )
+        anchors = self.anchor_rows[parents]
+        if depth == GDN_BEAM_REPLAY_WINDOW and not group.terminal_state_is_read_only():
+            # A fold writes dense state in-place. Give each child a private
+            # checkpoint before the kernel reads or writes any of those slots.
+            self.anchor_rows, src, dst = plan_state_forks(
+                slots=self.rows, parents=anchors
+            )
+            return self.checkpoints[src], self.checkpoints[dst]
+        self.anchor_rows = anchors
+        return None
+
+
+def gdn_beam_replay_record_steps(max_new_tokens: int) -> int:
+    return min(GDN_BEAM_REPLAY_WINDOW, max_new_tokens - 2)
+
+
+def gdn_beam_replay_arena_size(
+    width: int, max_new_tokens: int, state: StateStorage
+) -> tuple[int, int]:
+    temporal = state.pool.mamba_cache.temporal
+    v, k = temporal.shape[-2:]
+    per_slot = records_per_state_slot(v, k, temporal.element_size())
+    return ceil(
+        gdn_beam_replay_record_steps(max_new_tokens) * width / per_slot
+    ), per_slot
 
 
 def resolve_beam_state_optimizations(
@@ -131,30 +228,53 @@ def _supports_gdn_beam_replay(
         and temporal.storage_offset() % factor == 0
         and k % factor == 0
         and all(stride % factor == 0 for stride in temporal.stride()[:-1])
-        and (v * k) // factor >= 2 * (v + k + 1)
+        and records_per_state_slot(v, k, temporal.element_size()) >= 2
     )
 
 
 def build_gdn_beam_replay_inputs(
     *, tail: BeamTail, num_rows: int, device: torch.device
 ) -> GdnBeamReplayInputs | None:
-    replay = [entry for entry in tail.entries if entry.group.use_gdn_beam_replay]
-    if not replay:
+    inline = [entry for entry in tail.entries if entry.group.use_gdn_beam_replay]
+    windowed = [
+        entry
+        for entry in tail.entries
+        if entry.group.gdn_replay_window is not None
+        and not entry.group.launch_complete()
+    ]
+    if not inline and not windowed:
         return None
-    group_ids = [-1] * num_rows
-    slots = []
-    for group_id, entry in enumerate(replay):
-        kv = entry.group.leader.kv
-        assert kv.mamba_pool_idx is not None and kv.beam_mamba_slots is not None
-        slots.extend((kv.mamba_pool_idx.view(1), kv.beam_mamba_slots[:1]))
-        group_ids[entry.leader_idx] = group_id
-        start = tail.num_base_rows + entry.start
-        end = tail.num_base_rows + entry.end
-        group_ids[start:end] = [group_id] * (end - start)
-    return GdnBeamReplayInputs(
-        group_ids=async_h2d(group_ids, dtype=torch.int32, device=device),
-        slots=torch.cat(slots),
-    )
+    group_ids = slots = window_rows = None
+    if inline:
+        host_ids = [-1] * num_rows
+        inline_slots = []
+        for group_id, entry in enumerate(inline):
+            kv = entry.group.leader.kv
+            assert kv.mamba_pool_idx is not None and kv.beam_mamba_slots is not None
+            inline_slots.extend((kv.mamba_pool_idx.view(1), kv.beam_mamba_slots[:1]))
+            host_ids[entry.leader_idx] = group_id
+            start = tail.num_base_rows + entry.start
+            end = tail.num_base_rows + entry.end
+            host_ids[start:end] = [group_id] * (end - start)
+        group_ids = async_h2d(host_ids, dtype=torch.int32, device=device)
+        slots = torch.cat(inline_slots)
+    if windowed:
+        ids = []
+        metadata = []
+        for entry in windowed:
+            group = entry.group
+            ids.append(entry.leader_idx)
+            ids.extend(
+                range(tail.num_base_rows + entry.start, tail.num_base_rows + entry.end)
+            )
+            metadata.append(group.gdn_replay_window.rows_for_decode(group))
+        window_rows = torch.full(
+            (num_rows, GDN_BEAM_REPLAY_WINDOW + 2), -1, device=device, dtype=torch.int32
+        )
+        window_rows.index_copy_(
+            0, async_h2d(ids, dtype=torch.int64, device=device), torch.cat(metadata)
+        )
+    return GdnBeamReplayInputs(group_ids, slots, window_rows)
 
 
 def build_read_only_state_mask(

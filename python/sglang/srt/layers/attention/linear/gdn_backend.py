@@ -1253,6 +1253,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if beam_replay is not None:
                 state_write_options["beam_replay_group_ids"] = beam_replay.group_ids
                 state_write_options["beam_replay_slots"] = beam_replay.slots
+                state_write_options["beam_replay_window_rows"] = beam_replay.window_rows
             core_attn_out = self.kernel_dispatcher.packed_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,

@@ -95,6 +95,7 @@ class _StateFork(NamedTuple):
     src: torch.Tensor
     dst: torch.Tensor
     conv_only: bool = False
+    replay_checkpoint: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 def _streamed_topk_logprobs(
@@ -319,6 +320,25 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             and not stop_token_ids
             and self.trie_constraint is None
         )
+        replay = self.use_gdn_beam_replay and read_only_terminal_state
+        records_per_slot = 0
+        if replay and max_new_tokens > 3:
+            from sglang.srt.beam_search.recurrent import gdn_beam_replay_arena_size
+
+            assert state is not None
+            extra_slots, capacity = gdn_beam_replay_arena_size(
+                beam_width, max_new_tokens, state
+            )
+            if required_slots + extra_slots <= state.slots.size:
+                member_slots += extra_slots
+                records_per_slot = capacity
+            else:
+                logger.debug(
+                    "GDN beam replay needs %d extra state slots at width %d; "
+                    "using dense checkpoints with terminal writeback elision.",
+                    extra_slots,
+                    beam_width,
+                )
         group = BeamGroup(
             beam_width=beam_width,
             stop_token_ids=stop_token_ids,
@@ -329,11 +349,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             device=self.req_to_token_pool.device,
             device_history=fixed_length,
             read_only_terminal_state=read_only_terminal_state,
-            use_gdn_beam_replay=(
-                self.use_gdn_beam_replay
-                and read_only_terminal_state
-                and max_new_tokens == 3
-            ),
+            use_gdn_beam_replay=replay and max_new_tokens == 3,
+            gdn_replay_records_per_slot=records_per_slot,
         )
         if self.trie_constraint is not None:
             group.trie_prefix_codes = torch.empty(
@@ -510,6 +527,24 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             member_slots = leader.kv.beam_mamba_slots
             leader_slot = leader.kv.mamba_pool_idx
             assert member_slots is not None and leader_slot is not None
+            if group.gdn_replay_records_per_slot:
+                from sglang.srt.beam_search.recurrent import (
+                    GdnBeamReplayWindow,
+                    gdn_beam_replay_record_steps,
+                )
+
+                member_slots, arena = member_slots.split(
+                    (
+                        group.num_member_rows,
+                        member_slots.numel() - group.num_member_rows,
+                    )
+                )
+                group.gdn_replay_window = GdnBeamReplayWindow(
+                    torch.cat((leader_slot.view(1), member_slots)),
+                    arena,
+                    group.gdn_replay_records_per_slot,
+                    gdn_beam_replay_record_steps(group.max_new_tokens),
+                )
             mapping = pool.req_index_to_mamba_index_mapping
             if group.terminal_state_is_read_only():
                 mapping[member_rows] = leader_slot.to(torch.int32)
@@ -518,7 +553,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return _StateFork(
                 leader_slot.expand_as(member_slots),
                 member_slots,
-                conv_only=group.use_gdn_beam_replay,
+                conv_only=group.use_gdn_beam_replay
+                or group.gdn_replay_window is not None,
             )
         return None
 
@@ -731,6 +767,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 pool = self.req_to_token_pool
                 assert isinstance(pool, HybridReqToTokenPool)
                 mapping = pool.req_index_to_mamba_index_mapping
+                window = group.gdn_replay_window
+                checkpoint = (
+                    window.advance(group, parent_idx) if window is not None else None
+                )
                 if group.terminal_state_is_read_only():
                     # The upcoming decode reads shared parents without updating them.
                     slots = mapping[rows[parent_idx]]
@@ -738,7 +778,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                     slots, src, dst = plan_state_forks(
                         slots=mapping[rows], parents=parent_idx
                     )
-                    state_fork = _StateFork(src, dst)
+                    state_fork = _StateFork(
+                        src,
+                        dst,
+                        conv_only=window is not None,
+                        replay_checkpoint=checkpoint,
+                    )
                 # The leader's original slot remains its allocation for teardown;
                 # only the working row-to-slot bindings follow the new frontier.
                 mapping[rows] = slots
@@ -764,6 +809,17 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 src = torch.cat([fork.src for fork in subset])
                 dst = torch.cat([fork.dst for fork in subset])
             state.pool.copy_beam_slots(src=src, dst=dst, conv_only=conv_only)
+        checkpoints = [
+            fork.replay_checkpoint
+            for fork in forks
+            if fork.replay_checkpoint is not None
+        ]
+        if checkpoints:
+            src, dst = zip(*checkpoints, strict=True)
+            state.pool.copy_beam_temporal_slots(
+                src=src[0] if len(src) == 1 else torch.cat(src),
+                dst=dst[0] if len(dst) == 1 else torch.cat(dst),
+            )
 
     def _reclaim_orphans(
         self, group: BeamGroup, up_to_tick: Optional[int] = None

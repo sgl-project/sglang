@@ -1304,6 +1304,12 @@ class MambaPool:
         for sibling in self._slot_siblings:
             sibling.copy_beam_slots(src=src, dst=dst)
 
+    def copy_beam_temporal_slots(self, *, src: torch.Tensor, dst: torch.Tensor) -> None:
+        from sglang.kernels.ops.kvcache.copy_pages import copy_layered_pages
+
+        assert self.replayssm_write_pos is None and not self._slot_siblings
+        copy_layered_pages(self.mamba_cache.temporal, src=src, dst=dst)
+
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
         conv_cpu = [

@@ -24,7 +24,7 @@ split documented in coordinator.py.
 from __future__ import annotations
 
 import enum
-from typing import List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import msgspec
 import torch
@@ -32,6 +32,9 @@ import torch
 from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
 from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
+
+if TYPE_CHECKING:
+    from sglang.srt.beam_search.recurrent import GdnBeamReplayWindow
 
 
 class BeamGroupState(enum.Enum):
@@ -73,6 +76,7 @@ class BeamGroup:
         device_history: bool = False,
         read_only_terminal_state: bool = False,
         use_gdn_beam_replay: bool = False,
+        gdn_replay_records_per_slot: int = 0,
     ):
         self.beam_width = beam_width
         self.num_candidates = 2 * beam_width
@@ -95,6 +99,8 @@ class BeamGroup:
         self.device_history = device_history
         self.read_only_terminal_state = read_only_terminal_state
         self.use_gdn_beam_replay = use_gdn_beam_replay
+        self.gdn_replay_records_per_slot = gdn_replay_records_per_slot
+        self.gdn_replay_window: GdnBeamReplayWindow | None = None
         self._device_tokens: List[torch.Tensor] = []
         self._device_parents: List[torch.Tensor] = []
         self._device_final_tokens: Optional[torch.Tensor] = None
