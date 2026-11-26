@@ -46,7 +46,9 @@ def _routed(pool):
 
 @pytest.fixture
 def make_xqa_backend(monkeypatch):
-    def parent_init(self, *args, **kwargs):
+    def parent_init(self, model_runner, *args, **kwargs):
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = model_runner.req_to_token_pool.row_width
         self.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: SimpleNamespace(
                 kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
@@ -91,7 +93,7 @@ def make_xqa_backend(monkeypatch):
             kv_cache_dtype=torch.bfloat16,
             dtype=torch.bfloat16,
             page_size=32,
-            req_to_token_pool=SimpleNamespace(size=4, req_to_token=None),
+            req_to_token_pool=SimpleNamespace(size=4, row_width=128, req_to_token=None),
             device="cpu",
             max_running_requests=4,
             model=SimpleNamespace(modules=lambda: []),
@@ -513,7 +515,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
     backend.device = torch.device("cpu")
-    backend.max_context_len = 1024
+    backend.max_kv_len = 1024
     backend.page_size = PAGE_SIZE
     backend.max_num_pages = 8
     backend.req_to_token = torch.zeros(4, 1024, dtype=torch.int32)
@@ -1027,10 +1029,9 @@ def test_hybrid_wrappers_forward_in_graph_hook():
             SimpleNamespace(
                 kv_cache_dtype=torch.bfloat16,
                 token_to_kv_pool=None,
-                req_to_token_pool=None,
+                req_to_token_pool=SimpleNamespace(row_width=2048),
                 runner_ids=None,
                 server_args=SimpleNamespace(speculative_attention_mode="decode"),
-                model_config=SimpleNamespace(context_len=2048),
             ),
             prefill_backend=make_fake("prefill", calls),
             decode_backend=make_fake("decode", calls),
