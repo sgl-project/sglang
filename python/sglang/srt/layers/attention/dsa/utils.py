@@ -385,6 +385,41 @@ def maybe_prefetch_next_full_attention_kv(
             prefetch_kv_buffer(next_full_attention_layer_id)
 
 
+def maybe_prefetch_next_kimi_full_attention_kv(
+    forward_batch: "ForwardBatch",
+    next_full_attention_layer_id: Optional[int],
+) -> None:
+    """Prefetch Kimi's next Full Attention layer through its hybrid NPU pool."""
+    if (
+        next_full_attention_layer_id is None
+        or not is_npu()
+        or not dsa_use_prefill_cp(forward_batch)
+    ):
+        return
+
+    pool = get_token_to_kv_pool()
+    full_pool = getattr(pool, "full_kv_pool", None)
+    if not getattr(full_pool, "layer_shard_enabled", False):
+        return
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if prefix_lens is not None and all(n == 0 for n in prefix_lens):
+        return
+
+    used_bound = (
+        None
+        if not get_memory().disable_radix_cache
+        else _dsa_split_row_bound(forward_batch)
+    )
+    # Transfer completion uses model layer ids; the child addresses only the
+    # densely numbered Full Attention layers. Wait before either broadcast.
+    pool._wait_for_layer(next_full_attention_layer_id)
+    layer_id = pool._transfer_full_attention_id(next_full_attention_layer_id)
+    full_pool.prefetch_kv_buffer(layer_id, used_bound=used_bound)
+    prefetch_index = getattr(full_pool, "prefetch_index_k_buffer", None)
+    if prefetch_index is not None:
+        prefetch_index(layer_id, used_bound=used_bound)
+
+
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 

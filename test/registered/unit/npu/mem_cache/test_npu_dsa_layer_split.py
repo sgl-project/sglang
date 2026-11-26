@@ -21,7 +21,10 @@ from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
     LayerSplitNPUMLATokenToKVPool,
 )
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-from sglang.srt.layers.attention.dsa.utils import _dsa_split_row_bound
+from sglang.srt.layers.attention.dsa.utils import (
+    _dsa_split_row_bound,
+    maybe_prefetch_next_kimi_full_attention_kv,
+)
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -88,13 +91,12 @@ class _FakeWork:
 
 
 class TestShardBookkeeping(CustomTestCase):
-    def test_hybrid_prefetch_translates_sparse_model_layer_ids(self):
-        """A next-DSA-layer prefetch must reach the compact child before its read."""
+    def _hybrid_prefetch_pool(self):
         pool = object.__new__(HybridLinearKVPool)
-        pool.start_layer = 0
+        pool.start_layer = 8
         waits = []
         pool.layer_transfer_counter = SimpleNamespace(wait_until=waits.append)
-        pool.full_attention_layer_id_mapping = {3: 0, 7: 1, 11: 2}
+        pool.full_attention_layer_id_mapping = {11: 0, 15: 1, 19: 2}
         pool.full_kv_pool = _make_pool(layer_num=3, shard_rank=2)
         child = pool.full_kv_pool
         child.remote_kv_layer_id = None
@@ -105,25 +107,79 @@ class TestShardBookkeeping(CustomTestCase):
         child.pending_remote_index_broadcast = False
         child.pending_kv_works = []
         child.pending_index_works = []
+        return pool, waits
+
+    def test_kimi_prefetch_translates_model_ids_and_waits_before_broadcast(self):
+        pool, waits = self._hybrid_prefetch_pool()
+        child = pool.full_kv_pool
+        ctx = ForwardContext(
+            attn_backend=SimpleNamespace(
+                token_to_kv_pool=pool,
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.arange(8, 16).unsqueeze(0)
+                ),
+            )
+        )
+        fb = SimpleNamespace(
+            req_pool_indices=torch.tensor([0]), extend_prefix_lens_cpu=[8]
+        )
+        broadcast_waits = []
+
+        def kick_kv(layer_id, bound):
+            broadcast_waits.append(list(waits))
+            return [_FakeWork()]
+
+        def kick_index(layer_id):
+            broadcast_waits.append(list(waits))
+            return _FakeWork()
+
         with (
-            patch.object(child, "_broadcast_kv_from_owner", return_value=[_FakeWork()]),
-            patch.object(
-                child, "_broadcast_index_from_owner", return_value=_FakeWork()
+            forward_context(ctx),
+            patch("sglang.srt.layers.attention.dsa.utils.is_npu", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
+                return_value=True,
             ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.get_memory",
+                return_value=SimpleNamespace(disable_radix_cache=True),
+            ),
+            patch.object(child, "_broadcast_kv_from_owner", side_effect=kick_kv),
+            patch.object(child, "_broadcast_index_from_owner", side_effect=kick_index),
         ):
-            pool.prefetch_kv_buffer(11, used_bound=16)
-            pool.prefetch_index_k_buffer(11, used_bound=16)
+            maybe_prefetch_next_kimi_full_attention_kv(fb, 19)
+            child.layer_shard_enabled = False
+            maybe_prefetch_next_kimi_full_attention_kv(fb, 999)
         self.assertEqual(child.pending_remote_kv_layer_id, 2)
         self.assertEqual(child.pending_remote_index_layer_id, 2)
         self.assertTrue(child.pending_remote_kv_broadcast)
         self.assertTrue(child.pending_remote_index_broadcast)
         self.assertEqual((child._kv_used_bound, child._idx_used_bound), (16, 16))
-        self.assertEqual(waits, [11, 11])
-        child.layer_shard_enabled = False
-        pool.prefetch_kv_buffer(999)
-        pool.prefetch_index_k_buffer(999)
-        self.assertEqual(child.pending_remote_kv_layer_id, 2)
-        self.assertEqual(waits, [11, 11])
+        # Model layer 19 is offset 11 in this PP span, not compact layer 2.
+        self.assertEqual(waits, [11])
+        self.assertEqual(broadcast_waits, [[11], [11]])
+
+    def test_kimi_prefetch_without_prefix_keeps_scratch_unprepared(self):
+        pool, waits = self._hybrid_prefetch_pool()
+        child = pool.full_kv_pool
+        ctx = ForwardContext(attn_backend=SimpleNamespace(token_to_kv_pool=pool))
+        fb = SimpleNamespace(extend_prefix_lens_cpu=[0])
+        with (
+            forward_context(ctx),
+            patch("sglang.srt.layers.attention.dsa.utils.is_npu", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
+                return_value=True,
+            ),
+        ):
+            maybe_prefetch_next_kimi_full_attention_kv(fb, 19)
+        self.assertEqual(waits, [])
+        self.assertFalse(child.pending_remote_kv_broadcast)
+        self.assertFalse(child.pending_remote_index_broadcast)
+
+    def test_kimi_prefetch_on_non_npu_is_noop_without_forward_context(self):
+        with patch("sglang.srt.layers.attention.dsa.utils.is_npu", return_value=False):
+            maybe_prefetch_next_kimi_full_attention_kv(SimpleNamespace(), 19)
 
     def test_hybrid_write_preserves_cp_gather_patch_flags(self):
         """Dropping chunk flags discards a prefetched prefix and broadcasts again."""

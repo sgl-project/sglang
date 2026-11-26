@@ -4547,26 +4547,6 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-    def prefetch_kv_buffer(self, layer_id: int, **kwargs):
-        if not getattr(self.full_kv_pool, "layer_shard_enabled", False):
-            return
-        self.full_kv_pool.prefetch_kv_buffer(
-            self._transfer_full_attention_id(layer_id),
-            layer_transfer_counter=self.layer_transfer_counter,
-            layer_transfer_idx=layer_id - self.start_layer,
-            **kwargs,
-        )
-
-    def prefetch_index_k_buffer(self, layer_id: int, **kwargs):
-        prefetch = getattr(self.full_kv_pool, "prefetch_index_k_buffer", None)
-        if (
-            not getattr(self.full_kv_pool, "layer_shard_enabled", False)
-            or prefetch is None
-        ):
-            return
-        self._wait_for_layer(layer_id)
-        prefetch(self._transfer_full_attention_id(layer_id), **kwargs)
-
     def get_combined_kv_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         return self.full_kv_pool.get_combined_kv_buffer(
