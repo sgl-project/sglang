@@ -1454,36 +1454,79 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertEqual(mgr.request_status[room], KVPoll.Failed)
         mgr._allocate_staging_buffers.assert_called_once_with(1)
 
-    def test_deferred_staging_chunk_still_transfers_after_last_chunk_success(self):
-        room = 27
-        mgr = self._make_staging_manager(room)
-        first = self._make_chunk(room, [1], is_last_chunk=False)
-        last = self._make_chunk(room, [2], is_last_chunk=True)
-        last.index_slice = slice(1, 2)
-        events = []
-        attempts = []
+    def test_last_staging_chunk_waits_for_earlier_peer_before_room_success(self):
+        for outcome in ("ready", "oversized", "abort"):
+            with self.subTest(outcome=outcome):
+                room = 27
+                mgr = self._two_staged_peers(room)
+                first = self._make_chunk(room, [1], is_last_chunk=False)
+                last = self._make_chunk(room, [2], is_last_chunk=True)
+                last.index_slice = slice(1, 2)
+                events = []
+                posts = []
+                waits = 0
 
-        def stage(_strategy, chunk, _indices, _req, _info, _buffer):
-            page_start = chunk.index_slice.start
-            attempts.append(page_start)
-            if len(attempts) == 1:
-                return None, True, 0
-            return f"kv-{page_start}", False, page_start
+                def check_ready(req, index, num_pages, session_id):
+                    nonlocal waits
+                    if req.agent_name == "other" and index == 0:
+                        waits += 1
+                        if waits < 3:
+                            if waits == 2 and outcome == "abort":
+                                # After decode's waiting timeout, its ABORT must
+                                # still reach a live prefill room.
+                                mgr._handle_abort_notification(
+                                    [b"ABORT", str(room).encode("ascii")]
+                                )
+                            return False, index, -1, 0, -1
+                        if outcome == "oversized":
+                            return (
+                                False,
+                                index,
+                                FakeStagingAllocator.ALLOC_OVERSIZED,
+                                0,
+                                -1,
+                            )
+                    return True, index, 0, 0, 128
 
-        mgr._do_staging_transfer = stage
-        mgr.send_chunk_ready.side_effect = lambda **kw: events.append(
-            ("chunk", kw["chunk_idx"])
-        )
-        mgr.send_kv_status_message.side_effect = lambda **kw: events.append(
-            ("status", kw["status"])
-        )
-        self._run_staging_worker(mgr, [first, last])
-        self.assertEqual(attempts, [0, 1, 0])
-        self.assertEqual(
-            events, [("chunk", 1), ("status", KVPoll.Success), ("chunk", 0)]
-        )
-        self.assertNotIn(room, mgr.transfer_infos)
-        self.assertNotIn(room, mgr._staging_outstanding)
+                def post(peer, indices, *_args, **_kwargs):
+                    index = int(indices[0]) - 1
+                    posts.append((peer, index))
+                    return f"{peer}-{index}"
+
+                mgr._try_create_staging_strategy.return_value = SimpleNamespace(
+                    check_ready=check_ready
+                )
+                mgr.agent.check_remote_metadata = lambda _peer: True
+                mgr.send_kvcache_staged = post
+                mgr.send_chunk_ready.side_effect = lambda **kw: events.append(
+                    ("chunk", kw["writer_id"], kw["chunk_idx"])
+                )
+                mgr.send_kv_status_message.side_effect = lambda **kw: events.append(
+                    ("status", kw["status"])
+                )
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "sglang.srt.disaggregation.common.staging_buffer": _fake_staging_buffer_module()
+                    },
+                ):
+                    self._run_staging_worker(mgr, [first, last])
+                expected = [("agent", 0), ("agent", 1), ("other", 1)]
+                if outcome == "ready":
+                    expected.append(("other", 0))
+                self.assertEqual(posts, expected)
+                self.assertCountEqual(
+                    [c.args[0] for c in mgr.send_aux.call_args_list], ["agent", "other"]
+                )
+                status = KVPoll.Success if outcome == "ready" else KVPoll.Failed
+                self.assertEqual(mgr.request_status[room], status)
+                statuses = [] if outcome == "abort" else [("status", status)]
+                self.assertEqual(
+                    events, [("chunk", peer, idx) for peer, idx in expected] + statuses
+                )
+                self.assertEqual(mgr._staging_outstanding.get(room, 0), 0)
+                if outcome == "ready":
+                    self.assertNotIn(room, mgr.transfer_infos)
 
     def test_worker_waits_for_events_before_reading_and_counts_completed_handles(self):
         import torch

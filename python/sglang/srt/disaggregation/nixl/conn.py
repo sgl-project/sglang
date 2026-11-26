@@ -2098,12 +2098,20 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if any_failed:
                     raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
 
-                if deferred_peers:
-                    # Each remote ring has its own watermark. Done peers have
-                    # received both KV and any last-chunk aux. Retry the rest.
+                if deferred_peers or (
+                    self.enable_staging
+                    and kv_chunk.is_last_chunk
+                    and self._staging_outstanding[room] > 1
+                ):
+                    # Publish room Success only after every earlier chunk drains.
+                    # When this chunk has finished every peer, retry the empty set
+                    # so its KV, aux and CHUNK_READY notifications are sent once.
                     kv_chunk.pending_staging_peers = deferred_peers
-                    with self._staging_ctx.watermark_cv:
-                        self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
+                    if deferred_peers:
+                        with self._staging_ctx.watermark_cv:
+                            self._staging_ctx.watermark_cv.wait(
+                                STAGING_WATERMARK_WAIT_S
+                            )
                     queue.put(kv_chunk)
                     continue
                 # Clear with the decrement: the failure path below reads this
