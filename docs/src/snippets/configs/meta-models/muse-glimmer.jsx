@@ -409,7 +409,7 @@ export const config = {
     },
     {
       match: { hw: "h100", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
-      verificationStatus: (s) => s.modality === "text" ? "verified" : "unverified",
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
