@@ -717,6 +717,17 @@ class KimiK3ImageProcessor(
             features, sizes, configs, grids = processor.prepare_image_features(
                 eager_images
             )
+            if len(eager_images) > 1:
+                # Own storage per retained artifact: prepare_image_features
+                # splits one batch tensor, so a CPU view would keep the whole
+                # batch alive and the cache would charge each image for all of
+                # it. A device feature needs no copy here: _make_artifact
+                # transfers it per image, or cache_value keeps it out of the
+                # entry altogether.
+                features = [
+                    feature.clone() if feature.device.type == "cpu" else feature
+                    for feature in features
+                ]
             for index, feature, size, resize_config, grid in zip(
                 eager_entry_indices, features, sizes, configs, grids
             ):
