@@ -309,17 +309,25 @@ def npu_w8a8_mxfp8_linear(
             f"npu_w8a8_mxfp8_linear expects float8_e4m3fn weights, got {weight.dtype}"
         )
 
-    original_dtype = input.dtype
-    if original_dtype not in (torch.float16, torch.bfloat16):
-        input = input.to(torch.bfloat16)
-        original_dtype = torch.bfloat16
-
     orig_shape = input.shape
-    input_2d = input.view(-1, orig_shape[-1]).contiguous()
+    if input.dtype == torch.float8_e4m3fn and input_scale is not None:
+        # Pre-quantized MXFP8 activation from fused norm/swiglu+mx_quant op.
+        original_dtype = torch.bfloat16
+        x_fp8 = input if input.ndim == 2 else input.view(-1, orig_shape[-1])
+        x_scale = input_scale
+    else:
+        original_dtype = input.dtype
+        if original_dtype not in (torch.float16, torch.bfloat16):
+            input = input.to(torch.bfloat16)
+            original_dtype = torch.bfloat16
 
-    x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
-        input_2d, dst_type=torch.float8_e4m3fn
-    )
+        input_2d = input if input.ndim == 2 else input.view(-1, orig_shape[-1])
+        if not input_2d.is_contiguous():
+            input_2d = input_2d.contiguous()
+
+        x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            input_2d, dst_type=torch.float8_e4m3fn
+        )
     e8m0_dtype = _get_float8_e8m0fnu_dtype()
     quant_bias = (
         bias.to(torch.float32)
@@ -338,7 +346,11 @@ def npu_w8a8_mxfp8_linear(
         group_sizes=(1, 1, MXFP8_BLOCK_SIZE),
     )
 
-    return output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
+    return (
+        output_2d
+        if len(orig_shape) == 2
+        else output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
+    )
 
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):

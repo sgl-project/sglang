@@ -6,10 +6,24 @@ _E8M0_DTYPE = None
 
 
 def _get_float8_e8m0fnu_dtype():
-    # Resolve lazily rather than as a module-level constant: this module is
-    # imported early (during quant-scheme registration), so reading the dtype at
-    # call time keeps it correct regardless of import order / platform.
-    return getattr(torch, "float8_e8m0fnu", None)
+    # Prefer torch_npu.float8_e8m0fnu (int enum, e.g. 293): while eager
+    # npu_quant_matmul accepts torch.float8_e8m0fnu, torch_npu's FakeTensor
+    # meta registration (quant_matmul_extra_dtype_check) strictly requires
+    # scale_dtype == torch_npu.float8_e8m0fnu during torch.compile tracing.
+    global _E8M0_DTYPE
+    if _E8M0_DTYPE is None:
+        from sglang.srt.utils import is_npu
+
+        if is_npu():
+            try:
+                import torch_npu
+
+                _E8M0_DTYPE = getattr(torch_npu, "float8_e8m0fnu", None)
+            except ImportError:
+                pass
+        if _E8M0_DTYPE is None:
+            _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
+    return _E8M0_DTYPE
 
 
 def _get_float4_e2m1fn_x2_dtype():
@@ -58,9 +72,12 @@ def _require_e8m0_dtype():
         from sglang.srt.utils import is_npu
 
         if is_npu():
-            import torch_npu
+            try:
+                import torch_npu
 
-            _E8M0_DTYPE = getattr(torch_npu, "float8_e8m0fnu", None)
+                _E8M0_DTYPE = getattr(torch_npu, "float8_e8m0fnu", None)
+            except ImportError:
+                pass
         if _E8M0_DTYPE is None:
             _E8M0_DTYPE = _get_float8_e8m0fnu_dtype()
         if _E8M0_DTYPE is None:

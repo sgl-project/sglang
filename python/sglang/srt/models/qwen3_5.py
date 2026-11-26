@@ -255,7 +255,32 @@ def _qwen3_5_stage_facts(
     sparse = _qwen3_5_is_moe(config)
     return (
         declare_attn(read=attn_read),
-        declare_ffn(sparse=sparse, next_layer_sparse=sparse),
+        declare_ffn(
+            sparse=sparse,
+            next_layer_sparse=sparse,
+            read=NORM_QUANT_READOUT if (_is_npu and not sparse) else None,
+        )
+        if (_is_npu and not sparse)
+        else declare_ffn(sparse=sparse, next_layer_sparse=sparse),
+    )
+
+
+def _linear_uses_npu_mxfp8(linear: nn.Module) -> bool:
+    if not (_is_npu and envs.SGLANG_NPU_ENABLE_MXFP8_FUSION.get()):
+        return False
+    npu_ops = getattr(torch.ops, "npu", None)
+    if not (
+        hasattr(npu_ops, "npu_add_rms_norm_dynamic_mx_quant")
+        and hasattr(npu_ops, "npu_rms_norm_dynamic_mx_quant")
+    ):
+        return False
+    qm = getattr(linear, "quant_method", None)
+    if qm is None:
+        return False
+    w8a8_fn = getattr(qm, "w8a8_block_fp8_linear", None)
+    return (
+        getattr(w8a8_fn, "__name__", "") == "npu_w8a8_mxfp8_linear"
+        or qm.__class__.__name__ == "NPUMXFP8LinearMethod"
     )
 
 
@@ -1186,6 +1211,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
             )
 
+        self._ffn_npu_mxfp8 = isinstance(
+            self.mlp, Qwen2MoeMLP
+        ) and _linear_uses_npu_mxfp8(self.mlp.gate_up_proj)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1209,7 +1238,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        ffn_quant = (
+            "npu_mxfp8"
+            if self._ffn_npu_mxfp8 and self.ffn_boundary.reads_quantized(forward_batch)
+            else ""
+        )
+        hidden_states = self.ffn_boundary.prepare(
+            hidden_states, forward_batch, quant_format=ffn_quant
+        )
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
@@ -1419,6 +1455,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
 
         self.alt_stream = alt_stream
+        self._attn_npu_mxfp8 = _linear_uses_npu_mxfp8(self.qkv_proj)
+        self._ffn_npu_mxfp8 = isinstance(
+            self.mlp, Qwen2MoeMLP
+        ) and _linear_uses_npu_mxfp8(self.mlp.gate_up_proj)
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -1545,9 +1585,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             return self.forward_prepare_native(positions, hidden_states)
 
         qkv, _ = self.qkv_proj(hidden_states)
-        if positions.ndim == 1:
-            positions = positions.expand(3, -1)
-        cos_sin = rotary_emb.cos_sin_cache[positions].to(qkv)
+        pos3 = positions.expand(3, -1) if positions.ndim == 1 else positions
+        cos_sin = rotary_emb.cos_sin_cache[pos3].to(qkv)
         q, k, v, gate = split_qkv_rmsnorm_mrope(
             qkv=qkv,
             q_weight=self.q_norm.gemma_weight,
@@ -1647,10 +1686,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ):
+        attn_quant = (
+            "npu_mxfp8"
+            if self._attn_npu_mxfp8
+            and captured_last_layer_outputs is None
+            and self.attn_boundary.reads_quantized(forward_batch)
+            else ""
+        )
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             capture_gathered=captured_last_layer_outputs,
+            quant_format=attn_quant,
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1664,7 +1711,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        ffn_quant = (
+            "npu_mxfp8"
+            if self._ffn_npu_mxfp8 and self.ffn_boundary.reads_quantized(forward_batch)
+            else ""
+        )
+        hidden_states = self.ffn_boundary.prepare(
+            hidden_states, forward_batch, quant_format=ffn_quant
+        )
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(

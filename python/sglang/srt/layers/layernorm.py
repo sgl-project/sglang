@@ -1423,8 +1423,13 @@ class GemmaRMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            w = (
+                self.gemma_weight
+                if self.gemma_weight.dtype == x.dtype
+                else self.gemma_weight.to(x.dtype)
+            )
             norm_out, _, residual = torch_npu.npu_add_rms_norm(
-                residual, x, self.gemma_weight.to(x.dtype), self.variance_epsilon
+                residual, x, w, self.variance_epsilon
             )
             return norm_out, residual
 
