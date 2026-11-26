@@ -138,8 +138,9 @@ class WeightTransport(ABC):
 
     @abstractmethod
     def publish(self, *, storages: Dict[str, torch.Tensor]) -> Dict[str, Any]:
-        """Owner: make ``storages`` readable; returns the manifest's ``source``.
+        """Stage the owner's storages and return their locator for the manifest.
 
+        Readers discover the locator only through a published manifest.
         It may consume ``storages`` (vmm_fd repacks them), so nothing reads them after.
         """
 
@@ -147,9 +148,10 @@ class WeightTransport(ABC):
     def fetch(
         self, *, manifest: SnapshotManifest, device: torch.device
     ) -> Dict[str, torch.Tensor]:
-        """Reader: every storage of ``manifest`` as uint8 bytes, all or nothing.
+        """Fetch every storage of ``manifest`` as uint8 bytes, all or nothing.
 
-        Returns once the bytes are visible on the current stream; raises otherwise.
+        Returns once the bytes are visible on the current stream. A failed fetch
+        leaves no mapped tensors exposed and the transport safe to close.
         """
 
     @abstractmethod
@@ -281,9 +283,8 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
     the tensors on top. CUDA frees a ``cuMemCreate`` allocation only after all
     of its mappings and handles are released, so the engine's mappings keep
     its weights valid even if the daemon exits. ``close`` unmaps them and
-    frees the address range; the IPC loader calls it only when a load fails,
-    since the tensors of a loaded model do not own the mappings (they stay
-    until the process exits).
+    frees the address range. The IPC loader only closes it before any tensors
+    may reference its mappings. After that the mappings stay until process exit.
     """
 
     name = VMM_FD_BACKEND

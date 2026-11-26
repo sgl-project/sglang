@@ -147,7 +147,11 @@ if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
-    from sglang.srt.weight_cache.schema import LoadSpec, SnapshotManifest
+    from sglang.srt.weight_cache.schema import (
+        LoadSpec,
+        SnapshotManifest,
+        WeightCacheConfig,
+    )
 
 _is_npu = is_npu()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
@@ -359,7 +363,11 @@ class BaseModelLoader(ABC):
         self.load_config = load_config
 
     def lookup(
-        self, *, spec: LoadSpec, device_config: DeviceConfig
+        self,
+        *,
+        weight_config: WeightCacheConfig,
+        spec: LoadSpec,
+        device_config: DeviceConfig,
     ) -> Optional[SnapshotManifest]:
         """Look up the exact snapshot before loading. A miss selects a raw load."""
         return None
@@ -4357,3 +4365,28 @@ def get_model_loader(
         )
 
     return DefaultModelLoader(load_config)
+
+
+_SNAPSHOT_CHECKPOINT_FORMATS = frozenset(
+    {
+        LoadFormat.AUTO,
+        LoadFormat.PT,
+        LoadFormat.SAFETENSORS,
+        LoadFormat.FASTSAFETENSORS,
+        LoadFormat.INSTANTTENSOR,
+        LoadFormat.MISTRAL,
+    }
+)
+
+
+def require_checkpoint_loader(loader: BaseModelLoader) -> None:
+    """Allow only audited checkpoint loaders to supply a snapshot reference."""
+    load_format = loader.load_config.load_format
+    if (
+        type(loader) is not DefaultModelLoader
+        or load_format not in _SNAPSHOT_CHECKPOINT_FORMATS
+    ):
+        raise ValueError(
+            f"Cannot publish a snapshot from {type(loader).__name__} "
+            f"(load format {load_format!s}). A direct checkpoint load is required."
+        )

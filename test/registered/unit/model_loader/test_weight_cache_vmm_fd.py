@@ -1170,6 +1170,40 @@ class TestTransportSelection(CustomTestCase):
 
 
 class TestLoadedModelKeepsItsMappings(CustomTestCase):
+    def test_failed_load_keeps_mappings_after_installing_a_parameter(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+
+        loader = ipc_loader.WeightCacheModelLoader(
+            load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE)
+        )
+        backend = loader._transport_backend = mock.Mock(spec=TorchIpcTransportBackend)
+        backend.import_tensor.side_effect = [
+            torch.full((3, 2), 3.0),
+            RuntimeError("failed to import bias"),
+        ]
+        skeleton = torch.nn.Linear(2, 3, device="meta")
+        model_config = SimpleNamespace(
+            dtype=torch.float32, quantization=None, hf_config=SimpleNamespace()
+        )
+        with (
+            mock.patch.object(ipc_loader, "_LOADED_MODEL_TRANSPORTS", []) as retained,
+            mock.patch.object(ipc_loader, "_initialize_model", return_value=skeleton),
+            mock.patch(
+                "sglang.srt.model_loader.loader._get_quantization_config",
+                return_value=None,
+            ),
+            mock.patch.object(
+                loader,
+                "_fetch_from_cache",
+                return_value={"entries": {"weight": {}, "bias": {}}},
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed to import bias"):
+                loader.load_model(model_config=model_config, device_config=None)
+            backend.close.assert_not_called()
+            self.assertIn(backend, retained)
+            self.assertEqual(skeleton.weight.sum().item(), 18.0)
+
     def test_a_parameter_outliving_the_model_stays_mapped(self):
         """The imported tensors do not own the transport's mappings, and a
         parameter can outlive the model object, so the loader must not release

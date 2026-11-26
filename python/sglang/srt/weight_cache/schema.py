@@ -44,6 +44,17 @@ class WeightCacheConfig(
         return _digest(msgspec.to_builtins(self))
 
 
+class SnapshotRank(
+    msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
+    """The parallel shard described by a snapshot manifest."""
+
+    tp_rank: int
+    pp_rank: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+
+
 class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
     """How this rank loads the model: everything that is not in WeightCacheConfig.
 
@@ -86,16 +97,31 @@ class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
     device_capability: str
     torch_version: str
 
-    def digest(self, *, include_rank: bool = True) -> str:
-        """Identify how this rank loads the model, or without the rank what all ranks share.
+    @property
+    def rank(self) -> SnapshotRank:
+        return SnapshotRank(
+            tp_rank=self.tp_rank,
+            pp_rank=self.pp_rank,
+            moe_dp_rank=self.moe_dp_rank,
+            moe_ep_rank=self.moe_ep_rank,
+        )
 
-        A shard is named by this digest together with WeightCacheConfig.digest().
-        """
+    def digest(self, *, include_rank: bool = True) -> str:
+        """Identify how this rank loads the model, or what every rank shares."""
         fields = msgspec.to_builtins(self)
         if not include_rank:
-            for name in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
+            for name in SnapshotRank.__struct_fields__:
                 del fields[name]
         return _digest(fields)
+
+
+def snapshot_tag(
+    model: WeightCacheConfig, spec: LoadSpec, *, include_rank: bool = True
+) -> str:
+    """Name the snapshot shard or, for a vote, the load shared by all ranks."""
+    return _digest(
+        {"model": model.digest(), "spec": spec.digest(include_rank=include_rank)}
+    )
 
 
 class StorageMeta(msgspec.Struct, frozen=True, kw_only=True):
@@ -110,6 +136,7 @@ class SnapshotManifest(msgspec.Struct, frozen=True, kw_only=True):
 
     # Minted by the owners' publish vote; equal on every rank of one publish.
     version: str
+    rank: SnapshotRank
     # Filled by load-diff, moved by the transport, digested by the validator.
     storages: dict[str, StorageMeta]
     # Tensors, changed values and the expert map; only load-diff decodes it.

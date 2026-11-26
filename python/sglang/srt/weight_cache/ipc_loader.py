@@ -76,8 +76,8 @@ def _daemon_alive(pid: int) -> bool:
     return not fields or fields[0] not in (b"Z", b"X")
 
 
-# Transport backends of loaded models, kept until the process exits. For
-# vmm_fd, a mapping keeps the daemon's memory alive, but the imported tensors
+# Keep transport backends that may have produced tensors until process exit.
+# For vmm_fd, a mapping keeps the daemon's memory alive, but the imported tensors
 # sit on non-owning storages and a parameter or view can outlive the model
 # object, so a loaded model's mappings must never be unmapped while this process
 # runs. Keeping the backends here keeps the owner of those mappings reachable;
@@ -204,9 +204,8 @@ class WeightCacheModelLoader(BaseModelLoader):
                 quant_config,
             )
         except BaseException:
-            # Drop whatever the transport mapped for the failed load. A model
-            # that did load keeps its mappings until the process exits.
-            self._transport_backend.close()
+            if self._transport_backend not in _LOADED_MODEL_TRANSPORTS:
+                self._transport_backend.close()
             raise
         self.preloaded_weights_bytes = preloaded_weights_bytes
 
@@ -407,6 +406,11 @@ class WeightCacheModelLoader(BaseModelLoader):
         new_params_count = 0
         map_tic = time.perf_counter()
 
+        # Importing can expose a tensor to the exception traceback or model
+        # hooks even if installation subsequently fails.
+        if entries:
+            _LOADED_MODEL_TRANSPORTS.append(self._transport_backend)
+
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
@@ -498,7 +502,6 @@ class WeightCacheModelLoader(BaseModelLoader):
         # can outlive the model object, so the mappings are not released with
         # the model: they stay until the process exits.
         model._weight_cache_transport_backend = self._transport_backend
-        _LOADED_MODEL_TRANSPORTS.append(self._transport_backend)
 
         logger.info(
             f"[WeightCacheModelLoader] Zero-copy: mapped {imported_count} tensors "
@@ -581,17 +584,19 @@ class WeightCacheModelLoader(BaseModelLoader):
             send_msg(sock, {"type": "fetch_state", "config": engine_config})
             result = recv_msg(sock)
 
-            if result.get("status") == "mismatch":
-                mismatches = cache_config_mismatches(
-                    result["daemon_config"], engine_config
+            status = result.get("status")
+            if status not in ("ok", "mismatch"):
+                raise RuntimeError(
+                    f"[WeightCacheModelLoader] Daemon error: {result.get('message')}"
                 )
+            config_key = "daemon_config" if status == "mismatch" else "config"
+            mismatches = cache_config_mismatches(
+                result.get(config_key, {}), engine_config
+            )
+            if status == "mismatch" or mismatches:
                 raise RuntimeError(
                     f"[WeightCacheModelLoader] Daemon config mismatch, "
                     f"field: (daemon, engine): {mismatches}"
-                )
-            if result.get("status") != "ok":
-                raise RuntimeError(
-                    f"[WeightCacheModelLoader] Daemon error: {result.get('message')}"
                 )
 
             backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)

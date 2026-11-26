@@ -26,12 +26,29 @@ def export(
     raise NotImplementedError("load-diff lands with sgl-project/sglang#50943 D1")
 
 
+def preflight(*, skeleton: nn.Module, manifest: SnapshotManifest) -> None:
+    """Check whether this manifest installs on the skeleton without moving bytes."""
+    storages = {
+        name: torch.empty(meta.nbytes, dtype=torch.uint8, device="meta")
+        for name, meta in manifest.storages.items()
+    }
+    with torch.device("meta"):
+        install(skeleton=skeleton, manifest=manifest, storages=storages, dry_run=True)
+
+
 def install(
     *,
     skeleton: nn.Module,
     manifest: SnapshotManifest,
     storages: dict[str, torch.Tensor],
+    dry_run: bool = False,
 ) -> nn.Module:
     """Reader: attach ``storages`` to the meta-built ``skeleton`` and set the values
-    loading changed on the owner. Never post-processes."""
+    loading changed on the owner. Never post-processes.
+
+    For a dry run, use the supplied meta storages to check every installation
+    step while leaving the skeleton and process state untouched. Compare shapes
+    and byte ranges against the meta stand-ins; validate actual storage devices
+    and stream readiness only on the real load.
+    """
     raise NotImplementedError("load-diff lands with sgl-project/sglang#50943 D1")

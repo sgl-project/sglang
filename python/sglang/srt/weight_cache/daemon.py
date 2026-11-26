@@ -285,7 +285,10 @@ class WeightCacheDaemon:
         # Lazy imports to avoid circular dependencies and speed up startup
         from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
-        from sglang.srt.model_loader.loader import get_model_loader
+        from sglang.srt.model_loader.loader import (
+            get_model_loader,
+            require_checkpoint_loader,
+        )
 
         server_args = self.server_args
         publish(
@@ -363,8 +366,8 @@ class WeightCacheDaemon:
         )
         tic = time.perf_counter()
 
-        # Load model using DefaultModelLoader (includes TP sharding + quant post-process)
         loader = get_model_loader(load_config=load_config, model_config=model_config)
+        require_checkpoint_loader(loader)
         self.model = loader.load_model(
             model_config=model_config,
             device_config=DeviceConfig(current_platform.device_type, self.gpu_id),

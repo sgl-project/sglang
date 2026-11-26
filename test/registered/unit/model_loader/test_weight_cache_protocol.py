@@ -60,7 +60,7 @@ from sglang.srt.weight_cache.protocol import (
     recv_msg,
     send_msg,
 )
-from sglang.srt.weight_cache.schema import LoadSpec, WeightCacheConfig
+from sglang.srt.weight_cache.schema import LoadSpec, WeightCacheConfig, snapshot_tag
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
     TorchIpcTransportBackend,
@@ -332,6 +332,21 @@ class TestCacheConfigMessage(CustomTestCase):
     def test_identical_messages_match(self):
         self.assertEqual(cache_config_mismatches(_make_message(), _make_message()), {})
 
+    def test_tag_uses_the_snapshot_identity(self):
+        with _runtime_context(tp_size=8, tp_rank=3):
+            spec = build_load_spec(device=torch.device("cpu"))
+        model = _make_weight_cache_config()
+        message = cache_config_message(model, spec)
+        self.assertEqual(message["tag"], snapshot_tag(model, spec))
+        self.assertNotEqual(
+            message["tag"], snapshot_tag(model, spec, include_rank=False)
+        )
+        wrong = {**message, "tag": "tp=8"}
+        self.assertEqual(
+            cache_config_mismatches(message, wrong),
+            {"tag": (message["tag"], wrong["tag"])},
+        )
+
     def test_any_field_difference_is_reported(self):
         base = _make_message()
         for part, field, value in (
@@ -405,7 +420,7 @@ class TestCacheConfigMessage(CustomTestCase):
 class TestEngineFetchesFromTheDaemon(CustomTestCase):
     """The engine's request and its handling of the reply, over a real socket."""
 
-    def _fetch(self, daemon_config):
+    def _fetch(self, daemon_config, *, handle_connection=None):
         daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
         daemon.gpu_id = 0
         daemon.config = daemon_config
@@ -423,7 +438,7 @@ class TestEngineFetchesFromTheDaemon(CustomTestCase):
             def serve():
                 conn, _ = server.accept()
                 with conn:
-                    daemon._handle_connection(conn)
+                    (handle_connection or daemon._handle_connection)(conn)
 
             thread = threading.Thread(target=serve, daemon=True)
             thread.start()
@@ -454,6 +469,22 @@ class TestEngineFetchesFromTheDaemon(CustomTestCase):
             self._fetch(self._daemon_config(tp_rank=1))
         self.assertIn("Daemon config mismatch", str(ctx.exception))
         self.assertIn("'spec.tp_rank': (1, 0)", str(ctx.exception))
+
+    def test_rejects_a_wrong_rank_reply_before_receiving_storage(self):
+        wrong_rank = self._daemon_config(tp_rank=1)
+
+        def serve_wrong_rank(conn):
+            recv_msg(conn)
+            TorchIpcTransportBackend().send_fetch_state_response(
+                conn, config=wrong_rank, entries={}, pid=1
+            )
+
+        with mock.patch.object(
+            TorchIpcTransportBackend, "recv_fetch_state_response"
+        ) as receive:
+            with self.assertRaisesRegex(RuntimeError, "spec.tp_rank"):
+                self._fetch(wrong_rank, handle_connection=serve_wrong_rank)
+        receive.assert_not_called()
 
 
 class TestQuantConfigHashing(CustomTestCase):

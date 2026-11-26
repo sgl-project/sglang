@@ -18,7 +18,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.weight_cache import load_diff, schema, snapshot_loader, validator
 from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.coordinator import Ballot
-from sglang.srt.weight_cache.schema import SnapshotManifest, StorageMeta
+from sglang.srt.weight_cache.schema import SnapshotManifest, SnapshotRank, StorageMeta
 from sglang.srt.weight_cache.transport import WeightTransport
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -26,6 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _CPU = DeviceConfig("cpu")
+_GROUP = SimpleNamespace(rank_in_group=0)
 
 
 def _model_config():
@@ -57,13 +58,13 @@ def _topology(tp_rank=0, tp_size=2):
         yield
 
 
-def _pre_load(loader, model_config, *, checkpoint_id="rev1"):
+def _pre_load(loader, model_config, *, checkpoint_id="rev1", group=_GROUP):
     return snapshot_loader.pre_load_check(
         loader=loader,
         model_config=model_config,
         checkpoint_id=checkpoint_id,
         device_config=_CPU,
-        group=None,
+        group=group,
     )
 
 
@@ -90,6 +91,7 @@ class _MemoryTransport(WeightTransport):
 
     def __init__(self, fetch_error=None):
         self.published, self.closed, self.fetch_error = {}, False, fetch_error
+        self.fetches = 0
 
     def publish(self, *, storages):
         self.published = {name: t.clone() for name, t in storages.items()}
@@ -97,6 +99,7 @@ class _MemoryTransport(WeightTransport):
         return {"kind": "memory"}
 
     def fetch(self, *, manifest, device):
+        self.fetches += 1
         if self.fetch_error is not None:
             raise self.fetch_error
         return {name: self.published[name].clone() for name in manifest.storages}
@@ -106,33 +109,53 @@ class _MemoryTransport(WeightTransport):
 
 
 class _Source(snapshot_loader.SnapshotLoader):
-    def __init__(self, load_config, found=None, owner=False):
+    def __init__(
+        self, load_config, found=None, owner=False, *, staged=None, commits=None
+    ):
         super().__init__(load_config, owner=owner)
-        self.found, self.announced, self.withdrawn = found, [], []
+        self.found = found
+        self.staged = {} if staged is None else staged
+        self.commits = {} if commits is None else commits
 
     def download_model(self, model_config):
         pass
 
-    def _find(self, *, spec, device_config):
-        return self.found
+    def _find(self, *, tag, group_tag, device_config):
+        if self.found is not None:
+            return self.found
+        version = self.commits.get(group_tag)
+        return self.staged.get((tag, version))
 
-    def _announce(self, *, spec, manifest):
-        self.announced.append(manifest)
+    def _stage(self, *, tag, manifest):
+        self.staged[tag, manifest.version] = (manifest, self.publish_transport)
 
-    def _withdraw(self, *, spec, manifest):
-        self.withdrawn.append(manifest)
+    def _announce(self, *, tag, version):
+        self.commits[tag] = version
+
+    def _withdraw(self, *, tag, manifest):
+        self.staged.pop((tag, manifest.version), None)
+
+    def _retract(self, *, tag, version):
+        if self.commits.get(tag) == version:
+            self.commits.pop(tag)
 
 
-class _RawLoader:
-    def __init__(self, load_config):
-        self.load_config = load_config
+def _load_tiny_model(loader, *, model_config, device_config):
+    loader_mod._initialize_model(model_config, loader.load_config)
+    model = loader_mod._initialize_model(model_config, loader.load_config)
+    model.post_load_weights()  # stands in for loading weights
+    return model
 
-    def load_model(self, *, model_config, device_config):
-        # Presharded builds a throwaway model for its signature before the real one.
-        self.throwaway = loader_mod._initialize_model(model_config, self.load_config)
-        model = loader_mod._initialize_model(model_config, self.load_config)
-        model.post_load_weights()  # stands in for loading weights
-        return model
+
+def _manifest(*, tp_rank=0, version="v1", storages=None):
+    return SnapshotManifest(
+        rank=SnapshotRank(tp_rank=tp_rank, pp_rank=0, moe_dp_rank=0, moe_ep_rank=0),
+        version=version,
+        storages={} if storages is None else storages,
+        load_diff=b"tables",
+        attestation=b"attestation",
+        source={},
+    )
 
 
 def _vote_failing_at(failing_call=None):
@@ -189,6 +212,7 @@ class TestSnapshotLoader(CustomTestCase):
                 load_diff,
                 record_construction=lambda m: ("diff", id(m), m.post_processed),
                 export=parts["export"],
+                preflight=lambda **kwargs: None,
             ),
             mock.patch.multiple(
                 validator,
@@ -197,25 +221,31 @@ class TestSnapshotLoader(CustomTestCase):
             ),
             mock.patch.multiple(
                 snapshot_loader,
-                get_model_loader=mock.Mock(side_effect=lambda cfg, _: _RawLoader(cfg)),
+                get_model_loader=mock.Mock(
+                    side_effect=lambda cfg, _: loader_mod.DefaultModelLoader(cfg)
+                ),
                 vote=parts["vote"],
+            ),
+            mock.patch.object(
+                loader_mod.DefaultModelLoader, "load_model", _load_tiny_model
             ),
         ):
             yield
 
-    def _publish(self, source, transport, model_config=None):
+    def _publish(self, source, transport, model_config=None, *, group=_GROUP):
         if model_config is None:
             model_config = _model_config()
-        # Owner failure cases count the two publish votes independently of lookup.
+        # Owner failure cases count publish votes independently of lookup and load.
         with (
-            _topology(),
+            _topology(tp_rank=group.rank_in_group),
             mock.patch.object(snapshot_loader, "vote", _vote_failing_at()),
         ):
-            self.assertIsNone(_pre_load(source, model_config))
-        model = source.load_model(model_config=model_config, device_config=_CPU)
+            self.assertIsNone(_pre_load(source, model_config, group=group))
+            model = source.load_model(model_config=model_config, device_config=_CPU)
         exported = source.export_snapshot(model=model)
+        source.publish_transport = transport
         manifest = source.publish_snapshot(
-            exported=exported, transport=transport, group=None
+            exported=exported, transport=transport, group=group
         )
         return model, manifest
 
@@ -244,25 +274,17 @@ class TestSnapshotLoader(CustomTestCase):
         self.assertEqual(
             manifest.storages, {"proj": StorageMeta(nbytes=16, device="cpu")}
         )
-        self.assertEqual(source.announced, [manifest])
+        self.assertEqual(list(source.staged.values()), [(manifest, transport)])
+        self.assertEqual(list(source.commits.values()), [manifest.version])
 
     def test_reader_finds_owner_snapshot_under_the_pre_load_spec(self):
         owner = _Source(LoadConfig(), owner=True)
-        reader = _Source(LoadConfig())
+        reader = _Source(LoadConfig(), staged=owner.staged, commits=owner.commits)
         transport = _MemoryTransport()
         model_config = _model_config()
-        registry = {}
-
-        def announce(*, spec, manifest):
-            registry[spec.digest()] = (manifest, transport)
-
-        def find(*, spec, device_config):
-            return registry.get(spec.digest())
 
         with (
             self._owner_parts(),
-            mock.patch.object(owner, "_announce", announce),
-            mock.patch.object(reader, "_find", find),
             mock.patch.object(
                 _TinyModel,
                 "post_load_weights",
@@ -294,33 +316,61 @@ class TestSnapshotLoader(CustomTestCase):
             self.assertIsNone(exported.error)
 
             _pre_load(owner, model_config, checkpoint_id="second")
-            self.assertEqual(len(vote.calls), 2)
+            self.assertEqual(len(vote.calls), 3)
             with self.assertRaises(RuntimeError):
                 owner.publish_snapshot(
-                    exported=exported, transport=transport, group=None
+                    exported=exported, transport=transport, group=_GROUP
                 )
-        self.assertEqual(len(vote.calls), 3)
+        self.assertEqual(len(vote.calls), 4)
         self.assertIsNotNone(vote.calls[-1].error)
         publish.assert_not_called()
         self.assertTrue(transport.closed)
-        self.assertFalse(owner.announced)
+        self.assertFalse(owner.staged)
+        self.assertFalse(owner.commits)
+
+    def test_owner_rejects_a_different_publish_group(self):
+        source = _Source(LoadConfig(), owner=True)
+        model_config = _model_config()
+        transport = _MemoryTransport()
+        other_group = SimpleNamespace(rank_in_group=0)
+        groups = []
+        gather = _vote_failing_at()
+
+        def vote(*, group, ballot):
+            groups.append(group)
+            return gather(group=group, ballot=ballot)
+
+        with self._owner_parts(vote=vote), _topology():
+            self.assertIsNone(_pre_load(source, model_config))
+            model = source.load_model(model_config=model_config, device_config=_CPU)
+            exported = source.export_snapshot(model=model)
+            with self.assertRaisesRegex(RuntimeError, "group"):
+                source.publish_snapshot(
+                    exported=exported, transport=transport, group=other_group
+                )
+        self.assertEqual(len(groups), 3)
+        self.assertTrue(all(group is _GROUP for group in groups))
+        self.assertFalse(transport.published)
+        self.assertTrue(transport.closed)
 
     def test_every_rank_mints_the_version_from_all_attestations(self):
         gathered = [Ballot(payload=b"rank0"), Ballot(payload=b"rank1")]
         changed = [Ballot(payload=b"rank0"), Ballot(payload=b"changed")]
         versions = []
-        for attestation, ballots in (
-            (b"a0", gathered),
-            (b"a1", gathered),
-            (b"a0", changed),
+        for rank, attestation, ballots in (
+            (0, b"a0", gathered),
+            (1, b"a1", gathered),
+            (0, b"a0", changed),
         ):
+            group = SimpleNamespace(rank_in_group=rank)
+            source = _Source(LoadConfig(), owner=True)
             with self._owner_parts(
                 attest=lambda **kwargs: attestation,
                 vote=lambda *, group, ballot: ballots,
             ):
-                _, manifest = self._publish(
-                    _Source(LoadConfig(), owner=True), _MemoryTransport()
-                )
+                _, manifest = self._publish(source, _MemoryTransport(), group=group)
+            self.assertEqual(manifest.rank.tp_rank, rank)
+            self.assertEqual(bool(source.commits), rank == 0)
             versions.append(manifest.version)
         self.assertEqual(versions[0], versions[1])
         self.assertNotEqual(versions[0], versions[2])
@@ -331,8 +381,9 @@ class TestSnapshotLoader(CustomTestCase):
 
         cases = {
             "own export fails": (dict(export=export), "unsupported tensor", 1),
-            "peer fails to publish": (dict(vote=_vote_failing_at(1)), "vote 1", 1),
-            "peer fails to announce": (dict(vote=_vote_failing_at(2)), "vote 2", 2),
+            "peer fails to prepare": (dict(vote=_vote_failing_at(1)), "vote 1", 1),
+            "peer fails to stage": (dict(vote=_vote_failing_at(2)), "vote 2", 2),
+            "commit fails": (dict(vote=_vote_failing_at(3)), "vote 3", 3),
         }
         for name, (fakes, message, votes) in cases.items():
             with self.subTest(name):
@@ -347,7 +398,55 @@ class TestSnapshotLoader(CustomTestCase):
                 # Every rank votes, even one that failed, so no peer waits it out.
                 self.assertEqual(len(fakes["vote"].calls), votes)
                 self.assertTrue(transport.closed)
-                self.assertEqual(source.withdrawn, source.announced)
+                self.assertFalse(source.commits)
+                self.assertFalse(source.staged)
+
+    def test_owner_exposes_the_snapshot_only_after_the_stage_vote(self):
+        source = _Source(LoadConfig(), owner=True)
+        transport = _MemoryTransport()
+        public = []
+        staged = []
+
+        def vote(*, group, ballot):
+            public.append(bool(source.commits))
+            staged.append(bool(source.staged))
+            return [ballot]
+
+        with self._owner_parts(vote=vote):
+            _, manifest = self._publish(source, transport)
+        self.assertEqual(staged, [False, True, True])
+        self.assertEqual(public, [False, False, True])
+        self.assertEqual(list(source.commits.values()), [manifest.version])
+
+    def test_owner_does_not_export_a_presharded_load(self):
+        source = _Source(
+            LoadConfig(fallback_load_format=LoadFormat.PRESHARDED), owner=True
+        )
+        model_config = _model_config()
+        vote = _vote_failing_at()
+        with (
+            self._owner_parts(vote=vote),
+            _topology(),
+            mock.patch.object(
+                snapshot_loader, "get_model_loader", loader_mod.get_model_loader
+            ),
+            mock.patch.object(
+                loader_mod.PreshardedModelLoader, "load_model", _load_tiny_model
+            ),
+        ):
+            _pre_load(source, model_config)
+            model = source.load_model(model_config=model_config, device_config=_CPU)
+            self.assertTrue(model.post_processed)
+            exported = source.export_snapshot(model=model)
+            self.assertIn("PreshardedModelLoader", exported.error)
+            self.assertFalse(exported.storages)
+            with self.assertRaises(RuntimeError):
+                source.publish_snapshot(
+                    exported=exported, transport=_MemoryTransport(), group=_GROUP
+                )
+        self.assertIsNotNone(vote.calls[-1].error)
+        self.assertFalse(source.staged)
+        self.assertFalse(source.commits)
 
     def test_reader_raw_load_records_nothing(self):
         def record(model):
@@ -357,44 +456,61 @@ class TestSnapshotLoader(CustomTestCase):
             self._owner_parts(),
             mock.patch.object(validator, "record_construction", record),
             mock.patch.object(load_diff, "record_construction", record),
+            _topology(),
         ):
-            model = _Source(LoadConfig()).load_model(
-                model_config=_model_config(), device_config=_CPU
-            )
+            source = _Source(LoadConfig())
+            model_config = _model_config()
+            self.assertIsNone(_pre_load(source, model_config))
+            model = source.load_model(model_config=model_config, device_config=_CPU)
         self.assertFalse(model.training)
 
-    def _read(self, *, fetch_error=None, install_error=None, validate_error=None):
-        manifest = SnapshotManifest(
-            version="v1",
-            storages={"proj": StorageMeta(nbytes=16, device="cpu")},
-            load_diff=b"tables",
-            attestation=b"attestation",
-            source={},
-        )
+    def _read(
+        self,
+        *,
+        preflight_error=None,
+        fetch_error=None,
+        install_error=None,
+        validate_error=None,
+        failing_vote=None,
+    ):
+        manifest = _manifest(storages={"proj": StorageMeta(nbytes=16, device="cpu")})
         self.transport = _MemoryTransport(fetch_error=fetch_error)
         self.transport.published = {"proj": torch.zeros(16, dtype=torch.uint8)}
-        source = _Source(LoadConfig(), found=(manifest, self.transport))
+        self.source = _Source(LoadConfig(), found=(manifest, self.transport))
+        self.vote = _vote_failing_at(failing_vote)
         model_config = _model_config()
-        with (
-            _topology(),
-            mock.patch.object(snapshot_loader, "vote", _vote_failing_at()),
-        ):
-            self.assertIs(_pre_load(source, model_config), manifest)
 
-        def install(*, skeleton, manifest, storages):
+        def install(*, skeleton, manifest, storages, dry_run=False):
+            self.assertTrue(skeleton.proj.weight.is_meta)
+            if dry_run:
+                self.assertEqual(self.transport.fetches, 0)
+                self.assertTrue(storages["proj"].is_meta)
+                self.assertEqual(
+                    storages["proj"].nbytes, manifest.storages["proj"].nbytes
+                )
+                self.preflight_skeleton = skeleton
+                if preflight_error is not None:
+                    raise preflight_error
+                return skeleton
+            self.assertEqual(len(self.vote.calls), 1)
+            self.assertFalse(storages["proj"].is_meta)
+            skeleton.proj.weight = nn.Parameter(
+                storages["proj"].view(torch.float32).reshape(2, 2)
+            )
+            self.skeleton = skeleton
             if install_error is not None:
                 raise install_error
-            self.skeleton = skeleton
-            return _TinyModel(None)
+            return skeleton
 
         def validate(*, model, storages, attestation, constructed):
             if validate_error is not None:
                 raise validate_error
-            # Recorded on the meta skeleton; compared in eval mode, as the owner is.
             self.assertEqual(constructed, ("check", True))
             self.assertFalse(model.training)
 
         with (
+            _topology(),
+            mock.patch.object(snapshot_loader, "vote", self.vote),
             mock.patch.multiple(
                 validator,
                 record_construction=lambda m: ("check", m.proj.weight.is_meta),
@@ -402,28 +518,91 @@ class TestSnapshotLoader(CustomTestCase):
             ),
             mock.patch.object(load_diff, "install", install),
         ):
-            return source.load_model(model_config=model_config, device_config=_CPU)
+            self.assertIs(_pre_load(self.source, model_config), manifest)
+            return self.source.load_model(model_config=model_config, device_config=_CPU)
 
     def test_reader_installs_without_post_processing(self):
         model = self._read()
-        for module in (self.skeleton, model):
-            self.assertFalse(module.post_processed)
-            self.assertFalse(module.proj.quant_method.processed)
-        self.assertFalse(self.transport.closed)  # the bytes live as long as the model
+        self.assertIs(model, self.preflight_skeleton)
+        self.assertFalse(model.post_processed)
+        self.assertFalse(model.proj.quant_method.processed)
+        self.assertEqual(len(self.vote.calls), 2)
+        self.source.close()
+        self.assertFalse(self.transport.closed)
+        torch.testing.assert_close(model.proj.weight, torch.zeros(2, 2))
 
-    def test_reader_failure_after_lookup_unmaps(self):
-        # vmm_fd maps the whole snapshot in fetch, and nothing falls back after it.
-        for step in ("fetch", "install", "validate"):
-            with self.subTest(step):
-                with self.assertRaisesRegex(RuntimeError, step):
-                    self._read(**{f"{step}_error": RuntimeError(step)})
+    def test_reader_preflight_failure_votes_before_fetch(self):
+        for failures, error in (
+            ({"preflight_error": ValueError("bad manifest")}, "bad manifest"),
+            ({"failing_vote": 1}, "vote 1"),
+        ):
+            with self.subTest(failures=failures):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self._read(**failures)
+                self.assertEqual(len(self.vote.calls), 1)
+                self.assertEqual(self.transport.fetches, 0)
                 self.assertTrue(self.transport.closed)
+                with self.assertRaisesRegex(RuntimeError, "pre_load_check"):
+                    self.source.load_model(
+                        model_config=_model_config(), device_config=_CPU
+                    )
+
+    def test_reader_preflight_rejects_explicit_cuda_allocation(self):
+        class ModelWithCudaAllocation(_TinyModel):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.buffer = torch.empty(1, device="cuda")
+
+        with (
+            mock.patch.object(
+                loader_mod,
+                "get_model_architecture",
+                return_value=(ModelWithCudaAllocation, "Tiny"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "allocate accelerator memory"),
+        ):
+            self._read()
+        self.assertEqual(len(self.vote.calls), 1)
+        self.assertEqual(self.transport.fetches, 0)
+        self.assertTrue(self.transport.closed)
+
+    def test_reader_load_failure_votes_and_keeps_bound_storage(self):
+        for failures, error, mapped in (
+            ({"fetch_error": RuntimeError("fetch")}, "fetch", False),
+            ({"install_error": RuntimeError("install")}, "install", True),
+            ({"validate_error": RuntimeError("validate")}, "validate", True),
+            ({"failing_vote": 2}, "vote 2", True),
+        ):
+            with self.subTest(failures=failures):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self._read(**failures)
+                self.assertEqual(len(self.vote.calls), 2)
+                if failures.get("failing_vote") is None:
+                    self.assertIn(error, self.vote.calls[-1].error)
+                self.source.close()
+                self.assertEqual(self.transport.closed, not mapped)
+                if mapped:
+                    torch.testing.assert_close(
+                        self.skeleton.proj.weight, torch.zeros(2, 2)
+                    )
+
+    def test_reader_rejects_another_ranks_manifest_before_fetch(self):
+        transport = _MemoryTransport()
+        source = _Source(LoadConfig(), found=(_manifest(tp_rank=1), transport))
+        vote = _vote_failing_at()
+        with (
+            _topology(tp_rank=0),
+            mock.patch.object(snapshot_loader, "vote", vote),
+            self.assertRaisesRegex(RuntimeError, "rank"),
+        ):
+            _pre_load(source, _model_config())
+        self.assertIn("rank", vote.calls[0].error)
+        self.assertEqual(transport.fetches, 0)
+        self.assertTrue(transport.closed)
 
     def test_pre_load_check_votes_on_every_outcome_but_the_rank(self):
         ballots = []
-        manifest = SnapshotManifest(
-            version="v1", storages={}, load_diff=b"", attestation=b"", source={}
-        )
+        manifest = _manifest(tp_rank=1)
         failing = _Source(LoadConfig())
         failing._find = mock.Mock(side_effect=OSError("daemon socket refused"))
         found = _Source(LoadConfig(), found=(manifest, _MemoryTransport()))
@@ -434,8 +613,12 @@ class TestSnapshotLoader(CustomTestCase):
             (found, 1, 2),
             (_Source(LoadConfig()), 0, 4),
         ]
-        with mock.patch.object(
-            snapshot_loader, "vote", lambda *, group, ballot: ballots.append(ballot)
+        with (
+            mock.patch.object(
+                snapshot_loader, "vote", lambda *, group, ballot: ballots.append(ballot)
+            ),
+            mock.patch.object(load_diff, "preflight"),
+            mock.patch.object(validator, "record_construction"),
         ):
             for loader, rank, size in cases:
                 with _topology(rank, size):
@@ -449,7 +632,9 @@ class TestSnapshotLoader(CustomTestCase):
         transport = _MemoryTransport()
         rejected = _Source(LoadConfig(), found=(manifest, transport))
         with (
-            _topology(),
+            _topology(tp_rank=1),
+            mock.patch.object(load_diff, "preflight"),
+            mock.patch.object(validator, "record_construction"),
             mock.patch.object(snapshot_loader, "vote", _vote_failing_at(1)),
         ):
             with self.assertRaises(RuntimeError):

@@ -20,7 +20,7 @@ import msgspec
 from sglang.srt.environ import envs
 from sglang.srt.utils.serialization import safe_pickle_loads
 
-from .schema import LoadSpec, WeightCacheConfig
+from .schema import LoadSpec, WeightCacheConfig, snapshot_tag
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -29,20 +29,26 @@ logger = logging.getLogger(__name__)
 
 
 def cache_config_message(model: WeightCacheConfig, spec: LoadSpec) -> Dict[str, Any]:
-    """What a daemon and its engines compare: the model, and how this rank loads it."""
-    return {"model": msgspec.to_builtins(model), "spec": msgspec.to_builtins(spec)}
+    """The canonical tag and fields for reporting incompatible cache requests."""
+    return {
+        "tag": snapshot_tag(model, spec),
+        "model": msgspec.to_builtins(model),
+        "spec": msgspec.to_builtins(spec),
+    }
 
 
 def cache_config_mismatches(
     ours: Dict[str, Any], theirs: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Every field where two config messages differ, e.g. {"spec.tp_rank": (0, 1)}."""
+    """Report differing configuration fields, or a disagreement on the tag alone."""
     mismatches = {}
     for part in ("model", "spec"):
         a, b = ours.get(part, {}), theirs.get(part, {})
         for name in sorted(a.keys() | b.keys()):
             if name not in a or name not in b or a[name] != b[name]:
                 mismatches[f"{part}.{name}"] = (a.get(name), b.get(name))
+    if not mismatches and ours.get("tag") != theirs.get("tag"):
+        mismatches["tag"] = (ours.get("tag"), theirs.get("tag"))
     return mismatches
 
 
