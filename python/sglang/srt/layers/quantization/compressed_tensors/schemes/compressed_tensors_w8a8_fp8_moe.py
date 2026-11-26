@@ -359,7 +359,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto():
+        if moe_runner_backend.is_auto() or (
+            _is_xpu and moe_runner_backend.is_intel_xpu()
+        ):
             if (
                 _use_aiter
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
@@ -368,15 +370,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
-        elif (
-            _is_xpu
-            and moe_runner_backend.is_intel_xpu()
-            and (
-                self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                or not can_use_xpu_fp8_moe(moe_runner_config, self.weight_block_size)
-            )
-        ):
-            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_aiter()
@@ -385,8 +378,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
-        elif _is_xpu and moe_runner_backend.is_intel_xpu():
-            self.runner = None
         else:
             raise ValueError(
                 "compressed-tensors FP8 MoE supports --moe-runner-backend auto, "

@@ -3250,7 +3250,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _resolve_moe_runner_backend(self) -> MoeRunnerBackend:
         moe_runner_backend = get_moe_runner_backend()
 
-        if moe_runner_backend.is_auto():
+        if moe_runner_backend.is_auto() or (
+            _is_xpu and moe_runner_backend.is_intel_xpu()
+        ):
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             elif (
@@ -3315,17 +3317,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 "Fp8MoEMethod has no %s path; using triton for its fp8 experts.",
                 configured_backend.name,
             )
-        if (
-            _is_xpu
-            and moe_runner_backend.is_intel_xpu()
-            and not self.is_fp4_expert
-            and not can_use_xpu_fp8_moe(
-                moe_runner_config,
-                self.weight_block_size,
-                use_mxfp8=self.use_mxfp8,
-            )
-        ):
-            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_deep_gemm()
