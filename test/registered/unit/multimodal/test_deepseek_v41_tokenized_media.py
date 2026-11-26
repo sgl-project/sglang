@@ -8,15 +8,10 @@ serving   the flag selects this strategy for the checkpoint's architecture; serv
           -> test_serving_output_matches_legacy_processor
 hashes    transposed solid images have equal patches, but their grids and spans differ
           -> test_transposed_images_get_different_hashes
-cache     two vision configs sharing one item feature cache each compute their own patches;
-          a config reads its own entry back, also when the call names the CPU device; a
-          later edit to hf_config changes neither the patches nor the key; a sampled check
-          catches an entry whose span length alone is wrong; another Pillow misses; features
-          stay on the CPU under a trainer's default device; served patches are a copy of the
+cache     a sampled check catches an entry whose span length alone is wrong; features stay
+          on the CPU under a trainer's default device; served patches are a copy of the
           cached ones
-          -> test_vision_config_scopes_the_item_feature_cache,
-             test_vision_config_is_read_once_at_construction,
-             test_cache_check_compares_the_token_count,
+          -> test_cache_check_compares_the_token_count,
              test_features_stay_on_the_cpu_under_a_default_device,
              test_served_patches_are_a_copy_of_the_cached_ones
 turns     a later turn adds one image behind the expanded prefix
@@ -24,7 +19,8 @@ turns     a later turn adds one image behind the expanded prefix
 mrope     the scheduler's M-RoPE fallback returns none for two images
           -> test_scheduler_mrope_fallback_takes_two_images
 media     video and audio are request errors; a GPU image decoder or device is rejected,
-          in the config or per call; a text-only checkpoint takes text and rejects images
+          in the config or per call, and a call naming the CPU reads the cache entry of one
+          naming none; a text-only checkpoint takes text and rejects images
           -> test_video_and_audio_are_rejected, test_gpu_image_options_are_rejected,
              test_text_only_checkpoint_rejects_images
 """
@@ -221,70 +217,6 @@ class TestDeepseekV41TokenSpace(CustomTestCase):
         self.assertTrue(torch.equal(wide.feature, tall.feature))
         self.assertNotEqual(wide.hash, tall.hash)
 
-    def test_vision_config_scopes_the_item_feature_cache(self):
-        """Servers that override the vision config share one model path and cache directory;
-        a hit must not hand one the other's patches and span length."""
-        cache = {}
-
-        def expanded_len(max_n_token, **options):
-            processor = TokenSpaceProcessor.for_strategy(
-                DeepseekV41TokenSpaceProcessStrategy
-            )(
-                _config(vision_max_n_token=max_n_token),
-                self.tokenizer,
-                item_feature_cache=cache,
-            )
-            self.addCleanup(processor.shutdown)
-            output = asyncio.run(
-                processor.process(self.images[5:], input_ids=[IMAGE], **options)
-            )
-            return output["input_ids"].shape[-1]
-
-        # 80x60 is capped at 40 tokens as 26, and at 16 as 10.
-        self.assertEqual(expanded_len(40), 26)
-        self.assertEqual(expanded_len(16), 10)
-        self.assertEqual(len(cache), 2)
-        with patch.object(
-            DeepseekV41TokenSpaceProcessStrategy,
-            "load_image",
-            side_effect=AssertionError("missed its own cache entry"),
-        ):
-            # A trainer may name the CPU device the server left unset.
-            self.assertEqual(expanded_len(16, image_device="cpu"), 10)
-        # Pillow releases resize some images differently.
-        with patch("PIL.__version__", "0.0"):
-            self.assertEqual(expanded_len(16), 10)
-        self.assertEqual(len(cache), 3)
-
-    def test_vision_config_is_read_once_at_construction(self):
-        """The patches and the cache key come from one snapshot of the vision config; a
-        caller editing hf_config afterwards must not split them apart."""
-        cache = {}
-
-        def processor(config):
-            built = TokenSpaceProcessor.for_strategy(
-                DeepseekV41TokenSpaceProcessStrategy
-            )(config, self.tokenizer, item_feature_cache=cache)
-            self.addCleanup(built.shutdown)
-            return built
-
-        config = _config()
-        edited = processor(config)
-        config.vision_max_n_token = 16
-        output = asyncio.run(edited.process(self.images[5:], input_ids=[IMAGE]))
-        # 80x60 under the 40-token cap the processor was built with.
-        self.assertEqual(output["input_ids"].shape[-1], 26)
-        # The entry it wrote is keyed by that cap too: a 40-token processor reads it back.
-        with patch.object(
-            DeepseekV41TokenSpaceProcessStrategy,
-            "load_image",
-            side_effect=AssertionError("missed the entry"),
-        ):
-            output = asyncio.run(
-                processor(_config()).process(self.images[5:], input_ids=[IMAGE])
-            )
-        self.assertEqual(output["input_ids"].shape[-1], 26)
-
     def test_features_stay_on_the_cpu_under_a_default_device(self):
         """A trainer may set a default torch device; the features still come out on the
         CPU, or a cache hit and a miss would not merge."""
@@ -394,7 +326,7 @@ class TestDeepseekV41TokenSpace(CustomTestCase):
 
     def test_gpu_image_options_are_rejected(self):
         """Patches are made from PIL images on the CPU; a GPU decoder or device would be
-        ignored, so it is an error, in the config or per call."""
+        ignored, so it is an error, in the config or per call. Naming the CPU changes nothing."""
         for mm_process_config, message in (
             ({"image_decoder": "nvjpeg"}, "image_decoder must be 'pil'"),
             ({"image": {"device": "cuda:0"}}, r"\['device'\] must be 'cpu'"),
@@ -437,6 +369,15 @@ class TestDeepseekV41TokenSpace(CustomTestCase):
                 cached.process(
                     self.images[:1], input_ids=[IMAGE], image_device="cuda:0"
                 )
+            )
+        # Not even the cache entry: the call reads the one written without a device.
+        with patch.object(
+            DeepseekV41TokenSpaceProcessStrategy,
+            "load_image",
+            side_effect=AssertionError("missed the entry"),
+        ):
+            asyncio.run(
+                cached.process(self.images[:1], input_ids=[IMAGE], image_device="cpu")
             )
 
     def test_served_patches_are_a_copy_of_the_cached_ones(self):

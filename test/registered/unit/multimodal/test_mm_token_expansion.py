@@ -24,8 +24,6 @@ TokenSpaceProcessor.process(media, IDs)
   item feature cache, same image on another device -> loaded again
   item feature cache, same image on another GPU (serving vs a trainer rank) -> reused
   one map, processors of another checkpoint, mm_process_config or library version -> loaded again
-  one map, one checkpoint, configs the strategy's fingerprint tells apart -> each loads its own;
-      a fingerprint the key cannot hold -> ValueError at construction
   item feature cache, check rate 1 -> a hit is computed again, equal to the cache, not rewritten;
       the global random stream is untouched
   item feature cache, a sampled hit computes to other features -> RuntimeError
@@ -533,50 +531,6 @@ class TestTokenSpaceProcessor(unittest.TestCase):
                 asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
             loaded.append(load.await_args.args[0])
         self.assertEqual(loaded, [[image], None, [image], [image], [image]])
-
-    def test_item_feature_cache_is_scoped_by_the_strategy_fingerprint(self):
-        """Features that read hf_config change with an override under one model path; the
-        strategy's fingerprint keeps such processors from reading each other's entries."""
-
-        class _ScaledWidthStrategy(_ImageWidthStrategy):
-            def process_image(self, image, processor, preprocess_kwargs, **kwargs):
-                count = image.width * self.hf_config.scale
-                return {
-                    "pixel_values": torch.full((count, 1), float(count)),
-                    "num_image_tokens": [count],
-                }
-
-            def preprocess_fingerprint_payload(self):
-                return {"scale": self.hf_config.scale}
-
-        image = Image.new("RGB", (2, 1))
-        item_feature_cache = {}
-        expanded, loaded = [], []
-        for scale in (1, 2, 2):
-            processor = self._processor(
-                strategy_class=_ScaledWidthStrategy,
-                hf_config=PretrainedConfig(name_or_path="ckpt", scale=scale),
-                item_feature_cache=item_feature_cache,
-            )
-            load = AsyncMock(wraps=processor._load_media_lists)
-            with patch.object(processor, "_load_media_lists", load):
-                output = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
-            expanded.append(output["input_ids"].shape[-1])
-            loaded.append(load.await_args.args[0])
-        self.assertEqual(expanded, [3, 5, 5])
-        # The last processor reads the second one's entry without loading the image.
-        self.assertEqual(loaded, [[image], [image], None])
-
-        class _DevicePayloadStrategy(_ImageWidthStrategy):
-            def preprocess_fingerprint_payload(self):
-                return {"device": torch.device("cpu")}
-
-        # Not on the first cached request, which a strategy's own tests may never make.
-        with self.assertRaisesRegex(ValueError, "Unsupported value"):
-            self._processor(
-                strategy_class=_DevicePayloadStrategy,
-                hf_config=PretrainedConfig(name_or_path="ckpt"),
-            )
 
     def test_media_sources_must_be_lists(self):
         # A bare source would otherwise be iterated item by item, e.g. a URL per character.

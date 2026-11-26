@@ -8,7 +8,6 @@ pass through unchanged.
 from types import MappingProxyType
 
 import msgspec
-import PIL
 import torch
 
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
@@ -82,8 +81,7 @@ class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             and hf_config.vision_n_layers > 0
             and not hf_config.language_model_only
         )
-        # Patches and the cache key both come from this snapshot,
-        # whatever happens to hf_config afterwards.
+        # Patches come from this snapshot, whatever happens to hf_config afterwards.
         self._vision = (
             _VisionSettings(
                 vision_patch_size=hf_config.vision_patch_size,
@@ -98,12 +96,6 @@ class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         self.mm_token_expansion_params = {
             "image_token_id": hf_config.image_token_id if has_vision_tower else None
         }
-
-    def preprocess_fingerprint_payload(self):
-        if self._vision is None:
-            return {}
-        # Pillow 13 resizes some images differently (python-pillow/Pillow#9549).
-        return {**msgspec.structs.asdict(self._vision), "pillow": PIL.__version__}
 
     def resolve_media_options(self, processor, *, image_device=None, video_device=None):
         options = super().resolve_media_options(

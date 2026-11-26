@@ -91,17 +91,6 @@ class TokenSpaceProcessStrategy:
         # Token IDs and sizes for expansion, e.g. image_token_id, spatial_merge_size.
         self.mm_token_expansion_params = {}
 
-    def preprocess_fingerprint_payload(self) -> dict:
-        """Settings the item features depend on that the rest of the cache key leaves out.
-
-        Read and hashed once at construction. A non-empty payload joins every item feature
-        cache key, e.g. the hf_config fields a strategy reads, which
-        --json-model-override-args can change under the same model path. Use plain values
-        (str, int, float, bool, None, lists and dicts): a config object hashes by its
-        declared fields only.
-        """
-        return {}
-
     # Media loading, one source per call. The IO threads share this instance: these read
     # class attributes and __init__ state and never write `self`. Override to decode as
     # the model's own processor does.
