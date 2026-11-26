@@ -70,14 +70,19 @@ def get_forward_context_or_none() -> "ForwardContext | None":
     return _forward_context
 
 
-def request_allows_lossless() -> bool:
-    """Whether the request of this forward pass allows ``lossless`` fast paths."""
+def request_allows(tier: str) -> bool:
+    """Whether the request of this forward pass allows fast paths of ``tier``."""
     # only a request that allows it: many stages set the forward context
     # without forward_batch, and an exact request must still get exact bytes
     forward_batch = None if _forward_context is None else _forward_context.forward_batch
     sampling_params = getattr(forward_batch, "sampling_params", None)
     quality = getattr(sampling_params, "quality", None)
-    return quality is not None and quality_allows(quality, "lossless")
+    return quality is not None and quality_allows(quality, tier)
+
+
+def request_allows_lossless() -> bool:
+    """Whether the request of this forward pass allows ``lossless`` fast paths."""
+    return request_allows("lossless")
 
 
 @contextmanager

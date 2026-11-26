@@ -3,7 +3,7 @@ use crate::cache_action::{
 };
 use std::sync::Mutex;
 
-use tch::Tensor;
+use tch::{Device, Tensor};
 
 use super::*;
 use crate::components::{ComponentSet, FULL, Family, MAMBA, SWA, native_family};
