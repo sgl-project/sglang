@@ -1200,6 +1200,21 @@ class MambaPool:
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
         idx64 = indices.to(torch.int64)
+        if _is_npu and idx64.numel() > 0:
+            from sglang.srt.mem_cache.mamba_slot_fused import npu_clear_slots_fast
+
+            for conv in self.mamba_cache.conv:
+                if conv.numel() > 0 and conv[0, 0].is_contiguous():
+                    npu_clear_slots_fast(conv, idx64)
+                else:
+                    conv.index_fill_(1, idx64, 0)
+            temporal = self.mamba_cache.temporal
+            if temporal.numel() > 0:
+                if temporal[0, 0].is_contiguous():
+                    npu_clear_slots_fast(temporal, idx64)
+                else:
+                    temporal.index_fill_(1, idx64, 0)
+            return
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
 
