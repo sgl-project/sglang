@@ -775,7 +775,10 @@ class CommonKVManager(BaseKVManager):
         self._dcp_pack_max_tokens = max_tokens
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
-        return self.request_status[bootstrap_room]
+        # A room absent from request_status (concluded and cleaned up, or never
+        # registered under a racing n>1 fan-out) polls as Failed, so one stale
+        # room cannot raise KeyError and take down the scheduler.
+        return self.request_status.get(bootstrap_room, KVPoll.Failed)
 
     def check_status_pp_consensus(self, bootstrap_room: int) -> KVPoll:
         statuses = self.request_status.collect(bootstrap_room)
