@@ -1,0 +1,140 @@
+{
+  "source": {
+    "code_commits": [
+      "75ed36d976"
+    ],
+    "date": "2026-11-24",
+    "device": "NVIDIA GB300",
+    "nodes": 1,
+    "gpus_per_node": 2,
+    "push_slot_bytes": 33554432,
+    "raw_results": [
+      "sweep-w2.jsonl"
+    ]
+  },
+  "selection": {
+    "rule": "nearest global-token bucket at or below the workload",
+    "fallback": "nccl",
+    "note": "One run, eager launches, median of 5 timed loops per shape. Standalone RS push won every measured bucket T=4..4096 (11-12 us against 81-88 us for NCCL through T=512, 95 against 102 us at T=4096). AG push won through T=512 and direct AG at T=1024/2048 (10-11 us against 58-66 us for NCCL through T=256); NCCL won AG at T=4096. T=4682 is the first world=2 shape whose per-rank shard exceeds the 32 MiB symmetric slot, so it is an explicit NCCL boundary. The fused attention-residual kinds were not measured and are absent, which selects the separate path."
+  },
+  "configs": {
+    "reduce_scatter": {
+      "4": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 128
+      },
+      "8": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 128
+      },
+      "16": {
+        "strategy": "push",
+        "num_blocks": 32,
+        "block_size": 512
+      },
+      "32": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 128
+      },
+      "64": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "128": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 256
+      },
+      "256": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 256
+      },
+      "512": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "1024": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "2048": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "4096": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "4682": {
+        "strategy": "nccl"
+      }
+    },
+    "all_gather": {
+      "4": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 512
+      },
+      "8": {
+        "strategy": "push",
+        "num_blocks": 8,
+        "block_size": 512
+      },
+      "16": {
+        "strategy": "push",
+        "num_blocks": 16,
+        "block_size": 256
+      },
+      "32": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 512
+      },
+      "64": {
+        "strategy": "push",
+        "num_blocks": 8,
+        "block_size": 512
+      },
+      "128": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 256
+      },
+      "256": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 512
+      },
+      "512": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "1024": {
+        "strategy": "direct",
+        "num_blocks": 8,
+        "block_size": 1024
+      },
+      "2048": {
+        "strategy": "direct",
+        "num_blocks": 64,
+        "block_size": 512
+      },
+      "4096": {
+        "strategy": "nccl"
+      },
+      "4682": {
+        "strategy": "nccl"
+      }
+    }
+  }
+}
