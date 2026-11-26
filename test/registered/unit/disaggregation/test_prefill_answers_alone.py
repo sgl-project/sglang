@@ -29,7 +29,7 @@ from sglang.srt.disaggregation.utils import (  # noqa: E402
     answered_by_prefill,
     lacks_decode_peer,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH  # noqa: E402
+from sglang.srt.managers.req_types import FINISH_LENGTH  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_list import (  # noqa: E402
     IndexedReqList,
     ListKind,
