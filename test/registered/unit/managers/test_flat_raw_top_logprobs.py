@@ -591,6 +591,13 @@ class TestSchedulerFlatAssembly(CustomTestCase):
             chunked.logprob.input_top_logprobs_flat_null_prefix,
         )
 
+    def test_prompt_ids_keep_the_last_vocab_id(self):
+        req = self._make_req(flat=False)
+        # The stub vocabulary ends at 999_999, so larger ids stand for multimodal pads.
+        req.origin_input_ids = array("q", [1, 999_999, 1_000_000, 1 << 40, 2])
+        self._run_prefill(req, [3, 2])
+        self.assertEqual(req.logprob.input_token_logprobs_idx, [1, 999_999, 0, 0, 2])
+
     def test_unrepresentable_rows_fall_back_to_nested(self):
         req = self._make_req(flat=True, num_tokens=3)
         processor = _make_logprob_processor()
