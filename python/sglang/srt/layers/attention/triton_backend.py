@@ -1813,6 +1813,7 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        return_lse=False,
     ):
         if (
             k is not None
@@ -1820,9 +1821,14 @@ class TritonAttnBackend(AttentionBackend):
             and sinks is None
             and score_mod is None
             and aux_tensors is None
+            and not return_lse
             and self._can_run_dense_fp8_chunked_mha(q, k, v, layer, forward_batch)
         ):
             return self._forward_dense_fp8_chunked_mha(q, k, v, layer, forward_batch)
+        if return_lse and forward_batch.mha_one_shot:
+            raise NotImplementedError(
+                "return_lse is not supported on the dense one-shot extend path"
+            )
 
         # TODO: reuse the buffer across layers
         attn_out = getattr(forward_batch, "_attn_output", None)
@@ -1929,12 +1935,20 @@ class TritonAttnBackend(AttentionBackend):
                 raise NotImplementedError(
                     "DCP Triton extend does not support score_mod"
                 )
+            if return_lse:
+                raise NotImplementedError(
+                    "DCP Triton extend does not support return_lse"
+                )
             return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
+            if return_lse:
+                raise NotImplementedError(
+                    "Deterministic Triton extend does not support return_lse"
+                )
             return self._forward_extend_unified(
                 q,
                 o,
@@ -1989,6 +2003,7 @@ class TritonAttnBackend(AttentionBackend):
             and k_descale == 1.0
             and v_descale == 1.0
             and not logits_soft_cap
+            and not return_lse
             and self.forward_metadata.custom_mask is None
             and not (
                 self.use_sliding_window_kv_pool
@@ -2021,6 +2036,7 @@ class TritonAttnBackend(AttentionBackend):
         if (
             verify_fwd is not None
             and score_mod is None
+            and not return_lse
             and forward_batch.forward_mode.is_target_verify()
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2051,6 +2067,14 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        lse = None
+        if return_lse:
+            lse = torch.empty(
+                (q.shape[0], layer.tp_q_head_num),
+                dtype=torch.float32,
+                device=q.device,
+            )
+
         self._forward_extend_kernel(
             layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2079,11 +2103,16 @@ class TritonAttnBackend(AttentionBackend):
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             bf16_dot=self.draft_bf16_dot,
+            lse_extend=lse,
         )
+        if return_lse:
+            return o, lse
         return o
 
     def _forward_extend_kernel(self, layer, *args, **kwargs):
         if self.dllm_attention is not None:
+            if kwargs.get("lse_extend") is not None:
+                raise NotImplementedError("dllm attention does not support return_lse")
             return self.dllm_attention.forward_extend(layer, *args, **kwargs)
         return self.extend_attention_fwd(*args, **kwargs)
 
@@ -2469,6 +2498,7 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        return_lse=False,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -2562,7 +2592,11 @@ class TritonAttnBackend(AttentionBackend):
             get_is_capture_mode,
         )
 
-        if self.enable_deterministic or envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
+        if (
+            return_lse
+            or self.enable_deterministic
+            or envs.SGLANG_DISABLE_LEAN_ATTENTION.get()
+        ):
             enable_lean = False
         else:
             enable_lean = self.enable_lean_attention
@@ -2589,6 +2623,10 @@ class TritonAttnBackend(AttentionBackend):
             if score_mod is not None:
                 raise NotImplementedError(
                     "DCP Triton decode does not support score_mod"
+                )
+            if return_lse:
+                raise NotImplementedError(
+                    "DCP Triton decode does not support return_lse"
                 )
             group = get_parallel().dcp_group
             with use_symmetric_memory(group):
@@ -2636,6 +2674,10 @@ class TritonAttnBackend(AttentionBackend):
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
+        if return_lse:
+            # The split kernel leaves splits past a request's own count unwritten.
+            self.forward_metadata.attn_lse.fill_(-float("inf"))
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.kv_layers.read(layer.layer_id).key(),
@@ -2666,6 +2708,11 @@ class TritonAttnBackend(AttentionBackend):
             uneven_batch=self.forward_metadata.uneven_batch,
             stop_at_request_splits=self.enable_deterministic,
         )
+        if return_lse:
+            return o, torch.logsumexp(
+                self.forward_metadata.attn_lse[: q.shape[0], : layer.tp_q_head_num],
+                dim=-1,
+            ).float()
         return o
 
 
