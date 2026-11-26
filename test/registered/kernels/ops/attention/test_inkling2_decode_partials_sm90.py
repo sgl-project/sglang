@@ -143,9 +143,8 @@ def test_interior_split_partition(monkeypatch, splits):
     from sglang.kernels.ops.attention import inkling2_decode_attention_sm90 as attn
 
     # Enough SMs for any batch, so MAX_SPLITS alone sets the split count.
-    monkeypatch.setattr(
-        attn, "current_arch", lambda: types.SimpleNamespace(num_sms=1 << 16)
-    )
+    arch = types.SimpleNamespace(num_sms=1 << 16, is_sm=attn.current_arch().is_sm)
+    monkeypatch.setattr(attn, "current_arch", lambda: arch)
     monkeypatch.setattr(attn, "MAX_SPLITS", splits)
     inputs = _attention_inputs(6, 1, 8, None, 128)
     partials = attn.decode_partials(*inputs, SCALE)
@@ -164,7 +163,7 @@ def test_sequences_without_interior_tiles_keep_main_split(monkeypatch):
     qlen = 8
     inputs = _attention_inputs(6, 1, qlen, None, 128)
     seqused = inputs[4]
-    tile, _ = attn._verify_path(qlen, 6, None)
+    tile, _ = attn._verify_path(qlen, 6, None, False)
     has_interior = (seqused - qlen - EXTENT + 1) // tile > 0
     assert has_interior.any() and not has_interior.all()
     mixed = attn.decode_partials(*inputs, SCALE)
@@ -176,6 +175,21 @@ def test_sequences_without_interior_tiles_keep_main_split(monkeypatch):
     assert torch.equal(m, m0)
     torch.testing.assert_close(o, o0, rtol=1e-6, atol=0)
     torch.testing.assert_close(l, l0, rtol=1e-6, atol=0)
+
+
+def test_verify_paths_only_on_hopper_with_16bit_cache(monkeypatch):
+    """The interior tiles and the bias prefetch stay off for an MXFP8 cache and on any
+    GPU but Hopper (SM120 runs this kernel too): those launches are main's."""
+    from sglang.kernels.ops.attention import inkling2_decode_attention_sm90 as attn
+
+    def path(major, mxfp8):
+        arch = types.SimpleNamespace(is_sm=lambda want, minor=None: want == major)
+        monkeypatch.setattr(attn, "current_arch", lambda: arch)
+        return attn._verify_path(8, 6, None, mxfp8)
+
+    assert path(9, mxfp8=False) == (64, True)
+    assert path(9, mxfp8=True) == (0, False)
+    assert path(12, mxfp8=False) == (0, False)
 
 
 if __name__ == "__main__":

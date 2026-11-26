@@ -1,11 +1,11 @@
 """Paged decode attention with a compact relative bias for Hopper and SM120: the
 split-KV partials of paged_rel_bias_decode (unnormalized o, max, sum), reduced by
 combine_gate_sink, for one query per sequence or a causal block of queries per
-sequence (MTP verify). Each split takes an equal share of the sequence's own keys. On
-a global layer's verify of a block that pads to 32 or 64 rows, each masked tile's bias
-is gathered a tile ahead; at 64 rows the keys at least the bias extent behind every
-query row also run as larger unmasked tiles, and a split takes an equal share of the
-tiles."""
+sequence (MTP verify). Each split takes an equal share of the sequence's own keys.
+On Hopper with a 16-bit cache, a global layer's verify of a block that pads to 32 or
+64 rows gathers each masked tile's bias a tile ahead; at 64 rows the keys at least
+the bias extent behind every query row also run as larger unmasked tiles, and a
+split takes an equal share of the tiles."""
 
 import torch
 import triton
@@ -303,7 +303,7 @@ def decode_partials(
         assert k_words.stride() == v_words.stride()
     else:
         k_words = v_words = k_cache
-    interior, prefetch = _verify_path(qlen, group, window_size_left)
+    interior, prefetch = _verify_path(qlen, group, window_size_left, mxfp8)
     o = torch.empty(
         (splits, tokens, 1, heads_q, head_dim), dtype=torch.float32, device=q.device
     )
@@ -355,13 +355,16 @@ def decode_partials(
     return o, m, l
 
 
-def _verify_path(qlen, group, window_size_left):
+def _verify_path(qlen, group, window_size_left, mxfp8):
     """(keys per unmasked interior tile or 0, bias gathered a tile ahead) for a global
     layer's verify; (0, False) keeps main's path. Measured on H200 at 6 heads per KV
     head: interior tiles pay off at 64 rows (6 to 10 tokens) but ran up to 1.4% slower
     than main at 32 rows (3 to 5 tokens) on 1536 keys, and 128-key ones spilled at 128
     rows; at 16 rows (2 tokens) the bias prefetch alone ran up to 4% slower than
     main."""
+    # The interior tiles read no MXFP8 scales; SM120 and MXFP8 caches were not timed.
+    if mxfp8 or not current_arch().is_sm(9):
+        return 0, False
     if qlen == 1 or window_size_left is not None or not 16 < qlen * group <= 64:
         return 0, False
     return (64 if qlen * group > 32 else 0), True
