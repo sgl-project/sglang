@@ -1,4 +1,5 @@
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -12,6 +13,7 @@ from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
@@ -166,12 +168,58 @@ class TestForwardCadenceRetirementIsPriced(unittest.TestCase):
                     ),
                     # The rows a decode step allocates ahead (its own term).
                     patch(
-                        "sglang.srt.mem_cache.allocation_sizing.get_decode_reserve",
+                        "sglang.srt.mem_cache.allocation_sizing.get_spec_decode_reserve",
                         return_value=4,
                     ),
                 ):
                     retirement = window_retirement(shares_prefixes=False)
                 self.assertEqual(retirement.eviction_interval, rows)
+
+    def test_extend_retires_window_for_streaming_session_rows(self):
+        # A streaming session chunk extends its own row on a prefix-sharing cache;
+        # without retirement every SWA row it ever wrote stays allocated. A later
+        # chunk of a plain chunked prefill also holds its row but is left alone.
+        sessions = (
+            None,
+            SimpleNamespace(streaming=False),
+            SimpleNamespace(streaming=True),
+        )
+        for overlap, held, session in product([False, True], [True, False], sessions):
+            with (
+                self.subTest(overlap=overlap, held=held, session=session),
+                published_topology(device="cpu", chunked_prefill_size=256),
+                envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
+            ):
+                cache = _SwaCache()
+                req = SimpleNamespace(
+                    extend_batch_idx=0,
+                    kv=ReqKvInfo(req_pool_idx=0 if held else None),
+                    session=session,
+                )
+                batch = ScheduleBatch(
+                    reqs=[req],
+                    tree_cache=cache,
+                    req_to_token_pool=cache.req_to_token_pool,
+                    token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
+                    forward_mode=ForwardMode.EXTEND,
+                    enable_overlap=overlap,
+                )
+                batch.prefix_lens = [800]
+                free = cache.token_to_kv_pool_allocator.free_swa_segment
+
+                batch.maybe_evict_swa()
+
+                if not (held and session is not None and session.streaming):
+                    free.assert_not_called()
+                    continue
+                # Overlap keeps one chunk behind the frontier for the in-flight
+                # previous extend; the window itself stays in either case.
+                frontier = 800 - 256 if overlap else 800
+                free.assert_called_once()
+                self.assertTrue(
+                    torch.equal(free.call_args.args[0], torch.arange(frontier - 128))
+                )
+                self.assertEqual(req.kv.get_evicted_seqlen("swa"), frontier - 128)
 
 
 if __name__ == "__main__":

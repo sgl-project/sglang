@@ -151,7 +151,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         self.q_chunk = int(sparse_cfg.get("dash_query_chunk", 2048))
         self.stage0 = resolve_stage0(sparse_cfg)
         self.num_layers = int(model_runner.model_config.num_hidden_layers)
-        self.max_context_len = int(model_runner.model_config.context_len)
+        self.model_config = model_runner.model_config
 
         assert self.kv_pool.page_size == self.block_size, (
             f"page_size ({self.kv_pool.page_size}) must equal sparse_block_size "
@@ -200,7 +200,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
 
         # Captured grid and reduction widths must not grow with sequence length.
         self.max_block_static = max(
-            1, triton.cdiv(self.max_context_len, self.block_size)
+            1, triton.cdiv(self.model_config.context_len, self.block_size)
         )
         # Set by init_cuda_graph_state; until then every buffer grows on demand.
         self.cg_max_bs = 0
@@ -395,7 +395,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         self.coord_state = PageCoordState(
             sparse_cfg,
             max_reqs=max_reqs,
-            max_pages=page_capacity(self.max_context_len),
+            max_pages=page_capacity(self.model_config.context_len),
         )
         self.image_bucket_constraint = bool(
             sparse_cfg.get("image_bucket_constraint", False)
@@ -718,8 +718,8 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         cols = self._block_cols(max_block)
         rows = forward_batch.req_pool_indices.long()
         # Flattened gather reads only the requested page starts.
-        row_width = self.req_to_token.shape[1]
-        linear = rows[:, None] * row_width + cols[None, :]
+        req_to_token_row_width = self.req_to_token.shape[1]
+        linear = rows[:, None] * req_to_token_row_width + cols[None, :]
         gathered = (
             self.req_to_token.reshape(-1)
             .gather(0, linear.reshape(-1))
@@ -915,7 +915,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         md.slot_mapping = forward_batch.out_cache_loc
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if refresh_in_graph or seq_lens_cpu is None:
-            md.max_seq_len = self.max_context_len
+            md.max_seq_len = self.model_config.context_len
         else:
             md.max_seq_len = int(seq_lens_cpu.max().item())
         if _uses_static_width(
@@ -1581,7 +1581,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             self.cg_max_bs,
             self.cg_max_tokens,
             w,
-            self.max_context_len,
+            self.model_config.context_len,
             self.block_size,
             SCAN_TILE if _ENT_WINDOW else 0,
         )
