@@ -79,6 +79,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
+from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
@@ -3980,7 +3981,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
                 self.dq_k_buffer = self.dq_v_buffer = None
-                if self.layer_num and get_platform().is_sm120:
+                if self.layer_num and mxfp8_kv_via_bf16(platform=get_platform()):
                     self.dq_k_buffer = torch.zeros(
                         (m, n, k), dtype=torch.bfloat16, device=self.device
                     )

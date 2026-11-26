@@ -45,6 +45,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -231,11 +232,13 @@ class FlashAttentionBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.kv_cache_is_mxfp8 = self.kv_cache_dtype_str == "mxfp8"
         self.page_size = model_runner.page_size
-        self.mxfp8_via_bf16 = self.kv_cache_is_mxfp8 and get_platform().is_sm120
+        self.mxfp8_via_bf16 = self.kv_cache_is_mxfp8 and mxfp8_kv_via_bf16(
+            platform=get_platform()
+        )
         if self.mxfp8_via_bf16 and self.page_size != 128:
             raise ValueError(
-                "MXFP8 KV cache on SM120 requires --page-size 128, got "
-                f"{self.page_size}."
+                f"MXFP8 KV cache on SM{get_platform().device_sm} requires "
+                f"--page-size 128, got {self.page_size}."
             )
         # Static page-table width (upper bound). The device-side page-table build
         # sizes to this constant, so no runtime host max is needed.
@@ -563,7 +566,7 @@ class FlashAttentionBackend(AttentionBackend):
         if self.mxfp8_via_bf16:
             if q_descale is not None:
                 raise RuntimeError(
-                    "MXFP8 KV cache on SM120 attends with a BF16 query; FA4 reads "
+                    "MXFP8 KV cache on SM90 / SM120 attends with a BF16 query; FA4 reads "
                     "a BF16 copy of the cache, so Q must not be quantized."
                 )
             return {}
@@ -2016,7 +2019,7 @@ class FlashAttentionBackend(AttentionBackend):
                     or layer.is_cross_attention
                 ):
                     raise NotImplementedError(
-                        "MXFP8 KV cache on SM120 supports paged self-attention "
+                        "MXFP8 KV cache on SM90 / SM120 supports paged self-attention "
                         "without context parallelism, chunked local or cascade "
                         "attention, anchored windows or a skipped KV cache."
                     )
@@ -2585,7 +2588,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             if self.mxfp8_via_bf16 and (layer.is_cross_attention or use_local_attn):
                 raise NotImplementedError(
-                    "MXFP8 KV cache on SM120 does not support cross or chunked "
+                    "MXFP8 KV cache on SM90 / SM120 does not support cross or chunked "
                     "local attention."
                 )
 
@@ -2699,7 +2702,7 @@ class FlashAttentionBackend(AttentionBackend):
                         # FA4 would dequantize every sequence's whole context
                         # into the workspace on each step.
                         raise NotImplementedError(
-                            "MXFP8 KV cache on SM120 decodes only through the "
+                            "MXFP8 KV cache on SM90 / SM120 decodes only through the "
                             "relative-bias decode kernel."
                         )
                     result = self.flash_attn_with_kvcache(

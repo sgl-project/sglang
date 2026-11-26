@@ -35,6 +35,12 @@ _INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE = {
 }
 
 
+def mxfp8_kv_via_bf16(*, platform) -> bool:
+    """SM90 and SM120 lack the tcgen05 block-scaled operands of the FA4 MXFP8
+    path: prefill reads a BF16 copy of an MXFP8 cache, decode dequantizes inline."""
+    return platform.is_sm90 or platform.is_sm120
+
+
 def configure_kv_cache_dtype(
     *,
     server_args_kv_cache_dtype: str,

@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     resolve_compress_state_ring_size,
     uses_draft_swa_ring,
 )
+from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     get_minimax_sparse_index_dtype,
@@ -626,7 +627,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size += (
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
-                if get_platform().is_sm120 and num_layers:
+                if mxfp8_kv_via_bf16(platform=get_platform()) and num_layers:
                     # One BF16 row per token for FA4 (MHATokenToKVPoolMXFP8).
                     cell_size += (
                         n
@@ -862,7 +863,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
         self._full_dequant_per_token = self._swa_dequant_per_token = 0
-        if self.kv_cache_dtype_str == "mxfp8" and get_platform().is_sm120:
+        if self.kv_cache_dtype_str == "mxfp8" and mxfp8_kv_via_bf16(
+            platform=get_platform()
+        ):
             bf16_size = torch._utils._element_size(torch.bfloat16)
             if self._full_layers_num:
                 self._full_dequant_per_token = (

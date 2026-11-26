@@ -25,6 +25,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.inkling_common.attn import (
     RelLogitsProj,
@@ -462,7 +463,7 @@ class Inkling2Attention(nn.Module):
             "Inkling2 requires FA4 attention"
         )
         mxfp8 = get_model().kv_cache_dtype == "mxfp8"
-        fa4_mxfp8 = mxfp8 and not get_platform().is_sm120
+        fa4_mxfp8 = mxfp8 and not mxfp8_kv_via_bf16(platform=get_platform())
         sources = (
             AttentionSources(hidden_states, hidden_states, hidden_states)
             if isinstance(hidden_states, torch.Tensor)
