@@ -225,6 +225,18 @@ class TestToUnitRange(unittest.TestCase):
         self.assertIsNot(result, image)
         torch.testing.assert_close(image, torch.tensor([-1.0, 0.0, 1.0]))
 
+    def test_in_place_accepts_inference_output_outside_inference_mode(self):
+        with torch.inference_mode():
+            image = torch.tensor([-1.5, -1.0, 0.0, 1.0, 1.5])
+        self.assertTrue(image.is_inference())
+        expected = (image / 2 + 0.5).clamp(0, 1)
+
+        with torch.inference_mode(False), torch.no_grad():
+            result = _to_unit_range(image, in_place=True)
+
+        self.assertIs(result, image)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
 
 if __name__ == "__main__":
     unittest.main()
