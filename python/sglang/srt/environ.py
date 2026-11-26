@@ -2318,7 +2318,8 @@ class Envs:
     SGLANG_OPT_USE_INKLING_SHEARED_BIAS = EnvBool(True)
     # JSON expert placement for Inkling-2 routed experts under expert parallelism:
     # {"slots": {"<layer_id>": [logical expert held by each physical slot]}};
-    # rank r owns slots [r*E/ep, (r+1)*E/ep). Unset keeps contiguous placement.
+    # rank r owns slots [r*E/ep, (r+1)*E/ep). Must be identical on every rank.
+    # Unset keeps contiguous placement.
     SGLANG_OPT_INKLING2_EXPERT_PLACEMENT_FILE = EnvStr(None)
     # Use feature-stacked GEMMs for the no-LoRA BF16 shared sink. Eligible LoRA
     # serving enables this layout independently of the flag.

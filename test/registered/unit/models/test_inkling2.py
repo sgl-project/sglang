@@ -769,16 +769,19 @@ def test_multimodal_requires_explicit_enable(tmp_path):
     assert enabled.hf_config.vision_config == _RELEASE_CONFIG["vision_config"]
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 # ===== Static expert placement =====
 PLACE_EXPERTS, PLACE_EP, PLACE_HIDDEN, PLACE_TOPK = 16, 4, 8, 2
 
 
+@pytest.fixture
+def placement_cache():
+    placement._load_placement.cache_clear()
+    yield
+    placement._load_placement.cache_clear()
+
+
+# The model's experts in slot order: every rank's loaded rows, concatenated.
 def _placement_experts(full, slots):
-    """Concatenate every rank's loaded rows, i.e. the model's experts in slot order."""
     rows = []
     for rank in range(PLACE_EP):
         shard = SimpleNamespace(
@@ -791,9 +794,9 @@ def _placement_experts(full, slots):
     return torch.cat(rows)
 
 
-def _placement_moe(gate_weight, experts, x):
-    """Reference routed MoE: top-k over gate scores, weighted sum of expert outputs."""
-    scores = x @ gate_weight.T
+# Reference routed MoE: top-k over biased gate scores, weighted sum of expert outputs.
+def _placement_moe(gate_weight, gate_bias, experts, x):
+    scores = x @ gate_weight.T + gate_bias
     weights, ids = scores.softmax(-1).topk(PLACE_TOPK, dim=-1)
     return torch.einsum(
         "tk,tkd->td", weights, torch.einsum("tkdh,th->tkd", experts[ids], x)
@@ -801,10 +804,12 @@ def _placement_moe(gate_weight, experts, x):
 
 
 def test_placement_preserves_routed_output():
-    """Slot s must hold logical expert slots[s] in BOTH the gate rows and the expert
-    shards; using the inverse permutation in either place routes to the wrong expert."""
+    """Slot s must hold logical expert slots[s] in the gate weight, the gate bias,
+    and the expert shards; the inverse permutation anywhere routes to the wrong expert.
+    Loads through the loaders the gate attaches, so an unattached loader also fails."""
     torch.manual_seed(0)
     gate_weight = torch.randn(PLACE_EXPERTS, PLACE_HIDDEN)
+    gate_bias = torch.randn(PLACE_EXPERTS)
     experts = torch.randn(PLACE_EXPERTS, PLACE_HIDDEN, PLACE_HIDDEN)
     x = torch.randn(32, PLACE_HIDDEN)
     slots = torch.randperm(PLACE_EXPERTS)
@@ -814,16 +819,21 @@ def test_placement_preserves_routed_output():
         route_scale=1.0,
         n_routed_experts=PLACE_EXPERTS,
         hidden_size=PLACE_HIDDEN,
-        use_gate_bias=False,
+        use_gate_bias=True,
     )
     gate = moe.Inkling2Gate(config, expert_slots=slots)
-    gate._load_placed_rows(gate.weight, gate_weight)
+    gate.weight.weight_loader(gate.weight, gate_weight)
+    gate.bias.weight_loader(gate.bias, gate_bias)
 
-    placed = _placement_moe(gate.weight.data, _placement_experts(experts, slots), x)
-    torch.testing.assert_close(placed, _placement_moe(gate_weight, experts, x))
+    placed = _placement_moe(
+        gate.weight.data, gate.bias.data, _placement_experts(experts, slots), x
+    )
+    torch.testing.assert_close(
+        placed, _placement_moe(gate_weight, gate_bias, experts, x)
+    )
 
 
-def test_contiguous_when_unset():
+def test_contiguous_when_unset(placement_cache):
     with envs.SGLANG_OPT_INKLING2_EXPERT_PLACEMENT_FILE.override(None):
         assert (
             placement.expert_slots_for_layer(
@@ -833,13 +843,12 @@ def test_contiguous_when_unset():
         )
 
 
-def test_rejects_non_permutation(tmp_path):
+def test_rejects_non_permutation(tmp_path, placement_cache):
     """A slot list that repeats or drops an expert would load silently and misroute."""
     path = tmp_path / "placement.json"
     order = list(range(PLACE_EXPERTS))
     order[-1] = 0
     path.write_text(json.dumps({"slots": {"0": order}}))
-    placement._load_placement.cache_clear()
     with envs.SGLANG_OPT_INKLING2_EXPERT_PLACEMENT_FILE.override(str(path)):
         with pytest.raises(ValueError, match="not a permutation"):
             placement.expert_slots_for_layer(
@@ -862,3 +871,7 @@ def test_balance_keeps_shard_size_and_lowers_max_load():
         )
 
     assert max_load(slots) < max_load(list(range(PLACE_EXPERTS)))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

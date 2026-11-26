@@ -133,6 +133,12 @@ class Inkling2Gate(nn.Module):
                     set_weight_attrs(param, {"weight_loader": self._load_placed_rows})
 
     def _load_placed_rows(self, param, loaded):
+        # Keeps default_weight_loader's size check: index_select would silently
+        # take a subset of a wrong-sized checkpoint tensor.
+        if loaded.shape != param.shape:
+            raise ValueError(
+                f"Gate tensor shape mismatch: {tuple(loaded.shape)} != {tuple(param.shape)}"
+            )
         param.data.copy_(loaded.index_select(0, self.expert_slots.to(loaded.device)))
 
     def forward(self, x):
@@ -354,8 +360,8 @@ class Inkling2Experts(nn.Module):
         if swizzled:
             param.data.copy_(swizzle_blockscale(target).flatten(1))
 
+    # loaded is a [num_global_experts, ...] checkpoint tensor; returns this rank's experts.
     def _local_expert_rows(self, loaded):
-        """This rank's experts from a [num_global_experts, ...] checkpoint tensor."""
         if self.expert_slots is None:
             return loaded.chunk(self.ep_size, dim=0)[self.ep_rank]
         num_local = self.num_global_experts // self.ep_size

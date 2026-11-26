@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import json
 import logging
 
@@ -41,9 +42,21 @@ def expert_slots_for_layer(
     """Logical expert held by each physical slot for this layer, or None for
     contiguous placement (no placement file, or the file omits this layer)."""
     path = envs.SGLANG_OPT_INKLING2_EXPERT_PLACEMENT_FILE.get()
-    if path is None:
+    # A single rank holds every expert, so placement cannot change its load.
+    if path is None or ep_size == 1:
         return None
-    return _load_placement(path, num_experts, ep_size).get(layer_id)
+    slots = _load_placement(path, num_experts, ep_size).get(layer_id)
+    if slots is None:
+        _warn_unplaced(path, layer_id)
+    return slots
+
+
+@functools.cache
+def _warn_unplaced(path: str, layer_id: int) -> None:
+    logger.warning(
+        f"Inkling2 expert placement {path} has no entry for layer {layer_id}; "
+        "it keeps contiguous placement"
+    )
 
 
 @functools.cache
@@ -54,8 +67,9 @@ def _load_placement(
         raise ValueError(
             f"Expert placement needs {num_experts} experts divisible by EP size {ep_size}"
         )
-    with open(path) as f:
-        raw = json.load(f)
+    with open(path, "rb") as f:
+        content = f.read()
+    raw = json.loads(content)
     slots = raw.get("slots")
     if not isinstance(slots, dict):
         raise ValueError(f"{path}: expected an object with a 'slots' mapping")
@@ -67,13 +81,18 @@ def _load_placement(
                 f"{path}: layer {key} is not a permutation of {num_experts} experts"
             )
         placement[int(key)] = torch.tensor(order, dtype=torch.long)
-    logger.info(f"Inkling2 expert placement: {len(placement)} layers from {path}")
+    # Every rank reads the file itself; matching hashes across ranks' logs confirm one placement.
+    logger.info(
+        f"Inkling2 expert placement: {len(placement)} layers "
+        f"({min(placement, default=None)}..{max(placement, default=None)}) from {path}, "
+        f"sha256 {hashlib.sha256(content).hexdigest()[:16]}"
+    )
     return placement
 
 
 def balance_slots(counts: list[int], ep_size: int) -> list[int]:
     """Physical slot order that evens per-rank routed load, holding E/ep experts
-    per rank. Longest-processing-time first: within 4/3 of the optimal maximum."""
+    per rank. Greedy heuristic: heaviest expert first onto the least loaded rank."""
     num_experts = len(counts)
     per_rank = num_experts // ep_size
     if per_rank * ep_size != num_experts:
