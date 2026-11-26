@@ -198,7 +198,11 @@ def _quick_all_reduce_tp4_int4(monkeypatch, first_min_bytes):
     return quick_reduce
 
 
-def _coordinator_with_custom_allreduce(qr_comm):
+def _coordinator_with_custom_allreduce(monkeypatch, qr_comm):
+    # Quick all-reduce exists on ROCm only; deterministic collectives are off.
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: True)
+    monkeypatch.delenv("SGLANG_USE_1STAGE_ALLREDUCE", raising=False)
+    monkeypatch.delenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", raising=False)
     coordinator = parallel_state.GroupCoordinator.__new__(
         parallel_state.GroupCoordinator
     )
@@ -225,7 +229,7 @@ def test_quick_allreduce_first_min_bytes_precedes_custom_allreduce(
     monkeypatch, first_min_bytes, rows, method
 ):
     coordinator = _coordinator_with_custom_allreduce(
-        _quick_all_reduce_tp4_int4(monkeypatch, first_min_bytes)
+        monkeypatch, _quick_all_reduce_tp4_int4(monkeypatch, first_min_bytes)
     )
     input_ = torch.empty(rows, 5120, dtype=torch.bfloat16)
     assert coordinator._resolve_outplace_all_reduce_method(input_) == method
@@ -240,9 +244,40 @@ def test_quick_allreduce_first_min_bytes_keeps_kernel_input_rules(
     monkeypatch, shape, dtype
 ):
     coordinator = _coordinator_with_custom_allreduce(
-        _quick_all_reduce_tp4_int4(monkeypatch, 1 << 20)
+        monkeypatch, _quick_all_reduce_tp4_int4(monkeypatch, 1 << 20)
     )
     input_ = torch.empty(shape, dtype=dtype)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
+
+
+@pytest.mark.parametrize(
+    "env,value",
+    [
+        ("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "1"),
+        ("SGLANG_USE_1STAGE_ALLREDUCE", "1"),
+    ],
+)
+def test_quick_allreduce_first_min_bytes_skipped_for_deterministic_collectives(
+    monkeypatch, env, value
+):
+    coordinator = _coordinator_with_custom_allreduce(
+        monkeypatch, _quick_all_reduce_tp4_int4(monkeypatch, 1 << 20)
+    )
+    monkeypatch.setenv(env, value)
+    input_ = torch.empty(192, 5120, dtype=torch.bfloat16)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
+
+
+def test_quick_allreduce_first_min_bytes_needs_rocm_and_enabled_quick_allreduce(
+    monkeypatch,
+):
+    quick_reduce = _quick_all_reduce_tp4_int4(monkeypatch, 1 << 20)
+    coordinator = _coordinator_with_custom_allreduce(monkeypatch, quick_reduce)
+    input_ = torch.empty(192, 5120, dtype=torch.bfloat16)
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: False)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: True)
+    quick_reduce.disabled = True
     assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
 
 
