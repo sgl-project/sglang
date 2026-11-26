@@ -145,7 +145,7 @@ class DynamicChunkSizer:
         max_profile_tokens = min(
             int(self.chunked_prefill_size * 1.25),
             model_config.context_len,
-            self.req_to_token_pool.max_context_len,
+            self.req_to_token_pool.row_width,
         )
         step = max(1, max_profile_tokens // 128)
         for i in range(128):

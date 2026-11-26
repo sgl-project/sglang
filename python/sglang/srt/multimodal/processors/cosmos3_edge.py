@@ -35,6 +35,11 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.qwen_vl_media_processing import (
+    ceil_by_factor,
+    floor_by_factor,
+    round_by_factor,
+)
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 IMAGE_MIN_PIXELS = 256 * 256
@@ -46,18 +51,6 @@ DEFAULT_SOURCE_VIDEO_FPS = 24.0
 DEFAULT_TARGET_VIDEO_FPS = 2.0
 DEFAULT_MIN_FRAMES = 4
 DEFAULT_MAX_FRAMES = 768
-
-
-def _round_by_factor(number: float, factor: int) -> int:
-    return round(number / factor) * factor
-
-
-def _ceil_by_factor(number: float, factor: int) -> int:
-    return math.ceil(number / factor) * factor
-
-
-def _floor_by_factor(number: float, factor: int) -> int:
-    return math.floor(number / factor) * factor
 
 
 def _smart_resize(
@@ -77,16 +70,16 @@ def _smart_resize(
             f"{MAX_RATIO}, got {max(height, width) / min(height, width)}"
         )
 
-    h_bar = max(factor, _round_by_factor(height, factor))
-    w_bar = max(factor, _round_by_factor(width, factor))
+    h_bar = max(factor, round_by_factor(height, factor))
+    w_bar = max(factor, round_by_factor(width, factor))
     if num_frames * h_bar * w_bar > max_pixels:
         beta = math.sqrt((num_frames * height * width) / max_pixels)
-        h_bar = max(factor, _floor_by_factor(height / beta, factor))
-        w_bar = max(factor, _floor_by_factor(width / beta, factor))
+        h_bar = max(factor, floor_by_factor(height / beta, factor))
+        w_bar = max(factor, floor_by_factor(width / beta, factor))
     elif num_frames * h_bar * w_bar < min_pixels:
         beta = math.sqrt(min_pixels / (num_frames * height * width))
-        h_bar = _ceil_by_factor(height * beta, factor)
-        w_bar = _ceil_by_factor(width * beta, factor)
+        h_bar = ceil_by_factor(height * beta, factor)
+        w_bar = ceil_by_factor(width * beta, factor)
     return h_bar, w_bar
 
 
