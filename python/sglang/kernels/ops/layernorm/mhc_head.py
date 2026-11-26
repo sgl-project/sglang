@@ -37,20 +37,24 @@ def _hc_head_kernel(
     y_ptr,
     hidden_size: tl.constexpr,
     HC_MULT: tl.constexpr,
+    HC_BLOCK: tl.constexpr,
     K_TOTAL: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
     norm_eps: tl.constexpr,
     hc_eps: tl.constexpr,
+    EPS_OUTSIDE_SQRT: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
 
     # ---------- Pass 1: sum_sq over flattened K dim, plus hc_mult inner products ----------
     sumsq = tl.zeros((), dtype=tl.float32)
-    mix = tl.zeros((HC_MULT,), dtype=tl.float32)
+    mix = tl.zeros((HC_BLOCK,), dtype=tl.float32)
 
     x_row = x_ptr + pid * K_TOTAL
-    m_idx = tl.arange(0, HC_MULT)
+    # HC_BLOCK is HC_MULT padded to a power of two; the padded rows are masked.
+    m_idx = tl.arange(0, HC_BLOCK)
+    m_mask = m_idx < HC_MULT
 
     for k_off in tl.range(0, K_TOTAL, BLOCK_K):
         k_offs = k_off + tl.arange(0, BLOCK_K)
@@ -60,13 +64,16 @@ def _hc_head_kernel(
         sumsq += tl.sum(x_tile * x_tile, axis=0)
 
         fn_offs = m_idx[:, None] * K_TOTAL + k_offs[None, :]
-        fn_mask = (m_idx[:, None] < HC_MULT) & k_mask[None, :]
+        fn_mask = m_mask[:, None] & k_mask[None, :]
         fn_tile = tl.load(fn_ptr + fn_offs, mask=fn_mask, other=0.0)
         mix += tl.sum(fn_tile * x_tile[None, :], axis=1)
 
-    rsqrt = tl.rsqrt(sumsq / K_TOTAL + norm_eps)
+    if EPS_OUTSIDE_SQRT:
+        rsqrt = 1.0 / (tl.sqrt(sumsq / K_TOTAL) + norm_eps)
+    else:
+        rsqrt = tl.rsqrt(sumsq / K_TOTAL + norm_eps)
     scale_v = tl.load(scale_ptr).to(tl.float32)
-    base_v = tl.load(base_ptr + m_idx).to(tl.float32)
+    base_v = tl.load(base_ptr + m_idx, mask=m_mask, other=0.0).to(tl.float32)
 
     # pre[m] = sigmoid(mix[m] * rsqrt * scale + base[m]) + hc_eps
     pre = tl.sigmoid(mix * rsqrt * scale_v + base_v) + hc_eps
@@ -79,7 +86,7 @@ def _hc_head_kernel(
         d_mask = d_offs < hidden_size
 
         x_offs = m_idx[:, None] * hidden_size + d_offs[None, :]
-        x_mask = (m_idx[:, None] < HC_MULT) & d_mask[None, :]
+        x_mask = m_mask[:, None] & d_mask[None, :]
         x_block = tl.load(x_row + x_offs, mask=x_mask, other=0.0).to(tl.float32)
 
         y_block = tl.sum(pre[:, None] * x_block, axis=0)
@@ -94,6 +101,7 @@ def fused_hc_head(
     hc_base: torch.Tensor,
     norm_eps: float,
     hc_eps: float,
+    eps_outside_sqrt: bool = False,
 ) -> torch.Tensor:
     """Fused (RMSNorm + Linear + Sigmoid-gate + weighted-sum) for the DSV4 hc_head.
 
@@ -104,6 +112,7 @@ def fused_hc_head(
         hc_base   : (hc_mult,) fp32
         norm_eps  : RMS epsilon
         hc_eps    : additive epsilon after sigmoid
+        eps_outside_sqrt : normalize by 1 / (sqrt(mean_sq) + eps), as mhc_pre does
 
     Returns:
         y : (T, hidden_size) same dtype as x
@@ -130,7 +139,7 @@ def fused_hc_head(
     BLOCK_K = 512
     BLOCK_D = 512
 
-    hc_mult_pow2 = max(1, triton.next_power_of_2(hc_mult))
+    hc_block = max(1, triton.next_power_of_2(hc_mult))
 
     grid = (T,)
     _hc_head_kernel[grid](
@@ -140,12 +149,14 @@ def fused_hc_head(
         hc_base,
         y,
         hidden_size=hidden_size,
-        HC_MULT=hc_mult_pow2,
+        HC_MULT=hc_mult,
+        HC_BLOCK=hc_block,
         K_TOTAL=hc_mult * hidden_size,
         BLOCK_K=BLOCK_K,
         BLOCK_D=BLOCK_D,
         norm_eps=norm_eps,
         hc_eps=hc_eps,
+        EPS_OUTSIDE_SQRT=eps_outside_sqrt,
         num_warps=4,
     )
     return y

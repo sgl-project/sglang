@@ -128,7 +128,6 @@ import threading
 from collections.abc import Callable
 
 import pytest
-import requests
 from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -151,6 +150,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     is_in_ci,
 )
+from sglang.test.test_utils import admin_post
 
 logger = init_logger(__name__)
 
@@ -217,9 +217,9 @@ def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
     """
     local_path = maybe_download_model(model_path)
     weights_dir = os.path.join(local_path, module_name)
-    assert os.path.exists(
-        weights_dir
-    ), f"No weights dir for {module_name} in {local_path}"
+    assert os.path.exists(weights_dir), (
+        f"No weights dir for {module_name} in {local_path}"
+    )
 
     safetensors_files = _list_safetensors_files(weights_dir)
     assert safetensors_files, f"No safetensors files in {weights_dir}"
@@ -302,7 +302,7 @@ class _UpdateWeightsApiMixin:
         payload = {"model_path": model_path, "flush_cache": flush_cache}
         if target_modules is not None:
             payload["target_modules"] = target_modules
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/update_weights_from_disk",
             json=payload,
             timeout=timeout,
@@ -318,14 +318,14 @@ class _UpdateWeightsApiMixin:
         payload = {}
         if module_names is not None:
             payload["module_names"] = module_names
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/get_weights_checksum",
             json=payload,
             timeout=timeout,
         )
-        assert (
-            response.status_code == 200
-        ), f"get_weights_checksum failed: {response.status_code} {response.text}"
+        assert response.status_code == 200, (
+            f"get_weights_checksum failed: {response.status_code} {response.text}"
+        )
         return response.json()
 
     def _assert_server_matches_model(
@@ -494,7 +494,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         assert status_code == 400, f"Expected 400, got {status_code}"
         assert not result.get("success", True), "Should fail for nonexistent model"
 
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/update_weights_from_disk",
             json={},
             timeout=30,
@@ -542,9 +542,9 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
             and perturbed_checksums.get(name) != "not_found"
             and base_checksums.get(name) != "not_found"
         )
-        assert (
-            text_encoder_modules
-        ), "Expected at least one text encoder module checksum"
+        assert text_encoder_modules, (
+            "Expected at least one text encoder module checksum"
+        )
 
         # perturbed → corrupted (should fail and rollback)
         rollback_targets = [_TRANSFORMER_MODULE, _VAE_MODULE]
@@ -553,18 +553,18 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
             corrupted_vae_model_dir,
             target_modules=rollback_targets,
         )
-        assert (
-            status_code == 400
-        ), f"Expected 400 on corrupted weights, got {status_code}"
+        assert status_code == 400, (
+            f"Expected 400 on corrupted weights, got {status_code}"
+        )
         assert not result.get("success", True)
         message = result.get("message", "")
         assert "rolled back" in message.lower()
         # The updater reports the first failing module in the error message.
         # With ordered target_modules=[transformer, vae], this makes the
         # failure point explicit: transformer is processed first, then vae fails.
-        assert (
-            "Failed to update module 'vae'" in message
-        ), f"Expected vae to be the explicit failure point, got: {message}"
+        assert "Failed to update module 'vae'" in message, (
+            f"Expected vae to be the explicit failure point, got: {message}"
+        )
         rolled_back_checksums = self._get_weights_checksum(base_url)
 
         # 1) transformer: server == perturbed != base
@@ -583,12 +583,12 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
 
         # 3) text encoder(s): server == base == perturbed
         for name in text_encoder_modules:
-            assert rolled_back_checksums.get(name) == perturbed_checksums.get(
-                name
-            ), f"Text encoder module '{name}' should stay equal to perturbed"
-            assert rolled_back_checksums.get(name) == base_checksums.get(
-                name
-            ), f"Text encoder module '{name}' should stay equal to base"
+            assert rolled_back_checksums.get(name) == perturbed_checksums.get(name), (
+                f"Text encoder module '{name}' should stay equal to perturbed"
+            )
+            assert rolled_back_checksums.get(name) == base_checksums.get(name), (
+                f"Text encoder module '{name}' should stay equal to base"
+            )
 
 
 class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):

@@ -3,12 +3,9 @@ import re
 
 import numpy as np
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.qwen2_audio import Qwen2AudioForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -167,13 +164,13 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
 
         self._warn_if_audio_exceeds_window(base_output.audios)
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 
-        assert (
-            "feature_attention_mask" in ret
-        ), "feature_attention_mask not found in processor output"
+        assert "feature_attention_mask" in ret, (
+            "feature_attention_mask not found in processor output"
+        )
         input_lengths = ret["feature_attention_mask"].sum(dim=-1)
         input_lengths = (input_lengths - 1) // 2 + 1
         output_lengths = (input_lengths - 2) // 2 + 1

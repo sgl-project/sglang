@@ -127,6 +127,10 @@ class CohereCommand4Detector(BaseFormatDetector):
 
         block_end = eot_pos + len(self.eot_token)
         result = self.detect_and_parse(current[:block_end], tools)
+        # A streamed tool_index is the call ordinal, not the tool's position.
+        for call in result.calls:
+            self.current_tool_id += 1
+            call.tool_index = self.current_tool_id
         self._buffer = current[block_end:]
         return result
 

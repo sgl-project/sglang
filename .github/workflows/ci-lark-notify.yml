@@ -1,0 +1,59 @@
+name: CI Lark Notify
+
+# Lark cards for CUDA CI health; see scripts/ci_monitor/README.md.
+
+on:
+  workflow_run:
+    workflows: ["Nightly Test (Nvidia)", "Weekly Test (Nvidia)", "PR Test Base"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'Which report to run'
+        required: true
+        type: choice
+        options: [ci-status]
+      run_id:
+        description: 'Workflow run id (ci-status only)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Print the card instead of posting it'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PYTHONUNBUFFERED: 1
+  DRY_RUN_FLAG: ${{ inputs.dry_run && '--dry-run' || '' }}
+
+jobs:
+  ci-status:
+    if: >-
+      github.repository == 'sgl-project/sglang' && (
+        (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'schedule') ||
+        (github.event_name == 'workflow_dispatch' && inputs.task == 'ci-status')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci_monitor
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Post CI status card
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LARK_WEBHOOK: ${{ secrets.LARK_WEBHOOK }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: |
+          python scripts/ci_monitor/lark_notify.py $DRY_RUN_FLAG ci-status \
+            --run-id "$RUN_ID" \
+            ${{ github.event_name == 'workflow_dispatch' && '--any-event' || '' }}

@@ -105,8 +105,9 @@ def test_native_ministral3_matches_hf_prefill_and_generation():
         torch.testing.assert_close(native_output.logits, reference_output.logits)
         assert len(native_output.past_key_values.layers) == config.num_hidden_layers
 
-        with torch.no_grad(), set_forward_context(
-            current_timestep=0, attn_metadata=None
+        with (
+            torch.no_grad(),
+            set_forward_context(current_timestep=0, attn_metadata=None),
         ):
             native_ids = native.generate(input_ids, max_new_tokens=2, do_sample=False)
         with torch.no_grad():

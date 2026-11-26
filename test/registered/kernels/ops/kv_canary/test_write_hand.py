@@ -51,8 +51,8 @@ from sglang.test.kernels.kv_canary._hand_oracle import (
     _hand_fold_partial,
 )
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 _DEVICE = torch.device("cuda")
@@ -362,9 +362,9 @@ class TestSeedSlot:
         new_stored = read_slot_fields(canary_buf=self.buf_pair[0], slot_idx=new_slot)
         assert new_stored[0] == new_token
         assert new_stored[1] == new_position
-        assert new_stored[2] == to_signed_int64(
-            expected_running
-        ), f"new slot prev_hash {new_stored[2]} != expected {to_signed_int64(expected_running)}"
+        assert new_stored[2] == to_signed_int64(expected_running), (
+            f"new slot prev_hash {new_stored[2]} != expected {to_signed_int64(expected_running)}"
+        )
 
 
 class TestChain:
@@ -446,9 +446,9 @@ class TestChain:
             stored_prev_signed, stored_real_kv_hash = read_slot_fields(
                 canary_buf=cuda_buf, slot_idx=slot_idx
             )[2:]
-            assert stored_prev_signed == to_signed_int64(
-                running
-            ), f"slot {slot_idx}: stored prev_hash != recomputed chain step"
+            assert stored_prev_signed == to_signed_int64(running), (
+                f"slot {slot_idx}: stored prev_hash != recomputed chain step"
+            )
             running = splitmix64_mix3(running, token, position)
 
 
@@ -711,9 +711,9 @@ class TestSlotHandling:
         for slot in range(cuda_buf.shape[0]):
             if slot in (5, 7):
                 continue
-            assert torch.equal(
-                after[slot], cuda_buf_before_slot_view[slot]
-            ), f"slot {slot} should not have been written"
+            assert torch.equal(after[slot], cuda_buf_before_slot_view[slot]), (
+                f"slot {slot} should not have been written"
+            )
 
     def test_shrink_active_reqs_does_not_write_stale_slots(self) -> None:
         """Run write with bs=3 plan after a bs=8 run on same buffer: stale slots from bs=8 stay intact."""
@@ -749,9 +749,9 @@ class TestSlotHandling:
 
         after = cuda_buf.view(torch.int64)
         for slot in big_slots:
-            assert torch.equal(
-                after[slot], untouched_snapshot[slot]
-            ), f"slot {slot} from earlier bs=8 run was overwritten by bs=3 run"
+            assert torch.equal(after[slot], untouched_snapshot[slot]), (
+                f"slot {slot} from earlier bs=8 run was overwritten by bs=3 run"
+            )
 
 
 class TestRealKvHash:
@@ -796,6 +796,33 @@ class TestRealKvHash:
             real_kv_hash_mode=mode,
         )
 
+    @pytest.mark.parametrize("page_size", [1, 4])
+    def test_strided_real_kv_source_byte_equal(self, page_size: int) -> None:
+        """A strided source (``stride(0) > shape[1]``) folds the same hash as its packed copy.
+
+        The reference folds a contiguous clone; the CUDA kernel folds the strided view, whose
+        rows are followed by bytes it does not own. They agree only if the kernel steps rows
+        by ``stride(0)``.
+        """
+        sources_cuda = make_real_kv_sources(
+            count=2,
+            page_size=page_size,
+            row_gap=48,
+            device=_DEVICE,
+            fill_strategy="random_bytes",
+        )
+        assert all(s.tensor.stride(0) > s.tensor.shape[1] for s in sources_cuda)
+        sources_ref = clone_real_kv_sources(sources_cuda)
+
+        _run_write(
+            buf_pair=self.buf_pair,
+            input_ids=[10, 20, 30],
+            positions=[0, 1, 2],
+            out_cache_loc=[1, 6, 11],
+            real_kv_sources_pair=(sources_cuda, sources_ref),
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+        )
+
     @pytest.mark.parametrize("count", [1, 2, 3, 4])
     def test_real_kv_sources_fold_1_to_4(self, count: int) -> None:
         """Folding ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""
@@ -810,45 +837,6 @@ class TestRealKvHash:
             real_kv_sources_pair=(sources_cuda, sources_ref),
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
-
-    def test_real_kv_source_above_4_raises(self) -> None:
-        """``len(real_kv_sources) > 4`` → host wrapper raises ValueError before launching."""
-        cuda_buf = make_canary_buf(device=_DEVICE)
-        plan = make_write_plan(
-            write_offsets=[0, 1],
-            seed_slot_indices=[-1],
-            num_valid_reqs=1,
-            device=_DEVICE,
-        )
-        input_ids = _int32_tensor([1])
-        positions = _int32_tensor([0])
-        out_cache_loc = _int32_tensor([0])
-        log = FakeViolationLog.allocate(device=_DEVICE)
-        sources = make_real_kv_sources(count=4, device=_DEVICE)
-        extra = make_real_kv_source(device=_DEVICE)
-        too_many = sources + (extra,)
-
-        with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            launch_canary_write_kernel(
-                context=VerifyOrWriteContext(
-                    canary_buf=cuda_buf,
-                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                    violation_ring=log.ring,
-                    violation_write_index=log.write_index,
-                    slot_run_counter=log.slot_run_counter,
-                    kernel_run_counter=log.kernel_run_counter,
-                    enable_chain_position_assert=log.enable_chain_position_assert,
-                    real_kv_sources=too_many,
-                    real_kv_hash_mode=consts.RealKvHashMode.NONE,
-                ),
-                plan=plan,
-                input_ids=input_ids,
-                positions=positions,
-                out_cache_loc=out_cache_loc,
-                enable_write_input_assert=False,
-                expected_input_tokens=None,
-                expected_input_positions=None,
-            )
 
     @pytest.mark.parametrize(
         "mode,fold_fn,expected_hash",
@@ -927,9 +915,9 @@ class TestRealKvHash:
         _, _, _, stored_real_kv_hash = read_slot_fields(
             canary_buf=self.buf_pair[0], slot_idx=0
         )
-        assert stored_real_kv_hash == to_signed_int64(
-            expected_hash
-        ), f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(expected_hash):#x}"
+        assert stored_real_kv_hash == to_signed_int64(expected_hash), (
+            f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(expected_hash):#x}"
+        )
 
     def test_paged_real_kv_hash_consistent_across_slots(self) -> None:
         """page=16: writing two slots inside same page yields independent real_kv_hash per slot."""
@@ -1008,9 +996,9 @@ class TestRealKvHash:
         fields_b = _run_with(sources_b)
         assert fields_a[3] != 0
         assert fields_b[3] != 0
-        assert (
-            fields_a[3] != fields_b[3]
-        ), "reversing source order must change real_kv_hash (fold is ordered)"
+        assert fields_a[3] != fields_b[3], (
+            "reversing source order must change real_kv_hash (fold is ordered)"
+        )
 
 
 class TestRunCounter:
@@ -1201,9 +1189,9 @@ class TestPseudoMode:
         )
         assert int(cuda_log.write_index[0].item()) >= 1
         bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-        assert (
-            bits & consts.FailReason.WRITE_TOKEN_MISMATCH
-        ), f"expected WRITE_TOKEN_MISMATCH bit, got {bits:#b}"
+        assert bits & consts.FailReason.WRITE_TOKEN_MISMATCH, (
+            f"expected WRITE_TOKEN_MISMATCH bit, got {bits:#b}"
+        )
 
     def test_pseudo_mode_off_skips_token_check(self) -> None:
         """enable_write_verify_inputs=False makes the caller pass no expected-input tensors."""

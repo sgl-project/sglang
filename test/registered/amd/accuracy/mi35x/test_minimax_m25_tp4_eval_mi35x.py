@@ -3,7 +3,7 @@
 Tests MiniMax-M2.5 with TP=4 + EP=1 configuration using few-shot completion
 benchmark on MI35x. This configuration uses unified attention with FP8 KV cache.
 
-Registry: nightly-amd-4-gpu-mi35x-minimax-m25-tp4 suite
+Registry: nightly-test-4-gpu-amd-mi35x-minimax-m25-tp4 suite
 """
 
 import os
@@ -28,8 +28,9 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-4-gpu-mi35x-minimax-m25-tp4",
+    suite="nightly-test-4-gpu-amd-mi35x-minimax-m25-tp4",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999
@@ -188,9 +189,9 @@ class TestMiniMaxM25TP4EvalMI35x(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

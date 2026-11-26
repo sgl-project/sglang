@@ -51,7 +51,7 @@ def tv_resize(arr: np.ndarray, tw: int, th: int) -> np.ndarray:
 
 
 # Every resampler the Rust resize claims, and its reference: `aten_u8` for a
-# default server, `pil_bicubic` for --disable-fast-image-processor, `pil_lanczos`
+# default server, `pil_bicubic` for --image-processor-backend pil, `pil_lanczos`
 # for inkling.
 REFERENCES = {
     "pil_lanczos": lambda a, tw, th: pil_resize(a, tw, th, Image.Resampling.LANCZOS),
@@ -156,5 +156,5 @@ def test_resize_bench():
         rs_resize(arr, tw, th)
     t_rs = (time.perf_counter() - t0) / 10 * 1e3
     print(
-        f"\nresize 1920x1080->{tw}x{th}: PIL {t_pil:.1f}ms rust {t_rs:.1f}ms ({t_pil/t_rs:.1f}x)"
+        f"\nresize 1920x1080->{tw}x{th}: PIL {t_pil:.1f}ms rust {t_rs:.1f}ms ({t_pil / t_rs:.1f}x)"
     )

@@ -17,6 +17,7 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/type.cuh>   // For fp32_t / bf16_t aliases
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 
@@ -139,8 +140,8 @@ __global__ void causal_conv1d_kernel(const __grid_constant__ CausalConv1dParams 
     }
 
     if constexpr (USE_SILU) {
-      acc0 = __fdividef(acc0, 1.0f + __expf(-acc0));  // silu = x*sigmoid(x)
-      acc1 = __fdividef(acc1, 1.0f + __expf(-acc1));
+      acc0 = device::activation::silu(acc0);
+      acc1 = device::activation::silu(acc1);
     }
     if constexpr (USE_RESIDUAL) {
       acc0 += x_cur.x;
@@ -168,14 +169,14 @@ struct CausalConv1dKernel {
     auto Km1 = SymbolicSize{"W_minus_1"};
     auto NS = SymbolicSize{"nseq"};
     auto dev = SymbolicDevice{};
-    dev.set_options<kDLCUDA>();
+    dev.set_options<kDLGPU>();
     Wd.set_value(W);
     Km1.set_value(W - 1);
 
     // x may be a non-contiguous row view (stride_t arbitrary) but must be
     // channel-contiguous. cache_mask is torch-bool (verify shape/device only).
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(x);
-    TensorMatcher({-1, Km1, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    TensorMatcher({-1, Km1, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({NS}).with_dtype<int64_t>().with_device(dev).verify(safe_idx);
     TensorMatcher({NS, 1, 1}).with_device(dev).verify(cache_mask);
     TensorMatcher({D, Wd}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(weight);

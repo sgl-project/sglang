@@ -4,6 +4,10 @@ import time
 from types import SimpleNamespace
 from typing import ClassVar, List, Optional
 
+import torch
+
+from sglang.kernels.ops.kv_canary._dispatch import use_torch_reference
+from sglang.srt.utils import get_device
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -34,8 +38,18 @@ KV_CANARY_ARGS: List[str] = [
     "partial",
     "--kv-canary-sweep-interval",
     "100",
-    "--disable-piecewise-cuda-graph",
+    "--cuda-graph-backend-prefill=disabled",
 ]
+
+
+def _canary_args(enabled: bool) -> List[str]:
+    if not enabled:
+        return []
+    args = list(KV_CANARY_ARGS)
+    if use_torch_reference(torch.device(get_device())):
+        # install_canary refuses a captured decode over the torch reference.
+        args.append("--cuda-graph-backend-decode=disabled")
+    return args
 
 
 class ChunkedGsm8kMixin:
@@ -52,7 +66,7 @@ class ChunkedGsm8kMixin:
     gsm8k_threshold: ClassVar[float]
 
     def build_prefill_side_args(self) -> List[str]:
-        canary = list(KV_CANARY_ARGS) if self.use_kv_canary else []
+        canary = _canary_args(self.use_kv_canary)
         return (
             ["--chunked-prefill-size", str(self.chunked_prefill_size)]
             + list(self.feature_args)
@@ -118,7 +132,7 @@ class ChunkedTestPDBase(ChunkedGsm8kMixin, PDDisaggregationServerBase):
         cls.extra_prefill_args = cls(
             "test_mixed_prefix_gsm8k_chunked"
         ).build_prefill_side_args()
-        canary = list(KV_CANARY_ARGS) if cls.use_kv_canary else []
+        canary = _canary_args(cls.use_kv_canary)
         cls.extra_decode_args = canary + list(cls.decode_feature_args)
         PDDisaggregationServerBase.setUpClass()
         cls.model = try_cached_model(cls.model)

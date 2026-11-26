@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.w4afp8 import interleave_scales
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -84,17 +84,22 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         input_quant,
     ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
-        self.num_bits = config.num_bits
-        self.packed_factor = 32 // config.num_bits
-        self.group_size = config.group_size
+        self.num_bits = weight_quant.num_bits
+        self.packed_factor = 32 // self.num_bits
+        self.group_size = weight_quant.group_size
+        if self.group_size != 128:
+            raise ValueError(
+                f"CUTLASS W4AFP8 MoE requires group_size=128, got {self.group_size}"
+            )
         self.weight_quant = weight_quant
         self.input_quant = input_quant
 
-        assert config.symmetric, "Only symmetric quantization is supported"
+        assert weight_quant.symmetric, "Only symmetric quantization is supported"
         assert (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
-        ), f"W4AFP8MoE requires pack-quantized format, got {self.quant_config.quant_format}"
+        ), (
+            f"W4AFP8MoE requires pack-quantized format, got {self.quant_config.quant_format}"
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -288,9 +293,9 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

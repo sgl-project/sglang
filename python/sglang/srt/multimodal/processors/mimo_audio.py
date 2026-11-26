@@ -1,25 +1,30 @@
 """Stateful audio preprocessing pipeline shared by MiMo multimodal and ASR processors."""
 
 import io
+import logging
 import math
-import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import pybase64
 import torch
 
-from sglang.srt.utils import common
-from sglang.utils import logger
+from sglang.srt.multimodal import media_io
+
+logger = logging.getLogger(__name__)
 
 try:
     from torchcodec.decoders import AudioDecoder
-except ImportError:
+except (ImportError, OSError, RuntimeError) as e:
+    # TorchCodec may be installed but unable to load its FFmpeg libraries.
     logger.warning(
-        "torchcodec is not installed; audio inputs will fail at request time"
+        "torchcodec is unavailable; video audio-track detection and "
+        "audio decoding via AudioDecoder are disabled: %s",
+        e,
     )
     AudioDecoder = None
 
@@ -169,9 +174,9 @@ class MiMoAudioPipeline:
         Output: (mel-spectrogram tensor [T, n_mels], audio_token_len int).
         """
         self._ensure_audio_dependencies()
-        assert isinstance(
-            audio, (str, bytes, tuple)
-        ), f"audio must be a str, bytes or tuple, but got {type(audio)}"
+        assert isinstance(audio, (str, bytes, tuple)), (
+            f"audio must be a str, bytes or tuple, but got {type(audio)}"
+        )
         if isinstance(audio, tuple):
             waveform, original_sr = audio
         else:
@@ -184,9 +189,9 @@ class MiMoAudioPipeline:
                     )
                 elif audio.startswith("http://") or audio.startswith("https://"):
                     dl_start = time.perf_counter()
-                    timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+                    timeout = media_io.media_url_timeout(5)
                     try:
-                        content = common.download_remote_media(audio, timeout=timeout)
+                        content = media_io.download_remote_media(audio, timeout=timeout)
                         dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
                         if dl_elapsed_ms > 1000.0:
                             logger.warning(
@@ -201,8 +206,12 @@ class MiMoAudioPipeline:
                             f"error={type(e).__name__}: {e}, url={audio}"
                         )
                         raise
+                elif audio.startswith("file://"):
+                    file = media_io.check_local_media_file(
+                        unquote(urlparse(audio).path)
+                    )
                 else:
-                    file = audio
+                    file = media_io.check_local_media_file(audio)
             if AudioDecoder is None:
                 raise RuntimeError(
                     "torchcodec is required for audio decoding; install with `pip install torchcodec`."
@@ -256,9 +265,9 @@ class MiMoAudioPipeline:
         if isinstance(audio, (str, bytes, tuple)):
             return self.preprocess_audio(audio)
 
-        assert (
-            audio.shape[1] >= self.audio_channels
-        ), f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
+        assert audio.shape[1] >= self.audio_channels, (
+            f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
+        )
         T = audio.shape[0]
         audio = audio[:, : self.audio_channels].to(torch.long)
         padded_T = (

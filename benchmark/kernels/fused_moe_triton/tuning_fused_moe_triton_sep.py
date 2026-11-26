@@ -24,6 +24,7 @@ from common_utils import (
 )
 from ray.experimental.tqdm_ray import tqdm
 
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import clear_b_tma_desc_cache
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     get_config_dtype_str,
@@ -34,13 +35,18 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config impor
     get_config_file_name,
 )
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.server_args import (
-    ServerArgs,
-    set_global_server_args_for_scheduler,
+from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils import (
+    get_device,
+    get_device_module,
+    is_hip,
+    is_xpu,
 )
-from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
+device_module = get_device_module()
 
 
 @dataclasses.dataclass
@@ -72,11 +78,12 @@ class KernelWrapper:
             expert_ids=moe_input.expert_ids,
             num_tokens_post_padded=moe_input.num_tokens_post_padded,
         )
-        torch.cuda.synchronize()
+        device_module.synchronize()
 
-        # Capture 10 invocations with CUDA graph
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        # Capture inner_iter invocations into one replayable graph.
+        graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
+        graph = graph_cls()
+        with device_module.graph(graph):
             for k in range(self.inner_iter):
                 moe_input = self.moe_inputs[k]
                 self.func(
@@ -86,19 +93,19 @@ class KernelWrapper:
                     expert_ids=moe_input.expert_ids,
                     num_tokens_post_padded=moe_input.num_tokens_post_padded,
                 )
-        torch.cuda.synchronize()
+        device_module.synchronize()
 
         # Warmup
         for _ in range(5):
             graph.replay()
-        torch.cuda.synchronize()
+        device_module.synchronize()
         return graph
 
     def forward_cost(self, try_cnt=2):
         time_cost = float("inf")
         for _ in range(try_cnt):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+            start_event = device_module.Event(enable_timing=True)
+            end_event = device_module.Event(enable_timing=True)
             start_event.record()
             if self.use_cuda_graph:
                 self.graph.replay()
@@ -113,14 +120,19 @@ class KernelWrapper:
                         num_tokens_post_padded=moe_input.num_tokens_post_padded,
                     )
             end_event.record()
-            torch.cuda.synchronize()
+            device_module.synchronize()
             time_cost = min(time_cost, start_event.elapsed_time(end_event))
         return time_cost
 
 
 def load_topk_ids(topk_ids_dir, i: int):
-    num_layers = 61
-    dense_layers = 3
+    model_config = get_model_config(
+        get_model().model_path,
+        tp_size=get_parallel().tp_size,
+        ep_size=get_parallel().ep_size,
+    )
+    num_layers = model_config["num_layers"]
+    dense_layers = model_config["dense_layers"]
     moe_layers = num_layers - dense_layers
     return torch.load(
         f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
@@ -146,11 +158,16 @@ def benchmark_config(
     enable_up_tma: bool = False,
     tune_round: str = "both",
     down_use_tma_map: dict = None,
+    is_gated: bool = True,
 ) -> float:
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
     if ncu_enable:
         num_iters = 1
+    # Weights here are per-call, so a cached descriptor only pins a dead w1/w2.
+    clear_b_tma_desc_cache()
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
+    # w2 takes the activation output: half of w1's rows when gated, all of them otherwise
+    down_size = shard_intermediate_size // 2 if is_gated else shard_intermediate_size
     hidden_states = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16 or use_int8_w8a8:
         w1 = torch.randint(
@@ -169,7 +186,7 @@ def benchmark_config(
             (
                 num_experts,
                 hidden_size,
-                shard_intermediate_size // 2,
+                down_size,
             ),
             dtype=torch.int8,
         )
@@ -190,7 +207,7 @@ def benchmark_config(
             (
                 num_experts,
                 hidden_size,
-                shard_intermediate_size // 4,
+                down_size // 2,
             ),
             dtype=torch.uint8,
         )
@@ -198,9 +215,7 @@ def benchmark_config(
         w1 = torch.randn(
             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
         )
-        w2 = torch.randn(
-            num_experts, hidden_size, shard_intermediate_size // 2, dtype=init_dtype
-        )
+        w2 = torch.randn(num_experts, hidden_size, down_size, dtype=init_dtype)
 
     w1_scale = None
     w2_scale = None
@@ -217,7 +232,7 @@ def benchmark_config(
         n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
         n_tiles_w2 = (hidden_size + block_n - 1) // block_n
         k_tiles_w1 = (hidden_size + block_k - 1) // block_k
-        k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
+        k_tiles_w2 = (down_size + block_k - 1) // block_k
         w1_scale = torch.randn(
             (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.bfloat16
         )
@@ -240,7 +255,7 @@ def benchmark_config(
             n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
             n_tiles_w2 = (hidden_size + block_n - 1) // block_n
             k_tiles_w1 = (hidden_size + block_k - 1) // block_k
-            k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
+            k_tiles_w2 = (down_size + block_k - 1) // block_k
             w1_scale = torch.rand(
                 (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.float32
             )
@@ -287,7 +302,7 @@ def benchmark_config(
         (total_tokens, N),
     )
     intermediate_cache2 = torch.empty(
-        (total_tokens, N // 2),
+        (total_tokens, N // 2 if is_gated else N),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
@@ -470,7 +485,7 @@ def benchmark_config(
         if build_down:
             ts1.append(kernel1.forward_cost())  # down no-tma
             ts_tma1.append(kernel1_tma.forward_cost())  # down tma
-    torch.cuda.synchronize()
+    device_module.synchronize()
 
     avg = sum(ts0) / (num_iters) * 1000 if ts0 else float("inf")
     avg1 = sum(ts1) / (num_iters) * 1000 if ts1 else float("inf")
@@ -535,14 +550,13 @@ class BestConfigTrace:
 
 
 class BenchmarkWorker:
-
     def __init__(self, seed: int, server_args: ServerArgs) -> None:
-        torch.set_default_device("cuda")
-        torch.cuda.manual_seed_all(0)
+        torch.set_default_device(get_device())
+        device_module.manual_seed_all(0)
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
-        self.device_id = 0  # int(ray.get_gpu_ids()[0])
+        self.device_id = 0 if not ray.is_initialized() else int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
@@ -562,10 +576,15 @@ class BenchmarkWorker:
         topk_ids_dir: str,
         ep_size: int = 1,
         enable_up_tma: bool = False,
+        is_gated: bool = True,
     ) -> Tuple[Dict[str, int], float]:
-        torch.cuda.manual_seed_all(0)
+        device_module.manual_seed_all(0)
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
-        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+        with (
+            device_module.device(self.device_id)
+            if _is_xpu or _is_hip
+            else nullcontext()
+        ):
             if enable_up_tma:
                 # Two-step: first measure down to determine c_sorted,
                 # then measure up with the correct c_sorted.
@@ -584,6 +603,7 @@ class BenchmarkWorker:
                     topk_ids_list,
                     block_shape,
                     ep_size=ep_size,
+                    is_gated=is_gated,
                     enable_up_tma=True,
                     tune_round="down",
                 )
@@ -603,6 +623,7 @@ class BenchmarkWorker:
                     topk_ids_list,
                     block_shape,
                     ep_size=ep_size,
+                    is_gated=is_gated,
                     enable_up_tma=True,
                     tune_round="up",
                     down_use_tma_map={cfg["BLOCK_SIZE_M"]: down_use_tma},
@@ -624,6 +645,7 @@ class BenchmarkWorker:
                     topk_ids_list,
                     block_shape,
                     ep_size=ep_size,
+                    is_gated=is_gated,
                     enable_up_tma=False,
                     tune_round="both",
                 )
@@ -646,6 +668,7 @@ class BenchmarkWorker:
         topk_ids_dir: str,
         ep_size: int = 1,
         enable_up_tma: bool = False,
+        is_gated: bool = True,
     ) -> Dict[str, int]:
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
 
@@ -655,7 +678,11 @@ class BenchmarkWorker:
             trace0 = BestConfigTrace("kernel0", down_moe=False, enable_up_tma=False)
             trace1 = BestConfigTrace("kernel1", down_moe=True)
 
-            with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            with (
+                device_module.device(self.device_id)
+                if _is_xpu or _is_hip
+                else nullcontext()
+            ):
                 for config in tqdm(search_space):
                     try:
                         kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma = benchmark_config(
@@ -673,6 +700,7 @@ class BenchmarkWorker:
                             topk_ids_list,
                             block_shape,
                             ep_size=ep_size,
+                            is_gated=is_gated,
                             num_iters=100,
                             enable_up_tma=False,
                             tune_round="both",
@@ -694,7 +722,11 @@ class BenchmarkWorker:
             trace1 = BestConfigTrace("kernel1", down_moe=True)
 
             # === Round 1: Down-only ===
-            with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            with (
+                device_module.device(self.device_id)
+                if _is_xpu or _is_hip
+                else nullcontext()
+            ):
                 for config in tqdm(search_space, desc="Round 1 (down)"):
                     try:
                         _, _, kt1_no_tma, kt1_tma = benchmark_config(
@@ -712,6 +744,7 @@ class BenchmarkWorker:
                             topk_ids_list,
                             block_shape,
                             ep_size=ep_size,
+                            is_gated=is_gated,
                             num_iters=100,
                             enable_up_tma=True,
                             tune_round="down",
@@ -729,12 +762,15 @@ class BenchmarkWorker:
                 down_use_tma_map[block_m] = time_cost_all[2] > time_cost_all[3]
 
             print(
-                f"Round 1 done. Down TMA decisions per BLOCK_SIZE_M: "
-                f"{down_use_tma_map}"
+                f"Round 1 done. Down TMA decisions per BLOCK_SIZE_M: {down_use_tma_map}"
             )
 
             # === Round 2: Up with c_sorted from round 1 ===
-            with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            with (
+                device_module.device(self.device_id)
+                if _is_xpu or _is_hip
+                else nullcontext()
+            ):
                 for config in tqdm(search_space, desc="Round 2 (up)"):
                     try:
                         kt0_no_tma, kt0_tma, _, _ = benchmark_config(
@@ -752,6 +788,7 @@ class BenchmarkWorker:
                             topk_ids_list,
                             block_shape,
                             ep_size=ep_size,
+                            is_gated=is_gated,
                             num_iters=100,
                             enable_up_tma=True,
                             tune_round="up",
@@ -796,6 +833,7 @@ class BenchmarkWorker:
         cmp_config_files: List[str],
         topk_ids_dir: str,
         ep_size: int = 1,
+        is_gated: bool = True,
     ):
         # compare performance of different configs
         cmp_configs = []
@@ -806,8 +844,12 @@ class BenchmarkWorker:
             print(f"config {i}: {file}")
 
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
-        torch.cuda.manual_seed_all(0)
-        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+        device_module.manual_seed_all(0)
+        with (
+            device_module.device(self.device_id)
+            if _is_xpu or _is_hip
+            else nullcontext()
+        ):
             for bs in num_tokens:
                 kernel_times = []
                 cfgs = []
@@ -831,6 +873,7 @@ class BenchmarkWorker:
                         topk_ids_list,
                         block_shape,
                         ep_size=ep_size,
+                        is_gated=is_gated,
                     )
                     kernel_times.append(kernel_time)
                 print(f"batch_size={bs=}:")
@@ -851,6 +894,7 @@ def save_configs_sep(
     use_int4_w4a16: bool,
     block_shape: List[int],
     down_moe: bool = False,
+    is_gated: bool = True,
 ) -> None:
     dtype_str = get_config_dtype_str(
         dtype,
@@ -864,7 +908,7 @@ def save_configs_sep(
     # is the intermediate size after silu_and_mul.
     filename = get_config_file_name(
         num_experts,
-        shard_intermediate_size // 2,
+        shard_intermediate_size // 2 if is_gated else shard_intermediate_size,
         dtype_str,
         block_shape,
         down_moe=down_moe,
@@ -895,6 +939,7 @@ def main(args: argparse.Namespace):
     topk = model_config["topk"]
     hidden_size = model_config["hidden_size"]
     shard_intermediate_size = model_config["shard_intermediate_size"]
+    is_gated = model_config["is_gated"]
     dtype = model_config["dtype"]
     block_shape = model_config["block_shape"]
 
@@ -927,6 +972,7 @@ def main(args: argparse.Namespace):
             args.cmp_configs,
             topk_ids_dir,
             args.ep_size,
+            is_gated=is_gated,
         )
         return
 
@@ -950,6 +996,7 @@ def main(args: argparse.Namespace):
                 topk_ids_dir,
                 args.ep_size,
                 enable_up_tma=args.enable_tune_up_tma,
+                is_gated=is_gated,
             )
         else:
             cfg = {
@@ -977,6 +1024,7 @@ def main(args: argparse.Namespace):
                 topk_ids_dir,
                 args.ep_size,
                 enable_up_tma=args.enable_tune_up_tma,
+                is_gated=is_gated,
             )
             print(f"{t0=}, {t0_tma=}, {t1=}, {t1_tma=}")
         return
@@ -1019,6 +1067,7 @@ def main(args: argparse.Namespace):
         use_int4_w4a16,
         False,
         block_shape,
+        is_gated=is_gated,
     )
     print(
         f"Start tuning over {len(search_space)} configurations to create {filename}..."
@@ -1044,6 +1093,7 @@ def main(args: argparse.Namespace):
                 topk_ids_dir,
                 args.ep_size,
                 args.enable_tune_up_tma,
+                is_gated,
             )
             for batch_size in batch_sizes
         ],
@@ -1070,6 +1120,7 @@ def main(args: argparse.Namespace):
         use_int8_w8a16,
         use_int4_w4a16,
         block_shape,
+        is_gated=is_gated,
     )
 
     best_configs1 = {M: sort_config(config) for M, config in zip(batch_sizes, configs1)}
@@ -1086,6 +1137,7 @@ def main(args: argparse.Namespace):
         use_int4_w4a16,
         block_shape,
         down_moe=True,
+        is_gated=is_gated,
     )
     end = time.perf_counter()
     print(f"Tuning took {end - start:.2f} seconds")
@@ -1101,7 +1153,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int8_w4a16"],
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int4_w4a16"],
         default="auto",
     )
     parser.add_argument("--seed", type=int, default=0)

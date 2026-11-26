@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=800, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1200, stage="nightly", runner_config="4-gpu-b200")
 
 
 class FlashinferNvFp4OnlineMoeBackendBase:
@@ -66,25 +66,20 @@ class FlashinferNvFp4OnlineMoeBackendBase:
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.90)
+        server_info = requests.get(self.base_url + "/server_info").json()
+        internal_state = server_info["internal_states"][0]
+        # Zero means startup fell back to eager prefill instead of capturing.
+        prefill_graph_gb = internal_state["memory_usage"]["graph"]["prefill"]
+        print(f"{prefill_graph_gb=}")
+        self.assertGreater(prefill_graph_gb, 0)
         if self.spec_accept_length_threshold is not None:
-            server_info = requests.get(self.base_url + "/server_info").json()
-            avg_spec_accept_length = server_info["internal_states"][0][
-                "avg_spec_accept_length"
-            ]
+            avg_spec_accept_length = internal_state["avg_spec_accept_length"]
             print(f"{avg_spec_accept_length=}")
             self.assertGreater(
                 avg_spec_accept_length, self.spec_accept_length_threshold
             )
 
 
-# Only this class is affected, but the file runs with failfast, so leaving it
-# enabled also cuts off the class that sorts after it.
-@unittest.skip(
-    "flashinfer-ai/flashinfer#4486: on SM100/SM103 the TRTLLM_GEN tile-192 BMM "
-    "path returns non-finite MoE output from FlashInfer 0.6.16.post4 on, so the "
-    "first real prefill trips the sampler NaN assert and gsm8k scores 0.0. "
-    "See #34629 for the package bisect."
-)
 class TestFlashinferTrtllmGenMoeBackendNvFp4Online(
     FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
 ):
@@ -109,6 +104,9 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
     backend = "flashinfer_cutedsl"
     model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
     extra_args = [
+        # Nemotron-H prefill CUDA graphs are opt-in on SM100.
+        "--cuda-graph-backend-prefill",
+        "breakable",
         "--reasoning-parser",
         "nemotron_3",
         "--tool-call-parser",
@@ -129,6 +127,79 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
         "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+        "SGLANG_FLASHINFER_AUTOTUNE_EXTEND": "1",
+    }
+
+
+class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
+    FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
+):
+    backend = "flashinfer_cutedsl"
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
+    extra_args = [
+        # Nemotron-H prefill CUDA graphs are opt-in on SM100.
+        "--cuda-graph-backend-prefill",
+        "breakable",
+        "--reasoning-parser",
+        "nemotron_3",
+        "--tool-call-parser",
+        "qwen3_coder",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--attn-dp-size",
+        "4",
+        "--enable-dp-lm-head",
+        "--moe-a2a-backend",
+        "flashinfer_nvlink_one_sided",
+    ]
+    eval_args = {"max_tokens": 16000, "temperature": 1.0, "top_p": 0.95}
+    spec_accept_length_threshold = 2.5
+    extra_env = {
+        "FLASHINFER_NVFP4_4OVER6": "1",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+        "SGLANG_FLASHINFER_AUTOTUNE_EXTEND": "1",
+        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
+        "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE": "1",
+        "SGLANG_MOE_NVFP4_DISPATCH": "0",
+        "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096",
+    }
+
+
+class TestFlashinferMegaMoeBackendNvFp4OnlineW4A16(
+    FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
+):
+    backend = "flashinfer_megamoe"
+    # Use Qwen's gated activation; Nemotron's ReLU-squared is unsupported.
+    model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+    extra_args = [
+        "--dtype",
+        "bfloat16",
+        "--attn-dp-size",
+        "4",
+        "--enable-dp-lm-head",
+        "--moe-a2a-backend",
+        "flashinfer_megamoe",
+    ]
+    eval_args = {"api": "completion", "max_tokens": 512}
+    extra_env = {
+        "FLASHINFER_NVFP4_4OVER6": "1",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
+        "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE": "0",
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
+        # Convert every routed expert: MegaMoE cannot run excluded FP8 experts.
+        "SGLANG_FP4_IGNORED_LAYERS": "",
     }
 
 

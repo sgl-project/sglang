@@ -254,7 +254,7 @@ def print_breakdown(title: str, results: dict[str, dict[str, float]]) -> None:
 
 
 def microbench_torch_tensor_paths(
-    sizes: tuple[int, ...] = (1_000, 10_000, 100_000)
+    sizes: tuple[int, ...] = (1_000, 10_000, 100_000),
 ) -> None:
     """Compare three CPU-buffer -> pinned cuda tensor paths.
 
@@ -293,9 +293,11 @@ def microbench_torch_tensor_paths(
         ),
         (
             "(C) from_numpy(frombuf(array('q'))).pin() -> cuda",
-            lambda x: torch.from_numpy(np.frombuffer(x, dtype=np.int64))
-            .pin_memory()
-            .to("cuda", non_blocking=True),
+            lambda x: (
+                torch.from_numpy(np.frombuffer(x, dtype=np.int64))
+                .pin_memory()
+                .to("cuda", non_blocking=True)
+            ),
         ),
     ]:
         cells = []

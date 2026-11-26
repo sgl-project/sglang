@@ -71,8 +71,8 @@ from sglang.kernels.ops.attention.flash_attn.cute.utils import AuxData
 class FlashAttentionForwardSm120(FlashAttentionForwardBase):
     """SM120 warp-MMA forward kernel with TMA fused into the QK warps."""
 
-    # Experimental same-page paged-KV TMA path. Scratch benchmarks set this on
-    # the kernel instance; qualified dispatch keeps it disabled.
+    # Same-page paged-KV TMA path. Off in this class; the qualified packed decode
+    # kernel, FlashAttentionForwardSm120DecodeTranspose, turns it on.
     paged_tma = False
 
     def __init__(
@@ -1090,9 +1090,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
     ):
         assert blocksparse_tensors is None, "Block sparsity is not supported on SM120"
         assert (mBias is not None) == self.has_bias
-        assert (
-            mPageTable is None or self.paged_kv
-        ), "SM120 paged KV requires the dedicated DMA-warp specialization"
+        assert mPageTable is None or self.paged_kv, (
+            "SM120 paged KV requires the dedicated DMA-warp specialization"
+        )
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -1251,7 +1251,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         TileScheduler = (
             Sm120UniformBatchScheduler
             if is_varlen and self.direct_uniform_batch
-            else SingleTileVarlenScheduler if is_varlen else SingleTileScheduler
+            else SingleTileVarlenScheduler
+            if is_varlen
+            else SingleTileScheduler
         )
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),

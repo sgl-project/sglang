@@ -37,5 +37,8 @@ class AttnForwardMethod(IntEnum):
     # Use one-shot multi-head attention for ROCm
     MHA_ONE_SHOT_ROCM = auto()
 
+    # Use multi-head attention with chunked kv cache for ROCm
+    MHA_CHUNKED_KV_ROCM = auto()
+
     # Use absorbed multi-latent attention for ROCm
     MLA_ROCM = auto()

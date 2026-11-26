@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
+)
+from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
+    gather_pool_states,
+    scatter_pool_states,
 )
 from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
@@ -30,6 +34,43 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_FLASHINFER_GDN_ALIGNMENT = 32
+
+
+def copy_verify_intermediate_rows(
+    destination: torch.Tensor,
+    positional_source: torch.Tensor,
+    dst_indices_raw: torch.Tensor,
+) -> None:
+    """Move FlashInfer's positional verify snapshots to their owned rows."""
+    count = dst_indices_raw.shape[0]
+    destination.index_copy_(
+        0,
+        dst_indices_raw.to(device=destination.device, dtype=torch.long),
+        positional_source[:count],
+    )
+
+
+def _empty_aligned_like(
+    tensor: torch.Tensor, alignment: int = _FLASHINFER_GDN_ALIGNMENT
+) -> torch.Tensor:
+    element_size = tensor.dtype.itemsize
+    alignment_elements = max(1, alignment // element_size)
+    storage = torch.empty(
+        tensor.numel() + alignment_elements - 1,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    start_bytes = (-storage.data_ptr()) % alignment
+    if start_bytes % element_size:
+        raise RuntimeError(
+            f"Cannot align {tensor.dtype} storage at {storage.data_ptr()} "
+            f"to {alignment} bytes"
+        )
+    start = start_bytes // element_size
+    return storage[start : start + tensor.numel()].view(tensor.shape)
+
+
 # ---------------------------------------------------------------------------
 # Lazy import for FlashInfer GDN kernels
 # ---------------------------------------------------------------------------
@@ -40,10 +81,31 @@ _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
 
 
+def _host_track_lens(
+    forward_batch: ForwardBatch, use_host_metadata: bool
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extend lengths, track mask and tracked lengths past the prefix, on the host;
+    read back from the device only when the batch carries no host copy."""
+    if use_host_metadata:
+        return (
+            torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int64),
+            torch.tensor(forward_batch.mamba_prefill_track_mask_cpu, dtype=torch.bool),
+            torch.tensor(forward_batch.mamba_track_seqlens_cpu, dtype=torch.int64)
+            - torch.tensor(forward_batch.extend_prefix_lens_cpu, dtype=torch.int64),
+        )
+    return (
+        forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64),
+        forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool),
+        forward_batch.mamba_track_seqlens.to(device="cpu", dtype=torch.int64)
+        - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64),
+    )
+
+
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
     forward_metadata: ForwardMetadata,
     device: str,
+    use_host_metadata: bool,
 ) -> None:
     """Populate packed FlashInfer checkpoint metadata when tracking requires it."""
     if (
@@ -53,11 +115,9 @@ def maybe_build_flashinfer_checkpoint_plan(
         return
 
     checkpoint_every_n_tokens = mamba_cache_chunk_size()
-    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
-    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
-    relative_track_lens = forward_batch.mamba_track_seqlens.to(
-        device="cpu", dtype=torch.int64
-    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+    extend_seq_lens, track_mask, relative_track_lens = _host_track_lens(
+        forward_batch, use_host_metadata=use_host_metadata
+    )
 
     checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
@@ -86,7 +146,12 @@ def _get_flashinfer_gdn_kernels():
 
     Returns (available, prefill_fn, mtp_fn, decode_fn, mtp_bf16_fn).
     """
-    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_mtp_bf16
+    global \
+        _flashinfer_gdn_available, \
+        _flashinfer_chunk_gated_delta_rule, \
+        _flashinfer_gated_delta_rule_mtp, \
+        _flashinfer_gated_delta_rule_decode, \
+        _flashinfer_gated_delta_rule_mtp_bf16
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -122,6 +187,46 @@ def _get_flashinfer_gdn_kernels():
     )
 
 
+# Upper bound on the sequence counts the prewarm runs on the context-parallel
+# kernel; FlashInfer sends only batches of few sequences there.
+_MAX_PREWARM_CP_SEQUENCES = 64
+
+
+def _context_parallel_sequence_counts(num_heads: int, device: torch.device) -> list:
+    """The sequence counts for which FlashInfer's automatic policy
+    (``use_cp="auto"``) runs the context-parallel prefill with ``num_heads``
+    local heads on ``device``; empty when it never does."""
+    try:
+        from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import (
+            should_use_cp_host,
+        )
+        from flashinfer.utils import (
+            get_compute_capability,
+            get_device_name,
+            get_device_sm_count,
+        )
+    except ImportError:
+        should_use_cp_host = None
+    if should_use_cp_host is None:
+        # Every automatic threshold keeps the parallel work below the SM count.
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        return list(
+            range(1, max(1, min(num_sms // num_heads, _MAX_PREWARM_CP_SEQUENCES)) + 1)
+        )
+    capability = get_compute_capability(device)
+    num_sms = get_device_sm_count(device)
+    name = get_device_name(device)
+    counts = [
+        num_seqs
+        for num_seqs in range(1, _MAX_PREWARM_CP_SEQUENCES + 1)
+        if capability[0] in (9, 10, 12)
+        and should_use_cp_host(
+            num_seqs * num_heads, num_sms, name, device_capability=capability
+        )
+    ]
+    return counts
+
+
 def is_flashinfer_gdn_prefill_available() -> bool:
     """Return whether the kernel loader can construct the prefill path."""
     available, prefill_fn, *_ = _get_flashinfer_gdn_kernels()
@@ -143,6 +248,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     """
 
     uses_state_checkpoints = True
+    # extend() gathers each request's state by pool index and scatters the
+    # final state back the same way, so any slot pitch works.
+    extend_honors_slot_pitch = True
 
     def __init__(self):
         (
@@ -167,6 +275,19 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # states; SM100 accepts the state-pool dtype directly.
         self._prefill_needs_fp32_state = sm_major >= 12
         self.supports_target_verify = sm_major in (9, 10)
+        self._aligned_input_buffers: dict[tuple, torch.Tensor] = {}
+        self._aligned_parameter_cache: dict[
+            tuple, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._verify_intermediate_buffers: dict[tuple, torch.Tensor] = {}
+        self._alignment_fallback_warned = False
+        # FlashInfer writes through mutable state/workspace pointers, so misaligned
+        # inputs must fall back to Triton rather than use temporary copies.
+        from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
+            TritonGDNKernel,
+        )
+
+        self._alignment_fallback_kernel = TritonGDNKernel()
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
@@ -209,6 +330,124 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         logger.info("Using FlashInfer GDN kernels")
 
+    def _prepare_dynamic_input(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        # Reuse per-stream aligned scratch for uncommon read-only views; stable
+        # addresses avoid allocator churn and remain safe for CUDA graph capture.
+        if tensor.data_ptr() % _FLASHINFER_GDN_ALIGNMENT == 0:
+            return tensor
+
+        stream_key = (
+            torch.cuda.current_stream(tensor.device).cuda_stream
+            if tensor.device.type == "cuda"
+            else None
+        )
+        key = (
+            name,
+            tensor.device,
+            tensor.dtype,
+            tuple(tensor.shape),
+            stream_key,
+        )
+        aligned = self._aligned_input_buffers.get(key)
+        if aligned is None:
+            aligned = _empty_aligned_like(tensor)
+            self._aligned_input_buffers[key] = aligned
+        aligned.copy_(tensor)
+        return aligned
+
+    def _prepare_parameter(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        key = (
+            name,
+            id(tensor),
+            dtype,
+        )
+        cached_entry = self._aligned_parameter_cache.get(key)
+        if cached_entry is not None and cached_entry[0] is tensor:
+            return cached_entry[1]
+
+        prepared = tensor.detach().reshape(-1)
+        if dtype is not None:
+            prepared = prepared.to(dtype=dtype, copy=False)
+        if (
+            not prepared.is_contiguous()
+            or prepared.data_ptr() % _FLASHINFER_GDN_ALIGNMENT
+        ):
+            aligned = _empty_aligned_like(prepared)
+            aligned.copy_(prepared)
+            prepared = aligned
+        # Retaining the source also prevents a recycled Python id from
+        # colliding with an older cache entry.
+        self._aligned_parameter_cache[key] = (tensor, prepared)
+        return prepared
+
+    def _prepare_gate_parameters(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        *,
+        A_log_dtype: Optional[torch.dtype] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self._prepare_parameter("A_log", A_log, dtype=A_log_dtype),
+            self._prepare_parameter("dt_bias", dt_bias),
+        )
+
+    def _mutable_inputs_are_aligned(
+        self, *named_tensors: tuple[str, Optional[torch.Tensor]]
+    ) -> bool:
+        for name, tensor in named_tensors:
+            if tensor is None or tensor.data_ptr() % _FLASHINFER_GDN_ALIGNMENT == 0:
+                continue
+            if not self._alignment_fallback_warned:
+                logger.warning(
+                    "FlashInfer GDN mutable buffer %r has data_ptr %d "
+                    "(mod 32 = %d); falling back to Triton for this call.",
+                    name,
+                    tensor.data_ptr(),
+                    tensor.data_ptr() % _FLASHINFER_GDN_ALIGNMENT,
+                )
+                self._alignment_fallback_warned = True
+            return False
+        return True
+
+    def _prepare_verify_intermediate_buffer(
+        self,
+        intermediate_states_buffer: torch.Tensor,
+        batch_size: int,
+        force_scratch: bool = False,
+    ) -> tuple[torch.Tensor, bool]:
+        # FlashInfer requires exact capture B, which may exceed the pool-scoped
+        # buffer; padded tiers use stable scratch and copy owned rows back.
+        if not force_scratch:
+            direct = intermediate_states_buffer[:batch_size]
+            if direct.shape[0] == batch_size:
+                return direct, False
+
+        stream_key = (
+            torch.cuda.current_stream(intermediate_states_buffer.device).cuda_stream
+            if intermediate_states_buffer.device.type == "cuda"
+            else None
+        )
+        shape = (batch_size, *intermediate_states_buffer.shape[1:])
+        key = (
+            intermediate_states_buffer.device,
+            intermediate_states_buffer.dtype,
+            shape,
+            stream_key,
+        )
+        scratch = self._verify_intermediate_buffers.get(key)
+        if scratch is None:
+            template = intermediate_states_buffer.new_empty(shape)
+            scratch = _empty_aligned_like(template)
+            self._verify_intermediate_buffers[key] = scratch
+        return scratch, True
+
     # ---- decode ----
 
     def decode(
@@ -226,6 +465,21 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        if not self._mutable_inputs_are_aligned(("ssm_states", ssm_states)):
+            return self._alignment_fallback_kernel.decode(
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                **kwargs,
+            )
+
         batch_size = cache_indices.shape[0]
         num_heads = q.shape[2]
         head_k_dim = q.shape[3]
@@ -237,39 +491,57 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         value_fi = v.view(batch_size, 1, num_v_heads, head_v_dim)
         a_fi = a.view(batch_size, 1, num_v_heads)
         b_fi = b.view(batch_size, 1, num_v_heads)
+        query_fi = self._prepare_dynamic_input("decode_q", query_fi)
+        key_fi = self._prepare_dynamic_input("decode_k", key_fi)
+        value_fi = self._prepare_dynamic_input("decode_v", value_fi)
+        a_fi = self._prepare_dynamic_input("decode_a", a_fi)
+        b_fi = self._prepare_dynamic_input("decode_b", b_fi)
+        A_log_fi, dt_bias_fi = self._prepare_gate_parameters(
+            A_log,
+            dt_bias,
+            # Preserve the original backend contract: the SM100 state-pool
+            # kernel consumes float32 A_log, while SM90 uses the source dtype.
+            A_log_dtype=torch.float32 if self.use_state_pool else None,
+        )
 
         if self.use_state_pool:
+            cache_indices_fi = self._prepare_dynamic_input(
+                "decode_cache_indices", cache_indices
+            )
             output_fi, _ = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
                 v=value_fi,
                 state=None,
-                A_log=A_log.detach().float(),
+                A_log=A_log_fi,
                 a=a_fi,
-                dt_bias=dt_bias.detach(),
+                dt_bias=dt_bias_fi,
                 b=b_fi,
                 use_qk_l2norm=True,
                 initial_state=ssm_states,
-                initial_state_indices=cache_indices,
+                initial_state_indices=cache_indices_fi,
             )
         else:
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
             # will no longer be needed here.
-            state_batch = ssm_states[cache_indices]
+            state_indices, live_rows, state_batch = gather_pool_states(
+                ssm_states, cache_indices
+            )
             output_fi, new_state = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
                 v=value_fi,
                 state=state_batch,
-                A_log=A_log.detach(),
+                A_log=A_log_fi,
                 a=a_fi,
-                dt_bias=dt_bias.detach(),
+                dt_bias=dt_bias_fi,
                 b=b_fi,
                 scale=None,
                 output=None,
                 use_qk_l2norm=True,
             )
-            ssm_states[cache_indices] = new_state
+            scatter_pool_states(ssm_states, state_indices, live_rows, new_state)
+            output_fi = torch.where(live_rows, output_fi, 0)
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
@@ -291,44 +563,53 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         state_checkpoint_every_n_tokens: int = 0,
         **kwargs,
     ) -> tuple:
-        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+        from sglang.kernels.ops.attention.fla.l2norm import (
+            gdn_prefill_qkv_prepare_fwd,
+        )
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        q_fi = l2norm_fwd(q[0].contiguous())
-        k_fi = l2norm_fwd(k[0].contiguous())
-        v_fi = v[0].contiguous()
+        q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(q[0], k[0], v[0])
+
+        output = kwargs.get("output")
+        output_fi = None
+        if output is not None:
+            expected_output_shape = (
+                1,
+                total_seq_len,
+                num_v_heads,
+                head_v_dim,
+            )
+            if tuple(output.shape) != expected_output_shape:
+                raise ValueError(
+                    "FlashInfer GDN prefill output shape mismatch: "
+                    f"expected {expected_output_shape}, got {tuple(output.shape)}"
+                )
+            if output.dtype != v.dtype or output.device != v.device:
+                raise ValueError(
+                    "FlashInfer GDN prefill output must match v dtype/device, "
+                    f"got output=({output.dtype}, {output.device}) and "
+                    f"v=({v.dtype}, {v.device})"
+                )
+            output_fi = output[0]
+            if not output_fi.is_contiguous():
+                raise ValueError("FlashInfer GDN prefill output must be contiguous")
 
         # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
-        if self.use_state_pool:
-            # Negative indices (e.g. -1) are padding markers for slots not yet
-            # assigned to a real sequence; clamp them to 0 (the reserved dummy
-            # slot) so the FlashInfer kernel never reads out-of-bounds state.
-            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
-            initial_state_fi = (
-                ssm_states[ssm_cache_indices].to(torch.float32)
-                if self._prefill_needs_fp32_state
-                else ssm_states[ssm_cache_indices].contiguous()
-            )
-            cu_seqlens = query_start_loc.to(torch.int64)  # kernel requires int64
-        else:
-            # SM90: preserve original negative-index handling (remap to last slot).
-            ssm_cache_indices = torch.where(
-                cache_indices >= 0,
-                cache_indices,
-                ssm_states.shape[0] - 1,
-            ).to(torch.int64)
-            # State must be float32; kernel requires int64 cu_seqlens.
-            initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
-            cu_seqlens = query_start_loc.to(torch.int64)
+        ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
+            ssm_states, cache_indices
+        )
+        initial_state_fi = initial_state_fi.to(
+            self._prefill_state_dtype(initial_state_fi.dtype)
+        )
+        cu_seqlens = query_start_loc.to(torch.int64)
 
         # Keep final state and checkpoints in the same kernel state dtype.
-        output_state_fi = torch.empty_like(initial_state_fi)
         state_checkpoints = (
             initial_state_fi.new_empty(
                 (num_state_checkpoints, *initial_state_fi.shape[1:])
@@ -336,29 +617,22 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if num_state_checkpoints > 0
             else None
         )
-        output_fi, output_state_fi = self._prefill_fn(
+        output_fi, output_state_fi = self._run_prefill(
             q=q_fi,
             k=k_fi,
             v=v_fi,
-            g=alpha_fi,
+            alpha=alpha_fi,
             beta=beta_fi,
-            scale=None,
             initial_state=initial_state_fi,
-            output_final_state=True,
             cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
-            output_state=output_state_fi,
+            output=output_fi,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
         )
 
         # Write back state to pool
-        ssm_states.index_copy_(
-            0,
-            ssm_cache_indices,
-            output_state_fi.to(ssm_states.dtype),
-        )
+        scatter_pool_states(ssm_states, ssm_cache_indices, live_rows, output_state_fi)
 
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
@@ -366,6 +640,163 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
         h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
         return core_attn_out, None, h
+
+    def _prefill_state_dtype(self, pool_state_dtype: torch.dtype) -> torch.dtype:
+        if not self.use_state_pool or self._prefill_needs_fp32_state:
+            return torch.float32
+        return pool_state_dtype
+
+    def _run_prefill(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        output: Optional[torch.Tensor],
+        state_checkpoints: Optional[torch.Tensor],
+        checkpoint_cu_starts: Optional[torch.Tensor],
+        checkpoint_every_n_tokens: int,
+        use_cp: str | bool = "auto",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._prefill_fn(
+            q=q,
+            k=k,
+            v=v,
+            g=alpha,
+            beta=beta,
+            scale=None,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            output=output,
+            output_state=torch.empty_like(initial_state),
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            use_cp=use_cp,
+        )
+
+    def prewarm_extend(
+        self,
+        *,
+        num_qk_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        io_dtype: torch.dtype,
+        pool_state_dtype: torch.dtype,
+        checkpoint_every_n_tokens: int,
+        device: torch.device,
+    ) -> int:
+        """Run extend()'s prefill once per kernel variant, outside graph capture,
+        so that no serving batch waits on FlashInfer's lazy per-process compile.
+
+        Per batch, FlashInfer runs a context-parallel or a native kernel, each
+        compiled with and without state checkpoints; the checkpoint variants
+        run only when ``checkpoint_every_n_tokens > 0``. The context-parallel
+        kernel also specializes its final-state fixup on the number of states
+        it reduces (sequences times heads), so it runs once per sequence count
+        that FlashInfer's automatic policy sends to it, and is skipped, with a
+        warning, for a checkpoint mode FlashInfer cannot run it in. Returns how
+        many prefills ran.
+        """
+        assert not torch.cuda.is_current_stream_capturing()
+        seq_len = max(checkpoint_every_n_tokens, 64)
+        state_dtype = self._prefill_state_dtype(pool_state_dtype)
+
+        def batch(num_seqs: int):
+            total = num_seqs * seq_len
+            q = torch.zeros(
+                (total, num_qk_heads, head_k_dim), dtype=io_dtype, device=device
+            )
+            v = torch.zeros(
+                (total, num_v_heads, head_v_dim), dtype=io_dtype, device=device
+            )
+            alpha = torch.ones((total, num_v_heads), dtype=torch.float32, device=device)
+            # extend() hands the kernel a gathered, contiguous state per sequence.
+            initial_state = torch.zeros(
+                (num_seqs, num_v_heads, head_v_dim, head_k_dim),
+                dtype=state_dtype,
+                device=device,
+            )
+            inputs = dict(
+                q=q,
+                k=torch.zeros_like(q),
+                v=v,
+                alpha=alpha,
+                beta=torch.zeros_like(alpha),
+                initial_state=initial_state,
+                cu_seqlens=torch.arange(
+                    0, total + 1, seq_len, dtype=torch.int64, device=device
+                ),
+                output=None,
+            )
+            modes = {0: dict(state_checkpoints=None, checkpoint_cu_starts=None)}
+            if checkpoint_every_n_tokens > 0:
+                per_seq = seq_len // checkpoint_every_n_tokens
+                modes[checkpoint_every_n_tokens] = dict(
+                    state_checkpoints=initial_state.new_empty(
+                        (num_seqs * per_seq, *initial_state.shape[1:])
+                    ),
+                    checkpoint_cu_starts=torch.arange(
+                        0,
+                        num_seqs * per_seq + 1,
+                        per_seq,
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                )
+            return inputs, modes
+
+        num_runs = 0
+        # The native kernel's compile key does not depend on the sequence count.
+        # Serving needs it; a failure here is a real one and propagates.
+        inputs, modes = batch(1)
+        for every_n_tokens, checkpoints in modes.items():
+            self._run_prefill(
+                **inputs,
+                **checkpoints,
+                checkpoint_every_n_tokens=every_n_tokens,
+                use_cp=False,
+            )
+            num_runs += 1
+
+        # The context-parallel kernel is optional: when FlashInfer cannot run it
+        # for these inputs, a forced call raises ValueError while serving's
+        # "auto" warns and falls back to the native kernel warmed above.
+        rejected = set()
+        for num_seqs in _context_parallel_sequence_counts(
+            max(num_qk_heads, num_v_heads), device
+        ):
+            inputs, modes = batch(num_seqs)
+            for every_n_tokens, checkpoints in modes.items():
+                if every_n_tokens in rejected:
+                    continue
+                try:
+                    self._run_prefill(
+                        **inputs,
+                        **checkpoints,
+                        checkpoint_every_n_tokens=every_n_tokens,
+                        use_cp=True,
+                    )
+                except ValueError as e:
+                    rejected.add(every_n_tokens)
+                    logger.warning(
+                        "Skipping the FlashInfer GDN context-parallel prefill "
+                        "prewarm (checkpoint_every_n_tokens=%d): %s; serving "
+                        "falls back to the native prefill.",
+                        every_n_tokens,
+                        e,
+                    )
+                    continue
+                num_runs += 1
+        torch.cuda.current_stream(device).synchronize()
+        return num_runs
 
     # ---- target_verify (MTP) ----
 
@@ -386,6 +817,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        stable_rows: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         # MTP verify using FlashInfer gated_delta_rule_mtp kernel (SM90 + SM100+).
@@ -404,34 +836,80 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        query_mtp = q.view(batch_size, draft_token_num, num_heads, head_k_dim)
-        key_mtp = k.view(batch_size, draft_token_num, num_heads, head_k_dim)
-        value_mtp = v.view(batch_size, draft_token_num, num_v_heads, head_v_dim)
-
         if a is None or b is None or A_log is None or dt_bias is None:
             raise RuntimeError(
                 "FlashInfer GDN MTP kernel requires a, b, A_log, dt_bias."
             )
 
-        a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
-        b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
-
         intermediate_states_buffer_mtp = intermediate_states_buffer
-        if self.use_state_pool and intermediate_states_buffer is not None:
-            # The SM100 bf16 MTP kernel indexes this scratch buffer by the
-            # per-call batch id, while SGLang's speculative state cache is
-            # pool-scoped and may include an extra dummy slot.
-            intermediate_states_buffer_mtp = intermediate_states_buffer[:batch_size]
+        copy_verify_intermediate_back = False
+        if intermediate_states_buffer is not None and (
+            self.use_state_pool or stable_rows
+        ):
+            # FlashInfer writes positional rows; isolate them in exact-B scratch.
+            (
+                intermediate_states_buffer_mtp,
+                copy_verify_intermediate_back,
+            ) = self._prepare_verify_intermediate_buffer(
+                intermediate_states_buffer,
+                batch_size,
+                force_scratch=stable_rows,
+            )
+        if not self._mutable_inputs_are_aligned(
+            ("ssm_states", ssm_states),
+            ("intermediate_states_buffer", intermediate_states_buffer_mtp),
+        ):
+            return self._alignment_fallback_kernel.target_verify(
+                A_log=A_log,
+                dt_bias=dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=intermediate_states_buffer,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=cache_steps,
+                retrieve_parent_token=retrieve_parent_token,
+                **kwargs,
+            )
+
+        query_mtp = self._prepare_dynamic_input(
+            "verify_q",
+            q.view(batch_size, draft_token_num, num_heads, head_k_dim),
+        )
+        key_mtp = self._prepare_dynamic_input(
+            "verify_k",
+            k.view(batch_size, draft_token_num, num_heads, head_k_dim),
+        )
+        value_mtp = self._prepare_dynamic_input(
+            "verify_v",
+            v.view(batch_size, draft_token_num, num_v_heads, head_v_dim),
+        )
+
+        a_mtp = self._prepare_dynamic_input(
+            "verify_a", a.view(batch_size, draft_token_num, num_v_heads)
+        )
+        b_mtp = self._prepare_dynamic_input(
+            "verify_b", b.view(batch_size, draft_token_num, num_v_heads)
+        )
+        A_log_fi, dt_bias_fi = self._prepare_gate_parameters(A_log, dt_bias)
+        cache_indices_fi = self._prepare_dynamic_input(
+            "verify_cache_indices", cache_indices
+        )
 
         output_fi, _ = self._mtp_fn(
             q=query_mtp,
             k=key_mtp,
             v=value_mtp,
             initial_state=ssm_states,
-            initial_state_indices=cache_indices,
-            A_log=A_log.detach(),
+            initial_state_indices=cache_indices_fi,
+            A_log=A_log_fi,
             a=a_mtp,
-            dt_bias=dt_bias.detach(),
+            dt_bias=dt_bias_fi,
             b=b_mtp,
             scale=None,
             output=None,
@@ -439,5 +917,17 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             disable_state_update=True,
             use_qk_l2norm=True,
         )
+
+        if stable_rows and intermediate_states_buffer is not None:
+            # Persist positional output under PP-stable request rows.
+            copy_verify_intermediate_rows(
+                intermediate_states_buffer,
+                intermediate_states_buffer_mtp,
+                intermediate_state_indices[:batch_size],
+            )
+        elif copy_verify_intermediate_back:
+            intermediate_states_buffer.copy_(
+                intermediate_states_buffer_mtp[: intermediate_states_buffer.shape[0]]
+            )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)

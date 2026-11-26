@@ -1,6 +1,6 @@
 from typing import List, Union
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.mllama4 import Llama4ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -13,8 +13,6 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        self.vision_config = hf_config.vision_config
-        self.text_config = hf_config.text_config
         self.IM_START_TOKEN_ID = hf_config.boi_token_index
         self.IM_END_TOKEN_ID = hf_config.eoi_token_index
         self.IM_TOKEN_ID = hf_config.image_token_index
@@ -37,7 +35,7 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         )
 
         # Process the prompt and images
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

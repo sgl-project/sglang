@@ -9,10 +9,11 @@ from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, T5Config
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5ArchConfig
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -95,6 +96,13 @@ class HeliosT2VConfig(PipelineConfig):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("memory",),
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
+        )
+
 
 @dataclass
 class HeliosMidConfig(HeliosT2VConfig):
@@ -117,4 +125,42 @@ class HeliosDistilledConfig(HeliosT2VConfig):
     scheduler_type: str = "dmd"
     pyramid_num_inference_steps_list: list[int] = field(
         default_factory=lambda: [10, 10, 10]
+    )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.helios import (
+        HeliosDistilledSamplingParams,
+        HeliosMidSamplingParams,
+        HeliosT2VSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=HeliosT2VSamplingParams,
+        pipeline_config_cls=HeliosT2VConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Base",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "helios" in hf_id.lower()
+                and "mid" not in hf_id.lower()
+                and "distill" not in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=HeliosMidSamplingParams,
+        pipeline_config_cls=HeliosMidConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Mid",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=HeliosDistilledSamplingParams,
+        pipeline_config_cls=HeliosDistilledConfig,
+        hf_model_paths=[
+            "BestWishYsh/Helios-Distilled",
+        ],
     )

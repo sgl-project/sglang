@@ -3,7 +3,7 @@
 Tests MiniMax-M2.5 with TP=8 + EP=8 configuration using few-shot completion
 benchmark on MI325/MI300X.
 
-Registry: nightly-amd-accuracy-8-gpu-minimax-m25 suite
+Registry: nightly-accuracy-test-8-gpu-amd-minimax-m25 suite
 """
 
 import ast
@@ -29,8 +29,9 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-accuracy-8-gpu-minimax-m25",
+    suite="nightly-accuracy-test-8-gpu-amd-minimax-m25",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999
@@ -179,9 +180,9 @@ class TestMiniMaxM25EvalAMD(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

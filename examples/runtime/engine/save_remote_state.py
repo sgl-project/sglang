@@ -23,6 +23,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 from sglang import Engine, ServerArgs
+from sglang.srt.arg_groups.overrides import resolution_result
 
 parser = ArgumentParser()
 ServerArgs.add_cli_args(parser)
@@ -44,7 +45,7 @@ parser.add_argument(
 def main(args):
     engine_args = ServerArgs.from_cli_args(args)
     engine_args.resolve_once()
-    model_path = engine_args.model_path
+    model_path = resolution_result(engine_args, "model_path")
     if not Path(model_path).is_dir():
         raise ValueError("model path must be a local directory")
     # Create LLM instance from arguments

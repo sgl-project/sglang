@@ -27,6 +27,7 @@ class _RecordingVAE:
 
 def _server_args(decode_precision="fp16", disable_autocast=False):
     return SimpleNamespace(
+        component_precisions={},
         pipeline_config=SimpleNamespace(
             vae_decode_precision=decode_precision,
             vae_precision="fp32",

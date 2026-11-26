@@ -15,17 +15,19 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
     GLM_IMAGE_RESOLUTION_ALIGNMENT,
     align_glm_image_resolution,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
@@ -140,6 +142,32 @@ def _validate_glm_image_resolution_alignment(width: int, height: int) -> None:
             "GLM-Image dimensions must be aligned before AR token generation, "
             f"got {width}x{height}"
         )
+
+
+def center_crop_glm_image_output(
+    frames: torch.Tensor,
+    target_width: int | None,
+    target_height: int | None,
+) -> torch.Tensor:
+    """Center-crop decoded GLM-Image pixels back to the requested canvas."""
+    if None in (target_width, target_height):
+        return frames
+
+    decoded_height, decoded_width = frames.shape[-2:]
+    if target_width > decoded_width or target_height > decoded_height:
+        raise ValueError(
+            "Cannot crop GLM-Image output to a canvas larger than the decoded "
+            f"image: requested {target_width}x{target_height}, decoded "
+            f"{decoded_width}x{decoded_height}"
+        )
+    if (target_width, target_height) == (decoded_width, decoded_height):
+        return frames
+
+    left = (decoded_width - target_width) // 2
+    top = (decoded_height - target_height) // 2
+    return frames[
+        ..., top : top + target_height, left : left + target_width
+    ].contiguous()
 
 
 def pooled_image_features_to_tensor(image_features) -> torch.Tensor:
@@ -335,6 +363,23 @@ class GlmImageAR(PipelineStage):
                 e,
             )
             raise
+        except requests.HTTPError as e:
+            # HTTPError alone omits the server's request-validation details.
+            response = e.response
+            if response is not None:
+                logger.error(
+                    "SGLang encoder at %s returned HTTP %s: %s",
+                    server_args.srt_encoder_url,
+                    response.status_code,
+                    response.text[:2000],
+                )
+            else:
+                logger.error(
+                    "SGLang encoder at %s failed with no response: %s",
+                    server_args.srt_encoder_url,
+                    e,
+                )
+            raise
         except requests.RequestException as e:
             logger.error(
                 "SGLang encoder request to %s failed: %s",
@@ -381,13 +426,13 @@ class GlmImageAR(PipelineStage):
 
         Args:
             prompt: The text prompt with shape info (e.g., "description<sop>36 24<eop>")
-            condition_images: Optional list of condition images for i2i
+            image: Optional list of condition images for i2i
 
         Returns:
             Tuple of the D16 prior token IDs, optional source-image token IDs,
             and optional usage statistics returned by an external AR server.
         """
-        device = get_local_torch_device()
+        device = current_platform.get_local_torch_device()
         _validate_glm_image_resolution_alignment(width, height)
 
         is_text_to_image = image is None or len(image) == 0
@@ -489,8 +534,9 @@ class GlmImageAR(PipelineStage):
         height: int,
         width: int,
         server_args: ServerArgs,
+        device: Optional[torch.device] = None,
     ) -> tuple[list[torch.Tensor], list[dict[str, int] | None]]:
-        device = get_local_torch_device()
+        device = device or current_platform.get_local_torch_device()
         _validate_glm_image_resolution_alignment(width, height)
 
         input_ids = []
@@ -550,27 +596,15 @@ class GlmImageAR(PipelineStage):
             usages.append(_extract_srt_usage(item.get("meta_info")))
         return prior_token_ids, usages
 
-    def run_grouped_requests(
+    def generate_and_assign_prior_tokens(
         self,
         batches: list[Req],
         server_args: ServerArgs,
+        device: Optional[torch.device] = None,
     ) -> list[Req]:
-        can_batch_ar = (
-            len(batches) > 1
-            and server_args.srt_encoder_url is not None
-            and all(
-                isinstance(batch.prompt, str) and batch.image_path is None
-                for batch in batches
-            )
-        )
-        if not can_batch_ar:
-            return super().run_grouped_requests(batches, server_args)
-
+        """Generate one AR batch and assign its tokens and usage to each request."""
         height = batches[0].height
         width = batches[0].width
-        if any(batch.height != height or batch.width != width for batch in batches[1:]):
-            return super().run_grouped_requests(batches, server_args)
-
         start_time = time.time()
         output_counts = [_num_outputs_per_prompt(batch) for batch in batches]
         prompts = [
@@ -589,6 +623,7 @@ class GlmImageAR(PipelineStage):
             height=height,
             width=width,
             server_args=server_args,
+            device=device,
         )
         duration = time.time() - start_time
         logger.info(
@@ -614,6 +649,29 @@ class GlmImageAR(PipelineStage):
                 batch.metrics.record_stage(stage_name, duration)
             output_offset += output_count
         return batches
+
+    def run_grouped_requests(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        can_batch_ar = (
+            len(batches) > 1
+            and server_args.srt_encoder_url is not None
+            and all(
+                isinstance(batch.prompt, str) and batch.image_path is None
+                for batch in batches
+            )
+        )
+        if not can_batch_ar:
+            return super().run_grouped_requests(batches, server_args)
+
+        height = batches[0].height
+        width = batches[0].width
+        if any(batch.height != height or batch.width != width for batch in batches[1:]):
+            return super().run_grouped_requests(batches, server_args)
+
+        return self.generate_and_assign_prior_tokens(batches, server_args)
 
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs
@@ -681,17 +739,22 @@ class GlmImageAR(PipelineStage):
         width = batch.width
         if batch.image_path is not None:
             ar_condition_images = [
-                resize_glm_image_to_alignment(load_image(img_path))
+                load_image(img_path)
                 for img_path in image_path_to_list(batch.image_path)
             ]
         else:
             ar_condition_images = None
 
-        device = get_local_torch_device()
+        device = current_platform.get_local_torch_device()
 
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
+
+        if getattr(batch, "requested_width", None) is None:
+            batch.requested_width = width
+        if getattr(batch, "requested_height", None) is None:
+            batch.requested_height = height
 
         requested_width = width
         requested_height = height
@@ -706,6 +769,11 @@ class GlmImageAR(PipelineStage):
                 width,
                 height,
             )
+
+        if ar_condition_images is not None:
+            ar_condition_images = [
+                resize_glm_image_to_alignment(image) for image in ar_condition_images
+            ]
 
         time_start = time.time()
         num_outputs = _num_outputs_per_prompt(batch)
@@ -786,6 +854,34 @@ class GlmImageAR(PipelineStage):
         return batch
 
 
+class GlmImageDecodingStage(DecodingStage):
+    """Decode on the D32 canvas, then restore the user-requested dimensions."""
+
+    @torch.no_grad()
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> OutputBatch:
+        output_batch = super().forward(batch, server_args)
+        if output_batch.output is not None:
+            output_batch.output = center_crop_glm_image_output(
+                output_batch.output,
+                batch.requested_width,
+                batch.requested_height,
+            )
+        if output_batch.trajectory_decoded is not None:
+            output_batch.trajectory_decoded = [
+                center_crop_glm_image_output(
+                    decoded,
+                    batch.requested_width,
+                    batch.requested_height,
+                )
+                for decoded in output_batch.trajectory_decoded
+            ]
+        return output_batch
+
+
 class GlmImageBeforeDenoisingStage(PipelineStage):
     r"""
     Pipeline for text-to-image generation using GLM-Image.
@@ -827,14 +923,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             else 8
         )
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
-
-        self.default_sample_size = (
-            self.transformer.config.sample_size
-            if hasattr(self, "transformer")
-            and self.transformer is not None
-            and hasattr(self.transformer.config, "sample_size")
-            else 128
-        )
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -1005,73 +1093,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
-    def check_inputs(
-        self,
-        prompt,
-        height,
-        width,
-        callback_on_step_end_tensor_inputs,
-        prompt_embeds=None,
-    ):
-        if (
-            height is not None
-            and height % (self.vae_scale_factor * self.transformer.config.patch_size)
-            != 0
-            or width is not None
-            and width % (self.transformer.config.patch_size) != 0
-        ):
-            logger.warning(
-                f"`height` and `width` have to be divisible by {self.vae_scale_factor * 2} but are {height} and {width}. Dimensions will be resized accordingly"
-            )
-
-        if callback_on_step_end_tensor_inputs is not None and not all(
-            k in self._callback_tensor_inputs
-            for k in callback_on_step_end_tensor_inputs
-        ):
-            raise ValueError(
-                f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
-            )
-
-        if prompt is not None and prompt_embeds is not None:
-            raise ValueError(
-                f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
-                " only forward one of the two."
-            )
-        elif prompt is None and prompt_embeds is None:
-            raise ValueError(
-                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
-            )
-        elif prompt is not None and (
-            not isinstance(prompt, str) and not isinstance(prompt, list)
-        ):
-            raise ValueError(
-                f"`prompt` has to be of type `str` or `list` but is {type(prompt)}"
-            )
-
-    @property
-    def guidance_scale(self):
-        return self._guidance_scale
-
-    @property
-    def do_classifier_free_guidance(self):
-        return self._guidance_scale > 1
-
-    @property
-    def num_timesteps(self):
-        return self._num_timesteps
-
-    @property
-    def attention_kwargs(self):
-        return self._attention_kwargs
-
-    @property
-    def current_timestep(self):
-        return self._current_timestep
-
-    @property
-    def interrupt(self):
-        return self._interrupt
-
     @torch.no_grad()
     def forward(
         self,
@@ -1079,7 +1100,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         server_args: ServerArgs,
     ) -> Req:
 
-        guidance_scale = batch.guidance_scale
         prompt = batch.prompt
         num_inference_steps = batch.num_inference_steps
         if batch.image_path is not None:
@@ -1093,7 +1113,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         height = batch.height
         width = batch.width
 
-        device = get_local_torch_device()
+        device = current_platform.get_local_torch_device()
         batch_size = _num_outputs_per_prompt(batch)
         max_sequence_length = 1024
         seed = getattr(batch, "seed", None)
@@ -1120,10 +1140,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         prompt_embeds = None
         do_classifier_free_guidance = True
         dtype = get_module_dtype(self.transformer, torch.bfloat16)
-
-        self._guidance_scale = guidance_scale
-        self._current_timestep = None
-        self._interrupt = False
 
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
@@ -1205,11 +1221,12 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     condition_image, self.vae, device=device
                 )
                 condition_image = _repeat_to_batch(condition_image, batch_size)
-                condition_latent = retrieve_latents(
-                    self.vae.encode(condition_image),
-                    generator=generator,
-                    sample_mode="argmax",
-                )
+                with use_gpu_conditioning_hash(enabled=len(ar_condition_images) > 1):
+                    condition_latent = retrieve_latents(
+                        self.vae.encode(condition_image),
+                        generator=generator,
+                        sample_mode="argmax",
+                    )
                 condition_latent = (condition_latent - latents_mean) / latents_std
                 if condition_image_prior_token_id.dim() == 1:
                     condition_image_prior_token_id = (
@@ -1283,7 +1300,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         timesteps, num_inference_steps = retrieve_timesteps(
             scheduler, num_inference_steps, device, timesteps, sigmas, mu=mu
         )
-        self._num_timesteps = len(timesteps)
 
         # 7. Prepare for denoising loop
 

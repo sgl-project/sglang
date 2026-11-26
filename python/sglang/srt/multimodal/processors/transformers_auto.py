@@ -2,16 +2,13 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.multimodal.media_io import load_image
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import load_image
 
 
 def _first_attr(obj, names: tuple[str, ...], default=None):
@@ -101,7 +98,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             return []
         images = []
         for data in image_data:
-            img, _ = load_image(data)
+            img, _ = load_image(data, gpu_image_decode=False)
             if img.mode != "RGB":
                 img = img.convert("RGB")
             images.append(img)
@@ -199,7 +196,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             )
             if base_output is None:
                 return None
-            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
                 base_output, self.mm_tokens
             )
             ret = MultimodalProcessorOutput(

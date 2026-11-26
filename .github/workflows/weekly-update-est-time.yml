@@ -21,7 +21,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Update est_time values
         env:
@@ -74,7 +74,7 @@ jobs:
           } > /tmp/pr_body.md
 
           gh pr create \
-            --title "chore: update CI test est_time values" \
+            --title "[Chore] ci: Update test est_time values" \
             --body-file /tmp/pr_body.md \
             --base main \
             --head "$BRANCH_NAME"

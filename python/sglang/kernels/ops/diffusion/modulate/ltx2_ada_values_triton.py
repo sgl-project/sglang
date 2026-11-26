@@ -20,7 +20,6 @@ def _ltx2_ada_values9_kernel(
     out6_ptr,
     out7_ptr,
     out8_ptr,
-    rows: tl.constexpr,
     hidden: tl.constexpr,
     total_params: tl.constexpr,
     table_stride_p: tl.constexpr,
@@ -139,16 +138,21 @@ def ltx2_ada_values9(
     scale_shift_table: torch.Tensor,
     timestep: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
     if timestep.ndim != 3:
         raise ValueError("timestep must have shape [B, S, 9 * D]")
-    if not timestep.is_cuda or timestep.dtype != torch.bfloat16:
+    if (
+        not current_platform.tensor_on_device(timestep)
+        or timestep.dtype != torch.bfloat16
+    ):
         raise ValueError("timestep must be a CUDA bfloat16 tensor")
     if not timestep.is_contiguous():
         raise ValueError("timestep must be contiguous")
     if scale_shift_table.ndim != 2 or scale_shift_table.shape[0] != 9:
         raise ValueError("scale_shift_table must have shape [9, D]")
     if (
-        not scale_shift_table.is_cuda
+        not current_platform.tensor_on_device(scale_shift_table)
         or scale_shift_table.dtype not in (torch.bfloat16, torch.float32)
         or scale_shift_table.stride(-1) != 1
     ):
@@ -175,7 +179,6 @@ def ltx2_ada_values9(
         timestep,
         scale_shift_table,
         *outs,
-        rows,
         hidden,
         total_params,
         scale_shift_table.stride(0),

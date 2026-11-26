@@ -10,7 +10,7 @@ from packaging.version import Version
 
 from sglang.test.ci.ci_register import register_mlx_ci
 
-register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=1, suite="extra-unit-test-mlx")
 
 
 @unittest.skipUnless(
@@ -32,6 +32,25 @@ assert _KernelType is not None
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
+
+    def test_torch_compile_works_after_sglang_installs_stub(self):
+        script = """
+import sglang
+import torch
+torch.compile(lambda x: x * 2 + 1)(torch.randn(8))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
             check=False,
         )
         self.assertEqual(

@@ -2,7 +2,7 @@
 Benchmark & Correctness: FlashInfer KDA (SM100) vs Triton KDA — decode & MTP verify.
 
 Exercises the two real backend wrappers used by ``KDAKernelDispatcher``:
-  - ``FlashInferKDAKernel`` — wraps ``flashinfer.kda_decode.recurrent_kda``
+  - ``FlashInferKDAKernel`` — wraps ``flashinfer.recurrent_kda``
     (CuTe DSL, SM100/Blackwell only). Provides ``decode`` + ``target_verify``.
   - ``TritonKDAKernel``     — wraps ``fused_sigmoid_gating_delta_rule_update``
     (IS_KDA=True). Reference for both ``decode`` and ``target_verify``.
@@ -243,9 +243,7 @@ def run(task, fi, tri, device, dtype, args):
                     )  # noqa: E731
                 else:
                     inp = make_decode_inputs(B, H, HV, K, V, pool, device, dtype)
-                    corr = lambda kern: call_decode(
-                        kern, inp, inp["ssm"].clone()
-                    )  # noqa: E731
+                    corr = lambda kern: call_decode(kern, inp, inp["ssm"].clone())  # noqa: E731
                     ssm_t = inp["ssm"].clone()
                     timed = lambda kern: call_decode(kern, inp, ssm_t)  # noqa: E731
 

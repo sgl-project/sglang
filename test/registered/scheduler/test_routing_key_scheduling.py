@@ -20,9 +20,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-large")
-register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
-register_cpu_ci(est_time=184, suite="base-c-test-cpu")
+register_cuda_ci(est_time=50, stage="weekly", runner_config="1-gpu-large")
+register_amd_ci(est_time=120, suite="nightly-test-1-gpu-amd", nightly=True)
+register_cpu_ci(est_time=55, suite="extra-test-cpu-intel")
 
 
 class TestRoutingKeyScheduling(CustomTestCase):
@@ -111,7 +111,7 @@ class TestRoutingKeyScheduling(CustomTestCase):
             "max_tokens": max_tokens,
             "temperature": 0,
         }
-        headers = {"x-smg-routing-key": routing_key}
+        headers = {"x-sgl-routing-key": routing_key}
         start_time = time.perf_counter()
         async with aiohttp.ClientSession() as session:
             async with session.post(

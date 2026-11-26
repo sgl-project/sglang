@@ -20,13 +20,15 @@ Method status annotations:
 
 - ``[Active]``  — SGLang core calls this method through ``current_platform``.
   OOT implementations take effect immediately.
-- ``[Planned]`` — Reserved interface. SGLang core still uses hardcoded calls
-  (e.g. ``torch.cuda.empty_cache()``). OOT implementations will NOT take
-  effect until the core is migrated in a future PR.
+- ``[Planned]`` — Reserved interface. SGLang core does not call it yet, so
+  OOT implementations will NOT take effect until the core is migrated.
 """
 
 import enum
 import random
+from collections.abc import Iterator
+from contextlib import contextmanager
+from functools import cached_property
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -48,8 +50,10 @@ class PlatformEnum(enum.Enum):
     XPU = enum.auto()
     MUSA = enum.auto()
     NPU = enum.auto()
+    MLU = enum.auto()
     TPU = enum.auto()
     MPS = enum.auto()
+    SAIL = enum.auto()
     OOT = enum.auto()  # Out-of-tree (external plugin)
     UNSPECIFIED = enum.auto()
 
@@ -88,6 +92,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND: dict[str, str] = {
     "cpu": "gloo",
     "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
     "musa": "mccl",
+    "mlu": "cncl",
 }
 
 
@@ -126,18 +131,25 @@ class DeviceMixin:
     def is_npu(self) -> bool:
         return self._enum == PlatformEnum.NPU
 
+    def is_mlu(self) -> bool:
+        return self._enum == PlatformEnum.MLU
+
     def is_tpu(self) -> bool:
         return self._enum == PlatformEnum.TPU
 
     def is_mps(self) -> bool:
         return self._enum == PlatformEnum.MPS
 
+    def is_sail(self) -> bool:
+        return self._enum == PlatformEnum.SAIL
+
     def is_cuda_alike(self) -> bool:
-        """True for CUDA, ROCm, or MUSA (all expose CUDA-like APIs)."""
+        """True for CUDA, ROCm, MUSA, or SAIL (all expose CUDA-like APIs)."""
         return self._enum in (
             PlatformEnum.CUDA,
             PlatformEnum.ROCM,
             PlatformEnum.MUSA,
+            PlatformEnum.SAIL,
         )
 
     def is_out_of_tree(self) -> bool:
@@ -163,20 +175,24 @@ class DeviceMixin:
         """[Active] Whether pinned host memory is available for a target device."""
         return False
 
+    @contextmanager
+    def reindex_device_id(self, device_id: int) -> Iterator[int]:
+        """[Active] Temporarily remap a physical device to logical device 0."""
+        yield device_id
+
     # ------------------------------------------------------------------
-    # Planned methods — reserved interface.  Core still uses hardcoded
-    # calls (e.g. torch.cuda.*).  OOT implementations will NOT take
-    # effect until the core is migrated in a future PR.
+    # Device operations.  The ones still marked [Planned] are reserved:
+    # core does not call them yet.
     # ------------------------------------------------------------------
 
     # ---- Device management ----
 
     def get_device(self, device_id: int = 0) -> str:
-        """[Planned] Return ``torch.device`` for the given device id."""
+        """[Active] Return ``torch.device`` for the given device id."""
         raise NotImplementedError
 
     def set_device(self, device: "torch.device") -> None:
-        """[Planned] Set the current device."""
+        """[Active] Set the current device."""
         raise NotImplementedError
 
     def get_device_name(self, device_id: int = 0) -> str:
@@ -184,19 +200,19 @@ class DeviceMixin:
         raise NotImplementedError
 
     def get_device_uuid(self, device_id: int = 0) -> str:
-        """[Planned] Get unique device identifier string."""
+        """[Active] Get unique device identifier string."""
         raise NotImplementedError
 
     def get_device_capability(self, device_id: int = 0) -> Optional["DeviceCapability"]:
-        """[Planned] Get device compute capability. None if N/A."""
+        """[Active] Get device compute capability. None if N/A."""
         raise NotImplementedError
 
     def empty_cache(self) -> None:
-        """[Planned] Release cached device memory. No-op for CPU-like platforms."""
+        """[Active] Release cached device memory. No-op for CPU-like platforms."""
         pass
 
     def synchronize(self) -> None:
-        """[Planned] Synchronize device operations. No-op for CPU-like platforms."""
+        """[Active] Synchronize device operations. No-op for CPU-like platforms."""
         pass
 
     # ---- Memory ----
@@ -239,6 +255,10 @@ class DeviceMixin:
         """[Planned] Validate that a quantization method is supported. No-op by default."""
         pass
 
+    @cached_property
+    def cpu_arch(self) -> "CpuArchEnum":
+        return self.get_cpu_architecture()
+
     @classmethod
     def get_cpu_architecture(cls) -> "CpuArchEnum":
         """[Planned] Detect CPU architecture."""
@@ -252,11 +272,11 @@ class DeviceMixin:
         return CpuArchEnum.UNSPECIFIED
 
     def get_torch_profiler_activity_str(self) -> str:
-        """[Planned] Return the torch profiler activity string."""
+        """[Active] Return the torch profiler activity string."""
         raise NotImplementedError
 
     def get_torch_profiler_activity(self) -> torch.profiler.ProfilerActivity:
-        """[Planned] Return the torch profiler activity."""
+        """[Active] Return the torch profiler activity."""
         raise NotImplementedError
 
     # ------------------------------------------------------------------

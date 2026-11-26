@@ -3,6 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 from diffusers.image_processor import VaeImageProcessor
 
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlusPipelineConfig,
+    QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImageEditPlusSamplingParams,
+    QwenImageSamplingParams,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -19,7 +27,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     QwenImageProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 
 def prepare_mu(batch: Req, server_args: ServerArgs):
@@ -38,6 +46,11 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
 
 class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "QwenImagePipeline"
+
+    # Used when the checkpoint is a single safetensors file with no
+    # model_index.json to derive these from.
+    pipeline_config_cls = QwenImagePipelineConfig
+    sampling_params_cls = QwenImageSamplingParams
 
     _required_config_modules = [
         "text_encoder",
@@ -67,6 +80,16 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
+        text_encoder = self.get_module("text_encoder")
+        visual = getattr(getattr(text_encoder, "model", None), "visual", None)
+        # An offloaded encoder is built on CPU; rebuild the vision frequency
+        # table on the GPU so edits match the GPU-resident encoder. Edit-2509
+        # keeps the table its consistency reference was generated with.
+        if (
+            visual is not None
+            and type(server_args.pipeline_config) is not QwenImageEditPlusPipelineConfig
+        ):
+            visual.rotary_pos_emb.recompute_on_device_change = True
         vae_image_processor = VaeImageProcessor(
             vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
             * 2
@@ -83,6 +106,11 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
 
 class QwenImageEditPlusPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageEditPlusPipeline"
+
+    # Used when the checkpoint is a single safetensors file with no
+    # model_index.json to derive these from.
+    pipeline_config_cls = QwenImageEditPlusPipelineConfig
+    sampling_params_cls = QwenImageEditPlusSamplingParams
 
 
 def prepare_mu_layered(batch: Req, server_args: ServerArgs):

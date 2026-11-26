@@ -4,7 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import is_cuda
+
+_PDL = is_arch_support_pdl()
 
 PAD_SLOT_ID = -1
 
@@ -60,9 +63,9 @@ def _metadata_out(
         )
     for name, shape, dtype in spec:
         t = out[name]
-        assert (
-            tuple(t.shape) == shape and t.dtype == dtype and t.is_contiguous()
-        ), f"{name}: got {tuple(t.shape)}/{t.dtype}, want {shape}/{dtype} contiguous"
+        assert tuple(t.shape) == shape and t.dtype == dtype and t.is_contiguous(), (
+            f"{name}: got {tuple(t.shape)}/{t.dtype}, want {shape}/{dtype} contiguous"
+        )
     return out
 
 
@@ -306,9 +309,8 @@ def fused_decode_sconv_metadata(
     B: int, cache_indices: torch.Tensor, out: SconvMetadataOut | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, SconvDecodeMetadata]:
     """Single-launch replacement for the decode metadata prep: the two arange calls,
-    ones, `!= PAD`, `&`, `clamp` and `.long()` that
-    ``precompute_helion_decode_metadata`` (+ its callers) issued as ~7 tiny
-    elementwise kernels. Returns
+    ones, `!= PAD`, `&`, `clamp` and `.long()` that the unfused prep issued as ~7
+    tiny elementwise kernels. Returns
     ``(query_start_loc, has_initial_state, SconvDecodeMetadata)`` with tensors
     bit-identical to the unfused path. Pass ``out`` to write into preallocated
     (e.g. cuda-graph-static) destinations instead of fresh allocations.
@@ -341,37 +343,15 @@ def fused_decode_sconv_metadata(
     )
 
 
-def precompute_helion_decode_metadata(
-    B: int,
-    W: int,
-    cache_indices: torch.Tensor,
-    has_initial_state: torch.Tensor,
-) -> SconvDecodeMetadata:
-    """Precompute metadata for the helion decode path. Call once, reuse across layers."""
-    device = cache_indices.device
-    valid = cache_indices != PAD_SLOT_ID
-    cache_mask = (has_initial_state & valid)[:, None, None]  # [B, 1, 1]
-    safe_idx = cache_indices.clamp(min=0).long()
-    # Each sequence has exactly 1 token in the packed [1, B, D] layout
-    cu = torch.arange(B + 1, dtype=torch.int64, device=device)
-    si = torch.arange(B, dtype=torch.int32, device=device)
-    return SconvDecodeMetadata(
-        cache_mask=cache_mask,
-        safe_idx=safe_idx,
-        cu=cu,
-        si=si,
-    )
-
-
 # has_initial_state variants for the fused extend metadata kernel.
 HIS_ZEROS = 0  # boundary-KV draft extend: force conv to run fresh
 HIS_PREFIX = 1  # extend_prefix_lens > 0
 HIS_SEQ_MINUS_EXT = 2  # (seq_lens[:B] - extend_seq_lens) > 0 (draft_extend_v2 capture)
 HIS_ONES = 3  # target_verify: always has initial state
 
-# The single-tile local cumsum bounds the fused path; larger batches fall back
-# to the unfused op sequence.
-_FUSED_EXTEND_MAX_B = 1023
+# The single-tile local cumsum bounds variable-length extend; larger batches
+# fall back to the unfused op sequence. Uniform-length verify needs no cumsum.
+_FUSED_EXTEND_MAX_B = 2047
 
 
 @triton.jit
@@ -475,7 +455,8 @@ def fused_extend_sconv_metadata(
     owning layer).
     Returns ``(query_start_loc, has_initial_state, SconvExtendMetadata)`` with
     tensors bit-identical to the unfused path, or None when the shape falls
-    outside the fused kernel's single-tile bound (caller runs unfused).
+    outside the variable-length kernel's single-tile bound (caller runs unfused).
+    Uniform-length target verification does not have that batch-size bound.
 
     ``his_mode`` selects the has_initial_state source: HIS_ZEROS (boundary-KV
     draft extend), HIS_PREFIX (``his_src`` = extend_prefix_lens), HIS_SEQ_MINUS_EXT
@@ -483,10 +464,10 @@ def fused_extend_sconv_metadata(
     ``extend_seq_lens`` unused). Pass ``out`` to write into preallocated (e.g.
     cuda-graph-static) destinations instead of fresh allocations.
     """
-    if B > _FUSED_EXTEND_MAX_B or not cache_indices.is_cuda:
+    is_verify = his_mode == HIS_ONES
+    if (not is_verify and B > _FUSED_EXTEND_MAX_B) or not cache_indices.is_cuda:
         return None
     assert cache_indices.shape[0] >= B and cache_indices.stride(0) == 1
-    is_verify = his_mode == HIS_ONES
     if is_verify:
         assert draft_token_num is not None
     else:
@@ -499,7 +480,9 @@ def fused_extend_sconv_metadata(
     safe_idx = dst["safe_idx"]
     cu = dst["cu"]
     si = dst["si"]
-    BLOCK_T = 256
+    # Keep the variable-length si comparison tile at most 256 * 1024 elements
+    # when the cumsum tile grows to 2048 requests (e.g. MTP batches of 1264).
+    BLOCK_T = 128 if not is_verify and B > 1023 else 256
     dummy = cache_indices  # never dereferenced thanks to masks/constexpr
     _fused_extend_metadata_kernel[(1 + triton.cdiv(T, BLOCK_T),)](
         cache_indices,
@@ -535,8 +518,6 @@ def precompute_helion_extend_metadata(
     query_start_loc: torch.Tensor,
 ) -> SconvExtendMetadata:
     """Precompute metadata for the helion extend path. Call once, reuse across layers."""
-    device = cache_indices.device
-
     valid = cache_indices != PAD_SLOT_ID
     cache_mask = (has_initial_state & valid)[:, None, None]  # [B, 1, 1]
     safe_idx = cache_indices.clamp(min=0).long()
@@ -1107,7 +1088,11 @@ def _save_intermediate_conv_windows_kernel(
     W_MINUS_1: tl.constexpr,
     BLOCK_D: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
     pid_d = tl.program_id(2)
@@ -1173,9 +1158,9 @@ def save_intermediate_conv_windows(
 
     if hidden_states.dim() == 2:
         hidden_states = hidden_states.view(batch_size, -1, hidden_states.shape[-1])
-    assert (
-        hidden_states.dim() == 3
-    ), f"unexpected hidden_states shape {hidden_states.shape}"
+    assert hidden_states.dim() == 3, (
+        f"unexpected hidden_states shape {hidden_states.shape}"
+    )
     assert hidden_states.shape[0] == batch_size
     assert hidden_states.shape[2] == D
     assert intermediate_out.shape[1] == draft_token_num
@@ -1208,4 +1193,6 @@ def save_intermediate_conv_windows(
         W_MINUS_1=W_minus_1,
         BLOCK_D=BLOCK_D,
         PAD_SLOT_ID=PAD_SLOT_ID,
+        USE_PDL=_PDL,
+        launch_pdl=_PDL,
     )

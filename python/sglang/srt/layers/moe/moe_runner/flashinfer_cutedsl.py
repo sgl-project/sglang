@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -17,7 +18,7 @@ from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
     get_parallel,
 )
-from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
+from sglang.srt.utils.log_utils import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -44,32 +45,21 @@ _cutedsl_logged_scalarize: set = set()
 # ---------------------------------------------------------------------------
 
 
-def interleave_w13_halves(
-    tensor: torch.Tensor, group_size: int = 64, dim: int = 1
-) -> torch.Tensor:
-    """Interleave the two logical W13 halves for CuteDSL's SwiGLU GEMM1 layout.
+def use_cutedsl_moe_swap_ab(device: torch.device) -> bool:
+    """Select the same weight and execution layout on Blackwell SM100/SM103."""
+    if device.type != "cuda":
+        return False
+    # Resolve the current device before caching so an unindexed "cuda" device
+    # cannot reuse another GPU's result after torch.cuda.set_device().
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _use_cutedsl_moe_swap_ab(device_index)
 
-    The caller is responsible for loading W13 in the expected two-half order.
-    This helper only rewrites the first and second halves into alternating
-    `group_size` chunks along `dim`.
-    """
-    if tensor.shape[dim] % 2 != 0:
-        raise ValueError(
-            "Expected even size on interleave dimension for W13 half split."
-        )
-    split = tensor.shape[dim] // 2
-    if split % group_size != 0:
-        raise ValueError(
-            f"Expected split dim divisible by group_size={group_size}, got {split}."
-        )
-    first_half = tensor.narrow(dim, 0, split)
-    second_half = tensor.narrow(dim, split, split)
-    first_half_groups = first_half.split(group_size, dim=dim)
-    second_half_groups = second_half.split(group_size, dim=dim)
-    interleaved = [
-        item for pair in zip(first_half_groups, second_half_groups) for item in pair
-    ]
-    return torch.cat(interleaved, dim=dim)
+
+@lru_cache(maxsize=None)
+def _use_cutedsl_moe_swap_ab(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
 
 
 def cutedsl_quant_scale_to_scalar(
@@ -228,13 +218,14 @@ def resolve_cutedsl_standard_scales(
 
 
 def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) -> Any:
-    if activation == "silu":
+    # FlashInfer selects SiTU as the gated Swiglu path plus situ_beta.
+    if activation in ("silu", "situ"):
         return activation_type_cls.Swiglu
     if activation == "relu2":
         return activation_type_cls.Relu2
     raise ValueError(
-        f"CuteDSL MoE wrapper supports 'silu' (gated) or 'relu2' (non-gated) "
-        f"activation, got {activation!r}."
+        f"CuteDSL MoE wrapper supports 'silu'/'situ' (gated) or 'relu2' "
+        f"(non-gated) activation, got {activation!r}."
     )
 
 
@@ -257,7 +248,10 @@ def refresh_cutedsl_standard_scales_for_weight_update(
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
         resolve_cutedsl_standard_scales(layer)
     )
-    if layer.quant_config.use_per_token_activation:
+    if (
+        layer.quant_config.use_per_token_activation
+        and layer._cutedsl_wrapper.quant_mode == "w4a4"
+    ):
         used_input_scale = _make_per_token_global_scale(used_input_scale)
 
     new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
@@ -319,6 +313,8 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             "Install with: pip install flashinfer"
         ) from e
 
+    quant_mode = "w4a16" if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() else "w4a4"
+
     assert layer.intermediate_size_per_partition > 0, (
         f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
         f"got {layer.intermediate_size_per_partition}. Check EP/TP configuration."
@@ -335,15 +331,23 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         # A2A path: bounded by the dispatcher's own workspace limit.
         max_num_tokens = dispatcher.max_num_tokens * getattr(dispatcher, "ep_size", 1)
     else:
-        # Standard allgather path: the MoE sees up to dp_size local forwards
-        # gathered together, so scale the per-rank forward bound by dp_size.
-        max_num_tokens = get_parallel().dp_size * cutedsl_moe_max_num_tokens()
+        # Standard allgather path: the MoE sees up to num_dp_ranks local forwards
+        # gathered together, so scale the per-rank forward bound by num_dp_ranks.
+        max_num_tokens = get_parallel().num_dp_ranks * cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
+    swiglu_limit = layer.moe_runner_config.swiglu_limit
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
     # _dummy_run which runs under inference_mode(); inference tensors cannot
     # be inplace-updated during later CUDA graph capture (which runs outside
     # inference_mode), so we must opt out here.
+    situ_kwargs = {}
+    if layer.moe_runner_config.activation == "situ":
+        # SiTU's beta / linear beta, applied in the GEMM1 epilogue.
+        situ_kwargs = dict(
+            situ_beta=layer.moe_runner_config.gemm1_alpha,
+            situ_linear_beta=layer.moe_runner_config.gemm1_clamp_limit,
+        )
     with torch.inference_mode(False):
         layer._cutedsl_wrapper = CuteDslMoEWrapper(
             num_experts=layer.num_experts,
@@ -360,12 +364,16 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             activation_type=_cutedsl_wrapper_activation_type(
                 layer.moe_runner_config.activation, ActivationType
             ),
+            quant_mode=quant_mode,
+            swap_ab=use_cutedsl_moe_swap_ab(layer.w13_weight.device),
+            **situ_kwargs,
+            **(dict(swiglu_limit=swiglu_limit) if swiglu_limit is not None else {}),
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
             resolve_cutedsl_standard_scales(layer)
         )
-        if layer.quant_config.use_per_token_activation:
+        if layer.quant_config.use_per_token_activation and quant_mode == "w4a4":
             used_input_scale = _make_per_token_global_scale(used_input_scale)
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale
@@ -422,6 +430,9 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     # v2 only: quantize hidden states with per-token dynamic activation scales.
     use_per_token_activation: bool = False
 
+    # v2 only: FlashInfer CuTe DSL activation/weight quantization mode.
+    quant_mode: str = "w4a4"
+
     # v1 only: SBO down-GEMM overlap args.
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
@@ -438,8 +449,11 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 
     assert runner_config.activation in (
         "silu",
+        "situ",
         "relu2",
-    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    ), (
+        f"CuteDSL MoE supports 'silu'/'situ' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
@@ -461,6 +475,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
             per_token_activation=True,
             backend="cute-dsl",
         )
+    elif quant_info.quant_mode == "w4a16":
+        x_fp4 = hidden_states
+        x_sf = None
+        per_token_scale = None
     else:
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
@@ -470,11 +488,12 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         )
         per_token_scale = None
 
-    seq_len, hidden_size = hidden_states.shape
-    x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
-    x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
-        seq_len, hidden_size // _FP4_SF_VEC_SIZE
-    )
+    if quant_info.quant_mode != "w4a16":
+        seq_len, hidden_size = hidden_states.shape
+        x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
+        x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // _FP4_SF_VEC_SIZE
+        )
 
     output = quant_info.wrapper.run(
         x=x_fp4,
@@ -484,7 +503,9 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=quant_info.a2_scale,
+        fc2_input_scale=(
+            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
+        ),
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
@@ -494,12 +515,12 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     return StandardCombineInput(hidden_states=output)
 
 
-@register_fused_func("flashinfer", "flashinfer_cutedsl")
+@register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_cutedsl")
 def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
-    dispatch_output: FlashinferDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
+) -> FlashinferCombineInput | StandardCombineInput:
     """CuteDSL fused func for flashinfer alltoall dispatcher.
 
     Two cases depending on whether the dispatcher did FP4 quantization:
@@ -509,13 +530,24 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
+    # Eager prefill uses all-gather, including idle ranks in a prefill batch.
+    # Preserve the standard combine format so the dispatcher reduce-scatters it.
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return fused_experts_none_to_flashinfer_cutedsl_fp4(
+            dispatch_output, quant_info, runner_config
+        )
+
     assert runner_config.activation in (
         "silu",
+        "situ",
         "relu2",
-    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    ), (
+        f"CuteDSL MoE supports 'silu'/'situ' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
@@ -535,6 +567,9 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
                 "so the runner can forward per_token_scale to FlashInfer."
             )
         # NVFP4 dispatch, inputs are already quantized.
+        x_fp4 = hidden_states
+        per_token_scale = None
+    elif quant_info.quant_mode == "w4a16":
         x_fp4 = hidden_states
         per_token_scale = None
     else:
@@ -571,7 +606,9 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=quant_info.a2_scale,
+        fc2_input_scale=(
+            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
+        ),
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
@@ -602,10 +639,15 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     assert runner_config.activation in (
         "silu",
         "relu2",
-    ), f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
-    assert (
-        not runner_config.apply_router_weight_on_input
-    ), "apply_router_weight_on_input is not supported for Flashinfer"
+    ), (
+        f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
+    )
+    assert runner_config.swiglu_limit is None, (
+        f"CuteDSL masked MoE does not support swiglu_limit, got {runner_config.swiglu_limit}."
+    )
+    assert not runner_config.apply_router_weight_on_input, (
+        "apply_router_weight_on_input is not supported for Flashinfer"
+    )
 
     hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
 

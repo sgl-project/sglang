@@ -12,87 +12,69 @@ from sglang.kernels.ops.diffusion.norm.cutedsl_common.reduce import (
 
 
 @cute.jit
-def apply_norm_cta(
+def row_norm_stats(
     norm_type: cutlass.Constexpr,
-    num_warps: cutlass.Constexpr,
-    tidx: cutlass.Int32,
-    tXrX: cute.Tensor,
-    tWrW: Optional[cute.Tensor],
-    tBrB: Optional[cute.Tensor],
+    chunks: list,
+    num_chunks: cutlass.Constexpr,
+    warp_id: cutlass.Int32,
+    lane_id: cutlass.Int32,
     D: Union[cutlass.Int32, cutlass.Constexpr],
     eps: Union[cutlass.Float32, cutlass.Constexpr],
-) -> cute.Tensor:
+) -> Tuple[cute.Numeric, cute.Numeric]:
+    """
+    (mean, 1 / std) of a row for LayerNorm, (0, 1 / rms) for RMSNorm. chunks[j] is this
+    lane's slice of chunk warp_id * len(chunks) + j; sums accumulate in FP32 per lane, then per
+    chunk across lanes, then across chunks.
+    """
     if cutlass.const_expr(norm_type == "rms"):
-        return apply_rmsnorm_cta(num_warps, tidx, tXrX, tWrW, D, eps)
-    else:
-        return apply_layernorm_cta(num_warps, tidx, tXrX, tWrW, tBrB, D, eps)
+        vals = []
+        for j in cutlass.range_constexpr(len(chunks)):
+            val = cute.Float32(0.0)
+            for idx in range(cute.size(chunks[j])):
+                x_fp32 = chunks[j][idx].to(cutlass.Float32)
+                val += x_fp32 * x_fp32
+            vals.append(warp_reduce_sum(val))
+        acc_sq = cta_reduce_sum(vals, num_chunks, warp_id, lane_id)
+        return cute.Float32(0.0), cute.rsqrt(acc_sq / D + eps)
+    vals = []
+    for j in cutlass.range_constexpr(len(chunks)):
+        val = cute.Float32(0.0)
+        for idx in range(cute.size(chunks[j])):
+            val += chunks[j][idx].to(cutlass.Float32)
+        vals.append(warp_reduce_sum(val))
+    val = cta_reduce_sum(vals, num_chunks, warp_id, lane_id)
+    mean = val / D
+    vals = []
+    for j in cutlass.range_constexpr(len(chunks)):
+        val = cute.Float32(0.0)
+        for idx in range(cute.size(chunks[j])):
+            x_fp32 = chunks[j][idx].to(cutlass.Float32)
+            val += (x_fp32 - mean) * (x_fp32 - mean)
+        vals.append(warp_reduce_sum(val))
+    val = cta_reduce_sum(vals, num_chunks, warp_id, lane_id)
+    return mean, cute.rsqrt(val / D + eps)
 
 
 @cute.jit
-def apply_rmsnorm_cta(
-    num_warps: Union[cutlass.Int32, cutlass.Constexpr],
-    tidx: cutlass.Int32,
-    tXrX: cute.Tensor,
-    tWrW: Optional[cute.Tensor],
-    D: Union[cutlass.Int32, cutlass.Constexpr],
-    eps: Union[cutlass.Float32, cutlass.Constexpr],
-) -> cute.Tensor:
-    """
-    RMSNorm:
-      y[i] = x[i] / sqrt(sum(x ^ 2) / D + eps) * w[i]
-    """
-    val = cute.Float32(0.0)
-    for idx in range(cute.size(tXrX)):
-        # Accumulate in FP32 to improve numerical precision.
-        x_fp32 = tXrX[idx].to(cutlass.Float32)
-        val += x_fp32 * x_fp32
-    val = warp_reduce_sum(val)
-    acc_sq = cta_reduce_sum(val, num_warps, tidx)
-    factor = cute.rsqrt(acc_sq / D + eps)
-    tNrN = cute.make_fragment_like(tXrX)
-    if cutlass.const_expr(isinstance(tWrW, cute.Tensor)):
-        tNrN.store((tXrX.load() * factor * tWrW.load()).to(tNrN.element_type))
-    else:
-        tNrN.store((tXrX.load() * factor).to(tNrN.element_type))
-    return tNrN
-
-
-@cute.jit
-def apply_layernorm_cta(
-    num_warps: Union[cutlass.Int32, cutlass.Constexpr],
-    tidx: cutlass.Int32,
+def normalize_chunk(
+    norm_type: cutlass.Constexpr,
     tXrX: cute.Tensor,
     tWrW: Optional[cute.Tensor],
     tBrB: Optional[cute.Tensor],
-    D: Union[cutlass.Int32, cutlass.Constexpr],
-    eps: Union[cutlass.Float32, cutlass.Constexpr],
+    mean: cute.Numeric,
+    factor: cute.Numeric,
 ) -> cute.Tensor:
     """
-    LayerNorm:
-        mean = sum(x) / D
-        var  = sum((x - mean) ^ 2) / D
-        y[i] = (x[i] - mean) / sqrt(var + eps) * w[i] + b[i]
+    RMSNorm:   y[i] = x[i] * factor * w[i]
+    LayerNorm: y[i] = (x[i] - mean) * factor * w[i] + b[i]
     """
-    # Reduce mean
-    val = cute.Float32(0.0)
-    for idx in range(cute.size(tXrX)):
-        # Accumulate in FP32 to improve numerical precision.
-        val += tXrX[idx].to(cutlass.Float32)
-    val = warp_reduce_sum(val)
-    val = cta_reduce_sum(val, num_warps, tidx)
-    mean = val / D
-    # Reduce variance
-    val = cute.Float32(0.0)
-    for idx in range(cute.size(tXrX)):
-        # Accumulate in FP32 to improve numerical precision.
-        x_fp32 = tXrX[idx].to(cutlass.Float32)
-        val += (x_fp32 - mean) * (x_fp32 - mean)
-    val = warp_reduce_sum(val)
-    val = cta_reduce_sum(val, num_warps, tidx)
-    factor = cute.rsqrt(val / D + eps)
-    # Normalize
     tNrN = cute.make_fragment_like(tXrX)
-    if cutlass.const_expr(
+    if cutlass.const_expr(norm_type == "rms"):
+        if cutlass.const_expr(isinstance(tWrW, cute.Tensor)):
+            tNrN.store((tXrX.load() * factor * tWrW.load()).to(tNrN.element_type))
+        else:
+            tNrN.store((tXrX.load() * factor).to(tNrN.element_type))
+    elif cutlass.const_expr(
         isinstance(tWrW, cute.Tensor) and isinstance(tBrB, cute.Tensor)
     ):
         tNrN.store(
@@ -162,14 +144,17 @@ def tensor_slice_for_bsfd(
     thr_copy: cute.ThrCopy,
     batch_id: cutlass.Int32,
     seq_id: cutlass.Int32,
+    chunk_id: cutlass.Int32,
     S: Union[cutlass.Int32, cutlass.Constexpr],
     D: Union[cutlass.Int32, cutlass.Constexpr],
+    chunk: cutlass.Constexpr,
 ) -> Tuple[cute.Tensor, cute.Tensor]:
     """
     Slice a BSFD-compatible tensor into a per-thread gmem tile and rmem fragment.
 
-    Given a logical (batch_id, seq_id), this helper selects the corresponding
-    D-length slice from `mV` and prepares it for vectorized copy.
+    Given a logical (batch_id, seq_id), this helper selects columns
+    [chunk_id * chunk, (chunk_id + 1) * chunk) of the corresponding D-length
+    slice from `mV` and prepares them for vectorized copy.
     """
     gV: cute.Tensor
     if cutlass.const_expr(cute.is_static(mV.layout) and cute.size(mV.layout) == 1):
@@ -196,6 +181,7 @@ def tensor_slice_for_bsfd(
         gV = gV[0, 0, 0, None]
     else:
         raise NotImplementedError(f"BSFD slice: unsupported shape {mV.shape}.")
+    gV = cute.local_tile(gV, tiler=(chunk,), coord=(chunk_id,))
     tVgV = thr_copy.partition_S(gV)
     tVrV = cute.make_fragment_like(tVgV, tVgV.element_type)
     return tVgV, tVrV

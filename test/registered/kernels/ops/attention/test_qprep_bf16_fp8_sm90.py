@@ -50,10 +50,8 @@ def _make_inputs(T: int, H: int, K: int, seed: int = 1234, magnitude: float = 1.
 )
 @pytest.mark.parametrize("pad_heads_extra", [0, 2])
 def test_qprep_vs_triton_two_dot(T, h_k, pad_heads_extra):
+    from sglang.kernels.ops.attention.mla_qk_prep import absorbed_bmm_concat_cast_q_fp8
     from sglang.kernels.ops.attention.qprep_bf16_fp8_sm90 import q8kv8_qprep_fwd
-    from sglang.kernels.ops.kvcache.cache_ops import (
-        absorbed_bmm_concat_cast_q_fp8,
-    )
 
     H, K = h_k
     q_nope, q_rope, w_kc = _make_inputs(T, H, K)
@@ -88,10 +86,8 @@ def test_qprep_vs_triton_two_dot(T, h_k, pad_heads_extra):
     "h_k", [(64, 192), (128, 128)], ids=["glm_h64_k192", "ds_h128_k128"]
 )
 def test_qprep_fp64_reference_parity(h_k):
+    from sglang.kernels.ops.attention.mla_qk_prep import absorbed_bmm_concat_cast_q_fp8
     from sglang.kernels.ops.attention.qprep_bf16_fp8_sm90 import q8kv8_qprep_fwd
-    from sglang.kernels.ops.kvcache.cache_ops import (
-        absorbed_bmm_concat_cast_q_fp8,
-    )
 
     H, K = h_k
     T = 437
@@ -109,9 +105,9 @@ def test_qprep_fp64_reference_parity(h_k):
     ).transpose(0, 1)
     err_tri = (ref8[..., :N_LORA].to(torch.float64) - ref64).abs().mean().item()
     err_cuda = (out8[..., :N_LORA].to(torch.float64) - ref64).abs().mean().item()
-    assert (
-        err_cuda <= 1.05 * err_tri
-    ), f"CUDA fp64-ref mean |err| {err_cuda:.4e} exceeds Triton's {err_tri:.4e}"
+    assert err_cuda <= 1.05 * err_tri, (
+        f"CUDA fp64-ref mean |err| {err_cuda:.4e} exceeds Triton's {err_tri:.4e}"
+    )
 
 
 if __name__ == "__main__":

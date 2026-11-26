@@ -1,7 +1,7 @@
 import re
 from typing import Dict, List, Union
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.dots_ocr import DotsOCRForCausalLM
 from sglang.srt.models.dots_vlm import DotsVLMForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
@@ -28,22 +28,6 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         self.IM_START_TOKEN_ID = self.im_start_id
         self.IM_END_TOKEN_ID = self.im_end_id
 
-        vision_config = hf_config.vision_config
-        patch_size = vision_config.patch_size
-        merge_size = vision_config.spatial_merge_size
-
-        self.IMAGE_FACTOR = patch_size * merge_size
-        self.MIN_PIXELS = getattr(
-            _processor.image_processor,
-            "min_pixels",
-            getattr(_processor.image_processor, "size", {}).get("shortest_edge"),
-        )
-        self.MAX_PIXELS = getattr(
-            _processor.image_processor,
-            "max_pixels",
-            getattr(_processor.image_processor, "size", {}).get("longest_edge"),
-        )
-        self.MAX_RATIO = 200
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
             image_token_id=self.image_token_id,
@@ -75,7 +59,7 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        combined_mm_item, input_ids, _ = self.process_and_combine_mm_data(
+        combined_mm_item, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
         if combined_mm_item is None:

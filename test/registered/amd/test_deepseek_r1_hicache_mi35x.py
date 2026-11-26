@@ -12,7 +12,7 @@ Acceptance: GSM8K (1319 questions, 5-shot, completion API) score >= 0.93,
 matching ``test_deepseek_r1_eval_mi35x.py`` /
 ``test_deepseek_r1_eval_amd.py``.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-hicache suite.
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-r1-hicache suite.
 """
 
 import os
@@ -21,7 +21,6 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -29,13 +28,14 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     write_github_step_summary,
 )
 
 # DSR1-0528 can spend 20+ min in weight loading on MI35x before warmup.
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-r1-hicache",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-r1-hicache",
     nightly=True,
 )
 
@@ -129,7 +129,7 @@ class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
         if getattr(cls, "l3_storage_dir", None):
             shutil.rmtree(cls.l3_storage_dir, ignore_errors=True)
 

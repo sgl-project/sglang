@@ -33,8 +33,8 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-# The gfx95 runner: stage-b-test-1-gpu-large-amd is MI300, where every case below skips.
-register_amd_ci(est_time=6, suite="stage-b-test-1-gpu-small-amd-mi35x")
+# The gfx95 runner: base-b-test-1-gpu-large-amd is MI300, where every case below skips.
+register_amd_ci(est_time=6, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 LK, LV = 576, 512
 
@@ -74,16 +74,10 @@ def _inputs(seq_lens, head_num, page_size, max_kv_splits, seed):
     total = sum(seq_lens)
     n_slots = total + 64
 
-    if page_size == 1:
-        pool = torch.randn(
-            n_slots, 1, LK, dtype=torch.bfloat16, device=dev, generator=gen
-        )
-    else:
-        n_pages = (n_slots + page_size - 1) // page_size
-        pool = torch.randn(
-            n_pages, page_size, 1, LK, dtype=torch.bfloat16, device=dev, generator=gen
-        )
-        n_slots = n_pages * page_size
+    if page_size > 1:
+        n_slots = ((n_slots + page_size - 1) // page_size) * page_size
+    # Unified memory exposes dense 3-D KV views even when the allocator uses pages.
+    pool = torch.randn(n_slots, 1, LK, dtype=torch.bfloat16, device=dev, generator=gen)
 
     kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=dev)
     kv_indptr[1:] = torch.cumsum(

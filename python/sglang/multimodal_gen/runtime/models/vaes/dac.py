@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: MIT
 
 import math
-from bisect import bisect_right
 from typing import Union
 
 import torch
@@ -12,6 +11,7 @@ from einops import rearrange
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.dac import DacVAEConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -150,10 +150,6 @@ class ResidualVectorQuantize(nn.Module):
         self.n_codebooks = n_codebooks
         self.codebook_dim = codebook_dim
         self.codebook_size = codebook_size
-        dim_offsets = [0]
-        for dim in self.codebook_dim:
-            dim_offsets.append(dim_offsets[-1] + dim)
-        self._codebook_dim_offsets = tuple(dim_offsets)
 
         self.quantizers = nn.ModuleList(
             [
@@ -253,57 +249,6 @@ class ResidualVectorQuantize(nn.Module):
 
         return z_q, codes, latents, commitment_loss, codebook_loss
 
-    def from_codes(self, codes: torch.Tensor):
-        """Reconstruct the continuous representation from quantized codes.
-
-        Args:
-            codes (torch.Tensor): Quantized discrete representation with shape ``[B, N, T]``.
-
-        Returns:
-            tuple: A tuple containing:
-                - z_q (torch.Tensor): Quantized continuous representation with shape ``[B, D, T]``.
-                - z_p (torch.Tensor): Concatenated latent space representation with shape ``[B, N*D, T]``.
-                - codes (torch.Tensor): Original input codebook indices with shape ``[B, N, T]``.
-        """
-        z_q = 0.0
-        z_p = []
-        n_codebooks = codes.shape[1]
-        for i in range(n_codebooks):
-            z_p_i = self.quantizers[i].decode_code(codes[:, i, :])
-            z_p.append(z_p_i)
-
-            z_q_i = self.quantizers[i].out_proj(z_p_i)
-            z_q = z_q + z_q_i
-        return z_q, torch.cat(z_p, dim=1), codes
-
-    def from_latents(self, latents: torch.Tensor):
-        """Reconstruct the continuous representation from unquantized latents.
-
-        Args:
-            latents (torch.Tensor): Continuous representation after projection with shape ``[B, N*D, T]``.
-
-        Returns:
-            tuple: A tuple containing:
-                - z_q (torch.Tensor): Quantized representation of full-projected space with shape ``[B, D, T]``.
-                - z_p (torch.Tensor): Quantized representation of latent space with shape ``[B, N*D, T]``.
-                - codes (torch.Tensor): Codebook indices with shape ``[B, N, T]``.
-        """
-        z_q = 0
-        z_p = []
-        codes = []
-        dims = self._codebook_dim_offsets
-        n_codebooks = bisect_right(dims, latents.shape[1]) - 1
-        for i in range(n_codebooks):
-            j, k = dims[i], dims[i + 1]
-            z_p_i, codes_i = self.quantizers[i].decode_latents(latents[:, j:k, :])
-            z_p.append(z_p_i)
-            codes.append(codes_i)
-
-            z_q_i = self.quantizers[i].out_proj(z_p_i)
-            z_q = z_q + z_q_i
-
-        return z_q, torch.cat(z_p, dim=1), torch.stack(codes, dim=1)
-
 
 class ResidualUnit(nn.Module):
     def __init__(self, dim: int = 16, dilation: int = 1):
@@ -369,7 +314,6 @@ class Encoder(nn.Module):
 
         # Wrap black into nn.Sequential
         self.block = nn.Sequential(*self.block)
-        self.enc_dim = d_model
 
     def forward(self, x):
         return self.block(x)
@@ -506,6 +450,7 @@ class DAC(nn.Module, LayerwiseOffloadableModuleMixin):
 
         return audio_data
 
+    @cached_vae_encode
     def encode(
         self,
         audio_data: torch.Tensor,

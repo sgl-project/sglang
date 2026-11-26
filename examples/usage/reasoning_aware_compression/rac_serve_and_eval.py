@@ -31,7 +31,7 @@ from typing import List, Optional
 import msgspec
 
 import sglang as sgl
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful AI Assistant that provides well-reasoned and detailed "
@@ -209,7 +209,7 @@ def report(results: List[EvalResult]) -> None:
             f"{result.model_path:<{width}}  "
             f"{result.accuracy:>7.3f}  "
             f"{result.mean_completion_tokens:>16.0f}  "
-            f"{result.elapsed_seconds/60:>10.1f}m"
+            f"{result.elapsed_seconds / 60:>10.1f}m"
         )
 
     if len(results) > 1:

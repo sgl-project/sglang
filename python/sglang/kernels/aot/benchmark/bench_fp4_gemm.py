@@ -13,14 +13,14 @@ from flashinfer.testing import bench_gpu_time
 
 flashinfer_logger.setLevel(logging.ERROR)
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_device_capability,
     is_sm100_supported,
     is_sm120_supported,
 )
-from sglang.utils import is_in_ci
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -368,9 +368,9 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
             res_fi,
             backend="cudnn",
         )
-        assert torch.allclose(
-            res_fi, res_cutlass, atol=1e-3, rtol=1e-3
-        ), "cudnn fp4 doesn't match cutlass fp4"
+        assert torch.allclose(res_fi, res_cutlass, atol=1e-3, rtol=1e-3), (
+            "cudnn fp4 doesn't match cutlass fp4"
+        )
         mm_fp4(
             a_fp4,
             b_fp4_T,
@@ -381,9 +381,9 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
             res_fi,
             backend="trtllm",
         )
-        assert torch.allclose(
-            res_fi, res_cutlass, atol=1e-3, rtol=1e-3
-        ), "trtllm fp4 doesn't match cutlass fp4"
+        assert torch.allclose(res_fi, res_cutlass, atol=1e-3, rtol=1e-3), (
+            "trtllm fp4 doesn't match cutlass fp4"
+        )
 
     if csv_file:
         with open(csv_file, "a", newline="") as f:

@@ -35,9 +35,11 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader 
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
+)
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
     set_default_torch_dtype,
 )
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.hunyuan3d_paint import (
     Hunyuan3DPaintUNet,
 )
@@ -62,7 +64,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -140,13 +142,8 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
 
     # Path / checkpoint resolution
     @staticmethod
-    def _resolve_shape_dir(
-        model_path: str,
-        subfolder: str,
-        use_safetensors: bool,
-        variant: str | None,
-    ) -> tuple[str, str]:
-        """Locate (or download) the shape subfolder and return (config_path, ckpt_path)."""
+    def _locate_subfolder(model_path: str, subfolder: str) -> str:
+        """Return the local path of a model subfolder, downloading it when absent."""
         local_path = os.path.join(model_path, subfolder)
         if not os.path.exists(local_path):
             local_path = os.path.expanduser(local_path)
@@ -161,6 +158,17 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
                 allow_patterns=[f"{subfolder}/**"],
             )
             local_path = os.path.join(downloaded, subfolder)
+        return local_path
+
+    @staticmethod
+    def _resolve_shape_dir(
+        model_path: str,
+        subfolder: str,
+        use_safetensors: bool,
+        variant: str | None,
+    ) -> tuple[str, str]:
+        """Locate (or download) the shape subfolder and return (config_path, ckpt_path)."""
+        local_path = Hunyuan3D2Pipeline._locate_subfolder(model_path, subfolder)
 
         config_path = os.path.join(local_path, "config.yaml")
         if not os.path.exists(config_path):
@@ -182,7 +190,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             pattern = "*.safetensors" if use_safetensors else "*.ckpt"
             files = glob.glob(os.path.join(local_path, pattern))
             if files:
-                ckpt_path = files[0]
+                ckpt_path = sorted(files)[0]
 
         logger.info("Config path: %s", config_path)
         logger.info("Checkpoint path: %s", ckpt_path)
@@ -194,20 +202,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         subfolder: str,
         required_files: tuple[str, ...],
     ) -> str:
-        local_path = os.path.join(model_path, subfolder)
-        if not os.path.exists(local_path):
-            local_path = os.path.expanduser(local_path)
-
-        if not os.path.exists(local_path):
-            logger.info(
-                "Local path %s not found, downloading from HuggingFace Hub",
-                local_path,
-            )
-            downloaded = snapshot_download(
-                repo_id=model_path,
-                allow_patterns=[f"{subfolder}/**"],
-            )
-            local_path = os.path.join(downloaded, subfolder)
+        local_path = Hunyuan3D2Pipeline._locate_subfolder(model_path, subfolder)
 
         for relative_path in required_files:
             required_file = os.path.join(local_path, relative_path)
@@ -298,7 +293,14 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             component = target_cls(**params)
 
         if weights is not None:
-            component.load_state_dict(weights, strict=False)
+            # Extra checkpoint keys are tolerated, but a weight the module expects and
+            # the checkpoint lacks would stay randomly initialized and corrupt outputs.
+            missing = component.load_state_dict(weights, strict=False).missing_keys
+            if missing:
+                raise RuntimeError(
+                    f"{cfg['target']} checkpoint is missing {len(missing)} weights, "
+                    f"e.g. {missing[:5]}"
+                )
 
         component.to(device=device, dtype=dtype)
         return component.eval()

@@ -9,7 +9,6 @@ PP_SIZE: int = 2
 
 
 class CanaryPPFixture(CanaryE2EBase):
-
     model_mode: ClassVar[str] = "swa"
     workload_n_batches: ClassVar[int] = 2
 
@@ -18,7 +17,8 @@ class CanaryPPFixture(CanaryE2EBase):
         cls.extra_server_args = (
             "--pp-size",
             str(PP_SIZE),
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             *SWA_POOL_SERVER_ARGS,
             *cls.extra_server_args,
         )

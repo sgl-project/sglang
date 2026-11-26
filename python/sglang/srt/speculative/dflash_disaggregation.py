@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
 
-def build_dflash_family_disagg_draft_input(
+def build_dflash_disagg_draft_input(
     batch: ScheduleBatch,
     last_tokens_tensor: torch.Tensor,
     future_map: FutureMap,

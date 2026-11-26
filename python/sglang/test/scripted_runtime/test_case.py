@@ -7,7 +7,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class ScriptedTestCase(CustomTestCase):
-
     ENGINE_KWARGS: ClassVar[Dict[str, Any]] = {}
 
     server: ClassVar[ScriptedHttpServer]

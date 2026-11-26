@@ -74,7 +74,9 @@ class _FakeMHATokenToKVPool(_FakeKVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
         self._create_buffers()
 
@@ -100,7 +102,7 @@ def _load_npu_memory_pool_module():
         "sglang.srt.mem_cache",
         "sglang.srt.mem_cache.memory_pool",
         "sglang.srt.utils",
-        "sglang.srt.utils.common",
+        "sglang.srt.utils.device",
     ):
         sys.modules.setdefault(name, types.ModuleType(name))
 
@@ -119,8 +121,8 @@ def _load_npu_memory_pool_module():
     utils = sys.modules["sglang.srt.utils"]
     utils.get_bool_env_var = lambda _name, default: default == "True"
 
-    common = sys.modules["sglang.srt.utils.common"]
-    common.is_npu = lambda: False
+    device_utils = sys.modules["sglang.srt.utils.device"]
+    device_utils.is_npu = lambda: False
 
     module_path = (
         Path(__file__).resolve().parents[3]

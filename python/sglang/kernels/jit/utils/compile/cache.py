@@ -55,8 +55,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import msgspec
 
-from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
-from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime, is_musa_runtime
+from sglang.kernels.jit.utils.arch import CompileArch, get_compile_arch
+from sglang.kernels.jit.utils.common import (
+    cache_once,
+    is_hip_runtime,
+    is_musa_runtime,
+    is_sail_runtime,
+)
 from sglang.kernels.jit.utils.compile import toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
@@ -207,23 +212,29 @@ _VERSIONED_PACKAGES = (
 
 
 @cache_once
-def _target_tag() -> str:
-    """Short, human-readable target name used as a cache path segment.
+def _target_tag(arch: Optional[CompileArch] = None) -> str:
+    """Short, human-readable target name used as a cache path segment: the
+    CUDA target ``arch``, by default the local GPU's.
 
     HIP deliberately uses ``gcnArchName`` rather than the CUDA-shaped
     ``(major, minor)`` capability: the latter maps gfx940/gfx941/gfx942 onto a
     single ``9.4``, which are three different compile targets.
     """
+    if is_sail_runtime():
+        sail_arch = envs.SGLANG_SAIL_GPU_ARCH.get()
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in sail_arch)
+        return f"sail_{safe}"
     if is_hip_runtime():
         return toolchain.gpu_arch_name().split(":")[0] or "unknown"
-    arch = get_jit_cuda_arch()
+    arch = arch or get_compile_arch()
     prefix = "mp" if is_musa_runtime() else "sm"
     return f"{prefix}{arch.major}{arch.minor}{arch.suffix}"
 
 
 @cache_once
-def _environment_fingerprint() -> str:
-    """Process-wide part of ``build_key``: target, compilers, package versions.
+def _environment_fingerprint(arch: Optional[CompileArch] = None) -> str:
+    """Environment part of ``build_key``: target (the CUDA target ``arch``, by
+    default the local GPU's), compilers, package versions.
 
     The target here is the unabridged one — unlike ``_target_tag`` it keeps the
     gfx feature suffixes, because this half has to be exact.
@@ -232,10 +243,17 @@ def _environment_fingerprint() -> str:
     different host compiler means different system headers and different host
     codegen for otherwise identical inputs.
     """
-    if is_hip_runtime():
+    if is_sail_runtime():
+        # Imported lazily: sailify imports this module for file digests, so a
+        # top-level import would be circular.
+        from sglang.kernels.jit.utils.compile.sailify import sailify_version
+
+        sail_arch = envs.SGLANG_SAIL_GPU_ARCH.get()
+        target = f"hgcc:{sail_arch}:sailify-{sailify_version()}"
+    elif is_hip_runtime():
         target = f"hip:{toolchain.gpu_arch_name()}"
     else:
-        arch = get_jit_cuda_arch()
+        arch = arch or get_compile_arch()
         target = f"{'musa' if is_musa_runtime() else 'cuda'}:{arch.target_name}"
 
     compilers = []
@@ -283,7 +301,7 @@ def compute_build_key(spec: BuildSpec, *, build_file: str) -> str:
             tuple(source_digests),
             _normalize_text(build_file),
             _normalize_text(repr(units)),
-            _environment_fingerprint(),
+            _environment_fingerprint(spec.compile_arch),
         ]
     )
 
@@ -298,10 +316,20 @@ def _normalize_text(text: str) -> str:
     return text
 
 
-def build_key_dir(*, module_name: str, build_key: str) -> pathlib.Path:
+def cache_root() -> pathlib.Path:
     configured = envs.SGLANG_JIT_CACHE_DIR.get() or "~/.cache/sglang/jit"
-    root = pathlib.Path(configured).expanduser()
-    return root / _target_tag() / module_name / f"{_BUILD_KEY_PREFIX}{build_key}"
+    return pathlib.Path(configured).expanduser()
+
+
+def build_key_dir(
+    *, module_name: str, build_key: str, arch: Optional[CompileArch] = None
+) -> pathlib.Path:
+    return (
+        cache_root()
+        / _target_tag(arch)
+        / module_name
+        / f"{_BUILD_KEY_PREFIX}{build_key}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +497,7 @@ def _to_entries(
     their paths are unstable, and their contents are already a function of
     inputs ``build_key`` covers.
     """
+    build_dir = build_dir.resolve()
     seen: Dict[Tuple[str, str], _DepEntry] = {}
     for candidate in dependencies:
         path = (

@@ -3,7 +3,7 @@
 Tests DeepSeek-R1-MXFP4 quantized model with --kv-cache-dtype fp8_e4m3
 using few-shot completion benchmark on MI35x.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8 suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-kv-fp8 suite
 """
 
 import ast
@@ -30,7 +30,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 # Register for AMD CI - MI35x DeepSeek-R1-MXFP4 KV FP8 accuracy test (~60 min)
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-kv-fp8",
     nightly=True,
 )
 
@@ -181,9 +181,9 @@ class TestDeepSeekR1MXFP4KvFp8EvalMI35x(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

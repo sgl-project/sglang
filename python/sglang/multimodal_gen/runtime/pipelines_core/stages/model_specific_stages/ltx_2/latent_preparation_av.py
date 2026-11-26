@@ -40,9 +40,11 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
         result.add_check(
             "prompt_or_embeds",
             None,
-            lambda _: V.string_or_list_strings(batch.prompt)
-            or V.list_not_empty(batch.prompt_embeds)
-            or V.is_tensor(batch.prompt_embeds),
+            lambda _: (
+                V.string_or_list_strings(batch.prompt)
+                or V.list_not_empty(batch.prompt_embeds)
+                or V.is_tensor(batch.prompt_embeds)
+            ),
         )
 
         if isinstance(batch.prompt_embeds, list):

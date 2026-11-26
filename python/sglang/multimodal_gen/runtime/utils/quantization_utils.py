@@ -1,28 +1,132 @@
-import glob
 import json
-import os
 import re
 import struct
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+import torch
 from safetensors import safe_open
+from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
+    ComfyNvfp4Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
+    KitchenW4A4Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
+    KitchenW4A8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedEmbeddingMethod as SrtUnquantizedEmbeddingMethod,
+)
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod as SrtUnquantizedLinearMethod,
+)
+from sglang.srt.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding as SrtVocabParallelEmbedding,
+)
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
+from sglang.srt.model_loader.post_load import stage_module_for_post_load
+from sglang.srt.utils import is_npu
 
 logger = init_logger(__name__)
+
+
+def process_model_weights_after_loading(
+    model: nn.Module,
+    process_device: torch.device | None = None,
+    *,
+    quantized_only: bool = False,
+) -> int:
+    """Process native and SRT layers once, optionally staging one layer at a time."""
+    processed_layers = 0
+    for module in model.modules():
+        if not isinstance(
+            module,
+            (
+                LinearBase,
+                SrtLinearBase,
+                VocabParallelEmbedding,
+                SrtVocabParallelEmbedding,
+            ),
+        ):
+            continue
+        method = module.quant_method
+        if method is None:
+            continue
+        unquantized = isinstance(
+            method,
+            (
+                UnquantizedLinearMethod,
+                SrtUnquantizedLinearMethod,
+                UnquantizedEmbeddingMethod,
+                SrtUnquantizedEmbeddingMethod,
+            ),
+        )
+        if quantized_only and unquantized:
+            continue
+        if is_npu() and not unquantized:
+            torch.npu.config.allow_internal_format = True
+        if process_device is None:
+            method.process_weights_after_loading(module)
+        else:
+            with stage_module_for_post_load(module, process_device):
+                method.process_weights_after_loading(module)
+        if is_npu():
+            torch.npu.empty_cache()
+        processed_layers += 1
+    return processed_layers
+
+
+def _merge_comfy_quant_marker(
+    markers: dict[str, dict[str, Any]], prefix: str, marker: dict[str, Any]
+) -> None:
+    # Headers may summarize a layer whose tensor marker includes more fields.
+    previous = markers.setdefault(prefix, {})
+    if any(key in previous and previous[key] != value for key, value in marker.items()):
+        raise ValueError(f"Conflicting Comfy quantization markers for {prefix!r}")
+    previous.update(marker)
+
+
+# Model prefixes ComfyUI strips before matching _quantization_metadata layer names.
+_COMFY_MODEL_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "model.")
+
+
+def _checkpoint_prefix(layer: str, names: set[str]) -> str:
+    """The checkpoint name of a _quantization_metadata layer.
+
+    Some converters write layer names relative to the diffusion model
+    (``blocks.0.attn.qkv_proj``) while the tensors keep the full prefix.
+    """
+    if f"{layer}.weight" in names:
+        return layer
+    for model_prefix in _COMFY_MODEL_PREFIXES:
+        if f"{model_prefix}{layer}.weight" in names:
+            return model_prefix + layer
+    return layer
 
 
 def inspect_comfy_quant_markers(
@@ -33,10 +137,45 @@ def inspect_comfy_quant_markers(
     checkpoint_meta: dict[str, tuple[str, tuple[int, ...]]] = {}
     raw_markers: dict[str, dict[str, Any]] = {}
     marked_dtype_weight_prefixes: set[str] = set()
+    global_quant_formats: set[str] = set()
+    metadata_markers: list[tuple[str, str, dict[str, Any]]] = []
 
     for path in safetensors_list:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
-            for key in checkpoint.keys():
+            metadata = checkpoint.metadata() or {}
+            if quant_format := metadata.get("quant_format"):
+                global_quant_formats.add(quant_format.lower())
+            serialized_metadata = metadata.get("_quantization_metadata")
+            if serialized_metadata is not None:
+                try:
+                    metadata_config = json.loads(serialized_metadata)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid _quantization_metadata in {path}"
+                    ) from exc
+                if not isinstance(metadata_config, dict):
+                    raise ValueError(
+                        f"_quantization_metadata in {path} must contain an object"
+                    )
+                metadata_layers = metadata_config.get("layers")
+                if not isinstance(metadata_layers, dict):
+                    raise ValueError(
+                        f"_quantization_metadata in {path} must contain a layers object"
+                    )
+                for prefix, marker in metadata_layers.items():
+                    if not isinstance(marker, dict):
+                        raise ValueError(
+                            f"Comfy quantization metadata for {prefix!r} must be an object"
+                        )
+                    metadata_markers.append((path, prefix, marker))
+            keys = list(checkpoint.keys())
+            names = set(keys)
+            for path_, prefix, marker in metadata_markers:
+                if path_ == path:
+                    _merge_comfy_quant_marker(
+                        raw_markers, _checkpoint_prefix(prefix, names), marker
+                    )
+            for key in keys:
                 tensor_slice = checkpoint.get_slice(key)
                 checkpoint_meta[key] = (
                     tensor_slice.get_dtype(),
@@ -45,6 +184,7 @@ def inspect_comfy_quant_markers(
                 if key.endswith(".weight") and tensor_slice.get_dtype() in (
                     "F8_E4M3",
                     "I8",
+                    "U8",
                 ):
                     marked_dtype_weight_prefixes.add(key.removesuffix(".weight"))
                 if not key.endswith(".comfy_quant"):
@@ -60,12 +200,24 @@ def inspect_comfy_quant_markers(
                         f"Comfy quantization marker {key!r} must contain a JSON object"
                     )
                 prefix = key.removesuffix(".comfy_quant")
-                previous = raw_markers.get(prefix)
-                if previous is not None and previous != marker:
-                    raise ValueError(
-                        f"Conflicting Comfy quantization markers for {prefix!r}"
-                    )
-                raw_markers[prefix] = marker
+                _merge_comfy_quant_marker(raw_markers, prefix, marker)
+
+    if global_quant_formats == {"mxfp8"}:
+        for prefix in marked_dtype_weight_prefixes:
+            weight_meta = checkpoint_meta[f"{prefix}.weight"]
+            scale_meta = checkpoint_meta.get(f"{prefix}.weight_scale")
+            weight_dtype, weight_shape = weight_meta
+            if (
+                weight_dtype != "F8_E4M3"
+                or len(weight_shape) != 2
+                or weight_shape[1] % 32 != 0
+                or scale_meta != ("U8", (weight_shape[0], weight_shape[1] // 32))
+            ):
+                raise ValueError(
+                    f"MXFP8 layer {prefix!r} has incompatible weight/scale metadata: "
+                    f"{weight_meta} and {scale_meta}"
+                )
+            raw_markers.setdefault(prefix, {"format": "mxfp8"})
 
     missing_markers = marked_dtype_weight_prefixes - raw_markers.keys()
     if missing_markers:
@@ -77,7 +229,21 @@ def inspect_comfy_quant_markers(
     for prefix, marker in raw_markers.items():
         marker_format = marker.get("format")
         required = {f"{prefix}.weight", f"{prefix}.weight_scale"}
-        if marker_format not in ("float8_e4m3fn", "int8_tensorwise"):
+        if marker_format == "asym_w4a8_int8":
+            required = {
+                f"{prefix}.weight",
+                f"{prefix}.weight_s_rel",
+                f"{prefix}.weight_s_channel",
+            }
+        if marker_format == "nvfp4":
+            required.add(f"{prefix}.weight_scale_2")
+        if marker_format not in (
+            "float8_e4m3fn",
+            "int8_tensorwise",
+            "asym_w4a8_int8",
+            "convrot_w4a4",
+            "nvfp4",
+        ):
             continue
         missing = required - checkpoint_meta.keys()
         if missing:
@@ -90,8 +256,139 @@ def inspect_comfy_quant_markers(
                 "static" if f"{prefix}.input_scale" in checkpoint_meta else "dynamic"
             )
             continue
+        if marker_format == "asym_w4a8_int8":
+            weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
+            scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_s_rel"]
+            channel_dtype, channel_shape = checkpoint_meta[f"{prefix}.weight_s_channel"]
+            group_size = int(marker.get("group_size", 16))
+            if group_size < 4:
+                raise ValueError(
+                    f"Comfy W4A8 layer {prefix!r} has invalid group_size={group_size}"
+                )
+            if weight_dtype != "I8" or scale_dtype != "F8_E4M3":
+                raise ValueError(
+                    f"Comfy W4A8 layer {prefix!r} needs I8 weights and FP8 "
+                    f"group scales, got {weight_dtype} and {scale_dtype}"
+                )
+            if channel_dtype != "F32":
+                raise ValueError(
+                    f"Comfy W4A8 layer {prefix!r} needs F32 channel scales, "
+                    f"got {channel_dtype}"
+                )
+            if len(weight_shape) != 2:
+                raise ValueError(
+                    f"Comfy W4A8 layer {prefix!r} needs a 2D packed weight, "
+                    f"got {weight_shape}"
+                )
+            logical_input_size = weight_shape[1] * 2
+            expected_scale_shape = (weight_shape[0], logical_input_size // group_size)
+            if scale_shape != expected_scale_shape or channel_shape != (
+                weight_shape[0],
+            ):
+                raise ValueError(
+                    f"Comfy W4A8 layer {prefix!r} has incompatible weight/scale "
+                    f"shapes: {weight_shape}, {scale_shape}, and {channel_shape}"
+                )
+            codebook_key = f"{prefix}.weight_codebook"
+            correction_key = f"{prefix}.weight_correction"
+            marker["_has_codebook"] = codebook_key in checkpoint_meta
+            marker["_has_correction"] = correction_key in checkpoint_meta
+            if marker["_has_codebook"] and checkpoint_meta[codebook_key] != (
+                "F32",
+                (16,),
+            ):
+                raise ValueError(
+                    f"Comfy W4A8 layer {prefix!r} needs an F32[16] codebook"
+                )
+            expected_correction = (
+                logical_input_size // group_size,
+                weight_shape[0],
+            )
+            if marker["_has_correction"] and checkpoint_meta[correction_key] != (
+                "F32",
+                expected_correction,
+            ):
+                raise ValueError(
+                    f"Comfy W4A8 layer {prefix!r} has an incompatible correction tensor"
+                )
+            continue
+        if marker_format == "convrot_w4a4":
+            weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
+            scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_scale"]
+            if weight_dtype != "I8" or scale_dtype != "F32":
+                raise ValueError(
+                    f"Comfy W4A4 layer {prefix!r} needs I8 packed weights and "
+                    f"F32 scales, got {weight_dtype} and {scale_dtype}"
+                )
+            if len(weight_shape) != 2 or scale_shape != (weight_shape[0],):
+                raise ValueError(
+                    f"Comfy W4A4 layer {prefix!r} has incompatible weight/scale "
+                    f"shapes: {weight_shape} and {scale_shape}"
+                )
+            logical_input_size = weight_shape[1] * 2
+            convrot_group_size = int(marker.get("convrot_groupsize", 256))
+            if convrot_group_size not in (16, 64, 256):
+                raise ValueError(
+                    f"Comfy W4A4 layer {prefix!r} has unsupported "
+                    f"convrot_groupsize={convrot_group_size}"
+                )
+            if logical_input_size % 64 or logical_input_size % convrot_group_size:
+                raise ValueError(
+                    f"Comfy W4A4 layer {prefix!r} has input size "
+                    f"{logical_input_size}, incompatible with quant_group_size=64 "
+                    f"and convrot_groupsize={convrot_group_size}"
+                )
+            continue
+        if marker_format == "nvfp4":
+            weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
+            scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_scale"]
+            scale_2_dtype, scale_2_shape = checkpoint_meta[f"{prefix}.weight_scale_2"]
+            if weight_dtype != "U8" or scale_dtype != "F8_E4M3":
+                raise ValueError(
+                    f"Comfy NVFP4 layer {prefix!r} needs U8 packed weights and "
+                    f"FP8 block scales, got {weight_dtype} and {scale_dtype}"
+                )
+            if scale_2_dtype != "F32" or scale_2_shape not in ((), (1,)):
+                raise ValueError(
+                    f"Comfy NVFP4 layer {prefix!r} needs a scalar F32 "
+                    f"weight_scale_2, got {scale_2_dtype}{scale_2_shape}"
+                )
+            if len(weight_shape) != 2:
+                raise ValueError(
+                    f"Comfy NVFP4 layer {prefix!r} needs a 2D packed weight, "
+                    f"got {weight_shape}"
+                )
+            logical_input_size = weight_shape[1] * 2
+            expected_scale_shape = (weight_shape[0], logical_input_size // 16)
+            if logical_input_size % 16 or scale_shape != expected_scale_shape:
+                raise ValueError(
+                    f"Comfy NVFP4 layer {prefix!r} has incompatible weight/scale "
+                    f"shapes: {weight_shape} and {scale_shape}"
+                )
+            pre_quant_scale_key = f"{prefix}.pre_quant_scale"
+            marker["_has_pre_quant_scale"] = pre_quant_scale_key in checkpoint_meta
+            if marker["_has_pre_quant_scale"]:
+                pre_scale_dtype, pre_scale_shape = checkpoint_meta[pre_quant_scale_key]
+                if pre_scale_dtype not in ("BF16", "F16", "F32") or (
+                    pre_scale_shape != (logical_input_size,)
+                ):
+                    raise ValueError(
+                        f"Comfy NVFP4 layer {prefix!r} has an incompatible "
+                        f"pre_quant_scale: {pre_scale_dtype}{pre_scale_shape}"
+                    )
+            continue
+        if marker_format != "int8_tensorwise":
+            continue
         weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
         scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_scale"]
+        if weight_dtype == "I8" and scale_dtype == "F32" and scale_shape == ():
+            if len(weight_shape) != 2:
+                raise ValueError(
+                    f"Comfy tensorwise INT8 layer {prefix!r} needs a 2D weight, "
+                    f"got {weight_shape}"
+                )
+            marker["_is_tensorwise_scalar"] = True
+            continue
         if weight_dtype != "I8" or scale_dtype != "F32":
             raise ValueError(
                 f"Comfy INT8 layer {prefix!r} needs I8 weights and F32 scales, "
@@ -102,6 +399,7 @@ def inspect_comfy_quant_markers(
                 f"Comfy INT8 layer {prefix!r} has incompatible weight/scale "
                 f"shapes: {weight_shape} and {scale_shape}"
             )
+        marker["_is_rowwise"] = True
 
     mapped_markers: dict[str, dict[str, Any]] = {}
     for prefix, marker in raw_markers.items():
@@ -121,9 +419,24 @@ def resolve_comfy_checkpoint_quantization(
         return None
     formats = sorted({str(marker.get("format")) for marker in layer_markers.values()})
     if formats == ["int8_tensorwise"]:
-        return KitchenInt8Config(layer_markers=layer_markers)
+        return ConvRotInt8Config(layer_markers=layer_markers)
+    if formats == ["asym_w4a8_int8"]:
+        return KitchenW4A8Config(layer_markers)
+    if formats == ["asym_w4a8_int8", "int8_tensorwise"]:
+        return KitchenW4A8Config(layer_markers)
+    if formats == ["convrot_w4a4"]:
+        return KitchenW4A4Config(layer_markers)
+    if formats == ["convrot_w4a4", "int8_tensorwise"]:
+        return KitchenW4A4Config(layer_markers)
     if formats == ["float8_e4m3fn"]:
         return ComfyFp8Config(layer_markers)
+    if formats in (["nvfp4"], ["int8_tensorwise", "nvfp4"]):
+        return ComfyNvfp4Config(layer_markers)
+    if formats == ["mxfp8"]:
+        return MXFP8Config(
+            is_checkpoint_fp8_serialized=True,
+            layer_markers=layer_markers,
+        )
     raise NotImplementedError(
         "Unsupported Comfy quantization format(s): " + ", ".join(formats)
     )
@@ -147,14 +460,6 @@ def normalize_flat_modelopt_quant_config(
     normalized = dict(quant_cfg)
     normalized.setdefault("quant_type", quant_algo)
     return normalized
-
-
-def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
-    """Infer NVFP4 group_size from serialized weight/scale tensor shapes."""
-    return _infer_nvfp4_group_size_from_shapes(
-        getattr(weight, "shape", ()),
-        getattr(scale, "shape", ()),
-    )
 
 
 def _infer_nvfp4_group_size_from_shapes(weight_shape, scale_shape) -> Optional[int]:
@@ -285,13 +590,6 @@ def find_quant_modelslim_config(model_config, component_model_path):
     return quant_cfg
 
 
-def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
-    for prefix, new_prefix in prefix_mapping.items():
-        if key.startswith(prefix):
-            key = key.replace(prefix, new_prefix, 1)
-    return key
-
-
 def get_quant_config(
     model_config,
     component_model_path: str,
@@ -316,54 +614,17 @@ def get_quant_config(
     if hf_quant_config["quant_method"] == "gguf":
         return quant_cls.from_config({})
 
-    if hf_quant_config is not None:
-        hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
-        is_modelopt_fp8 = (
-            hf_quant_config.get("quant_method") == "modelopt"
-            and "FP8" in str(hf_quant_config.get("quant_algo", "")).upper()
-        )
-        extra_kwargs = (
-            {"ignore_remap": quant_ignore_remap}
-            if quant_ignore_remap and is_modelopt_fp8
-            else {}
-        )
-        return quant_cls.from_config(hf_quant_config, **extra_kwargs)
-
-    model_name_or_path = model_config["model_path"]
-    hf_folder = model_name_or_path
-
-    possible_config_filenames = quant_cls.get_config_filenames()
-
-    # If the quantization config is not found, use the default config.
-    if not possible_config_filenames:
-        return quant_cls()
-
-    config_files = glob.glob(os.path.join(hf_folder, "*.json"))
-
-    quant_config_files = [
-        f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
-    ]
-    if len(quant_config_files) == 0:
-        raise ValueError(
-            f"Cannot find the config file for {model_config['quantization_config']['quant_method']}"
-        )
-    if len(quant_config_files) > 1:
-        raise ValueError(
-            f"Found multiple config files for {model_config['quantization_config']['quant_method']}: "
-            f"{quant_config_files}"
-        )
-
-    quant_config_file = quant_config_files[0]
-    with open(quant_config_file) as f:
-        config = json.load(f)
-        if remap_prefix is not None and "quantization" in config:
-            exclude_modules = [
-                replace_prefix(key, remap_prefix)
-                for key in config["quantization"]["exclude_modules"]
-            ]
-            config["quantization"]["exclude_modules"] = exclude_modules
-        config["packed_modules_mapping"] = packed_modules_mapping
-        return quant_cls.from_config(config)
+    hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+    is_modelopt_fp8 = (
+        hf_quant_config.get("quant_method") == "modelopt"
+        and "FP8" in str(hf_quant_config.get("quant_algo", "")).upper()
+    )
+    extra_kwargs = (
+        {"ignore_remap": quant_ignore_remap}
+        if quant_ignore_remap and is_modelopt_fp8
+        else {}
+    )
+    return quant_cls.from_config(hf_quant_config, **extra_kwargs)
 
 
 def handle_fp8_metadata_format(quant_config_dict):
@@ -374,6 +635,48 @@ def handle_fp8_metadata_format(quant_config_dict):
         quant_config_dict["quant_method"] = "fp8"
         quant_config_dict["activation_scheme"] = "dynamic"
     return quant_config_dict
+
+
+def _get_serialized_quant_config(
+    file_path: str, quant_config_dict: dict
+) -> Optional[QuantizationConfig]:
+    from sglang.multimodal_gen.runtime.layers.quantization.rowwise_fp8 import (
+        FP8_FORMAT,
+        build_rowwise_fp8_config_from_metadata,
+    )
+
+    declared_formats = set()
+    layers = quant_config_dict.get("layers", {})
+    if isinstance(layers, dict):
+        for layer_config in layers.values():
+            layer_format = (
+                layer_config.get("format")
+                if isinstance(layer_config, dict)
+                else layer_config
+            )
+            if isinstance(layer_format, str):
+                declared_formats.add(layer_format)
+    quant_configs = quant_config_dict.get("quant_configs", {})
+    if isinstance(quant_configs, dict):
+        declared_formats.update(quant_configs)
+
+    # NVFP4 layer formats stay with the Comfy loaders, which own that layout.
+    format_builders = {
+        FP8_FORMAT: lambda: build_rowwise_fp8_config_from_metadata(
+            quant_config_dict, _read_safetensors_tensor_metadata(file_path)
+        ),
+    }
+    supported_formats = declared_formats.intersection(format_builders)
+    if not supported_formats:
+        return None
+    if len(supported_formats) > 1:
+        raise ValueError(
+            "Serialized quantization metadata declares multiple supported quant "
+            f"formats: {sorted(supported_formats)}. Only one is supported."
+        )
+
+    quant_format = supported_formats.pop()
+    return format_builders[quant_format]()
 
 
 def get_quant_config_from_safetensors_metadata(
@@ -405,6 +708,11 @@ def get_quant_config_from_safetensors_metadata(
 
     if not quant_config_dict:
         return None
+
+    quant_config = _get_serialized_quant_config(file_path, quant_config_dict)
+    if quant_config is not None:
+        logger.debug(f"Get quantization config from safetensors file: {file_path}")
+        return quant_config
 
     # handle diffusers fp8 safetensors metadata format
     if (
@@ -452,7 +760,7 @@ def _canonicalize_modulation_exclude(module_name: str) -> str:
     return module_name
 
 
-def _build_nvfp4_config_from_safetensors_files(
+def build_nvfp4_config_from_safetensors_list(
     file_paths: list[str],
     param_names_mapping_dict: Optional[dict] = None,
     reverse_param_names_mapping_dict: Optional[dict] = None,
@@ -501,11 +809,12 @@ def _build_nvfp4_config_from_safetensors_files(
             and "layers" in quant_config_dict
         ):
             layers = quant_config_dict.get("layers", {})
-            file_quantized_modules.update(
+            metadata_nvfp4_modules = {
                 layer_name
                 for layer_name, layer_cfg in layers.items()
                 if isinstance(layer_cfg, dict) and layer_cfg.get("format") == "nvfp4"
-            )
+            }
+            file_quantized_modules.update(metadata_nvfp4_modules)
 
         tensor_metadata = _read_safetensors_tensor_metadata(file_path)
         with safe_open(file_path, framework="pt", device="cpu") as f:
@@ -642,6 +951,7 @@ def _build_nvfp4_config_from_safetensors_files(
                     "swizzled" if checkpoint_uses_swizzled_scales else "linear"
                 ),
                 "swap_weight_nibbles": checkpoint_uses_swizzled_scales,
+                "checkpoint_uses_comfy_quantization": checkpoint_uses_comfy_quant,
             }
         )
         logger.info(
@@ -662,32 +972,3 @@ def _build_nvfp4_config_from_safetensors_files(
             e,
         )
         return None
-
-
-def build_nvfp4_config_from_safetensors(
-    file_path: str,
-    param_names_mapping_dict: Optional[dict] = None,
-    reverse_param_names_mapping_dict: Optional[dict] = None,
-    fallback_group_size: Optional[int] = None,
-) -> Optional[QuantizationConfig]:
-    """Backward-compatible wrapper for a single safetensors file."""
-    return _build_nvfp4_config_from_safetensors_files(
-        [file_path],
-        param_names_mapping_dict,
-        reverse_param_names_mapping_dict,
-        fallback_group_size,
-    )
-
-
-def build_nvfp4_config_from_safetensors_list(
-    file_paths: list[str],
-    param_names_mapping_dict: Optional[dict] = None,
-    reverse_param_names_mapping_dict: Optional[dict] = None,
-    fallback_group_size: Optional[int] = None,
-) -> Optional[QuantizationConfig]:
-    return _build_nvfp4_config_from_safetensors_files(
-        file_paths,
-        param_names_mapping_dict,
-        reverse_param_names_mapping_dict,
-        fallback_group_size,
-    )

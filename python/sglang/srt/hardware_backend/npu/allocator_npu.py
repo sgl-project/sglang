@@ -6,7 +6,8 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     alloc_extend_naive,
 )
-from sglang.srt.utils import get_num_new_pages, next_power_of_2
+from sglang.srt.mem_cache.utils import get_num_new_pages
+from sglang.srt.utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -48,14 +49,14 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             num_new_pages_item = num_new_pages_tensor.item()
         else:
             num_new_pages_item = num_new_pages
-        if self.need_sort and num_new_pages_item > len(self.free_pages):
+        if num_new_pages_item > len(self.free_pages):
             self.merge_and_sort_free()
 
         if num_new_pages_item > len(self.free_pages):
             return None
 
         if num_new_pages_item < 200:
-            from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
+            from sgl_kernel_npu.operators.mem_cache import alloc_extend_indices
 
             out_indices = torch.empty(
                 (extend_num_tokens,),
@@ -63,15 +64,13 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 device=self.device,
             )
             max_num_extend_tokens = next_power_of_2(extend_num_tokens)
-            bs = prefix_lens.shape[0]
-            alloc_extend_kernel[(bs,)](
+            alloc_extend_indices(
                 prefix_lens,
                 seq_lens,
                 last_loc,
                 self.free_pages,
-                out_indices,
-                next_power_of_2(bs),
                 self.page_size,
+                out_indices,
                 max_num_extend_tokens,
             )
 
@@ -116,7 +115,6 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         if num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
-
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -126,6 +124,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages == 0:
             out_indices = last_loc + 1
         else:
+            start_new_pages = start_new_pages.clamp(max=num_new_pages - 1)
             out_indices = (last_loc + 1) * (1 - need_new_pages) + self.free_pages[
                 start_new_pages
             ] * self.page_size * need_new_pages
@@ -140,14 +139,10 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        if self.is_not_in_free_group:
+        if self.free_group is None:
             device = free_index.device
             free_page_indices = torch.unique(free_index.cpu() // self.page_size)
-            free_page_indices = free_page_indices.to(device)
-            if self.need_sort:
-                self.release_pages = torch.cat((free_page_indices, self.release_pages))
-            else:
-                self.free_pages = torch.cat((free_page_indices, self.free_pages))
+            self._release_page_ids(free_page_indices.to(device))
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 

@@ -29,9 +29,12 @@ from sglang.srt.layers.clippable_linear import (
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.runtime_context import (
+    get_mm,
+    get_parallel,
+)
 from sglang.srt.utils import (
-    add_prefix,
     cpu_has_amx_support,
     get_device_capability,
     is_cpu,
@@ -192,18 +195,12 @@ class Gemma4VisionAttention(nn.Module):
 
     @staticmethod
     def _select_backend() -> str:
-        """Mirror VisionAttention._determine_attention_backend for consistency."""
-
         override = get_mm().mm_attention_backend
         if override is not None:
             return override
         if is_cuda():
             major, _ = get_device_capability()
             if major == 9:
-                from sglang.srt.utils import is_blackwell_supported
-
-                if is_blackwell_supported():
-                    return "triton_attn"
                 return "fa3"
             return "triton_attn"
         if is_hip():
@@ -526,12 +523,16 @@ class Gemma4VisionPooler(nn.Module):
         if isinstance(length, (list, tuple)):
             length = length[0]
         if hidden_states.shape[1] == length:
-            mask = padding_positions
+            mask = ~padding_positions
         else:
+            hidden_states = hidden_states.masked_fill(
+                padding_positions.unsqueeze(-1), 0.0
+            )
             hidden_states, mask = self._avg_pool_by_positions(
                 hidden_states, patch_positions, length
             )
-        hidden_states = hidden_states * self.root_hidden_size
+        # Scaling can exceed the FP16 range before standardization.
+        hidden_states = hidden_states.float() * self.root_hidden_size
         return hidden_states, mask
 
 
@@ -614,4 +615,4 @@ class Gemma4VisionEncoder(nn.Module):
         if self.standardize:
             pooled = (pooled - self.std_bias) * self.std_scale
 
-        return pooled, pooler_mask
+        return pooled.to(inputs_embeds.dtype), pooler_mask

@@ -8,19 +8,22 @@ from urllib.parse import unquote, urlparse
 import pybase64
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
+from sglang.srt.multimodal.media_io import (
+    check_local_media_file,
+    download_remote_media,
+    get_video_bytes,
+    is_local_media_path,
+    media_url_timeout,
+)
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.common import download_remote_media
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -413,24 +416,30 @@ class MossVLImageProcessor(SGLangBaseProcessor):
     def _write_video_bytes_to_tempfile(
         self, video_bytes: bytes, suffix: str = ".mp4"
     ) -> str:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-            f.write(video_bytes)
-            return f.name
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+                temp_path = f.name
+                f.write(video_bytes)
+            return temp_path
+        except BaseException:
+            if temp_path is not None:
+                self._remove_temp_video_paths([temp_path])
+            raise
 
     def _normalize_video_string(self, value: str) -> Tuple[str, Optional[str]]:
         if value.startswith("file://"):
-            return self._resolve_file_url(value), None
+            return check_local_media_file(self._resolve_file_url(value)), None
 
-        if os.path.isfile(value):
-            return value, None
+        if is_local_media_path(value):
+            return check_local_media_file(value), None
 
         if value.startswith(("http://", "https://")):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            timeout = media_url_timeout(10)
             content = download_remote_media(value, timeout=timeout)
             suffix = os.path.splitext(urlparse(value).path)[1] or ".mp4"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-                f.write(content)
-                return f.name, f.name
+            temp_path = self._write_video_bytes_to_tempfile(content, suffix=suffix)
+            return temp_path, temp_path
 
         if value.startswith("data:"):
             header, encoded = value.split(",", 1)
@@ -446,9 +455,8 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             )
             return temp_path, temp_path
 
-        temp_path = self._write_video_bytes_to_tempfile(
-            pybase64.b64decode(value, validate=True)
-        )
+        # Bare base64; a missing local path gets the loaders' not-found error.
+        temp_path = self._write_video_bytes_to_tempfile(get_video_bytes(value))
         return temp_path, temp_path
 
     def _normalize_single_video_input(
@@ -483,14 +491,45 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             )
             for v in video_data
         ]
-        results = await asyncio.gather(*futures)
+        gather_task = asyncio.gather(*futures, return_exceptions=True)
+        cancelled_error = None
+        try:
+            results = await asyncio.shield(gather_task)
+        except asyncio.CancelledError as error:
+            cancelled_error = error
+            results = await gather_task
 
         normalized_inputs: List[Union[str, Dict]] = []
         temp_paths: List[str] = []
-        for normalized_input, created_paths in results:
+        errors = []
+        for result in results:
+            if isinstance(result, BaseException):
+                errors.append(result)
+                continue
+            normalized_input, created_paths = result
             normalized_inputs.append(normalized_input)
             temp_paths.extend(created_paths)
+
+        if cancelled_error is not None or errors:
+            self._remove_temp_video_paths(temp_paths)
+            if cancelled_error is not None:
+                raise cancelled_error
+            first_error = errors[0]
+            if len(errors) > 1:
+                first_error.add_note(
+                    f"{len(errors) - 1} additional video input(s) failed"
+                )
+            raise first_error
+
         return normalized_inputs, temp_paths
+
+    @staticmethod
+    def _remove_temp_video_paths(temp_paths: List[str]) -> None:
+        for temp_path in temp_paths:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
 
     async def process_mm_data_async(
         self,
@@ -500,9 +539,10 @@ class MossVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        normalized_video_data, temp_video_paths = (
-            await self._normalize_video_inputs_async(request_obj.video_data)
-        )
+        (
+            normalized_video_data,
+            temp_video_paths,
+        ) = await self._normalize_video_inputs_async(request_obj.video_data)
 
         try:
             base_output = await self.load_mm_data(
@@ -545,14 +585,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             if mm_items and vision_token_info:
                 mm_items[0].set("vision_token_info", vision_token_info[0])
 
-            if self.use_cuda_ipc:
-                for item in mm_items:
-                    if isinstance(item.feature, torch.Tensor):
-                        item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
-                    if isinstance(item.precomputed_embeddings, torch.Tensor):
-                        item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
-                            item.precomputed_embeddings
-                        )
+            mm_items = self._prepare_mm_items_for_transport(mm_items)
 
             return MultimodalProcessorOutput(
                 input_ids=input_ids.tolist(),
@@ -569,8 +602,4 @@ class MossVLImageProcessor(SGLangBaseProcessor):
                 visible_frame_counts=visible_frame_counts,
             )
         finally:
-            for temp_path in temp_video_paths:
-                try:
-                    os.unlink(temp_path)
-                except FileNotFoundError:
-                    pass
+            self._remove_temp_video_paths(temp_video_paths)

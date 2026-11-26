@@ -37,6 +37,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
@@ -161,7 +162,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_kernel(const __
   // ---- 1. push: wait for the producer's output (PDL; no-op without a PDL
   // launch or an early-triggering producer), multicast-store this rank's
   // partial row, and issue the residual load (it lands under the barrier). ----
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  device::PDLWaitPrimary<true>();
   const auto* in_row = static_cast<const __nv_bfloat16*>(p.in) + t * p.in_stride_t;
   const auto* sh_row =
       p.shared == nullptr ? nullptr : static_cast<const __nv_bfloat16*>(p.shared) + t * p.shared_stride_t;
@@ -230,7 +231,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_kernel(const __
         acc += h * cm * __bfloat162float(wtaps[i][j][w]);
       }
       acc += xj * __bfloat162float(wtaps[i][j][W1]);
-      if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
+      if constexpr (USE_SILU) acc = device::activation::silu(acc);
       if constexpr (USE_RESIDUAL) acc += xj;
       y[j] = acc;
     }
@@ -393,7 +394,7 @@ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_verify_kernel(const __grid
   // GPU, so Phase 2's cross-token (neighbor) staging reads are race-free -- the
   // per-block barrier only synchronized the same blockIdx across ranks and did
   // NOT order block t-j's push before block t's read.
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  device::PDLWaitPrimary<true>();
   auto* mc = static_cast<__nv_bfloat16*>(p.mc_stage);
   const auto* in = static_cast<const __nv_bfloat16*>(p.in);
   const auto* sh = static_cast<const __nv_bfloat16*>(p.shared);
@@ -505,7 +506,7 @@ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_verify_kernel(const __grid
           acc += tap * __bfloat162float(wtaps[j][iw]);
         }
         acc += xj * __bfloat162float(wtaps[j][W1]);
-        if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
+        if constexpr (USE_SILU) acc = device::activation::silu(acc);
         if constexpr (USE_RESIDUAL) acc += xj;
         y[j] = acc;
       }
@@ -627,7 +628,7 @@ struct ArSconvNormKernel {
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(residual_out);
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hs_out);
     TensorMatcher({D}).with_dtype<DType>().with_device(dev).verify(norm_weight);
-    TensorMatcher({-1, W1s, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    TensorMatcher({-1, W1s, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({T}).with_dtype<int32_t>().with_device(dev).verify(cache_indices);
     TensorMatcher({T}).with_device(dev).verify(cache_mask);
     TensorMatcher({D, Wd}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(conv_weight);
@@ -752,7 +753,7 @@ struct ArSconvNormVerifyKernel {
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(residual_out);
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hs_out);
     TensorMatcher({D}).with_dtype<DType>().with_device(dev).verify(norm_weight);
-    TensorMatcher({-1, W1s, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    TensorMatcher({-1, W1s, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(dev).verify(cache_indices);
     TensorMatcher({B}).with_device(dev).verify(cache_mask);
     TensorMatcher({D, Wd}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(conv_weight);

@@ -23,7 +23,6 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import get_scalar_types
-from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
     AWQAscendLinearScheme,
@@ -33,6 +32,7 @@ from .schemes import (
     AWQLinearScheme,
     AWQMarlinLinearScheme,
     AWQMoEScheme,
+    AWQXPULinearScheme,
 )
 
 if TYPE_CHECKING:
@@ -211,6 +211,34 @@ class AWQCPUConfig(AWQConfig):
 
         assert isinstance(layer, FusedMoE)
         return AWQIntelAMXMoEScheme(self)
+
+
+class AWQXPUConfig(AWQConfig):
+    """AWQ int4 dense linear on Intel XPU.
+
+    Lowers to torch's native ``_weight_int4pack_mm_with_scales_and_zeros`` op.
+    MoE is out of scope for the dense phase (mirrors ``GPTQXPUConfig``).
+    """
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[LinearMethodBase]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            raise NotImplementedError(
+                "AWQ MoE is not yet supported on XPU (dense-only phase)."
+            )
+        return super().get_quant_method(layer, prefix)
+
+    def get_linear_scheme(self, layer: torch.nn.Module):
+        from sglang.srt.layers.linear import LinearBase
+
+        assert isinstance(layer, LinearBase)
+        return AWQXPULinearScheme(self)
 
 
 class AWQMarlinConfig(QuantizationConfig):
@@ -439,7 +467,6 @@ class AWQLinearMethod(LinearMethodBase):
 
 
 class AWQMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quant_config: AWQMarlinConfig):
         self.quant_config = quant_config
         self.quant_type = scalar_types.uint4
@@ -472,19 +499,12 @@ class AWQMoEMethod(FusedMoEMethodBase):
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
+
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         return layer.scheme.apply_weights(layer, dispatch_output)
-
-
-# Register fake implementations for torch.compile support
-if _is_cuda:
-
-    @register_fake_if_exists("sgl_kernel::awq_marlin_repack")
-    def _(b_q_weight, size_k, size_n, num_bits):
-        return b_q_weight.new_empty(
-            (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
-        )

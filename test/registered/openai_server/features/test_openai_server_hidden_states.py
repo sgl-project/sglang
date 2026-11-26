@@ -3,8 +3,8 @@ from abc import ABC
 
 import openai
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
@@ -16,16 +16,15 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=177, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=178, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(
     est_time=140,
-    suite="stage-b-test-1-gpu-small-amd",
+    suite="base-b-test-1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
 
 
 class BaseTestOpenAIServerWithHiddenStates(ABC):
-
     @classmethod
     def setUpClass(cls):
         cls.return_hidden_states = [False, True]
@@ -55,18 +54,14 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
 
     def test_chat_completion(self):
         for return_hidden_states in self.return_hidden_states:
-            for (
-                parallel_sample_num
-            ) in (
+            for parallel_sample_num in (
                 self.parallel_sample_nums
             ):  # parallel sample num 2 breaks in the adapter with a 400 for EAGLE
                 self.run_chat_completion(parallel_sample_num, return_hidden_states)
 
     def test_chat_completion_stream(self):
         for return_hidden_states in self.return_hidden_states:
-            for (
-                parallel_sample_num
-            ) in (
+            for parallel_sample_num in (
                 self.parallel_sample_nums
             ):  # parallel sample num > 1 breaks in the adapter with a 400 for EAGLE
                 self.run_chat_completion_stream(
@@ -144,13 +139,13 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
                     hidden_states_list.append(choice.hidden_states)
 
         if return_hidden_states:
-            assert (
-                len(hidden_states_list) == parallel_sample_num * num_choices
-            ), f"Expected {parallel_sample_num * num_choices} hidden states, got {len(hidden_states_list)}"
+            assert len(hidden_states_list) == parallel_sample_num * num_choices, (
+                f"Expected {parallel_sample_num * num_choices} hidden states, got {len(hidden_states_list)}"
+            )
         else:
-            assert (
-                hidden_states_list == []
-            ), "hidden_states were returned and should not have been"
+            assert hidden_states_list == [], (
+                "hidden_states were returned and should not have been"
+            )
 
     def run_chat_completion(self, parallel_sample_num, return_hidden_states):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -201,13 +196,13 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
                     hidden_states_list.append(choice.delta.hidden_states)
 
         if return_hidden_states:
-            assert (
-                len(hidden_states_list) == parallel_sample_num
-            ), f"Expected {parallel_sample_num} hidden states, got {len(hidden_states_list)}"
+            assert len(hidden_states_list) == parallel_sample_num, (
+                f"Expected {parallel_sample_num} hidden states, got {len(hidden_states_list)}"
+            )
         else:
-            assert (
-                hidden_states_list == []
-            ), "hidden_states were returned and should not have been"
+            assert hidden_states_list == [], (
+                "hidden_states were returned and should not have been"
+            )
 
 
 class TestOpenAIServerWithHiddenStatesEnabled(
@@ -249,7 +244,11 @@ class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=["--enable-return-hidden-states", "--disable-cuda-graph"],
+            other_args=[
+                "--enable-return-hidden-states",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
+            ],
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)

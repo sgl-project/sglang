@@ -12,6 +12,7 @@ import logging
 import multiprocessing as mp
 import traceback
 from concurrent import futures
+from http import HTTPStatus
 from typing import List
 
 import grpc
@@ -19,20 +20,30 @@ import zmq
 import zmq.asyncio
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
-from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
-from sglang.srt.disaggregation.encoder.server import MMEncoder, launch_encoder
+from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
+from sglang.srt.disaggregation.encoder.runtime import validate_encode_request
+from sglang.srt.disaggregation.encoder.server import (
+    MMEncoder,
+    await_task_completion_on_cancel,
+    launch_encoder,
+)
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
-from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_serving,
+    publish,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import random_uuid
 from sglang.srt.utils.network import NetworkAddress, get_zmq_socket
 
 logger = logging.getLogger(__name__)
-SGLangEncoderServicer = sglang_encoder_pb2_grpc.SglangEncoderServicer
+SGLangEncoderServicer = encoder_pb2_grpc.SglangEncoderServicer
 add_SGLangEncoderServicer_to_server = (
-    sglang_encoder_pb2_grpc.add_SglangEncoderServicer_to_server
+    encoder_pb2_grpc.add_SglangEncoderServicer_to_server
 )
 
 
@@ -41,9 +52,6 @@ class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
     Standard gRPC health check service for encoder server.
     Implements grpc.health.v1.Health for Kubernetes probes.
     """
-
-    OVERALL_SERVER = ""
-    ENCODER_SERVICE = "sglang.grpc.encoder.SglangEncoder"
 
     def __init__(self):
         self._serving = False
@@ -76,15 +84,18 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self,
         encoder: MMEncoder,
         send_sockets: List[zmq.Socket],
-        server_args: ServerArgs,
     ):
         self.encoder = encoder
         self.send_sockets = send_sockets
-        self.server_args = server_args
+
+    async def _dispatch_encode(self, request_dict: dict):
+        for socket in self.send_sockets:
+            await async_sock_send(socket, wrap_as_pickle(request_dict))
+        return await self.encoder.encode_request(request_dict, Modality.IMAGE)
 
     async def Encode(
-        self, request: sglang_encoder_pb2.EncodeRequest, context
-    ) -> sglang_encoder_pb2.EncodeResponse:
+        self, request: encoder_pb2.EncodeRequest, context
+    ) -> encoder_pb2.EncodeResponse:
         try:
             request_dict = {
                 "mm_items": list(request.mm_items),
@@ -93,26 +104,38 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 "num_parts": request.num_parts,
                 "part_idx": request.part_idx,
             }
-            for socket in self.send_sockets:
-                await async_sock_send(socket, wrap_as_pickle(request_dict))
+            if err := validate_encode_request(request_dict):
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details(err)
+                return encoder_pb2.EncodeResponse()
 
             # gRPC encode is image-only; the request follows the configured
-            # cache and transfer backend.
-            (
-                nbytes,
-                embedding_len,
-                embedding_dim,
-                error_msg,
-                error_code,
-            ) = await self.encoder.encode_request(request_dict, Modality.IMAGE)
+            # cache and transfer backend. Keep TP dispatch and rank-0 collective
+            # launch order identical when gRPC handlers run concurrently.
+            async with self.encoder.encode_dispatch_lock:
+                encode_task = asyncio.create_task(self._dispatch_encode(request_dict))
+                result = await await_task_completion_on_cancel(
+                    encode_task, f"Encoder request {request.req_id}"
+                )
+                (
+                    nbytes,
+                    embedding_len,
+                    embedding_dim,
+                    error_msg,
+                    error_code,
+                ) = result
             if error_msg is not None:
                 await self.encoder.release_request(request.req_id)
-                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_code(
+                    grpc.StatusCode.INVALID_ARGUMENT
+                    if error_code == HTTPStatus.BAD_REQUEST
+                    else grpc.StatusCode.INTERNAL
+                )
                 context.set_details(error_msg)
-                return sglang_encoder_pb2.EncodeResponse()
+                return encoder_pb2.EncodeResponse()
 
             if get_disagg().encoder_transfer_backend == "mooncake":
-                return sglang_encoder_pb2.EncodeResponse(
+                return encoder_pb2.EncodeResponse(
                     embedding_size=nbytes,
                     embedding_len=embedding_len,
                     embedding_dim=embedding_dim,
@@ -134,7 +157,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                         )
                     await asyncio.gather(*tasks)
                     await self.encoder.release_request(request.req_id)
-                return sglang_encoder_pb2.EncodeResponse()
+                return encoder_pb2.EncodeResponse()
             elif get_disagg().encoder_transfer_backend == "zmq_to_tokenizer":
                 embedding_port = (
                     request.embedding_port[0] if request.embedding_port else 0
@@ -145,21 +168,29 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     embedding_port=embedding_port,
                 )
                 await self.encoder.release_request(request.req_id)
-                return sglang_encoder_pb2.EncodeResponse()
+                return encoder_pb2.EncodeResponse()
 
-            return sglang_encoder_pb2.EncodeResponse()
+            return encoder_pb2.EncodeResponse()
 
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(self.encoder.release_request(request.req_id))
+            except Exception:
+                logger.exception(
+                    "Failed to release cancelled encoder request %s", request.req_id
+                )
+            raise
         except Exception as e:
             logger.error(f"Encode error: {e}")
             traceback.print_exc()
             await self.encoder.release_request(request.req_id)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return sglang_encoder_pb2.EncodeResponse()
+            return encoder_pb2.EncodeResponse()
 
     async def Send(
-        self, request: sglang_encoder_pb2.SendRequest, context
-    ) -> sglang_encoder_pb2.SendResponse:
+        self, request: encoder_pb2.SendRequest, context
+    ) -> encoder_pb2.SendResponse:
         try:
             await self.encoder.send(
                 req_id=request.req_id,
@@ -171,51 +202,60 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 ),
             )
             await self.encoder.release_request(request.req_id)
-            return sglang_encoder_pb2.SendResponse()
+            return encoder_pb2.SendResponse()
 
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(self.encoder.release_request(request.req_id))
+            except Exception:
+                logger.exception(
+                    "Failed to release cancelled encoder request %s", request.req_id
+                )
+            raise
         except Exception as e:
             logger.error(f"Send error: {e}")
             traceback.print_exc()
             await self.encoder.release_request(request.req_id)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return sglang_encoder_pb2.SendResponse()
+            return encoder_pb2.SendResponse()
 
     async def SchedulerReceiveUrl(
-        self, request: sglang_encoder_pb2.SchedulerReceiveUrlRequest, context
-    ) -> sglang_encoder_pb2.SchedulerReceiveUrlResponse:
+        self, request: encoder_pb2.SchedulerReceiveUrlRequest, context
+    ) -> encoder_pb2.SchedulerReceiveUrlResponse:
         try:
             await self.encoder.register_embedding_destinations(
                 request.req_id,
                 request.receive_count,
                 [request.receive_url],
             )
-            return sglang_encoder_pb2.SchedulerReceiveUrlResponse()
+            return encoder_pb2.SchedulerReceiveUrlResponse()
 
         except Exception as e:
             logger.error(f"SchedulerReceiveUrl error: {e}")
             traceback.print_exc()
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return sglang_encoder_pb2.SchedulerReceiveUrlResponse()
+            return encoder_pb2.SchedulerReceiveUrlResponse()
 
 
 async def serve_grpc_encoder(server_args: ServerArgs):
+    publish(server_args, role="encoder")
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.asyncio.Context(10)
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
 
-    if server_args.dist_init_addr:
-        na = NetworkAddress.parse(server_args.dist_init_addr)
+    if get_parallel().dist_init_addr:
+        na = NetworkAddress.parse(get_parallel().dist_init_addr)
         dist_init_method = na.to_tcp()
     else:
         dist_init_method = NetworkAddress(
-            server_args.host or "127.0.0.1", port_args.nccl_port
+            get_serving().host or "127.0.0.1", port_args.nccl_port
         ).to_tcp()
 
     send_sockets: List[zmq.Socket] = []
-    for rank in range(1, server_args.tp_size):
+    for rank in range(1, get_parallel().tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
             get_zmq_socket(zmq_ctx, zmq.PUSH, schedule_path, bind=False)
@@ -242,18 +282,19 @@ async def serve_grpc_encoder(server_args: ServerArgs):
     encoder_servicer = SGLangEncoderServer(
         encoder=encoder,
         send_sockets=send_sockets,
-        server_args=server_args,
     )
     add_SGLangEncoderServicer_to_server(encoder_servicer, server)
 
     SERVICE_NAMES = (
-        sglang_encoder_pb2.DESCRIPTOR.services_by_name["SglangEncoder"].full_name,
+        encoder_pb2.DESCRIPTOR.services_by_name["SglangEncoder"].full_name,
         "grpc.health.v1.Health",
         reflection.SERVICE_NAME,
     )
     reflection.enable_server_reflection(SERVICE_NAMES, server)
 
-    listen_addr = NetworkAddress(server_args.host, server_args.port).to_host_port_str()
+    listen_addr = NetworkAddress(
+        get_serving().host, get_serving().port
+    ).to_host_port_str()
     server.add_insecure_port(listen_addr)
 
     await server.start()

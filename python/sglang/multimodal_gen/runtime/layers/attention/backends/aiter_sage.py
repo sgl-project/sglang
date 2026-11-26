@@ -13,7 +13,6 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class AITERSageBackend(AttentionBackend):
-
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.AITER_SAGE
@@ -23,11 +22,6 @@ class AITERSageBackend(AttentionBackend):
         return AITERSageImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        # AITER Sage backend does not require special metadata.
-        return AttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         raise NotImplementedError(
             "AITER Sage backend does not have a metadata builder."
@@ -35,7 +29,6 @@ class AITERSageBackend(AttentionBackend):
 
 
 class AITERSageImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,

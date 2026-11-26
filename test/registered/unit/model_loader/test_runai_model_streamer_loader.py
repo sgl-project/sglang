@@ -1,5 +1,8 @@
 import concurrent.futures
+import json
+import os
 import sys
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -7,12 +10,13 @@ from typing import cast
 from unittest.mock import patch
 
 import torch
+from safetensors.torch import save_file
 
 import sglang.srt.model_loader.loader as loader_mod
 import sglang.srt.model_loader.utils as model_loader_utils
 import sglang.srt.model_loader.weight_utils as weight_utils
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.models.deepseek_common import deepseek_weight_loader
 from sglang.srt.models.deepseek_v4 import (
@@ -20,10 +24,11 @@ from sglang.srt.models.deepseek_v4 import (
     _dequant_fp8_wo_a_streaming,
 )
 from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _FakeModel:
@@ -32,6 +37,170 @@ class _FakeModel:
 
 
 class TestRunaiModelStreamerLoader(CustomTestCase):
+    def test_bundled_draft_file_selection(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            for name in ("model.safetensors", "mtp.safetensors"):
+                save_file({"weight": torch.ones(1)}, os.path.join(model_path, name))
+            with open(
+                os.path.join(model_path, "model.safetensors.index.json"), "w"
+            ) as f:
+                json.dump({"weight_map": {"weight": "model.safetensors"}}, f)
+
+            config = SimpleNamespace(
+                model_path=model_path,
+                revision=None,
+                hf_config=SimpleNamespace(architectures=["DraftModel"]),
+            )
+            model = SimpleNamespace(
+                allow_patterns_overrides=["mtp.safetensors"],
+                safetensors_index_file=None,
+            )
+            loader = loader_mod.RunaiModelStreamerLoader(
+                LoadConfig(load_format=LoadFormat.RUNAI_STREAMER)
+            )
+            loader.target_device_str = "cpu"
+            with (
+                patch.object(loader_mod, "get_server_args", return_value=None),
+                # The runai package is optional; list the local directory instead.
+                patch.object(
+                    runai_utils,
+                    "list_safetensors",
+                    side_effect=lambda path: sorted(
+                        os.path.join(path, name)
+                        for name in os.listdir(path)
+                        if name.endswith(".safetensors")
+                    ),
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_safetensors_weights_iterator",
+                    return_value=iter(()),
+                ) as streamer,
+            ):
+                list(loader._get_all_weights(config, model))
+                streamer.assert_called_once_with(
+                    [os.path.join(model_path, "mtp.safetensors")],
+                    False,
+                    "cpu",
+                    load_group=_DEFAULT_LOAD_GROUP,
+                )
+
+    def test_local_directory_wildcard_rejected(self):
+        """A directory wildcard must fail loudly on local paths too, not match nothing."""
+        loader = loader_mod.RunaiModelStreamerLoader(
+            LoadConfig(load_format=LoadFormat.RUNAI_STREAMER)
+        )
+        with (
+            tempfile.TemporaryDirectory() as model_path,
+            patch.object(loader_mod, "get_server_args", return_value=None),
+            patch.object(runai_utils, "list_safetensors", return_value=[]),
+            self.assertRaisesRegex(ValueError, "directory wildcards"),
+        ):
+            loader._prepare_weights(
+                model_path, None, allow_patterns_overrides=["*/model.safetensors"]
+            )
+
+    def test_remote_checkpoint_index(self):
+        for scheme in ("s3", "gs", "az"):
+            for relative_cache in (False, True):
+                with (
+                    self.subTest(scheme=scheme, relative_cache=relative_cache),
+                    tempfile.TemporaryDirectory() as cache_dir,
+                ):
+                    model_path = f"{scheme}://bucket/model"
+                    shard = "model-00001-of-00001.safetensors"
+                    files = [
+                        f"{model_path}/{shard}",
+                        f"{model_path}/mtp.safetensors",
+                        f"{model_path}/unused.safetensors",
+                    ]
+                    cache_root = (
+                        os.path.relpath(cache_dir) if relative_cache else cache_dir
+                    )
+                    with (
+                        patch.object(
+                            runai_utils.envs.SGLANG_CACHE_DIR,
+                            "get",
+                            return_value=cache_root,
+                        ),
+                        patch.object(loader_mod, "get_server_args", return_value=None),
+                        patch.object(
+                            runai_utils, "list_safetensors", return_value=files
+                        ) as list_safetensors,
+                        patch.object(
+                            loader_mod, "download_weights_from_hf"
+                        ) as download,
+                        patch.object(
+                            loader_mod, "download_safetensors_index_file_from_hf"
+                        ) as download_index,
+                        patch.object(
+                            weight_utils,
+                            "runai_safetensors_weights_iterator",
+                            return_value=iter(()),
+                        ) as streamer,
+                    ):
+                        metadata = runai_utils.ObjectStorageModel.get_path(model_path)
+                        os.makedirs(metadata, exist_ok=True)
+                        loader = loader_mod.RunaiModelStreamerLoader(
+                            LoadConfig(load_format=LoadFormat.RUNAI_STREAMER)
+                        )
+                        self.assertEqual(
+                            loader._prepare_weights(model_path, revision=None),
+                            (model_path, files),
+                        )
+                        list_safetensors.assert_called_with(path=model_path)
+
+                        with open(
+                            os.path.join(metadata, "model.safetensors.index.json"), "w"
+                        ) as f:
+                            json.dump({"weight_map": {"weight": shard}}, f)
+                        self.assertEqual(
+                            loader._prepare_weights(model_path, revision=None),
+                            (model_path, [files[0]]),
+                        )
+
+                        loader.target_device_str = "cpu"
+                        source = loader_mod.RunaiModelStreamerLoader.Source(
+                            model_or_path=model_path,
+                            revision=None,
+                            model_config=cast(
+                                ModelConfig,
+                                SimpleNamespace(
+                                    hf_config=SimpleNamespace(
+                                        architectures=["Glm4MoeForCausalLMNextN"],
+                                        num_nextn_predict_layers=1,
+                                    )
+                                ),
+                            ),
+                        )
+                        list(loader._get_weights_iterator(source))
+                        streamer.assert_called_once_with(
+                            files[:2], True, "cpu", load_group=_DEFAULT_LOAD_GROUP
+                        )
+
+                        streamer.reset_mock()
+                        config = SimpleNamespace(
+                            model_path=metadata,
+                            model_weights=model_path,
+                            revision="revision",
+                            hf_config=SimpleNamespace(architectures=["DraftModel"]),
+                        )
+                        model = SimpleNamespace(
+                            allow_patterns_overrides=["mtp.safetensors"],
+                            safetensors_index_file=None,
+                        )
+                        list(loader._get_all_weights(config, model))
+                        list_safetensors.assert_called_with(path=model_path)
+                        streamer.assert_called_once_with(
+                            [files[1]], True, "cpu", load_group=_DEFAULT_LOAD_GROUP
+                        )
+                        download.assert_not_called()
+                        download_index.assert_not_called()
+
+                        list_safetensors.return_value = [files[-1]]
+                        with self.assertRaisesRegex(RuntimeError, shard):
+                            loader._prepare_weights(model_path, revision=None)
+
     def test_passes_quant_config_to_model_init(self):
         quant_config = object()
         fake_model = _FakeModel()
@@ -95,6 +264,84 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
 
         self.assertEqual(weights[0][0], "weight")
         self.assertTrue(getattr(weights[0][1], weight_utils.RUNAI_STREAMER_TENSOR_ATTR))
+
+    def test_load_group_controls_distributed_streaming(self):
+        streamed = {}
+        source_tensor = torch.tensor([1])
+
+        class FakeStreamer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def stream_files(self, files, **kwargs):
+                streamed.update(kwargs)
+                self.files_to_tensors_metadata = {files[0]: [object()]}
+
+            def get_tensors(self):
+                yield "weight", source_tensor
+
+        groups = (
+            ("default", _DEFAULT_LOAD_GROUP, True, True),
+            ("world", SimpleNamespace(world_size=4), True, True),
+            ("stage", SimpleNamespace(world_size=2), True, False),
+            ("single_rank", SimpleNamespace(world_size=1), True, False),
+            ("local", None, True, False),
+            ("uninitialized_default", _DEFAULT_LOAD_GROUP, False, True),
+            ("uninitialized_local", None, False, False),
+        )
+        for name, group, initialized, collective in groups:
+            for requested in (False, True):
+                with (
+                    self.subTest(group=name, requested=requested),
+                    patch.object(loader_mod, "get_server_args", return_value=None),
+                    patch.object(
+                        torch.distributed, "is_initialized", return_value=initialized
+                    ),
+                    patch.object(
+                        torch.distributed,
+                        "get_world_size",
+                        return_value=4,
+                        side_effect=None if initialized else AssertionError,
+                    ),
+                    patch.object(
+                        torch.distributed,
+                        "get_rank",
+                        return_value=3,
+                        side_effect=None if initialized else AssertionError,
+                    ),
+                    patch.object(weight_utils, "is_cuda_alike", return_value=True),
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "runai_model_streamer": SimpleNamespace(
+                                SafetensorsStreamer=FakeStreamer
+                            )
+                        },
+                    ),
+                ):
+                    loader = loader_mod.RunaiModelStreamerLoader(
+                        LoadConfig(
+                            load_format=LoadFormat.RUNAI_STREAMER, load_group=group
+                        )
+                    )
+                    loader._is_distributed = requested
+                    loader.target_device_str = "cuda:3"
+                    source = loader.Source("unused", None, prefix="draft.")
+                    with patch.object(
+                        loader,
+                        "_prepare_weights",
+                        return_value=("unused", ["model.safetensors"]),
+                    ):
+                        weights = list(loader._get_weights_iterator(source))
+
+                distributed = requested and collective
+                self.assertEqual(streamed["is_distributed"], distributed)
+                self.assertEqual(streamed["device"], "cuda:3" if distributed else "cpu")
+                self.assertEqual(weights[0][0], "draft.weight")
+                self.assertIs(weights[0][1], source_tensor)
 
     def test_deepseek_clone_only_clones_marked_tensors(self):
         unmarked = torch.tensor([1], dtype=torch.int32)
@@ -228,6 +475,7 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                 DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name(remapper, name)
             ),
             _assert_confidence_head_loaded=lambda **_kwargs: None,
+            post_load_weights=lambda: None,
         )
 
         def weights():

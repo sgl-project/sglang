@@ -1,15 +1,20 @@
 import base64
 import io
+import logging
 import os
 import shutil
+import subprocess
 import time
 import uuid
 
 import folder_paths
 import numpy as np
+import requests
 import torch
 from comfy_api.input import VideoInput
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_dir(path: str) -> None:
@@ -80,7 +85,16 @@ def is_empty_image(image: torch.Tensor, tolerance: float = 1e-6) -> bool:
 def get_image_path(image: torch.Tensor) -> str:
     """
     Save tensor image to ComfyUI temp directory as PNG and return the path.
+
+    This input only has a single image slot, so a batch keeps its first
+    image (as before) and logs a warning that the rest are dropped.
     """
+    if image.dim() == 4 and image.shape[0] > 1:
+        logger.warning(
+            "get_image_path received a batch of %d images but this input only "
+            "accepts one; using the first. Use 'Image From Batch' to pick another.",
+            image.shape[0],
+        )
     temp_dir = folder_paths.get_temp_directory()
 
     # Build file name
@@ -129,6 +143,14 @@ def convert_b64_to_tensor_image(b64_image: str) -> torch.Tensor:
 
 
 class SGLDVideoInput(VideoInput):
+    """Minimal fallback used only when ComfyUI's own file-backed VideoInput
+    isn't importable. It cannot decode frames/audio or re-encode on save, so
+    it fails loudly on those rather than silently returning wrong data (the
+    previous ``get_components`` returned ``[video_path]`` instead of a
+    ``VideoComponents``, and ``save_to`` dropped ``format``/``codec``/
+    ``metadata`` without telling the caller).
+    """
+
     def __init__(self, video_path: str, height: int, width: int):
         super().__init__()
 
@@ -146,31 +168,109 @@ class SGLDVideoInput(VideoInput):
         return self.width, self.height
 
     def get_components(self):
-        """
-        Returns the components of the video input.
-        This is required by the VideoInput abstract base class.
-        """
-        return [self.video_path]
+        raise NotImplementedError(
+            "SGLDVideoInput cannot decode frames/audio (no ComfyUI "
+            "VideoFromFile available in this environment); pass the file "
+            "at video_path to a node that reads files directly instead."
+        )
 
     def save_to(self, path: str, format=None, codec=None, metadata=None):
-        """
-        Abstract method to save the video input to a file.
-        """
+        if format is not None or codec is not None or metadata is not None:
+            raise NotImplementedError(
+                "SGLDVideoInput can only copy the file as-is; format/codec/"
+                "metadata conversion needs ComfyUI's own VideoFromFile, "
+                "which is unavailable in this environment."
+            )
+        if not os.path.exists(self.video_path):
+            raise FileNotFoundError(
+                f"Video not found at '{self.video_path}'. This file must be "
+                "readable from the ComfyUI process; a path on a remote "
+                "SGLang Diffusion server is not."
+            )
         save_path = path
-        # Copy video file from video_path to save_path
-        if os.path.exists(self.video_path):
-            # Ensure destination directory exists
-            save_dir = os.path.dirname(save_path)
-            if save_dir:
-                os.makedirs(save_dir, exist_ok=True)
-            shutil.copy2(self.video_path, save_path)
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        shutil.copy2(self.video_path, save_path)
+
+    def as_trimmed(
+        self,
+        start_time: float | None = None,
+        duration: float | None = None,
+        strict_duration: bool = False,
+    ):
+        """
+        Required by VideoInput since ComfyUI #12107.
+
+        Trims via ffmpeg stream-copy (fast, no re-encode); `strict_duration`
+        is accepted for interface compatibility but not enforced to frame
+        accuracy, since this node never needs sub-frame precision.
+        """
+        start_time = start_time or 0.0
+        if duration is not None and duration < 0:
+            return None
+
+        temp_dir = folder_paths.get_temp_directory()
+        _ensure_dir(temp_dir)
+        ext = os.path.splitext(self.video_path)[1] or ".mp4"
+        dest = os.path.join(temp_dir, f"sgl_video_trim_{uuid.uuid4().hex[:8]}{ext}")
+
+        cmd = ["ffmpeg", "-y", "-ss", str(start_time), "-i", self.video_path]
+        if duration is not None:
+            cmd += ["-t", str(duration)]
+        cmd += ["-c", "copy", dest]
+        subprocess.run(cmd, capture_output=True, check=True)
+
+        return SGLDVideoInput(dest, self.height, self.width)
+
+
+def resolve_video_path(file_path: str | None, url: str | None) -> str:
+    """
+    Resolve the generated video to a path this process can use.
+
+    The server sets `file_path` to None once a cloud upload succeeds (the
+    local file is removed); fetch `url` into the ComfyUI temp directory in
+    that case. Otherwise `file_path` is returned as-is; a server on another
+    host without cloud storage returns a path this process can't read, and
+    `SGLDVideoInput.save_to` raises clearly when that path turns out to be
+    unreadable.
+    """
+    if file_path:
+        return file_path
+    if not url:
+        raise RuntimeError(
+            "Generated video has no local file_path and no url to fetch it from."
+        )
+
+    temp_dir = folder_paths.get_temp_directory()
+    _ensure_dir(temp_dir)
+    ext = os.path.splitext(url.split("?", 1)[0])[1] or ".mp4"
+    dest = os.path.join(temp_dir, f"sgl_video_{uuid.uuid4().hex[:8]}{ext}")
+
+    with requests.get(url, timeout=120, stream=True) as response:
+        response.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+    return dest
 
 
 def convert_video_to_comfy_video(
     video_path: str, height: int, width: int
 ) -> VideoInput:
     """
-    Convert video to ComfyUI VIDEO format (VideoInput).
+    Convert a video file on disk to ComfyUI's VIDEO type.
+
+    Prefers ComfyUI's own file-backed ``VideoFromFile``: it probes the real
+    file for dimensions/frames/audio, so it is also immune to the
+    width/height we were told (which can be wrong, e.g. when the server
+    picked a different size than requested to match an image-to-video
+    input). ``height``/``width`` are only used by the ``SGLDVideoInput``
+    fallback below.
     """
-    video_input = SGLDVideoInput(video_path, height, width)
-    return video_input
+    try:
+        from comfy_api.input_impl import VideoFromFile
+
+        return VideoFromFile(video_path)
+    except ImportError:
+        return SGLDVideoInput(video_path, height, width)

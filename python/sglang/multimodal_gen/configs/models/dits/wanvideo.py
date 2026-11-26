@@ -30,6 +30,10 @@ class WanVideoArchConfig(DiTArchConfig):
             r"^blocks\.(\d+)\.ffn\.net\.0\.proj\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
             r"^blocks\.(\d+)\.ffn\.net\.2\.(.*)$": r"blocks.\1.ffn.fc_out.\2",
             r"^blocks\.(\d+)\.norm2\.(.*)$": r"blocks.\1.self_attn_residual_norm.norm.\2",
+            r"^blocks\.(\d+)\.attn1\.to_q_rot$": r"blocks.\1.q_rot",
+            r"^blocks\.(\d+)\.attn1\.to_k_rot$": r"blocks.\1.k_rot",
+            r"^blocks\.(\d+)\.attn1\.q_rot$": r"blocks.\1.q_rot",
+            r"^blocks\.(\d+)\.attn1\.k_rot$": r"blocks.\1.k_rot",
         }
     )
 
@@ -69,13 +73,16 @@ class WanVideoArchConfig(DiTArchConfig):
             r"^blocks\.(\d+)\.cross_attn\.k\.(.*)$": r"blocks.\1.attn2.to_k.\2",
             r"^blocks\.(\d+)\.cross_attn\.v\.(.*)$": r"blocks.\1.attn2.to_v.\2",
             r"^blocks\.(\d+)\.cross_attn\.o\.(.*)$": r"blocks.\1.attn2.to_out.0.\2",
+            # I2V image branch
+            r"^blocks\.(\d+)\.cross_attn\.k_img\.(.*)$": r"blocks.\1.attn2.add_k_proj.\2",
+            r"^blocks\.(\d+)\.cross_attn\.v_img\.(.*)$": r"blocks.\1.attn2.add_v_proj.\2",
             r"^blocks\.(\d+)\.ffn\.0\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
             r"^blocks\.(\d+)\.ffn\.2\.(.*)$": r"blocks.\1.ffn.fc_out.\2",
         }
     )
 
     patch_size: tuple[int, int, int] = (1, 2, 2)
-    text_len = 512
+    text_len: int = 512
     num_attention_heads: int = 40
     attention_head_dim: int = 128
     in_channels: int = 16
@@ -100,9 +107,7 @@ class WanVideoArchConfig(DiTArchConfig):
     local_attn_size: int = (
         -1
     )  # Window size for temporal local attention (-1 indicates global attention)
-    sink_size: int = (
-        0  # Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
-    )
+    sink_size: int = 0  # Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
     num_frames_per_block: int = 3
     sliding_window_num_frames: int = 21
     attention_type: str = "original"

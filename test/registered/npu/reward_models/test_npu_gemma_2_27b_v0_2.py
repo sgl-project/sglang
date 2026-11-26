@@ -10,7 +10,7 @@ from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
 logger = logging.getLogger(__name__)
-register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-test-1-npu-a3", nightly=True)
 
 MODELS = [
     (
@@ -34,7 +34,6 @@ CONVS = [
 
 
 class TestRewardModels(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
@@ -70,9 +69,9 @@ class TestRewardModels(CustomTestCase):
         logger.info(f"{hf_scores=}")
         logger.info(f"{srt_scores=}")
 
-        assert torch.all(
-            abs(hf_scores - srt_scores) < tolerance
-        ), "reward scores are not all close"
+        assert torch.all(abs(hf_scores - srt_scores) < tolerance), (
+            "reward scores are not all close"
+        )
 
     def test_reward_scores(self):
         for model, tp_size, tolerance in MODELS:

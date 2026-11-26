@@ -23,21 +23,25 @@ def _int_env(name: str, default: int) -> int:
     return int(raw) if raw is not None and raw != "" else default
 
 
+def _import_umbp():
+    """Import mori.umbp, UMBPHostTensorAllocator's third-party dependency."""
+    try:
+        import mori.umbp as umbp_mod
+    except ImportError as exc:
+        raise RuntimeError(
+            "mori.umbp is not available. Build mori with BUILD_UMBP=ON "
+            "or fall back to the default torch host allocator."
+        ) from exc
+    return umbp_mod
+
+
 class UMBPHostTensorAllocator(HostTensorAllocator):
     """Allocate the HiCache L2 host tensor from mori's UMBPHostMemAllocator."""
 
     def __init__(self) -> None:
         super().__init__()
-        try:
-            import mori.umbp as umbp_mod
-        except ImportError as exc:
-            raise RuntimeError(
-                "mori.umbp is not available. Build mori with BUILD_UMBP=ON "
-                "or fall back to the default torch host allocator."
-            ) from exc
-
-        self._mod = umbp_mod
-        self._allocator = umbp_mod.UMBPHostMemAllocator()
+        self._mod = _import_umbp()
+        self._allocator = self._mod.UMBPHostMemAllocator()
 
         self._use_hugepage = _bool_env("SGLANG_HICACHE_HOST_HUGEPAGE", True)
         self._hugepage_size = _int_env(
@@ -45,6 +49,9 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         )
         self._numa_node = _int_env("SGLANG_HICACHE_HOST_NUMA_NODE", -1)
         self._prefault = _bool_env("SGLANG_HICACHE_HOST_PREFAULT", True)
+        # Standalone mode needs fd-shareable backing; allocation precedes
+        # config parsing.
+        self._standalone_process = bool(os.getenv("UMBP_STANDALONE_ADDRESS"))
         self._handles: Dict[int, Any] = {}
 
     def allocate(
@@ -62,11 +69,18 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         element_size = torch.empty((), dtype=dtype).element_size()
         nbytes = math.prod(int(dim) for dim in dims) * element_size
 
-        requested_backing = (
-            self._mod.UMBPHostBufferBacking.AnonymousHugetlb
-            if self._use_hugepage
-            else self._mod.UMBPHostBufferBacking.Anonymous
-        )
+        if self._standalone_process:
+            requested_backing = (
+                self._mod.UMBPHostBufferBacking.AnonymousShmHugetlb
+                if self._use_hugepage
+                else self._mod.UMBPHostBufferBacking.AnonymousShm
+            )
+        else:
+            requested_backing = (
+                self._mod.UMBPHostBufferBacking.AnonymousHugetlb
+                if self._use_hugepage
+                else self._mod.UMBPHostBufferBacking.Anonymous
+            )
 
         handle = self._allocator.alloc(
             nbytes,
@@ -101,15 +115,19 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
             handle.mapped_size,
             self._numa_node,
         )
-        if (
-            self._use_hugepage
-            and handle.actual_backing == self._mod.UMBPHostBufferBacking.Anonymous
-        ):
+        demoted = handle.actual_backing == (
+            self._mod.UMBPHostBufferBacking.AnonymousShm
+            if self._standalone_process
+            else self._mod.UMBPHostBufferBacking.Anonymous
+        )
+        if self._use_hugepage and demoted:
             logger.warning(
-                "UMBPHostTensorAllocator: requested AnonymousHugetlb backing "
-                "but kernel demoted to Anonymous (4 KiB pages). Check "
-                "vm.nr_hugepages and HugePages_Free in /proc/meminfo. "
-                "Performance and AINIC MR-size benefits will not apply."
+                "UMBPHostTensorAllocator: requested %s backing but kernel "
+                "demoted to %s (4 KiB pages). Check vm.nr_hugepages and "
+                "HugePages_Free in /proc/meminfo. Performance and AINIC "
+                "MR-size benefits will not apply.",
+                requested_backing,
+                handle.actual_backing,
             )
 
         return tensor.view(dims)

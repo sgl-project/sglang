@@ -17,12 +17,9 @@ from sglang.multimodal_gen.configs.models.encoders import (
     CLIPTextConfig,
     CLIPVisionConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import ImageEncoder, TextEncoder
-from sglang.multimodal_gen.runtime.models.encoders.vision import (
-    resolve_visual_encoder_outputs,
-)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.clip import (
     CLIPEncoder,
     CLIPTextEmbeddings,
@@ -36,7 +33,6 @@ def _srt_clip_param_name(name: str) -> str:
 
 
 class CLIPTextTransformer(nn.Module):
-
     def __init__(
         self,
         config: CLIPTextConfig,
@@ -145,7 +141,6 @@ class CLIPTextTransformer(nn.Module):
 
 
 class CLIPTextModel(TextEncoder):
-
     def __init__(
         self,
         config: CLIPTextConfig,
@@ -185,6 +180,9 @@ class CLIPTextModel(TextEncoder):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            # standalone CLIP text-transformer checkpoints omit the model wrapper
+            if name.startswith(("embeddings.", "encoder.", "final_layer_norm.")):
+                name = f"text_model.{name}"
             name = _srt_clip_param_name(name)
             # Handle q_proj, k_proj, v_proj -> qkv_proj mapping
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -254,7 +252,6 @@ class CLIPTextModelWithProjection(CLIPTextModel):
 
 
 class CLIPVisionTransformer(nn.Module):
-
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -301,35 +298,24 @@ class CLIPVisionTransformer(nn.Module):
         self,
         pixel_values: torch.Tensor,
         output_hidden_states: Optional[bool] = None,
-        feature_sample_layers: list[int] | None = None,
     ) -> BaseEncoderOutput:
 
         hidden_states = self.embeddings(pixel_values)
         hidden_states = self.pre_layrnorm(hidden_states)
 
-        return_all_hidden_states = output_hidden_states or (
-            feature_sample_layers is not None
-        )
+        return_all_hidden_states = bool(output_hidden_states)
 
-        # Produces either the last layer output or all of the hidden states,
-        # depending on if we have feature_sample_layers or not
+        # Produces either the last layer output or all of the hidden states
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             return_all_hidden_states=return_all_hidden_states,
         )
 
-        if not return_all_hidden_states:
-            # Handle post-norm (if applicable) and stacks feature layers if needed
-            encoder_outputs = resolve_visual_encoder_outputs(
-                encoder_outputs,
-                feature_sample_layers,
-                self.post_layernorm,
-                self.config.num_hidden_layers,
-            )
-
         if return_all_hidden_states:
             return BaseEncoderOutput(hidden_states=encoder_outputs)
 
+        if self.post_layernorm is not None:
+            encoder_outputs = self.post_layernorm(encoder_outputs)
         return BaseEncoderOutput(last_hidden_state=encoder_outputs)
 
 
@@ -337,6 +323,9 @@ class CLIPVisionModel(ImageEncoder):
     config_class = CLIPVisionConfig
     main_input_name = "pixel_values"
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    # CLIPEncoder and its linears come from SRT, so their serialized checkpoint
+    # format must use the matching SRT quantization implementation.
+    checkpoint_quantization_backend = "srt"
 
     def __init__(self, config: CLIPVisionConfig) -> None:
         super().__init__(config)
@@ -351,14 +340,12 @@ class CLIPVisionModel(ImageEncoder):
     def forward(
         self,
         pixel_values: torch.Tensor,
-        feature_sample_layers: list[int] | None = None,
         output_hidden_states: Optional[bool] = None,
         **kwargs,
     ) -> BaseEncoderOutput:
         base_encoder_output = self.vision_model(
             pixel_values,
             output_hidden_states=output_hidden_states,
-            feature_sample_layers=feature_sample_layers,
         )
 
         return base_encoder_output
@@ -411,10 +398,6 @@ class CLIPVisionModel(ImageEncoder):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-
-class BertModel(CLIPTextModel):
-    pass
 
 
 EntryClass = [CLIPTextModel, CLIPTextModelWithProjection, CLIPVisionModel]

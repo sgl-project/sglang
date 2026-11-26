@@ -34,15 +34,14 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 
 class GPTBigCodeAttention(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -114,7 +113,6 @@ class GPTBigCodeAttention(nn.Module):
 
 
 class GPTBigMLP(nn.Module):
-
     def __init__(
         self,
         intermediate_size: int,
@@ -150,7 +148,6 @@ class GPTBigMLP(nn.Module):
 
 
 class GPTBigCodeBlock(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -193,7 +190,6 @@ class GPTBigCodeBlock(nn.Module):
 
 
 class GPTBigCodeModel(nn.Module):
-
     def __init__(
         self,
         config: GPTBigCodeConfig,
@@ -205,8 +201,7 @@ class GPTBigCodeModel(nn.Module):
         assert not config.add_cross_attention
 
         self.embed_dim = config.hidden_size
-        lora_vocab = 0
-        self.vocab_size = config.vocab_size + lora_vocab
+        self.vocab_size = config.vocab_size
         self.wte = VocabParallelEmbedding(
             self.vocab_size,
             self.embed_dim,
@@ -247,13 +242,6 @@ class GPTBigCodeForCausalLM(nn.Module):
 
     supported_lora_modules = ["c_fc", "c_proj", "wte", "c_attn"]
 
-    embedding_modules = {
-        "wte": "input_embeddings",
-        "lm_head": "output_embeddings",
-    }
-
-    embedding_padding_modules = []
-
     def __init__(
         self,
         config: GPTBigCodeConfig,
@@ -269,7 +257,6 @@ class GPTBigCodeForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("transformer", prefix)
         )
         self.lm_head = self.transformer.wte
-        self.unpadded_vocab_size = config.vocab_size
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()

@@ -1,7 +1,11 @@
+import threading
 from contextlib import contextmanager, nullcontext
-from typing import Iterator, Optional, Union
+from dataclasses import dataclass
+from typing import Iterator, List, Optional, Union
 
 import torch
+import torch.nn as nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
@@ -24,12 +28,31 @@ def resolve_precision(
     precision_attr: Optional[str] = None,
     field_name: Optional[str] = None,
 ) -> torch.dtype:
+    component_precision = server_args.component_precisions.get(
+        component_or_precision_attr
+    )
+    if component_precision is not None:
+        return precision_to_dtype(
+            component_precision,
+            f"component_precisions.{component_or_precision_attr}",
+        )
     precision_attr = precision_attr or component_or_precision_attr
     precision = getattr(server_args.pipeline_config, precision_attr)
     return precision_to_dtype(precision, field_name or precision_attr)
 
 
-def resolve_decode_precision(server_args, component_name: str = "vae") -> torch.dtype:
+def resolve_decode_precision(
+    server_args,
+    component_name: str = "vae",
+    *,
+    quality: str | None = None,
+) -> torch.dtype:
+    component_precision = server_args.component_precisions.get(component_name)
+    if component_precision is not None:
+        return precision_to_dtype(
+            component_precision, f"component_precisions.{component_name}"
+        )
+
     pipeline_config = server_args.pipeline_config
     if component_name in ("audio_vae", "vocoder"):
         return resolve_precision(
@@ -37,6 +60,11 @@ def resolve_decode_precision(server_args, component_name: str = "vae") -> torch.
             component_name,
             precision_attr="audio_vae_precision",
         )
+
+    if quality == "high":
+        high_precision = getattr(pipeline_config, "vae_decode_precision_high", None)
+        if high_precision is not None:
+            return precision_to_dtype(high_precision, "vae_decode_precision_high")
 
     decode_precision = getattr(pipeline_config, "vae_decode_precision", None)
     if decode_precision is not None:
@@ -48,10 +76,21 @@ def resolve_decode_precision(server_args, component_name: str = "vae") -> torch.
     )
 
 
-def resolve_component_precision(server_args, module_name: str) -> Optional[torch.dtype]:
-    pipeline_config = getattr(server_args, "pipeline_config", None)
-    if pipeline_config is None:
+def resolve_component_precision_override(
+    server_args, module_name: str
+) -> Optional[torch.dtype]:
+    exact_precision = server_args.component_precisions.get(module_name)
+    if exact_precision is None:
         return None
+    return precision_to_dtype(exact_precision, f"component_precisions.{module_name}")
+
+
+def resolve_component_precision(server_args, module_name: str) -> Optional[torch.dtype]:
+    exact_precision = resolve_component_precision_override(server_args, module_name)
+    if exact_precision is not None:
+        return exact_precision
+
+    pipeline_config = server_args.pipeline_config
 
     if module_name in ("audio_vae", "vocoder"):
         precision_attr = "audio_vae_precision"
@@ -94,6 +133,14 @@ def autocast_enabled(dtype: torch.dtype, disable_autocast: bool) -> bool:
         dtype != torch.float32
         and not disable_autocast
         and current_platform.is_amp_supported()
+    )
+
+
+def autocast_enabled_for_device(
+    tensor: torch.Tensor, dtype: torch.dtype, disable_autocast: bool
+) -> bool:
+    return tensor.device.type == current_platform.device_type and autocast_enabled(
+        dtype, disable_autocast
     )
 
 
@@ -141,6 +188,91 @@ def align_tensor_to_module_dtype(
     return tensor.to(device=device, dtype=dtype)
 
 
+def _restore_module_value_state(cache):
+    with torch.no_grad():
+        for param, value in cache["parameters"].values():
+            param.data = value
+        for buffer, value in cache["buffers"].values():
+            buffer.data = value
+
+
+def _module_fp32_cache(module):
+    cache = {"parameters": {}, "buffers": {}}
+
+    try:
+        with torch.no_grad():
+            for name, param in module.named_parameters(recurse=True):
+                if param.is_floating_point() and param.dtype != torch.float32:
+                    value = param.data
+                    cache["parameters"][name] = (param, value)
+                    param.data = value.to(dtype=torch.float32)
+            for name, buffer in module.named_buffers(recurse=True):
+                if buffer.is_floating_point() and buffer.dtype != torch.float32:
+                    value = buffer.data
+                    cache["buffers"][name] = (buffer, value)
+                    buffer.data = value.to(dtype=torch.float32)
+    except BaseException:
+        _restore_module_value_state(cache)
+        cache.clear()
+        raise
+
+    return cache
+
+
+@contextmanager
+def temporary_module_fp32_dtype(
+    module,
+    *,
+    enabled: bool = True,
+) -> Iterator:
+    """Temporarily cast a module's floating parameters and buffers to fp32 for the scope.
+
+    The module is restored to its exact original state on exit, including original dtypes and
+    values. This is intended for inference-only, short-lived CPU workarounds where fp32 math is
+    required but the module should not be left in a permanently altered state.
+    """
+    if not enabled:
+        yield module
+        return
+
+    cache = _module_fp32_cache(module)
+    try:
+        yield module
+    finally:
+        _restore_module_value_state(cache)
+        cache.clear()
+
+
+@contextmanager
+def temporary_modules_fp32_dtype(
+    modules: List[nn.Module],
+    *,
+    enabled: Union[bool, List[bool]] = True,
+) -> Iterator[List[nn.Module]]:
+    """Temporarily cast a set of modules to fp32 while preserving their original state.
+
+    This mirrors the single-module helper for multi-module workloads: each module is only
+    converted if it contains non-fp32 floating values, and every restored module is returned to
+    the exact original dtype/value state after the context exits.
+    """
+    enabled_list = [enabled] * len(modules) if isinstance(enabled, bool) else enabled
+    if len(enabled_list) != len(modules):
+        raise ValueError("enabled must have one entry per module")
+    caches = [None] * len(modules)
+
+    try:
+        for index, (module, is_enabled) in enumerate(zip(modules, enabled_list)):
+            if is_enabled:
+                caches[index] = _module_fp32_cache(module)
+        yield modules
+    finally:
+        for cache, is_enabled in zip(caches, enabled_list):
+            if not is_enabled or cache is None:
+                continue
+            _restore_module_value_state(cache)
+            cache.clear()
+
+
 @contextmanager
 def temporary_module_dtype(
     module,
@@ -153,9 +285,93 @@ def temporary_module_dtype(
         yield module
         return
 
+    original_dtypes = (
+        _snapshot_tensor_dtypes(module)
+        if restore_dtype is None and isinstance(module, torch.nn.Module)
+        else []
+    )
     original_dtype = restore_dtype or get_module_dtype(module)
     module = module.to(dtype=dtype)
     try:
         yield module
     finally:
-        module.to(dtype=original_dtype)
+        if original_dtypes:
+            _restore_tensor_dtypes(original_dtypes)
+        else:
+            module.to(dtype=original_dtype)
+
+
+def _snapshot_tensor_dtypes(
+    module: torch.nn.Module,
+) -> list[tuple[dict, str, torch.dtype]]:
+    # named_parameters()/named_buffers() skip duplicates; module.to() converts each.
+    return [
+        (tensors, name, tensor.dtype)
+        for _, submodule in module.named_modules(remove_duplicate=False)
+        for tensors in (submodule._parameters, submodule._buffers)
+        for name, tensor in tensors.items()
+        if tensor is not None
+    ]
+
+
+def _restore_tensor_dtypes(dtypes: list[tuple[dict, str, torch.dtype]]) -> None:
+    for tensors, name, dtype in dtypes:
+        tensor = tensors.get(name)
+        if tensor is None or tensor.dtype == dtype:
+            continue
+        if isinstance(tensor, torch.nn.Parameter):
+            tensor.data = tensor.data.to(dtype)
+        else:
+            tensors[name] = tensor.to(dtype)
+
+
+@dataclass
+class MixedPrecisionState:
+    param_dtype: torch.dtype | None = None
+    reduce_dtype: torch.dtype | None = None
+    output_dtype: torch.dtype | None = None
+    compute_dtype: torch.dtype | None = None
+    mp_policy: MixedPrecisionPolicy | None = None
+
+
+class _MixedPrecisionContext(threading.local):
+    state: MixedPrecisionState | None = None
+
+
+_mixed_precision_state = _MixedPrecisionContext()
+
+
+def get_mixed_precision_state() -> MixedPrecisionState:
+    """Get the current mixed precision state."""
+    state = _mixed_precision_state.state
+    if state is None:
+        raise ValueError("Mixed precision state not set")
+    return state
+
+
+def set_mixed_precision_policy(
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+    output_dtype: torch.dtype | None = None,
+    mp_policy: MixedPrecisionPolicy | None = None,
+):
+    """Set mixed precision policy for the current thread.
+
+    Args:
+        param_dtype: Parameter dtype used for training
+        reduce_dtype: Reduction dtype used for gradients
+        output_dtype: Optional output dtype
+    """
+    state = MixedPrecisionState(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        output_dtype=output_dtype,
+        mp_policy=mp_policy,
+    )
+    _mixed_precision_state.state = state
+
+
+def get_compute_dtype() -> torch.dtype:
+    """Get the current compute dtype from mixed precision policy."""
+    state = _mixed_precision_state.state
+    return torch.get_default_dtype() if state is None else state.param_dtype

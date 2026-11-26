@@ -2,6 +2,7 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.managers.memory_managers import layerwise_offload
@@ -70,6 +71,14 @@ class TestSelection:
         with patch(THRESHOLD_PATH, 1024):
             assert _host_resident_tables(model) == []
 
+    def test_a_table_tied_to_an_output_head_is_left_alone(self):
+        # a tied head would keep a host weight and fail its device matmul
+        model = _Declared()
+        model.head = torch.nn.Linear(64, 4096, bias=False)
+        model.head.weight = model.embed.weight
+        with patch(THRESHOLD_PATH, 1024):
+            assert _host_resident_tables(model) == []
+
 
 class TestDetachAndRestore:
     def test_the_weight_survives_a_move_that_skips_it(self):
@@ -97,3 +106,22 @@ class TestDetachAndRestore:
             restore_host_resident_tables(detached, "cpu")
         assert detached == []
         assert not model.embed._forward_pre_hooks
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_a_device_resident_table_is_parked_on_the_host(self):
+        model = _Declared().to("cuda")
+        ids = torch.tensor([[1, 2, 3], [4, 5, 6]], device="cuda")
+        with torch.no_grad():
+            expected = model.embed(ids)
+
+        with patch(THRESHOLD_PATH, 1024):
+            detached = detach_host_resident_tables(model)
+            assert model.embed.weight.numel() == 0
+            model.to("cuda")
+            restore_host_resident_tables(detached, "cuda")
+
+        with torch.no_grad():
+            actual = model.embed(ids)
+        assert model.embed.weight.device.type == "cpu"
+        assert actual.device.type == "cuda"
+        assert torch.equal(actual, expected)

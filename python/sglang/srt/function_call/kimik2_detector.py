@@ -15,6 +15,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +70,6 @@ class KimiK2Detector(BaseFormatDetector):
         # like "functions.ReadFile:0" or bare call counters like "3".
         self.tool_call_regex = re.compile(
             r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>",
-            re.DOTALL,
-        )
-
-        self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
             re.DOTALL,
         )
 
@@ -144,7 +140,7 @@ class KimiK2Detector(BaseFormatDetector):
         best_score = -1
         for tool in tools:
             params = tool.function.parameters or {}
-            props = set(params.get("properties", {}).keys())
+            props = set(get_schema_properties(params).keys())
             if not props:
                 continue
             overlap = len(arg_keys & props)
@@ -224,9 +220,6 @@ class KimiK2Detector(BaseFormatDetector):
             emit, hold = self._split_pending_start(self._buffer)
             self._buffer = hold
             return StreamingParseResult(normal_text=_strip_special_tokens(emit))
-
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
 
         normal_text_parts: list[str] = []
         calls: list[ToolCallItem] = []
@@ -332,9 +325,9 @@ class KimiK2Detector(BaseFormatDetector):
                     )
                     if argument_diff:
                         self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            argument_diff
+                        )
 
                 if end_idx == -1:
                     # Args still streaming.
@@ -467,6 +460,7 @@ class KimiK2Detector(BaseFormatDetector):
             tools=converted_tools,
             tool_choice=converted_tool_choice,
             reasoning=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
         )
 
     def get_structural_tag_name(self) -> str:

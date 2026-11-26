@@ -3,12 +3,13 @@
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Any, Dict
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
-
-if TYPE_CHECKING:
-    pass
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorage,
+    HiCacheStorageConfig,
+    _maybe_wrap_hicache_storage_failure_injector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,22 @@ class StorageBackendFactory:
             ImportError: If backend module cannot be imported
             Exception: If backend initialization fails
         """
+        backend = StorageBackendFactory._do_create_backend(
+            backend_name,
+            storage_config,
+            mem_pool_host,
+            **kwargs,
+        )
+        return _maybe_wrap_hicache_storage_failure_injector(backend)
+
+    @classmethod
+    def _do_create_backend(
+        cls,
+        backend_name: str,
+        storage_config: HiCacheStorageConfig,
+        mem_pool_host: Any,
+        **kwargs,
+    ) -> HiCacheStorage:
         # First check if backend is already registered
         if backend_name in cls._registry:
             registry_entry = cls._registry[backend_name]
@@ -160,9 +177,14 @@ class StorageBackendFactory:
         """Create built-in backend with original initialization logic."""
         if backend_name in ("file", "sim"):
             return backend_class(storage_config)
+        elif backend_name == "fast_file":
+            return backend_class(storage_config, mem_pool_host)
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":
+            backend = backend_class(storage_config, mem_pool_host)
+            return backend
+        elif backend_name == "npu_memcache":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
         elif backend_name == "aibrix":
@@ -178,6 +200,12 @@ class StorageBackendFactory:
                 bytes_per_page = (
                     mem_pool_host.get_size_per_token() * mem_pool_host.page_size
                 )
+            else:
+                raise ValueError(
+                    "The hf3fs storage backend does not support "
+                    f"--hicache-mem-layout {mem_pool_host.layout!r}; supported "
+                    "layouts: page_first, page_first_direct, layer_first."
+                )
 
             dtype = mem_pool_host.dtype
             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
@@ -189,6 +217,10 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "shm":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "seaweedfs":
+            return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "tensorcast":
+            return backend_class(storage_config)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -196,6 +228,12 @@ class StorageBackendFactory:
 # Register built-in storage backends
 StorageBackendFactory.register_backend(
     "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"
+)
+
+StorageBackendFactory.register_backend(
+    "fast_file",
+    "sglang.srt.mem_cache.storage.fast_file.fast_file_store",
+    "HiCacheFastFile",
 )
 
 StorageBackendFactory.register_backend(
@@ -212,6 +250,12 @@ StorageBackendFactory.register_backend(
     "mooncake",
     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
     "MooncakeStore",
+)
+
+StorageBackendFactory.register_backend(
+    "npu_memcache",
+    "sglang.srt.mem_cache.storage.npu_memcache.npu_memcache_store",
+    "NpuMemcacheStore",
 )
 
 StorageBackendFactory.register_backend(
@@ -248,4 +292,16 @@ StorageBackendFactory.register_backend(
     "shm",
     "sglang.srt.mem_cache.storage.shm",
     "HiCacheShm",
+)
+
+StorageBackendFactory.register_backend(
+    "tensorcast",
+    "sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store",
+    "TensorcastStore",
+)
+
+StorageBackendFactory.register_backend(
+    "seaweedfs",
+    "sglang.srt.mem_cache.storage.seaweedfs.seaweedfs_store",
+    "SeaweedFSStore",
 )

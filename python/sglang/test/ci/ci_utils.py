@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Union
 
 from sglang.srt.debug_utils import cuda_coredump
-from sglang.srt.utils.common import kill_process_tree
+from sglang.srt.utils.process import kill_process_tree
 from sglang.test.ci.ci_register import CIRegistry
 
 # Configure logger to output to stdout
@@ -21,6 +21,73 @@ logger = logging.getLogger(__name__)
 class TestFile:
     name: str
     estimated_time: float = 60
+
+
+class _ForkTestWorker:
+    """Preloaded interpreter that forks an isolated child for each test file."""
+
+    def __init__(self, preload_modules: List[str]):
+        result_read_fd, result_write_fd = os.pipe()
+        worker_path = os.path.join(os.path.dirname(__file__), "fork_test_worker.py")
+        cmd = ["python3", worker_path, "--result-fd", str(result_write_fd)]
+        if preload_modules:
+            cmd += ["--preload", *preload_modules]
+        self.process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=None,
+            stderr=None,
+            text=True,
+            pass_fds=(result_write_fd,),
+        )
+        os.close(result_write_fd)
+        self.result_stream = os.fdopen(result_read_fd)
+        self.files_run = 0
+
+    def run(self, filename: str) -> tuple[int, float]:
+        tic = time.perf_counter()
+        if self.process.poll() is not None or self.process.stdin is None:
+            return 1, 0.0
+        try:
+            self.process.stdin.write(json.dumps({"filename": filename}) + "\n")
+            self.process.stdin.flush()
+            result_line = self.result_stream.readline()
+        except (BrokenPipeError, OSError):
+            return 1, time.perf_counter() - tic
+        if not result_line:
+            return 1, time.perf_counter() - tic
+        try:
+            result = json.loads(result_line)
+        except json.JSONDecodeError:
+            return 1, time.perf_counter() - tic
+        self.files_run += 1
+        return int(result["returncode"]), float(result["elapsed"])
+
+    def close(self, terminate: bool = False):
+        if self.process.poll() is None:
+            if terminate:
+                kill_process_tree(self.process.pid)
+            elif self.process.stdin is not None:
+                try:
+                    self.process.stdin.write(json.dumps({"command": "stop"}) + "\n")
+                    self.process.stdin.flush()
+                    self.process.wait(timeout=10)
+                except (BrokenPipeError, subprocess.TimeoutExpired):
+                    kill_process_tree(self.process.pid)
+        if self.process.poll() is None:
+            self.process.kill()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        if self.process.stdin is not None:
+            # A worker that died before reading leaves the request unflushed.
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+        self.result_stream.close()
 
 
 # Patterns that indicate retriable accuracy/performance failures
@@ -158,6 +225,9 @@ def run_unittest_files(
     enable_retry: bool = False,
     max_attempts: int = 2,
     retry_wait_seconds: int = 60,
+    fork_worker_batch_size: int = 1,
+    fork_worker_preload: Optional[List[str]] = None,
+    timeout_overrides: Optional[Dict[str, float]] = None,
 ):
     """
     Run a list of test files.
@@ -172,6 +242,12 @@ def run_unittest_files(
                      assertion failures (not code errors).
         max_attempts: Maximum number of attempts per file including initial run (default: 2).
         retry_wait_seconds: Seconds to wait between retries (default: 60).
+        fork_worker_batch_size: Number of files served by one preloaded fork
+                                worker. Each file still runs in a fresh child
+                                process. One keeps the existing exec behavior.
+        fork_worker_preload: Extra modules the fork worker imports before
+                             forking, so each child inherits them.
+        timeout_overrides: First-attempt timeouts keyed by path suffix; retries use the above.
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
@@ -185,6 +261,8 @@ def run_unittest_files(
     # Per-file elapsed seconds, latest attempt wins. Consumed by the
     # TIMINGS block emitted at the end of this function.
     file_elapsed: Dict[str, float] = {}
+    fork_worker = None
+    use_fork_worker = fork_worker_batch_size > 1 and not enable_retry
 
     for i, file in enumerate(files):
         if isinstance(file, CIRegistry):
@@ -193,17 +271,22 @@ def run_unittest_files(
             # FIXME: remove this branch after migrating all tests to use CIRegistry
             filename, estimated_time = file.name, file.estimated_time
 
-        file_timeout = (
+        base_timeout = (
             timeout_per_file
             if timeout_per_file is not None
             else derive_timeout_per_file(estimated_time)
         )
+        # An override caps only the first attempt; retries get the full budget.
+        first_timeout = base_timeout
+        for suffix, override in (timeout_overrides or {}).items():
+            if filename == suffix or filename.endswith("/" + suffix):
+                first_timeout = min(base_timeout, override)
 
         process = None
         output_lines = []
 
         def run_one_file(filename, capture_output=False):
-            nonlocal process, output_lines
+            nonlocal process, output_lines, fork_worker
 
             full_path = os.path.join(os.getcwd(), filename)
             logger.info(
@@ -211,10 +294,24 @@ def run_unittest_files(
             )
             file_tic = time.perf_counter()
 
-            cmd = ["python3", full_path, "-f"]
-
-            if capture_output:
+            if use_fork_worker:
+                if (
+                    fork_worker is None
+                    or fork_worker.files_run >= fork_worker_batch_size
+                ):
+                    if fork_worker is not None:
+                        fork_worker.close()
+                    fork_worker = _ForkTestWorker(fork_worker_preload or [])
+                process = fork_worker.process
+                ret_code, _ = fork_worker.run(full_path)
+                if ret_code != 0 or fork_worker.files_run >= fork_worker_batch_size:
+                    fork_worker.close()
+                    fork_worker = None
+                    process = None
+                elapsed = time.perf_counter() - file_tic
+            elif capture_output:
                 # Capture output for retry decision
+                cmd = ["python3", full_path, "-f"]
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -223,21 +320,32 @@ def run_unittest_files(
                     errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
                 )
                 output_lines = []
-                for line in process.stdout:
-                    logger.info(line.rstrip())
-                    output_lines.append(line)
+
+                def read_output():
+                    for line in process.stdout:
+                        logger.info(line.rstrip())
+                        output_lines.append(line)
+
+                # Read stdout on a background thread so the main thread won't block on EOF.
+                reader_thread = threading.Thread(target=read_output, daemon=True)
+                reader_thread.start()
                 process.wait()
+                # Bounded wait for the reader to finish.
+                reader_thread.join(timeout=60)
             else:
+                cmd = ["python3", full_path, "-f"]
                 process = subprocess.Popen(cmd, stdout=None, stderr=None)
                 process.wait()
 
-            elapsed = time.perf_counter() - file_tic
+            if not use_fork_worker:
+                elapsed = time.perf_counter() - file_tic
+                ret_code = process.returncode
             file_elapsed[filename] = elapsed
 
             logger.info(
                 f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
             )
-            return process.returncode
+            return ret_code
 
         # Retry loop for each file
         attempt = 1
@@ -245,6 +353,7 @@ def run_unittest_files(
         was_retried = False
 
         while attempt <= (max_attempts if enable_retry else 1):
+            file_timeout = first_timeout if attempt == 1 else base_timeout
             if attempt > 1:
                 logger.info(
                     f"\n[CI Retry] Attempt {attempt}/{max_attempts} for {filename}\n"
@@ -297,7 +406,11 @@ def run_unittest_files(
                     break
 
             except TimeoutError:
-                kill_process_tree(process.pid)
+                if fork_worker is not None:
+                    fork_worker.close(terminate=True)
+                    fork_worker = None
+                elif process is not None:
+                    kill_process_tree(process.pid)
                 time.sleep(5)
                 # TimeoutError aborts run_one_file before its elapsed write;
                 # record the timeout cap as an upper bound so the file still
@@ -322,8 +435,31 @@ def run_unittest_files(
 
         if not file_passed:
             success = False
-            if not continue_on_error:
-                break
+
+        # Flush per-file so a SIGKILL mid-suite still surfaces completed files.
+        metrics_path = os.environ.get("SGLANG_TEST_METRICS_FILE")
+        if metrics_path and filename in file_elapsed:
+            try:
+                incremental_record = {
+                    "kind": "file",
+                    "test_file": os.path.basename(filename),
+                    "status": "pass" if file_passed else "fail",
+                    "duration": round(file_elapsed[filename], 2),
+                }
+                if not file_passed:
+                    reason = next((r for f, r in failed_tests if f == filename), None)
+                    if reason:
+                        incremental_record["error"] = reason
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(incremental_record) + "\n")
+            except OSError:
+                pass
+
+        if not file_passed and not continue_on_error:
+            break
+
+    if fork_worker is not None:
+        fork_worker.close()
 
     elapsed_total = time.perf_counter() - tic
 
@@ -336,11 +472,11 @@ def run_unittest_files(
         logger.info(f"Fail. Time elapsed: {elapsed_total:.2f}s")
 
     # Print summary
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'=' * 60}")
     logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
     if enable_retry and retried_tests:
         logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'=' * 60}")
     if passed_tests:
         logger.info("✓ PASSED:")
         for test in passed_tests:
@@ -353,7 +489,7 @@ def run_unittest_files(
         logger.info("\n↻ RETRIED:")
         for test, attempts, result in retried_tests:
             logger.info(f"  {test} ({attempts} attempts, {result})")
-    logger.info(f"{'='*60}\n")
+    logger.info(f"{'=' * 60}\n")
 
     # Machine-readable timings block for downstream scrapers/dashboards.
     # One JSON object per executed file (post-retry: only the latest

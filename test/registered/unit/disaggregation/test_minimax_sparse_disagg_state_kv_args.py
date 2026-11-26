@@ -1,13 +1,17 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import KVArgs
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import setup_state_kv_args
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _make_k_only_pool(start_layer: int = 0) -> MiniMaxSparseKVPool:
@@ -28,6 +32,14 @@ def _make_k_only_pool(start_layer: int = 0) -> MiniMaxSparseKVPool:
         device="cpu",
         start_layer=start_layer,
         end_layer=end_layer,
+    )
+
+
+def _static_storage(pool, draft=None, total_kv_layers=None) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(
+        None, allocator, draft_token_to_kv_pool=draft, num_hidden_layers=total_kv_layers
     )
 
 
@@ -53,21 +65,48 @@ def _make_kv_pool(start_layer: int = 0) -> MiniMaxSparseKVPool:
 
 
 class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
-    def test_setup_state_kv_args_single_minimax_component(self):
-        pool = _make_k_only_pool()
-        kv_args = KVArgs()
-        setup_state_kv_args(kv_args, pool)
-        self.assertEqual(kv_args.state_types, [StateType.MINIMAX_INDEX_K])
-        self.assertEqual(len(kv_args.state_data_ptrs), 1)
-        self.assertEqual(len(kv_args.state_data_ptrs[0]), pool.index_k_pool.layer_num)
-        self.assertEqual(len(kv_args.state_item_lens[0]), pool.index_k_pool.layer_num)
-
     def test_index_kv_pool_raises(self):
         pool = _make_kv_pool()
         self.assertIsNotNone(pool.index_kv_pool)
         kv_args = KVArgs()
         with self.assertRaises(NotImplementedError):
-            setup_state_kv_args(kv_args, pool)
+            setup_state_kv_args(kv_args, _static_storage(pool))
+
+    def test_decode_rejects_prefill_with_different_attention_tp(self):
+        # Only the NVFP4 page-row main KV has a head-sliced sender, and dense KV
+        # state has no per-head split; this pool has dense layers, so reject
+        # before any transfer with or without page rows.
+        for main_kv_page_row in (False, True):
+            with self.subTest(main_kv_page_row=main_kv_page_row):
+                self._check_rejects_different_attention_tp(main_kv_page_row)
+
+    def _check_rejects_different_attention_tp(self, main_kv_page_row: bool):
+        kv_args = KVArgs()
+        kv_args.page_size = 4
+        setup_state_kv_args(kv_args, _static_storage(_make_k_only_pool()))
+        kv_args.main_kv_page_row = main_kv_page_row
+        manager = object.__new__(CommonKVManager)
+        manager.kv_args = kv_args
+        manager.attn_tp_size = 4
+        manager.kv_cache_dtype_str = None
+        manager.prefill_info_table = {}
+        response = Mock(status_code=200)
+        response.json.return_value = dict(
+            attn_tp_size=8,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=1,
+            page_size=4,
+            kv_cache_dtype=None,
+            follow_bootstrap_room=True,
+        )
+        with patch(
+            "sglang.srt.disaggregation.common.conn.requests.get",
+            return_value=response,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "different attention TP sizes"):
+                manager.try_ensure_parallel_info("prefill:8998")
+        self.assertEqual(manager.prefill_info_table, {})
 
 
 if __name__ == "__main__":

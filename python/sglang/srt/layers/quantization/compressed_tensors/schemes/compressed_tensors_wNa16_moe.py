@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
     gptq_marlin_moe_repack,
 )
@@ -26,7 +27,8 @@ from sglang.srt.layers.quantization.marlin_utils import (
     moe_awq_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from compressed_tensors.quantization import QuantizationArgs
@@ -48,7 +50,7 @@ __all__ = [
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _use_aiter:
     pass
@@ -63,7 +65,6 @@ class GPTQMarlinState(Enum):
 
 
 class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
-
     def __init__(
         self,
         quant_config: CompressedTensorsConfig,
@@ -86,10 +87,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             and self.num_bits in WNA16_SUPPORTED_BITS
         ):
             raise ValueError(
-                "For Fused MoE layers, only ",
-                f"{CompressionFormat.pack_quantized.value} ",
-                "is supported for the following bits: ",
-                f"{WNA16_SUPPORTED_BITS}",
+                "For Fused MoE layers, only "
+                f"{CompressionFormat.pack_quantized.value} "
+                "is supported for the following bits: "
+                f"{WNA16_SUPPORTED_BITS}"
             )
         self.num_gpu_experts = num_gpu_experts
 
@@ -156,6 +157,18 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             num_groups_w2 = num_groups_w13 = 1
             self.group_size = -1
         else:
+            if (
+                not load_full_w2
+                and intermediate_size_per_partition % self.group_size != 0
+            ):
+                # Each rank narrows whole scale groups, so a shard that starts
+                # or ends mid-group would pair its K range with the wrong scales.
+                raise ValueError(
+                    "Compressed-tensors WNA16 MoE needs the per-rank intermediate "
+                    f"size ({intermediate_size_per_partition}) to be divisible by "
+                    f"group_size ({self.group_size}). Use a tensor parallel size "
+                    "that keeps whole groups per rank, or enable expert parallelism."
+                )
             num_groups_w2 = w2_scales_size // self.group_size
             num_groups_w13 = hidden_size // self.group_size
 
@@ -216,6 +229,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             )
             layer.register_parameter("w2_weight_zero_point", w2_qzeros)
             set_weight_attrs(w2_qzeros, extra_weight_attrs)
+            set_weight_attrs(w2_qzeros, {"load_full_w2": load_full_w2})
 
         w13_g_idx = torch.nn.Parameter(
             torch.empty(
@@ -452,9 +466,9 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -498,7 +512,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
 
 class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
-    """ROCm/HIP-compatible W4A16 MoE method using Triton kernels instead of Marlin.
+    """W4A16 MoE method using Triton kernels instead of Marlin.
 
     Inherits weight creation from CompressedTensorsWNA16MoE but converts
     weights to the uint8-packed format expected by the Triton fused MoE kernel
@@ -556,16 +570,15 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 
 
 class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
-
     def __init__(self, quantization_config) -> None:
         self.pack_factor = 8  # weight dtype is int4,  but use int32 to create
         target = (

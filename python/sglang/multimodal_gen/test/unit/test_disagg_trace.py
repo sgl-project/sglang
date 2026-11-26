@@ -29,10 +29,9 @@ from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import pack_tensors
 from sglang.multimodal_gen.runtime.pipelines_core import Req
-from sglang.srt import server_args as srt_server_args_module
 from sglang.srt.observability import trace as srt_trace
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.runtime_context import get_server_args, reset_context
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 try:
@@ -63,7 +62,7 @@ def _enable_minimal_otel() -> None:
 @contextmanager
 def _srt_trace_server_args():
     try:
-        prev_server_args = srt_server_args_module.get_global_server_args()
+        prev_server_args = get_server_args()
     except ValueError:  # nothing published yet
         prev_server_args = None
     # publish resolves what it is handed, so a stand-in cannot go through it.

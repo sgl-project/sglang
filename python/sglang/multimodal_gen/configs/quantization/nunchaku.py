@@ -14,8 +14,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     is_nunchaku_available,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import StoreBoolean
 
 logger = init_logger(__name__)
 

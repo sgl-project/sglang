@@ -1,22 +1,19 @@
-import math
-import os
+import logging
 import re
 import time
-from typing import List, Optional, Union
+from copy import deepcopy
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from typing import Any, List, Optional, Union
 
-import numpy as np
 import torch
-import torchvision
 from PIL import Image
-from torchvision.transforms import InterpolationMode
+from transformers import BaseImageProcessor
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
 from sglang.srt.models.interns2_mobius import (
     InternS2MobiusForConditionalGeneration,
 )
@@ -31,63 +28,74 @@ from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+from sglang.srt.multimodal.media_artifacts.base import (
+    MediaArtifactCacheMixin,
+    MediaArtifactInput,
+)
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.qwen_vl_media_processing import (
+    IMAGE_FACTOR,
+    MAX_PIXELS,
+    MIN_PIXELS,
+    _get_processor_video_config,
+    preprocess_video_sync,
+)
+from sglang.srt.multimodal.qwen_vl_media_processing import (
+    smart_nframes as smart_nframes,
+)
+from sglang.srt.multimodal.qwen_vl_media_processing import smart_resize as smart_resize
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
-from sglang.utils import logger
 
-IMAGE_FACTOR = 28
-MIN_PIXELS = 4 * 28 * 28
-MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
-MAX_RATIO = 200
+logger = logging.getLogger(__name__)
+
 RESIZE_RESAMPLE = getattr(Image, envs.SGLANG_RESIZE_RESAMPLE.get(), None)
 if envs.SGLANG_RESIZE_RESAMPLE.is_set() and RESIZE_RESAMPLE is None:
     logger.warning(
         f"Invalid RESIZE_RESAMPLE value: '{envs.SGLANG_RESIZE_RESAMPLE.get()}'. "
         f"Ignoring and using default."
     )
-VIDEO_TOTAL_PIXELS = int(
-    float(os.environ.get("VIDEO_MAX_PIXELS", 128000 * 28 * 28 * 0.9))
-)
-
-VIDEO_MIN_PIXELS = 128 * 28 * 28
-VIDEO_MAX_PIXELS = 768 * 28 * 28
-FRAME_FACTOR = 2
-FPS = 2.0
-FPS_MIN_FRAMES = 4
-FPS_MAX_FRAMES = 768
-
-QWEN_VIDEO_PREPROCESS_CONFIG_KEYS = frozenset(
-    {
-        "fps",
-        "nframes",
-        "min_frames",
-        "max_frames",
-        "min_pixels",
-        "max_pixels",
-        "total_pixels",
-        "resized_height",
-        "resized_width",
-    }
-)
 
 
-def _get_processor_video_config(video_config, video_metadata):
-    if video_metadata and all(metadata is not None for metadata in video_metadata):
-        return {
-            key: value
-            for key, value in video_config.items()
-            if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
-        }
-    return None
+@dataclass(frozen=True)
+class QwenVLImagePreprocessArtifact:
+    """Prompt-independent Qwen-VL processor output for one image."""
+
+    content_digest: str
+    artifact_key: str
+    feature_hash: int
+    feature: Optional[torch.Tensor]
+    model_specific_data: dict[str, Any]
+
+    @property
+    def has_feature(self) -> bool:
+        return self.feature is not None
+
+    def cache_value(self) -> "QwenVLImagePreprocessArtifact":
+        """Keep CPU processor outputs but never retain a CUDA tensor."""
+        if self.feature is None or self.feature.device.type == "cpu":
+            return self
+        return replace(self, feature=None)
+
+    def cache_size_items(self) -> tuple:
+        return (
+            self.content_digest,
+            self.artifact_key,
+            self.feature_hash,
+            self.feature,
+            self.model_specific_data,
+        )
 
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -98,197 +106,106 @@ if _is_cpu and _is_cpu_amx_available:
 
         from sglang.srt.layers.amx_utils import fast_preprocess_cpu
 
-        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = (
-            fast_preprocess_cpu
-        )
+        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = fast_preprocess_cpu
     except Exception as e:
         logger.warning(
             f"Failed to hack Qwen2VLImageProcessorFast with AMX optimization: {e}"
         )
 
 
-def smart_resize(
-    height: int,
-    width: int,
-    factor: int = IMAGE_FACTOR,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-) -> tuple[int, int]:
-    """
-    Rescales the image so that the following conditions are met:
-
-    1. Both dimensions (height and width) are divisible by 'factor'.
-
-    2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
-
-    3. The aspect ratio of the image is maintained as closely as possible.
-    """
-    if max(height, width) / min(height, width) > MAX_RATIO:
-        raise ValueError(
-            f"absolute aspect ratio must be smaller than {MAX_RATIO}, got {max(height, width) / min(height, width)}"
-        )
-    h_bar = max(factor, round_by_factor(height, factor))
-    w_bar = max(factor, round_by_factor(width, factor))
-    if h_bar * w_bar > max_pixels:
-        beta = math.sqrt((height * width) / max_pixels)
-        h_bar = floor_by_factor(height / beta, factor)
-        w_bar = floor_by_factor(width / beta, factor)
-    elif h_bar * w_bar < min_pixels:
-        beta = math.sqrt(min_pixels / (height * width))
-        h_bar = ceil_by_factor(height * beta, factor)
-        w_bar = ceil_by_factor(width * beta, factor)
-    return h_bar, w_bar
+# Peak GPU memory of the HF image processor is a small multiple of its output
+# (it holds resized, normalized and patchified copies, then torch.cat's them).
+# Bound each processor call by an estimated byte budget so a request with many
+# or very large images cannot spike GPU memory.
+_PREPROCESS_SOURCE_BYTES_PER_PIXEL = 18
+_PREPROCESS_TARGET_BYTES_PER_PIXEL = 24
+_PREPROCESS_GPU_BUDGET_BYTES = 512 * 1024 * 1024
 
 
-def round_by_factor(number: int, factor: int) -> int:
-    """Returns the closest integer to 'number' that is divisible by 'factor'."""
-    return round(number / factor) * factor
+def _media_size(media) -> Optional[tuple[int, int]]:
+    """Return (height, width) of a decoded image, or None if unknown."""
+    size = getattr(media, "size", None)
+    if isinstance(media, Image.Image):
+        return size[1], size[0]
+    shape = getattr(media, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        if len(shape) == 3 and shape[0] in (1, 3, 4) and shape[-1] not in (1, 3, 4):
+            return int(shape[1]), int(shape[2])  # CHW
+        return int(shape[0]), int(shape[1])  # HWC / HW
+    return None
 
 
-def ceil_by_factor(number: int, factor: int) -> int:
-    """Returns the smallest integer greater than or equal to 'number' that is divisible by 'factor'."""
-    return math.ceil(number / factor) * factor
-
-
-def floor_by_factor(number: int, factor: int) -> int:
-    """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
-    return math.floor(number / factor) * factor
-
-
-def smart_nframes(
-    ele: dict,
-    total_frames: int,
-    video_fps: int | float,
+def _estimate_preprocess_bytes(
+    media, *, factor: int, min_pixels: int, max_pixels: int
 ) -> int:
-    """calculate the number of frames for video used for model inputs.
+    """Conservative estimate of peak GPU bytes to preprocess one image."""
+    hw = _media_size(media)
+    if hw is None:
+        return _PREPROCESS_GPU_BUDGET_BYTES  # unknown size: isolate it
+    height, width = hw
+    try:
+        h_bar, w_bar = smart_resize(
+            height, width, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels
+        )
+        target_pixels = h_bar * w_bar
+    except ValueError:
+        target_pixels = min(height * width, max_pixels)
+    return (
+        height * width * _PREPROCESS_SOURCE_BYTES_PER_PIXEL
+        + target_pixels * _PREPROCESS_TARGET_BYTES_PER_PIXEL
+    )
 
-    Args:
-        ele (dict): a dict contains the configuration of video.
-            support either `fps` or `nframes`:
-                - nframes: the number of frames to extract for model inputs.
-                - fps: the fps to extract frames for model inputs.
-                    - min_frames: the minimum number of frames of the video, only used when fps is provided.
-                    - max_frames: the maximum number of frames of the video, only used when fps is provided.
-        total_frames (int): the original total number of frames of the video.
-        video_fps (int | float): the original fps of the video.
 
-    Raises:
-        ValueError: nframes should in interval [FRAME_FACTOR, total_frames].
+def _chunk_by_byte_budget(
+    costs: list[int], budget: int
+) -> list[tuple[list[int], bool]]:
+    """Greedily pack consecutive indices into groups whose cost sums to <= budget.
 
-    Returns:
-        int: the number of frames for video used for model inputs.
+    Returns ``(indices, oversized)`` groups in input order. An image whose own
+    cost exceeds the budget forms a single-image oversized group, which the
+    caller runs on CPU.
     """
-    assert not (
-        "fps" in ele and "nframes" in ele
-    ), "Only accept either `fps` or `nframes`"
-    if "nframes" in ele:
-        nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
-    else:
-        fps = ele.get("fps", FPS)
-        min_frames = ceil_by_factor(ele.get("min_frames", FPS_MIN_FRAMES), FRAME_FACTOR)
-        max_frames = floor_by_factor(
-            ele.get("max_frames", min(FPS_MAX_FRAMES, total_frames)), FRAME_FACTOR
-        )
-        nframes = total_frames / video_fps * fps
-        if nframes > total_frames:
-            logger.warning(
-                f"smart_nframes: nframes[{nframes}] > total_frames[{total_frames}]"
-            )
-        nframes = min(min(max(nframes, min_frames), max_frames), total_frames)
-        nframes = floor_by_factor(nframes, FRAME_FACTOR)
-    if not (FRAME_FACTOR <= nframes and nframes <= total_frames):
-        raise ValueError(
-            f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], but got {nframes}."
-        )
-    return nframes
+    groups: list[tuple[list[int], bool]] = []
+    current: list[int] = []
+    current_cost = 0
+    for idx, cost in enumerate(costs):
+        if cost > budget:
+            if current:
+                groups.append((current, False))
+                current, current_cost = [], 0
+            groups.append(([idx], True))
+            continue
+        if current and current_cost + cost > budget:
+            groups.append((current, False))
+            current, current_cost = [], 0
+        current.append(idx)
+        current_cost += cost
+    if current:
+        groups.append((current, False))
+    return groups
 
 
 # process video, qwen-specific
+
+
 async def preprocess_video(
     vr,
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
-) -> torch.Tensor:
-    # preprocessed video
-    is_video_obj = isinstance(vr, VideoDecoderWrapper)
-    if not is_video_obj:
-        return vr, None
-    entry_time = time.perf_counter()
-
-    total_frames, video_fps = len(vr), vr.avg_fps
-
-    nframes = smart_nframes(
-        video_config, total_frames=total_frames, video_fps=video_fps
+):
+    return preprocess_video_sync(
+        vr, image_factor=image_factor, video_config=video_config
     )
-    idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
-    idx = np.unique(idx)
-
-    video = vr.get_frames_as_tensor(idx.tolist())
-
-    video = video.permute(0, 3, 1, 2)  # NHWC -> TCHW
-
-    nframes, _, height, width = video.shape
-    min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
-    total_pixels = video_config.get("total_pixels", VIDEO_TOTAL_PIXELS)
-    max_pixels = max(
-        min(
-            video_config.get("max_pixels", VIDEO_MAX_PIXELS),
-            total_pixels / nframes * FRAME_FACTOR,
-        ),
-        int(min_pixels * 1.05),
-    )
-
-    get_batch_time = time.perf_counter()
-
-    max_pixels_supposed = video_config.get("max_pixels", max_pixels)
-
-    if max_pixels_supposed > max_pixels:
-        logger.warning(
-            f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}]."
-        )
-    max_pixels = min(max_pixels_supposed, max_pixels)
-    if "resized_height" in video_config and "resized_width" in video_config:
-        resized_height, resized_width = smart_resize(
-            video_config["resized_height"],
-            video_config["resized_width"],
-            factor=image_factor,
-        )
-    else:
-        resized_height, resized_width = smart_resize(
-            height,
-            width,
-            factor=image_factor,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-        )
-    smart_resize_time = time.perf_counter()
-    video = torchvision.transforms.functional.resize(
-        video,
-        [resized_height, resized_width],
-        interpolation=InterpolationMode.BILINEAR,
-    )
-    video = video.pin_memory()
-    video_metadata = {
-        "fps": video_fps,
-        "duration": total_frames / video_fps,
-        "total_num_frames": total_frames,
-        "frames_indices": idx,
-        "video_backend": "torchvision",
-    }
-    torchvision_resize_time = time.perf_counter()
-    logger.debug(
-        f"[preprocess_video Perf], "
-        f"get_batch_time: {(get_batch_time - entry_time) * 1000:.2f} ms, "
-        f"smart_resize_time: {(smart_resize_time - get_batch_time) * 1000:.2f} ms, "
-        f"torchvision_resize_time: {(torchvision_resize_time - smart_resize_time) * 1000:.2f} ms, "
-        f"total_time: {(torchvision_resize_time - entry_time) * 1000:.2f} ms"
-    )
-    return video, video_metadata
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
-class QwenVLImageProcessor(SGLangBaseProcessor):
+class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     supports_transformers_backend = True
+    generates_input_ids_from_raw_prompt = True
+    artifact_modality = Modality.IMAGE
+    # Requests that bypass the chunked artifact path still fall back to CPU
+    # instead of failing with a 500 when GPU preprocessing runs out of memory.
+    retry_on_cpu_after_gpu_oom = True
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
@@ -300,10 +217,16 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         InternS2PreviewForConditionalGeneration,
         InternS2MobiusForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
+        Cosmos3ForConditionalGeneration,
+        Qwen4ExpForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        self.uses_media_artifacts_without_cache = self.model_type in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        )
         if self.model_type in (
             "qwen2_vl",
             "qwen2_5_vl",
@@ -311,6 +234,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
         ):
@@ -342,12 +266,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             self.hf_config.vision_config, "tokens_per_second", None
         )
 
+        # Also match the legacy sglang <image> sentinel used by /generate,
+        # so the artifact fast path can normalize it before build_input_ids.
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
-            # The regex that matches expanded image tokens.
             image_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>|<image>"
             ),
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
@@ -521,8 +446,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
+            "cosmos3_omni",
         ):
             return None
 
@@ -657,7 +584,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "qwen3_vl_moe",
                 "qwen3_5",
                 "qwen3_5_moe",
+                "qwen4_exp",
                 "intern_s2_preview",
+                "cosmos3_omni",
             ]
             and video_timestamps is not None
         ):
@@ -723,7 +652,339 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mrope_position_delta=mrope_position_delta,
         )
 
-    async def process_mm_data_async(
+    def _run_image_processor(self, processor, entries, image_kwargs, device):
+        kwargs = dict(image_kwargs)
+        if device is not None:
+            kwargs["device"] = device
+        else:
+            kwargs.pop("device", None)
+        result = processor.image_processor(
+            images=[entry.media for entry in entries],
+            return_tensors="pt",
+            **kwargs,
+        )
+        features = self._get_processor_output_value(result, "pixel_values")
+        image_grid_thw = self._get_processor_output_value(result, "image_grid_thw")
+        return features, image_grid_thw
+
+    def _preprocess_cost_params(self, processor, image_kwargs):
+        ip = processor.image_processor
+        patch = getattr(ip, "patch_size", 14)
+        merge = getattr(ip, "merge_size", self._spatial_merge_size)
+        size = getattr(ip, "size", None)
+
+        def size_field(name):
+            if size is None:
+                return None
+            if isinstance(size, dict):
+                return size.get(name)
+            return getattr(size, name, None)  # transformers SizeDict
+
+        min_pixels = (
+            image_kwargs.get("min_pixels")
+            or getattr(ip, "min_pixels", None)
+            or size_field("shortest_edge")
+        )
+        max_pixels = (
+            image_kwargs.get("max_pixels")
+            or getattr(ip, "max_pixels", None)
+            or size_field("longest_edge")
+        )
+        return (
+            int(patch) * int(merge),
+            int(min_pixels or MIN_PIXELS),
+            int(max_pixels or MAX_PIXELS),
+        )
+
+    def _run_image_processor_chunked(
+        self, processor, entries, image_kwargs, processor_device
+    ):
+        """Run the HF image processor under a bounded GPU memory budget.
+
+        Images are split into byte-capped chunks; each chunk's output is moved
+        to CPU and joined there. Single images over budget, and chunks that hit
+        a GPU OOM, are retried on CPU.
+        """
+        on_gpu = processor_device is not None and str(processor_device) != "cpu"
+        if not on_gpu:
+            with self._temporary_fast_processor_cuda_pool(processor_device):
+                features, grid = self._run_image_processor(
+                    processor, entries, image_kwargs, processor_device
+                )
+            return self._maybe_offload_features(features), grid
+
+        factor, min_pixels, max_pixels = self._preprocess_cost_params(
+            processor, image_kwargs
+        )
+        costs = [
+            _estimate_preprocess_bytes(
+                e.media, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels
+            )
+            for e in entries
+        ]
+        groups = _chunk_by_byte_budget(costs, _PREPROCESS_GPU_BUDGET_BYTES)
+
+        if len(groups) == 1 and not groups[0][1]:
+            try:
+                with self._temporary_fast_processor_cuda_pool(processor_device):
+                    features, grid = self._run_image_processor(
+                        processor, entries, image_kwargs, processor_device
+                    )
+                return self._maybe_offload_features(features), grid
+            except torch.cuda.OutOfMemoryError:
+                logger.warning("Qwen-VL image preprocessing OOM; retrying on CPU")
+            return self._run_image_processor_on_cpu(processor, entries, image_kwargs)
+
+        feature_parts, grid_parts = [], []
+        for indices, oversized in groups:
+            chunk = [entries[i] for i in indices]
+            done = False
+            if not oversized:
+                try:
+                    with self._temporary_fast_processor_cuda_pool(processor_device):
+                        f, g = self._run_image_processor(
+                            processor, chunk, image_kwargs, processor_device
+                        )
+                        if isinstance(f, torch.Tensor):
+                            f = f.cpu()
+                    done = True
+                except torch.cuda.OutOfMemoryError:
+                    logger.warning(
+                        "Qwen-VL image preprocessing OOM on a chunk; retrying on CPU"
+                    )
+            if not done:
+                f, g = self._run_image_processor_on_cpu(processor, chunk, image_kwargs)
+            feature_parts.append(f)
+            grid_parts.append(torch.as_tensor(g, dtype=torch.long))
+        if not all(isinstance(f, torch.Tensor) for f in feature_parts):
+            raise TypeError("Qwen-VL image processor must return pixel_values")
+        return torch.cat(feature_parts, dim=0), torch.cat(grid_parts, dim=0)
+
+    def _run_image_processor_on_cpu(self, processor, entries, image_kwargs):
+        features, grid = self._run_image_processor(
+            processor, entries, image_kwargs, "cpu"
+        )
+        return features, grid
+
+    def _maybe_offload_features(self, features):
+        if (
+            isinstance(features, torch.Tensor)
+            and (
+                self.mm_preprocess_cache.enabled or not self.keep_mm_features_on_device
+            )
+            and not self.precompute_hash_before_cpu_transfer
+        ):
+            return features.cpu()
+        return features
+
+    def prepare_artifact_batch(
+        self,
+        entries: list[MediaArtifactInput],
+        *,
+        processor=None,
+    ) -> list[QwenVLImagePreprocessArtifact]:
+        """Preprocess image cache misses without retaining prompt-specific state."""
+        if not entries:
+            return []
+
+        processor, _ = self._resolve_processor(processor)
+        image_kwargs = dict(self.image_config or {})
+        processor_device = None
+        if (
+            isinstance(processor.image_processor, BaseImageProcessor)
+            and not self.disable_fast_image_processor
+        ):
+            processor_device = self._fast_image_processor_device(processor)
+            if processor_device is not None:
+                image_kwargs["device"] = processor_device
+
+        features, image_grid_thw = self._run_image_processor_chunked(
+            processor, entries, image_kwargs, processor_device
+        )
+
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("Qwen-VL image processor must return pixel_values")
+        if not isinstance(image_grid_thw, torch.Tensor):
+            image_grid_thw = torch.as_tensor(image_grid_thw, dtype=torch.long)
+        if image_grid_thw.ndim != 2 or image_grid_thw.shape != (len(entries), 3):
+            raise ValueError(
+                "Qwen-VL image processor returned an invalid image_grid_thw shape: "
+                f"{tuple(image_grid_thw.shape)}"
+            )
+        feature_lengths = image_grid_thw.prod(dim=1).tolist()
+        if sum(feature_lengths) != features.shape[0]:
+            raise ValueError(
+                "Qwen-VL image processor feature count does not match image grids: "
+                f"{features.shape[0]} != {sum(feature_lengths)}"
+            )
+
+        artifacts = []
+        feature_offset = 0
+        for entry, grid, feature_length in zip(
+            entries, image_grid_thw, feature_lengths
+        ):
+            feature = features[
+                feature_offset : feature_offset + feature_length
+            ].contiguous()
+            feature_offset += feature_length
+            # hash typed encoder inputs once on a miss; retain the complete
+            # digest even when cache_value drops the device feature
+            feature_hash = resolve_multimodal_item_hash(
+                feature=(feature, grid), namespace=entry.artifact_key
+            )
+            artifacts.append(
+                QwenVLImagePreprocessArtifact(
+                    content_digest=entry.content_digest,
+                    artifact_key=entry.artifact_key,
+                    feature_hash=feature_hash,
+                    feature=feature,
+                    model_specific_data={"image_grid_thw": grid.unsqueeze(0)},
+                )
+            )
+        return artifacts
+
+    def compose_image_artifacts(
+        self,
+        input_text,
+        artifacts: list[QwenVLImagePreprocessArtifact],
+    ) -> Optional[MultimodalProcessorOutput]:
+        """Compose prompt tokens and request-owned items from cached images.
+
+        Returns None when the raw prompt cannot be aligned with the prepared
+        artifacts; the caller falls back to _process_mm_data_uncached.
+        """
+        image_grids = []
+        for artifact in artifacts:
+            grid = self._as_grid_batch(
+                artifact.model_specific_data.get("image_grid_thw")
+            )
+            if grid is None or grid.shape[0] != 1:
+                raise ValueError("Each Qwen-VL image artifact requires one image grid")
+            image_grids.append(grid)
+        image_grid_thw = torch.cat(image_grids, dim=0)
+
+        grid_key = tuple(
+            tuple(int(value) for value in row.tolist()) for row in image_grid_thw
+        )
+        normalized_text = self._normalize_prompt_for_fast_path(
+            input_text, expected_image_count=len(grid_key)
+        )
+        if normalized_text is None:
+            return None
+        try:
+            if isinstance(normalized_text, str):
+                (
+                    input_ids_tuple,
+                    offsets,
+                    mrope_positions,
+                    mrope_position_delta,
+                ) = self._cached_image_prompt_template(normalized_text, grid_key)
+            else:
+                (
+                    input_ids_tuple,
+                    offsets,
+                    mrope_positions,
+                    mrope_position_delta,
+                ) = self._build_image_prompt_template(normalized_text, grid_key)
+        except ValueError as exc:
+            if "prompt placeholders" not in str(exc):
+                raise
+            logger.debug(
+                "Qwen-VL fast path skipped after normalization (%s); "
+                "falling back to full preprocessing",
+                exc,
+            )
+            return None
+        input_ids_list = list(input_ids_tuple)
+
+        mm_items = []
+        for artifact, offset in zip(artifacts, offsets):
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=artifact.feature,
+                offsets=[offset],
+                model_specific_data=deepcopy(artifact.model_specific_data),
+            )
+            item.set_identity(artifact.feature_hash.to_bytes(32, "big"))
+            mm_items.append(item)
+
+        padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
+            input_ids_list, mm_items
+        )
+        mm_items = self._prepare_mm_items_for_transport(mm_items)
+        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
+        return MultimodalProcessorOutput(
+            input_ids=input_ids_list,
+            padded_input_ids=padded_input_ids,
+            mm_items=mm_items,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            mrope_positions=mrope_positions.clone(),
+            mrope_position_delta=mrope_position_delta.clone(),
+        )
+
+    def _normalize_prompt_for_fast_path(self, input_text, expected_image_count: int):
+        # Non-string input (list of ints) is already in the pre-tokenized shape
+        # build_input_ids expects; only string prompts need placeholder rewriting.
+        if not isinstance(input_text, str):
+            return input_text
+        native = self.mm_tokens.image_token
+        normalized, count = self.mm_tokens.image_token_regex.subn(native, input_text)
+        if count != expected_image_count:
+            logger.debug(
+                "Qwen-VL fast path skipped: %d image placeholder(s) in prompt "
+                "vs %d prepared artifact(s); falling back to full preprocessing",
+                count,
+                expected_image_count,
+            )
+            return None
+        return normalized
+
+    @lru_cache(maxsize=256)
+    def _cached_image_prompt_template(self, input_text: str, grid_key: tuple):
+        """Cache prompt expansion and M-RoPE by prompt and image-grid shape."""
+        return self._build_image_prompt_template(input_text, grid_key)
+
+    def _build_image_prompt_template(self, input_text, grid_key: tuple):
+        image_grid_thw = torch.tensor(grid_key, dtype=torch.long)
+        input_ids_list, offsets, modalities = self.build_input_ids(
+            input_text, img_grid_thw=image_grid_thw
+        )
+        if modalities != [Modality.IMAGE] * len(grid_key):
+            raise ValueError("Qwen-VL image artifacts do not match prompt placeholders")
+
+        template_items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=None,
+                offsets=[offset],
+                model_specific_data={"image_grid_thw": grid.unsqueeze(0)},
+            )
+            for grid, offset in zip(image_grid_thw, offsets)
+        ]
+        input_ids = torch.tensor(input_ids_list, dtype=torch.long)
+        mrope_result = self._compute_image_only_mrope_positions_from_offsets(
+            input_len=input_ids.numel(),
+            mm_items=template_items,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        if mrope_result is None:
+            mrope_result = self.compute_mrope_positions(input_ids_list, template_items)
+        mrope_positions, mrope_position_delta = mrope_result
+        if mrope_positions is not None and mrope_positions.ndim == 3:
+            mrope_positions = mrope_positions.squeeze(1)
+        return (
+            tuple(input_ids_list),
+            tuple(offsets),
+            mrope_positions,
+            mrope_position_delta,
+        )
+
+    async def _process_mm_data_uncached(
         self,
         image_data: List[Union[str, bytes]],
         input_text,
@@ -765,8 +1026,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
+            "cosmos3_omni",
         ):
             processor_kwargs.update(
                 video_metadata=video_metadata,
@@ -777,7 +1040,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens, **processor_kwargs
         )
 
-        self._mark_dp_encoder_features_for_deferred_reconstruction(mm_items)
+        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
 
         audio_feature_lengths = None
 
@@ -891,10 +1154,51 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mrope_position_delta=mrope_position_delta,
         )
 
-    def _mark_dp_encoder_features_for_deferred_reconstruction(self, mm_items):
+    async def process_mm_data_async(
+        self,
+        image_data: List[Union[str, bytes]],
+        input_text,
+        request_obj,
+        *args,
+        **kwargs,
+    ):
+        if (
+            not image_data
+            or request_obj.video_data
+            or request_obj.audio_data
+            or any(self._is_preprocessed_input(item) for item in image_data)
+            or (
+                not self.mm_preprocess_cache.enabled
+                and not self.uses_media_artifacts_without_cache
+            )
+        ):
+            return await self._process_mm_data_uncached(
+                image_data, input_text, request_obj, *args, **kwargs
+            )
+
+        prepare_artifacts = (
+            self.prepare_media_artifacts
+            if self.mm_preprocess_cache.enabled
+            else self.prepare_media_artifacts_without_cache
+        )
+        artifacts = await prepare_artifacts(
+            image_data, content_hashes=getattr(request_obj, "mm_content_hashes", None)
+        )
+        composed = self.compose_image_artifacts(input_text, artifacts)
+        if composed is not None:
+            return composed
+        return await self._process_mm_data_uncached(
+            image_data, input_text, request_obj, *args, **kwargs
+        )
+
+    def _mark_cuda_ipc_features_for_deferred_reconstruction(self, mm_items):
+        supports_deferred_reconstruction = get_mm().mm_enable_dp_encoder or (
+            get_parallel().tp_size == 1
+            and self.model_type in ("qwen3_vl", "qwen3_vl_moe")
+        )
         if not (
             self.keep_mm_features_on_device
-            and self.server_args.mm_enable_dp_encoder
+            and supports_deferred_reconstruction
             and self.model_type
             in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
         ):

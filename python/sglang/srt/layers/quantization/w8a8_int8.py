@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import logging
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -23,13 +22,12 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
     is_host_cpu_arm64,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -119,43 +117,11 @@ class W8A8Int8Config(QuantizationConfig):
             return W8A8Int8MoEMethod(self)
         return None
 
-    def is_layer_skipped(
-        self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
-    ):
-        # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
-        proj_name = prefix.split(".")[-1]
-        if proj_name in fused_mapping:
-            shard_prefixes = [
-                prefix.replace(proj_name, shard_proj_name)
-                for shard_proj_name in fused_mapping[proj_name]
-            ]
-
-            is_skipped = None
-            for shard_prefix in shard_prefixes:
-                is_shard_skipped = (
-                    self.quant_description[shard_prefix + ".weight"] == "FLOAT"
-                )
-
-                if is_skipped is None:
-                    is_skipped = is_shard_skipped
-                elif is_shard_skipped != is_skipped:
-                    raise ValueError(
-                        f"Detected some but not all shards of {prefix} "
-                        "are quantized. All shards of fused layers "
-                        "to have the same precision."
-                    )
-        else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
-
-        assert is_skipped is not None
-        return is_skipped
-
     def get_scaled_act_names(self) -> List[str]:
         return []
 
 
 class W8A8Int8LinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: W8A8Int8Config):
         self.quantization_config = quantization_config
 
@@ -183,7 +149,6 @@ class W8A8Int8LinearMethod(LinearMethodBase):
     ):
 
         weight_loader = extra_weight_attrs.get("weight_loader")
-        self.logical_widths = output_partition_sizes
 
         weight = ModelWeightParameter(
             data=torch.empty(
@@ -259,8 +224,6 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
-        tp_size = get_parallel().tp_size
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(

@@ -164,8 +164,7 @@ def _build_rope_kernel(inputs: MlxAOTKernelBuildInputs) -> MlxAOTRoPEKernel:
         rope_pool_fused = _load_metal_rope_pool_fused()
     except Exception as exc:  # noqa: BLE001
         logger.info(
-            "AOT Metal RoPE kernel not available (%s) - falling back to "
-            "mx.fast.rope.",
+            "AOT Metal RoPE kernel not available (%s) - falling back to mx.fast.rope.",
             exc,
         )
         return MlxAOTRoPEKernel()

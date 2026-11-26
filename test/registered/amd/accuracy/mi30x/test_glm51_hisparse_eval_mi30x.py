@@ -3,20 +3,21 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     write_github_step_summary,
 )
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-accuracy-8-gpu-glm51-hisparse",
+    suite="nightly-accuracy-test-8-gpu-amd-glm51-hisparse",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 
@@ -62,7 +63,7 @@ class TestGLM51HiSparseEvalAMD(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process"):
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_gsm8k_accuracy(self):
         args = SimpleNamespace(
@@ -80,8 +81,7 @@ class TestGLM51HiSparseEvalAMD(unittest.TestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (glm-5.1 hisparse mi30x)\n"
-                f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (glm-5.1 hisparse mi30x)\n{metrics["score"]=:.3f}\n'
             )
         self.assertGreater(metrics["score"], 0.93)
 

@@ -3,7 +3,8 @@
 Round-trips export -> exchange -> import/map across ranks for both transports
 (POSIX, FABRIC) and both mapping shapes (single base, multi-chunk span). The
 only in-tree consumer, ``register_graph_inputs``, reaches this path only under
-``expandable_segments``, so the tests allocate shareable buffers directly. A
+``expandable_segments``, so the tests allocate shareable buffers directly and
+drive ``register_graph_inputs`` itself over hand-mapped spans. A
 POSIX-only allocation forces ``export_shareable_handles`` down its POSIX
 fallback (otherwise unreachable on FABRIC hardware); FABRIC cases need an
 NVLink fabric (GB200/GB300) and skip elsewhere.
@@ -21,8 +22,10 @@ import torch.distributed as dist
 from cuda.bindings import driver as drv
 
 from sglang.kernels.jit.utils import cache_once
-from sglang.srt import cuda_vmm_utils
-from sglang.srt.cuda_vmm_utils import (
+from sglang.srt.utils import cuda_vmm_utils
+from sglang.srt.utils.cuda_vmm_utils import (
+    VmmGraphInputManager,
+    adjacent_runs,
     check_drv,
     exchange_posix_fds,
     export_shareable_handles,
@@ -37,7 +40,7 @@ from sglang.srt.cuda_vmm_utils import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=16, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="2-gpu-large")
 
 _FABRIC = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
 _POSIX_FD = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
@@ -104,9 +107,7 @@ def _byte(rank: int, chunk: int) -> int:
 def _assert_region(va: int, expected: int, peer: int, chunk: int) -> None:
     host = np.empty(16, dtype=np.uint8)
     check_drv(drv.cuMemcpyDtoH(host.ctypes.data, va, host.nbytes), "cuMemcpyDtoH")
-    assert (
-        host == expected
-    ).all(), (
+    assert (host == expected).all(), (
         f"read {host.tolist()} from peer {peer} chunk {chunk}, expected all {expected}"
     )
 
@@ -308,6 +309,164 @@ def test_handle_roundtrip(transport: str, n_chunks: int) -> None:
             check_drv(drv.cuMemUnmap(va, size), "cuMemUnmap")
             check_drv(drv.cuMemAddressFree(va, size), "cuMemAddressFree")
             check_drv(drv.cuMemRelease(handle), "cuMemRelease")
+
+
+class _GraphInputHolder:
+    """Collective stand-in: serves one pre-mapped graph input and records the
+    per-rank pointers ``register_graph_inputs`` registers for it."""
+
+    def __init__(self, bases_info, chunk_indices, offsets) -> None:
+        self._bases = (bases_info, chunk_indices, offsets)
+        self.peer_ptrs = None
+
+    def get_graph_capture_bases(self):
+        return self._bases
+
+    def register_peer_mapped_inputs(self, peer_ptrs) -> None:
+        self.peer_ptrs = peer_ptrs
+
+
+def _create_span(handle_type, n_chunks: int, chunk_hint: int):
+    """One reserved VA range backed by ``n_chunks`` separate allocations mapped
+    back to back, as expandable segments lay out a tensor that outgrows one
+    chunk. Returns (handles, span_va, chunk_size)."""
+    device_id = torch.cuda.current_device()
+    prop = _make_prop(handle_type, device_id)
+    gran = check_drv(
+        drv.cuMemGetAllocationGranularity(prop, _RECOMMENDED),
+        "cuMemGetAllocationGranularity",
+    )
+    size = ((chunk_hint + gran - 1) // gran) * gran
+    span_va = int(
+        check_drv(
+            drv.cuMemAddressReserve(size * n_chunks, gran, 0, 0),
+            "cuMemAddressReserve",
+        )
+    )
+    handles = []
+    for chunk in range(n_chunks):
+        handle = check_drv(drv.cuMemCreate(size, prop, 0), "cuMemCreate")
+        va = span_va + chunk * size
+        check_drv(drv.cuMemMap(va, size, 0, handle, 0), "cuMemMap")
+        check_drv(
+            drv.cuMemSetAccess(va, size, [make_rw_access_desc(device_id)], 1),
+            "cuMemSetAccess",
+        )
+        handles.append(handle)
+    return handles, span_va, size
+
+
+def test_register_graph_inputs_follows_widest_input() -> None:
+    """A graph input covering more than 16 allocator chunks on one rank must
+    still register on every rank: the exchanged per-input struct is sized to
+    the widest input across ranks, not to a fixed 16 slots."""
+    group = _gloo_group()
+    rank = dist.get_rank(group)
+    world = dist.get_world_size(group)
+    chunks_on = [20 if peer % 2 else 1 for peer in range(world)]
+    handles, span_va, size = _create_span(_POSIX_FD, chunks_on[rank], _ALLOC_BYTES)
+    for chunk in range(chunks_on[rank]):
+        check_drv(
+            drv.cuMemsetD8(span_va + chunk * size, _byte(rank, chunk), size),
+            "cuMemsetD8",
+        )
+    torch.cuda.synchronize()
+
+    holder = _GraphInputHolder(
+        bases_info=[(span_va + chunk * size, size) for chunk in range(len(handles))],
+        chunk_indices=[list(range(len(handles)))],
+        offsets=[0],
+    )
+    manager = VmmGraphInputManager(obj=holder, group=group, rank=rank, world_size=world)
+    try:
+        manager.register_graph_inputs()
+        (row,) = holder.peer_ptrs
+        assert row[rank] == span_va
+        for peer in range(world):
+            if peer == rank:
+                continue
+            for chunk in range(chunks_on[peer]):
+                _assert_region(
+                    row[peer] + chunk * size, _byte(peer, chunk), peer, chunk
+                )
+    finally:
+        manager.close()
+        for chunk, handle in enumerate(handles):
+            check_drv(drv.cuMemUnmap(span_va + chunk * size, size), "cuMemUnmap")
+            check_drv(drv.cuMemRelease(handle), "cuMemRelease")
+        check_drv(
+            drv.cuMemAddressFree(span_va, size * len(handles)), "cuMemAddressFree"
+        )
+
+
+def test_adjacent_runs_split_at_gaps() -> None:
+    """Allocations group into address-ordered runs that break wherever two are
+    not back to back."""
+    bases = [(300, 100), (100, 100), (500, 50), (200, 100), (550, 10)]
+    assert adjacent_runs(bases) == [[1, 3, 0], [2, 4]]
+    assert adjacent_runs([]) == []
+
+
+def test_register_graph_inputs_maps_each_allocation_once() -> None:
+    """Graph inputs that overlap on the same allocator chunks share one peer
+    mapping of each chunk, and every input still resolves to the peer bytes it
+    covers."""
+    group = _gloo_group()
+    rank = dist.get_rank(group)
+    world = dist.get_world_size(group)
+    spans = [_create_span(_POSIX_FD, n_chunks, _ALLOC_BYTES) for n_chunks in (5, 1)]
+    bases_info = []
+    for handles, span_va, size in spans:
+        for chunk in range(len(handles)):
+            va = span_va + chunk * size
+            check_drv(
+                drv.cuMemsetD8(va, _byte(rank, len(bases_info)), size), "cuMemsetD8"
+            )
+            bases_info.append((va, size))
+    torch.cuda.synchronize()
+    size = bases_info[0][1]
+    # (allocations covered, byte offset from the first one)
+    inputs = [
+        ([0, 1, 2], 0),
+        ([1, 2, 3], size // 2),
+        ([2, 3, 4], 4096),
+        ([0, 1, 2], 0),
+        ([4], 0),
+        ([5], size // 2),
+    ]
+
+    holder = _GraphInputHolder(
+        bases_info=bases_info,
+        chunk_indices=[chunks for chunks, _ in inputs],
+        offsets=[offset for _, offset in inputs],
+    )
+    manager = VmmGraphInputManager(obj=holder, group=group, rank=rank, world_size=world)
+    try:
+        manager.register_graph_inputs()
+        mapped = sum(len(chunks) for _, _, chunks in manager._peer_mappings)
+        assert mapped == (world - 1) * len(bases_info)
+        for (chunks, offset), row in zip(inputs, holder.peer_ptrs):
+            assert row[rank] == bases_info[chunks[0]][0] + offset
+            for peer in range(world):
+                if peer == rank:
+                    continue
+                _assert_region(row[peer], _byte(peer, chunks[0]), peer, chunks[0])
+                for position, chunk in enumerate(chunks):
+                    _assert_region(
+                        row[peer] - offset + position * size,
+                        _byte(peer, chunk),
+                        peer,
+                        chunk,
+                    )
+    finally:
+        manager.close()
+        for handles, span_va, size in spans:
+            for chunk, handle in enumerate(handles):
+                check_drv(drv.cuMemUnmap(span_va + chunk * size, size), "cuMemUnmap")
+                check_drv(drv.cuMemRelease(handle), "cuMemRelease")
+            check_drv(
+                drv.cuMemAddressFree(span_va, size * len(handles)), "cuMemAddressFree"
+            )
 
 
 if __name__ == "__main__":

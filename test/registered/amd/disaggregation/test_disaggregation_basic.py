@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
+register_amd_ci(est_time=600, suite="base-b-disaggregation-test-large-8-gpu-amd-mi35x")
 
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
@@ -108,7 +108,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -134,12 +134,12 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         input_logprobs = j["meta_info"]["input_token_logprobs"]
         output_logprobs = j["meta_info"]["output_token_logprobs"]
 
-        assert (
-            len(output_logprobs) == completion_tokens
-        ), f"output_logprobs and completion_tokens should have the same length, but got {len(output_logprobs)} and {completion_tokens}"
-        assert (
-            len(input_logprobs) > 0
-        ), f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
+        assert len(output_logprobs) == completion_tokens, (
+            f"output_logprobs and completion_tokens should have the same length, but got {len(output_logprobs)} and {completion_tokens}"
+        )
+        assert len(input_logprobs) > 0, (
+            f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
+        )
 
     def test_structured_output(self):
         json_schema = json.dumps(
@@ -216,7 +216,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         )
 
 
-# register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
+# register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large-amd")
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -311,7 +311,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
 
@@ -332,7 +332,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 raise e from health_check_error
 
 
-# register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
+# register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large-amd")
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -423,7 +423,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval_few_shot_gsm8k(args)

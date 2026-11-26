@@ -24,10 +24,11 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.srt.utils.custom_op import register_custom_op
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _temb_table_slices_kernel(
     out_ptr,
     temb_ptr,
@@ -49,8 +50,24 @@ def _temb_table_slices_kernel(
         tl.store(out_ptr + (j * rows + row) * D + cols, w + t, mask=mask)
 
 
-def can_use_fused_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> bool:
-    return (
+def _fake_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
+    batch, seq_len, six, hidden = temb.shape
+    return temb.new_empty((six, batch, seq_len, hidden), dtype=torch.float32)
+
+
+@register_custom_op(
+    op_name="triton_wan_temb_table_slices",
+    mutates_args=[],
+    fake_impl=_fake_temb_table_slices,
+)
+@replay_launches
+def fused_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
+    """``table.unsqueeze(0) + temb.float()`` as a ``(6, B, S, D)`` buffer.
+
+    ``temb`` is ``(B, S, 6, D)``; ``table`` is the block's ``(1, 6, D)`` fp32
+    adaLN table.  ``out[j]`` is the ``j``-th modulation slice, contiguous.
+    """
+    if not (
         temb.is_cuda
         and temb.dtype in (torch.bfloat16, torch.float16, torch.float32)
         and temb.dim() == 4
@@ -62,25 +79,8 @@ def can_use_fused_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> 
         and table.shape == (1, 6, temb.shape[-1])
         and table.is_contiguous()
         and temb.numel() > 0
-    )
-
-
-def _fake_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
-    batch, seq_len, six, hidden = temb.shape
-    return temb.new_empty((six, batch, seq_len, hidden), dtype=torch.float32)
-
-
-@register_custom_op(
-    op_name="triton_wan_temb_table_slices",
-    mutates_args=[],
-    fake_impl=_fake_temb_table_slices,
-)
-def fused_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
-    """``table.unsqueeze(0) + temb.float()`` as a ``(6, B, S, D)`` buffer.
-
-    ``temb`` is ``(B, S, 6, D)``; ``table`` is the block's ``(1, 6, D)`` fp32
-    adaLN table.  ``out[j]`` is the ``j``-th modulation slice, contiguous.
-    """
+    ):
+        raise RuntimeError("invalid input for fused_temb_table_slices")
     batch, seq_len, _, hidden = temb.shape
     out = temb.new_empty((6, batch, seq_len, hidden), dtype=torch.float32)
     rows = batch * seq_len

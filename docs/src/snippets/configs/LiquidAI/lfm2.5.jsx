@@ -62,7 +62,7 @@ export const config = {
   // Reproduce commands for the Benchmark card's "⚡ Reproduce" modal.
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -71,26 +71,26 @@ export const config = {
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
   --num-threads 128`,
       gpqa_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 # GPQA's HF dataset (Idavidrein/gpqa) is gated — accept its terms with your HF account first.
 sgl-eval run gpqa \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
   --num-threads 128`,
       mmlu_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run mmlu \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
   --num-threads 128`,
       aime25_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
@@ -244,10 +244,10 @@ sgl-eval run aime25 \\
       match: { hw: "h100", variant: "vl", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
+        "--mm-feature-transport cuda_ipc",
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
@@ -260,10 +260,10 @@ sgl-eval run aime25 \\
       match: { hw: "h100", variant: "vl-450m", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
+        "--mm-feature-transport cuda_ipc",
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
@@ -361,10 +361,10 @@ sgl-eval run aime25 \\
       match: { hw: "h200", variant: "vl", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
+        "--mm-feature-transport cuda_ipc",
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
@@ -377,10 +377,10 @@ sgl-eval run aime25 \\
       match: { hw: "h200", variant: "vl-450m", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
+        "--mm-feature-transport cuda_ipc",
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
@@ -486,10 +486,10 @@ sgl-eval run aime25 \\
       match: { hw: "b200", variant: "vl", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
+        "--mm-feature-transport cuda_ipc",
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
@@ -504,10 +504,10 @@ sgl-eval run aime25 \\
       match: { hw: "b200", variant: "vl-450m", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
+        "--mm-feature-transport cuda_ipc",
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",

@@ -26,7 +26,7 @@ def _jit_usp_relayout_module(dtype: torch.dtype) -> Module:
         cuda_wrappers=[
             (
                 "usp_merge_heads",
-                "usp_relayout::" f"UspMergeHeadsKernel<{args}>::run",
+                f"usp_relayout::UspMergeHeadsKernel<{args}>::run",
             ),
         ],
     )
@@ -42,7 +42,7 @@ def _fake_merge_heads(x: torch.Tensor) -> torch.Tensor:
     mutates_args=[],
     fake_impl=_fake_merge_heads,
 )
-def _usp_merge_heads_custom_op(x: torch.Tensor) -> torch.Tensor:
+def _usp_merge_heads_cuda(x: torch.Tensor) -> torch.Tensor:
     world, seq, batch, h_local, head_dim = x.shape
     out = x.new_empty((batch, seq, world, h_local, head_dim))
     module = _jit_usp_relayout_module(x.dtype)
@@ -52,25 +52,12 @@ def _usp_merge_heads_custom_op(x: torch.Tensor) -> torch.Tensor:
 
 def can_use_usp_merge_heads(x: torch.Tensor) -> bool:
     return (
-        isinstance(x, torch.Tensor)
-        and torch.version.hip is None
+        torch.version.hip is None
         and x.is_cuda
         and x.dtype in _SUPPORTED_DTYPES
-        and x.dim() == 5
         and x.numel() > 0
         and x.is_contiguous()
     )
-
-
-def _usp_merge_heads_cuda(x: torch.Tensor) -> torch.Tensor:
-    """[W, S, B, h_local, D] -> [B, S, W, h_local, D] contiguous.
-
-    Bit-exact single-pass replacement for
-    ``x.permute(2, 1, 0, 3, 4).contiguous()`` on the Ulysses output path.
-    """
-    if not can_use_usp_merge_heads(x):
-        raise RuntimeError("unsupported input for usp_merge_heads CUDA")
-    return _usp_merge_heads_custom_op(x)
 
 
 def usp_merge_heads(x: torch.Tensor) -> torch.Tensor:
