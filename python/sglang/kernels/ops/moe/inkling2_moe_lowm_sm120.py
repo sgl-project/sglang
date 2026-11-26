@@ -15,6 +15,18 @@ def _require_sm12x() -> None:
 
 
 @cache_once
+def _combine_module():
+    _require_sm12x()
+    return load_jit(
+        "inkling2_moe_combine_lowm_sm120",
+        cuda_files=["inkling2/moe_lowm_sm120.cuh"],
+        cuda_wrappers=[
+            ("moe_combine_bf16", "inkling2_moe_lowm_sm120::moe_combine_bf16"),
+        ],
+    )
+
+
+@cache_once
 def _route_module():
     _require_sm12x()
     return load_jit(
@@ -107,3 +119,28 @@ def route_metadata_lowm(ids, weights, num_experts=_NUM_EXPERTS):
             flat_ids, flat_w, src2dst, dst2src, gammas, offsets
         )
     return src2dst, dst2src, gammas, offsets
+
+
+def moe_combine_bf16(down_bf16, src2dst, top_k=_TOP_K):
+    """Sum top-8 routed BF16 rows per token; -1 or OOB src2dst entries contribute zero."""
+    if top_k != _TOP_K:
+        raise ValueError(f"moe_combine_bf16 requires top_k={_TOP_K}, got {top_k}")
+    src2dst_flat = src2dst.reshape(-1).contiguous()
+    n = src2dst_flat.numel()
+    if n % top_k != 0:
+        raise ValueError(
+            f"moe_combine_bf16 src2dst length {n} is not divisible by top_k={top_k}"
+        )
+    if down_bf16.shape[0] != n:
+        raise ValueError(
+            f"moe_combine_bf16 down_bf16 rows ({down_bf16.shape[0]}) must equal "
+            f"src2dst length ({n})"
+        )
+    tokens = n // top_k
+    hidden = down_bf16.shape[1]
+    out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=down_bf16.device)
+    if tokens:
+        _combine_module().moe_combine_bf16(
+            down_bf16.contiguous(), src2dst_flat, out, top_k
+        )
+    return out
