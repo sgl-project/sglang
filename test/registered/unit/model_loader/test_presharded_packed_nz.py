@@ -11,11 +11,12 @@ import torch
 
 from sglang.srt.model_loader.loader import PreshardedModelLoader
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestPreshardedPackedNZ(unittest.TestCase):
+class TestPreshardedPackedNZ(CustomTestCase):
     def test_hash_dump_and_restore_keep_bits_views_and_extra_aliases(self):
         source = torch.tensor(
             [[-(2**31), -1], [0, 42], [2**31 - 1, 256]], dtype=torch.int32
