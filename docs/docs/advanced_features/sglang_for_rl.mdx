@@ -339,7 +339,8 @@ The worker checks the indexed shard and tensor names before publishing. When
 all workers succeed, pass the returned `model_path` to `/update_weights_from_disk`.
 
 Use the same absolute `local_checkpoint_dir` on all workers and one publication
-stream per directory. Keep the source seed and delta chain until all hosts have
+stream per directory. Publish each version once. Every host must read the same
+bytes for that version, including on retry. Keep the seed and deltas until all hosts have
 published their snapshot. A retry reuses an existing snapshot on each host.
 The ordinary in-place checkpoint advances on ordinary pulls only. Each retained
 snapshot costs one full checkpoint of local storage. Remove it on each host
