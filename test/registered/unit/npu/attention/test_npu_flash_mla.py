@@ -365,7 +365,9 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         model_config=model_config,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
-        req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(2, 512)),
+        req_to_token_pool=SimpleNamespace(
+            max_context_len=512, req_to_token=torch.zeros(2, 512)
+        ),
         token_to_kv_pool=object(),
         use_mla_backend=not is_draft,
         spec_algorithm=spec,

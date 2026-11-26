@@ -35,7 +35,7 @@ on:
 
 env:
   # The CANN image a3 jobs install the PR into; /rerun-test reads it from here.
-  NPU_A3_PR_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12
+  NPU_A3_PR_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.2.0-a3-ubuntu22.04-py3.12
 
 concurrency:
   group: pr-test-npu-${{ inputs.coverage_mode == true && 'coverage-' || '' }}${{ inputs.ref || github.ref }}
@@ -165,7 +165,7 @@ jobs:
           # wheel does not pull it in (the NPU image uses triton-ascend instead).
           # unsafe-best-match: --index-url is the lowest-priority index, so the
           # default strategy would resolve PyPI's CUDA torch, not the +cpu build.
-          uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton \
+          uv pip install torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 triton \
             --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple/ \
             --index-strategy unsafe-best-match
@@ -217,7 +217,7 @@ jobs:
           # triton, no Ascend wheels); keep the two blocks in sync.
           rm -f python/pyproject.toml
           mv python/pyproject_npu.toml python/pyproject.toml
-          uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton \
+          uv pip install torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 triton \
             --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple/ \
             --index-strategy unsafe-best-match
