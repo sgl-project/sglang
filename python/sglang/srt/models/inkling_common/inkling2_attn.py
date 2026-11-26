@@ -34,7 +34,10 @@ from sglang.srt.models.inkling_common.attn import (
     get_inkling_relative_attention_score_mod,
     serving_attention_backend,
 )
-from sglang.srt.models.inkling_common.inkling2_arch import supports_fa4
+from sglang.srt.models.inkling_common.inkling2_arch import (
+    prefer_triton_fallbacks,
+    supports_fa4,
+)
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
 from sglang.srt.runtime_context import get_model, get_parallel, get_platform
@@ -94,6 +97,8 @@ class QKL2Clip(nn.Module):
             set_weight_attrs(self.scale, {"weight_loader": self.weight_loader})
         else:
             self.register_parameter("scale", None)
+        # The CUTE clip kernel compiles for Hopper and newer; SM80 uses Triton.
+        self._use_triton = prefer_triton_fallbacks()
 
     def weight_loader(self, param, loaded_weight):
         if loaded_weight.shape != param.shape:
@@ -104,11 +109,16 @@ class QKL2Clip(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x, *, output_scale=None):
-        from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip import (
-            qk_l2_clip_fwd_cutedsl,
-        )
+        if self._use_triton:
+            from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip_triton import (
+                qk_l2_clip_fwd_triton as _clip,
+            )
+        else:
+            from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip import (
+                qk_l2_clip_fwd_cutedsl as _clip,
+            )
 
-        output = qk_l2_clip_fwd_cutedsl(
+        output = _clip(
             x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale
         )
         return output.view(x.shape)
