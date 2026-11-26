@@ -1853,6 +1853,7 @@ def setup_state_kv_args(
     window_tails: Optional[Dict[str, int]] = None,
     draft_kv_ring: Optional[DFlashDraftKVRing] = None,
     empty_draft_kv_ring: bool = False,
+    mooncake_page_dcp: bool = False,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
@@ -1941,6 +1942,22 @@ def setup_state_kv_args(
             if draft_token_to_kv_pool is not None
             else 0
         )
+        if mooncake_page_dcp:
+            num_draft = kv_args.num_draft_entries
+            kv_args.dcp_page_global_slots = (
+                owner_view.get_dcp_remote_decode_layout() + [True] * num_draft
+            )
+            # Hybrid pools already publish their model layer IDs. Plain NPU
+            # pools need them here to match the separate latent/RoPE/index groups.
+            layer_ids = kv_args.kv_layer_ids
+            if not layer_ids:
+                layer_ids = owner_view.get_kv_layer_ids()
+                if num_draft:
+                    draft_ids = _draft_entry_layer_ids(
+                        pool=draft_token_to_kv_pool, num_entries=num_draft
+                    )
+                    layer_ids += remap_draft_layer_ids(draft_ids, total_kv_layers)
+            kv_args.dcp_page_layer_ids = layer_ids
 
 
 def _token_kv_view(token_to_kv_pool):

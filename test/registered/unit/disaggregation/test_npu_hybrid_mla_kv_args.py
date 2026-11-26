@@ -7,9 +7,14 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
-from sglang.srt.disaggregation.utils import setup_state_kv_args
+from sglang.srt.disaggregation.utils import (
+    build_kv_layer_ids,
+    get_kv_transfer_buf_infos,
+    setup_state_kv_args,
+)
 from sglang.srt.hardware_backend.npu import memory_pool_npu
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+from sglang.srt.mem_cache import memory_pool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,13 +42,14 @@ def _recurrent_state(layer_ids):
     )
 
 
-def _npu_mla(layer_num):
+def _npu_mla(layer_num, **kwargs):
     return NPUMLATokenToKVPool(
         **_MLA,
         kv_lora_rank=16,
         qk_rope_head_dim=8,
         layer_num=layer_num,
         enable_memory_saver=False,
+        **kwargs,
     )
 
 
@@ -61,7 +67,7 @@ def _hybrid_npu_mla(full_layer_ids, state_layer_ids):
     )
 
 
-def _register(target, draft):
+def _register(target, draft, *, mooncake_page_dcp=False):
     allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: target)
     storage = StaticKVStorage(
         None,
@@ -70,11 +76,30 @@ def _register(target, draft):
         num_hidden_layers=_TARGET_LAYERS,
     )
     kv_args = KVArgs()
+    kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens = (
+        get_kv_transfer_buf_infos(storage)
+    )
+    if draft is not None:
+        draft_ptrs, draft_lens, draft_item_lens = draft.get_contiguous_buf_infos()
+        kv_args.kv_data_ptrs += draft_ptrs
+        kv_args.kv_data_lens += draft_lens
+        kv_args.kv_item_lens += draft_item_lens
+        kv_args.num_draft_entries = len(draft_ptrs)
+    # Use the NPU layer-ID layout for these CPU tensors.
+    with patch.object(memory_pool, "_is_npu", True):
+        kv_args.kv_layer_ids = build_kv_layer_ids(
+            token_to_kv_pool=target,
+            draft_token_to_kv_pool=draft,
+            num_draft_entries=kv_args.num_draft_entries,
+            num_hidden_layers=_TARGET_LAYERS,
+            storage=storage,
+        )
     setup_state_kv_args(
         kv_args,
         storage,
         draft_token_to_kv_pool=draft,
         total_kv_layers=_TARGET_LAYERS,
+        mooncake_page_dcp=mooncake_page_dcp,
     )
     return kv_args
 
@@ -136,6 +161,34 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
         kv_args = _register(self.target, None)
         self._assert_target_registered(kv_args)
         self.assertEqual(kv_args.draft_kv_layers, 0)
+
+    def test_mooncake_page_dcp_registers_plain_pp_local_buffer_groups(self):
+        target = _npu_mla(
+            layer_num=2,
+            start_layer=2,
+            end_layer=4,
+            index_head_dim=8,
+            indexer_layer_ids=(3,),
+        )
+        kv_args = _register(target, _npu_mla(layer_num=1), mooncake_page_dcp=True)
+
+        self.assertEqual(kv_args.kv_layer_ids, [])
+        # Two latent K buffers, two RoPE buffers, one index-K and two draft buffers.
+        self.assertEqual(list(kv_args.dcp_page_layer_ids), [2, 3, 2, 3, 3, 6, 6])
+        self.assertEqual(
+            list(kv_args.dcp_page_global_slots),
+            [False, False, False, False, True, True, True],
+        )
+
+    def test_mooncake_page_dcp_preserves_hybrid_full_attention_layer_ids(self):
+        kv_args = _register(self.target, _npu_mla(layer_num=1), mooncake_page_dcp=True)
+
+        self.assertEqual(list(kv_args.dcp_page_layer_ids), [0, 2, 4, 0, 2, 4, 6, 6])
+        self.assertEqual(list(kv_args.dcp_page_layer_ids), kv_args.kv_layer_ids)
+        self.assertEqual(
+            list(kv_args.dcp_page_global_slots),
+            [False, False, False, False, False, False, True, True],
+        )
 
 
 if __name__ == "__main__":

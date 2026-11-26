@@ -8,7 +8,10 @@ import numpy.typing as npt
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.common.utils import (
+    build_page_interleaved_dcp_transfer_groups,
+    group_concurrent_contiguous,
+)
 from sglang.srt.disaggregation.mooncake.buffers import group_units
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
@@ -35,64 +38,6 @@ class AscendStateType(str, enum.Enum):
 
 
 _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
-
-
-def _build_page_interleaved_dcp_plan(
-    src_page_indices: npt.NDArray[np.int32],
-    dst_page_indices: npt.NDArray[np.int32],
-    *,
-    page_size: int,
-    dcp_size: int,
-    dcp_rank: int,
-    src_page_offset: int,
-    decode_prefix_len: int,
-    num_kv_tokens: int,
-) -> Tuple[npt.NDArray[np.int64], ...]:
-    """Map physical prefill pages to local/global decode page slots."""
-    if not 0 <= dcp_rank < dcp_size:
-        raise ValueError(f"Invalid DCP rank {dcp_rank} for size {dcp_size}")
-    virtual_page_size = page_size * dcp_size
-    if decode_prefix_len % virtual_page_size:
-        raise ValueError(
-            "Ascend PD DCP requires decode_prefix_len to align to the virtual "
-            f"page size ({virtual_page_size}), got {decode_prefix_len}"
-        )
-    if src_page_offset < 0 or num_kv_tokens < 0:
-        raise ValueError(
-            "Ascend PD DCP page offset and token count must be nonnegative"
-        )
-
-    src_pages = np.asarray(src_page_indices, dtype=np.int64)
-    dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
-    max_src_pages = (num_kv_tokens + page_size - 1) // page_size
-    if src_pages.size > max_src_pages:
-        raise ValueError(
-            "Ascend PD DCP source page count exceeds the token count: "
-            f"pages={src_pages.size}, tokens={num_kv_tokens}, page_size={page_size}"
-        )
-    if src_pages.size == 0:
-        empty = np.empty((0,), dtype=np.int64)
-        return empty, empty.copy(), empty.copy(), empty.copy()
-
-    # CP may assign this sender only a contiguous subset of the chunk pages;
-    # index_slice.start still carries that subset's suffix-relative offset.
-    relative_pages = src_page_offset + np.arange(src_pages.size, dtype=np.int64)
-    dst_positions = relative_pages // dcp_size
-    if dst_positions[-1] >= dst_pages.size:
-        raise ValueError(
-            "Ascend PD DCP destination does not contain enough virtual pages: "
-            f"required={dst_positions[-1] + 1}, available={dst_pages.size}"
-        )
-    dst_super_pages = dst_pages[dst_positions]
-    owners = (decode_prefix_len // page_size + relative_pages) % dcp_size
-    local = owners == dcp_rank
-
-    return (
-        src_pages[local],
-        dst_super_pages[local],
-        src_pages,
-        dst_super_pages * dcp_size + owners,
-    )
 
 
 class AscendKVManager(MooncakeKVManager):
@@ -487,7 +432,7 @@ class AscendKVManager(MooncakeKVManager):
         if dst_kv_item_lens and len(dst_kv_item_lens) != num_entries:
             raise RuntimeError("Ascend PD DCP destination KV metadata is inconsistent")
 
-        local_src, local_dst, global_src, global_dst = _build_page_interleaved_dcp_plan(
+        local_groups, global_groups = build_page_interleaved_dcp_transfer_groups(
             prefill_kv_indices,
             dst_kv_indices,
             page_size=self.kv_args.page_size,
@@ -497,6 +442,8 @@ class AscendKVManager(MooncakeKVManager):
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
         )
+        local_units = group_units(*local_groups)
+        global_units = group_units(*global_groups)
 
         peer_kv_keys = self._peers[mooncake_session_id].keys.kv
         copies: List[Copy] = []
@@ -520,9 +467,7 @@ class AscendKVManager(MooncakeKVManager):
                         f"actual={dst_kv_item_lens[entry]}"
                     )
 
-            src_pages = global_src if uses_global_slots else local_src
-            dst_pages = global_dst if uses_global_slots else local_dst
-            units = group_units(*group_concurrent_contiguous(src_pages, dst_pages))
+            units = global_units if uses_global_slots else local_units
             copies.append(
                 Copy(
                     src=self._local_keys.kv[entry],
