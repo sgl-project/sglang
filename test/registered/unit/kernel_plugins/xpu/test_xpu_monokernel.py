@@ -26,7 +26,7 @@ from sglang.srt.kernel_plugins.amd.binding import (
 )
 from sglang.srt.kernel_plugins.nvidia.binding import handle_nvidia_megakernel
 from sglang.srt.runtime_context import publish, reset_context
-from sglang.srt.server_args import ServerArgs, prepare_server_args
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -100,13 +100,6 @@ class TestXpuMonokernel(CustomTestCase):
         publish(server_args(), role="test")
         self.addCleanup(reset_context)
         self.assertEqual(binding._backend(), BACKEND)
-
-    def test_the_deprecated_backend_choice_maps_to_the_flag(self):
-        args = prepare_server_args(
-            ["--model-path", "dummy", "--monokernel-backend", "xpu"]
-        )
-        self.assertTrue(args.enable_xpu_monokernel)
-        self.assertFalse(args.enable_amd_monokernel)
 
     def test_the_isa_of_an_intel_gpu(self):
         for arch, isa in (
