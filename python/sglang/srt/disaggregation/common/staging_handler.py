@@ -630,8 +630,8 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
     tinfo = room_infos.get(stg_session)
     if tinfo is not None:
         if tinfo.staging is None:
-            tinfo.staging = StagingTransferInfo()
-        tinfo.staging.set_chunk(stg_chunk_idx, stg_offset, stg_round, stg_end)
+            tinfo.staging = {}
+        tinfo.staging[stg_chunk_idx] = (stg_offset, stg_round, stg_end)
     else:
         logger.warning(
             "STAGING_RSP RECV but tinfo=None room=%s chunk=%d session=%s",
@@ -646,22 +646,9 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
 # ======================================================================
 
 
-@dataclasses.dataclass
-class StagingTransferInfo:
-    """Per-chunk staging allocation info attached to a TransferInfo."""
-
-    offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])
-    rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
-    ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
-
-    def set_chunk(self, idx: int, offset: int, rnd: int, end: int):
-        while len(self.offsets) <= idx:
-            self.offsets.append(-1)
-            self.rounds.append(0)
-            self.ends.append(-1)
-        self.offsets[idx] = offset
-        self.rounds[idx] = rnd
-        self.ends[idx] = end
+# The bootstrap thread publishes (offset, round, end) together so the worker
+# always checks the watermark against the reservation it actually writes.
+StagingTransferInfo = dict[int, tuple[int, int, int]]
 
 
 @dataclasses.dataclass
@@ -751,17 +738,15 @@ class PrefillStagingStrategy:
         )
 
         stg = req.staging
-        if stg is None or chunk_idx >= len(stg.offsets):
+        reservation = stg.get(chunk_idx) if stg is not None else None
+        if reservation is None:
             return (False, chunk_idx, -1, 0, -1)
 
-        c_offset = stg.offsets[chunk_idx]
+        c_offset, c_round, c_end = reservation
         if c_offset == StagingAllocator.ALLOC_OVERSIZED:
             return (False, chunk_idx, StagingAllocator.ALLOC_OVERSIZED, 0, -1)
         if c_offset < 0:
             return (False, chunk_idx, -1, 0, -1)
-
-        c_round = stg.rounds[chunk_idx]
-        c_end = stg.ends[chunk_idx]
 
         if session_id is None:
             session_id = req.mooncake_session_id
