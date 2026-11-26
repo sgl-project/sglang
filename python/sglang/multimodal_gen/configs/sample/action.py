@@ -67,6 +67,7 @@ class ActionSamplingParams:
             self.num_inference_steps = env_steps
 
     build_request_extra = SamplingParams.build_request_extra
+    request_task = SamplingParams.request_task
 
     def apply_request_extra(self, req: Any) -> None:
         req.extra.update(self.build_request_extra())
