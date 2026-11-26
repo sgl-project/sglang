@@ -98,7 +98,7 @@ class LoadStat(
     num_total_tokens: int = 0  # KV tokens in use plus queued request tokens
     max_running_requests: int = 0  # Scheduler running-request limit
     total_prefill_uncached_tokens: int = 0  # Cumulative uncached prefill tokens
-    total_prefill_busy_us: int = 0  # Cumulative prefill step time in microseconds
+    total_prefill_busy_us: int = 0  # Cumulative prefill busy time in microseconds
 
 
 def _open_pub_socket(endpoint: str) -> zmq.Socket:
