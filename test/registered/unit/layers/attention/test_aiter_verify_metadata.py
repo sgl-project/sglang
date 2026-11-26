@@ -62,7 +62,8 @@ def _unified_verify_backend():
     backend.use_muse_attention_paths = False
     backend.muse_reuse_verify_lengths = False
     backend.page_size = 1
-    backend.max_context_len = 128
+    backend.max_kv_len = 128
+    backend.max_num_pages = 128
     backend.num_draft_tokens = _VERIFY_TOKENS_PER_REQ
     backend.qo_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int32)
     backend.kv_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int32)
@@ -70,7 +71,7 @@ def _unified_verify_backend():
     backend.cuda_graph_kv_last_page_len = torch.zeros(_BATCH_SIZE, dtype=torch.int32)
     backend.req_to_token = torch.zeros((_BATCH_SIZE, 128), dtype=torch.int32)
     backend.cuda_graph_page_table = torch.zeros(
-        (_BATCH_SIZE, backend.max_context_len), dtype=torch.int32
+        (_BATCH_SIZE, backend.max_kv_len), dtype=torch.int32
     )
 
     def build_verify_unified_metadata(
@@ -161,7 +162,8 @@ def _dcp_verify_backend(asm_cprr):
     backend.dcp_world_size = _DCP_SIZE
     backend.num_draft_tokens = _DRAFT_TOKENS
     backend.cprr_kernel_heads = 96 if asm_cprr else 0
-    backend.max_context_len = _DCP_MAX_CONTEXT_LEN
+    backend.max_kv_len = _DCP_MAX_CONTEXT_LEN
+    backend.max_num_pages = _DCP_MAX_CONTEXT_LEN
     backend.max_split_per_batch = 32
     backend.cprr_fast_mode = True
     backend.cprr_intra_batch_mode = False
@@ -275,7 +277,9 @@ def _init_mha_backend(kv_cache_layout):
         model_config=model_config,
         device=torch.device("cpu"),
         kv_cache_dtype=torch.bfloat16,
-        req_to_token_pool=SimpleNamespace(req_to_token=None, size=_BATCH_SIZE),
+        req_to_token_pool=SimpleNamespace(
+            row_width=4096, req_to_token=None, size=_BATCH_SIZE
+        ),
         runner_ids=None,
         token_to_kv_pool=pool,
         is_draft_worker=False,
