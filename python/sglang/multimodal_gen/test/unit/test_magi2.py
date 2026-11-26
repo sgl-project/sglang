@@ -1213,7 +1213,7 @@ class TestLoaderPrecision(unittest.TestCase):
     def test_component_precisions_override_only_their_own_entry(self):
         """--component-precisions was ignored by the MAGI-2 loader."""
         defaults = self._loaded_dtypes({})
-        for component in self._LOADERS.values():
+        for component in self._LOADER_CLASSES:
             with self.subTest(component=component):
                 want = dict(defaults)
                 want[component] = torch.float16
@@ -1237,14 +1237,15 @@ class TestSyntheticWarmup(unittest.TestCase):
     def test_default_warmup_runs_the_two_stage_tier_at_full_length(self):
         """The generic probe picked the preview tier, leaving the refiner cold."""
         params = Magi2SamplingParams(prompt="x")
-        for num_gpus, frames in ((1, 249), (4, 253), (8, 253)):
+        # Exact 249 frames on every GPU count: requests of any other length are rejected.
+        for num_gpus in (1, 4, 8):
             with self.subTest(num_gpus=num_gpus):
                 req = SimpleNamespace(width=896, height=512, num_frames=17)
                 params.prepare_synthetic_warmup_request_for_queue(
                     req, self._warmup_args(num_gpus=num_gpus)
                 )
                 self.assertEqual((req.width, req.height), (1920, 1088))
-                self.assertEqual(req.num_frames, frames)
+                self.assertEqual(req.num_frames, 249)
 
     def test_explicit_warmup_shape_is_kept(self):
         params = Magi2SamplingParams(prompt="x")
