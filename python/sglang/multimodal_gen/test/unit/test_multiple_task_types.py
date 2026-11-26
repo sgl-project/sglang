@@ -433,6 +433,45 @@ def test_wan_s2v_rejects_cache_flags_it_would_ignore(
         Wan2_2_S2V_14B_SamplingParam(enable_spectrum=True)
 
 
+@pytest.mark.parametrize(
+    "http_client",
+    [(Wan2_2_S2V_14B_Config, Wan2_2_S2V_14B_SamplingParam)],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "fields, requested_frames",
+    [
+        ({}, 64),
+        ({"seconds": 5}, 80),
+        ({"fps": 24}, 64),
+        ({"num_frames": 81}, 81),
+        ({"fps": 24, "num_frames": 81}, 81),
+    ],
+    ids=["none", "seconds", "fps", "num_frames", "fps_num_frames"],
+)
+def test_wan_s2v_video_defaults_use_model_fps(http_client, fields, requested_frames):
+    """S2V writes its video at 16 fps, so the API must not size an omitted
+    num_frames by its 24 fps default or a request fps."""
+    client, admitted, config = http_client
+    response = client.post(
+        "/v1/videos",
+        json={
+            "prompt": "a woman sings",
+            "size": "1024x704",
+            "input_reference": "/tmp/ref.png",
+            "audio_path": "/tmp/talk.wav",
+            **fields,
+        },
+    )
+    assert response.status_code == 200, response.text
+    params = admitted[-1].sampling_params
+    assert params.fps == 16
+    # Wan rounds num_frames to 4k + 1 after the hook (64 -> 65).
+    assert params.num_frames == config.adjust_num_frames(
+        requested_frames, log_adjustment=False
+    )
+
+
 def test_http_rejects_invalid_tasks_before_model_execution(http_client):
     client, admitted, _ = http_client
     for endpoint, payload in [
