@@ -71,7 +71,7 @@ def trtllm_moe_enable_pdl(num_tokens: int) -> bool:
     from sglang.kernels.jit.utils import is_arch_support_pdl
 
     return (
-        not getattr(get_forward(), "sp_active", False)
+        not get_forward().sp_active
         and is_arch_support_pdl()
         and num_tokens <= _TRTLLM_MOE_PDL_MAX_TOKENS
     )
@@ -104,8 +104,6 @@ def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
-
     return moe_finalize_fuse_shared(
         deferred_output.gemm2_out,
         deferred_output.expanded_idx_to_permuted_idx,
@@ -151,8 +149,6 @@ def _make_deferred_finalize_output(
 def _finalize_in_order(result, *, top_k: int, out: torch.Tensor) -> torch.Tensor:
     """Sum FlashInfer's ``do_finalize=False`` outputs into ``out``, adding the
     top-k terms in the same order whatever the batch size."""
-    from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
-
     deferred = _make_deferred_finalize_output(result, top_k=top_k)
     num_tokens = out.shape[0]
     return moe_finalize_fuse_shared(

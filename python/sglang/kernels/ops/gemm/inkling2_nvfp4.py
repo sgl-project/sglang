@@ -1,6 +1,5 @@
 import torch
 
-from sglang.kernels.ops.gemm.inkling2_cute_grouped_nvfp4 import routed_swap_matmul
 from sglang.kernels.ops.moe.inkling2_moe import _sm_count, routed_quant_module
 
 
@@ -8,6 +7,9 @@ def _routed_gemm(device, rows, weight, scales, counts, offsets, schedule, quanti
     """Grouped NVFP4 GEMM of rows that quantize(module, values, x_scales, amax,
     sm_count) writes, with the activation scales laid out as one 128-row scale
     block run per expert. Returns the FP32 accumulator and the per-row amax."""
+    # CuTe DSL (CUDA-only): imported on use, so ROCm can import this module.
+    from sglang.kernels.ops.gemm.inkling2_cute_grouped_nvfp4 import routed_swap_matmul
+
     experts, output_size, packed_width = weight.shape
     width = packed_width * 2
     sm_count = _sm_count(device)
