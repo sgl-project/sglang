@@ -229,7 +229,7 @@ async fn dispatch(
 
     let mut rng = StdRng::seed_from_u64(args.seed ^ 0x5eed);
     let mut handles = Vec::with_capacity(rows.len());
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         let (http, template, row) = (http.clone(), template.clone(), row.clone());
         let permits = permits.clone();
         let completed = completed.clone();
@@ -245,7 +245,9 @@ async fn dispatch(
             output
         }));
 
-        if request_rate.is_finite() {
+        // Only pace between arrivals: a final sleep would inflate the run's
+        // measured duration after every request has already completed.
+        if index + 1 < rows.len() && request_rate.is_finite() {
             // Poisson arrivals: exponential gaps with mean 1/rate. Sampled
             // from the uniform inverse CDF, since the gap distribution is the
             // only random draw this loop makes.
@@ -679,6 +681,84 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+    use crate::args::Api;
+    use crate::dataset::Prompt;
+
+    // A rejected URL completes each request without network I/O. Failed
+    // requests use the same dispatch pacing as successful ones, and virtual
+    // time lets us observe every sleep without waiting in real time.
+    async fn dispatch_elapsed(count: usize, rate: f64) -> Duration {
+        let args = Args::parse_from(["sglang-bench", "--disable-tqdm"]);
+        let template = RequestTemplate {
+            api: Api::SglangGenerate,
+            api_url: "invalid://localhost/generate".into(),
+            model: "test".into(),
+            stream: true,
+            temperature: 0.0,
+            top_p: 1.0,
+            ignore_eos: true,
+            return_logprob: false,
+            top_logprobs_num: 0,
+            logprob_start_len: -1,
+            extra_body: Default::default(),
+            headers: HeaderMap::new(),
+            grpc: None,
+        };
+        let rows = vec![
+            DatasetRow {
+                prompt: Prompt::Text("test".into()),
+                prompt_len: 1,
+                output_len: 1,
+                text_prompt_len: 1,
+                vision_prompt_len: 0,
+            };
+            count
+        ];
+        let started = tokio::time::Instant::now();
+        let outputs = dispatch(
+            &reqwest::Client::new(),
+            &template,
+            &rows,
+            &args,
+            rate,
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(outputs.len(), count);
+        assert!(outputs.iter().all(|output| !output.success));
+        started.elapsed()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_does_not_wait_without_another_arrival() {
+        assert_eq!(dispatch_elapsed(0, 0.2).await, Duration::ZERO);
+        assert_eq!(dispatch_elapsed(1, 0.2).await, Duration::ZERO);
+        assert_eq!(dispatch_elapsed(3, f64::INFINITY).await, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_keeps_seeded_gaps_between_requests() {
+        let args = Args::default();
+        let mut rng = StdRng::seed_from_u64(args.seed ^ 0x5eed);
+        let rate = 0.2;
+        // Three requests need the first two seeded gaps, and no third gap.
+        let expected: Duration = (0..2)
+            .map(|_| {
+                let uniform: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
+                Duration::from_secs_f64(-uniform.ln() / rate)
+            })
+            .sum();
+        let elapsed = dispatch_elapsed(3, rate).await;
+        // Tokio rounds each timer to millisecond resolution.
+        assert!(
+            elapsed >= expected,
+            "elapsed {elapsed:?}, expected {expected:?}"
+        );
+        assert!(
+            elapsed <= expected + Duration::from_millis(4),
+            "elapsed {elapsed:?}, expected {expected:?}"
+        );
+    }
 
     /// The civil-date arithmetic behind the default result filename, checked
     /// on epoch day 0, a leap day, and a year boundary.
