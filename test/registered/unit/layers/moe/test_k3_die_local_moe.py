@@ -22,7 +22,6 @@ def _env(ar_fusion=False):
     with (
         envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM.override(True),
         envs.SGLANG_K3_AR_FUSION.override(ar_fusion),
-        envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS.override(""),
     ):
         policy.reset_caches()
         try:
@@ -77,7 +76,7 @@ class TestK3DieLocalMoE(CustomTestCase):
         self.assertIn("deep_gemm 0.2.9 lacks the one-rank MegaMoE API", warnings[0])
 
     def test_in_tree_table_dispatch(self):
-        table = json.loads(policy._DEFAULT_TABLE.read_text())
+        table = json.loads(policy._TABLE.read_text())
         fold = table["ar_fusion_fold_max_rows"]
         self.assertEqual(
             table["widths_ar_fusion"], [rows for rows in table["widths"] if rows > fold]

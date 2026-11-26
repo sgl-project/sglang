@@ -18,7 +18,7 @@ from sglang.srt.utils.log_utils import print_warning_once
 logger = logging.getLogger(__name__)
 
 _SWITCH = "SGLANG_K3_ROUTED_MOE_DEEPGEMM"
-_DEFAULT_TABLE = Path(__file__).with_name("k3_die_local_moe_widths.json")
+_TABLE = Path(__file__).with_name("k3_die_local_moe_widths.json")
 # Rows of the MegaMoE buffer; no dispatched width may exceed it
 MAX_VERIFY_ROWS = 256
 # (num_experts, num_local_experts, w13 shape, w2 shape) validated: Kimi K3.1, EP8
@@ -36,34 +36,17 @@ def ar_fusion() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
-def table_path() -> Path:
-    override = envs.SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS.get()
-    return Path(override) if override else _DEFAULT_TABLE
-
-
-@functools.lru_cache(maxsize=1)
 def verify_widths() -> FrozenSet[int]:
     """Row counts of a target-verify call that run on the MegaMoE kernel."""
     if not enabled():
         return frozenset()
-    path = table_path()
-    key = "widths_ar_fusion" if ar_fusion() else "widths"
-    table = json.loads(path.read_text())
-    if key not in table:
-        raise ValueError(f"{path} has no {key!r} list")
-    widths = table[key]
-    if not widths or not all(
-        type(w) is int and 1 <= w <= MAX_VERIFY_ROWS for w in widths
-    ):
-        raise ValueError(
-            f"{path}: {key!r} is a non-empty list of row counts in [1, {MAX_VERIFY_ROWS}]"
-        )
-    return frozenset(widths)
+    table = json.loads(_TABLE.read_text())
+    return frozenset(table["widths_ar_fusion" if ar_fusion() else "widths"])
 
 
 def reset_caches() -> None:
     """Forget what was read from the environment (tests)."""
-    for cached in (ar_fusion, table_path, verify_widths):
+    for cached in (ar_fusion, verify_widths):
         cached.cache_clear()
     _seen.clear()
 
@@ -157,7 +140,7 @@ def wanted(layer: torch.nn.Module, with_bias: bool, precision: str) -> bool:
             f"{_SWITCH} is set but not used ({reason}); the routed experts stay on the default path"
         )
         return False
-    verify_widths()  # a bad table fails here, at load
+    verify_widths()  # read the table here, at load
     return True
 
 
@@ -375,7 +358,7 @@ def _log_startup() -> None:
         _summary["experts"],
         _summary["weight_bytes"],
         len(widths),
-        f"{widths[0]}-{widths[-1]}" if widths else "none",
+        f"{widths[0]}-{widths[-1]}",
         ar_fusion(),
-        table_path().name,
+        _TABLE.name,
     )

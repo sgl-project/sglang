@@ -2636,8 +2636,6 @@ class Envs:
     # Die-local routed experts on DeepGEMM's one-rank MegaMoE for DFlash target
     # verify on two-die GPUs (srt/layers/moe/k3_die_local_moe.py).
     SGLANG_K3_ROUTED_MOE_DEEPGEMM = EnvBool(False)
-    # JSON file replacing the in-tree per-width table (k3_die_local_moe_widths.json).
-    SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS = EnvStr("")
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

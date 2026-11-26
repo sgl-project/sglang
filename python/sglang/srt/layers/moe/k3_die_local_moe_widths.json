@@ -5,6 +5,5 @@
   "widths_ar_fusion": [80, 85, 90, 100, 110, 120, 130, 140, 150, 160, 200, 220, 235],
   "ar_fusion_fold_max_rows": 73,
   "rule": "widths: the row counts of a per-call benchmark (5 to 235 rows; reference = trtllm-gen with the serving engine's autotuned tactic, same process, same weights) at which the MegaMoE call was faster in every repetition. widths_ar_fusion: with SGLANG_K3_AR_FUSION a call of at most ar_fusion_fold_max_rows rows folds its finalize into the push all-reduce, which a MegaMoE call gives up; such a width is listed only if the kernel saves more than the folded finalize plus the latent copy (about 10 us per call, estimated from the finalize stage of a verify round), which none did. Widths above the fold limit are taken from widths unchanged.",
-  "not_listed": "5 rows (level with trtllm-gen) and row counts that were not timed, such as 205 and 215, stay on trtllm-gen.",
-  "regenerate": "Time both kernels per row count on the target GPU and model with the engine's trtllm-gen tactic table, keep the row counts where the MegaMoE call wins in every repetition, and pass the file with SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS."
+  "not_listed": "5 rows (level with trtllm-gen) and row counts that were not timed, such as 205 and 215, stay on trtllm-gen."
 }
