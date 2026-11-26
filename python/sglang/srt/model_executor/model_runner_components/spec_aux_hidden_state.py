@@ -117,10 +117,13 @@ def _check_capture_layer_ids_in_range(layer_ids, model_config: ModelConfig) -> N
             "--return-aux-hidden-state-layer-ids requires target num_hidden_layers "
             "in config."
         )
-    # Loop models: target layer ids span num_hidden_layers * num_loops.
-    num_layers = int(num_layers) * int(
-        getattr(model_config.hf_text_config, "num_loops", 1)
-    )
+    # Loop models: target layer ids index layer visits, not physical layers.
+    num_visits = getattr(model_config.hf_text_config, "num_layer_visits", None)
+    if num_visits is None:
+        num_visits = int(num_layers) * int(
+            getattr(model_config.hf_text_config, "num_loops", 1)
+        )
+    num_layers = int(num_visits)
     out_of_range = [layer_id for layer_id in layer_ids if layer_id >= num_layers]
     if out_of_range:
         raise ValueError(
@@ -232,9 +235,12 @@ def _resolve_dflash_aux_hidden_state(
                 f"in config. Got target={target_num_layers}."
             )
         target_num_layers = int(target_num_layers)
-        # Loop models: target layer ids span num_hidden_layers * num_loops.
-        num_loops = getattr(model_config.hf_text_config, "num_loops", 1)
-        target_num_layers = target_num_layers * int(num_loops)
+        # Loop models: target layer ids index layer visits, not physical layers.
+        num_visits = getattr(model_config.hf_text_config, "num_layer_visits", None)
+        if num_visits is None:
+            num_loops = getattr(model_config.hf_text_config, "num_loops", 1)
+            num_visits = target_num_layers * int(num_loops)
+        target_num_layers = int(num_visits)
 
         if (
             trained_target_layers is not None
