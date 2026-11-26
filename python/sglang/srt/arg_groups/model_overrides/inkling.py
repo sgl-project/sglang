@@ -89,7 +89,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             # Page size 1 left 0.5 GB after the KV pool; requests ran out of memory.
             if cfg.page_size is None:
                 overrides["page_size"] = 128
-        if cfg.kv_cache_dtype == "mxfp8" and mxfp8_kv_via_bf16(platform=get_platform()):
+        if mxfp8_kv_via_bf16(platform=get_platform()) and cfg.kv_cache_dtype == "mxfp8":
             # The scales are interleaved per 128-token page.
             if cfg.page_size is None:
                 overrides["page_size"] = 128
@@ -106,9 +106,9 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
                 algorithm.supports_ragged_verify()
                 and read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
             ):
+                device_sm = get_platform().device_sm
                 raise ValueError(
-                    "Inkling2 with --kv-cache-dtype mxfp8 on "
-                    f"SM{get_platform().device_sm} verifies "
+                    f"Inkling2 with --kv-cache-dtype mxfp8 on SM{device_sm} verifies "
                     "every request's whole draft block; use "
                     "SGLANG_RAGGED_VERIFY_MODE=static or cap-accept."
                 )

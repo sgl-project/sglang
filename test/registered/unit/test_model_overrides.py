@@ -1352,6 +1352,43 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         loop = "Inkling2LoopForConditionalGeneration"
         self.assertEqual(backend(arch=loop), ("megamoe", True))
 
+    def test_inkling2_mxfp8_page_size_default(self):
+        """MXFP8 KV on SM90 reads scales interleaved per 128-token page, so a bare
+        launch defaults the page size to 128; BF16 on SM90, Blackwell FA4 and an
+        explicit page size keep theirs."""
+        from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
+
+        def page_size(sm=90, kv_cache_dtype="mxfp8", page_size=None):
+            hf = SimpleNamespace(architectures=["Inkling2ForConditionalGeneration"])
+            args = SimpleNamespace(
+                tool_call_parser="inkling2",
+                reasoning_parser="inkling",
+                tp_size=1,
+                moe_dp_size=1,
+                ep_size=1,
+                attn_dp_size=1,
+                moe_a2a_backend="none",
+                kv_cache_dtype=kv_cache_dtype,
+                page_size=page_size,
+                speculative_algorithm=None,
+                swa_full_tokens_ratio=0.1,
+                mamba_full_memory_ratio=0.1,
+                mamba_radix_cache_strategy="extra_buffer",
+                disable_radix_cache=False,
+                attention_backend="fa4",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+            )
+            with override_platform(
+                is_cuda=True, device_sm=sm, is_sm90=sm == 90, is_sm120=False
+            ):
+                return _inkling_overrides(args, hf).get("page_size", page_size)
+
+        self.assertEqual(page_size(), 128)
+        self.assertIsNone(page_size(kv_cache_dtype="auto"))
+        self.assertIsNone(page_size(sm=100))
+        self.assertEqual(page_size(page_size=256), 256)
+
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.

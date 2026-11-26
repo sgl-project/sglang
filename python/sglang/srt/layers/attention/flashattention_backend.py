@@ -566,8 +566,8 @@ class FlashAttentionBackend(AttentionBackend):
         if self.mxfp8_via_bf16:
             if q_descale is not None:
                 raise RuntimeError(
-                    "MXFP8 KV cache on SM90 / SM120 attends with a BF16 query; FA4 reads "
-                    "a BF16 copy of the cache, so Q must not be quantized."
+                    "MXFP8 KV cache on SM90 / SM120 attends with a BF16 query; FA4 "
+                    "reads a BF16 copy of the cache, so Q must not be quantized."
                 )
             return {}
         if self.fa_impl_ver != 4:

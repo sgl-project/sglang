@@ -101,8 +101,9 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
 
 
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
-    """MXFP8 KV cache runs on SM100+ (Blackwell) and, through a BF16 copy of the
-    cache for prefill, on SM90."""
+    """MXFP8 KV cache runs on SM100+ (Blackwell) and, for Inkling 2, on SM90
+    through a BF16 copy of the cache for prefill."""
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
     from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
 
     cfg = resolving_view(server_args)
@@ -114,6 +115,14 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
             "--kv-cache-dtype mxfp8 requires an SM90 (Hopper) or SM100+ "
             "(Blackwell) GPU."
         )
+    # On SM90 only Inkling 2's relative-bias decode kernel reads MXFP8 pages.
+    if platform.is_sm90:
+        architectures = model_config_of(server_args).hf_config.architectures or ()
+        if not any(arch in INKLING2_ARCHS for arch in architectures):
+            raise ValueError(
+                "--kv-cache-dtype mxfp8 on SM90 (Hopper) supports only Inkling 2 "
+                "models."
+            )
     # The SM90 / SM120 kernels read the per-layer pools' interleaved scales; the
     # unified pool stores them token-major.
     if mxfp8_kv_via_bf16(platform=platform) and cfg.enable_unified_memory:
