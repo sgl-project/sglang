@@ -181,8 +181,12 @@ async fn pd_generate_merges_only_the_decode_suffix_per_prompt() {
 
 #[tokio::test]
 async fn pd_generate_returns_prompt_routes_when_decode_has_none() {
-    for (completion_tokens, expected) in [(0, routes(&[2])), (1, routes(&[2, 0]))] {
-        let p = json!({"meta_info": {"routed_experts": routes(&[2, 0]), "input_token_logprobs": [[null, 10, null]]}});
+    for (completion_tokens, start, prompt_routes, expected) in [
+        (0, 0, routes(&[2, 0]), routes(&[2])),
+        (1, 0, routes(&[2, 0]), routes(&[2, 0])),
+        (1, 2, routes(&[]), routes(&[])),
+    ] {
+        let p = json!({"meta_info": {"routed_experts": prompt_routes, "input_token_logprobs": [[null, 10, null]]}});
         let d = json!({"text": "a", "meta_info": {"prompt_tokens": 2, "completion_tokens": completion_tokens, "input_token_logprobs": []}});
         let prefill = MockWorker::start_returning_error(StatusCode::OK, p).await;
         let decode = MockWorker::start_returning_error(StatusCode::OK, d).await;
@@ -194,7 +198,7 @@ async fn pd_generate_returns_prompt_routes_when_decode_has_none() {
             HashTree::new(),
         );
         let body = json!({"input_ids": [10, 11], "return_routed_experts": true, "return_logprob": true,
-                          "sampling_params": {"max_new_tokens": completion_tokens}});
+                          "routed_experts_start_len": start, "sampling_params": {"max_new_tokens": completion_tokens}});
         let res = send(&app, "POST", &body).await;
         assert_eq!(res.status(), StatusCode::OK);
         let response: Value = serde_json::from_slice(&collect_body(res.into_body()).await).unwrap();
