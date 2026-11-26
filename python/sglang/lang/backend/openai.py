@@ -106,26 +106,34 @@ class OpenAI(BaseBackend):
     def get_chat_template(self):
         return self.chat_template
 
+    def _openai_kwargs(self, sampling_params: SglSamplingParams):
+        kwargs = sampling_params.to_openai_kwargs()
+        # The completions API takes only max_tokens; o1/o3 chat models reject it.
+        if self.is_chat_model and (
+            self.model_name.startswith("o1")
+            or self.model_name.startswith("o3")
+            or "o1" in self.model_name
+        ):
+            kwargs.pop("max_tokens", None)
+        else:
+            kwargs.pop("max_completion_tokens", None)
+        return kwargs
+
     def _prepare_spec_execution(
         self,
         sampling_params: SglSamplingParams,
         num_api_spec_tokens: int,
         spec_var_name: str,
     ):
-        if "max_tokens" not in self.spec_kwargs:
-            self.spec_kwargs["max_tokens"] = num_api_spec_tokens
-        else:
-            assert self.spec_kwargs["max_tokens"] == num_api_spec_tokens
-
-        params = sampling_params.to_openai_kwargs()
+        params = self._openai_kwargs(sampling_params)
         for key, value in params.items():
             if key in ["stop"]:
                 continue
-            if key in ["max_tokens"]:
+            if key in ("max_tokens", "max_completion_tokens"):
                 warnings.warn(
-                    "The parameter max_tokens will be overwritten by speculated number of tokens."
+                    f"The parameter {key} will be overwritten by speculated number of tokens."
                 )
-                continue
+                value = num_api_spec_tokens
             if key not in self.spec_kwargs:
                 self.spec_kwargs[key] = value
             else:
@@ -160,15 +168,7 @@ class OpenAI(BaseBackend):
             else:
                 prompt = s.text_
 
-            kwargs = sampling_params.to_openai_kwargs()
-            if (
-                self.model_name.startswith("o1")
-                or self.model_name.startswith("o3")
-                or "o1" in self.model_name
-            ):
-                kwargs.pop("max_tokens", None)
-            else:
-                kwargs.pop("max_completion_tokens", None)
+            kwargs = self._openai_kwargs(sampling_params)
 
             comp = openai_completion(
                 client=self.client,
@@ -183,7 +183,7 @@ class OpenAI(BaseBackend):
             assert not self.is_chat_model, (
                 "constrained type not supported on chat model"
             )
-            kwargs = sampling_params.to_openai_kwargs()
+            kwargs = self._openai_kwargs(sampling_params)
             kwargs.pop("stop")
             comp = openai_completion(
                 client=self.client,
@@ -203,7 +203,7 @@ class OpenAI(BaseBackend):
             assert not self.is_chat_model, (
                 "constrained type not supported on chat model"
             )
-            kwargs = sampling_params.to_openai_kwargs()
+            kwargs = self._openai_kwargs(sampling_params)
             kwargs.pop("stop")
             comp = openai_completion(
                 client=self.client,
@@ -296,7 +296,7 @@ class OpenAI(BaseBackend):
             else:
                 prompt = s.text_
 
-            kwargs = sampling_params.to_openai_kwargs()
+            kwargs = self._openai_kwargs(sampling_params)
             generator = openai_completion_stream(
                 client=self.client,
                 token_usage=self.token_usage,
@@ -348,7 +348,7 @@ class OpenAI(BaseBackend):
             ret_str = ret.choices[0].text
             ret_token = self.tokenizer.encode(ret_str)[0]
             self.token_usage.prompt_tokens += ret.usage.prompt_tokens
-            self.token_usage.completion_tokens = ret.usage.completion_tokens
+            self.token_usage.completion_tokens += ret.usage.completion_tokens
 
             # TODO:
             # 1. return logits as the scores

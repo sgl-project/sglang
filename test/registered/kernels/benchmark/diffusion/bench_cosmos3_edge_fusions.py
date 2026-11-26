@@ -22,7 +22,7 @@ def eager_relu2(x):
 
 
 @marker.parametrize("case", ["qk_400", "qk_1024", "relu2_400", "relu2_8190"])
-@marker.benchmark("provider", ["eager", "fused"])
+@marker.benchmark("provider", ["eager", "fused"], gate=["fused"])
 def benchmark(case, provider):
     operation, tokens = case.split("_")
     tokens = int(tokens)
