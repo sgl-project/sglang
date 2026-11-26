@@ -54,7 +54,7 @@ def _allocator(device, chain, lazy):
         ),
         max_mamba_cache_size=8,
         model_context_len=256,
-        extra_max_context_len=1,
+        req_to_token_headroom=1,
         max_num_reqs=4,
         enable_mamba_extra_buffer=False,
         enable_mamba_extra_buffer_lazy=False,
