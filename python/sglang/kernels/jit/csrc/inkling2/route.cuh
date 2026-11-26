@@ -2,6 +2,7 @@
 // Stable sort of routed expert ids by expert, and the grouped GEMM metadata of
 // one rank's experts, in one CTA. Equal to the Triton _route_metadata in inkling2_route.py.
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -197,6 +198,16 @@ __global__ void __launch_bounds__(kThreads) route_metadata_kernel(
   }
 }
 
+// Shared memory one launch needs, in bytes: the dynamic Layout plus the kernel's static arrays. The caller
+// compares it with the device's per-block opt-in limit to decide whether this kernel can run at all.
+int64_t route_metadata_smem_bytes(int64_t n, int64_t num_experts, int64_t num_local) {
+  cudaFuncAttributes attributes;
+  host::RuntimeCheck(
+      cudaFuncGetAttributes(&attributes, route_metadata_kernel) == cudaSuccess,
+      "Cannot query route metadata kernel attributes");
+  return int64_t(Layout(int(n), int(num_experts), int(num_local)).bytes + attributes.sharedSizeBytes);
+}
+
 void route_metadata(
     tvm::ffi::TensorView ids,
     tvm::ffi::TensorView weights,
@@ -216,10 +227,22 @@ void route_metadata(
   host::RuntimeCheck(num_local < kThreads && num_experts < 1023, "Unsupported route metadata shape");
   size_t const smem = Layout(n, int(num_experts), num_local).bytes;
   auto kernel = route_metadata_kernel;
-  if (smem > 48 * 1024)
-    host::RuntimeCheck(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)) == cudaSuccess,
-        "Cannot set route metadata shared memory");
+  if (smem > 48 * 1024) {
+    // Backstop: the Python dispatch only picks this kernel when the layout fits the device, so a refusal here
+    // means that check and the device disagree.
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)) != cudaSuccess) {
+      (void)cudaGetLastError();
+      host::Panic(
+          "Cannot set route metadata shared memory: ",
+          smem,
+          " dynamic bytes for ",
+          n,
+          " ids and ",
+          num_experts,
+          " experts, device allows ",
+          host::runtime::get_max_smem_per_block(ids.device().device_id));
+    }
+  }
   host::LaunchKernel(1, kThreads, ids.device(), smem)
       .enable_pdl(true)(
           kernel,

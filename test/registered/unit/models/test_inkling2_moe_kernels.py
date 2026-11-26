@@ -103,6 +103,37 @@ def test_route_metadata_cuda_matches_triton(monkeypatch, tokens, skewed):
 
 
 @sm100_or_sm103
+@pytest.mark.parametrize("tokens,skewed", [(512, False), (512, True)])
+def test_route_metadata_falls_back_when_smem_does_not_fit(monkeypatch, tokens, skewed):
+    """On a device whose per-block shared memory is too small for the CUDA kernel (a 99 KiB
+    GB10 at 384 experts), route_metadata takes the Triton sort and returns the same tensors."""
+    from sglang.kernels.ops.moe import inkling2_route as route
+
+    expected = _route(tokens, skewed, seed=tokens)
+
+    def no_cuda_kernel():
+        raise AssertionError("the CUDA kernel launched though its layout does not fit")
+
+    monkeypatch.setattr(route, "_cuda_route_fits", lambda *args: False)
+    monkeypatch.setattr(route, "_route_module", no_cuda_kernel)
+    actual = _route(tokens, skewed, seed=tokens)
+    for a, b in zip(actual, expected):
+        assert torch.equal(a, b)
+
+
+@sm100_or_sm103
+def test_route_smem_fits_boundary():
+    """Inkling-2-Small (384 experts, 96 local) fits a 99 KiB GB10 block up to 2,752 ids,
+    and the full 4,096 ids on a 227 KiB Hopper or SM100 block."""
+    from sglang.kernels.ops.moe import inkling2_route as route
+
+    gb10 = 101376
+    assert route._route_smem_fits(2752, EXPERTS, LOCAL, gb10)
+    assert not route._route_smem_fits(2753, EXPERTS, LOCAL, gb10)
+    assert route._route_smem_fits(route.ROUTE_MAX_IDS, EXPERTS, LOCAL, 227 * 1024)
+
+
+@sm100_or_sm103
 @pytest.mark.parametrize(
     "tokens,skewed,width",
     [(1, False, 4608), (16, False, 4608), (256, False, 4608), (512, True, 4608)]

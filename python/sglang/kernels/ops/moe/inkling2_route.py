@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -264,8 +266,26 @@ def _route_module():
     return load_jit(
         "inkling2_route",
         cuda_files=["inkling2/route.cuh"],
-        cuda_wrappers=[("route_metadata", "inkling2_route::route_metadata")],
+        cuda_wrappers=[
+            ("route_metadata", "inkling2_route::route_metadata"),
+            ("route_metadata_smem_bytes", "inkling2_route::route_metadata_smem_bytes"),
+        ],
     )
+
+
+def _route_smem_fits(n, num_experts, num_local, limit):
+    """Whether the CUDA kernel's shared memory (its own byte count, read from route.cuh
+    so the two cannot drift apart) fits in `limit` bytes."""
+    return _route_module().route_metadata_smem_bytes(n, num_experts, num_local) <= limit
+
+
+@functools.lru_cache(maxsize=None)
+def _cuda_route_fits(device_index, n, num_experts, num_local):
+    """Whether the CUDA kernel can launch on this device. Its sort keeps counts for every
+    expert in shared memory, so large expert counts exceed the 99 KiB per-block limit of
+    GB10 and SM120 (Hopper and SM100 allow about 227 KiB)."""
+    limit = torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
+    return _route_smem_fits(n, num_experts, num_local, limit)
 
 
 def route_metadata(ids, weights, start, num_local, num_experts, block_size_m=128):
@@ -289,7 +309,11 @@ def route_metadata(ids, weights, start, num_local, num_experts, block_size_m=128
     offsets = torch.empty(num_local + 1, device=device, dtype=torch.int32)
     block_offsets = torch.empty(num_local + 1, device=device, dtype=torch.int32)
     schedule = torch.empty(max_blocks, device=device, dtype=torch.int32)
-    if n > ROUTE_CUDA_MIN_IDS and not _is_hip:
+    if (
+        n > ROUTE_CUDA_MIN_IDS
+        and not _is_hip
+        and _cuda_route_fits(device.index, n, num_experts, num_local)
+    ):
         _route_module().route_metadata(
             ids,
             weights,
