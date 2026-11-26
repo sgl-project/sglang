@@ -346,5 +346,8 @@ class PipelineExecutor(ABC):
         )
         try:
             yield
-        finally:
+        except BaseException:
+            profiler.stop_on_error(dump_rank=dump_rank)
+            raise
+        else:
             profiler.stop(dump_rank=dump_rank)

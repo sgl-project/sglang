@@ -125,7 +125,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
         self.req_to_token_pool = runner.req_to_token_pool  # pool obj for TboAttnBackend
         self.req_to_token = runner.req_to_token_pool.req_to_token
-        self.max_context_len = runner.req_to_token_pool.max_context_len
+        self.max_kv_len = self.req_to_token_pool.row_width
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
         self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(
@@ -258,7 +258,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
             self.num_kv_heads = self.kv_pool.main_pool.head_num
             self._msa_nb_max = (
-                self.max_context_len + self.block_size_k - 1
+                self.max_kv_len + self.block_size_k - 1
             ) // self.block_size_k
             self._msa_cg: dict[int, tuple] = {}
 
@@ -467,7 +467,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
-            self._max_seqlen_k = self.max_context_len
+            self._max_seqlen_k = self.max_kv_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
             if self._linear_verify and forward_batch.forward_mode.is_target_verify():
@@ -506,13 +506,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     .reshape(-1)
                     .to(torch.int32)
                 )
-                _mb = self.req_to_token.shape[1] // self.page_size
+                _mb = self.max_kv_len // self.page_size
                 _bt_cols = (
                     torch.arange(
                         _mb, device=_vmeta.per_query_req.device, dtype=torch.long
                     )
                     * self.page_size
-                ).clamp(max=self.req_to_token.shape[1] - 1)
+                ).clamp(max=self.max_kv_len - 1)
                 _vmeta.native_bt = (
                     self.req_to_token[_vmeta.per_query_req][:, _bt_cols]
                     // self.page_size
@@ -600,11 +600,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     int(ndt)
                 )
                 # Captured block_table for the native verify op (re-runs at replay).
-                _mb = self.req_to_token.shape[1] // self.page_size
+                _mb = self.max_kv_len // self.page_size
                 _bt_cols = (
                     torch.arange(_mb, device=per_query_req.device, dtype=torch.long)
                     * self.page_size
-                ).clamp(max=self.req_to_token.shape[1] - 1)
+                ).clamp(max=self.max_kv_len - 1)
                 _native_bt = (
                     self.req_to_token[per_query_req][:, _bt_cols] // self.page_size
                 ).to(torch.int32)
@@ -771,7 +771,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         """Logical->physical page table for the native sparse main op."""
         blk_cols = (
             torch.arange(max_blocks, device=device, dtype=torch.long) * self.page_size
-        ).clamp(max=self.req_to_token.shape[1] - 1)
+        ).clamp(max=self.max_kv_len - 1)
         return (self.req_to_token[req_indices][:, blk_cols] // self.page_size).to(
             torch.int32
         )
@@ -852,7 +852,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             # Legacy score+index-value contract for non-MiniMax-M3 sparse layouts.
             req_idx = forward_batch.req_pool_indices.long()
-            max_cols = self.req_to_token.shape[1]
+            max_cols = self.max_kv_len
             blk_cols = (
                 torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
             ).clamp(max=max_cols - 1)
@@ -1004,7 +1004,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 sanitize_page_ids=True,
             )
         else:
-            max_cols = self.req_to_token.shape[1]
+            max_cols = self.max_kv_len
             blk_cols = (
                 torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
             ).clamp(max=max_cols - 1)
