@@ -6,12 +6,9 @@ export const DeepSeekV32Deployment = () => {
   //   DeepSeek-V3.2-NVFP4                         → nvidia/ family, B200/B300 only, TP=4
   //   DeepSeek-V3.2-MXFP4                         → amd/ family, MI300X/MI355X only, TP=8
   //
-  // Ascend A3: 4-node 2P2D PD disaggregation with DeepSeek-V3.2-W8A8 (2 prefill + 2 decode
-  // nodes, 8 cards / 16 dies each). Mirrors the frozen best practice in
-  // docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v3_2.mdx,
-  // with the per-node IP detection loop replaced by the Node Role / Node Rank selectors and
-  // the server port moved to the Cookbook's 30000; docs/scripts/tests/deepseek-v32-ascend.test.mjs
-  // checks that nothing else diverges.
+  // Ascend A3: four independent single-node instances (2P2D), 8 cards / 16 dies each.
+  // Adapts the Ascend best practice to P CP16/EP16 and D attention DP16/EP16.
+  // Instance IDs select hosts, not distributed node ranks. Tests cover these adaptations.
   const isAscend = (values) => values.hardware === 'a3';
   const options = {
     hardware: {
@@ -34,7 +31,7 @@ export const DeepSeekV32Deployment = () => {
         const isBlackwell = hw === 'b200' || hw === 'b300';
         const isAMD = hw === 'mi300x' || hw === 'mi355x';
         const isA3 = hw === 'a3';
-        const a3Reason = 'Ascend A3 is validated with DeepSeek-V3.2 (W8A8) only';
+        const a3Reason = 'This Ascend A3 recipe covers DeepSeek-V3.2 (W8A8) only';
         return [
           { id: 'v32',         label: 'DeepSeek-V3.2',           default: !isBlackwell && !isAMD, subtitle: isA3 ? 'W8A8' : undefined },
           { id: 'v32speciale', label: 'DeepSeek-V3.2-Speciale',  default: false, disabled: isA3, disabledReason: isA3 ? a3Reason : '' },
@@ -49,7 +46,7 @@ export const DeepSeekV32Deployment = () => {
       title: 'Deployment Scenario',
       condition: isAscend,
       items: [
-        { id: '4a3-pd', label: '4 × A3 PD Disaggregation', subtitle: '2 prefill + 2 decode nodes', default: true }
+        { id: '4a3-pd', label: '4 × A3 PD Disaggregation', subtitle: '2P2D · one instance per server', default: true }
       ]
     },
     npuRole: {
@@ -57,18 +54,18 @@ export const DeepSeekV32Deployment = () => {
       title: 'Node Role',
       condition: isAscend,
       items: [
-        { id: 'prefill', label: 'Prefill', subtitle: 'TP 32 · CP 32',        default: true  },
-        { id: 'decode',  label: 'Decode',  subtitle: 'TP 32 · DP 8 · EP 32', default: false },
+        { id: 'prefill', label: 'Prefill', subtitle: 'CP 16 · EP 16',        default: true  },
+        { id: 'decode',  label: 'Decode',  subtitle: 'Attention DP 16 · EP 16', default: false },
         { id: 'router',  label: 'Router',  subtitle: 'PD router',            default: false }
       ]
     },
-    npuNodeRank: {
-      name: 'npuNodeRank',
-      title: 'Node Rank',
+    npuInstance: {
+      name: 'npuInstance',
+      title: 'Instance ID',
       condition: (values) => isAscend(values) && values.npuRole !== 'router',
       items: [
-        { id: '0', label: 'Node 0', subtitle: 'head node', default: true  },
-        { id: '1', label: 'Node 1',                        default: false }
+        { id: '0', label: 'Instance 0', subtitle: 'single-node instance', default: true  },
+        { id: '1', label: 'Instance 1', subtitle: 'single-node instance', default: false }
       ]
     },
     strategy: {
@@ -142,7 +139,7 @@ export const DeepSeekV32Deployment = () => {
   // Ascend A3 4-node PD reference
   const npuServerPort = 30000;
   const generateAscendCommand = (values) => {
-    const { npuDeployment, npuRole, npuNodeRank } = values;
+    const { npuDeployment, npuRole, npuInstance } = values;
 
     if (npuDeployment !== '4a3-pd') {
       return '# Error: unknown deployment scenario\n# Please select "4 × A3 PD Disaggregation" for Deployment Scenario';
@@ -154,28 +151,31 @@ export const DeepSeekV32Deployment = () => {
     if (npuRole === 'router') {
       return [
         '# Ascend A3 · 4-node PD disaggregation · router',
-        '# Run on any host that can reach prefill node 0 and decode node 0.',
-        '# Replace <prefill-node0-ip>, <decode-node0-ip>, and the model path before running.',
+        '# Run on a host that can reach both prefill and both decode instances.',
+        '# Replace all four instance IP placeholders and the model path before running.',
         'python -m sglang_router.launch_router \\',
-        '  --model-id /path/to/DeepSeek-V3.2-W8A8 \\',
-        '  --no-tokenizer \\',
-        `  --worker-urls http://<prefill-node0-ip>:${npuServerPort} http://<decode-node0-ip>:${npuServerPort} \\`,
+        '  --model-path /path/to/DeepSeek-V3.2-W8A8 \\',
+        '  --pd-disaggregation \\',
+        '  --policy cache_aware \\',
+        `  --prefill http://<prefill-node0-ip>:${npuServerPort} 8998 \\`,
+        `  --prefill http://<prefill-node1-ip>:${npuServerPort} 8998 \\`,
+        `  --decode http://<decode-node0-ip>:${npuServerPort} \\`,
+        `  --decode http://<decode-node1-ip>:${npuServerPort} \\`,
         '  --host 127.0.0.1 \\',
         '  --port 6688 \\',
-        '  --request-timeout-secs 1800 \\',
-        '  --stale-request-timeout-secs 1800'
+        '  --request-timeout-secs 1800'
       ].join('\n');
     }
 
-    if (!['0', '1'].includes(npuNodeRank)) {
-      return '# Error: unknown node rank\n# Please select "Node 0" or "Node 1" for Node Rank';
+    if (!['0', '1'].includes(npuInstance)) {
+      return '# Error: unknown instance ID\n# Please select "Instance 0" or "Instance 1"';
     }
     const isPrefill = npuRole === 'prefill';
-    const rank = Number(npuNodeRank);
+    const rank = Number(npuInstance);
     const roleName = isPrefill ? 'prefill' : 'decode';
 
     const header = [
-      `# Ascend A3 · 4-node PD disaggregation · ${roleName} node ${rank} of 2`,
+      `# Ascend A3 · 2P2D · ${roleName} instance ${rank} (one server, 16 dies)`,
       '# Run inside the quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3 container on this node.',
       '# Replace the <...> placeholders (node IPs, the NIC carrying them) and the model path.',
       'echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor',
@@ -218,11 +218,12 @@ export const DeepSeekV32Deployment = () => {
     const roleFlags = isPrefill
       ? [
           `--port ${npuServerPort}`,
-          '--dist-init-addr <prefill-node0-ip>:5000',
+          `--dist-init-addr <prefill-node${rank}-ip>:5000`,
           '--disaggregation-bootstrap-port 8998',
-          `--node-rank ${rank}`,
-          '--nnodes 2',
-          '--tp 32',
+          '--node-rank 0',
+          '--nnodes 1',
+          '--tp 16',
+          '--ep 16',
           '--watchdog-timeout 9000',
           '--mem-fraction-static 0.73',
           '--disable-radix-cache',
@@ -236,8 +237,8 @@ export const DeepSeekV32Deployment = () => {
           '--disable-cuda-graph',
           '--moe-dense-tp-size 1',
           '--enable-prefill-cp',
-          '--cp-strategy zigzag',
-          '--attn-cp-size 32',
+          '--cp-strategy interleave',
+          '--attn-cp-size 16',
           '--speculative-algorithm NEXTN',
           '--speculative-num-steps 1',
           '--speculative-eagle-topk 1',
@@ -245,12 +246,12 @@ export const DeepSeekV32Deployment = () => {
         ]
       : [
           `--port ${npuServerPort}`,
-          '--dist-init-addr <decode-node0-ip>:5000',
-          `--node-rank ${rank}`,
-          '--nnodes 2',
-          '--tp 32',
-          '--enable-dp-attention --dp-size 8',
-          '--ep 32',
+          `--dist-init-addr <decode-node${rank}-ip>:5000`,
+          '--node-rank 0',
+          '--nnodes 1',
+          '--tp 16',
+          '--enable-dp-attention --dp-size 16',
+          '--ep 16',
           '--moe-dense-tp-size 1',
           '--enable-dp-lm-head',
           '--watchdog-timeout 9000',
@@ -287,7 +288,7 @@ export const DeepSeekV32Deployment = () => {
 
     if (hardware === 'a3') {
       if (modelname !== 'v32') {
-        return `# Error: Ascend A3 deployment is validated with DeepSeek-V3.2 (W8A8) only\n# Please select "DeepSeek-V3.2" for Model Name`;
+        return `# Error: This Ascend A3 recipe covers DeepSeek-V3.2 (W8A8) only\n# Please select "DeepSeek-V3.2" for Model Name`;
       }
       return generateAscendCommand(values);
     }
