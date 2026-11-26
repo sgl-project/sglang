@@ -9,7 +9,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils.common import is_hip_runtime
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
 
 logger = logging.getLogger(__name__)
@@ -35,9 +35,8 @@ def supported_hardware() -> bool:
     """Whether this device is one the kernels target, before asking whether the
     shape fits or whether they build. They are raw gfx950: MFMA, wave64 DPP and
     an e4m3fn fp8 cache throughout."""
-    if not is_hip_runtime() or not torch.cuda.is_available():
-        return False
-    return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
 
 
 def model_shape_supported(
