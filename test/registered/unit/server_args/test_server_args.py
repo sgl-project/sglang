@@ -1900,6 +1900,71 @@ class TestSkipTokenizerInit(unittest.TestCase):
                 )
 
 
+class TestHy4FlashAdaDsaPolicy(CustomTestCase):
+    @staticmethod
+    def _resolve(capability=(8, 9), **kwargs):
+        from types import SimpleNamespace
+
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
+
+        defaults = dict(
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="triton_sparse_mla",
+            dsa_decode_backend=None,
+            dsa_triton_union=0,
+            speculative_algorithm=None,
+        )
+        defaults.update(kwargs)
+        hf_config = SimpleNamespace(
+            architectures=["HYV4FlashForConditionalGeneration"], learnable_sink=True
+        )
+        view = ResolvedView(
+            SimpleNamespace(
+                _model_config=SimpleNamespace(hf_config=hf_config), **defaults
+            )
+        )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_cuda=True, is_npu=False, is_xpu=False, is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=capability),
+        ):
+            return {**defaults, **_dsa_split_backend_resolution(view)}
+
+    def test_sm89_opt_in_pairs_the_backends(self):
+        cfg = self._resolve()
+        self.assertEqual(cfg["dsa_prefill_backend"], "triton_sparse_mla")
+        self.assertEqual(cfg["dsa_decode_backend"], "triton_sparse_mla")
+
+    def test_defaults_unchanged(self):
+        for capability in ((8, 9), (9, 0), (10, 0)):
+            with self.subTest(capability=capability):
+                cfg = self._resolve(capability, dsa_prefill_backend=None)
+                self.assertEqual(cfg["dsa_prefill_backend"], "flashmla_sparse")
+                self.assertEqual(cfg["dsa_decode_backend"], "flashmla_sparse")
+
+    def test_other_architectures_do_not_opt_in(self):
+        for capability in ((8, 0), (8, 6), (9, 0), (10, 0)):
+            with (
+                self.subTest(capability=capability),
+                self.assertRaisesRegex(ValueError, "requires .*flashmla_sparse"),
+            ):
+                self._resolve(capability)
+
+    def test_unsupported_configurations(self):
+        for fields, message in (
+            ({"kv_cache_dtype": "fp8_e4m3"}, "requires BF16 KV"),
+            ({"dsa_triton_union": 2}, "does not support union"),
+            ({"speculative_algorithm": "DFLY"}, "does not support speculative"),
+            ({"dsa_decode_backend": "flashmla_sparse"}, "requires .*triton_sparse_mla"),
+        ):
+            with (
+                self.subTest(fields=fields),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                self._resolve(**fields)
+
+
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     # The backend selection moved to the resolution pipeline; these policy
     # tests drive the pass through its read-only view.

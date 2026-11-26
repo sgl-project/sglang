@@ -513,13 +513,14 @@ def _validate_triton_sparse_mla_backend(
     num_q_heads: int,
     union: int,
     index_kpool: int,
+    allow_sm89: bool = False,
 ) -> None:
     if _is_hip:
         raise ValueError(
             "triton_sparse_mla is a CUDA prefill backend; on ROCm use the "
             "existing tilelang / aiter DSA paths."
         )
-    if device_sm_major < 9:
+    if device_sm_major < 9 and not (device_sm_major == 8 and allow_sm89):
         raise ValueError(
             "triton_sparse_mla requires SM90 (Hopper) or newer; "
             f"got sm_major={device_sm_major}."
@@ -1138,6 +1139,13 @@ class DeepseekSparseAttnBackend(
                 num_q_heads=self.num_q_heads,
                 union=self.dsa_triton_union,
                 index_kpool=self.dsa_index_kpool,
+                allow_sm89=(
+                    self.dsa_decode_impl == "triton_sparse_mla"
+                    and hf_config.architectures[0]
+                    == "HYV4FlashForConditionalGeneration"
+                    and _is_cuda
+                    and torch.cuda.get_device_capability() == (8, 9)
+                ),
             )
 
         # Q8KV8 per-call device-tensor caches, populated lazily on the first
@@ -2769,9 +2777,12 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+        if attn_sink is not None and dsa_impl not in (
+            "flashmla_sparse",
+            "triton_sparse_mla",
+        ):
             raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+                f"DSA backend {dsa_impl} does not support learnable attention sinks."
             )
 
         phase = (
@@ -3060,6 +3071,7 @@ class DeepseekSparseAttnBackend(
                     sm_scale=layer.scaling,
                     v_head_dim=layer.v_head_dim,
                     topk_length=metadata.dsa_cache_seqlens_int32,
+                    attn_sink=attn_sink,
                 )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
@@ -3192,9 +3204,12 @@ class DeepseekSparseAttnBackend(
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
 
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+        if attn_sink is not None and dsa_impl not in (
+            "flashmla_sparse",
+            "triton_sparse_mla",
+        ):
             raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+                f"DSA backend {dsa_impl} does not support learnable attention sinks."
             )
 
         if uses_raw_fp8_dsa_kv_layout(dsa_impl):
@@ -3266,7 +3281,19 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        if dsa_impl == "flashmla_sparse":
+        if dsa_impl == "triton_sparse_mla":
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_triton_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+                topk_length=metadata.dsa_cache_seqlens_int32,
+                attn_sink=attn_sink,
+            )
+        elif dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
@@ -3929,6 +3956,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
             sparse_mla_prefill,
@@ -3953,6 +3981,7 @@ class DeepseekSparseAttnBackend(
             sm_scale,
             v_head_dim,
             topk_length=topk_length,
+            attn_sink=attn_sink,
             union=union,
         )
 

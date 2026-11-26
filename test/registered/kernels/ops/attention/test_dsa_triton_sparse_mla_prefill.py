@@ -21,7 +21,7 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-l
 D_QK, D_V, SM_SCALE = 576, 512, 0.0625
 
 
-def _reference(q, kv, indices, d_v=D_V):
+def _reference(q, kv, indices, d_v=D_V, attn_sink=None):
     """fp32 reference: each token attends over its own valid selected rows."""
     T, h, _ = q.shape
     S = kv.shape[0]
@@ -34,7 +34,10 @@ def _reference(q, kv, indices, d_v=D_V):
             out[t] = 0.0
             continue
         k = kf[idx]
-        p = torch.softmax((qf[t] @ k.T) * SM_SCALE, dim=-1)
+        scores = (qf[t] @ k.T) * SM_SCALE
+        if attn_sink is not None:
+            scores = torch.cat((scores, attn_sink[:, None]), dim=-1)
+        p = torch.softmax(scores, dim=-1)[:, : k.shape[0]]
         out[t] = p @ k[:, :d_v]
     return out.to(torch.bfloat16)
 
@@ -84,6 +87,66 @@ def _assert_matches(case, out, ref, tag, cos_min=0.999, max_abs=0.05):
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSATritonSparseMLAPrefill(CustomTestCase):
+    def test_hy4_flash_learnable_sink(self):
+        for heads, topk in ((16, 512), (8, 2048)):
+            with self.subTest(heads=heads, topk=topk):
+                rows, slots = 35, topk * 2
+                q, kv, g = _qkv(rows, slots, heads, seed=topk)
+                indices = _random_indices(rows, topk, slots, g)
+                indices[1, 1::2] = -1  # holes, not just a padded tail
+                indices[2].fill_(-1)
+                lengths = torch.full(
+                    (rows,), topk + 17, dtype=torch.int32, device=q.device
+                )
+                lengths[3] = topk // 3  # mask valid-looking stale tail entries
+                lengths[4] = 0
+                sink = torch.linspace(-80, 80, heads, device=q.device)
+                masked = indices.clone()
+                masked[3, topk // 3 :] = -1
+                masked[4].fill_(-1)
+                ref = _reference(q, kv, masked, attn_sink=sink)
+                out = sparse_mla_prefill(
+                    q, kv, indices, SM_SCALE, topk_length=lengths, attn_sink=sink
+                )
+                torch.testing.assert_close(
+                    out.float(), ref.float(), atol=0.02, rtol=0.02
+                )
+                torch.testing.assert_close(
+                    out[2], torch.zeros_like(out[2]), atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    out[4], torch.zeros_like(out[4]), atol=0, rtol=0
+                )
+                # The second chunk can refer to any of the same cached slots.
+                split = 13
+                chunks = torch.cat(
+                    [
+                        sparse_mla_prefill(
+                            q[sl],
+                            kv,
+                            indices[sl],
+                            SM_SCALE,
+                            topk_length=lengths[sl],
+                            attn_sink=sink,
+                        )
+                        for sl in (slice(0, split), slice(split, None))
+                    ]
+                )
+                torch.testing.assert_close(chunks, out, atol=0, rtol=0)
+
+    def test_learnable_sink_rejects_union(self):
+        q, kv, g = _qkv(4, 64, 8, seed=4)
+        indices = _random_indices(4, 64, 64, g)
+        with self.assertRaisesRegex(ValueError, "does not support sinks with union"):
+            sparse_mla_prefill(
+                q,
+                kv,
+                indices,
+                SM_SCALE,
+                union=2,
+                attn_sink=torch.zeros(8, device=q.device),
+            )
+
     def test_base_path(self):
         for T, topk in ((512, 512), (2048, 2048), (37, 2048)):
             S = max(T, topk + 8)
