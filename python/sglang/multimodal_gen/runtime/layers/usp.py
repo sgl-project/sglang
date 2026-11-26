@@ -721,7 +721,9 @@ def _usp_input_all_to_all_varlen(
     return x
 
 
-def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+def _usp_output_all_to_all(
+    x: torch.Tensor, head_dim: int = 1, out: torch.Tensor | None = None
+) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
 
@@ -738,6 +740,9 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     Returns:
         Tensor with the same dim order as input, with heads gathered and sequence sharded.
+        With head_dim=2, ``out`` (a [b, s_local, h, d] view with heads contiguous in
+        a row) may receive the result; callers compare data pointers, since the
+        other exchange paths return their own tensor.
     """
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
@@ -785,7 +790,7 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
     else:  # head_dim == 2
         # Shape transition: [world_size, s_local, b, h_local, d] -> [b, s_local, world_size, h_local, d]
-        x = usp_merge_heads(x).reshape(b, s_local, h_global, d)
+        x = usp_merge_heads(x, out=out).reshape(b, s_local, h_global, d)
 
     return x
 

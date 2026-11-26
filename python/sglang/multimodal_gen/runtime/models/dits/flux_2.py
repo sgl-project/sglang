@@ -98,6 +98,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+_is_rocm = current_platform.is_rocm()
 
 _get_qkv_projections = get_qkv_projections
 
@@ -864,6 +865,14 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
+        # A caller-owned output buffer selects ROCm's Triton head merge; the
+        # joint output is split into text and image afterwards, so any
+        # [B, S_local, H, D] buffer serves. CUDA's merge needs no buffer.
+        attn_output = None
+        if _is_rocm:
+            attn_output = query.new_empty(
+                (*query.shape[:2], self.local_heads, self.head_dim)
+            )
         hidden_states = self.attn(
             query,
             key,
@@ -871,6 +880,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
             num_replicated_prefix=num_replicated_prefix,
+            output=attn_output,
         )
 
         hidden_states = hidden_states.flatten(2, 3)
@@ -1045,6 +1055,19 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         if complex_freqs is not None:
             complex_freqs = complex_freqs[: query.shape[1]]
 
+        # BF16: build the output projection's [attn | mlp] input in place. The
+        # attention output lands in its columns when the exchange can write
+        # there, and SwiGLU writes the rest; the GEMM input is byte-identical.
+        gemm_input = attn_output = None
+        if not (self._enable_fp8_token_cat or self._enable_nvfp4_token_cat):
+            attn_dim = self.local_heads * self.head_dim
+            gemm_input = query.new_empty(
+                (*query.shape[:2], attn_dim + mlp_hidden_states.shape[-1] // 2)
+            )
+            attn_output = gemm_input[..., :attn_dim].unflatten(
+                -1, (self.local_heads, self.head_dim)
+            )
+
         # Packed QKV/MLP projection views can be normalized and rotated
         # without materializing contiguous Q/K inputs on the supported path.
         query, key = _flux2_single_qk_rope(
@@ -1063,20 +1086,16 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
             num_replicated_prefix=num_replicated_prefix,
+            output=attn_output,
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
-        # BF16: build the output projection's [attn | mlp] input in place. SwiGLU
-        # writes its columns directly and only the narrower attention output is
-        # copied, instead of a full-width cat; the GEMM input is byte-identical.
-        if not (self._enable_fp8_token_cat or self._enable_nvfp4_token_cat):
+        if gemm_input is not None:
             attn_dim = hidden_states.shape[-1]
-            gemm_input = hidden_states.new_empty(
-                (*hidden_states.shape[:-1], attn_dim + mlp_hidden_states.shape[-1] // 2)
-            )
             self.mlp_act_fn(mlp_hidden_states, out=gemm_input[..., attn_dim:])
-            gemm_input[..., :attn_dim].copy_(hidden_states)
+            if hidden_states.data_ptr() != gemm_input.data_ptr():
+                gemm_input[..., :attn_dim].copy_(hidden_states)
             hidden_states, _ = self.to_out(gemm_input)
             return hidden_states
 

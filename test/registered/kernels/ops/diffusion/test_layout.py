@@ -39,6 +39,9 @@ from sglang.kernels.ops.diffusion import (
     pack_qkv_destination_major,
     usp_merge_heads,
 )
+from sglang.kernels.ops.diffusion.layout.usp_relayout_triton import (
+    can_use_usp_merge_heads_triton,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
 )
@@ -128,6 +131,34 @@ def test_usp_merge_heads_unsupported_inputs_use_exact_fallback():
     with patch.object(torch.version, "hip", "6.3"):
         assert not can_use_usp_merge_heads(x)
         assert torch.equal(usp_merge_heads(x), x.permute(2, 1, 0, 3, 4).contiguous())
+
+
+@pytest.mark.parametrize(
+    "world,seq,batch,h_local,head_dim",
+    [(8, 928, 1, 6, 128), (2, 64, 3, 4, 64), (4, 33, 2, 4, 100)],
+)
+@pytest.mark.skipif(
+    not torch.version.hip, reason="the Triton merge-heads path serves ROCm"
+)
+def test_usp_merge_heads_rocm_bitwise_into_row_strided_out(
+    world, seq, batch, h_local, head_dim
+):
+    x = torch.randn(
+        world, seq, batch, h_local, head_dim, dtype=torch.bfloat16, device=DEVICE
+    )
+    ref = x.permute(2, 1, 0, 3, 4).contiguous()
+    assert can_use_usp_merge_heads_triton(x)
+    assert torch.equal(usp_merge_heads(x), ref)
+
+    # The attention columns of a wider GEMM input, as FLUX.2's single block
+    # passes them; the columns after them must stay untouched.
+    width = world * h_local * head_dim
+    wide = torch.full((batch, seq, width + 17), -1.0, dtype=x.dtype, device=DEVICE)
+    out = wide[..., :width].unflatten(-1, (world * h_local, head_dim))
+    merged = usp_merge_heads(x, out=out)
+    assert merged.data_ptr() == wide.data_ptr()
+    assert torch.equal(out, ref.reshape(out.shape))
+    assert bool((wide[..., width:] == -1).all())
 
 
 # ---------------------------------------------------------------------------

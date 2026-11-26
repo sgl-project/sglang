@@ -972,6 +972,7 @@ class USPAttention(nn.Module):
         q_prefix: torch.Tensor | None = None,
         k_prefix: torch.Tensor | None = None,
         v_prefix: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -995,6 +996,9 @@ class USPAttention(nn.Module):
                 Callers may pass ``build_varlen_mask_meta(attn_mask)`` or a
                 known contiguous padding gap. Masked query rows are zero-filled
                 on output (differs from SDPA semantics).
+            output: optional [B, S_local, H, D] view (heads contiguous in a row)
+                that the plain Ulysses path writes the result into; other
+                paths return their own tensor, so compare data pointers.
 
         Note: Replicated tensors are not supported in this implementation.
         When skip_sequence_parallel=True (set at construction time), all SP
@@ -1626,7 +1630,7 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All to restore original sharding
         if sp_size > 1:
             # -> [B, S_local, H, D]
-            out = _usp_output_all_to_all(out, head_dim=2)
+            out = _usp_output_all_to_all(out, head_dim=2, out=output)
 
         return out
 
