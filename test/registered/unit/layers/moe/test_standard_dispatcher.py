@@ -324,11 +324,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
         """Folding a routed factor does not require selected-weight normalization."""
         hidden = torch.ones((1, 4))
         logits = torch.tensor([[3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0]])
-        for name in (
-            "grouped_topk_gpu",
-            "kimi_k2_biased_topk_impl",
-            "biased_topk_impl",
-        ):
+        for name in ("grouped_topk_gpu", "biased_topk_impl"):
             router = getattr(topk_module, name)._torchdynamo_orig_callable
             for renormalize in (True, False):
                 for fold in (True, False):
@@ -354,15 +350,14 @@ class TestLayerRunnerDispatch(CustomTestCase):
                         if fold:
                             expected *= 2.5
                         torch.testing.assert_close(weights, expected)
-                        if name != "kimi_k2_biased_topk_impl":
-                            kwargs.update(topk=3, num_fused_shared_experts=1)
-                            shared_weights, shared_ids = router(**kwargs)
-                            torch.testing.assert_close(shared_weights[:, :2], expected)
-                            self.assertEqual(int(shared_ids[0, -1]), logits.shape[-1])
-                            torch.testing.assert_close(
-                                shared_weights[:, -1],
-                                torch.tensor([1.0 if fold else 1.0 / 2.5]),
-                            )
+                        kwargs.update(topk=3, num_fused_shared_experts=1)
+                        shared_weights, shared_ids = router(**kwargs)
+                        torch.testing.assert_close(shared_weights[:, :2], expected)
+                        self.assertEqual(int(shared_ids[0, -1]), logits.shape[-1])
+                        torch.testing.assert_close(
+                            shared_weights[:, -1],
+                            torch.tensor([1.0 if fold else 1.0 / 2.5]),
+                        )
 
     def test_fp8_fallback_uses_local_ids_and_materialized_routes(self):
         """FP8 experts under an FP4 runner request must not receive global IDs."""

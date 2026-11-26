@@ -4,7 +4,6 @@ import unittest
 from unittest.mock import patch
 
 import torch
-import torch_mlu  # noqa: F401 -- registers the MLU device backend
 import torch_mlu_ops
 
 from sglang.kernels.fused_op import get_fused_op_backend, set_fused_op_backend
