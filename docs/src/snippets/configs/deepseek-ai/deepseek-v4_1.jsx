@@ -3,15 +3,14 @@
 // Cells marked `verified` are transcribed from recorded runs on that hardware with
 // real weights.
 //
-// GPU DSpark cells cap --cuda-graph-max-bs-decode: the derived batch list does
-// not fit while capturing the DSpark decode graphs. H200 is the
+// Every DSpark cell caps --cuda-graph-max-bs-decode: the derived batch list does
+// not fit while capturing the DSpark decode graphs, on any platform. H200 is the
 // tightest board at 140 GiB and needs the cap on both cells plus a lower memory
 // fraction; the B200 / B300 / GB300 High-Throughput cells start without either.
 //
-// GPU deployment cells do not use DP-Attention, DeepEP or MegaMoE. DP-Attention
-// is used in the MI355X agentic recipe (cookbook §3.6); the Ascend A5 recipe uses
-// DP-Attention and DeepEP as configured by its deployment script. GPU EP tracks
-// TP on every shape except MI355X.
+// DP-Attention, DeepEP and MegaMoE are absent by design. DeepEP and MegaMoE have
+// never been enabled on this model; DP-Attention runs in the MI355X agentic recipe
+// (cookbook §3.6). EP is set equal to TP on every shape except MI355X.
 
 export const config = {
   modelName: "DeepSeek-V4.1",
