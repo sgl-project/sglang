@@ -88,7 +88,7 @@ patches:
   - target: sglang.srt.mem_cache.allocation_sizing.get_req_to_token_headroom
     edits:
       - match: |
-          return get_decode_reach(get_alloc_page_size())
+          return get_spec_decode_reach(get_alloc_page_size())
         replacement: |
           return 4 + (max_speculative_num_draft_tokens() or 0)
 """
