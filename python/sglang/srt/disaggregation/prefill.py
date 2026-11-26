@@ -514,7 +514,12 @@ class PrefillBootstrapQueue:
         """Create a KV sender for the request without enqueuing it."""
         backend = (
             TransferBackend.FAKE
-            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or answered_by_prefill(req)
+            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or answered_by_prefill(
+                req,
+                disaggregation_mode=self.scheduler.disaggregation_mode,
+                transfer_backend=self.transfer_backend,
+            )
             else self.transfer_backend
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
@@ -1511,7 +1516,11 @@ class SchedulerDisaggregationPrefillMixin:
                 if req.return_routed_experts:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
-                    if answered_by_prefill(req):
+                    if answered_by_prefill(
+                        req,
+                        disaggregation_mode=self.disaggregation_mode,
+                        transfer_backend=self.transfer_backend,
+                    ):
                         # This output is the whole response, not a handoff.
                         req.update_finish_state()
                         assert req.finished(), f"{req.rid=} sampled no final token"

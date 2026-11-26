@@ -16,12 +16,16 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation import utils  # noqa: E402
 from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST  # noqa: E402
+from sglang.srt.disaggregation.mode import (  # noqa: E402
+    FAKE_BOOTSTRAP_HOST,
+    DisaggregationMode,
+)
 from sglang.srt.disaggregation.prefill import (  # noqa: E402
     SchedulerDisaggregationPrefillMixin,
 )
 from sglang.srt.disaggregation.utils import (  # noqa: E402
     ReqToMetadataIdxAllocator,
+    TransferBackend,
     answered_by_prefill,
     lacks_decode_peer,
 )
@@ -37,11 +41,7 @@ from sglang.test.scheduler_test_utils import FakeReq, leaving_retirer  # noqa: E
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-
-def _disagg(mode="prefill", backend="nixl"):
-    return SimpleNamespace(
-        disaggregation_mode=mode, disaggregation_transfer_backend=backend
-    )
+PREFILL = DisaggregationMode.PREFILL
 
 
 def _req(host, max_new_tokens=1):
@@ -55,34 +55,38 @@ def _req(host, max_new_tokens=1):
 class TestAnsweredByPrefill(CustomTestCase):
     def test_only_a_hostless_request_on_a_real_backend_prefill_server(self):
         cases = [
-            (_disagg("prefill", "nixl"), None, True),
-            (_disagg("prefill", "mooncake"), None, True),
-            (_disagg("prefill", "nixl"), "10.0.0.1", False),
-            (_disagg("prefill", "nixl"), FAKE_BOOTSTRAP_HOST, False),
-            (_disagg("prefill", "fake"), None, False),
-            (_disagg("decode", "nixl"), None, False),
-            (_disagg("null", "mooncake"), None, False),
+            (PREFILL, TransferBackend.NIXL, None, True),
+            (PREFILL, TransferBackend.MOONCAKE, None, True),
+            (PREFILL, TransferBackend.NIXL, "10.0.0.1", False),
+            (PREFILL, TransferBackend.NIXL, FAKE_BOOTSTRAP_HOST, False),
+            (PREFILL, TransferBackend.FAKE, None, False),
+            (DisaggregationMode.DECODE, TransferBackend.NIXL, None, False),
+            (DisaggregationMode.NULL, TransferBackend.MOONCAKE, None, False),
         ]
-        for disagg, host, expected in cases:
-            with self.subTest(mode=disagg.disaggregation_mode, host=host):
-                with patch.object(utils, "get_disagg", return_value=disagg):
-                    self.assertEqual(lacks_decode_peer(_req(host)), expected)
-                    self.assertEqual(answered_by_prefill(_req(host)), expected)
+        for mode, backend, host, expected in cases:
+            with self.subTest(mode=mode, backend=backend, host=host):
+                kwargs = dict(disaggregation_mode=mode, transfer_backend=backend)
+                self.assertEqual(lacks_decode_peer(_req(host), **kwargs), expected)
+                self.assertEqual(answered_by_prefill(_req(host), **kwargs), expected)
 
     def test_admitted_request_asks_for_at_most_one_token(self):
-        with patch.object(utils, "get_disagg", return_value=_disagg()):
-            for asked in (0, 1):
-                self.assertTrue(answered_by_prefill(_req(None, asked)))
-            # Intake rejects these before admission; reaching here is a bug.
-            for asked in (2, 128, None):
-                with self.assertRaises(AssertionError):
-                    answered_by_prefill(_req(None, asked))
+        kwargs = dict(
+            disaggregation_mode=PREFILL, transfer_backend=TransferBackend.NIXL
+        )
+        for asked in (0, 1):
+            self.assertTrue(answered_by_prefill(_req(None, asked), **kwargs))
+        # Intake rejects these before admission; reaching here is a bug.
+        for asked in (2, 128, None):
+            with self.assertRaises(AssertionError):
+                answered_by_prefill(_req(None, asked), **kwargs)
 
 
 class _Stage(SchedulerDisaggregationPrefillMixin):
     """Single-rank prefill scheduler running the real transfer-queue path."""
 
-    def __init__(self):
+    def __init__(self, transfer_backend):
+        self.disaggregation_mode = PREFILL
+        self.transfer_backend = transfer_backend
         self.attn_cp_cpu_group = self.attn_tp_cpu_group = None
         self.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(4)
@@ -156,12 +160,9 @@ class TestTransferQueueFinish(CustomTestCase):
         self._patch.stop()
 
     def _finish(self, backend, host, max_new_tokens=1):
-        with patch.object(
-            utils, "get_disagg", return_value=_disagg("prefill", backend)
-        ):
-            stage = _Stage()
-            req = stage.transfer(host, max_new_tokens)
-            done = stage.release()
+        stage = _Stage(backend)
+        req = stage.transfer(host, max_new_tokens)
+        done = stage.release()
         self.assertEqual(done, [req])
         self.assertEqual(stage.streamed, [req])
         self.assertEqual(len(req.calls), 1)
@@ -170,22 +171,24 @@ class TestTransferQueueFinish(CustomTestCase):
     def test_hostless_request_finishes_with_its_real_reason(self):
         for asked in (0, 1):
             with self.subTest(max_new_tokens=asked):
-                kind, _ = self._finish("nixl", host=None, max_new_tokens=asked)
+                kind, _ = self._finish(
+                    TransferBackend.NIXL, host=None, max_new_tokens=asked
+                )
                 self.assertEqual(kind, "update")
 
     def test_hosted_request_still_hands_off(self):
-        kind, reason = self._finish("nixl", host="10.0.0.1")
+        kind, reason = self._finish(TransferBackend.NIXL, host="10.0.0.1")
         self.assertEqual(kind, "outside")
         self.assertIsInstance(reason, FINISH_LENGTH)
         self.assertEqual(reason.length, 0)
 
     def test_sentinel_request_still_hands_off(self):
-        kind, reason = self._finish("nixl", host=FAKE_BOOTSTRAP_HOST)
+        kind, reason = self._finish(TransferBackend.NIXL, host=FAKE_BOOTSTRAP_HOST)
         self.assertEqual(kind, "outside")
         self.assertEqual(reason.length, 0)
 
     def test_fake_backend_hostless_request_still_hands_off(self):
-        kind, reason = self._finish("fake", host=None)
+        kind, reason = self._finish(TransferBackend.FAKE, host=None)
         self.assertEqual(kind, "outside")
         self.assertEqual(reason.length, 0)
 

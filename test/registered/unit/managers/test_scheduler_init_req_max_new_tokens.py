@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -71,16 +72,6 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         cm = get_parallel().override(attn_dcp_size=1)
         cm.__enter__()
         self.addCleanup(cm.__exit__, None, None, None)
-        # The PD-prefill branch asks whether a request has a decode peer.
-        patcher = patch(
-            "sglang.srt.disaggregation.utils.get_disagg",
-            return_value=SimpleNamespace(
-                disaggregation_mode="prefill",
-                disaggregation_transfer_backend="nixl",
-            ),
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def _new_scheduler(
         self,
@@ -91,6 +82,7 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.transfer_backend = TransferBackend.NIXL
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
@@ -413,16 +405,10 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
             scheduler.init_req_max_new_tokens(req)
             self.assertEqual(req.sampling_params.max_new_tokens, 1)
 
-        with patch(
-            "sglang.srt.disaggregation.utils.get_disagg",
-            return_value=SimpleNamespace(
-                disaggregation_mode="prefill",
-                disaggregation_transfer_backend="fake",
-            ),
-        ):
-            req = self._new_req(max_new_tokens=0, input_len=30)
-            scheduler.init_req_max_new_tokens(req)
-            self.assertEqual(req.sampling_params.max_new_tokens, 1)
+        scheduler.transfer_backend = TransferBackend.FAKE
+        req = self._new_req(max_new_tokens=0, input_len=30)
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 1)
 
 
 if __name__ == "__main__":

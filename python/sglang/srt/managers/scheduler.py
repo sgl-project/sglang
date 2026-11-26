@@ -3080,7 +3080,10 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # No decode takes a handoff from a request prefill answers alone,
             # so it keeps the budget it asked for.
-            if lacks_decode_peer(req) and req.sampling_params.max_new_tokens in (0, 1):
+            if self._lacks_decode_peer(req) and req.sampling_params.max_new_tokens in (
+                0,
+                1,
+            ):
                 return
             req.sampling_params.max_new_tokens = 1
             # min <= max invariant; EOS stays legal as the handoff token
@@ -3481,7 +3484,7 @@ class Scheduler(
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
-                    and not lacks_decode_peer(req)
+                    and not self._lacks_decode_peer(req)
                 ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
@@ -3613,7 +3616,10 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if lacks_decode_peer(req) and req.sampling_params.max_new_tokens not in (0, 1):
+        if self._lacks_decode_peer(req) and req.sampling_params.max_new_tokens not in (
+            0,
+            1,
+        ):
             self._reject_bad_request(
                 req,
                 "A prefill request without a bootstrap host has no decode to "
@@ -3996,6 +4002,16 @@ class Scheduler(
                 req.time_stats.set_wait_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _lacks_decode_peer(self, req: Req) -> bool:
+        # Only a prefill server consults its transfer backend for this.
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return False
+        return lacks_decode_peer(
+            req,
+            disaggregation_mode=self.disaggregation_mode,
+            transfer_backend=self.transfer_backend,
+        )
 
     def _reject_bad_request(self, req: Req, error_msg: str) -> None:
         """Return a validation error as a 400 without running the model."""
