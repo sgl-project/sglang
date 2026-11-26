@@ -75,6 +75,8 @@ def _reject_unsupported_hyv4_flash(cfg: Any) -> None:
     "Dots3NoteForCausalLM",
     "Xing4_0ForCausalLM",
     "KimiK31ForConditionalGeneration",
+    "GigaChat4ForCausalLM",
+    "GigaChat4ForCausalLMNextN",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""

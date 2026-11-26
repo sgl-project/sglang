@@ -735,6 +735,13 @@ class ForwardFlags:
         "attn_tp_sequence_sharded": False,
         # Physical token rows in TP rank order for the current Ascend MoE call.
         "ascend_allgather_row_sizes": None,
+        # The batch of the current model forward, published by ModelRunner so
+        # the EP dispatcher can derive an Ascend allgather row layout lazily.
+        "forward_batch": None,
+        # Whether the FFN stage's MoE input is a contiguous attention-TP slice
+        # of the DP shard (True) or the gathered full shard on every rank
+        # (False). None means the stage did not declare it.
+        "moe_input_attn_tp_sliced": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
