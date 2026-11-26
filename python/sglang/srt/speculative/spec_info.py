@@ -173,7 +173,7 @@ class SpeculativeAlgorithm(Enum):
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
-        per-topk page rounding; see get_alloc_len_per_decode."""
+        per-topk page rounding; see get_spec_decode_reserve."""
         return not self.is_ngram()
 
     def carries_draft_hidden_states(self) -> bool:
@@ -334,9 +334,10 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dspark():
             from sglang.srt.arg_groups.model_override_base import model_config_of
+            from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 
-            if model_config_of(server_args).hf_config.architectures == [
-                "Inkling2ForConditionalGeneration"
+            if model_config_of(server_args).hf_config.architectures in [
+                [a] for a in INKLING2_ARCHS
             ]:
                 from sglang.srt.speculative.inkling2_mtp_worker import Inkling2MTPWorker
 

@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.qk_norm_rope import qk_norm_rope
 from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
 from sglang.srt.environ import envs
@@ -329,7 +330,7 @@ class Qwen3Attention(nn.Module):
             and quant_config is None
             and attn_tp_size == 1
             and self.head_dim == 128
-            and torch.cuda.get_device_capability()[0] == 9
+            and current_arch().is_sm(9)
             and attention_backends()[0] in ("fa3", "flashinfer")
             and get_spec().speculative_algorithm is None
             and self.rotary_emb.is_neox_style

@@ -179,7 +179,6 @@ def load_fused_expert_weights(
     num_experts: int,
 ):
     param = params_dict[name]
-    # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
     weight_loader = param.weight_loader
     # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
     for expert_id in range(num_experts):
@@ -291,9 +290,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
-                # [TODO] Skip layers that are on other devices (check if sglang has a similar function)
-                # if is_pp_missing_parameter(name, self):
-                #     continue
 
                 if name not in params_dict:
                     continue
@@ -390,15 +386,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-
-        # TODO mimic deepseek
-        # Lazy initialization of expert weights cache to avoid slowing down load_weights
-        # if not hasattr(self, "routed_experts_weights_of_layer"):
-        #     self.routed_experts_weights_of_layer = {
-        #         layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-        #         for layer_id in range(self.start_layer, self.end_layer)
-        #         if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
-        #     }
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

@@ -132,7 +132,7 @@ do
         --swa-full-tokens-ratio 0.3 \
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
@@ -314,7 +314,7 @@ do
         --swa-full-tokens-ratio 0.3 \
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
@@ -496,7 +496,7 @@ do
         --swa-full-tokens-ratio 0.3 \
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
@@ -678,7 +678,7 @@ do
         --swa-full-tokens-ratio 0.3 \
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
