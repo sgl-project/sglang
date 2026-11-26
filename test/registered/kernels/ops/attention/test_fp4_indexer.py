@@ -804,3 +804,67 @@ def test_expand_index_page_table_matches_cpu(bs, n, bpp):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="Hopper paged indexer dispatch",
+)
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("num_blocks", [2048, 64])
+def test_fp4_paged_candidate_gather_matches_masked_replay(ratio, num_blocks):
+    """Scoring only the published candidate blocks gives the bits of the dense masked
+    path at every visible position (candidates scored, the rest -inf), across graph
+    replays that change lengths and block ids, including -1 padding and empty rows."""
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+        candidate_block_mask,
+    )
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        fp4_index_logits_paged_candidates,
+    )
+
+    batch, width, capacity = 30, 20000, 32768
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    req = (torch.arange(batch, device=q.device) // 6).to(torch.int32)
+    req_table = torch.zeros(
+        (req.max().item() + 1, capacity * ratio), device=q.device, dtype=torch.int32
+    )
+    req_table[req.long(), : width * ratio : ratio] = (slots * ratio).to(torch.int32)
+    lengths = torch.full((batch,), width, device=q.device, dtype=torch.int32)
+    blocks = torch.full((batch, num_blocks), -1, device=q.device, dtype=torch.int32)
+    args = (q, weights, req, req_table, lengths, table, PAGE_SIZE, capacity, ratio)
+
+    def publish(step):
+        blocks.fill_(-1)
+        for row, length in enumerate(lengths.tolist()):
+            n = (length + 7) // 8
+            if not n:
+                continue
+            ids = torch.randperm(n, device=q.device)[: num_blocks - 1]
+            ids = torch.cat([ids[ids != n - 1], torch.tensor([n - 1], device=q.device)])
+            ids = ids[:num_blocks][torch.randperm(min(num_blocks, ids.numel()))]
+            blocks[row, : ids.numel()] = ids.to(torch.int32)
+
+    publish(0)
+    fp4_index_logits_paged_candidates(*args, blocks)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fp4_index_logits_paged_candidates(*args, blocks)
+    for step, long_len in enumerate([width, 0, 1, 129, 20000 - 63, 9000]):
+        short = torch.tensor([0, 1, 7, 8, 9, 127, 128, 3000], device=q.device)
+        lengths.copy_(short[torch.arange(batch, device=q.device) % 8].to(torch.int32))
+        lengths[6 * (step % 5) : 6 * (step % 5) + 6] = long_len
+        publish(step)
+        q.neg_()
+        actual.fill_(torch.nan)
+        graph.replay()
+        mask = candidate_block_mask(blocks, capacity, 8)
+        expected = fp4_index_logits_paged(*args, mask)
+        visible = (
+            torch.arange(capacity, device=q.device)[None, :]
+            < lengths.clamp(max=capacity)[:, None]
+        )
+        assert torch.equal(
+            actual[visible].view(torch.int32), expected[visible].view(torch.int32)
+        )

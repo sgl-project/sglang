@@ -2222,6 +2222,9 @@ class Envs:
     # Raise the per-rank prefill Indexer score tile limit to 2 GiB.
     SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
     SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE = EnvBool(False)
+    # Hopper paged decode: candidate consumers score only the published blocks (gather)
+    # instead of every position under a dense mask. Same scores; cost scales with the candidates.
+    SGLANG_OPT_DSV41_INDEXER_CANDIDATE_GATHER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

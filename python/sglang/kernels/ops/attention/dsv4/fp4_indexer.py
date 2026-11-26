@@ -967,3 +967,138 @@ def _launch_fp4_index_logits_paged_balanced(
         BLOCK_B=triton.next_power_of_2(batch),
         num_warps=num_warps,
     )
+
+
+@triton.jit
+def _fp4_index_logits_paged_candidates_kernel(
+    q_ptr,
+    w_ptr,
+    req_ptr,
+    req_table_ptr,
+    lens_ptr,
+    table_ptr,
+    blocks_ptr,
+    out_ptr,
+    L,
+    num_candidate_cols,
+    page_size,
+    row_stride,
+    req_stride,
+    blocks_stride,
+    out_stride,
+    stride_qb,
+    stride_qh,
+    stride_wb,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+    RATIO: tl.constexpr,
+    CAND_BLOCK: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+):
+    # One tile of a row's candidate columns: column c is position
+    # blocks[b, c // CAND_BLOCK] * CAND_BLOCK + c % CAND_BLOCK. Positions are
+    # scored exactly as the masked dense path scores them; the caller fills the
+    # rest of the row with -inf.
+    b = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_L + tl.arange(0, BLOCK_L)
+    blk = tl.load(
+        blocks_ptr + b * blocks_stride + cols // CAND_BLOCK,
+        mask=cols < num_candidate_cols,
+        other=-1,
+    )
+    pos = blk.to(tl.int64) * CAND_BLOCK + cols % CAND_BLOCK
+    n_vis = tl.minimum(tl.load(lens_ptr + b), L)
+    valid = (blk >= 0) & (pos < n_vis)
+    if tl.max(valid.to(tl.int32), 0) == 0:
+        return
+    req = tl.load(req_ptr + b).to(tl.int64)
+    slot = (
+        tl.load(req_table_ptr + req * req_stride + pos * RATIO, mask=valid, other=0).to(
+            tl.int64
+        )
+        // RATIO
+    )
+    q_even, q_odd, w = _fp4_index_row_query(
+        q_ptr, w_ptr, b, stride_qb, stride_qh, stride_wb, H, HALF_D
+    )
+    k_low, k_high = _fp4_index_k_tile(
+        table_ptr, slot, valid, page_size, row_stride, BLOCK_L, HALF_D
+    )
+    logit = _fp4_index_logits_from_k(q_even, q_odd, w, k_low, k_high, valid)
+    tl.store(out_ptr + b * out_stride + pos, logit, mask=valid)
+
+
+def fp4_index_logits_paged_candidates(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    req: torch.Tensor,
+    req_table: torch.Tensor,
+    lens: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+    max_len: int,
+    ratio: int,
+    blocks: torch.Tensor,
+    block_size: int = 8,
+) -> torch.Tensor:
+    """``fp4_index_logits_paged`` with a candidate mask given as block ids.
+
+    ``blocks`` is ``[batch, n]`` int32, the candidate blocks of ``block_size``
+    positions of each row, unordered and -1 padded (a source's published ids).
+    Only the candidate positions are scored, with the same values as the dense
+    masked path; every other position of the ``[batch, max_len]`` output is -inf.
+    The work scales with ``n * block_size`` instead of the context length.
+    """
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+    assert table.dtype == torch.uint8 and table.ndim == 2
+    assert ratio in (1, 2) and max_len <= req_table.shape[1] // ratio
+    assert req_table.stride(1) == 1
+    assert blocks.dtype == torch.int32 and blocks.shape[0] == q.shape[0]
+    batch, heads, _ = q.shape
+    q = q.contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
+    req = req.contiguous()
+    lens = lens.contiguous()
+    blocks = blocks.contiguous()
+    out = aligned_new_empty(
+        shape=(batch, max_len),
+        dtype=torch.float32,
+        device=q.device,
+        alignment_bytes=get_input_stride_alignment_bytes(),
+    )
+    if not batch or not max_len:
+        return out
+    out.fill_(float("-inf"))
+    num_candidate_cols = blocks.shape[1] * block_size
+    if not num_candidate_cols:
+        return out
+    block_l = 128
+    _fp4_index_logits_paged_candidates_kernel[
+        (batch, triton.cdiv(num_candidate_cols, block_l))
+    ](
+        q,
+        weights,
+        req,
+        req_table,
+        lens,
+        table,
+        blocks,
+        out,
+        max_len,
+        num_candidate_cols,
+        page_size,
+        table.stride(0),
+        req_table.stride(0),
+        blocks.stride(0),
+        out.stride(0),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        H=heads,
+        HALF_D=INDEX_HEAD_DIM // 2,
+        RATIO=ratio,
+        CAND_BLOCK=block_size,
+        BLOCK_L=block_l,
+        num_warps=4,
+    )
+    return out

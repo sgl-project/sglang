@@ -137,7 +137,10 @@ class DenseBlocksBackend:
             )
             published = BlockIds(
                 blocks=blocks,
-                decode_mask=candidate_block_mask(blocks, d.lmax, self.block_size),
+                # The candidate-gather consumers read the block ids directly.
+                decode_mask=None
+                if envs.SGLANG_OPT_DSV41_INDEXER_CANDIDATE_GATHER.get()
+                else candidate_block_mask(blocks, d.lmax, self.block_size),
             )
         else:
             published = BlockIds(
@@ -156,17 +159,24 @@ class DenseBlocksBackend:
         inputs: DecodeInputs,
         published: Optional[BlockIds],
     ) -> None:
+        gather = (
+            published is not None
+            and published.decode_mask is None
+            and envs.SGLANG_OPT_DSV41_INDEXER_CANDIDATE_GATHER.get()
+            and (get_platform().is_sm90 or get_platform().is_sm120)
+        )
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             candidate_mask=published.decode_mask if published is not None else None,
+            candidate_blocks=published.blocks if gather else None,
         )
         if d is None:
             return
         assert published is not None and published.blocks.shape[0] == d.bs
         if isinstance(d, PagedDecodeScores):
-            assert published.decode_mask is not None
+            assert published.decode_mask is not None or gather
             select_decode(inputs, d, inputs.indexer.index_topk)
             return
         k = min(inputs.indexer.index_topk, d.lmax)
