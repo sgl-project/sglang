@@ -359,7 +359,7 @@ class TestWindowRetirement(CustomTestCase):
                 patch("sglang.srt.runtime_context.get_schedule", return_value=schedule),
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec),
                 patch(
-                    "sglang.srt.mem_cache.allocation_sizing.get_alloc_reserve_per_decode",
+                    "sglang.srt.mem_cache.allocation_sizing.get_decode_reserve",
                     return_value=10,
                 ),
             ):
