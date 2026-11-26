@@ -274,6 +274,100 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
         self.assertTrue(layer.w2_weight_scale.load_full_w2)
         self.assertTrue(layer.w2_weight_zero_point.load_full_w2)
 
+    def _get_moe_scheme_for_platform(
+        self, backend, *, device_sm, is_sm100=False, num_bits=4, **weight_overrides
+    ):
+        quant_config = CompressedTensorsConfig.from_config(
+            _make_wna16_moe_config(
+                ["re:.*mlp.experts.*"], num_bits=num_bits, **weight_overrides
+            )
+        )
+        with (
+            mock.patch.object(
+                compressed_tensors,
+                "get_moe_runner_backend",
+                return_value=backend,
+            ),
+            override_platform(device_sm=device_sm, is_sm100=is_sm100),
+        ):
+            return quant_config.get_moe_scheme(
+                torch.nn.Module(), layer_name=EXPERTS_LAYER
+            )
+
+    def test_triton_moe_min_capability_supports_volta_and_turing(self):
+        self.assertEqual(CompressedTensorsWNA16TritonMoE.get_min_capability(), 70)
+        self.assertEqual(CompressedTensorsWNA16MoE.get_min_capability(), 80)
+
+    def test_turing_int4_auto_uses_triton(self):
+        for device_sm in (70, 75):
+            for group_size in (32, 128):
+                with self.subTest(device_sm=device_sm, group_size=group_size):
+                    scheme = self._get_moe_scheme_for_platform(
+                        MoeRunnerBackend.AUTO,
+                        device_sm=device_sm,
+                        group_size=group_size,
+                    )
+                    self.assertIsInstance(scheme, CompressedTensorsWNA16TritonMoE)
+
+    def test_turing_auto_rejects_unvalidated_triton_layouts(self):
+        cases = {
+            "int8": {"num_bits": 8},
+            "asymmetric": {"symmetric": False},
+            "channel": {"strategy": "channel", "group_size": None},
+            "group64": {"group_size": 64},
+            "actorder": {"actorder": "group"},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name=name):
+                scheme = self._get_moe_scheme_for_platform(
+                    MoeRunnerBackend.AUTO, device_sm=75, **overrides
+                )
+                self.assertIsInstance(scheme, CompressedTensorsWNA16MoE)
+                self.assertNotIsInstance(scheme, CompressedTensorsWNA16TritonMoE)
+
+    def test_turing_explicit_marlin_is_preserved(self):
+        scheme = self._get_moe_scheme_for_platform(
+            MoeRunnerBackend.MARLIN, device_sm=75
+        )
+        self.assertIsInstance(scheme, CompressedTensorsWNA16MoE)
+        self.assertNotIsInstance(scheme, CompressedTensorsWNA16TritonMoE)
+
+    def test_non_pre_ampere_int4_auto_keeps_marlin(self):
+        for device_sm in (0, 80):
+            with self.subTest(device_sm=device_sm):
+                scheme = self._get_moe_scheme_for_platform(
+                    MoeRunnerBackend.AUTO, device_sm=device_sm
+                )
+                self.assertIsInstance(scheme, CompressedTensorsWNA16MoE)
+                self.assertNotIsInstance(scheme, CompressedTensorsWNA16TritonMoE)
+
+    def test_moe_align_block_size_uses_jit_on_pre_ampere(self):
+        import importlib
+
+        import sglang.kernels.ops.moe.moe_align as moe_align_mod
+
+        align_mod = importlib.import_module(
+            "sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size"
+        )
+
+        topk_ids = torch.zeros((70, 1), dtype=torch.int32)
+        with (
+            mock.patch.object(align_mod, "_is_cuda", True),
+            mock.patch.object(
+                align_mod, "sgl_moe_align_block_size", create=True
+            ) as mock_aot,
+            mock.patch.object(moe_align_mod, "moe_align_block_size") as mock_jit,
+        ):
+            with override_platform(device_sm=75):
+                align_mod.moe_align_block_size(topk_ids, block_size=64, num_experts=8)
+            self.assertEqual(mock_jit.call_count, 1)
+            self.assertEqual(mock_aot.call_count, 0)
+
+            with override_platform(device_sm=80):
+                align_mod.moe_align_block_size(topk_ids, block_size=64, num_experts=8)
+            self.assertEqual(mock_jit.call_count, 1)
+            self.assertEqual(mock_aot.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
