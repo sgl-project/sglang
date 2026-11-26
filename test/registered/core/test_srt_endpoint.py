@@ -337,6 +337,59 @@ class TestSRTEndpoint(CustomTestCase):
         # The consecutive-id prompt guarantees every 37th position is probed.
         self.assertGreater(checked, 4)
 
+    def test_token_ids_logprob_rows(self):
+        """Each scored position reports its own ids across a prefill chunk
+        boundary, with the values token_ids_logprob gives for the same ids."""
+        server_info = requests.get(self.base_url + "/server_info").json()
+        # -1 (chunking off) leaves one extend; the rows still run the path.
+        chunk = max(server_info["chunked_prefill_size"], 400)
+        rng = random.Random(0)
+        input_ids = [rng.randrange(1000, 20000) for _ in range(chunk + 200)]
+        logprob_start_len = chunk - 200
+        pool = rng.sample(range(1000, 30000), 200)
+        rows = []
+        for position in range(logprob_start_len + 1, len(input_ids)):
+            # The actual token first: its score is also in input_token_logprobs.
+            row = [input_ids[position]]
+            row += [t for t in rng.sample(pool, 5) if t != input_ids[position]]
+            rows.append(row)
+        rows[3] = []
+
+        def score(**ask):
+            requests.post(self.base_url + "/flush_cache")
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": input_ids,
+                    "sampling_params": {"max_new_tokens": 0},
+                    "return_logprob": True,
+                    "logprob_start_len": logprob_start_len,
+                    **ask,
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["meta_info"]
+
+        meta = score(token_ids_logprob_rows=rows)
+        reported = meta["input_token_ids_logprobs"]
+        self.assertEqual(len(reported), len(rows) + 1)
+        self.assertIsNone(reported[0])
+        for i, row in enumerate(rows):
+            if not row:
+                self.assertFalse(reported[i + 1])
+                continue
+            self.assertEqual([item[1] for item in reported[i + 1]], row)
+            self.assertAlmostEqual(
+                reported[i + 1][0][0], meta["input_token_logprobs"][i + 1][0], places=5
+            )
+
+        union = sorted({t for row in rows for t in row})
+        flat = score(token_ids_logprob=union)["input_token_ids_logprobs"]
+        for i, row in enumerate(rows):
+            at = {item[1]: item[0] for item in flat[i + 1]}
+            for value, requested, *_ in reported[i + 1] or []:
+                self.assertAlmostEqual(value, at[requested], places=3)
+
     def test_logprob_grammar(self):
         prompts = "Question: Is Paris the Capital of France? Answer:"
         allowed_tokens = [" Yes", " No"]
@@ -842,6 +895,10 @@ class TestRustServerEndpoint(TestSRTEndpoint):
 
     @unittest.skip(f"/flush_cache endpoint + cached_tokens meta {_RUST_TODO}")
     def test_cache_tokens(self):
+        pass
+
+    @unittest.skip(f"token_ids_logprob_rows request field {_RUST_TODO}")
+    def test_token_ids_logprob_rows(self):
         pass
 
     def test_greedy_token_equals_top1(self):

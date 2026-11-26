@@ -188,6 +188,13 @@ ARG ROCM1000_TORCH_VERSION="2.11.0"
 ARG ROCM1000_TORCHVISION_VERSION="0.26.0"
 ARG ROCM1000_TORCHAUDIO_VERSION="2.11.0"
 ARG ROCM1000_TRITON_VERSION="3.8.0+git4cff872c"
+# torch 2.11.0+rocm10.0.0 pins triton==3.8.0+git4cff872c, which lacks
+# triton-lang/triton#11256 (ROCm/triton#963): a masked async buffer load to
+# LDS never writes its `other` value, so masked lanes read stale LDS. On gfx950
+# this turns AITER's Triton gemm_afp4wfp4 output into NaNs (ROCm/aiter#7595).
+# Replace it with AMD's 3.8.0 build for the same SDK that contains the fix, and
+# point torch's pin at it. Leave empty to keep the SDK's Triton.
+ARG ROCM1000_TRITON_OVERRIDE_VERSION="3.8.0+git669b31ac"
 
 ARG ROCM1010_SDK_VERSION="10.1.0"
 ARG ROCM1010_TORCH_VERSION="2.12.0"
@@ -234,11 +241,12 @@ RUN set -eux; \
       rocm1000) \
         sdk="${ROCM1000_SDK_VERSION}"; torch="${ROCM1000_TORCH_VERSION}"; \
         vision="${ROCM1000_TORCHVISION_VERSION}"; audio="${ROCM1000_TORCHAUDIO_VERSION}"; \
-        triton="${ROCM1000_TRITON_VERSION}" ;; \
+        triton="${ROCM1000_TRITON_VERSION}"; \
+        triton_override="${ROCM1000_TRITON_OVERRIDE_VERSION}" ;; \
       rocm1010) \
         sdk="${ROCM1010_SDK_VERSION}"; torch="${ROCM1010_TORCH_VERSION}"; \
         vision="${ROCM1010_TORCHVISION_VERSION}"; audio="${ROCM1010_TORCHAUDIO_VERSION}"; \
-        triton="${ROCM1010_TRITON_VERSION}" ;; \
+        triton="${ROCM1010_TRITON_VERSION}"; triton_override="" ;; \
       *) echo "No pinned ROCm stack for GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
     esac; \
     python3 -m pip install --no-cache-dir \
@@ -273,7 +281,12 @@ RUN set -eux; \
           exit 1; \
         fi; \
       done; \
-    done
+    done; \
+    if [ -n "${triton_override}" ]; then \
+      python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
+          --index-url ${ROCM_INDEX_URL} "triton==${triton_override}.rocm${sdk}"; \
+      python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); assert v=='${triton_override}.rocm${sdk}', v; t,n=re.subn(r'^Requires-Dist: triton==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t); print('[Triton] torch now requires triton', v)"; \
+    fi
 
 RUN rocm-sdk init && rocm-sdk targets
 
@@ -332,13 +345,14 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # Base image 950 with ROCm 10.0.0 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_950_ROCM1000 AS gfx950-rocm1000
 ENV BUILD_VLLM="0"
-# Keeps the SDK's Triton. uTLX (BUILD_UTLX=1, see the uTLX step) needs Triton
-# with plugin support, which the SDK's lacks, so then it is replaced by the
-# commit the SDK's wheel comes from, built from source like gfx1250's; the
-# suffix keeps the version torch pins.
+# Keeps the Triton wheel from rocm1000-base (ROCM1000_TRITON_OVERRIDE_VERSION).
+# uTLX (BUILD_UTLX=1, see the uTLX step) needs Triton with plugin support,
+# which that wheel lacks, so then it is replaced by the commit that wheel
+# comes from, built from source like gfx1250's; the suffix keeps the version
+# torch's (patched) pin names. Must include ROCm/triton#963.
 ENV BUILD_TRITON="0"
 ENV TRITON_REPO_DEFAULT="https://github.com/ROCm/triton.git"
-ENV TRITON_COMMIT_DEFAULT="4cff872ced001ea92d9fcf05b3f6517e2b486d19"
+ENV TRITON_COMMIT_DEFAULT="669b31acc1dd1b3fd93286afd5db67f65d9f7557"
 ENV TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
@@ -361,9 +375,11 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 # gfx1250 is promoted to its own AITER pin here, ahead of the gfx942/gfx950
-# shared pin. Validated by the manual gfx1250 AITER Scout #173 A/B (no automated
-# gfx1250 Scout): gpt-oss, Flux.2, Wan2.2 and Kimi-K2 all NO_NEW_REGRESSION.
-ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
+# shared pin. Validated by a manual gfx1250 AITER Scout A/B (no automated gfx1250
+# Scout) against the previous pin 07ff5f318: gpt-oss-120B TP1, Kimi-K2 TP8,
+# Flux.2 and Wan2.2 all NO_NEW_REGRESSION. This pin additionally carries the
+# a16w16 FlyDSL kernel update (aiter ROCm/aiter#7851) that Flux.2 depends on.
+ENV AITER_COMMIT_DEFAULT="58b435276ffe1400fe86f108b577b6f26107f3b1"
 # The upstream Triton the gfx1250 bring-up was validated against, carried over
 # from the ROCm 7.14 flavor this image replaced. Built from source below.
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
@@ -386,7 +402,7 @@ ENV TRITON_REVERT_COMMITS_DEFAULT="9debefe44117a44c274b05033cfe9e4858883b86"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
+ENV AITER_COMMIT_DEFAULT="58b435276ffe1400fe86f108b577b6f26107f3b1"
 ENV BUILD_RCCL="1"
 # rocm-systems develop. The fix for the hang in the first all-reduce on gfx1250
 # (ROCm/rocm-systems#14254) has landed on the mainline, so pin develop instead
@@ -483,8 +499,9 @@ ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 ARG MOONCAKE_COMMIT="748af1a53dba2d57c110de0e7feb5613ddb8835b"
 
+# v0.1.12 (aligned with python/pyproject.toml and natively compatible with apache-tvm-ffi==0.1.11)
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
-ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
+ARG TILELANG_COMMIT="2d63708c8ad57196051c4636a1167c5453c73a48"
 
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
@@ -854,18 +871,6 @@ RUN cd sglang \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install $CONS -e "python[${all_extras}]"; \
        fi
 
-# gfx950: bundle TreeCore, which Kimi-K3.1's env defaults load on every rank so they cannot mix
-# Rust/Python implementations and diverge on HiCache reclaim. Build against the installed ROCm
-# torch; isolation would pull CUDA torch.
-RUN if [ "${GPU_ARCH%%-*}" = "gfx950" ]; then \
-      cd sglang/python \
-      && python -m pip --no-cache-dir install "setuptools-rust>=1.11" \
-      && sed -i -E 's/^rust-extensions = \["multimodal"\]$/rust-extensions = ["multimodal", "rust_tree_core"]/' pyproject.toml \
-      && SGLANG_BUILD_RUST_EXTS=rust_tree_core python setup.py build_rust --inplace \
-      && rm -rf ../rust/sglang-radix-tree/target \
-      && SGLANG_RUST_BUILD_MODE=never python -c "from sglang.srt.mem_cache.rust_tree_core import extension"; \
-    fi
-
 RUN python -m pip cache purge
 
 RUN case "${GPU_ARCH##*-}" in \
@@ -932,26 +937,30 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
-  # TVM Python bits need Cython + z3 before configure.
+  # TVM/TileLang build needs Cython>=3.1, patchelf, and z3 before configure.
+  # Pin apache-tvm-ffi==0.1.11: matches TileLang v0.1.12 (>=0.1.10,<=0.1.11),
+  # preserves the ROCm DLPack fix, and provides extra_lib_paths for xgrammar>=0.2.8.
   # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
-  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" "z3-solver==4.15.4.0"; \
+  "$VENV_PIP" install --no-cache-dir "cython>=3.1.0" "patchelf>=0.17.2" "apache-tvm-ffi==0.1.11" "z3-solver==4.15.4.0"; \
   \
   # Clone + pin TileLang (bundled TVM), then build
-  git clone --recursive "${TILELANG_REPO}" /opt/tilelang && \
-  cd /opt/tilelang && \
-  git fetch --depth=1 origin "${TILELANG_COMMIT}" || true && \
-  git checkout -f "${TILELANG_COMMIT}" && \
-  git submodule update --init --recursive && \
+  git clone --recursive "${TILELANG_REPO}" /opt/tilelang; \
+  cd /opt/tilelang; \
+  if ! git cat-file -e "${TILELANG_COMMIT}^{commit}" 2>/dev/null; then \
+    git fetch origin "${TILELANG_COMMIT}"; \
+  fi; \
+  git checkout -f "${TILELANG_COMMIT}"; \
+  git submodule update --init --recursive; \
   if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
     export ROCM_PATH=${ROCM_HOME}; \
   else \
     export ROCM_PATH=/opt/rocm; \
   fi; \
-  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
+  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}"; \
   "$VENV_PIP" install -e . -v --no-build-isolation --no-deps; \
   if [ -f pyproject.toml ]; then sed -i "/^[[:space:]]*\"torch/d" pyproject.toml || true; fi; \
   "$VENV_PIP" cache purge || true; \
-  "$VENV_PY" -c "import tilelang; print(tilelang.__version__)"'
+  "$VENV_PY" -c "import tilelang, xgrammar; print(tilelang.__version__)"'
 
 # -----------------------
 # Hadamard-transform (HIP build)

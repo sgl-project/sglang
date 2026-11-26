@@ -6,7 +6,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.sam import sam_rel_pos_bias_reference
 
 register_cuda_ci(
-    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
+    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 # SAM ViT-B global attention: 12 heads.
@@ -15,7 +15,7 @@ NUM_HEADS = 12
 
 @marker.parametrize("batch", [1, 2, 4, 8], [1, 8])
 @marker.parametrize("queries,key_size", [(1600, 40), (4096, 64)], [(1600, 40)])
-@marker.benchmark("impl", ["jit", "torch"])
+@marker.benchmark("impl", ["jit", "torch"], gate=["jit"])
 def benchmark(batch: int, queries: int, key_size: int, impl: str):
     rel_h = torch.randn(
         batch, NUM_HEADS, queries, key_size, 1, device="cuda", dtype=torch.bfloat16

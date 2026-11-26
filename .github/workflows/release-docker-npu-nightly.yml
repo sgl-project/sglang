@@ -23,19 +23,19 @@ jobs:
       matrix:
         include:
           - device_type: a3
-            cann_version: "9.1.0"
+            cann_version: "9.2.0"
             platform: amd64
             runner: ubuntu-latest
           - device_type: a3
-            cann_version: "9.1.0"
+            cann_version: "9.2.0"
             platform: arm64
             runner: ubuntu-22.04-arm
           - device_type: 950
-            cann_version: "9.1.0"
+            cann_version: "9.2.0"
             platform: amd64
             runner: ubuntu-latest
           - device_type: 950
-            cann_version: "9.1.0"
+            cann_version: "9.2.0"
             platform: arm64
             runner: ubuntu-22.04-arm
     steps:
@@ -83,7 +83,7 @@ jobs:
           provenance: false
           sbom: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=2026.11.0.post8
+            SGLANG_KERNEL_NPU_TAG=2026.11.0.post15
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
 
@@ -94,7 +94,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        cann_version: ["9.1.0"]
+        cann_version: ["9.2.0"]
         device_type: ["a3", "950"]
     steps:
       - name: Set up Docker Buildx

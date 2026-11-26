@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -46,6 +47,7 @@ def _fake_residual_gate_fp32(
     mutates_args=[],
     fake_impl=_fake_residual_gate_fp32,
 )
+@replay_launches
 def _residual_gate_fp32(
     x: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:

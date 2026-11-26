@@ -40,7 +40,7 @@ CELLS = {
 @marker.parametrize("cell", list(CELLS), ["a64k", "d_short"])
 @marker.parametrize("rows", [1024, 4096, 8192], [1024])
 @marker.parametrize("heads", [32, 64], [32, 64])
-@marker.benchmark("impl", ["ours", "deepgemm"], unit="us")
+@marker.benchmark("impl", ["ours", "deepgemm"], unit="us", gate=["ours"])
 def benchmark(cell: str, rows: int, heads: int, impl: str):
     if torch.cuda.get_device_capability()[0] != 10:
         return marker.skip("SM100 only")

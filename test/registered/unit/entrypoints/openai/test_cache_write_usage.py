@@ -215,13 +215,18 @@ class TestCacheWriteUsage(CustomTestCase):
         class _StubParser:
             """Stands in for FunctionCallParser on the calls-only path."""
 
-            def parse_stream_chunk(self, delta):
-                return "", [
-                    SimpleNamespace(
-                        source_text=delta,
-                        name=None,
-                        parameters='{"a": 1}',
-                        tool_index=0,
+            def parse_stream_segments(self, delta):
+                return [
+                    (
+                        "",
+                        [
+                            SimpleNamespace(
+                                source_text=delta,
+                                name=None,
+                                parameters='{"a": 1}',
+                                tool_index=0,
+                            )
+                        ],
                     )
                 ]
 

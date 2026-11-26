@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
     Derived,
 )
+from sglang.srt.arg_groups.argparse_actions import NoneChoiceAction
 from sglang.srt.arg_groups.choices import (
     ATTENTION_BACKEND_CHOICES,
     FP4_GEMM_RUNNER_BACKEND_CHOICES,
@@ -27,6 +28,7 @@ from sglang.srt.arg_groups.choices import (
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     RL_ON_POLICY_TARGET_CHOICES,
+    WATERMARK_ALGORITHM_CHOICES,
     reject_removed_choice,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -88,13 +90,23 @@ class ExecFeatures(msgspec.Struct):
     ] = False
     enable_watermark: A[
         bool,
-        "Enable Aaronson-Gumbel text watermarking.",
+        "Enable text watermarking with the algorithm --watermark-algorithm selects.",
     ] = False
+    watermark_algorithm: A[
+        str,
+        Arg(
+            help="The text watermarking algorithm: gumbel (Aaronson-Gumbel) or "
+            "synthid (SynthID Text).",
+            choices=WATERMARK_ALGORITHM_CHOICES,
+        ),
+    ] = "gumbel"
     watermark_config: A[
         Optional[str],
         "Watermark settings as a JSON file path or an inline JSON object with "
-        "optional key, key_b, context_window, mixing_probability, max_probability, "
-        "default_enabled, and enforce_all fields.",
+        "optional default_enabled and enforce_all fields; gumbel reads key, key_b, "
+        "context_window, mixing_probability, and max_probability; synthid reads "
+        "keys, ngram_len, num_candidates, context_history_size, and "
+        "skip_first_ngram_calls.",
     ] = None
     watermark_key: A[
         Optional[str],
@@ -124,6 +136,26 @@ class ExecFeatures(msgspec.Struct):
         bool,
         Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = False
+    watermark_keys: A[
+        Optional[List[int]],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_ngram_len: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_num_candidates: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_context_history_size: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_skip_first_ngram_calls: A[
+        Optional[bool],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "
@@ -312,7 +344,7 @@ class ExecKernel(msgspec.Struct):
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; bias-free M <= 16 uses FlashInfer's autotuned CuTe DSL mm_bf16 except on SM107 or with --disable-flashinfer-autotune, other shapes dispatch between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; on SM12x without deterministic inference, BF16 projections of at most 32 rows with at least 2048 output columns, the FP32-output LM head and the DSpark draft vocab projection at up to 32 rows use the SM12x GEMVs; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; bias-free M <= 16 uses FlashInfer's autotuned CuTe DSL mm_bf16 except on SM107 or with --disable-flashinfer-autotune, other shapes dispatch between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=["auto", "cutedsl", "gemv", "torch"],
         ),
@@ -766,6 +798,17 @@ class ExecGraph(msgspec.Struct):
         bool,
         "Enable profiling of cuda graph capture.",
     ] = False
+    cuda_graph_persistence: A[
+        Optional[Literal["save", "load"]],
+        Arg(
+            help="Persist the CUDA graphs across restarts with Foundry (optional dependency sglang[foundry]). 'save' captures as usual and writes the graphs and the memory layout they reference to an archive; 'load' rebuilds the graphs from that archive instead of capturing. SAVE and LOAD must use the same model, flags and GPUs. Decode graphs use the full backend; prefill graphs are 'full' or 'disabled' (default disabled).",
+            choices=["save", "load"],
+        ),
+    ] = None
+    cuda_graph_persistence_config: A[
+        Optional[str],
+        "Foundry TOML for --cuda-graph-persistence (workspace_root, base_addr, region_size, scratch_space_size, ...). Its 'mode' key is ignored: the flag's mode wins. Defaults: archive in ./foundry_archive.",
+    ] = None
     enable_cudagraph_gc: A[
         bool,
         "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen and paused during capture, which speeds it up and keeps a collection from invalidating the graph.",
@@ -1044,14 +1087,16 @@ class ExecMoe(msgspec.Struct):
         (
             "Configuration for the ascend_ops MoE backend used by the main "
             "model and/or speculative draft as a JSON object, "
-            'for example {"prefill":"alltoallv","decode":"low_latency"}.'
+            'for example {"prefill":"alltoallv","decode":"fused_op"}. '
+            "Either phase can select fused_op to use MegaMoE."
         ),
     ] = None
     elastic_ep_backend: A[
         Literal[None, "mooncake", "nixl"],
         Arg(
             help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
-            choices=["none", "mooncake", "nixl"],
+            action=NoneChoiceAction,
+            action_kwargs={"choices": ["none", "mooncake", "nixl"]},
         ),
     ] = None
     enable_elastic_expert_backup: A[
