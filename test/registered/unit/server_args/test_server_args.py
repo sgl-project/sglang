@@ -50,6 +50,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
     handle_kv4_compatibility,
+    handle_mxfp8_kv_cache_compatibility,
     handle_nvfp4_prefill_kv_dequant_dtype,
     handle_platform_kv_cache_dtype_compatibility,
     validate_prefill_only_disable_kv_cache_args,
@@ -1714,6 +1715,21 @@ class TestPlatformKVCacheDtypeCompatibility(CustomTestCase):
                 self._resolve(
                     out_of_tree=True, declared={_PLATFORM_KV_CACHE_DTYPE}, **overrides
                 )
+
+
+class TestMxfp8KVCacheCompatibility(CustomTestCase):
+    """The Blackwell requirement belongs to the in-tree FA4 MXFP8 pool; an
+    out-of-tree platform serves mxfp8 through its own get_kv_pool_cls pool."""
+
+    @override_platform(is_blackwell=False)
+    def test_blackwell_gate_applies_only_in_tree(self):
+        args = ServerArgs(model_path="dummy", kv_cache_dtype="mxfp8")
+        with patch("sglang.srt.arg_groups.kv_cache_hook.current_platform") as platform:
+            platform.is_out_of_tree.return_value = False
+            with self.assertRaisesRegex(ValueError, "Blackwell"):
+                handle_mxfp8_kv_cache_compatibility(args)
+            platform.is_out_of_tree.return_value = True
+            handle_mxfp8_kv_cache_compatibility(args)
 
 
 class TestLoraForwardDomains(unittest.TestCase):

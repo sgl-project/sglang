@@ -103,7 +103,8 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
     """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
     cfg = resolving_view(server_args)
-    if cfg.kv_cache_dtype != "mxfp8":
+    # Out of tree, the platform's get_kv_pool_cls(kind="mha_mxfp8") pool decides.
+    if cfg.kv_cache_dtype != "mxfp8" or current_platform.is_out_of_tree():
         return
     if not get_platform().is_blackwell:
         raise ValueError(

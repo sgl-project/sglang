@@ -41,7 +41,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-KVPoolKind = Literal["mha", "mla", "dsa"]
+KVPoolKind = Literal["mha", "mla", "dsa", "mha_mxfp8", "mha_swa", "dsv4"]
 
 _LEGACY_KV_POOL_HOOKS: dict[str, str] = {
     "mha": "get_mha_kv_pool_cls",
@@ -204,11 +204,33 @@ class SRTPlatform(DeviceMixin):
         means the in-tree class, which allocates on ``device`` and is
         correct for any torch device.
 
+        Three more kinds follow the same contract:
+
+        - ``mha_mxfp8``: the MHA pool for ``--kv-cache-dtype mxfp8``, built at
+          every ``mha`` site in place of the ``mha`` class. Subclass
+          ``MHATokenToKVPool``; the in-tree ``MHATokenToKVPoolMXFP8`` lays out
+          its scale factors for the CUDA FA4 kernel, so ``None`` refuses mxfp8
+          out of tree when an MHA pool is built. Core budgets fp8 data plus one
+          byte per 32 elements, and moves scale buffers for PD, HiCache and the
+          linker only for the in-tree class: keep scales inside the buffers
+          ``_create_buffers`` registers, or reject those features.
+        - ``mha_swa``: the sliding-window sub-pool of the MHA SWA composite.
+          Subclass ``MHATokenToKVPool``; ``None`` reuses the full-attention
+          class, so only a platform storing the two sub-pools in different
+          formats needs it. Consulted for every ``--kv-cache-dtype`` and
+          budgeted like the full-attention pool, so the class must serve the
+          dtype within those bytes per token.
+        - ``dsv4``: the DeepSeek-V4 compressed-KV pool. Subclass
+          ``DeepSeekV4TokenToKVPool``; the in-tree class assumes CUDA, so
+          ``None`` refuses DeepSeek-V4 out of tree.
+
         A platform that still overrides the removed
         ``get_{mha,mla,dsa}_kv_pool_cls`` hooks is served from them, with a
         deprecation warning.
         """
-        hook = _LEGACY_KV_POOL_HOOKS[kind]
+        hook = _LEGACY_KV_POOL_HOOKS.get(kind)
+        if hook is None:
+            return None
         legacy = getattr(self, hook, None)
         if legacy is None:
             return None
