@@ -160,6 +160,25 @@ sgl-eval run gsm8k \\
             disableReason: "Not yet run on TPU7x; the TPU7x recipes keep one KV cache per pass." },
         ],
       },
+      {
+        // The tool-call header past tool calls render with: the tool's name
+        // (Inkling-2-Mini), empty with assistant names dropped
+        // (TML-d24-varloop-research), or the assistant's own name. Pick the one the
+        // checkpoint writes. Prompt rendering is the same on every GPU backend.
+        id: "toolCallHeader", title: "Tool-Call Header",
+        stripPrefixes: ["--inkling2-tool-call-author-name-mode"],
+        options: [
+          { id: "toolName", label: "Tool name (Inkling-2-Mini, default)", flags: [] },
+          { id: "dropName", label: "Empty, names dropped (TML-d24-varloop-research)",
+            flags: ["--inkling2-tool-call-author-name-mode drop_name"],
+            disable: { hw: ["tpu7x"] },
+            disableReason: "Not yet run on TPU7x." },
+          { id: "independent", label: "Assistant's own name",
+            flags: ["--inkling2-tool-call-author-name-mode independent"],
+            disable: { hw: ["tpu7x"] },
+            disableReason: "Not yet run on TPU7x." },
+        ],
+      },
     ],
 
     // ----- Card: "PD Disaggregation" -----

@@ -36,7 +36,7 @@ class TestFlashInferCudaGraphMetadataReuse(unittest.TestCase):
                 backend.prefill_cuda_graph_metadata = {}
                 backend.draft_extend_cuda_graph_metadata = {}
                 backend.num_wrappers = 1
-                backend.max_context_len = 4
+                backend.max_kv_len = 4
                 backend.skip_prefill = True
                 backend.use_sliding_window_kv_pool = False
                 backend.init_cuda_graph_state(
@@ -150,7 +150,7 @@ class TestTRTLLMMLAGraphMetadata(unittest.TestCase):
         backend = trtllm_mla.TRTLLMMLABackend.__new__(trtllm_mla.TRTLLMMLABackend)
         backend.decode_cuda_graph_metadata = {}
         backend.decode_cuda_graph_kv_indices = torch.zeros((4, 4), dtype=torch.int32)
-        backend.max_context_len = 32
+        backend.max_kv_len = 32
         backend.num_draft_tokens = 3
         backend._calc_padded_blocks = lambda _: 4
         backend.runner_ids = SimpleNamespace(

@@ -16,6 +16,8 @@ Covers:
 
 import asyncio
 import itertools
+import pickle
+import sys
 import time
 import unittest
 from array import array
@@ -25,26 +27,41 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import msgspec
 import numpy as np
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+import torch  # noqa: E402
+import zmq.asyncio  # noqa: E402
+from zmq.utils.monitor import recv_monitor_message  # noqa: E402
+
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
+from sglang.srt.managers import io_struct, mm_utils  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
+    BatchEmbeddingOutput,
     BatchStrOutput,
+    BatchTokenizedGenerateReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     RequestOutputStats,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
+from sglang.srt.managers.req_types import (  # noqa: E402
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
     TokenizerManager,
     _add_sampling_mask_to_meta_info,
 )
+from sglang.srt.multimodal.modality import Modality  # noqa: E402
 from sglang.srt.multimodal.transport.cuda_ipc import (  # noqa: E402
     CudaIpcTensorTransportProxy,
 )
@@ -56,6 +73,7 @@ from sglang.srt.observability.request_logger import RequestLogger  # noqa: E402
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
+from sglang.srt.utils.aio_rwlock import RWLock  # noqa: E402
 from sglang.srt.utils.weight_versions import WeightVersionSpan  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -167,6 +185,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     case.addCleanup(override.restore)
     tm = TokenizerManager.__new__(TokenizerManager)
     tm.server_args = MagicMock()
+    tm.mm_processor = None
     tm._config_updates = []
     tm.server_args.enable_trace = False
     tm.server_args.enable_metrics = False
@@ -1478,12 +1497,585 @@ class TestWaitOneResponseAfterStateFreed(CustomTestCase):
         self.assertEqual(out["text"], "hello")
 
 
+class TestResponseBeforeSendResumes(CustomTestCase):
+    def test_completed_response_survives_send_resumption(self):
+        for request_type, paths in (
+            (GenerateReqInput, ("single", "batch", "sequential", "parallel")),
+            (EmbeddingReqInput, ("single", "batch", "sequential")),
+        ):
+            for path in paths:
+                for stream in (
+                    (False, True) if request_type is GenerateReqInput else (False,)
+                ):
+                    with self.subTest(
+                        request_type=request_type.__name__, path=path, stream=stream
+                    ):
+                        asyncio.run(self._drive(request_type, path, stream))
+
+    def test_send_completion_preserves_reused_rid_and_encoder_gate(self):
+        override = get_context().override_server_args(batch_notify_size=100)
+        with override:
+            for path in ("single", "batch"):
+                with self.subTest(path=path):
+                    asyncio.run(self._drive(GenerateReqInput, path, False, reuse=True))
+
+    def test_dispatch_metadata_precedes_early_terminal_response(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            for path in ("single", "batch"):
+                for pickle_ipc in (False, True):
+                    with (
+                        self.subTest(
+                            request_type=request_type.__name__,
+                            path=path,
+                            pickle_ipc=pickle_ipc,
+                        ),
+                        patch.object(io_struct, "_USE_PICKLE_IPC", pickle_ipc),
+                        get_context().override_server_args(batch_notify_size=100),
+                    ):
+                        asyncio.run(
+                            self._drive(request_type, path, False, check_timing=True)
+                        )
+
+    async def _drive(self, request_type, path, stream, reuse=False, check_timing=False):
+        tm = _make_tm_for_generate(self)
+        tm.enable_metrics = check_timing
+        if check_timing:
+            tm.disaggregation_mode = DisaggregationMode.NULL
+            tm.metrics_collector = Mock(labels={})
+            tm.enable_priority_scheduling = False
+        tm.cuda_vmm_feature_transport = SimpleNamespace(
+            prepare_for_dispatch_async=AsyncMock(return_value=[]),
+            cancel_for_dispatch=Mock(),
+        )
+        tm.positional_embeds_transport = SimpleNamespace(
+            prepare_for_dispatch=Mock(return_value=[]), cancel_for_dispatch=Mock()
+        )
+        tm.batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
+        kwargs = {}
+        if request_type is GenerateReqInput:
+            kwargs = {"stream": stream, "return_prompt_token_ids": True}
+            if path == "parallel":
+                kwargs["sampling_params"] = {"n": 2, "max_new_tokens": 1}
+        obj = request_type(text="prompt" if path == "single" else ["a", "b"], **kwargs)
+
+        def tokenize(req):
+            if reuse:
+                old_gates[req.rid] = asyncio.Event()
+                tm.encoder_dispatch_ready[req.rid] = old_gates[req.rid]
+            tokenized = dict(
+                rid=req.rid,
+                input_text="prompt",
+                input_ids=array("q", [1]),
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=SamplingParams(max_new_tokens=1),
+                time_stats=tm.rid_to_state[req.rid].time_stats,
+            )
+            if request_type is GenerateReqInput:
+                return TokenizedGenerateReqInput(
+                    **tokenized,
+                    input_embeds=None,
+                    return_logprob=False,
+                    logprob_start_len=-1,
+                    top_logprobs_num=0,
+                    token_ids_logprob=None,
+                    stream=stream,
+                )
+            return TokenizedEmbeddingReqInput(**tokenized)
+
+        tm._tokenize_one_request = AsyncMock(side_effect=tokenize)
+        tm._should_use_batch_tokenization = Mock(return_value=path == "batch")
+        tm._batch_tokenize_and_process = AsyncMock(
+            side_effect=lambda size, req: [tokenize(req[i]) for i in range(size)]
+        )
+        completed = []
+        responders = []
+        replacements = []
+        old_gates = {}
+        completed_states = []
+        dispatch_finish_before_enqueue = []
+
+        def dispatch(tokenized):
+            future = asyncio.get_running_loop().create_future()
+            if check_timing:
+                if io_struct._USE_PICKLE_IPC:
+                    tokenized = pickle.loads(pickle.dumps(tokenized))
+                else:
+                    tokenized = io_struct.msgpack_decode(
+                        io_struct.msgpack_encode(tokenized)
+                    )
+            requests = getattr(tokenized, "batch", [tokenized])
+
+            async def respond():
+                if check_timing:
+                    self.assertFalse(future.done())
+                    for req in requests:
+                        req.unwrap_pickle_fields()
+                        state = tm.rid_to_state[req.rid]
+                        self.assertFalse(state.dispatched)
+                        self.assertIsNot(req.time_stats, state.time_stats)
+                        self.assertEqual(
+                            req.time_stats.api_server_dispatch_finish_time, 0.0
+                        )
+                        dispatch_finish_before_enqueue.append(
+                            state.time_stats.api_server_dispatch_finish_time
+                        )
+                # Completing the send schedules its waiter; process the response
+                # before that waiter gets its next event-loop turn.
+                future.set_result(None)
+                for req in requests:
+                    state = tm.rid_to_state[req.rid]
+                    if request_type is GenerateReqInput:
+                        output = _make_batch_str_output(req.rid)
+                    else:
+                        output = BatchEmbeddingOutput(
+                            rids=[req.rid],
+                            finished_reasons=[{"type": "length"}],
+                            embeddings=[[1.0]],
+                            request_stats=[_request_stats(prompt_tokens=1)],
+                            placeholder_tokens_idx=None,
+                            placeholder_tokens_val=None,
+                        )
+                    await tm._handle_batch_output(output)
+                    self.assertNotIn(req.rid, tm.rid_to_state)
+                    completed.append(req.rid)
+                    completed_states.append(state)
+                    if reuse:
+                        replacement = GenerateReqInput(text="new", rid=req.rid)
+                        replacement.normalize_batch_and_arguments()
+                        tm._init_req_state(replacement)
+                        gate = asyncio.Event()
+                        tm.encoder_dispatch_ready[req.rid] = gate
+                        replacements.append(
+                            (tm.rid_to_state[req.rid], gate, old_gates[req.rid])
+                        )
+
+            responders.append(asyncio.create_task(respond()))
+            return future
+
+        tm._dispatch_to_scheduler = Mock(side_effect=dispatch)
+        generator = tm.generate_request(obj)
+        try:
+            outputs = [out async for out in generator]
+            await asyncio.gather(*responders)
+            if not stream and path != "single":
+                outputs = outputs[0]
+            expected = 1 if path == "single" else 4 if path == "parallel" else 2
+            self.assertEqual(len(outputs), expected)
+            self.assertEqual(
+                len(completed), expected + (2 if path == "parallel" else 0)
+            )
+            if check_timing:
+                self.assertEqual(len(dispatch_finish_before_enqueue), expected)
+                self.assertTrue(all(ts > 0 for ts in dispatch_finish_before_enqueue))
+            for out in outputs:
+                self.assertIn(out["meta_info"]["id"], completed)
+                if check_timing:
+                    self.assertGreater(
+                        out["meta_info"]["api_server_dispatch_finish_ts"], 0.0
+                    )
+                    self.assertLessEqual(
+                        out["meta_info"]["api_server_dispatch_finish_ts"],
+                        out["meta_info"]["request_finished_ts"],
+                    )
+                if request_type is GenerateReqInput:
+                    self.assertEqual(out["text"], "hello")
+                    self.assertEqual(out["prompt_token_ids"], [1])
+                else:
+                    self.assertEqual(out["embedding"], [1.0])
+            if reuse:
+                self.assertEqual(len(tm.rid_to_state), expected)
+                for state, gate, old_gate in replacements:
+                    self.assertIs(tm.rid_to_state[state.obj.rid], state)
+                    self.assertFalse(state.dispatched)
+                    self.assertIs(tm.encoder_dispatch_ready[state.obj.rid], gate)
+                    self.assertFalse(gate.is_set())
+                    if path == "single":
+                        self.assertTrue(old_gate.is_set())
+            else:
+                self.assertFalse(tm.rid_to_state)
+            if check_timing:
+                self.assertTrue(all(state.finished for state in completed_states))
+            tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_not_called()
+            tm.positional_embeds_transport.cancel_for_dispatch.assert_not_called()
+        finally:
+            await asyncio.gather(*responders, return_exceptions=True)
+            await generator.aclose()
+
+
+class TestDisconnectDuringPendingSend(CustomTestCase):
+    @unittest.skipUnless(sys.version_info >= (3, 12), "Eager tasks require Python 3.12")
+    def test_immediate_http_send_does_not_yield(self):
+        for failure in (None, RuntimeError, asyncio.CancelledError):
+            with self.subTest(failure=failure):
+
+                async def drive():
+                    tm = _make_tm_for_generate(self)
+                    obj = GenerateReqInput(text="prompt")
+                    request = Mock()
+                    turns = []
+                    asyncio.get_running_loop().call_soon(turns.append, "callback")
+
+                    async def send():
+                        if failure is not None:
+                            raise failure("enqueue failed")
+
+                    if failure is None:
+                        await tm._send_with_disconnect_monitor(send(), obj, request)
+                    else:
+                        with self.assertRaises(failure):
+                            await tm._send_with_disconnect_monitor(send(), obj, request)
+                    self.assertEqual(turns, [])
+                    request.is_disconnected.assert_not_called()
+                    await asyncio.sleep(0)
+                    self.assertEqual(turns, ["callback"])
+
+                asyncio.run(drive())
+
+    def test_completed_future_and_custom_awaitable_are_supported(self):
+        for custom in (False, True):
+            with self.subTest(custom=custom):
+
+                async def drive():
+                    tm = _make_tm_for_generate(self)
+                    future = asyncio.get_running_loop().create_future()
+                    future.set_result(None)
+
+                    class Send:
+                        def __await__(self):
+                            return future.__await__()
+
+                    request = Mock()
+                    await tm._send_with_disconnect_monitor(
+                        Send() if custom else future,
+                        GenerateReqInput(text="prompt"),
+                        request,
+                    )
+                    request.is_disconnected.assert_not_called()
+
+                asyncio.run(drive())
+
+    def test_http_send_preserves_loop_task_factory(self):
+        async def drive():
+            tm = _make_tm_for_generate(self)
+            loop = asyncio.get_running_loop()
+            created = []
+
+            def factory(loop, coro, **kwargs):
+                created.append(coro)
+                return asyncio.Task(coro, loop=loop, **kwargs)
+
+            async def send():
+                pass
+
+            previous = loop.get_task_factory()
+            loop.set_task_factory(factory)
+            try:
+                sending = send()
+                await tm._send_with_disconnect_monitor(
+                    sending, GenerateReqInput(text="prompt"), Mock()
+                )
+                self.assertEqual(created, [sending])
+            finally:
+                loop.set_task_factory(previous)
+
+        asyncio.run(drive())
+
+    def test_http_send_uses_scheduled_fallback_before_python_312(self):
+        async def drive():
+            tm = _make_tm_for_generate(self)
+            turns = []
+            asyncio.get_running_loop().call_soon(turns.append, "callback")
+
+            async def send():
+                self.assertEqual(turns, ["callback"])
+
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.sys.version_info", (3, 11)
+            ):
+                await tm._send_with_disconnect_monitor(
+                    send(), GenerateReqInput(text="prompt"), Mock()
+                )
+
+        asyncio.run(drive())
+
+    def test_completed_sender_failure_during_caller_cancellation_is_retrieved(self):
+        async def drive():
+            tm = _make_tm_for_generate(self)
+            obj = GenerateReqInput(text="prompt")
+            loop = asyncio.get_running_loop()
+            owner = asyncio.current_task()
+            errors = []
+            previous = loop.get_exception_handler()
+            loop.set_exception_handler(lambda _, context: errors.append(context))
+            try:
+
+                async def fail():
+                    raise RuntimeError("enqueue failed")
+
+                send_task = asyncio.create_task(fail())
+                send_task.add_done_callback(lambda _: owner.cancel())
+                with self.assertRaises(asyncio.CancelledError):
+                    await tm._send_with_disconnect_monitor(send_task, obj, Mock())
+                del send_task
+                await asyncio.sleep(0)
+                self.assertEqual(errors, [])
+            finally:
+                loop.set_exception_handler(previous)
+
+        asyncio.run(drive())
+
+    def test_completed_cancelled_sender_preserves_disconnect_error(self):
+        async def drive():
+            tm = _make_tm_for_generate(self)
+            obj = GenerateReqInput(text="prompt")
+            send_task = asyncio.create_task(asyncio.Event().wait())
+
+            async def disconnect():
+                send_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await send_task
+                return True
+
+            request = Mock()
+            request.is_disconnected = AsyncMock(side_effect=disconnect)
+            with patch(
+                "sglang.srt.managers.tokenizer_manager._REQUEST_STATE_WAIT_TIMEOUT",
+                0.001,
+            ):
+                with self.assertRaisesRegex(ValueError, "disconnected"):
+                    await tm._send_with_disconnect_monitor(send_task, obj, request)
+            self.assertTrue(send_task.cancelled())
+            request.is_disconnected.assert_awaited_once()
+
+        asyncio.run(drive())
+
+    def test_disconnect_releases_pending_send_and_reader_lock(self):
+        for batched in (False, True):
+            for pickle_ipc in (False, True):
+                with self.subTest(batched=batched, pickle_ipc=pickle_ipc):
+                    asyncio.run(self._drive(batched, pickle_ipc))
+
+    def test_cancellation_after_enqueue_preserves_queued_resources(self):
+        for pickle_ipc in (False, True):
+            with self.subTest(pickle_ipc=pickle_ipc):
+                asyncio.run(self._drive(False, pickle_ipc, queued=True))
+
+    def test_cancellation_during_disconnect_probe_preserves_queued_resources(self):
+        for batched in (False, True):
+            for pickle_ipc in (False, True):
+                with self.subTest(batched=batched, pickle_ipc=pickle_ipc):
+                    asyncio.run(
+                        self._drive(
+                            batched, pickle_ipc, queued=True, cancel_during_probe=True
+                        )
+                    )
+
+    async def _drive(
+        self, batched, pickle_ipc, queued=False, cancel_during_probe=False
+    ):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        tm.model_update_lock = RWLock()
+        tm.tokenizer_ipc_name = None
+        tm.disaggregation_mode = DisaggregationMode.NULL
+        tm.cuda_vmm_feature_transport = SimpleNamespace(
+            prepare_for_dispatch_async=AsyncMock(return_value=[]),
+            cancel_for_dispatch=Mock(),
+        )
+        tm.positional_embeds_transport = SimpleNamespace(
+            prepare_for_dispatch=Mock(return_value=[]), cancel_for_dispatch=Mock()
+        )
+        tm.batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
+        source = torch.arange(16, dtype=torch.float32)
+        tokenized = []
+
+        def tokenize(req):
+            result = TokenizedGenerateReqInput(
+                rid=req.rid,
+                input_text="prompt",
+                input_ids=array("q", [1]),
+                input_embeds=None,
+                mm_inputs=(
+                    None
+                    if batched
+                    else MultimodalProcessorOutput(
+                        mm_items=[
+                            MultimodalDataItem(
+                                modality=Modality.IMAGE, feature=source, hash=123
+                            )
+                        ]
+                    )
+                ),
+                token_type_ids=None,
+                sampling_params=SamplingParams(max_new_tokens=1),
+                return_logprob=False,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+                lora_id=req.lora_id,
+                time_stats=tm.rid_to_state[req.rid].time_stats,
+            )
+            tokenized.append(result)
+            return result
+
+        tm._tokenize_one_request = AsyncMock(side_effect=tokenize)
+        tm._should_use_batch_tokenization = Mock(return_value=batched)
+        tm._batch_tokenize_and_process = AsyncMock(
+            side_effect=lambda size, req: [tokenize(req[i]) for i in range(size)]
+        )
+        obj = GenerateReqInput(
+            text=["a", "b"] if batched else "prompt", lora_path="adapter"
+        )
+        messages = asyncio.Queue()
+
+        async def receive():
+            if cancel_during_probe and not futures[0].done():
+                # Starlette's self-cancelling scope encloses this receive.
+                # Complete enqueue and cancel the HTTP owner in that scope.
+                futures[0].add_done_callback(lambda _: task.cancel())
+                futures[0].set_result(None)
+            return await messages.get()
+
+        request = Request(
+            {"type": "http", "method": "POST", "path": "/generate", "headers": []},
+            receive=receive,
+        )
+        context = zmq.asyncio.Context()
+        sender = context.socket(zmq.PUSH)
+        peer = context.socket(zmq.PULL)
+        monitor = sender.get_monitor_socket(events=zmq.EVENT_DISCONNECTED)
+        endpoint = f"tcp://127.0.0.1:{sender.bind_to_random_port('tcp://127.0.0.1')}"
+        tm.send_to_scheduler = sender
+        pending = asyncio.Event()
+        futures = []
+        original_dispatch = tm._dispatch_to_scheduler
+
+        def dispatch(packet):
+            future = original_dispatch(packet)
+            if not isinstance(packet, AbortReq):
+                if cancel_during_probe:
+                    # The real packet is queued; expose completion to the sender
+                    # only when the HTTP disconnect probe starts.
+                    self.assertTrue(future.done())
+                    self.assertIsNone(future.exception())
+                    future = asyncio.get_running_loop().create_future()
+                self.assertFalse(future.done())
+                futures.append(future)
+                pending.set()
+            return future
+
+        tm._dispatch_to_scheduler = dispatch
+        generator = tm.generate_request(obj, request)
+        task = None
+        try:
+            peer.connect(endpoint)
+            await asyncio.wait_for(sender.send(b"connected"), 3)
+            self.assertEqual(await asyncio.wait_for(peer.recv(), 3), b"connected")
+            if not cancel_during_probe:
+                peer.close(linger=0)
+                event = await asyncio.wait_for(recv_monitor_message(monitor), 3)
+                self.assertEqual(event["event"], zmq.EVENT_DISCONNECTED)
+
+                async def wait_until_unwritable():
+                    while sender.getsockopt(zmq.EVENTS) & zmq.POLLOUT:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_until_unwritable(), 3)
+            self.assertEqual(sender.getsockopt(zmq.SNDTIMEO), -1)
+            with (
+                patch.object(io_struct, "_USE_PICKLE_IPC", pickle_ipc),
+                patch.object(mm_utils, "_get_is_default_transport", return_value=False),
+                patch.object(
+                    mm_utils,
+                    "get_serving",
+                    return_value=SimpleNamespace(skip_tokenizer_init=False),
+                ),
+                patch(
+                    "sglang.srt.managers.tokenizer_manager._REQUEST_STATE_WAIT_TIMEOUT",
+                    0.01,
+                ),
+            ):
+                task = asyncio.create_task(anext(generator))
+                await asyncio.wait_for(pending.wait(), 3)
+                self.assertEqual(tm.model_update_lock._readers, 1)
+                self.assertFalse(futures[0].done())
+                if queued:
+                    if not cancel_during_probe:
+                        futures[0].add_done_callback(lambda _: task.cancel())
+                        peer = context.socket(zmq.PULL)
+                        peer.connect(endpoint)
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, 3)
+                    self.assertGreater(task.cancelling(), 0)
+                    packet = await asyncio.wait_for(io_struct.async_sock_recv(peer), 3)
+                    for received in packet.batch if batched else [packet]:
+                        if received.mm_inputs is not None:
+                            mm_utils.unwrap_shm_features(received)
+                            self.assertTrue(
+                                torch.equal(
+                                    received.mm_inputs.mm_items[0].feature, source
+                                )
+                            )
+                            self.assertEqual(received.mm_inputs.mm_items[0].hash, 123)
+                        state = tm.rid_to_state[received.rid]
+                        self.assertTrue(state.dispatched)
+                        self.assertTrue(state.abort_sent)
+                        await tm._handle_batch_output(
+                            _make_batch_str_output(received.rid)
+                        )
+                    tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_not_called()
+                    tm.positional_embeds_transport.cancel_for_dispatch.assert_not_called()
+                    if cancel_during_probe:
+                        expected_rids = (
+                            {received.rid for received in packet.batch}
+                            if batched
+                            else {packet.rid}
+                        )
+                        aborted_rids = set()
+                        for _ in expected_rids:
+                            abort = await asyncio.wait_for(
+                                io_struct.async_sock_recv(peer), 3
+                            )
+                            self.assertIsInstance(abort, AbortReq)
+                            aborted_rids.add(abort.rid)
+                        self.assertEqual(aborted_rids, expected_rids)
+                else:
+                    messages.put_nowait({"type": "http.disconnect"})
+                    with self.assertRaisesRegex(ValueError, "disconnected"):
+                        await asyncio.wait_for(task, 0.5)
+                    self.assertTrue(futures[0].cancelled())
+                    self.assertFalse(tm.rid_to_state)
+                    tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once()
+                    tm.positional_embeds_transport.cancel_for_dispatch.assert_called_once()
+                    peer = context.socket(zmq.PULL)
+                    peer.connect(endpoint)
+                    await asyncio.wait_for(sender.send(b"marker"), 3)
+                    self.assertEqual(await asyncio.wait_for(peer.recv(), 3), b"marker")
+                self.assertEqual(tm.model_update_lock._readers, 0)
+                async with tm.model_update_lock.writer_lock:
+                    pass
+                await asyncio.gather(*tm._lora_release_tasks)
+                self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await generator.aclose()
+            for item in tokenized:
+                mm_utils.discard_shm_features(item)
+            sender.close(linger=0)
+            peer.close(linger=0)
+            monitor.close(linger=0)
+            context.destroy(linger=0)
+
+
 class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
     """Cancellation after dispatch must stop the scheduler request."""
 
     @patch(
         "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
-        side_effect=lambda obj: obj,
+        side_effect=lambda obj, **kwargs: obj,
     )
     def test_cancel_after_dispatch_sends_abort_and_keeps_state(self, _wrap_shm):
         tm = _make_tm_for_generate(self)
@@ -1549,11 +2141,26 @@ class TestAbortBeforeDispatch(CustomTestCase):
 
     @staticmethod
     def _mm_inputs():
-        item = SimpleNamespace(
-            feature=Mock(spec=CudaIpcTensorTransportProxy),
-            precomputed_embeddings=Mock(spec=CudaIpcTensorTransportProxy),
+        proxies = [
+            CudaIpcTensorTransportProxy(
+                data=torch.zeros(64, dtype=torch.uint8),
+                info_data=torch.zeros(16),
+                pool_ipc_handle=("test-pool",),
+                pool_byte_offset=256 * (index + 1),
+                ready_byte_offset=12 * index,
+                ack_byte_offset=12 * index + 4,
+                generation=1,
+                total_consumer_count=2,
+                use_pool_handle_cache=True,
+            )
+            for index in range(2)
+        ]
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=proxies[0],
+            precomputed_embeddings=proxies[1],
         )
-        return SimpleNamespace(mm_items=[item])
+        return MultimodalProcessorOutput(mm_items=[item])
 
     def _assert_cuda_ipc_cancelled(self, tm, mm_inputs):
         item = mm_inputs.mm_items[0]
@@ -1569,7 +2176,7 @@ class TestAbortBeforeDispatch(CustomTestCase):
 
     @patch(
         "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
-        side_effect=lambda obj: obj,
+        side_effect=lambda obj, **kwargs: obj,
     )
     def test_abort_during_preprocessing_is_not_dispatched(self, _wrap_shm):
         # Feature publication is the last await before dispatch.
@@ -1617,7 +2224,7 @@ class TestAbortBeforeDispatch(CustomTestCase):
 
     @patch(
         "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
-        side_effect=lambda obj: obj,
+        side_effect=lambda obj, **kwargs: obj,
     )
     def test_abort_all_skips_preprocessing_requests_but_not_paused_ones(
         self, _wrap_shm
@@ -1719,6 +2326,74 @@ class TestAbortBeforeDispatch(CustomTestCase):
         self.assertEqual(len(sent), 2)
         self.assertEqual(list(sent[1].batch), [tokenized_objs[0]])
         self.assertTrue(tm.rid_to_state[kept].dispatched)
+
+    def test_public_batch_finishes_request_aborted_during_publication(self):
+        async def drive():
+            tm = self._make_tm(self)
+            tm.disaggregation_mode = DisaggregationMode.NULL
+            tm.batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
+            obj = GenerateReqInput(text=["kept", "aborted"], stream=True)
+
+            def tokenize(req):
+                return TokenizedGenerateReqInput(
+                    rid=req.rid,
+                    input_text=req.text,
+                    input_ids=array("q", [1]),
+                    input_embeds=None,
+                    mm_inputs=None,
+                    token_type_ids=None,
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                    return_logprob=False,
+                    logprob_start_len=-1,
+                    top_logprobs_num=0,
+                    token_ids_logprob=None,
+                    stream=True,
+                    time_stats=tm.rid_to_state[req.rid].time_stats,
+                )
+
+            tm._should_use_batch_tokenization = Mock(return_value=True)
+            tm._batch_tokenize_and_process = AsyncMock(
+                side_effect=lambda size, req: [tokenize(req[i]) for i in range(size)]
+            )
+
+            async def publish(_mm_inputs):
+                tm.abort_request(obj.rid[1])
+                return []
+
+            tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = publish
+            responders = []
+
+            def dispatch(packet):
+                if isinstance(packet, BatchTokenizedGenerateReqInput):
+                    self.assertEqual([r.rid for r in packet.batch], [obj.rid[0]])
+                    responders.append(
+                        asyncio.create_task(
+                            tm._handle_batch_output(_make_batch_str_output(obj.rid[0]))
+                        )
+                    )
+
+            tm._dispatch_to_scheduler = Mock(side_effect=dispatch)
+            generator = tm.generate_request(obj)
+            try:
+
+                async def consume():
+                    return [out async for out in generator]
+
+                outputs = await asyncio.wait_for(consume(), 2)
+                await asyncio.gather(*responders)
+                self.assertEqual(
+                    {out["meta_info"]["id"] for out in outputs}, set(obj.rid)
+                )
+                aborted = next(
+                    out for out in outputs if out["meta_info"]["id"] == obj.rid[1]
+                )
+                self.assertEqual(aborted["meta_info"]["finish_reason"]["type"], "abort")
+                self.assertFalse(tm.rid_to_state)
+            finally:
+                await generator.aclose()
+                await asyncio.gather(*responders, return_exceptions=True)
+
+        asyncio.run(drive())
 
 
 class TestLoRARequestLifecycle(CustomTestCase):
@@ -1845,6 +2520,239 @@ class TestLoRARequestLifecycle(CustomTestCase):
     def test_second_parallel_warmup_failure_releases_all_references(self):
         """A failed warmup must return references even after earlier warmups finish."""
         asyncio.run(self._drive_parallel_request(fail_second_warmup=True))
+
+    async def _drive_parallel_lora_failure(self, mode, pickle_ipc, fail_at=1):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        tm.disaggregation_mode = DisaggregationMode.NULL
+        tm.model_update_lock = RWLock()
+        tm.tokenizer_ipc_name = None
+        tm.canary_info_hook = None
+        tm.mm_processor = None
+        tm.cuda_vmm_feature_transport = SimpleNamespace(
+            prepare_for_dispatch_async=AsyncMock(return_value=[]),
+            cancel_for_dispatch=Mock(),
+        )
+        tm.positional_embeds_transport = SimpleNamespace(
+            prepare_for_dispatch=Mock(return_value=[]),
+            cancel_for_dispatch=Mock(),
+        )
+        obj = GenerateReqInput(
+            text=["prompt"],
+            lora_path="adapter",
+            sampling_params={"n": 3, "max_new_tokens": 1},
+        )
+        initial_rids = set()
+        samples = []
+        futures = []
+        responders = []
+        pending = asyncio.Event()
+        messages = asyncio.Queue()
+
+        def references():
+            return tm.lora_registry._counters["adapter"].value()
+
+        def tokenize(req):
+            initial_rids.update(tm.rid_to_state)
+            self.assertEqual(len(initial_rids), 3)
+            self.assertEqual(references(), 3)
+            return TokenizedGenerateReqInput(
+                rid=req.rid,
+                input_text=req.text,
+                input_ids=array("q", [1]),
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=SamplingParams(max_new_tokens=1),
+                return_logprob=False,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+                lora_id=req.lora_id,
+                time_stats=tm.rid_to_state[req.rid].time_stats,
+            )
+
+        tm._tokenize_one_request = AsyncMock(side_effect=tokenize)
+        create_state = tm._init_req_state
+        child_count = 0
+
+        def create(req, request=None):
+            nonlocal child_count
+            if isinstance(req.rid, str) and req.lora_path:
+                child_count += 1
+                if mode == "create_failure" and child_count == fail_at:
+                    self.assertTrue(initial_rids.issubset(tm.rid_to_state))
+                    children = set(tm.rid_to_state) - initial_rids
+                    self.assertEqual(len(children), fail_at - 1)
+                    self.assertTrue(
+                        all(tm.rid_to_state[rid].lora_released for rid in children)
+                    )
+                    self.assertEqual(references(), 3)
+                    self.assertFalse(samples)
+                    raise RuntimeError("sample state creation failed")
+            return create_state(req, request)
+
+        tm._init_req_state = create
+
+        def dispatch(packet):
+            future = asyncio.get_running_loop().create_future()
+            futures.append(future)
+            if isinstance(packet, AbortReq):
+                tm._handle_abort_req(packet)
+            else:
+                packet.unwrap_pickle_fields()
+                self.assertEqual(packet.lora_id, "adapter")
+                if packet.sampling_params.max_new_tokens == 0:
+                    responders.append(
+                        asyncio.create_task(
+                            tm._handle_batch_output(_make_batch_str_output(packet.rid))
+                        )
+                    )
+                else:
+                    samples.append(packet)
+                    if mode == "send_failure" and len(samples) == fail_at:
+                        future.cancel()
+                        raise RuntimeError("sample enqueue failed")
+                    if mode in ("cancel", "cancel_immediate") and len(samples) == 1:
+                        asyncio.get_running_loop().call_soon(task.cancel)
+                        if mode == "cancel":
+                            return future
+                    if mode == "disconnect" and len(samples) == 1:
+                        messages.put_nowait({"type": "http.disconnect"})
+                        pending.set()
+                        return future
+                    if mode == "finished_first":
+                        if len(samples) == 1:
+                            responders.append(
+                                asyncio.create_task(
+                                    tm._handle_batch_output(
+                                        _make_batch_str_output(packet.rid)
+                                    )
+                                )
+                            )
+                        elif len(samples) == 2:
+                            pending.set()
+                            return future
+            future.set_result(None)
+            return future
+
+        tm.send_to_scheduler = SimpleNamespace(
+            send_pyobj=lambda packet, flags, protocol: dispatch(
+                pickle.loads(pickle.dumps(packet, protocol=protocol))
+            ),
+            send=lambda data, flags: dispatch(io_struct.msgpack_decode(data)),
+        )
+        request = Request(
+            {"type": "http", "method": "POST", "path": "/generate", "headers": []},
+            receive=messages.get,
+        )
+        generator = tm.generate_request(obj, request)
+        task = None
+        try:
+            with (
+                patch.object(io_struct, "_USE_PICKLE_IPC", pickle_ipc),
+                patch(
+                    "sglang.srt.managers.tokenizer_manager._REQUEST_STATE_WAIT_TIMEOUT",
+                    0.01,
+                ),
+            ):
+                task = asyncio.create_task(anext(generator))
+                if mode == "finished_first":
+                    await asyncio.wait_for(pending.wait(), 3)
+                    await asyncio.gather(*responders)
+                    await asyncio.gather(*tm._lora_release_tasks)
+                    self.assertNotIn(samples[0].rid, tm.rid_to_state)
+                    self.assertEqual(references(), 2)
+                    self.assertEqual(len(tm.rid_to_state), 2)
+                    self.assertTrue(
+                        all(not state.dispatched for state in tm.rid_to_state.values())
+                    )
+                    task.cancel()
+                exception = {
+                    "cancel": asyncio.CancelledError,
+                    "cancel_immediate": asyncio.CancelledError,
+                    "finished_first": asyncio.CancelledError,
+                    "disconnect": ValueError,
+                    "send_failure": RuntimeError,
+                    "create_failure": RuntimeError,
+                }[mode]
+                with self.assertRaises(exception):
+                    await asyncio.wait_for(task, 3)
+                await asyncio.gather(*responders)
+                await asyncio.gather(*tm._lora_release_tasks)
+                self.assertEqual(references(), 0)
+                self.assertFalse(tm.rid_to_state)
+                self.assertEqual(tm.model_update_lock._readers, 0)
+                expected_samples = {
+                    "cancel": 1,
+                    "cancel_immediate": None,
+                    "disconnect": 1,
+                    "send_failure": fail_at,
+                    "create_failure": 0,
+                    "finished_first": 2,
+                }[mode]
+                if expected_samples is None:
+                    self.assertIn(len(samples), (1, 2, 3))
+                else:
+                    self.assertEqual(len(samples), expected_samples)
+                self.assertTrue(all(future.done() for future in futures))
+                if mode == "cancel":
+                    self.assertTrue(futures[1].cancelled())
+                elif mode == "cancel_immediate":
+                    self.assertFalse(futures[1].cancelled())
+        finally:
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await generator.aclose()
+            await asyncio.gather(*responders, return_exceptions=True)
+            await asyncio.gather(*tm._lora_release_tasks, return_exceptions=True)
+            for future in futures:
+                future.cancel()
+
+    def test_parallel_http_cancel_releases_unsent_sample_references(self):
+        for pickle_ipc in (False, True):
+            with self.subTest(pickle_ipc=pickle_ipc):
+                asyncio.run(self._drive_parallel_lora_failure("cancel", pickle_ipc))
+
+    def test_parallel_http_disconnect_releases_unsent_sample_references(self):
+        for pickle_ipc in (False, True):
+            with self.subTest(pickle_ipc=pickle_ipc):
+                asyncio.run(self._drive_parallel_lora_failure("disconnect", pickle_ipc))
+
+    def test_parallel_http_cancel_after_immediate_enqueue_releases_references(self):
+        for pickle_ipc in (False, True):
+            with self.subTest(pickle_ipc=pickle_ipc):
+                asyncio.run(
+                    self._drive_parallel_lora_failure("cancel_immediate", pickle_ipc)
+                )
+
+    def test_parallel_enqueue_failure_releases_all_sample_references(self):
+        for pickle_ipc in (False, True):
+            for fail_at in (1, 2):
+                with self.subTest(pickle_ipc=pickle_ipc, fail_at=fail_at):
+                    asyncio.run(
+                        self._drive_parallel_lora_failure(
+                            "send_failure", pickle_ipc, fail_at
+                        )
+                    )
+
+    def test_parallel_state_creation_failure_keeps_initial_owners(self):
+        for pickle_ipc in (False, True):
+            for fail_at in (2, 3):
+                with self.subTest(pickle_ipc=pickle_ipc, fail_at=fail_at):
+                    asyncio.run(
+                        self._drive_parallel_lora_failure(
+                            "create_failure", pickle_ipc, fail_at
+                        )
+                    )
+
+    def test_parallel_terminal_sample_preserves_unsent_sample_references(self):
+        for pickle_ipc in (False, True):
+            with self.subTest(pickle_ipc=pickle_ipc):
+                asyncio.run(
+                    self._drive_parallel_lora_failure("finished_first", pickle_ipc)
+                )
 
 
 class TestPriorityRange(CustomTestCase):
@@ -2268,8 +3176,8 @@ class TestReadsInputIdsLate(CustomTestCase):
                 tm._tokenize_one_request = AsyncMock(return_value=tokenized)
                 tm._send_one_request = AsyncMock()
 
-                async def wait_one_response(obj, request):
-                    state = tm.rid_to_state[obj.rid]
+                async def wait_one_response(obj, request, *, state):
+                    self.assertIs(state, tm.rid_to_state[obj.rid])
                     yield {
                         "input_ids": obj.input_ids,
                         "released": state.prompt_released,
