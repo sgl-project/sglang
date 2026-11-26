@@ -92,3 +92,9 @@ def test_rope_parameters_precedence_and_round_trip(tmp_path):
     reloaded = MiniCPM5Config.from_pretrained(tmp_path)
 
     assert get_rope_config(reloaded) == (30000, explicit)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

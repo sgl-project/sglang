@@ -199,3 +199,9 @@ def test_attention_applies_the_gate_from_each_query_head():
         torch.tensor([[1.0, 2.0, 3.0, 4.0]])
         * torch.sigmoid(torch.tensor([[0.0, 0.0, 1.0, 1.0]])),
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
