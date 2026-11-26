@@ -1,7 +1,7 @@
 """DeepSeek-V4.1 decoder-replay tail: the state hand-off of its prefill-graph break,
-who gets the tail (CUDA always, ROCm breakable prefill graphs on opt-in), the break's
-shape threshold, the KV store's row cut inside a tail graph, and the HIP metadata flag
-that marks a graph captured with the tail."""
+who gets the tail (CUDA always, ROCm breakable prefill graphs unless the switch is
+off), the break's shape threshold, the KV store's row cut inside a tail graph, and the
+HIP metadata flag that marks a graph captured with the tail."""
 
 import unittest
 from contextlib import ExitStack
@@ -108,7 +108,7 @@ class TestMaybeCreate(CustomTestCase):
         *,
         cuda,
         breakable=True,
-        hip_opt_in=False,
+        hip_opt_in=None,
         borrow=False,
         max_rows=2048,
         model=None,
@@ -123,9 +123,10 @@ class TestMaybeCreate(CustomTestCase):
                     replay_tail, "check_cuda_graph_backend", return_value=breakable
                 )
             )
-            stack.enter_context(
-                envs.SGLANG_OPT_HIP_PREFILL_GRAPH_EXACT_TAIL.override(hip_opt_in)
-            )
+            if hip_opt_in is not None:
+                stack.enter_context(
+                    envs.SGLANG_OPT_HIP_PREFILL_GRAPH_EXACT_TAIL.override(hip_opt_in)
+                )
             stack.enter_context(envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(borrow))
             stack.enter_context(
                 envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.override(max_rows)
@@ -133,10 +134,16 @@ class TestMaybeCreate(CustomTestCase):
             tail = DecoderReplayTail.maybe_create(model or _model())
         return tail, graph_backend
 
-    def test_hip_opt_in_is_off_by_default(self):
-        self.assertIs(envs.SGLANG_OPT_HIP_PREFILL_GRAPH_EXACT_TAIL.default, False)
+    def test_hip_exact_tail_is_on_by_default(self):
+        self.assertIs(envs.SGLANG_OPT_HIP_PREFILL_GRAPH_EXACT_TAIL.default, True)
+        tail, _ = self._create(cuda=False)
+        self.assertIsInstance(tail, DecoderReplayTail)
 
-    def test_hip_needs_the_opt_in_and_a_breakable_prefill_graph(self):
+    def test_hip_default_needs_a_breakable_prefill_graph(self):
+        tail, _ = self._create(cuda=False, breakable=False)
+        self.assertIsNone(tail)
+
+    def test_hip_needs_the_switch_and_a_breakable_prefill_graph(self):
         for hip_opt_in, breakable in ((False, True), (True, False), (False, False)):
             with self.subTest(hip_opt_in=hip_opt_in, breakable=breakable):
                 tail, _ = self._create(

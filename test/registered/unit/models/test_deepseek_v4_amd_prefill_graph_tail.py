@@ -228,7 +228,7 @@ class TestHipPrefillGraphTail(CustomTestCase):
         self.assertEqual(result, "shared")
         shared.assert_called_once_with(backend, batch)
 
-    def test_off_by_default_leaves_the_shared_gate(self):
+    def test_switch_off_leaves_the_shared_gate(self):
         backend = self._backend()
         backend.enable_hip_prefill_graph_tail = False
         result, shared, batch = self._can_run(backend, attn_dp_size=2)
