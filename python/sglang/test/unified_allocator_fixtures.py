@@ -178,7 +178,7 @@ def build_tri_pool(
         mamba2_cache_params=config,
         max_mamba_cache_size=8,
         model_context_len=256 * page_size,
-        extra_max_context_len=1,
+        req_to_token_headroom=1,
         max_num_reqs=4,
         enable_mamba_extra_buffer=False,
         enable_mamba_extra_buffer_lazy=False,
@@ -661,7 +661,7 @@ def build_test_unified_pools(
     total_bytes=None,
     unified_total_bytes=None,
     model_context_len=None,
-    extra_max_context_len=0,
+    req_to_token_headroom=0,
     max_num_reqs=1,
     enable_memory_saver=False,
     post_capture_active=False,
@@ -739,7 +739,7 @@ def build_test_unified_pools(
         head_dim=head_dim,
         max_num_reqs=max_num_reqs,
         model_context_len=model_context_len or 0,
-        extra_max_context_len=extra_max_context_len,
+        req_to_token_headroom=req_to_token_headroom,
         state_cache_params=mamba2_cache_params,
         enable_mamba_extra_buffer=enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
@@ -818,7 +818,7 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         head_dim=g.head_dim,
         max_num_reqs=g.max_num_reqs,
         model_context_len=g.context_len,
-        extra_max_context_len=1,
+        req_to_token_headroom=1,
         state_cache_params=cache_params,
         disable_overlap_schedule=True,
     )
@@ -833,7 +833,7 @@ def build_unified_bundle(geometry: UnifiedGeometry):
     )
 
 
-def build_mamba_pool(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
+def build_mamba_pool(*, page_size=1, lazy=True, mla=False, ratio=(1, 1), state_slots=8):
     """Full + state composite over real CPU pools; returns the pool bundle and
     its allocator."""
     full_layers, state_layers = ratio
@@ -847,14 +847,17 @@ def build_mamba_pool(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
             full_tokens=100 * page_size,
             context_len=256 * page_size,
             lazy=lazy,
+            state_slots=state_slots,
         )
     )
     return bundle, bundle.token_to_kv_pool_allocator
 
 
-def build_mamba_cache(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
+def build_mamba_cache(
+    *, page_size=1, lazy=True, mla=False, ratio=(1, 1), state_slots=8
+):
     bundle, allocator = build_mamba_pool(
-        page_size=page_size, lazy=lazy, mla=mla, ratio=ratio
+        page_size=page_size, lazy=lazy, mla=mla, ratio=ratio, state_slots=state_slots
     )
     cache = UnifiedRadixCache(
         CacheInitParams(

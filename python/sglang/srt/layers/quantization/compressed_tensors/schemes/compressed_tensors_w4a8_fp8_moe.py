@@ -84,14 +84,17 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         input_quant,
     ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
-        self.num_bits = config.num_bits
-        self.packed_factor = 32 // config.num_bits
-        self.group_size = config.group_size
+        self.num_bits = weight_quant.num_bits
+        self.packed_factor = 32 // self.num_bits
+        self.group_size = weight_quant.group_size
+        if self.group_size != 128:
+            raise ValueError(
+                f"CUTLASS W4AFP8 MoE requires group_size=128, got {self.group_size}"
+            )
         self.weight_quant = weight_quant
         self.input_quant = input_quant
 
-        assert config.symmetric, "Only symmetric quantization is supported"
+        assert weight_quant.symmetric, "Only symmetric quantization is supported"
         assert (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
         ), (

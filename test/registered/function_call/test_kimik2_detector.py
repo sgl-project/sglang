@@ -12,7 +12,7 @@ from sglang.srt.parser.reasoning_parser import KimiK2Detector as KimiK2Reasoning
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(5, "base-a-test-cpu")
-register_cpu_ci(est_time=4, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=4, suite="extra-test-cpu-intel")
 
 
 def _make_tool(name, parameters=None):
@@ -897,10 +897,8 @@ class TestKimiK2EndToEnd(unittest.TestCase):
         """
         tc_det = KimiK2FuncDetector()
 
-        # ``weird@id`` matches the broad ``[^\\s<|]+`` capture in
-        # ``stream_tool_call_portion_regex`` but fails both the standard
-        # ``name:idx`` form and the bare-counter form, so
-        # ``_parse_tool_call_id`` returns ``(None, 0)``.
+        # ``weird@id`` fails both the standard ``name:idx`` form and the
+        # bare-counter form, so ``_parse_tool_call_id`` returns ``(None, 0)``.
         chunks = [
             "normal text before",
             "<|tool_calls_section_begin|>"

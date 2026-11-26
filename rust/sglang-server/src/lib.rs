@@ -18,25 +18,32 @@ mod tokenizer_manager;
 mod utils;
 
 pub use api_server::core::GenerateValidator;
-pub use api_server::core::{ExtensionCounter, ExtensionHistogram};
+pub use api_server::core::{AbortHook, ExtensionCounter, ExtensionHistogram};
 pub use api_server::handlers::{AbortEnding, Aborted};
 pub use api_server::http::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
     GenerateTerminal,
 };
 pub use api_server::http::pre_generate::abortable_before_generate;
+/// What a model package's tests serve its extensions from.
 #[cfg(feature = "test-support")]
-pub use api_server::http::pre_generate::test_support;
+pub mod test_support {
+    pub use crate::api_server::http::pre_generate::test_support::*;
+    pub use crate::utils::runtime::test_support::*;
+}
+pub use message::buffers::ExternalBuffer;
 pub use message::config::{
-    DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
-    ModelConfig, RequestLogConfig, RustServerServerArgs, ServerArgs,
+    DefaultSamplingParams, DisaggregationMode, Http2Config, MetricsConfig, MmFamily, MmResample,
+    MmSpec, ModelConfig, RequestLogConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
-pub use message::request::{GenerateRequest, MediaAdmission, MmData, ProcessorFetch};
+pub use message::request::{
+    DispatchFinishTime, GenerateRequest, MediaAdmission, MmData, ProcessorFetch,
+};
 pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
-    MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
+    MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds, feature_digest,
 };
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
 pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor, MmRequestInfo};
@@ -60,13 +67,14 @@ use crate::utils::{logging, runtime, shm::ShmSegment};
 /// msgpack sidecar) that `RustMmProcessor.wrap_encoded` or an external
 /// package's wrapper consumes. An inline buffer is a numpy array, shaped, that
 /// **owns** the Rust vector (no copy); a shm buffer is a [`ShmBuffer`] naming
-/// the segment to map. `frozen`: immutable snapshot, so field access never
-/// contends on a borrow.
+/// the segment to map; an external buffer is the object its processor's
+/// [`ExternalBuffer`] built. `frozen`: immutable snapshot, so field access
+/// never contends on a borrow.
 #[pyclass(frozen, get_all)]
 pub struct IngressRequest {
     header: Py<PyBytes>,
-    /// `(name, numpy array | ShmBuffer)` in producer order; empty for control
-    /// requests.
+    /// `(name, numpy array | ShmBuffer | external buffer)` in producer order;
+    /// empty for control requests.
     buffers: Vec<(String, Py<PyAny>)>,
 }
 
@@ -127,7 +135,8 @@ impl ShmBuffer {
 }
 
 /// Hand one buffer across: the inline vector becomes a numpy array owning it,
-/// viewed with the buffer's shape; the shm segment becomes its name.
+/// viewed with the buffer's shape; the shm segment becomes its name; an
+/// external buffer becomes the object its processor builds.
 fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(String, Py<PyAny>)> {
     use message::buffers::{BufferData, BufferStore};
     use numpy::{IntoPyArray, PyArrayMethods};
@@ -158,6 +167,7 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
         BufferStore::Shm { segment, dtype } => {
             Py::new(py, ShmBuffer::new(segment, dtype.numpy(), shape))?.into_any()
         }
+        BufferStore::External(external) => external.into_py(py)?,
     };
     Ok((buffer.name, value))
 }
@@ -216,6 +226,7 @@ impl Server {
             from_scheduler_cap,
             stage_channel_cap,
             cores,
+            None,
             None,
             None,
             None,
@@ -337,6 +348,12 @@ impl Server {
         self.rt.begin_drain(force);
     }
 
+    /// Python's `--warmups` finished: health may answer 200 once startup
+    /// warmup has too. Only meaningful with `ServerArgs.custom_warmups_pending`.
+    pub fn finish_custom_warmups(&self) {
+        self.rt.finish_custom_warmups();
+    }
+
     /// Whether a drain has begun and every listener has closed since, its
     /// end released if held (see [`Server::hold_drain_end`]): the scheduler
     /// may stop.
@@ -390,9 +407,10 @@ impl Server {
             .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
     }
 
-    /// Signal all threads to stop (best effort).
-    pub fn shutdown(&self) {
-        self.rt.request_shutdown();
+    /// Signal all threads to stop (best effort). Joining them and writing out
+    /// the request log can take a while, so other Python threads keep running.
+    pub fn shutdown(&self, py: Python<'_>) {
+        py.detach(|| self.rt.request_shutdown());
     }
 }
 
@@ -401,10 +419,12 @@ impl Server {
     /// package's own server class: `http_layer` wraps the HTTP app (see
     /// [`HttpLayer`]), `generate_hook` adds the package's keys to native
     /// `/generate` frames (see [`GenerateHook`]), `generate_validator`
-    /// refuses generations from every ingress (see [`GenerateValidator`]), and
-    /// `server_info_state_keys` names the package scheduler's own
-    /// `internal_state` fields, which `/server_info` reports as the scheduler
-    /// set them; a name it already reports, or one given twice, fails the start.
+    /// refuses generations from every ingress (see [`GenerateValidator`]),
+    /// `abort_hook` is told of every abort that names live requests (see
+    /// [`AbortHook`]), and `server_info_state_keys` names the package
+    /// scheduler's own `internal_state` fields, which `/server_info` reports
+    /// as the scheduler set them; a name it already reports, or one given
+    /// twice, fails the start.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_extensions(
         server_args: ServerArgs,
@@ -416,6 +436,7 @@ impl Server {
         http_layer: Option<HttpLayer>,
         generate_hook: Option<Arc<dyn GenerateHook>>,
         generate_validator: Option<Arc<dyn GenerateValidator>>,
+        abort_hook: Option<Arc<dyn AbortHook>>,
         server_info_state_keys: Vec<String>,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
@@ -446,6 +467,7 @@ impl Server {
             server_args: std::sync::Arc::new(server_args),
             generate_hook,
             generate_validator,
+            abort_hook,
             server_info_state_keys,
         };
         let rt =
@@ -489,6 +511,7 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DefaultSamplingParams>()?;
     m.add_class::<ModelConfig>()?;
     m.add_class::<MetricsConfig>()?;
+    m.add_class::<Http2Config>()?;
     m.add_class::<RequestLogConfig>()?;
     m.add_class::<ServerArgs>()?;
     m.add_class::<MmFamily>()?;
