@@ -49,15 +49,14 @@ class FusedSparseKVCacheManager:
         self.req_to_token_pool = req_to_token_pool
         self.sparse_topk = sparse_topk
         self.device = req_to_token_pool.device
-        self.paged_kv_cache = paged_kv_cache
         self.start_layer = paged_kv_cache.start_layer
         # MLA params
         self.head_num = MLA_KV_HEAD_NUM
         self.page_size = paged_kv_cache.page_size
-        self.kv_lora_rank = self.paged_kv_cache.kv_lora_rank
-        self.qk_rope_head_dim = self.paged_kv_cache.qk_rope_head_dim
-        self.store_dtype = self.paged_kv_cache.store_dtype
-        self.layer_num = self.paged_kv_cache.layer_num
+        self.kv_lora_rank = paged_kv_cache.kv_lora_rank
+        self.qk_rope_head_dim = paged_kv_cache.qk_rope_head_dim
+        self.store_dtype = paged_kv_cache.store_dtype
+        self.layer_num = paged_kv_cache.layer_num
         self.budget = paged_kv_cache.sparse_kv_budget_plan
         self.size = self.budget.request_rows
         self.max_context_len = self.budget.context_len
