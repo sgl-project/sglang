@@ -529,10 +529,10 @@ export const config = {
     "gb300|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     "b200|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     "gb200|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
-    a3:     "quay.io/ascend/sglang:main-cann9.1.0-a3",
+    a3:     "quay.io/ascend/sglang:main-cann9.2.0-a3",
     // 950PR/DT Series uses the Docker Hub daily build (the quay.io A2/A3 line
     // carries no 950PR/DT tag).
-    a5:     "lmsysorg/sglang:main-cann9.1.0-950",
+    a5:     "lmsysorg/sglang:main-cann9.2.0-950",
   },
   // Pre-selects the issue template's `model` field on "Submit verified cell".
   github: {
