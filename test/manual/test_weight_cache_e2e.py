@@ -20,7 +20,11 @@ import socket
 import sys
 import time
 
-from sglang.srt.weight_cache.protocol import CacheConfig, recv_msg, send_msg
+from sglang.srt.weight_cache.protocol import (
+    cache_config_mismatches,
+    recv_msg,
+    send_msg,
+)
 
 
 def find_free_port():
@@ -115,17 +119,16 @@ def run_single_daemon(
                 try:
                     req = recv_msg(conn)
                     if req.get("type") == "query_config":
-                        send_msg(
-                            conn, {"status": "ok", "config": daemon.config.to_dict()}
-                        )
+                        send_msg(conn, {"status": "ok", "config": daemon.config})
                     elif req.get("type") == "fetch_state":
-                        engine_config = CacheConfig.from_dict(req["config"])
-                        if daemon.config.matches(engine_config):
+                        if not cache_config_mismatches(
+                            daemon.config, req.get("config")
+                        ):
                             send_msg(
                                 conn,
                                 {
                                     "status": "ok",
-                                    "config": daemon.config.to_dict(),
+                                    "config": daemon.config,
                                     "entries": daemon.state_entries,
                                 },
                             )
@@ -134,7 +137,7 @@ def run_single_daemon(
                                 conn,
                                 {
                                     "status": "mismatch",
-                                    "daemon_config": daemon.config.to_dict(),
+                                    "daemon_config": daemon.config,
                                 },
                             )
                     elif req.get("type") == "ping":
@@ -292,11 +295,12 @@ def main():
     result = recv_msg(s)
     s.close()
     daemon_config = result.get("config", {})
+    model, spec = daemon_config["model"], daemon_config["spec"]
     print(
-        f"\nDaemon (0,0) config: model={daemon_config.get('model_path')}, "
-        f"arch={daemon_config.get('model_arch')}, "
-        f"tp_size={daemon_config.get('tp_size')}, "
-        f"dtype={daemon_config.get('dtype')}"
+        f"\nDaemon (0,0) config: model={model['checkpoint_id']}, "
+        f"arch={model['model_arch']}, "
+        f"tp_size={spec['tp_size']}, "
+        f"dtype={model['dtype']}"
     )
 
     # Fetch state from daemon (pp_rank=0, tp_rank=0)
@@ -341,8 +345,10 @@ def main():
         sys.exit(1)
 
     # Test config mismatch
-    mismatch_config = dict(daemon_config)
-    mismatch_config["tp_size"] = daemon_config.get("tp_size", 1) + 1
+    mismatch_config = {
+        **daemon_config,
+        "spec": {**spec, "tp_size": spec["tp_size"] + 1},
+    }
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(10)
     s.connect(socket_path_0)

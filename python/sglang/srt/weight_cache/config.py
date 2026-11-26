@@ -1,34 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build snapshot lookup keys from the resolved model and runtime configuration."""
+"""Build WeightCacheConfig from the model config and LoadSpec from the runtime context."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.layers import dp_attention
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import use_cutedsl_moe_swap_ab
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import MoeA2ABackend, resolve_moe_runner_backend
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
 from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 from sglang.srt.model_loader.loader import PreshardedModelLoader
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 
-from .protocol import (
-    compute_env_stamp,
-    model_weight_fields,
-    parallel_weight_fields,
-    resolve_cache_quantization,
-)
+from .protocol import compute_env_stamp, hash_quant_config, resolve_cache_quantization
 from .schema import LoadSpec, WeightCacheConfig
 
 if TYPE_CHECKING:
     import torch
     from transformers import PretrainedConfig
 
-    from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
 
 
@@ -46,50 +40,81 @@ def _hf_config_hash(hf_config: PretrainedConfig) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def build_load_spec(
-    *,
-    model_config: ModelConfig,
-    checkpoint_id: str,
-    load_config: LoadConfig,
-    target_device: torch.device,
-) -> LoadSpec:
-    """Capture this rank's model and resolved runtime settings before loading.
+def path_checkpoint_id() -> str:
+    """The cache daemon's checkpoint ID: the requested model path and revision.
 
-    The caller identifies the checkpoint contents (e.g. a pinned Hub commit or
-    a local checkpoint digest). Two checkpoints can have identical model configs.
+    ModelConfig may swap in a base model (Kev adapters), so read the request.
+    """
+    path, revision = get_model().model_path, get_model().revision
+    return f"{path}@{revision}" if revision else path
+
+
+def build_weight_cache_config(
+    model_config: ModelConfig,
+    *,
+    checkpoint_id: str,
+    draft_model_idx: Optional[int] = None,
+) -> WeightCacheConfig:
+    """Describe the model; call it before the model is built.
+
+    Construction and loading can rewrite the HF and quantization configs.
     """
     quant_method, quant_config = resolve_cache_quantization(model_config)
-    model = WeightCacheConfig(
+    architectures = model_config.hf_config.architectures
+    return WeightCacheConfig(
         checkpoint_id=checkpoint_id,
+        model_arch=architectures[0] if architectures else "",
         hf_config_hash=_hf_config_hash(model_config.hf_config),
-        draft_model_idx=load_config.draft_model_idx,
-        **model_weight_fields(
-            model_config, quant_method=quant_method, quant_config=quant_config
-        ),
+        dtype=str(model_config.dtype),
+        quant_method=quant_method,
+        quant_config_hash=hash_quant_config(quant_config),
+        draft_model_idx=draft_model_idx,
     )
+
+
+def build_load_spec(*, device: torch.device) -> LoadSpec:
+    """Describe how this rank loads the model.
+
+    Call it after the parallel groups and the GEMM backends are initialized.
+    """
+    parallel = get_parallel()
     execution = get_exec()
-    moe_runner = get_moe_runner_backend()
-    a2a_backend = get_moe_a2a_backend()
+    # From the published config: a dense model's process never sets the MoE flags.
+    moe_runner = resolve_moe_runner_backend(execution.moe.moe_runner_backend)
+    a2a_backend = MoeA2ABackend(execution.moe.moe_a2a_backend)
     swap_ab = None
     if moe_runner.is_flashinfer_cutedsl() and (
         a2a_backend.is_none() or a2a_backend.is_flashinfer()
     ):
-        swap_ab = use_cutedsl_moe_swap_ab(target_device)
+        swap_ab = use_cutedsl_moe_swap_ab(device)
 
     return LoadSpec(
-        model=model,
-        **parallel_weight_fields(ep_size=get_parallel().moe_ep_size),
-        **compute_env_stamp(),
-        moe_runner_backend=moe_runner.value,
-        fp4_gemm_runner_backend=get_fp4_gemm_runner_backend().value,
-        fp8_gemm_runner_backend=get_fp8_gemm_runner_backend().value,
-        bf16_gemm_backend=get_bf16_gemm_backend().value,
+        tp_size=parallel.tp_size,
+        pp_size=parallel.pp_size,
+        dp_size=parallel.dp_size,
+        ep_size=parallel.moe_ep_size,
+        # MoE-DP can alias a wider attention-CP communicator; compare its configured width.
+        moe_dp_size=parallel.moe_dp_size,
+        attn_dp_size=parallel.attn_dp_size,
+        attn_cp_size=parallel.attn_cp_size,
         moe_cp_size=dp_attention.get_moe_cp_size(),
-        enable_fp32_lm_head=execution.features.enable_fp32_lm_head,
+        moe_dense_tp_size=parallel.moe_dense_tp_size,
+        enable_dp_lm_head=parallel.enable_dp_lm_head,
+        tp_rank=parallel.tp_rank,
+        pp_rank=parallel.pp_rank,
+        moe_dp_rank=parallel.moe_dp_rank,
+        moe_ep_rank=parallel.moe_ep_rank,
         ep_num_redundant_experts=execution.moe.ep_num_redundant_experts,
         enable_eplb=execution.moe.enable_eplb,
         init_expert_location=PreshardedModelLoader._normalize_init_expert_location(
             execution.moe.init_expert_location
         ),
+        moe_a2a_backend=execution.moe.moe_a2a_backend,
+        moe_runner_backend=moe_runner.value,
+        fp4_gemm_runner_backend=get_fp4_gemm_runner_backend().value,
+        fp8_gemm_runner_backend=get_fp8_gemm_runner_backend().value,
+        bf16_gemm_backend=get_bf16_gemm_backend().value,
         flashinfer_cutedsl_swap_ab=swap_ab,
+        enable_fp32_lm_head=execution.features.enable_fp32_lm_head,
+        **compute_env_stamp(),
     )

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Data contracts of snapshot loading.
+"""Data contracts of weight caching and snapshot loading.
 
 msgspec types only, importing nothing from sglang: load-diff and the validator
 share this module and nothing else.
@@ -14,76 +14,88 @@ from typing import Any, Optional
 import msgspec
 
 
+def _digest(fields: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+
 class WeightCacheConfig(
     msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
 ):
-    """Identity and format of the model weights, shared across ranks.
+    """The model: its checkpoint and the model options that decide its weights.
 
-    The checkpoint ID follows the contents across staging paths and revision aliases.
+    Built from ModelConfig, the checkpoint ID and the draft layer, and equal on
+    every rank. How a rank loads the model is in LoadSpec.
     """
 
-    checkpoint_id: str  # pinned Hub commit or local checkpoint content digest
+    # A content digest or pinned commit; the cache daemon uses path_checkpoint_id.
+    checkpoint_id: str
     model_arch: str
-    hf_config_hash: str  # effective HF config after model overrides
+    hf_config_hash: str  # effective HF config after model overrides, without paths
     dtype: str
-    quant_method: str
+    quant_method: str  # "" for unquantized
     quant_config_hash: str
     draft_model_idx: Optional[int]  # layer selected from a multi-layer draft checkpoint
 
     def __post_init__(self):
         if not self.checkpoint_id:
-            raise ValueError("A snapshot requires an immutable checkpoint identifier")
+            raise ValueError("A weight cache config requires a checkpoint ID")
+
+    def digest(self) -> str:
+        return _digest(msgspec.to_builtins(self))
 
 
 class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
-    """A model and the conditions that determine its loaded weights on this rank.
+    """How this rank loads the model: everything that is not in WeightCacheConfig.
 
-    Shard lookup uses the whole spec. Ranks vote on the model and shared load
-    settings while excluding their logical rank coordinates.
+    Built from the runtime context alone.
     """
 
-    model: WeightCacheConfig
-
-    # Parallel layout and logical shard coordinates.
+    # Parallel layout, equal on every rank.
     tp_size: int
-    tp_rank: int
     pp_size: int
-    pp_rank: int
     dp_size: int
     ep_size: int
     moe_dp_size: int
-    moe_dp_rank: int
-    moe_ep_rank: int
     attn_dp_size: int
     attn_cp_size: int
-    moe_dense_tp_size: Optional[int]
     moe_cp_size: int
+    moe_dense_tp_size: Optional[int]
+    enable_dp_lm_head: bool
 
-    # Runtime and kernel choices that affect the representation of the weights.
-    device_capability: str
-    torch_version: str
+    # This rank's shard.
+    tp_rank: int
+    pp_rank: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+
+    # Expert placement.
+    ep_num_redundant_experts: int
+    enable_eplb: bool
+    init_expert_location: Optional[str]
+
+    # Kernels and features that post-process the weights differently.
     moe_a2a_backend: str
     moe_runner_backend: str
     fp4_gemm_runner_backend: str
     fp8_gemm_runner_backend: str
     bf16_gemm_backend: str
-    enable_dp_lm_head: bool
-    enable_fp32_lm_head: bool
-    ep_num_redundant_experts: int
-    enable_eplb: bool
-    init_expert_location: Optional[str]
     flashinfer_cutedsl_swap_ab: Optional[bool]
+    enable_fp32_lm_head: bool
+
+    # The process that post-processes the weights.
+    device_capability: str
+    torch_version: str
 
     def digest(self, *, include_rank: bool = True) -> str:
-        """Identify this shard for lookup, or its shared configuration for a vote."""
+        """Identify how this rank loads the model, or without the rank what all ranks share.
+
+        A shard is named by this digest together with WeightCacheConfig.digest().
+        """
         fields = msgspec.to_builtins(self)
-        # Keep the flat key encoding while exposing model settings as a nested struct.
-        fields.update(fields.pop("model"))
         if not include_rank:
             for name in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
                 del fields[name]
-        encoded = json.dumps(fields, sort_keys=True)
-        return hashlib.sha256(encoded.encode()).hexdigest()
+        return _digest(fields)
 
 
 class StorageMeta(msgspec.Struct, frozen=True, kw_only=True):

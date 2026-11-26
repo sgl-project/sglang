@@ -312,8 +312,10 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
     the 2-GPU runner.
     """
 
-    daemon_args = []
-    server_args = []
+    # A flag that ModelConfig writes into hf_config: the daemon and the engine
+    # must derive the same model (WeightCacheConfig) from it.
+    daemon_args = ["--context-length", "4096"]
+    server_args = daemon_args[:]
     tp_size = 1
     log_files = (SMOKE_STDOUT_FILENAME, SMOKE_STDERR_FILENAME)
 

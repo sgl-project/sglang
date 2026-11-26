@@ -24,10 +24,11 @@ from sglang.srt.model_loader.loader import (
     _initialize_model,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
 
+from .config import build_load_spec, build_weight_cache_config, path_checkpoint_id
 from .protocol import (
-    build_cache_config,
+    cache_config_message,
+    cache_config_mismatches,
     check_ipc_quant_support,
     get_socket_path,
     recv_msg,
@@ -102,7 +103,7 @@ class WeightCacheModelLoader(BaseModelLoader):
 
     - socket file missing            -> fall back to disk load
     - connection refused             -> raise (daemon crashed after binding)
-    - CacheConfig mismatch           -> raise (do NOT disk-load on a shared GPU
+    - config mismatch                -> raise (do NOT disk-load on a shared GPU
                                         holding a different config's weights;
                                         also surfaces fingerprint drift bugs)
     - any protocol / transfer error  -> raise
@@ -559,35 +560,38 @@ class WeightCacheModelLoader(BaseModelLoader):
             ) from e
 
         try:
-            quant_method, quant_config = resolve_cache_quantization(model_config)
-            engine_config = build_cache_config(
+            model = build_weight_cache_config(
                 model_config,
-                quant_method=quant_method,
-                quant_config=quant_config,
-                model_path=model_config.model_path,
-                revision=model_config.revision,
-                ep_size=get_parallel().moe_ep_size,
+                checkpoint_id=path_checkpoint_id(),
+                draft_model_idx=self.load_config.draft_model_idx,
             )
+            spec = build_load_spec(device=device_config.device)
 
             logger.info(
                 f"[WeightCacheModelLoader] Requesting weights from daemon at "
                 f"{self.socket_path} with config: "
-                f"model={engine_config.model_path}, "
-                f"arch={engine_config.model_arch}, "
-                f"tp={engine_config.tp_size}/{engine_config.tp_rank}, "
-                f"quant={engine_config.quant_method}, "
-                f"dtype={engine_config.dtype}"
+                f"model={model.checkpoint_id}, "
+                f"arch={model.model_arch}, "
+                f"tp={spec.tp_size}/{spec.tp_rank}, "
+                f"quant={model.quant_method}, "
+                f"dtype={model.dtype}"
             )
 
-            send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})
+            engine_config = cache_config_message(model, spec)
+            send_msg(sock, {"type": "fetch_state", "config": engine_config})
             result = recv_msg(sock)
 
-            if result.get("status") != "ok":
-                daemon_config = result.get("daemon_config", {})
+            if result.get("status") == "mismatch":
+                mismatches = cache_config_mismatches(
+                    result["daemon_config"], engine_config
+                )
                 raise RuntimeError(
-                    f"[WeightCacheModelLoader] Daemon config mismatch!\n"
-                    f"  Engine config: {engine_config.to_dict()}\n"
-                    f"  Daemon config: {daemon_config}"
+                    f"[WeightCacheModelLoader] Daemon config mismatch, "
+                    f"field: (daemon, engine): {mismatches}"
+                )
+            if result.get("status") != "ok":
+                raise RuntimeError(
+                    f"[WeightCacheModelLoader] Daemon error: {result.get('message')}"
                 )
 
             backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
