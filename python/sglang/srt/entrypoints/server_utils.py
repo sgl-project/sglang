@@ -212,6 +212,11 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
     result["launch_command"] = server_args.launch_command
     result.update(scheduler_info)
     result["kv_events"] = describe_kv_events_publisher(server_args)
+    # A PD prefill answers a request naming no bootstrap host and asking for at
+    # most one token by itself; sgl-router reads this before sending one.
+    result["prefill_answers_alone"] = (
+        server_args.disaggregation_transfer_backend != "fake"
+    )
     return result
 
 

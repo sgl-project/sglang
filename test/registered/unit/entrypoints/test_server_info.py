@@ -471,6 +471,19 @@ class TestModelInfoTransportParity(CustomTestCase):
         self.assertEqual(rust_body, python_body)
 
 
+class TestServerInfoPrefillAnswersAlone(CustomTestCase):
+    def test_reported_unless_the_transfer_backend_is_fake(self):
+        # sgl-router skips decode for a one-token request only on engines that
+        # report this; on the fake backend a hostless request still hands off.
+        for backend, expected in (("mooncake", True), ("nixl", True), ("fake", False)):
+            with self.subTest(backend=backend):
+                args = ServerArgs(
+                    model_path="dummy", disaggregation_transfer_backend=backend
+                )
+                info = _call_server_info_with(args)
+                self.assertIs(info["prefill_answers_alone"], expected)
+
+
 class TestServerInfoKvEventsField(CustomTestCase):
     """The new `kv_events` field is wired correctly across the full
     `_build_kv_events_block` input matrix.
