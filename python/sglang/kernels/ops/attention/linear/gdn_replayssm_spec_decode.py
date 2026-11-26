@@ -1230,7 +1230,8 @@ def gdn_replayssm_spec_decode(
     An INT8 checkpoint requires ``launch_mode="verify"`` and FP32 row scales
     of shape ``[num_slots, HV, V]``. Only the V dimension must be contiguous.
     The caller owns materialization and must resolve pending flushes before
-    verify. The existing D/K residual buffers use their usual format.
+    consuming output. A pending-flush row is skipped, leaving its output and
+    ring untouched. The existing D/K residual buffers use their usual format.
     """
     temporal_int8 = checkpoint_state.dtype == torch.int8
     if temporal_int8:
@@ -1268,15 +1269,19 @@ def gdn_replayssm_spec_decode(
         and checkpoint_state.is_cuda
         and torch.cuda.get_device_capability(checkpoint_state.device)[0] == 12
     ):
-        # Tuned SM120 (RTX 5090) CUDA-Graph dispatch: 2 warps hides i8->bf16
-        # unpack + GDDR7 latency; BV=64 saturates SMs at small batch, BV=128
-        # halves (I+A)^{-1} + q/k work once B>=24 fills all 170 SMs.
         num_warps = 2
         nk = 2
-        if batch_size < 24:
-            block_v, num_stages = 64, 1
-        else:
+        # The wider tile helps the measured T8/R32, K=V=128 workload
+        # at B32, while it regresses B24/25, especially with history.
+        if (
+            batch_size >= 32
+            and max_spec_len == 8
+            and max_cache_len == 32
+            and q.shape[-1] == v.shape[-1] == 128
+        ):
             block_v, num_stages = 128, 2
+        else:
+            block_v, num_stages = 64, 1
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
 
