@@ -68,10 +68,13 @@ from sglang.multimodal_gen.runtime.cache.spectrum import (
     target_audio_video_span,
 )
 from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_group,
     get_tp_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_replica_group,
     get_ring_ctx,
     get_ulysses_ctx,
 )
@@ -1841,6 +1844,7 @@ class MiniMaxH3AdalnProj(nn.Module):
         prefix: str,
         expand_ratio: int,
         modality_num: int,
+        parallel_group: GroupCoordinator | None = None,
     ) -> None:
         super().__init__()
         if out_features != expand_ratio * arch.hidden_size * modality_num:
@@ -1864,7 +1868,9 @@ class MiniMaxH3AdalnProj(nn.Module):
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=f"{prefix}.linear",
+            tp_group=parallel_group,
         )
+        self.parallel_group = self.linear.tp_group
 
     def project_local(self, adaln_input: torch.Tensor) -> torch.Tensor:
         x, _ = self.linear(adaln_input)
@@ -1878,8 +1884,8 @@ class MiniMaxH3AdalnProj(nn.Module):
     def forward(self, adaln_input: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Project the post-SiLU embedding in its checkpoint-defined dtype."""
         x = self.project_local(adaln_input)
-        if get_tp_world_size() > 1:
-            x = tensor_model_parallel_all_gather(x)
+        if self.parallel_group is not None and self.parallel_group.world_size > 1:
+            x = self.parallel_group.all_gather(x, dim=-1)
         return self.split_output(x)
 
 
@@ -1973,6 +1979,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         prefix: str,
         use_adaln_cache: bool = False,
+        adaln_parallel_group: GroupCoordinator | None = None,
         layer_index: int = 0,
     ) -> None:
         super().__init__()
@@ -1996,6 +2003,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 prefix=f"{prefix}.adaln_proj",
                 expand_ratio=6,
                 modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
+                parallel_group=adaln_parallel_group,
             )
         )
         self.preserve_input_for_cache_dit = False
@@ -2170,6 +2178,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         *,
         prefix: str,
         use_adaln_cache: bool = False,
+        adaln_parallel_group: GroupCoordinator | None = None,
     ) -> None:
         super().__init__()
         video_patch_dim = (
@@ -2189,6 +2198,7 @@ class MiniMaxH3FinalLayer(nn.Module):
                 prefix=f"{prefix}.adaln_proj",
                 expand_ratio=2,
                 modality_num=1,
+                parallel_group=adaln_parallel_group,
             )
         )
         self.video_out = ColumnParallelLinear(
@@ -2620,7 +2630,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
     def _can_batch_block_adaln(self) -> bool:
         return (
             self.adaln_cache is None
-            and get_tp_world_size() > 1
+            and self.adaln_parallel_group.world_size > 1
             and not torch.compiler.is_compiling()
             and not envs.SGLANG_CACHE_DIT_ENABLED
             and not hasattr(self, "_sglang_cache_dit_adapter")
@@ -2706,6 +2716,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         adaln_max_plans: int = 64,
         adaln_host_cache_bytes: int = 0,
         adaln_precision: str = "match",
+        adaln_fold: bool = False,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
@@ -2732,6 +2743,24 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             adaln_cache_path is not None or adaln_weight_files is not None
         )
         self.arch = arch
+        self.adaln_parallel_group = get_tp_group()
+        if adaln_fold:
+            if self._adaln_precomputed:
+                raise ValueError("AdaLN folding cannot be combined with an AdaLN cache")
+            group = get_replica_group()
+            if group.world_size <= get_tp_world_size():
+                raise ValueError("AdaLN folding requires a replica wider than DiT TP")
+            if any(
+                width % group.world_size
+                for width in (arch.adaln_out_features, arch.final_adaln_out_features)
+            ):
+                raise ValueError("AdaLN output widths must divide the replica size")
+            self.adaln_parallel_group = group
+            logger.info(
+                "MiniMax H3 AdaLN folding: projection TP%d, DiT TP%d",
+                group.world_size,
+                get_tp_world_size(),
+            )
         if arch.checkpoint_uses_diffusers_layout:
             self.preprocess_loaded_state_dict = _diffusers_h3_checkpoint
         self.hidden_size = arch.hidden_size
@@ -2832,6 +2861,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     quant_config,
                     prefix=f"blocks.{index}",
                     use_adaln_cache=self._adaln_precomputed,
+                    adaln_parallel_group=self.adaln_parallel_group,
                     layer_index=index,
                 )
                 for index in range(arch.num_layers)
@@ -2847,6 +2877,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             quant_config,
             prefix="final_layer",
             use_adaln_cache=self._adaln_precomputed,
+            adaln_parallel_group=self.adaln_parallel_group,
         )
         pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
         if pdd_heads:
@@ -3576,7 +3607,9 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                         for block in self.blocks
                     ]
                 )
-                gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
+                gathered_adaln = self.adaln_parallel_group.all_gather(
+                    local_adaln, dim=-1
+                )
                 block_adaln_params = tuple(
                     block.adaln_proj.split_output(output)
                     for block, output in zip(self.blocks, gathered_adaln)
