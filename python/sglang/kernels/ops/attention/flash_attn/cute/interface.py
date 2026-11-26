@@ -27,6 +27,7 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
     cute_dsl_ptxas.patch()
 
 
+from sglang.kernels.ops.attention import fa4_sm120
 from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
     get_forward_host,
     try_cached_paged_decode,
@@ -972,9 +973,15 @@ def _flash_attn_fwd(
         # The qv kernel has no split-KV variant.
         num_splits = 1
 
-    fp32_out_sm90 = arch // 10 == 9 and out.dtype == torch.float32 and num_splits == 1
-    is_split_kv = num_splits > 1 or fp32_out_sm90
-    if fp32_out_sm90:
+    # SM90 and forward-host kernels write FP32 only as split partials;
+    # a single split's partial is the output itself.
+    fp32_out_one_split = (
+        (arch // 10 == 9 or arch_forward_host is not None)
+        and out.dtype == torch.float32
+        and num_splits == 1
+    )
+    is_split_kv = num_splits > 1 or fp32_out_one_split
+    if fp32_out_one_split:
         out_partial = out.unsqueeze(0)
         lse_partial = (
             lse.unsqueeze(0)
@@ -1909,7 +1916,7 @@ def _flash_attn_fwd(
                     pack_gqa=pack_gqa,
                 )
             compiled_fwd(*call_args)
-    if is_split_kv and not fp32_out_sm90:
+    if is_split_kv and not fp32_out_one_split:
         _flash_attn_fwd_combine(
             out_partial,
             lse_partial.transpose(-1, -2),
@@ -1922,6 +1929,7 @@ def _flash_attn_fwd(
         not fake_mode
         and not torch.cuda.is_current_stream_capturing()
         and arch_forward_host is not None
+        and not fp32_out_one_split
         and q is not None
         and k is not None
         and qv is None
@@ -1990,7 +1998,10 @@ def _flash_attn_fwd(
 def _get_jit_cache(name: str):
     return get_jit_cache(
         name,
-        source_paths=(os.path.dirname(os.path.abspath(__file__)),),
+        source_paths=(
+            os.path.dirname(os.path.abspath(__file__)),
+            os.path.dirname(os.path.abspath(fa4_sm120.__file__)),
+        ),
         enable_tvm_ffi=True,
     )
 
