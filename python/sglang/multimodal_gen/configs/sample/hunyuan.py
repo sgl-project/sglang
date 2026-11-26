@@ -76,9 +76,9 @@ class HunyuanSamplingParams(SamplingParams):
             return
         # InputValidationStage fills a missing side from 16:9 after this runs.
         if self.height is None and self.width > 0:
-            self.height = self.width * 720 // 1280
+            self.height = max(1, self.width * 720 // 1280)
         elif self.width is None and self.height > 0:
-            self.width = self.height * 1280 // 720
+            self.width = max(1, self.height * 1280 // 720)
         if self.width is None or self.height is None:
             return
         if self.width <= 0 or self.height <= 0:

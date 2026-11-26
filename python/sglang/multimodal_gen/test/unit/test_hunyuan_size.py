@@ -120,6 +120,7 @@ def test_warmup_resolution_aligns_to_the_patch_grid():
         ({"width": 1920, "height": None}, (1920, 1072)),
         ({"width": None, "height": 1080}, (1920, 1072)),
         ({"width": 1000, "height": None}, (992, 560)),
+        ({"width": 1, "height": None}, (16, 16)),
     ],
 )
 def test_one_missing_side_is_inferred_then_aligned(fields, expected):
