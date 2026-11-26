@@ -53,7 +53,7 @@ from sglang.srt.utils.weight_versions import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq
-from sglang.test.test_utils import enter_scope, published_topology
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -763,7 +763,7 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
         )
 
 
-class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
+class TestOutputStreamerCachedTokensSplit(CustomTestCase):
     def setUp(self):
         for target, value in (
             ("get_serving", SimpleNamespace(stream_interval=1, weight_version="v")),
