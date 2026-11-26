@@ -1356,7 +1356,6 @@ class DeepseekV4AttnBackend(
         self.encoder_replay = False
         self.encoder_row_floor = None
         self.device = torch.device(model_runner.device)
-        self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert head_dim == 512, (
             "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
@@ -1438,7 +1437,7 @@ class DeepseekV4AttnBackend(
         if self.dsv4_prefill_backend == DSV4_CUTEDSL_H16_PREFILL_BACKEND:
             self._cutedsl_h16_c128_combined_topk = (
                 _validate_dsv4_cutedsl_h16_combined_topk(
-                    self.max_context_len,
+                    model_runner.model_config.context_len,
                     self.index_topk,
                 )
             )
@@ -3538,7 +3537,7 @@ class DeepseekV4AttnBackend(
             is_draft_runner=self.is_draft_runner,
             skip_prefill=False,
             max_bs=max_bs,
-            max_context_len=self.max_context_len,
+            max_context_len=self.model_runner.model_config.context_len,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             is_read=False,
