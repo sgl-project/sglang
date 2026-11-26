@@ -8,7 +8,7 @@ import time
 import zlib
 from array import array
 from collections import deque
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, nullcontext, suppress
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -26,6 +26,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -186,6 +187,38 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+# Arbitrary; far above the few rounds a stage takes to report in a new epoch.
+_STORAGE_UNREPORTED_WARN_ROUNDS = 1000
+# Port, host length, host bytes (an IPv6 literal fits).
+_PP_STORE_ADDRESS_SLOTS = 2 + 64
+# Arbitrary; failed ticks in a row before PP0 escalates to one error.
+_PP_STORE_OPEN_ERROR_TICKS = 100
+
+
+class _PPSyncAddressRelay:
+    """PPConsensusStore's PP-group handle: sends PP0's address down the HiCache
+    PP-sync channel in tick order. A collective would make PP0 wait for stages
+    that receive the attach only after PP0's tick (PD prefill forwards it later)."""
+
+    def __init__(self, cache: UnifiedRadixCache):
+        self._cache = cache
+        self.exchanged = False
+        self.address: Optional[tuple[str, int]] = None
+
+    def broadcast_object(self, obj, src=0):
+        data = torch.zeros(_PP_STORE_ADDRESS_SLOTS, dtype=torch.int64)
+        if obj is not None:
+            host = list(obj[0].encode())
+            data[0], data[1] = obj[1], len(host)
+            data[2 : 2 + len(host)] = torch.tensor(host)
+        self._cache._pp_sync(data)
+        self.exchanged = True
+        port, size = data[:2].tolist()
+        if port == 0:
+            raise RuntimeError("PP0 has no HiCache PP store this tick")
+        self.address = (bytes(data[2 : 2 + size].tolist()).decode(), port)
+        return self.address
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -227,6 +260,17 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # Cache-mode PP only: replicates each stage's storage-queue totals to PP0;
+    # the per-queue counts every stage drained in lockstep this epoch. Opened in
+    # the first tick with storage on and kept across detach / attach: a stage's
+    # close can block in zmq term once PP0's store is gone, so like the PD store
+    # it ends with the process.
+    _pp_ready_store: Optional[PPConsensusStore] = None
+    _pp_store_expected: bool = False
+    _pp_store_open_failures: int = 0
+    _storage_drained: tuple[int, ...] = ()
+    _storage_epoch: int = 0
+    _storage_unreported_rounds: int = 0
 
     def __init__(
         self,
@@ -535,6 +579,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # ongoing_backup: the ack drain settles every write at a rank-agreed
         # written prefix of this span (buffer mode reads it from its entry).
         self._backup_requested_tokens: dict[int, int] = {}
+        self._restart_storage_totals()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -660,6 +705,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        self._pp_store_expected = (
+            self.pp_size > 1
+            and self.pp_group is not None
+            and self.host_memory_mode == "cache"
+        )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -4171,6 +4221,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
 
     def drain_storage_control_queues(self) -> None:
+        """PP=1 only (test kits): under PP, check_hicache_events drains only what
+        every stage has received."""
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
@@ -4227,6 +4279,7 @@ class UnifiedRadixCache(BasePrefixCache):
             },
             log_metrics=False,
         )
+        self._restart_storage_totals()
 
     # ---- HiCache: Storage backend lifecycle (delegated) ----
 
@@ -4284,6 +4337,121 @@ class UnifiedRadixCache(BasePrefixCache):
             ready_count += 1
         return ready_count
 
+    def _storage_queue_sizes(
+        self, extra_pool_names: tuple[PoolName, ...]
+    ) -> tuple[int, ...]:
+        cc = self.cache_controller
+        return (
+            cc.prefetch_hit_queue.qsize(),
+            cc.ack_prefetch_queue.qsize(),
+            cc.ack_backup_queue.qsize(),
+            cc.host_mem_release_queue.qsize(),
+            *(cc.extra_host_mem_release_queues[n].qsize() for n in extra_pool_names),
+        )
+
+    def _open_pp_ready_store(self) -> None:
+        # Runs in the tick, where storage is on at the same point on every stage.
+        if not self._pp_store_expected or self._pp_ready_store is not None:
+            return
+        relay = _PPSyncAddressRelay(self)
+        try:
+            self._pp_ready_store = PPConsensusStore(self.pp_size, self.pp_rank, relay)
+        except Exception:
+            if not relay.exchanged:
+                # Keep the PP-sync stream aligned: PP0 says "no store", the rest hear it.
+                with suppress(RuntimeError):
+                    relay.broadcast_object(None)
+            if relay.address is not None:
+                raise  # PP0 opened a store this rank cannot join
+            if self.pp_rank == 0:
+                self._pp_store_open_failures += 1
+                if self._pp_store_open_failures in (1, _PP_STORE_OPEN_ERROR_TICKS):
+                    log = (
+                        logger.warning
+                        if self._pp_store_open_failures == 1
+                        else logger.error
+                    )
+                    log(
+                        "HiCache PP storage drain: PP0 could not open its PP store "
+                        "(%d ticks in a row); retrying every tick, and nothing is "
+                        "drained until it opens.",
+                        self._pp_store_open_failures,
+                        exc_info=True,
+                    )
+
+    def _storage_ready_key(self, index: int) -> str:
+        return f"hicache_storage:{self._storage_epoch}:{index}"
+
+    def _storage_drained_counts(self, num_queues: int) -> tuple[int, ...]:
+        # Sized on the first report of an epoch; the extra host pools are fixed by then.
+        if not self._storage_drained:
+            self._storage_drained = (0,) * num_queues
+        return self._storage_drained
+
+    def _report_storage_totals(self, sizes: tuple[int, ...]) -> None:
+        # Items received so far (drained + queued) only grow, so PP0 may read
+        # a stale total and still never ask a stage for more than it holds.
+        drained = self._storage_drained_counts(len(sizes))
+        for index, (done, size) in enumerate(zip(drained, sizes)):
+            key = self._storage_ready_key(index)
+            if self._pp_ready_store.get(key) != done + size:
+                self._pp_ready_store[key] = done + size
+
+    def _min_storage_totals(self, sizes: tuple[int, ...]) -> tuple[int, ...]:
+        drained = self._storage_drained_counts(len(sizes))
+        store = self._pp_ready_store
+        peer_totals = [
+            (
+                store.collect(self._storage_ready_key(index))[1:]
+                if store is not None
+                else [None] * (self.pp_size - 1)
+            )
+            for index in range(len(sizes))
+        ]
+        self._warn_on_unreported_stages(sizes=sizes, peer_totals=peer_totals)
+        # A stage that has not reported in this epoch holds nothing undrained.
+        return tuple(
+            min(done + size, *(done if t is None else t for t in totals)) - done
+            for done, size, totals in zip(drained, sizes, peer_totals)
+        )
+
+    def _warn_on_unreported_stages(
+        self, *, sizes: tuple[int, ...], peer_totals: list[list[Optional[int]]]
+    ) -> None:
+        # Epochs out of step (unequal resets or detaches across stages) look like
+        # a stage that never reports: PP0 relays 0 and the queues only grow.
+        unreported = any(sizes) and any(None in totals for totals in peer_totals)
+        self._storage_unreported_rounds = (
+            self._storage_unreported_rounds + 1 if unreported else 0
+        )
+        if self._storage_unreported_rounds == _STORAGE_UNREPORTED_WARN_ROUNDS:
+            missing = sorted(
+                {
+                    rank
+                    for totals in peer_totals
+                    for rank, total in enumerate(totals, start=1)
+                    if total is None
+                }
+            )
+            logger.warning(
+                "HiCache PP storage drain: PP ranks %s sent no queue totals for "
+                "storage epoch %d in %d rounds while PP0 has items queued; nothing "
+                "is drained until they do (epochs out of step across stages?).",
+                missing,
+                self._storage_epoch,
+                self._storage_unreported_rounds,
+            )
+
+    def _restart_storage_totals(self) -> None:
+        # A rank-local drain or clear desyncs the drained counts; a new epoch
+        # keeps PP0 from reading totals counted against the old ones.
+        if self._pp_ready_store is not None:
+            for index in range(len(self._storage_drained)):
+                self._pp_ready_store.pop(self._storage_ready_key(index))
+        self._storage_epoch += 1
+        self._storage_drained = ()
+        self._storage_unreported_rounds = 0
+
     def _sync_hicache_ready_counts(
         self,
     ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
@@ -4299,20 +4467,18 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_queue_sizes = (
                 (0,) * (4 + len(extra_pool_names)) if self.enable_storage else ()
             )
+            if self._pp_ready_store is not None and self.enable_storage:
+                self._report_storage_totals(self._storage_queue_sizes(extra_pool_names))
         else:
             write_acks = self._count_ready_acks(cc.ack_write_queue)
             load_acks = self._count_ready_acks(cc.ack_load_queue)
             storage_queue_sizes = (
-                (
-                    cc.prefetch_hit_queue.qsize(),
-                    cc.ack_prefetch_queue.qsize(),
-                    cc.ack_backup_queue.qsize(),
-                    cc.host_mem_release_queue.qsize(),
-                    *(extra_release_queues[name].qsize() for name in extra_pool_names),
-                )
+                self._storage_queue_sizes(extra_pool_names)
                 if self.enable_storage
                 else ()
             )
+            if self._pp_store_expected and storage_queue_sizes:
+                storage_queue_sizes = self._min_storage_totals(storage_queue_sizes)
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order and live prefetch set matched on every rank.
@@ -4662,6 +4828,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.enable_storage:
             self._raise_if_storage_workers_died()
         self._bound_async_work()
+        if self.enable_storage:
+            self._open_pp_ready_store()
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
@@ -4689,6 +4857,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+            if self._pp_ready_store is not None:
+                self._storage_drained = tuple(
+                    done + n
+                    for done, n in zip(self._storage_drained, storage_queue_sizes)
+                )
         if self.enable_storage:
             # After the drain: a prefetch it retired is not voted on.
             self._vote_prefetch_deadlines()

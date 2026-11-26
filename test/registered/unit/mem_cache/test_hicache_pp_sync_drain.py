@@ -1,6 +1,7 @@
 """Unit tests for HiCache PP synchronization."""
 
 import socket
+import threading
 import time
 import unittest
 from collections import deque
@@ -12,8 +13,10 @@ import torch
 import torch.distributed
 import torch.multiprocessing
 
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
@@ -132,6 +135,18 @@ class TestPPSyncWindowGloo(CustomTestCase):
             elapsed = dict(result)
         self.assertGreater(elapsed["drain"], 0.5, elapsed)
         self.assertLess(elapsed["window"], 0.5, elapsed)
+
+
+class _StoreGroup:
+    """broadcast_object stand-in: PP0's store publishes its address, PP1 reads it."""
+
+    def __init__(self):
+        self._obj = None
+
+    def broadcast_object(self, obj, src=0):
+        if obj is not None:
+            self._obj = obj
+        return self._obj
 
 
 class TestUnifiedPPSyncBatching(CustomTestCase):
@@ -310,6 +325,242 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
             extra_release_counts={},
             log_metrics=True,
         )
+
+    def _storage_stage(self, pp_rank, group, backups):
+        cache = self._make_cache(pp_rank, [], [])
+        cache.tree_core.enable_storage = True
+        cache.tree_core.page_size = 1
+        cache._backup_requested_tokens = {}
+        cache._storage_prefetch_hit_remaining_by_reqid = {}
+        cache.ongoing_backup = {}
+        cache._all_reduce_storage_drain = MagicMock()
+        cc = cache.cache_controller
+        for name in (
+            "prefetch_hit_queue",
+            "ack_prefetch_queue",
+            "ack_backup_queue",
+            "host_mem_release_queue",
+        ):
+            setattr(cc, name, Queue())
+        cc.extra_host_mem_release_queues = {}
+        cc.backup_skip = False
+        for _ in range(backups):
+            self._ack_backup(cache)
+        cache._pp_store_expected = True
+        if group is not None:
+            cache._pp_ready_store = PPConsensusStore(2, pp_rank, group)
+            self.addCleanup(cache._pp_ready_store.close)
+        return cache
+
+    def _ack_backup(self, cache):
+        cc = cache.cache_controller
+        cc.ack_backup_queue.put(
+            SimpleNamespace(id=cc.ack_backup_queue.qsize(), completed_tokens=0)
+        )
+
+    def _leader_round(self, leader):
+        leader.check_hicache_events()
+        counts = leader._all_reduce.call_args.args[0].clone()
+        return counts, counts.tolist()[4]  # [write, load, hit, prefetch, backup, ...]
+
+    def _follower_round(self, follower, leader, counts):
+        follower._all_reduce.side_effect = lambda data, _: data.copy_(counts)
+        done = threading.Event()
+
+        def run():
+            follower.check_hicache_events()
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        self.assertTrue(
+            done.wait(timeout=5), "PP1 blocked draining acks it has not received"
+        )
+        if follower._pp_ready_store is None:
+            return
+        # Let PP1's latest totals (one per storage queue) reach PP0.
+        keys = [follower._storage_ready_key(index) for index in range(4)]
+        self._wait_until(
+            lambda: all(
+                leader._pp_ready_store.collect(key)[1]
+                == follower._pp_ready_store.get(key)
+                for key in keys
+            )
+        )
+
+    def _wait_until(self, condition):
+        deadline = time.monotonic() + 5
+        while not condition():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+
+    def test_cache_mode_pp_drains_only_what_every_stage_received(self):
+        """In cache mode PP1 drains the storage-ack count PP0 relays, blocking
+        until it has that many. PP0 must relay only what every stage has
+        received, even when a stage's last report predates its last drain."""
+        group = _StoreGroup()
+        leader = self._storage_stage(0, group, backups=2)
+        follower = self._storage_stage(1, group, backups=1)
+        relayed = []
+        for ack_after_round in (False, False, True, False, False):
+            counts, n_backup = self._leader_round(leader)
+            relayed.append(n_backup)
+            self._follower_round(follower, leader, counts)
+            if ack_after_round:
+                self._ack_backup(follower)
+
+        # Round 3: PP1 last reported 1 ack and has drained it, so PP0 relays 0;
+        # its second ack is reported in round 4 and drained in round 5.
+        self.assertEqual(relayed, [0, 1, 0, 0, 1])
+        for cache in (leader, follower):
+            self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
+
+    def test_detach_drain_starts_a_new_epoch(self):
+        """The detach drain consumes each stage's queues rank-locally, so the
+        totals PP1 reported before it are no longer a lower bound. PP0, running
+        ahead, must ignore them, relay 0 until PP1 reports again, then resume."""
+        group = _StoreGroup()
+        leader = self._storage_stage(0, group, backups=1)
+        follower = self._storage_stage(1, group, backups=2)
+        for _ in range(2):
+            counts, _ = self._leader_round(leader)
+            self._follower_round(follower, leader, counts)
+        old_key = follower._storage_ready_key(2)
+        self.assertEqual(leader._pp_ready_store.collect(old_key)[1], 2)
+
+        # PP0 drains and decides its next round before PP1 reaches its drain,
+        # while PP1's pre-detach total of 2 is still in PP0's view.
+        leader.drain_storage_control_queues_local()
+        self._ack_backup(leader)
+        counts, n_backup = self._leader_round(leader)
+        relayed = [n_backup]
+        follower.drain_storage_control_queues_local()
+        self._follower_round(follower, leader, counts)
+        self._wait_until(lambda: leader._pp_ready_store.collect(old_key)[1] is None)
+        self.assertEqual(follower._storage_epoch, leader._storage_epoch)
+
+        self._ack_backup(follower)
+        for _ in range(2):
+            counts, n_backup = self._leader_round(leader)
+            relayed.append(n_backup)
+            self._follower_round(follower, leader, counts)
+        # PP1's new ack is reported in round 2 and drained in round 3.
+        self.assertEqual(relayed, [0, 0, 1])
+        for cache in (leader, follower):
+            self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
+
+    def test_store_opens_in_the_tick_and_outlives_detach(self):
+        """The store opens in the first tick with storage on, with PP0's address
+        relayed down the PP-sync channel (no collective, which would wait for a
+        stage that has not seen the attach). A detach keeps it and starts a new
+        epoch; after the next attach draining resumes without a second relay."""
+        leader = self._storage_stage(0, None, backups=1)
+        follower = self._storage_stage(1, None, backups=1)
+        for cache in (leader, follower):  # cleanups run last-in first, PP1 first
+            self.addCleanup(
+                lambda c=cache: c._pp_ready_store and c._pp_ready_store.close()
+            )
+        relayed = []
+        leader._pp_sync = MagicMock(
+            side_effect=lambda data: relayed.append(data.clone())
+        )
+        follower._pp_sync = MagicMock(
+            side_effect=lambda data: data.copy_(relayed.pop(0))
+        )
+        for cache in (leader, follower):
+            cache.tree_core.enable_storage = False
+            cache.check_hicache_events()
+            self.assertIsNone(cache._pp_ready_store)
+            cache.tree_core.enable_storage = True
+
+        def rounds(n):
+            out = []
+            for _ in range(n):
+                counts, n_backup = self._leader_round(leader)
+                out.append(n_backup)
+                self._follower_round(follower, leader, counts)
+            return out
+
+        self.assertEqual(rounds(2), [0, 1])
+        self.assertEqual(relayed, [])  # PP1 consumed PP0's one address
+        stores = [leader._pp_ready_store, follower._pp_ready_store]
+        old_key = follower._storage_ready_key(2)
+        for cache in (leader, follower):
+            cache.cache_controller.detach_storage_backend = MagicMock()
+            self.assertTrue(StorageAttachment(cache).detach()[0])
+            cache.tree_core.enable_storage = True  # what the next attach turns on
+            self._ack_backup(cache)
+        self._wait_until(lambda: leader._pp_ready_store.collect(old_key)[1] is None)
+
+        # The new epoch hears PP1 from its first round, so round 2 drains.
+        self.assertEqual(rounds(3), [0, 1, 0])
+        self.assertEqual([leader._pp_ready_store, follower._pp_ready_store], stores)
+        self.assertEqual(leader._pp_sync.call_count, 1)
+        self.assertEqual(follower._storage_epoch, leader._storage_epoch)
+        for cache in (leader, follower):
+            self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
+
+    def test_store_open_failure_retries_next_tick(self):
+        """If PP0 cannot open its store, PP1 hears "no store" on the same channel,
+        so the PP-sync stream stays aligned; nothing is drained, PP0 warns once,
+        escalates once to an error, and a later tick opens the store and drains."""
+        leader = self._storage_stage(0, None, backups=1)
+        follower = self._storage_stage(1, None, backups=1)
+        for cache in (leader, follower):  # cleanups run last-in first, PP1 first
+            self.addCleanup(
+                lambda c=cache: c._pp_ready_store and c._pp_ready_store.close()
+            )
+        relayed = []
+        leader._pp_sync = MagicMock(
+            side_effect=lambda data: relayed.append(data.clone())
+        )
+        follower._pp_sync = MagicMock(
+            side_effect=lambda data: data.copy_(relayed.pop(0))
+        )
+        failures_left = [2]
+
+        def flaky_store(pp_size, pp_rank, group):
+            if pp_rank == 0 and failures_left[0]:
+                failures_left[0] -= 1
+                raise OSError("no routable address")
+            return PPConsensusStore(pp_size, pp_rank, group)
+
+        module = "sglang.srt.mem_cache.unified_radix_cache"
+        relayed_counts = []
+        with (
+            patch(f"{module}.PPConsensusStore", flaky_store),
+            patch(f"{module}._PP_STORE_OPEN_ERROR_TICKS", 2),
+            self.assertLogs(module, level="WARNING") as logs,
+        ):
+            for _ in range(4):
+                counts, n_backup = self._leader_round(leader)
+                relayed_counts.append(n_backup)
+                self._follower_round(follower, leader, counts)
+                self.assertEqual(relayed, [])  # PP1 heard every address message
+
+        # Ticks 1-2 fail (no store anywhere); tick 3 opens both, tick 4 drains.
+        self.assertEqual(relayed_counts, [0, 0, 0, 1])
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING", "ERROR"])
+        for cache in (leader, follower):
+            self.assertIsNotNone(cache._pp_ready_store)
+            self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
+
+    def test_pp0_warns_once_when_a_stage_never_reports(self):
+        """A stage whose epoch is out of step never reports; PP0 relays 0 and
+        must say so once instead of stalling silently."""
+        leader = self._storage_stage(0, _StoreGroup(), backups=1)
+        with (
+            patch(
+                "sglang.srt.mem_cache.unified_radix_cache._STORAGE_UNREPORTED_WARN_ROUNDS",
+                2,
+            ),
+            self.assertLogs(
+                "sglang.srt.mem_cache.unified_radix_cache", level="WARNING"
+            ) as logs,
+        ):
+            relayed = [self._leader_round(leader)[1] for _ in range(3)]
+        self.assertEqual(relayed, [0, 0, 0])
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("PP ranks [1]", logs.output[0])
 
 
 if __name__ == "__main__":
