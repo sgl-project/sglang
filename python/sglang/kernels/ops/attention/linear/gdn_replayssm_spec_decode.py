@@ -943,6 +943,9 @@ def gdn_replayssm_compact_commit_persistent_kernel(
             else:
                 track_len = 0
 
+            # Zero rejected lanes at load time. A zero decay does not mask NaN
+            # or Inf, including a non-finite key fed to the tensor-core dot.
+            history_mask = o_t < tl.where(fold_active, n_history, track_len)
             task = pid
             while task < per_row_tasks:
                 i_v = task % nv
@@ -981,18 +984,22 @@ def gdn_replayssm_compact_commit_persistent_kernel(
                     k_l
                     + replay_idx * stride_k_slot
                     + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
-                    + o_k[None, :]
+                    + o_k[None, :],
+                    mask=history_mask[:, None],
+                    other=0.0,
                 )
                 updates = tl.load(
                     d_l
                     + replay_idx * stride_d_slot
                     + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
                     + o_v[None, :],
-                    mask=mask_v[None, :],
+                    mask=history_mask[:, None] & mask_v[None, :],
                     other=0.0,
                 ).to(tl.float32)
                 gates = tl.load(
-                    g_l + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
+                    g_l + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys,
+                    mask=history_mask,
+                    other=0.0,
                 ).to(tl.float32)
 
                 if fold_active:
@@ -1026,9 +1033,17 @@ def gdn_replayssm_compact_commit_persistent_kernel(
                         track_decay = tl.where(
                             track_mask, tl.exp(track_total - track_prefix), 0.0
                         )
-                        track_updates = updates * track_decay[:, None]
-                        track_hi = track_updates.to(k_cache.dtype.element_ty)
-                        track_delta = tl.dot(tl.trans(keys), track_hi)
+                        # A simultaneous active fold can have a longer prefix
+                        # than the tracking snapshot.
+                        track_keys = keys
+                        track_updates = updates
+                        if fold_active:
+                            track_keys = tl.where(track_mask[:, None], keys, 0.0)
+                            track_updates = tl.where(track_mask[:, None], updates, 0.0)
+                        track_hi = (track_updates * track_decay[:, None]).to(
+                            k_cache.dtype.element_ty
+                        )
+                        track_delta = tl.dot(tl.trans(track_keys), track_hi)
                         track_state = old_state * tl.exp(track_total) + track_delta
                         p_track = (
                             h0_l
