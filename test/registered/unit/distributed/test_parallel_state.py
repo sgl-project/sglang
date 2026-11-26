@@ -504,13 +504,139 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             mock_world.local_rank = 0
             mock_world_group.return_value = mock_world
 
-            publish_build_topology(tp_size=8, pp_size=1, dcp_size=8)
+            publish_build_topology(tp_size=8, pp_size=1, dcp_size=4)
             parallel_state.initialize_model_parallel()
 
             assert created_group_kwargs["dcp"]["use_quick_allreduce"] is False
             assert "use_quick_allreduce" not in created_group_kwargs["tp"]
 
             parallel_state.destroy_model_parallel()
+
+
+def _init_tp8_dcp(
+    is_hip, dcp_size=8, tp_quick_allreduce=None, other_rank_qr_runs=False
+):
+    """tp_quick_allreduce: None (no QR communicator), "disabled" or "enabled";
+    other_rank_qr_runs: whether another rank's TP group runs QR."""
+    created = {}
+
+    def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
+        group = Mock()
+        group.device_group = Mock()
+        group.qr_comm = None
+        if tp_quick_allreduce is not None and kwargs.get("group_name") == "tp":
+            group.qr_comm = Mock(disabled=tp_quick_allreduce == "disabled")
+        created[kwargs.get("group_name", "unknown")] = group
+        return group
+
+    with (
+        patch.object(parallel_state, "_WORLD", None),
+        patch.object(parallel_state, "_TP", None),
+        patch.object(parallel_state, "_DCP", None),
+        patch.object(parallel_state, "_ATTN_CP", None),
+        patch.object(parallel_state, "_ATTN_TP", None),
+        patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "is_hip", return_value=is_hip),
+        patch.object(parallel_state, "is_cuda", return_value=not is_hip),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=8),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_backend", return_value="nccl"),
+        patch.dict(
+            sys.modules,
+            {"sglang.srt.layers.sampler": Mock(SYNC_TOKEN_IDS_ACROSS_TP=False)},
+        ),
+        patch.object(
+            parallel_state,
+            "init_model_parallel_group",
+            side_effect=mock_init_model_parallel_group,
+        ),
+        patch.object(parallel_state, "get_world_group") as mock_world_group,
+        patch.object(
+            parallel_state,
+            "_any_rank_in_world",
+            side_effect=lambda flag: flag or other_rank_qr_runs,
+        ),
+    ):
+        mock_world = Mock()
+        mock_world.device_group = Mock()
+        mock_world.local_rank = 0
+        mock_world_group.return_value = mock_world
+
+        publish_build_topology(tp_size=8, pp_size=1, dcp_size=dcp_size)
+        parallel_state.initialize_model_parallel()
+        tp, dcp = parallel_state._TP, parallel_state._DCP
+        parallel_state.destroy_model_parallel()
+        dcp_destroys = dcp.destroy.call_count if dcp is not None else 0
+        return created, tp, dcp, dcp_destroys, tp.destroy.call_count
+
+
+def test_hip_full_width_dcp_reuses_tp_group():
+    """On ROCm, DCP spanning the whole TP group must not build a second coordinator,
+    and teardown must not destroy the shared TP group once more for DCP."""
+    created, tp, dcp, _, tp_destroys = _init_tp8_dcp(is_hip=True)
+    assert "dcp" not in created
+    assert dcp is tp
+    *_, tp_destroys_without_dcp = _init_tp8_dcp(is_hip=True, dcp_size=1)
+    assert tp_destroys == tp_destroys_without_dcp
+
+
+def test_non_hip_full_width_dcp_keeps_separate_group():
+    created, tp, dcp, dcp_destroys, _ = _init_tp8_dcp(is_hip=False)
+    assert "dcp" in created
+    assert dcp is not tp
+    assert dcp_destroys == 1
+
+
+def test_hip_full_width_dcp_keeps_separate_group_when_tp_quick_allreduce_runs():
+    """DCP must not reach an enabled TP QuickAllReduce: a quantized QR regime would
+    round the bf16 all-reduce of DCP's MHA merge, so DCP keeps its own QR-free group."""
+    created, tp, dcp, dcp_destroys, _ = _init_tp8_dcp(
+        is_hip=True, tp_quick_allreduce="enabled"
+    )
+    assert dcp is not tp
+    assert created["dcp"] is dcp
+    assert dcp.qr_comm is None
+    assert dcp_destroys == 1
+
+
+def test_hip_full_width_dcp_follows_any_rank_whose_tp_quick_allreduce_runs():
+    """Ranks must agree on building DCP groups: if another TP group runs QR, a rank
+    whose own QR is disabled still builds the DCP group instead of aliasing."""
+    created, tp, dcp, _, _ = _init_tp8_dcp(
+        is_hip=True, tp_quick_allreduce="disabled", other_rank_qr_runs=True
+    )
+    assert dcp is not tp
+    assert created["dcp"] is dcp
+
+
+def test_hip_full_width_dcp_reuses_tp_group_when_tp_quick_allreduce_is_disabled():
+    """A disabled QR (ROCM_QUICK_REDUCE_QUANTIZATION=NONE, the default) never
+    dispatches, so DCP still reuses TP's coordinator."""
+    created, tp, dcp, _, _ = _init_tp8_dcp(is_hip=True, tp_quick_allreduce="disabled")
+    assert "dcp" not in created
+    assert dcp is tp
+
+
+def test_destroy_model_parallel_destroys_each_aliased_group_once():
+    """Groups that alias TP (DCP, attention CP/TP, MoE) must not destroy the shared
+    coordinator again, whichever of them aliases it."""
+    tp, pp = Mock(), Mock()
+    with (
+        patch.object(parallel_state, "_SHARED_EXPERTS_TP", tp),
+        patch.object(parallel_state, "_TP", tp),
+        patch.object(parallel_state, "_PP", pp),
+        patch.object(parallel_state, "_DCP", tp),
+        patch.object(parallel_state, "_MOE_EP", tp),
+        patch.object(parallel_state, "_MOE_TP", tp),
+        patch.object(parallel_state, "_MOE_DP", tp),
+        patch.object(parallel_state, "_ATTN_CP", tp),
+        patch.object(parallel_state, "_ATTN_TP", tp),
+    ):
+        parallel_state.destroy_model_parallel()
+        assert parallel_state._TP is None and parallel_state._ATTN_TP is None
+    assert tp.destroy.call_count == 1
+    assert pp.destroy.call_count == 1
 
 
 def _read_group_descs(group_name):
