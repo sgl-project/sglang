@@ -2,16 +2,19 @@
 
 import hashlib
 import math
+import random
 import sys
 from array import array
 from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import msgspec
 import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.tree_slots import core_window_evictable, core_window_protected
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
@@ -25,6 +28,7 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import PrefetchAck
 from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.managers.schedule_batch import Req
@@ -41,7 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.events import LoRANameTable
+from sglang.srt.mem_cache.events import KvEventLoraNames, LoRANameTable
 from sglang.srt.mem_cache.evict_policy import TLRUStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -49,6 +53,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
@@ -58,6 +66,7 @@ from sglang.srt.mem_cache.rust_tree_core.adapter import (
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings as mem_cache
 from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
+from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     ComponentAction,
@@ -80,9 +89,18 @@ from sglang.srt.mem_cache.utils import (
     hash_str_to_int64,
 )
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.tree_slots import FAMILY_OF, index_slots, slot_of, tree_slots_of
+from sglang.srt.server_args import ServerArgs
+from sglang.test.tree_slots import (
+    CUSTOM_WINDOW_COMPONENT,
+    FAMILY_OF,
+    index_slots,
+    slot_of,
+    storage_tree_slots,
+    tree_slots_of,
+)
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 
 def _slots(*components):
@@ -817,6 +835,218 @@ def test_tlru_host_refill_raises_device_ancestor_history(backend):
 def test_eviction_config_rejects_unknown_constructor_options(policy, config):
     with pytest.raises(TypeError):
         _tree_core(eviction_policy=policy, eviction_policy_config=config)
+
+
+@pytest.fixture
+def published_server_args():
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    yield
+    reset_context()
+
+
+def _joint_lru_cache(backend):
+    bundle = build_test_unified_pools(
+        device="cpu",
+        kv_cache_dtype=torch.float16,
+        page_size=1,
+        start_layer=0,
+        end_layer=8,
+        full_attention_layer_ids=[0, 1],
+        swa_attention_layer_ids=list(range(2, 8)),
+        head_num=2,
+        head_dim=4,
+        swa_head_num=2,
+        swa_head_dim=4,
+        sliding_window_size=4,
+        full_max_total_num_tokens=48,
+        swa_max_total_num_tokens=48,
+        total_bytes=48 * (2 + 6) * 2 * 2 * 4 * 2,
+        lazy_compaction=True,
+    )
+    allocator = bundle.token_to_kv_pool_allocator
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            sliding_window_size=4,
+            tree_slots=storage_tree_slots(allocator.storage, window=4),
+            tree_core_backend=backend,
+            eviction_policy="joint_lru",
+        )
+    )
+    assert cache._tree_core_backend == backend
+    allocator.lazy_compaction = True
+    for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+        sub_pool.lazy_compaction = True
+    victims = []
+    select = cache.tree_core.next_joint_eviction_victim
+
+    def recorded():
+        victim = select()
+        victims.append(None if victim is None else victim[0])
+        return victim
+
+    cache.tree_core.next_joint_eviction_victim = recorded
+    return cache, allocator, victims
+
+
+def _joint_lru_block_moves(allocator, blocked):
+    # A fixed page forbids the moves compaction needs.
+    for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+        sub_pool.unfix_pages("blocked")
+        if blocked:
+            sub_pool.fix_pages("blocked", [sub_pool.min_page_index])
+
+
+def _joint_lru_state(cache, allocator, seqs):
+    core = cache.tree_core
+    components = (ComponentType.FULL, core.slot_id(TREE_WINDOW))
+    return (
+        allocator.full_attn_allocator.allocated_count(),
+        allocator.swa_attn_allocator.allocated_count(),
+        tuple(core.component_evictable_size(ct) for ct in components),
+        tuple(core.component_protected_size(ct) for ct in components),
+        tuple(core.match_full_device_prefix(_key(s))[0] for s in seqs),
+    )
+
+
+@pytest.mark.usefixtures("published_server_args")
+@pytest.mark.parametrize("seed", range(10))
+def test_joint_eviction_matches_the_python_tree_core(seed):
+    rng = random.Random(seed)
+    sides = {backend: _joint_lru_cache(backend) for backend in ("python", "rust")}
+    seqs, locks = [], {backend: [] for backend in sides}
+    prefixes = [[1, 2], [1, 2, 3], [10, 11], [20], [1, 5]]
+    for step in range(60):
+        r = rng.random()
+        if r < 0.5:
+            tail = [rng.randint(30, 60) for _ in range(rng.randint(0, 5))]
+            op = ("insert", rng.choice(prefixes) + tail)
+        elif r < 0.7 and seqs:
+            s = rng.choice(seqs)
+            op = ("match", s[: rng.randint(1, len(s))])
+        elif r < 0.8 and seqs:
+            op = ("lock", rng.choice(seqs), rng.random() < 0.5)
+        else:
+            op = ("evict", rng.randint(1, 24), rng.randint(0, 24), rng.random() < 0.7)
+        outcome = {}
+        for backend, (cache, allocator, victims) in sides.items():
+            start = len(victims)
+            if op[0] == "insert":
+                value = allocator.alloc(len(op[1]))
+                if value is None:
+                    _joint_lru_block_moves(allocator, False)
+                    allocator.evict_to_free_tokens(cache, len(op[1]))
+                    value = allocator.alloc(len(op[1]))
+                if value is not None:
+                    cache.insert(InsertParams(key=_key(op[1]), value=value))
+                outcome[backend] = (value is not None, victims[start:])
+            elif op[0] == "match":
+                outcome[backend] = cache.match_prefix(
+                    MatchPrefixParams(_key(op[1]))
+                ).device_prefix_len
+            elif op[0] == "lock":
+                if op[2] and locks[backend]:
+                    cache.unlock(locks[backend].pop(0))
+                    outcome[backend] = "unlocked"
+                else:
+                    result = cache.match_prefix(MatchPrefixParams(_key(op[1])))
+                    locks[backend].append(cache.lock(result.last_device_node))
+                    outcome[backend] = result.device_prefix_len
+            else:
+                _, full_tokens, swa_tokens, moves = op
+                _joint_lru_block_moves(allocator, not moves)
+                window = allocator.swa_attn_allocator.sub_pool_name
+                result = cache.evict(
+                    EvictParams(
+                        num_tokens=full_tokens,
+                        window_num_tokens={window: swa_tokens} if swa_tokens else {},
+                    )
+                )
+                outcome[backend] = (
+                    result.num_tokens_evicted,
+                    result.window_num_tokens_evicted.get(window, 0),
+                    victims[start:],
+                )
+        if op[0] == "insert" and all(o[0] for o in outcome.values()):
+            if op[1] not in seqs:
+                seqs.append(op[1])
+        states = {b: _joint_lru_state(c, a, seqs) for b, (c, a, _) in sides.items()}
+        assert outcome["python"] == outcome["rust"], (step, op)
+        assert states["python"] == states["rust"], (step, op)
+    # The workload reaches both sides of the joint walk.
+    window = sides["python"][0].tree_core.slot_id(TREE_WINDOW)
+    assert {ComponentType.FULL, window} <= set(sides["python"][2])
+
+
+def _joint_lru_node_paths(core, seqs):
+    """Map each node that ends on a prefix of ``seqs`` to its root path."""
+    paths = {}
+    for seq in seqs:
+        for end in range(1, len(seq) + 1):
+            matched, node_id, pinned = core.match_full_device_prefix(_key(seq[:end]))
+            if matched == pinned == end:
+                paths[node_id] = tuple(seq[:end])
+    return paths
+
+
+def _joint_lru_split_tree(cache, allocator):
+    # SWA keeps 4 tokens, all in the 5-token tail, so the split prefix keeps its access.
+    seqs = [list(range(1, 11)), [1, 2, 3, 4, 5, 6, 7, 8, 50, 51, 52, 53, 54]]
+    for tokens in seqs:
+        cache.insert(InsertParams(key=_key(tokens), value=allocator.alloc(len(tokens))))
+    return seqs
+
+
+def _joint_lru_refreshed_tree(cache, allocator):
+    # Matching [1..10] refreshes SWA only on [7..10]; [1..4] gets Full access, not SWA.
+    for tokens in ([1, 2, 3, 4], list(range(1, 11)), [20, 21]):
+        cache.insert(InsertParams(key=_key(tokens), value=allocator.alloc(len(tokens))))
+    cache.match_prefix(MatchPrefixParams(_key(list(range(1, 11)))))
+    return [list(range(1, 11)), [20, 21]]
+
+
+@pytest.mark.usefixtures("published_server_args")
+@pytest.mark.parametrize("build", [_joint_lru_split_tree, _joint_lru_refreshed_tree])
+def test_joint_eviction_order_matches_the_python_tree_core(build):
+    orders = {}
+    for backend in ("python", "rust"):
+        cache, allocator, _ = _joint_lru_cache(backend)
+        seqs = build(cache, allocator)
+        core = cache.tree_core
+        paths = _joint_lru_node_paths(core, seqs)
+        core.start_joint_eviction()
+        try:
+            orders[backend] = [
+                (component, paths[node_id])
+                for component, node_id in iter(core.next_joint_eviction_victim, None)
+            ]
+        finally:
+            core.end_joint_eviction()
+    assert orders["python"] == orders["rust"]
+    assert orders["python"]
+
+
+@pytest.mark.parametrize(
+    "binding_cls",
+    [mem_cache.RustUnifiedTreeCoreBinding, mem_cache.RustBigramUnifiedTreeCoreBinding],
+)
+def test_unified_bindings_forward_the_joint_walk(binding_cls):
+    binding = binding_cls(
+        mem_cache.TreeCoreInitParamsBinding(
+            page_size=1,
+            swa_sliding_window_size=4,
+            eviction_policy="joint_lru",
+            joint_lru=True,
+        ),
+        _slots(ComponentType.FULL, ComponentType.SWA),
+    )
+    binding.start_joint_eviction()
+    assert binding.next_joint_eviction_victim() is None
+    binding.end_joint_eviction()
 
 
 def test_stale_handle_reads_raise_key_error_without_poisoning_the_core():
@@ -1840,7 +2070,7 @@ def test_host_lock_refs_round_trip(swa, missing_receipt):
         return  # A Rust ownership violation poisons the core.
     core.dec_host_lock_ref(leaf, params)
     if swa:
-        assert core.swa_protected_size() == 1
+        assert core_window_protected(core) == 1
     core.dec_lock_ref(leaf, device_lock.to_dec_params())
     core.sanity_check([], [])
 
@@ -2085,6 +2315,77 @@ def test_dynamo_format_events_match_python_hashes_and_name_the_adapter():
     assert core.take_events() == [
         BlockRemoved(block_hashes=namespaced, medium=StorageMedium.GPU)
     ]
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("dynamo_format", [False, True])
+@pytest.mark.parametrize("is_eagle", [False, True])
+@pytest.mark.parametrize(
+    "salt, adapter",
+    [
+        (None, None),
+        ("tenant-a", None),
+        (None, "adapter-a"),
+        ("tenant-a", "adapter-a"),
+    ],
+)
+def test_storage_key_binding_matches_published_event_ids(
+    backend, dynamo_format, is_eagle, salt, adapter
+):
+    """Hinted storage keys bind to the IDs each tree core publishes.
+
+    With EAGLE, keys are bigrams: the matched prefix holds one raw token per
+    bigram and the new key's raw tokens start with the shared boundary token.
+    """
+    lora_id = "a" * 32
+    extra_key = None if adapter is None else "user-" + lora_id
+    lora_names = KvEventLoraNames()
+    if adapter is not None:
+        lora_names.register(lora_id=lora_id, lora_name=adapter)
+        lora_names.register(SimpleNamespace(extra_key=extra_key, lora_id=lora_id))
+    core = _tree_core(
+        backend,
+        enable_kv_cache_events=True,
+        page_size=2,
+        dynamo_kv_event_format=dynamo_format,
+        kv_event_lora_names=lora_names,
+        is_eagle=is_eagle,
+    )
+    tokens = array("q", range(1, 9 + is_eagle))
+    key = RadixKey(tokens, extra_key=extra_key, cache_salt=salt, is_bigram=is_eagle)
+    _pump_insert(
+        core, InsertParams(key=key, value=torch.arange(10, 18, dtype=torch.int64))
+    )
+    event_ids = [
+        block_hash & ((1 << 64) - 1)
+        for event in core.kv_events.take()
+        if isinstance(event, BlockStored)
+        for block_hash in event.block_hashes
+    ]
+    storage_keys = get_storage_hash_str(key, page_size=2)
+    assert len(event_ids) == len(storage_keys) == 4
+    if salt is None and adapter is None:
+        # Un-namespaced hints carry no map; the event ID is the storage key's.
+        assert event_ids == [int(page_key[:16], 16) for page_key in storage_keys]
+
+    seed = core.kv_events.namespace_seed(extra_key, salt)
+    for prefix_pages in range(4):
+        split = 2 * prefix_pages
+        binding = storage_key_to_event_hashes(
+            RadixKey(
+                tokens[split:],
+                extra_key=extra_key,
+                cache_salt=salt,
+                is_bigram=is_eagle,
+            ),
+            2,
+            tokens[:split].tolist(),
+            storage_keys[prefix_pages - 1] if prefix_pages else None,
+            namespace_seed=seed,
+        )
+        assert binding == dict(
+            zip(storage_keys[prefix_pages:], event_ids[prefix_pages:])
+        )
 
 
 def test_salted_eagle_events_match_the_bigram_hash_contract():
@@ -2711,20 +3012,10 @@ def test_swa_backup_resolves_relocated_full_virtual_ids(backend, unified, entryp
         )
     assert swa.nodes_to_load == [nodes[0], nodes[2]]
     assert swa.device_indices.dtype == torch.int64
-    assert swa.device_indices.tolist() == (
-        [511, 407, 613] if unified else [111, 107, 113]
-    )
-    if unified:
-        allocator.translate_swa_indices_for_transfer.assert_called_once()
-        assert allocator.translate_swa_indices_for_transfer.call_args.args[
-            0
-        ].tolist() == [
-            11,
-            7,
-            13,
-        ]
-    else:
-        allocator.translate_swa_indices_for_transfer.assert_not_called()
+    # A unified pool's window copy names its rows by the owner's ids and
+    # translates them when submitted, so a relocation before then is seen.
+    assert swa.device_indices.tolist() == ([11, 7, 13] if unified else [111, 107, 113])
+    allocator.translate_swa_indices_for_transfer.assert_not_called()
     assert core.get_component_device_value(nodes[0], ComponentType.SWA).tolist() == [
         111,
         107,
@@ -3094,7 +3385,11 @@ def test_internal_swa_write_back_preserves_window_until_ack(
     _mock_swa_write_back_io(case, backup)
     cache, core = case.cache, case.core
     parent, leaf = case.nodes
-    params = EvictParams(num_tokens=0, swa_num_tokens=case.segment)
+    params = EvictParams(
+        window_num_tokens={
+            cache.window_sub_pool_of_slot(ComponentType.SWA): case.segment
+        }
+    )
     if backup in ("raised", "ack_raised"):
         with pytest.raises(RuntimeError, match="DMA .* failed"):
             cache.evict(params)
@@ -3111,14 +3406,24 @@ def test_internal_swa_write_back_preserves_window_until_ack(
         # The driver's finally block must discard the paused walk even when
         # submission or completion fails, so a new eviction can make progress.
         _mock_swa_write_back_io(case)
-        assert cache.evict(params).swa_num_tokens_evicted == case.segment
+        assert (
+            cache.evict(params).window_num_tokens_evicted.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            )
+            == case.segment
+        )
         assert core.get_component_device_value(parent, ComponentType.SWA) is None
         cache.dec_lock_ref(leaf, case.leaf_lock)
         core.sanity_check([], [])
         return
 
     result = cache.evict(params)
-    assert result.swa_num_tokens_evicted == case.segment
+    assert (
+        result.window_num_tokens_evicted.get(
+            cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+        )
+        == case.segment
+    )
     assert result.num_tokens_evicted == 0
     assert result.mamba_num_evicted == int(with_mamba)
     if with_mamba:
@@ -3146,7 +3451,12 @@ def test_internal_swa_write_back_preserves_window_until_ack(
         assert matched.best_match_node == parent
         assert matched.device_prefix_len == 0
         assert matched.full_kv_hit_length == case.segment
-        assert matched.swa_host_hit_length == case.segment
+        assert (
+            matched.window_host_hit_lengths.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            )
+            == case.segment
+        )
         assert matched.mamba_host_hit_length == int(with_mamba)
         (transfer,) = core.build_hicache_transfers(
             ComponentType.SWA, parent, CacheTransferPhase.LOAD_BACK
@@ -3166,8 +3476,19 @@ def test_internal_swa_write_back_reserves_entire_unbacked_window(backend):
     # SWA LRU, and its backup window includes both unbacked prefix segments.
     cache.match_prefix(MatchPrefixParams(key=_key(list(range(case.segment)))))
     _mock_swa_write_back_io(case, "host_pressure")
-    result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=case.segment))
-    assert result.swa_num_tokens_evicted == case.segment
+    result = cache.evict(
+        EvictParams(
+            window_num_tokens={
+                cache.window_sub_pool_of_slot(ComponentType.SWA): case.segment
+            }
+        )
+    )
+    assert (
+        result.window_num_tokens_evicted.get(
+            cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+        )
+        == case.segment
+    )
     assert case.events[:2] == [("host_evict", 2 * case.segment), ("write", victim)]
     (submission,) = case.submissions
     (transfer,) = submission[2][ComponentType.SWA]
@@ -3221,8 +3542,14 @@ def test_internal_swa_write_back_respects_active_window_locks(backend, guard):
         cache._finish_write_through_ack(parent)
     assert (
         cache.evict(
-            EvictParams(num_tokens=0, swa_num_tokens=case.segment)
-        ).swa_num_tokens_evicted
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): case.segment
+                }
+            )
+        ).window_num_tokens_evicted.get(
+            cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+        )
         == case.segment
     )
     assert core.component_has_host_value_only(parent, ComponentType.SWA)
@@ -3249,8 +3576,14 @@ def test_internal_swa_write_back_follows_runtime_policy_update(backend):
     assert cache._tree_core_backend == backend
     assert (
         cache.evict(
-            EvictParams(num_tokens=0, swa_num_tokens=case.segment)
-        ).swa_num_tokens_evicted
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): case.segment
+                }
+            )
+        ).window_num_tokens_evicted.get(
+            cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+        )
         == case.segment
     )
     assert core.component_has_host_value_only(case.nodes[0], ComponentType.SWA)
@@ -3670,7 +4003,7 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     class AuxiliarySWAComponent(SWAComponent):
-        component_type = ComponentType.AUXILIARY_SWA
+        component_type = CUSTOM_WINDOW_COMPONENT
 
         def _publish_window(self, node, cache_actions):
             cache_actions.append(
@@ -3690,10 +4023,10 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
             page_size=1,
             sliding_window_size=4,
             tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.AUXILIARY_SWA), window=4
+                (ComponentType.FULL, CUSTOM_WINDOW_COMPONENT), window=4
             ),
             component_registry_override={
-                FAMILY_OF[ComponentType.AUXILIARY_SWA]: AuxiliarySWAComponent
+                FAMILY_OF[CUSTOM_WINDOW_COMPONENT]: AuxiliarySWAComponent
             },
             tree_core_backend="python",
         )
@@ -3707,7 +4040,7 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
         InsertParams(key=_key(list(range(6))), value=values, prev_prefix_len=2)
     ).last_device_node
     lock = cache.inc_lock_ref(leaf).to_dec_params()
-    component = ComponentType.AUXILIARY_SWA
+    component = CUSTOM_WINDOW_COMPONENT
     original = core.get_component_device_value(parent, component).clone()
     core.set_hicache_enabled()
     core.has_swa_host_pool = True
@@ -4206,7 +4539,7 @@ def test_swa_window_repair_with_page_rounded_window(backend, is_bigram):
         (0, 8)
     ]
     assert core.full_evictable_size() == 16
-    assert core.swa_evictable_size() == 8
+    assert core_window_evictable(core) == 8
     core.sanity_check([], [])
 
 
@@ -4271,7 +4604,7 @@ def test_swa_window_repair_preserves_full_slots_and_key_namespace(page_size, is_
             == []
         )
     assert core.full_evictable_size() == 8
-    assert core.swa_evictable_size() == 4
+    assert core_window_evictable(core) == 4
     core.sanity_check([], [])
 
 
@@ -4300,12 +4633,12 @@ def test_swa_window_repair_returns_split_actions_and_balances_existing_locks():
         assert action.old_node_id == leaf
         assert action.new_child_node_id == leaf
     assert actions[0].new_node_id != actions[1].new_node_id
-    assert core.swa_protected_size() == 4
-    assert core.swa_evictable_size() == 0
+    assert core_window_protected(core) == 4
+    assert core_window_evictable(core) == 0
     core.finish_write_through([action.new_node_id for action in actions] + [leaf], leaf)
     core.dec_lock_ref(leaf, receipt.to_dec_params())
-    assert core.swa_protected_size() == 0
-    assert core.swa_evictable_size() == 4
+    assert core_window_protected(core) == 0
+    assert core_window_evictable(core) == 4
     core.sanity_check([], [])
 
 
@@ -4339,7 +4672,7 @@ def test_swa_window_repair_rejects_invalid_publication_without_partial_changes()
         (0, 2),
         (6, 8),
     ]
-    assert core.swa_evictable_size() == 4
+    assert core_window_evictable(core) == 4
     core.sanity_check([], [])
 
 
@@ -4362,6 +4695,36 @@ def test_swa_straddling_insert_crosses_the_boundary_actions():
     # Below the floor the duplicate's SWA peers are gone: full side only.
     assert isinstance(free_duplicates, FreeDeviceKVFullOnly)
     assert free_duplicates.indices[0].tolist() == [20, 21]
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize(
+    "swa_evicted_seqlen, expected_frees",
+    [
+        pytest.param(0, [([10, 11, 12, 13], True)], id="whole_node"),
+        pytest.param(2, [([12, 13], True), ([20, 21], False)], id="partial"),
+    ],
+)
+def test_full_only_frees_say_whether_they_free_a_tree_value(
+    backend, swa_evicted_seqlen, expected_frees
+):
+    core, _ = _swa_transfer_core(backend, window=8)
+    # The first insert's SWARebuild stays unapplied, so the node is an SWA tombstone.
+    _insert(core, [1, 2, 3, 4], [10, 11, 12, 13])
+    result = _pump_insert(
+        core,
+        InsertParams(
+            key=_key([1, 2, 3, 4]),
+            value=torch.tensor([20, 21, 22, 23], dtype=torch.int64),
+            component_evicted_seqlens={ComponentType.SWA: swa_evicted_seqlen},
+        ),
+    )
+    frees = [
+        (torch.cat(action.indices).tolist(), action.tree_owned)
+        for action in result.cache_actions
+        if isinstance(action, FreeDeviceKVFullOnly)
+    ]
+    assert frees == expected_frees
 
 
 def test_every_pool_name_crosses_the_prefetch_commit_boundary():
@@ -4486,7 +4849,7 @@ def test_skipped_mamba_lock_survives_swa_only_release_through_the_adapter():
     assert core.mamba_protected_size() == 1
     core.dec_lock_ref(node, owner.to_dec_params())
     assert core.protected_size() == 0
-    assert core.swa_protected_size() == 0
+    assert core_window_protected(core) == 0
     assert core.mamba_protected_size() == 0
 
 
@@ -4928,6 +5291,40 @@ def test_fresh_swa_leaf_forwards_buffer_split_action(backend, window):
     )
 
 
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("buffer_only", [False, True])
+@pytest.mark.parametrize("inserted_len", [0, 2])
+def test_buffer_only_insert_lists_each_unbacked_ancestor_once(
+    backend, buffer_only, inserted_len
+):
+    core = _tree_core(backend)
+    # One node per token, so the path holds four unbacked nodes.
+    for n in range(1, 5):
+        _insert(core, list(range(n)), list(range(n)))
+    core.set_hicache_enabled()
+    if buffer_only:
+        core.set_host_memory_buffer_only()
+    core.write_through_threshold = 1
+    result = _pump_insert(
+        core,
+        InsertParams(
+            key=_key(list(range(5))),
+            value=torch.arange(5, dtype=torch.int64),
+            inserted_len=inserted_len,
+        ),
+    )
+    chains = [a.node_ids for a in result.cache_actions if isinstance(a, BackupKV)]
+    (path,) = core.collect_path_info([result.last_device_node])
+    nodes = [node.node_id for node in path]
+    # Nodes the request already inserted are not counted, so the first backup carries them.
+    first = inserted_len + 1
+    if buffer_only:
+        # A buffer-only walk lists each node once: later chains stop at the previous tail.
+        assert chains == [nodes[:first]] + [[node] for node in nodes[first:]]
+    else:
+        assert chains == [nodes[:end] for end in range(first, len(nodes) + 1)]
+
+
 def test_python_fresh_swa_leaf_cap_rejects_write_through_ack():
     core, _ = _swa_transfer_core("python", window=2)
     core.set_host_memory_buffer_only()
@@ -4974,7 +5371,7 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
         total_bytes=4096,
         enable_memory_saver=False,
         need_sort=False,
-        lazy_compaction=False,
+        lazy_compaction=True,
     )
     allocator = bundle.token_to_kv_pool_allocator
     padding = allocator.alloc(4)
@@ -5016,11 +5413,11 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
     assert full_indices.numel() == 0
     (swa_transfer,) = transfers[ComponentType.SWA]
     assert swa_transfer.nodes_to_load == [source_id for source_id, _ in sources]
+    # The unified pool's window copy names its rows by the owner's ids; it
+    # translates them when submitted.
     assert torch.equal(
         swa_transfer.device_indices,
-        allocator.translate_swa_indices_for_transfer(
-            torch.cat([source_values for _, source_values in sources])
-        ),
+        torch.cat([source_values for _, source_values in sources]).to(torch.int64),
     )
 
 
@@ -5099,6 +5496,104 @@ def test_swa_prefetch_commit_end_to_end():
     assert release.host_indices[0].tolist() == [50, 51]
 
 
+def _named_window_core(name: str, window: int):
+    """A window tree core whose window keeps its HiCache copies in the host
+    pool ``name`` (a window sub-pool's), which the core calls `swa`."""
+    slots = tuple(
+        (
+            msgspec.structs.replace(slot, host_pool=name)
+            if slot.family == TREE_WINDOW
+            else slot
+        )
+        for slot in tree_slots_of(
+            (ComponentType.FULL, ComponentType.SWA), window=window
+        )
+    )
+    core = _tree_core(tree_slots=slots, sliding_window_size=window)
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    return core
+
+
+def _reduced_ack(pool_hits, host_pools):
+    """A prefetch ACK reduced as the host-cache controller reduces it, on the
+    one rank of its group, which registers ``host_pools``."""
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.mem_pool_host = SimpleNamespace(entry_map=dict.fromkeys(host_pools))
+    controller.prefetch_completion_sync_groups = [None]
+    controller._host_pool_schemas = []
+    controller._all_gather_object = lambda obj, group: [obj]
+    controller._all_reduce = lambda tensor, op, groups: None
+    ack = PrefetchAck(rid="r", operation=None, pool_hits=dict(pool_hits))
+    controller._reduce_prefetch_ack(ack)
+    return ack
+
+
+def _commit_window_prefetch(core, name, host_indices, extra_pool_hit_pages):
+    """Insert a prefetched three-token suffix, then commit its window's host
+    buffer with the storage result the cache updates from the ACK."""
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+
+    anchor = core.match_prefix(MatchPrefixParams(key=_key([99]))).best_match_node
+    insert_result = core.insert_host(
+        anchor,
+        _key([1, 2, 3]),
+        torch.tensor([100, 101, 102], dtype=torch.int64),
+        ["h0", "h1", "h2"],
+    )
+    result = PoolTransferResult(kv_hit_pages=3, extra_pool_hit_pages={})
+    result.update_extra_pool_hit_pages(extra_pool_hit_pages)
+    actions = []
+    core.commit_hicache_transfers(
+        anchor,
+        CacheTransferPhase.PREFETCH,
+        {
+            ComponentType.SWA: [
+                PoolTransfer(
+                    name=name,
+                    host_indices=torch.tensor(host_indices, dtype=torch.int64),
+                )
+            ]
+        },
+        cache_actions=actions,
+        insert_result=insert_result,
+        pool_storage_result=result,
+    )
+    return actions
+
+
+@pytest.mark.parametrize("loaded", [True, False])
+def test_named_window_prefetch_ack_reaches_the_core(loaded):
+    """BUG REGRESSION. A named window's prefetch hit count must reach the core
+    through the reduced ACK, so a fully loaded window keeps its host buffer."""
+    name = "window_4"
+    core = _named_window_core(name, window=4)
+    ack = _reduced_ack({name: 2} if loaded else {}, (PoolName.KV, name))
+    assert set(ack.pool_hits) <= {str(PoolName.KV), name}
+    actions = _commit_window_prefetch(core, name, [30, 31], ack.pool_hits)
+    if loaded:
+        # The whole window loaded: its tail is attached, nothing is freed.
+        assert actions == []
+    else:
+        # A failed read frees the prefetched host buffer.
+        (free,) = actions
+        assert isinstance(free, FreeComponentHostSlot)
+        assert free.host_indices[0].tolist() == [30, 31]
+
+
+@pytest.mark.parametrize("alias_first", [True, False])
+def test_named_window_pool_wins_over_its_core_alias(alias_first):
+    """A storage result may also carry an entry under the core's own window
+    name; the pool that was read decides, whichever comes first."""
+    name = "window_4"
+    core = _named_window_core(name, window=4)
+    hits = [(name, 2), (str(PoolName.SWA), 0)]
+    actions = _commit_window_prefetch(
+        core, name, [30, 31], dict(hits[::-1] if alias_first else hits)
+    )
+    assert actions == []
+
+
 def test_swa_locked_overlap_defers_through_the_recover_action():
     core = _swa_tree_core(window=8)
     first = _insert(core, [1, 2], [10, 11])
@@ -5145,15 +5640,15 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
     assert result.component_lock_uuids[ComponentType.SWA] is not None
     assert not result.component_host_lock_uuids
     # The locked window is protected SWA accounting, visible through the binding.
-    assert core.swa_protected_size() == 2
-    assert core.swa_evictable_size() == 1
+    assert core_window_protected(core) == 2
+    assert core_window_evictable(core) == 1
     core.dec_lock_ref(
         node,
         result.to_dec_params(),
     )
     # The uuid-bounded release returned the window to evictable.
-    assert core.swa_protected_size() == 0
-    assert core.swa_evictable_size() == 3
+    assert core_window_protected(core) == 0
+    assert core_window_evictable(core) == 3
     # A repeat acquire reuses the stamped uuid.
     again = core.inc_lock_ref(node)
     assert (
@@ -5163,7 +5658,7 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
     skipped = core.inc_lock_ref(node, skip_lock_components=(ComponentType.SWA,))
     assert ComponentType.SWA not in skipped.component_lock_uuids
     core.dec_lock_ref(node, skipped.to_dec_params())
-    assert core.swa_protected_size() == 2
+    assert core_window_protected(core) == 2
     core.dec_lock_ref(node, again.to_dec_params())
     core.sanity_check([], [])
 
@@ -5184,7 +5679,7 @@ def test_swa_tombstones_cross_the_binding_and_release_balanced(
     )
     result = core.inc_lock_ref(leaf)
     assert result.component_lock_uuids[ComponentType.SWA] is None
-    assert core.swa_protected_size() == 2
+    assert core_window_protected(core) == 2
     release = core.dec_swa_lock_only if swa_only else core.dec_lock_ref
     if missing_receipt:
         missing = DecLockRefParams(node_id=leaf)
@@ -5196,7 +5691,7 @@ def test_swa_tombstones_cross_the_binding_and_release_balanced(
         assert error.value.__cause__ is None
         return  # A Rust ownership violation poisons the core.
     release(leaf, result.to_dec_params())
-    assert core.swa_protected_size() == 0
+    assert core_window_protected(core) == 0
     if swa_only:
         core.dec_lock_ref(leaf, DecLockRefParams(node_id=leaf), skip_swa=True)
     core.sanity_check([], [])

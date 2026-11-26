@@ -246,25 +246,15 @@ def ep_joiner_of(cfg: Any) -> bool:
     return cfg.ep_join_mode in ("scale", "recover")
 
 
-def context_parallel_attn_dp_size(cfg: Any, layout: str) -> int:
-    """The attention-DP width a DeepSeek context-parallel layout runs.
-
-    These layouts run data-parallel groups as attention DP, so `--dp-size N`
-    alone still means N attention-DP groups there. That reading is deprecated.
-    """
-    assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
-        f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
-        "data-parallel replicas combined with attention data parallelism "
-        "are not supported."
-    )
+def reject_dp_size_under_context_parallel(cfg: Any, layout: str) -> None:
+    """Reject `--dp-size > 1` under a DeepSeek context-parallel layout;
+    attention DP there is `--attn-dp-size`."""
     if cfg.dp_size > 1:
-        # TODO: reject `--dp-size > 1` here after 2026-12-31.
-        logger.warning(
-            f"--dp-size {cfg.dp_size} under {layout} runs {cfg.dp_size} attention "
-            "data-parallel groups. This is deprecated and will be rejected after "
-            f"2026-12-31; use --attn-dp-size {cfg.dp_size} instead."
+        raise ValueError(
+            f"--dp-size {cfg.dp_size} as attention data parallelism under "
+            f"{layout} was removed in SGLang 1.0; use --attn-dp-size "
+            f"{cfg.dp_size}."
         )
-    return cfg.attn_dp_size * cfg.dp_size
 
 
 def ep_scale_joiner_of(cfg: Any) -> bool:
@@ -277,8 +267,25 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
     return cfg.startup_weight_load_mode == "overlap"
 
 
+def decode_state_free_radix_of(cfg: Any) -> bool:
+    """Whether a PD decode radix tree keeps FULL KV only; hybrid-SSM models only."""
+    from sglang.srt.environ import envs
+
+    # Partial configs (e.g. golden tests) carry no PD fields.
+    if not (
+        getattr(cfg, "disaggregation_mode", None) == "decode"
+        and bool(cfg.disaggregation_decode_enable_radix_cache)
+        and cfg.disable_radix_cache is False
+    ):
+        return False
+    forced = envs.SGLANG_DECODE_STATE_FREE_RADIX.get()
+    return cfg.decode_state_free_radix_default if forced is None else forced
+
+
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Return whether the resolved Mamba cache strategy requires an extra buffer."""
+    if decode_state_free_radix_of(cfg):
+        return False
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",

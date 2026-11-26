@@ -99,14 +99,12 @@ def _request(feature, rid: str = "vlm-request") -> TokenizedEmbeddingReqInput:
 def _receiver() -> SchedulerRequestReceiver:
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
-        recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        server_args=SimpleNamespace(),
         model_config=SimpleNamespace(is_multimodal=True),
         max_recv_per_poll=-1,
-        stream_output=lambda *args, **kwargs: None,
+        request_retirer=None,
         get_last_batch=lambda: None,
         rust_server_mode=False,
     )

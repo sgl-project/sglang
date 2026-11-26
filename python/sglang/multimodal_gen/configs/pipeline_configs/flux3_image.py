@@ -19,13 +19,21 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines.flux3_image_package import (
         Flux3ImagePackage,
     )
 
+logger = init_logger(__name__)
+
 _IMAGE_MODES = frozenset({"t2i", "i2i"})
+
+# The FLUX.3 stages build latents on a 16-pixel grid (DOWNSAMPLING_RATIO in
+# model_specific_stages/flux3_image.py) and reject other sizes.
+_FLUX3_SIZE_MULTIPLE = 16
+
 # Release repos: the distilled flow map and the CFG base model.
 FLUX3_IMAGE_HF_PATHS = [
     "black-forest-labs/flux-3-image-klein",
@@ -105,6 +113,31 @@ class Flux3ImageSamplingParams(SamplingParams):
             # is synthesized under breakable CUDA graphs) it warms the t2i path.
             req.image_path = None
             self.flux3_mode = "t2i"
+        # Warmup overwrites the dimensions after _adjust has run.
+        self._align_resolution(server_args.pipeline_config)
+
+    def _adjust_visual_fields(self, server_args: Any, pipeline_config: Any) -> None:
+        super()._adjust_visual_fields(server_args, pipeline_config)
+        self._align_resolution(pipeline_config)
+
+    def _align_resolution(self, pipeline_config: Any) -> None:
+        if not isinstance(pipeline_config, Flux3ImagePipelineConfig):
+            return
+        m = _FLUX3_SIZE_MULTIPLE
+        requested_size = (self.width, self.height)
+        if self.width is not None and self.width > 0:
+            self.width = max(m, self.width // m * m)
+        if self.height is not None and self.height > 0:
+            self.height = max(m, self.height // m * m)
+        if (self.width, self.height) != requested_size:
+            logger.warning(
+                "FLUX.3 requires dimensions divisible by %s; adjusted requested "
+                "resolution from %sx%s to %sx%s",
+                m,
+                *requested_size,
+                self.width,
+                self.height,
+            )
 
     def _adjust(self, server_args: Any) -> None:
         package = server_args.pipeline_config.flux3_package

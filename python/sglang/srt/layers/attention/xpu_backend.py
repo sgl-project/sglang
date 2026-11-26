@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.local_attention import (
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
@@ -173,7 +173,7 @@ class XPUAttentionBackend(AttentionBackend):
         self.forward_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
         )
@@ -305,7 +305,12 @@ class XPUAttentionBackend(AttentionBackend):
         if self.dcp_size == 1:
             self.kv_layers.layer(layer.layer_id).store(
                 layer,
-                KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                KVWriteLoc(
+                    cache_loc,
+                    window_locs=window_write_locs(
+                        self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                    ),
+                ),
                 k,
                 v,
                 layer.k_scale,

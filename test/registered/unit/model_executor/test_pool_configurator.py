@@ -9,6 +9,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
     make_page_shard_spec,
+    page_shard_row_bytes,
 )
 from sglang.srt.runtime_context import (
     get_context,
@@ -16,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    get_spec,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -273,6 +275,7 @@ class TestDefaultConfigurator(CustomTestCase):
             max_running_requests=1,
         )
         mr.model_config.context_len = 8193
+        mr.page_shard_scratch_row_bytes = lambda: page_shard_row_bytes(mr)
         with (
             mock_cpu_env(),
             patch(
@@ -659,7 +662,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             speculative_num_steps=3,
             speculative_eagle_topk=2,
             speculative_num_draft_tokens=5,
-            disable_overlap_schedule=True,  # spec-v1: no double allocation
+            disable_overlap_schedule=True,
         )
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
@@ -669,19 +672,15 @@ class TestHybridSWAConfigurator(CustomTestCase):
             cfg = create_memory_pool_configurator(mr)
             config = cfg.calculate_pool_sizes(available, page_size=4)
 
-        # spec-v1 (overlap off): decode_alloc = max(ceil_align(3+4,4)*2,
-        # ceil_align(5,4)) = 16. trailing = 8 + 20 + page(4) = 32; per req =
-        # 32 + 16 = 48. Global prefill = 1*chunk(4) + page(4) = 8.
-        # cap = 48 * 2 + 8 = 104 -> ceil_align(104, 4) = 104.
-        self.assertEqual(config.swa_max_total_num_tokens, 104)
+        # decode_alloc = reach = 2 * max(2 pages * 4 * topk 2, 5) + 3 = 35;
+        # per req = trailing 32 + 35 = 67; cap = 67 * 2 + chunk 4 + page 4 = 142,
+        # page-aligned to 144.
+        self.assertEqual(config.swa_max_total_num_tokens, 144)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_swa_request_cap_doubles_decode_alloc_for_spec_v2_overlap(self):
-        # Overlap on -> spec-v2: decode_alloc = 2 * get_alloc_len_per_decode =
-        # 2 * max(steps*topk, max_draft) = 2 * max(6, 5) = 12 (page=1, since the
-        # v2 allocator does not support page>1 & topk>1). trailing = 8 + 20 +
-        # page(1) = 29; per req = 29 + 12 = 41. Global prefill =
-        # 2*chunk(4) + page(1) = 9; cap = 41 * 2 + 9 = 91.
+    def test_swa_request_cap_with_overlap_counts_two_chunks(self):
+        # decode_alloc = reach = 2 * max(6, 5) = 12 (page 1); per req = trailing
+        # 29 + 12 = 41; cap = 41 * 2 + 2 chunks * 4 + page 1 = 91.
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -699,7 +698,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             speculative_num_steps=3,
             speculative_eagle_topk=2,
             speculative_num_draft_tokens=5,
-            disable_overlap_schedule=False,  # spec-v2: 2 * get_alloc_len_per_decode
+            disable_overlap_schedule=False,
         )
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
@@ -1484,6 +1483,174 @@ class TestDflashDraftKvBudget(CustomTestCase):
                     target_kv_per_token + draft_kv_per_token * loc_space_scale,
                 )
 
+    def test_draft_kv_ring_drops_the_per_token_draft_charge(self):
+        mr = _make_model_runner(self)
+        mr.spec_algorithm.is_dflash.return_value = True
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=5,
+        )
+        mr.dflash_draft_cell_size_per_token = 10_240
+        with (
+            mock_cpu_env(),
+            get_spec().override(speculative_dflash_draft_kv_ring=True),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        self.assertEqual(cfg._cell_size, 4 * (64 + 64) * 32 * KV_SIZE)
+
+    def _ring_target_configurator(self, *, page_size, mha=False, **publish):
+        import torch
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+            SpecAuxHiddenStateConfig,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        runner = _make_model_runner(
+            self,
+            page_size=page_size,
+            speculative_num_draft_tokens=8,
+            **publish,
+        )
+        draft = SimpleNamespace(
+            dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            attention_arch=AttentionArch.MLA,
+            hf_config={
+                "architectures": ["DFlashDraftModel"],
+                "num_hidden_layers": 5,
+                "dflash_config": {"attention_mode": "mla"},
+                "layer_types": ["sliding_attention"] * 5,
+                "sliding_window": 1024,
+            },
+        )
+        if mha:
+            draft = SimpleNamespace(
+                dtype=torch.bfloat16,
+                head_dim=128,
+                v_head_dim=128,
+                get_num_kv_heads=lambda tp: 8 // tp,
+                attention_arch=AttentionArch.MHA,
+                hf_config={
+                    "architectures": ["DFlashDraftModel"],
+                    "num_hidden_layers": 5,
+                    "layer_types": ["sliding_attention"] * 5,
+                    "sliding_window": 2048,
+                },
+            )
+        return KVCacheConfigurator(
+            device="cpu",
+            gpu_id=0,
+            attn_dp_size=1,
+            pp_size=1,
+            pp_group=runner.pp_group,
+            model=None,
+            model_config=runner.model_config,
+            server_args=get_server_args(),
+            kv_cache_dtype=torch.bfloat16,
+            model_dtype=torch.bfloat16,
+            page_size=page_size,
+            sliding_window_size=None,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            is_draft_worker=False,
+            post_capture_kv_active=False,
+            spec_aux_config=SpecAuxHiddenStateConfig(
+                draft_model_config=draft, dflash_draft_num_layers=5
+            ),
+            draft_parallel_layout=None,
+            is_hybrid_swa=False,
+            is_hybrid_swa_compress=False,
+            use_mla_backend=False,
+            layer_info=runner.layer_info,
+            forward_stream=None,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            memory_pool_config=None,
+        )
+
+    def test_draft_kv_ring_charge_matches_the_ring_pool(self):
+        from sglang.srt.speculative.dflash_draft_ring import (
+            draft_kv_ring_pool_rows_from_config,
+        )
+
+        for dcp_size, page_size, publish in (
+            (8, 1, {}),
+            (1, 64, {}),
+            (
+                8,
+                64,
+                dict(disaggregation_mode="decode", disaggregation_decode_extra_slots=6),
+            ),
+        ):
+            with (
+                self.subTest(dcp=dcp_size, page=page_size, **publish),
+                mock_cpu_env(tp_size=8),
+                get_parallel().override(attn_dcp_size=dcp_size),
+            ):
+                config = self._ring_target_configurator(
+                    page_size=page_size, max_running_requests=48, **publish
+                )
+                with get_spec().override(speculative_dflash_draft_kv_ring=True):
+                    charged = config._dflash_draft_kv_ring_bytes()
+                req_pool = config._build_req_to_token_pool(
+                    max_num_reqs=config._req_pool_rows(48)
+                )
+                rows = draft_kv_ring_pool_rows_from_config(
+                    config.spec_aux_config.draft_model_config.hf_config,
+                    req_to_token_rows=req_pool.req_to_token.shape[0],
+                    page_size=page_size,
+                )
+                # 5 layers of a (512 + 64)-wide bf16 latent row.
+                self.assertEqual(config.dflash_draft_cell_size_per_token, 5 * 576 * 2)
+                self.assertEqual(
+                    charged,
+                    (rows + page_size) * config.dflash_draft_cell_size_per_token,
+                )
+
+    def test_paged_mha_draft_kv_ring_charge_matches_the_ring_pool(self):
+        from sglang.srt.speculative.dflash_draft_ring import (
+            draft_kv_ring_paged_rows_per_req,
+            draft_kv_ring_pool_rows_from_config,
+        )
+
+        page_size = 64
+        with mock_cpu_env(tp_size=4):
+            config = self._ring_target_configurator(
+                page_size=page_size, mha=True, max_running_requests=32
+            )
+            with get_spec().override(speculative_dflash_draft_kv_ring=True):
+                charged = config._dflash_draft_kv_ring_bytes()
+            req_rows = config._build_req_to_token_pool(
+                max_num_reqs=config._req_pool_rows(32)
+            ).req_to_token.shape[0]
+            rows = draft_kv_ring_pool_rows_from_config(
+                config.spec_aux_config.draft_model_config.hf_config,
+                req_to_token_rows=req_rows,
+                page_size=page_size,
+            )
+        rows_per_req = draft_kv_ring_paged_rows_per_req(
+            window_left=2047, block_size=8, page_size=page_size
+        )
+        self.assertEqual(rows, page_size + req_rows * rows_per_req)
+        self.assertEqual(
+            charged, (rows + page_size) * config.dflash_draft_cell_size_per_token
+        )
+
+    def test_draft_kv_ring_charges_nothing_when_off(self):
+        with mock_cpu_env(tp_size=8):
+            config = self._ring_target_configurator(
+                page_size=1, max_running_requests=48
+            )
+            self.assertEqual(config._dflash_draft_kv_ring_bytes(), 0)
+
     def test_draft_loc_space_scale(self):
         """An MLA draft that executes DCP keeps per-rank rows."""
         from sglang.srt.mem_cache.kv_cache_configurator import draft_loc_space_scale
@@ -1989,7 +2156,10 @@ class TestFusedDraftPricing(unittest.TestCase):
         charged twice (once inside the entry, once as a private pool)."""
         mr, cfg = self._make(fused_entry=None, draft_layers=2)
         mr.spec_aux_config.eagle_draft_swa_num_layers = 2
-        mr.fused_entry_bytes.side_effect = lambda name: 4_321 if name == "swa" else None
+        mr.target_window_sub_pool.return_value = "window_4096"
+        mr.fused_entry_bytes.side_effect = lambda name: (
+            4_321 if name == "window_4096" else None
+        )
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 HybridSWAPoolConfigurator,

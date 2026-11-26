@@ -100,6 +100,23 @@ class HiCacheStorageExtraInfo:
     # Page hashes preceding the call's keys, from the sequence start;
     # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
+    # Free-form per-call metadata. If the backend's consumes_kv_hints() is True,
+    # lookups (batch_exists, batch_exists_v2) and reads (batch_get_v1,
+    # batch_get_v2) for a request whose kv_hints has actions also carry:
+    #   "kv_hints": the request's KvHintsEnvelope (a msgspec Struct). It is
+    #       caller-supplied and unauthenticated; validate it before acting on it.
+    #   "storage_key_to_event_hash": only for a request with cache_salt or
+    #       extra_key. Maps each storage key to its KV event block ID, as
+    #       unsigned 64-bit (events carry the same value as signed int64), in
+    #       this rank's event format whether or not it publishes events. An
+    #       empty map means the prefix could not be verified, so treat those
+    #       pages as unbound. Without the map, the ID is int(storage_key[:16], 16).
+    # Legacy batch_get() takes no extra_info, so a "dynamic" backend needs
+    # extra_config interface_v1=1 for its primary KV reads to carry hints.
+    # With --hicache-host-memory-mode buffer_only and PP > 1, prefetch reads use
+    # PP0's entries, kept only where the local backend also opts in. Lookups
+    # and other prefetches decide on each rank.
+    # Decode-side lookups carry request_id "__storage_hit_query__".
     extra_info: Optional[dict] = None
 
 
@@ -109,8 +126,9 @@ class PoolName(str, Enum):
     KV = "kv"
     MAMBA = "mamba"
     SWA = "swa"
-    AUXILIARY_SWA = "auxiliary_swa"
     INDEXER = "indexer"
+    # the ue8m0 exponents of FP4 index keys, beside INDEXER's e2m1 bytes
+    INDEXER_SCALE = "indexer_scale"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
     DEEPSEEK_V4_C1 = "deepseek_v4_c1"
@@ -145,6 +163,17 @@ class PoolName(str, Enum):
         return self.value
 
 
+# A host pool's name as a plain string: a `PoolName` value, or a unified window
+# sub-pool's own name; a `PoolName` member compares and hashes equal to it.
+HostPoolName = str
+
+
+def host_pool_name(name: str) -> HostPoolName:
+    """``name`` as a host pool name: the plain string of a `PoolName` member,
+    or the name itself."""
+    return str(name)
+
+
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
@@ -170,16 +199,21 @@ class PoolTransfer:
     nodes_to_load      : evicted nodes this transfer covers
     """
 
-    name: PoolName
+    name: HostPoolName
     host_indices: Optional[torch.Tensor] = None
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
-    indices_from_pool: Optional[PoolName] = None
+    indices_from_pool: Optional[HostPoolName] = None
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0
+
+    def __post_init__(self):
+        self.name = host_pool_name(self.name)
+        if self.indices_from_pool is not None:
+            self.indices_from_pool = host_pool_name(self.indices_from_pool)
 
 
 def merge_source_transfers(
@@ -214,9 +248,15 @@ def merge_source_transfers(
 class SidecarPoolSpec:
     """Pool whose transfer indices are reused from one real source pool."""
 
-    pool_name: PoolName
-    indices_from_pool: PoolName
+    pool_name: HostPoolName
+    indices_from_pool: HostPoolName
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+
+    def __post_init__(self):
+        object.__setattr__(self, "pool_name", host_pool_name(self.pool_name))
+        object.__setattr__(
+            self, "indices_from_pool", host_pool_name(self.indices_from_pool)
+        )
 
 
 @dataclass
@@ -253,7 +293,11 @@ class PoolTransferResult:
 def l3_page_span(host_pool: Any) -> int:
     """Logical slots one L3 key covers for this host pool. Under DCP a key is a
     widened (logical) page backed by one physical page on each rank; pools
-    without DCP (or with a page of 1, like KDA state) are unchanged."""
+    without DCP (or with a page of 1, like KDA state) are unchanged. A pool
+    whose physical layout is not row-sharded reports its own span."""
+    span = getattr(host_pool, "storage_page_span", None)
+    if span:
+        return int(span)
     page_size = getattr(host_pool, "page_size", 1) or 1
     return page_size * (getattr(host_pool, "dcp_size", 1) or 1)
 
@@ -355,6 +399,17 @@ class HiCacheStorage(ABC):
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
+
+    def consumes_kv_hints(self) -> bool:
+        """Whether lookups and reads should carry request kv_hints in extra_info.
+
+        Off by default: binding storage keys to event IDs rehashes the
+        request's prefix on the scheduler. Legacy batch_get() never carries
+        them; see HiCacheStorageExtraInfo.extra_info. Keep the answer the
+        same on every PP rank: buffer_only PP prefetch tickets carry PP0's
+        hint metadata, so a later stage that opts in alone gets none there.
+        """
+        return False
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
@@ -535,6 +590,9 @@ class HiCacheStorage(ABC):
     def clear(self) -> None:
         pass
 
+    def close(self) -> None:
+        pass
+
     def get_stats(self):
         return None
 
@@ -635,6 +693,9 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
                 logger.debug(f"Inject failure in {func_name}")
                 return True
         return False
+
+    def consumes_kv_hints(self) -> bool:
+        return self._backend.consumes_kv_hints()
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self._backend.register_mem_pool_host(mem_pool_host)
@@ -858,8 +919,8 @@ class HiCacheFile(HiCacheStorage):
             if storage_config.is_rank_replicated
             else self.tp_config_suffix
         )
-        # TODO: Include KV dtype and stored layout in keys for both DCP and
-        # non-DCP caches; raw file payloads do not describe their format.
+        # The controller includes the logical KV dtype and any storage_format_tag
+        # in model_name. Other layout differences still need extra_backend_tag.
         if storage_config.dcp_size > 1:
             # Equivalent MLA shards in different DCP groups share a file.
             dcp_suffix = (

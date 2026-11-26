@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolGroup,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -60,9 +61,14 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -75,10 +81,54 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import index_slots
+from sglang.test.tree_slots import FAMILY_OF, index_slots
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=30, stage="base-b", runner_config="1-gpu-small-amd")
+
+
+class _RecordedSeries:
+    """In-memory stand-in for a prometheus Counter/Gauge/Histogram."""
+
+    def __init__(self, *args, **kwargs):
+        self.values = defaultdict(float)
+        self.observations = defaultdict(list)
+
+    def labels(self, **labels):
+        return _RecordedChild(self, tuple(sorted(labels.items())))
+
+
+class _RecordedChild:
+    def __init__(self, series, key):
+        self.series, self.key = series, key
+
+    def inc(self, value=1):
+        self.series.values[self.key] += value
+
+    def set(self, value):
+        self.series.values[self.key] = value
+
+    def observe(self, value):
+        self.series.observations[self.key].append(value)
+
+
+class _RecordingRadixCacheMetrics(RadixCacheMetricsCollector):
+    _counter_cls = _RecordedSeries
+    _gauge_cls = _RecordedSeries
+    _histogram_cls = _RecordedSeries
+
+    def __init__(self):
+        super().__init__(labels={"model_name": "test"})
+
+    @staticmethod
+    def value(series, **labels):
+        key = tuple(sorted({"model_name": "test", **labels}.items()))
+        return series.values.get(key, 0.0)
+
+    @staticmethod
+    def observations(series):
+        return series.observations.get((("model_name", "test"),), [])
 
 
 class _FakeLinker(UnifiedCacheLinker):
@@ -182,8 +232,18 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        "metrics_collector": None,
     }
     defaults.update(kwargs)
+    # The stand-in's window slots, as a tree with these slots reports them.
+    windows = tuple(
+        dict.fromkeys(
+            ct
+            for ct in (*defaults["tree_components"], *defaults["components"])
+            if FAMILY_OF.get(ct) == TREE_WINDOW
+        )
+    )
+    defaults.setdefault("window_slots", lambda: windows)
     return SimpleNamespace(**defaults)
 
 
@@ -222,6 +282,7 @@ class TestMooncakePrefetch(CustomTestCase):
         linker.storage = MooncakeStore.__new__(MooncakeStore)
         linker.storage.registered_pools = linker.pools
         linker.storage.config_prefix = None
+        linker.storage.unified_suffixes = None
         linker.storage.mla_suffix = "cp0_pp0"
         linker.storage.store = SimpleNamespace(batch_get_into_multi_buffers=read)
         linker.load_thread = threading.Thread(target=linker.load_thread_func)
@@ -239,7 +300,7 @@ class TestMooncakePrefetch(CustomTestCase):
         transfer = PoolTransfer(
             name=PoolName.KV, keys=["page"], device_indices=torch.tensor(indices)
         )
-        ready = TransferReady([SimpleNamespace(synchronize=synchronize)])
+        ready = TransferReady(SimpleNamespace(synchronize=synchronize))
         with patch.object(linker, "record_transfer_ready", return_value=ready):
             return linker.prefetch([transfer])
 
@@ -317,7 +378,15 @@ class TestMooncakePrefetch(CustomTestCase):
 
 
 class TestLinkerDevicePrefetch(CustomTestCase):
-    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete"):
+    def _fixture(
+        self,
+        *,
+        swa=False,
+        mamba=False,
+        policy="wait_complete",
+        session=False,
+        metrics=None,
+    ):
         cfg = CacheConfig(
             page_size=1 if mamba else 2,
             components=(ComponentType.FULL,)
@@ -329,7 +398,10 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             full_attention_layer_ids=(0,),
         )
         with patch.object(shared_cache_suite, "get_device", return_value="cpu"):
-            cache, allocator, _ = build_fixture(cfg, tree_core_backend="python")
+            cache, allocator, _ = build_fixture(
+                cfg, enable_session_radix_cache=session, tree_core_backend="python"
+            )
+        cache.metrics_collector = metrics
         backend = _FakeLinker()
         if swa:
             backend.pools[PoolName.SWA] = object()
@@ -384,7 +456,13 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         assert free + cache.full_evictable_size() + cache.full_protected_size() == 32
         if ComponentType.SWA in cache.components:
             free = allocator.swa_attn_allocator.available_size()
-            assert free + cache.swa_evictable_size() + cache.swa_protected_size() == 32
+            window = cache.window_sub_pool_of_slot(ComponentType.SWA)
+            assert (
+                free
+                + cache.window_evictable_size(window)
+                + cache.window_protected_size(window)
+                == 32
+            )
         if ComponentType.MAMBA in cache.components:
             free = allocator.state_slots.available_size()
             assert (
@@ -400,6 +478,25 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             tree_cache=cache,
         )
         Scheduler._prefetch_kvcache(scheduler, req)
+
+    def test_prefetch_metrics_count_lookup_load_and_outcome(self):
+        for landed in (True, False):
+            with self.subTest(landed=landed):
+                metrics = _RecordingRadixCacheMetrics()
+                cache, backend, req, allocator = self._fixture(metrics=metrics)
+                self._enqueue(cache, req)
+                backend.prefetch_futures[-1].set_result(landed)
+                cache.linker.check_prefetch_events()
+
+                value = metrics.value
+                assert value(metrics.linker_lookup_tokens) == 6
+                assert value(metrics.linker_hit_tokens) == 6
+                loaded = value(metrics.linker_load_tokens, mode="prefetch")
+                assert loaded == (6 if landed else 0)
+                outcome = "published" if landed else "failed"
+                assert value(metrics.linker_prefetch_requests, outcome=outcome) == 1
+                assert sum(metrics.linker_prefetch_requests.values.values()) == 1
+                self._assert_balanced(cache, allocator)
 
     def test_timeout_config_overrides_legacy_including_empty_object(self):
         cache, backend, _, _ = self._fixture()
@@ -493,7 +590,13 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert allocator.swa_attn_allocator.available_size() == 30
                 assert not backend.queued_loads
                 cache.evict(
-                    EvictParams(num_tokens=6, swa_num_tokens=2, mamba_num=int(mamba))
+                    EvictParams(
+                        num_tokens=6,
+                        window_num_tokens={
+                            cache.window_sub_pool_of_slot(ComponentType.SWA): 2
+                        },
+                        mamba_num=int(mamba),
+                    )
                 )
                 assert allocator.full_attn_allocator.available_size() == 32
                 assert allocator.swa_attn_allocator.available_size() == 32
@@ -683,6 +786,36 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert self._match(cache, req).device_prefix_len == 6
                 self._assert_balanced(cache, allocator)
                 cache.sanity_check()
+
+    def test_published_prefetch_is_covered_by_its_session_while_queued(self):
+        cache, backend, req, allocator = self._fixture(session=True)
+        req.session_id = "s"
+        req.session_generation = cache.ensure_session_generation("s")
+        self._enqueue(cache, req)
+        backend.prefetch_futures[-1].set_result(True)
+        cache.linker.check_prefetch_events()
+        published = self._match(cache, req).last_device_node
+        full = cache.components[ComponentType.FULL]
+        assert full.session_ref(cache.tree_core.node_by_id(published)) == 1
+
+        # Newer and unreferenced, so plain LRU would evict the prefetch first.
+        cache.write_through_threshold = sys.maxsize
+        other = self._request("other", start=11)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(other.origin_input_ids[:6]),
+                value=allocator.alloc(6),
+                inserted_len=6,
+            )
+        )
+        cache.evict(EvictParams(num_tokens=6))
+        assert self._match(cache, req).device_prefix_len == 6
+        assert self._match(cache, other).device_prefix_len == 0
+
+        cache.release_radix_session("s")
+        assert full.session_ref(cache.tree_core.node_by_id(published)) == 0
+        self._assert_balanced(cache, allocator)
+        cache.sanity_check()
 
     def test_layer_wise_still_uses_queued_loads_without_prefetch(self):
         cache, backend, req, allocator = self._fixture()
@@ -1009,6 +1142,78 @@ class TestUnifiedCacheLinkerPythonBackend(
         consumer.check_hicache_events()
         consumer.sanity_check()
 
+    def test_metrics_follow_offload_lookup_and_layer_wise_load(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        tokens = list(range(1, 9))
+
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer.metrics_collector = produced = _RecordingRadixCacheMetrics()
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        value = produced.value
+        self.assertEqual(value(produced.linker_offload_tokens), len(tokens))
+        self.assertEqual(value(produced.linker_offloads_in_flight), 1)
+        producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+        self.assertEqual(value(produced.linker_offloads_in_flight), 0)
+        self.assertEqual(
+            len(produced.observations(produced.linker_offload_duration_seconds)), 1
+        )
+        self.assertEqual(value(produced.linker_failures, stage="offload"), 0)
+
+        for landed in (True, False):
+            with self.subTest(landed=landed):
+                consumer, _, consumer_req_pool = build_fixture(cfg)
+                consumer.metrics_collector = consumed = _RecordingRadixCacheMetrics()
+                consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+                consumer_linker.load_landed = landed
+                consumer.init_cache_linker(consumer_linker)
+                req = self._make_req(consumer_req_pool)
+                match = consumer.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+                )
+                self._apply_match_to_req(req, match)
+                consumer.init_load_back(
+                    InitLoadBackParams(
+                        best_match_node=match.best_match_node,
+                        host_hit_length=match.host_hit_length,
+                        req=req,
+                    )
+                )
+                value = consumed.value
+                self.assertEqual(value(consumed.linker_lookup_tokens), len(tokens))
+                self.assertEqual(value(consumed.linker_hit_tokens), len(tokens))
+                self.assertEqual(
+                    value(consumed.linker_load_tokens, mode="layer_wise"), 0
+                )
+                # Restored tokens are reported as storage hits, not host hits.
+                self.assertTrue(req.host_hit_is_storage)
+
+                self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+                loaded = consumer.linker.private_load_indices[req.rid]
+                self._bind_loaded_request(
+                    consumer, consumer_req_pool, req, tokens, loaded
+                )
+                aborted = consumer.finish_external_linker_loads([req])
+                self.assertEqual(aborted, [] if landed else [req])
+                self.assertEqual(
+                    value(consumed.linker_load_tokens, mode="layer_wise"),
+                    len(tokens) if landed else 0,
+                )
+                self.assertEqual(
+                    len(consumed.observations(consumed.linker_finish_wait_seconds)), 1
+                )
+                self.assertEqual(
+                    value(consumed.linker_failures, stage="load"), 0 if landed else 1
+                )
+                if landed:
+                    consumer.checkpoint(req, up_to=req.extend_end)
+                consumer.unlock(req.lock)
+                req.lock = None
+
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
         cfg = CacheConfig(
             page_size=2,
@@ -1247,7 +1452,12 @@ class TestUnifiedCacheLinkerPythonBackend(
         )
         self.assertEqual(match.device_prefix_len, 2)
         self.assertEqual(match.host_hit_length, 2)
-        self.assertEqual(match.swa_host_hit_length, 2)
+        self.assertEqual(
+            match.window_host_hit_lengths.get(
+                consumer.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            2,
+        )
         self._apply_match_to_req(req, match)
 
         self._insert(consumer, consumer_allocator, consumer_req_pool, tokens[:3])
@@ -1632,6 +1842,23 @@ def test_restorable_prefix_intersects_sparse_rank_results():
     assert hit_pages == 2
 
 
+def test_restorable_prefix_ignores_candidates_outside_the_tail():
+    cache = _cache_for_wrapper(_all_reduce_attn_groups=lambda mask, op: None)
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+
+    # Candidates at or below the device hit and beyond the tail are dropped.
+    assert (
+        wrapper._sync_restorable_prefix(
+            [1, 2, 3, 5, 9], num_pages=5, device_hit_pages=2
+        )
+        == 5
+    )
+    assert (
+        wrapper._sync_restorable_prefix([1, 2, 9], num_pages=5, device_hit_pages=2) == 0
+    )
+    assert wrapper._sync_restorable_prefix([], num_pages=5, device_hit_pages=0) == 0
+
+
 def test_async_offload_pins_node_until_completion():
     linker = _FakeLinker()
     lock_params = object()
@@ -1711,6 +1938,86 @@ def test_offload_skips_node_already_stored_by_tree_core():
     assert linker.queued_offloads == []
 
 
+class _ScriptedRangeStore:
+    def __init__(self, *gets):
+        self.gets = list(gets)
+        self.get_calls = []
+        self.renewed = []
+
+    def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+        self.get_calls.append(list(keys))
+        return self.gets.pop(0)
+
+    def batch_get_session_start(self, keys):
+        self.renewed.append(sorted(keys))
+        return [0] * len(keys)
+
+
+def _range_linker(store):
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.storage = SimpleNamespace(store=store)
+    return linker
+
+
+def test_range_get_renews_leases_of_keys_shared_across_requests():
+    store = _ScriptedRangeStore([-707, -707, -600, -600], [4, 4, 4, 4])
+    keys = ["a", "b", "a", "b"]
+
+    result = _range_linker(store)._get_layer_ranges(
+        keys, [[0]] * 4, [[4]] * 4, [[0]] * 4
+    )
+
+    assert result == [4, 4, 4, 4]
+    assert store.renewed == [["a", "b"]]
+    assert store.get_calls == [keys, keys]
+
+
+def test_range_get_renews_keys_another_read_already_reported():
+    store = _ScriptedRangeStore([-600, -600, 4, 4], [4, 4])
+
+    result = _range_linker(store)._get_layer_ranges(
+        ["a", "b", "c", "d"], [[0]] * 4, [[4]] * 4, [[0]] * 4
+    )
+
+    assert result == [4, 4, 4, 4]
+    assert store.renewed == [["a", "b"]]
+    assert store.get_calls[1] == ["a", "b"]
+
+
+def test_range_get_renews_again_after_a_racing_read():
+    store = _ScriptedRangeStore([-707, -707, 4, 4], [-600, -600], [4, 4])
+
+    result = _range_linker(store)._get_layer_ranges(
+        ["a", "b", "c", "d"], [[0]] * 4, [[4]] * 4, [[0]] * 4
+    )
+
+    assert result == [4, 4, 4, 4]
+    assert store.renewed == [["a", "b"], ["a", "b"]]
+
+
+def test_range_get_gives_up_after_bounded_renewals():
+    store = _ScriptedRangeStore([-600, 4], *([-600],) * 4)
+
+    result = _range_linker(store)._get_layer_ranges(
+        ["a", "b"], [[0]] * 2, [[4]] * 2, [[0]] * 2
+    )
+
+    assert result == [-600, 4]
+    assert len(store.renewed) == 4
+
+
+def test_range_get_does_not_renew_other_failures():
+    first = [-707, -1, 4, 4]
+    store = _ScriptedRangeStore(list(first))
+
+    result = _range_linker(store)._get_layer_ranges(
+        ["a", "b", "c", "d"], [[0]] * 4, [[4]] * 4, [[0]] * 4
+    )
+
+    assert result == first
+    assert store.renewed == []
+
+
 def test_layer_counter_reports_failure_after_the_forward():
     ready = []
     counter = LayerWiseLoadCounter(2, lambda index, layer: ready.append(layer))
@@ -1724,6 +2031,24 @@ def test_layer_counter_reports_failure_after_the_forward():
 
     assert ready == [0, 1]  # an MLA dedup source still broadcasts layer 1
     assert counter.finish(index) is False
+
+
+def test_layer_counter_times_only_blocked_waits():
+    counter = LayerWiseLoadCounter(2)
+    index = counter.update_producer()
+    counter.set_consumer(index)
+    counter.complete(index, 0)
+    loader = threading.Timer(0.05, counter.complete, (index, 1))
+    loader.start()
+
+    counter.wait_until(0)  # already landed: not a blocked wait
+    assert counter.blocked_seconds.get(index, 0.0) == 0.0
+    counter.wait_until(1)
+    loader.join()
+
+    assert counter.finish(index) is True
+    assert counter.pop_blocked_seconds(index) >= 0.04
+    assert counter.pop_blocked_seconds(index) == 0.0  # consumed once
 
 
 def test_layer_counter_finish_waits_for_layers_still_loading():
@@ -1773,19 +2098,44 @@ def test_prefix_device_indices_includes_private_linker_tail(device_len, tail_len
 
 
 @pytest.mark.parametrize("landed", [True, False])
-def test_finish_loads_releases_private_index_references(landed, caplog):
+@pytest.mark.parametrize("metrics_enabled", [True, False])
+@pytest.mark.parametrize("peer_landed", [True, False])
+def test_finish_loads_releases_private_index_references(
+    landed, metrics_enabled, peer_landed, caplog
+):
+    """Completed batches release private indices and wait records even without metrics."""
     backend = _FakeLinker()
     backend.load_landed = landed
+    backend.layer_done_counter = counter = LayerWiseLoadCounter(1)
+    metrics = _RecordingRadixCacheMetrics() if metrics_enabled else None
+
+    def reduce_landed(value, op):
+        value.fill_(int(bool(value.item()) and peer_landed))
+
     wrapper = UnifiedCacheLinkerWrapper(
-        _cache_for_wrapper(_all_reduce_attn_groups=lambda value, op: None), backend
+        _cache_for_wrapper(
+            _all_reduce_attn_groups=reduce_landed, metrics_collector=metrics
+        ),
+        backend,
     )
     wrapper.inflight_load_rids = ["rid"]
     wrapper.private_load_indices["rid"] = torch.arange(4)
-    wrapper.start_layer_wise_loading()
+    index = wrapper.start_layer_wise_loading()
+    # The forward recorded a blocked layer wait for this batch.
+    counter.blocked_seconds[index] = 0.25
 
-    assert wrapper.finish_loads() == ([] if landed else ["rid"])
+    succeeded = landed and peer_landed
+    assert wrapper.finish_loads() == ([] if succeeded else ["rid"])
+    # Consuming an already completed batch must not count its tokens again.
+    assert wrapper.finish_loads() == []
     assert wrapper.private_load_indices == {}
-    assert ("External linker load failed" in caplog.text) is (not landed)
+    assert counter.blocked_seconds == {}
+    if metrics is not None:
+        assert metrics.observations(metrics.linker_forward_wait_seconds) == [0.25]
+        assert metrics.value(metrics.linker_load_tokens, mode="layer_wise") == (
+            4 if succeeded else 0
+        )
+    assert ("External linker load failed" in caplog.text) is (not succeeded)
 
 
 @pytest.mark.parametrize("operation", ["reset", "close"])
@@ -1800,7 +2150,10 @@ def test_linker_lifecycle_releases_private_index_references(operation):
 
 def test_release_request_cancels_queued_load():
     linker = _FakeLinker()
-    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), linker)
+    metrics = _RecordingRadixCacheMetrics()
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(metrics_collector=metrics), linker
+    )
     wrapper.hit_markers["rid"] = object()
     wrapper.inflight_load_rids = ["rid"]
     linker.queued_loads["rid"] = [object()]
@@ -1812,6 +2165,8 @@ def test_release_request_cancels_queued_load():
     assert wrapper.inflight_load_rids == []
     assert "rid" not in linker.queued_loads
     assert wrapper.private_load_indices == {}
+    assert wrapper.finish_loads() == []
+    assert metrics.value(metrics.linker_load_tokens, mode="layer_wise") == 0
 
 
 def test_failed_offload_rolls_back_split_fragments():
@@ -1990,7 +2345,7 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     component.cache = cache
     component.tree_core = cache.tree_core
     # #32759: request-relative SWA needs tail re-prefill even without HiCache.
-    assert cache.swa_reprefill_tail_tokens() == (128 if unified_kv else 0)
+    assert cache.window_reprefill_tail_tokens() == (128 if unified_kv else 0)
     node = SimpleNamespace(
         component_data={
             ComponentType.SWA: SimpleNamespace(value=None, host_value=None)
@@ -2005,7 +2360,7 @@ def test_cache_without_swa_needs_no_reprefill():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.components = {}
     index_slots(cache, cache.components)
-    assert cache.swa_reprefill_tail_tokens() == 0
+    assert cache.window_reprefill_tail_tokens() == 0
 
 
 @pytest.mark.parametrize("swa_stored", [True, False])
@@ -2014,15 +2369,36 @@ def test_skip_swa_when_linker_store_lacks_swa(swa_stored):
     linker = _FakeLinker()
     if swa_stored:
         linker.pools[PoolName.SWA] = object()
-    swa = object()
+    swa = SimpleNamespace(pool_name=PoolName.SWA)
     cache = _cache_for_wrapper(
         components={ComponentType.SWA: swa},
         _components_tuple=(swa,),
         tree_components=(ComponentType.FULL, ComponentType.SWA),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    assert wrapper._skip_swa is (not swa_stored)
+    assert (swa in wrapper._skipped_windows) is (not swa_stored)
     assert (swa in wrapper._components) is swa_stored
+
+
+def test_linker_keeps_every_window_slot():
+    """A tree with several window slots (a draft window of its own length
+    beside the target's) gets a linker; each window is stored, or tombstoned
+    when the store lacks its pool, on its own."""
+    linker = _FakeLinker()
+    linker.pools["window_127"] = object()
+    target = SimpleNamespace(pool_name="window_127", window_sub_pool="window_127")
+    draft = SimpleNamespace(pool_name="window_128", window_sub_pool="window_128")
+    target_slot, draft_slot = ComponentType.SWA, object()
+    cache = _cache_for_wrapper(
+        components={target_slot: target, draft_slot: draft},
+        _components_tuple=(target, draft),
+        tree_components=(ComponentType.FULL, target_slot),
+        window_slots=lambda: (target_slot, draft_slot),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    assert wrapper._windows == (target, draft)
+    assert wrapper._skipped_windows == (draft,)
+    assert target in wrapper._components and draft not in wrapper._components
 
 
 @pytest.fixture
@@ -2051,6 +2427,7 @@ def full_linker_component():
 def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
+    swa.__dict__["_window_sub_pool"] = "swa"
     swa.build_external_linker_transfer = MagicMock(
         side_effect=AssertionError("excluded SWA reached linker")
     )
@@ -2163,11 +2540,12 @@ def test_linker_load_preserves_swa_boundaries(
 ):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
+    swa.__dict__["_window_sub_pool"] = "swa"
     participates = swa_stored
 
     def prepare(phase, req, full_transfer, transfer, prefix_len, **kwargs):
         if phase == ExternalLinkerLoadPhase.PREPARE:
-            req.kv.set_evicted_seqlen(ComponentType.SWA, prefix_len - 2)
+            req.kv.set_evicted_seqlen("swa", prefix_len - 2)
         return transfer
 
     swa.build_external_linker_transfer = MagicMock(
@@ -2196,7 +2574,7 @@ def test_linker_load_preserves_swa_boundaries(
         if previous_boundary is None
         else ReqKvInfo(
             kv_allocated_len=previous_boundary,
-            component_evicted_seqlens={ComponentType.SWA: previous_boundary},
+            window_evicted_seqlens={"swa": previous_boundary},
         )
     )
     req = SimpleNamespace(
@@ -2224,7 +2602,7 @@ def test_linker_load_preserves_swa_boundaries(
     assert wrapper.inflight_load_rids == ["rid"]
     assert torch.equal(wrapper.private_load_indices["rid"], restored)
     assert req.swa_branching_seqlen is None
-    assert req.kv.get_evicted_seqlen(ComponentType.SWA) == expected_boundary
+    assert req.kv.get_evicted_seqlen("swa") == expected_boundary
     assert req.kv.kv_allocated_len == (previous_boundary or 0)
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD
@@ -2248,15 +2626,17 @@ class TestTransferReadyEvents(CustomTestCase):
 
     def test_transfer_waits_on_the_forward_using_the_pages(self):
         forward_stream = MagicMock(name="forward_stream")
-        indices_ready, forward_done = self._record(forward_stream).events
+        ready = self._record(forward_stream)
+        indices_ready, forward_done = ready.indices_ready, ready.forward_done
         indices_ready.record.assert_called_once_with()
         forward_done.record.assert_called_once_with(forward_stream)
         # The transfer thread waits; the forward stream's own order is untouched.
         self.assertEqual(forward_stream.mock_calls, [])
 
     def test_transfer_without_a_forward_stream_waits_on_the_current_one(self):
-        (indices_ready,) = self._record(None).events
-        indices_ready.record.assert_called_once_with()
+        ready = self._record(None)
+        ready.indices_ready.record.assert_called_once_with()
+        self.assertIsNone(ready.forward_done)
 
     def test_mooncake_offload_thread_waits_on_every_event(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
@@ -2270,7 +2650,7 @@ class TestTransferReadyEvents(CustomTestCase):
             (
                 ["transfer"],
                 1,
-                TransferReady([order.indices_ready, order.forward_done]),
+                TransferReady(order.indices_ready, order.forward_done),
                 "session-a",
             )
         )
@@ -2295,9 +2675,8 @@ class TestTransferReadyEvents(CustomTestCase):
                 linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
                 order = MagicMock()
                 linker.record_transfer_ready = order.record_transfer_ready
-                order.record_transfer_ready.return_value = TransferReady(
-                    [order.indices_ready, order.forward_done]
-                )
+                ready = TransferReady(order.indices_ready, order.forward_done)
+                order.record_transfer_ready.return_value = ready
                 linker.load_layer_wise = order.load_layer_wise
                 linker.load_all_layers = order.load_all_layers
                 order.load_all_layers.return_value = True
@@ -2319,18 +2698,23 @@ class TestTransferReadyEvents(CustomTestCase):
                     self.assertEqual(linker.start_layer_wise_loading(), 3)
                 linker.load_queue.put(None)
                 linker.load_thread_func()
+                # Layer-wise loads defer the wait into `load_layer_wise`, before
+                # their get sessions start.
                 self.assertEqual(
                     order.mock_calls,
-                    [
-                        call.record_transfer_ready(),
-                        call.indices_ready.synchronize(),
-                        call.forward_done.synchronize(),
-                        (
-                            call.load_all_layers(["transfer"])
-                            if prefetch
-                            else call.load_layer_wise(3, [["transfer"]])
-                        ),
-                    ],
+                    (
+                        [
+                            call.record_transfer_ready(),
+                            call.indices_ready.synchronize(),
+                            call.forward_done.synchronize(),
+                            call.load_all_layers(["transfer"]),
+                        ]
+                        if prefetch
+                        else [
+                            call.record_transfer_ready(),
+                            call.load_layer_wise(3, [["transfer"]], ready),
+                        ]
+                    ),
                 )
                 if prefetch:
                     self.assertTrue(completion.result())
@@ -2341,7 +2725,7 @@ class TestTransferReadyEvents(CustomTestCase):
         order = MagicMock()
         linker.mla_broadcaster = order.broadcaster
         linker.num_layers = 2
-        ready = TransferReady([order.indices_ready, order.forward_done])
+        ready = TransferReady(order.indices_ready, order.forward_done)
         linker.broadcast_loads = {3: (0, "prepared", ready)}
         device = MagicMock(name="device_module")
         device.current_stream.return_value = order.stream

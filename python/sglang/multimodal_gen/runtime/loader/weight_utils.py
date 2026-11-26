@@ -53,9 +53,9 @@ def checkpoint_weights_iterator(
         )
         return
     if os.path.isfile(model_path):
-        files = [model_path] if model_path.endswith((".bin", ".pt")) else []
+        files = [model_path] if model_path.endswith((".bin", ".pt", ".pth")) else []
     else:
-        for suffix in ("*.bin", "*.pt"):
+        for suffix in ("*.bin", "*.pt", "*.pth"):
             files = filter_files_not_needed_for_inference(
                 sorted(str(path) for path in Path(model_path).glob(suffix))
             )
@@ -111,12 +111,6 @@ if HAS_RUNAI_MODEL_STREAMER:
 # lock files in the temp directory will be automatically deleted when the
 # system reboots, so users will not complain about annoying lock files
 temp_dir = tempfile.gettempdir()
-
-
-class DisabledTqdm(tqdm):
-    def __init__(self, *args, **kwargs):
-        kwargs["disable"] = True
-        super().__init__(*args, **kwargs)
 
 
 def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
@@ -234,9 +228,6 @@ def safetensors_weights_iterator(
         device = str(checkpoint_device)
     else:
         device = "cpu" if to_cpu else str(get_local_torch_device())
-    # The caller may still pass the old boolean; map it onto a backend name so
-    # there is one place that decides, and it is the place that knows which
-    # backends can skip keys.
     requested = None
     if use_runai_model_streamer is not None:
         requested = (

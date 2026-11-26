@@ -258,13 +258,12 @@ sgl-eval run aime25 \\
       router: {
         port: 8000,
         command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --disable-circuit-breaker \\
-  --health-check-interval-secs 999999`,
+  --disable-circuit-breaker`,
       },
     },
 
@@ -288,7 +287,7 @@ sgl-eval run aime25 \\
   // worker topology; changing a GPU overlay must never rewrite these commands.
   resolveRecipe: (cell, s) => {
     if (!((s.hw === "a3" && s.nodes === "single") || (s.hw === "a5" && s.nodes === "multi-2")) || !["prefill", "decode", "router"].includes(s.pdMode)) return cell;
-    const router = { port: 30000, command: s.hw === "a5" ? config.npuRouterCommand.replace("--policy round_robin", "--policy cache_aware") : config.npuRouterCommand };
+    const router = { port: 30000, command: config.npuRouterCommand(s.hw === "a5" ? "glm52" : "glm-5") };
     if (s.pdMode === "router") return { ...cell, pd: true, pdMode: "router",
       nnodes: 1, verified: false, env: [], flags: [], warn: undefined,
       commands: { python: router.command, docker: `docker run --network host --rm ${s.hw === "a5" ? "<your-compatible-950pr-dt-series-image>" : "quay.io/ascend/sglang:v0.5.22-cann9.1.0-a3"} ${router.command}` }, router };
@@ -303,7 +302,7 @@ sgl-eval run aime25 \\
       commands: { python: command } };
   },
 
-  npuRouterCommand: "python3 -m sglang_router.launch_router \\\n  --pd-disaggregation \\\n  --prefill http://<prefill-head-ip>:30000 8998 \\\n  --decode http://<decode-head-ip>:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin",
+  npuRouterCommand: (modelId) => `sgl-router \\\n  --model-id ${modelId} \\\n  --no-tokenizer \\\n  --worker-urls http://<prefill-head-ip>:30000 http://<decode-head-ip>:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin`,
 
   npuPdRecipes: [
     {
@@ -344,7 +343,7 @@ sgl-eval run aime25 \\
         "--moe-a2a-backend deepep",
         "--deepep-mode normal",
         "--disable-shared-experts-fusion",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph", "--disable-prefill-cuda-graph",
         "--dtype bfloat16",
         "--load-balance-method round_robin",
         "--enable-dp-lm-head",
@@ -431,17 +430,14 @@ sgl-eval run aime25 \\
         "ASCEND_MF_STORE_URL=\"tcp://<memfabric-store-host>:31001\"",
         "ASCEND_MF_LOG_LEVEL=2",
         "HCCL_SOCKET_IFNAME=\"<network-interface>\"",
-        "DEEPEP_HCCL_BUFFSIZE=2048",
-        "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1",
-        "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200"
+        "DEEPEP_HCCL_BUFFSIZE=2048"
       ],
       flags: [
         "--model-path \"/models/GLM-5.2\"",
         "--trust-remote-code",
         "--tp-size 16",
-        "--dp 4",
+        "--attn-dp-size 4",
         "--served-model-name glm52",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--load-balance-method round_robin",
         "--disaggregation-mode prefill",
@@ -458,10 +454,12 @@ sgl-eval run aime25 \\
         "--kv-cache-dtype \"fp8_e4m3\"",
         "--moe-a2a-backend deepep",
         "--deepep-mode auto",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph", "--disable-prefill-cuda-graph",
         "--enable-metrics",
         "--host {{HOST_IP}}",
-        "--port {{PORT}}"
+        "--port {{PORT}}",
+        "--enable-prefill-delayer",
+        "--prefill-delayer-max-delay-passes 200"
       ]
     },
     {
@@ -494,9 +492,8 @@ sgl-eval run aime25 \\
         "--model-path \"/models/GLM-5.2\"",
         "--trust-remote-code",
         "--tp-size 16",
-        "--dp 4",
+        "--attn-dp-size 4",
         "--served-model-name glm52",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--load-balance-method round_robin",
         "--disaggregation-mode decode",
@@ -1648,8 +1645,6 @@ sgl-eval run aime25 \\
         "ASCEND_USE_FIA=1",
         "SGLANG_NPU_USE_MLAPO=1",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=35",
-        "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1",
-        "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200",
         "SGLANG_ENABLE_SPEC_V2=1",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
         "TRANSFORMERS_VERBOSITY=error",
@@ -1661,7 +1656,7 @@ sgl-eval run aime25 \\
         "--model-path \"/models/GLM-5.2\"",
         "--trust-remote-code",
         "--tp-size 16",
-        "--dp 1",
+        "--attn-dp-size 1",
         "--served-model-name glm52",
         "--attention-backend ascend",
         "--device npu",
@@ -1673,7 +1668,6 @@ sgl-eval run aime25 \\
         "--chunked-prefill-size 16384",
         "--kv-cache-dtype fp8_e4m3",
         "--speculative-draft-kv-cache-dtype bf16",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--load-balance-method round_robin",
         "--moe-a2a-backend deepep",
@@ -1684,7 +1678,9 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 5",
         "--host {{HOST_IP}}",
-        "--port {{PORT}}"
+        "--port {{PORT}}",
+        "--enable-prefill-delayer",
+        "--prefill-delayer-max-delay-passes 200"
       ]
     },
 

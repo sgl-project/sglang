@@ -20,10 +20,11 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.frozen_kv_mtp_utils import target_kv_pool_view
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 _DEV = "cuda"
 _SWA = IdSpaceKind.SLIDING_WINDOW
@@ -80,7 +81,10 @@ _POOLS = {
 def _write_loc():
     # Different full and window ids, so a write at the wrong side's ids shows.
     loc = torch.tensor([3, 7, 11], device=_DEV)
-    return KVWriteLoc(loc, swa_loc=torch.tensor([2, 5, 9], device=_DEV))
+    return KVWriteLoc(
+        loc,
+        window_locs={SWAKVPool.WINDOW_SUB_POOL: torch.tensor([2, 5, 9], device=_DEV)},
+    )
 
 
 class TestKVLayerAccess(CustomTestCase):
@@ -165,7 +169,14 @@ class TestKVLayerAccess(CustomTestCase):
                         rope = torch.full((1, 1, 2), 3.0, dtype=pool.dtype, device=_DEV)
                         layer = SimpleNamespace(layer_id=layer_id)
                         kv.store_mla(
-                            layer, KVWriteLoc(loc, window_loc, full_loc), nope, rope
+                            layer,
+                            KVWriteLoc(
+                                loc,
+                                full_loc=full_loc,
+                                window_locs={SWAKVPool.WINDOW_SUB_POOL: window_loc},
+                            ),
+                            nope,
+                            rope,
                         )
                         expected = torch.zeros_like(buffer)
                         slot = (
