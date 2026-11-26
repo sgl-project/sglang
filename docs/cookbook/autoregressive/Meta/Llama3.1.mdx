@@ -311,7 +311,7 @@ sglang serve \
 - Benchmark Command:
 
 ```shell Command
-sglang serve \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Meta-Llama/Llama-3.1-70B \
   --dataset-name random \
@@ -365,9 +365,9 @@ Max ITL (ms):                            21.95
 ##### 5.1.1.2 Medium Concurrency
 
 ```shell Command
-sglang serve \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
-  --model-path Meta-Llama/Llama-3.1-70B \
+  --model Meta-Llama/Llama-3.1-70B \
   --dataset-name random \
   --random-input-len 1000 \
   --random-output-len 1000 \
@@ -419,9 +419,9 @@ Max ITL (ms):                            478.92
 ##### 5.1.1.3 High Concurrency
 
 ```shell Command
-sglang serve \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
-  --model-path Meta-Llama/Llama-3.1-70B \
+  --model Meta-Llama/Llama-3.1-70B \
   --dataset-name random \
   --random-input-len 1000 \
   --random-output-len 1000 \
@@ -475,9 +475,9 @@ Max ITL (ms):                            1107.09
 ##### 5.1.2.1 Low Concurrency
 
 ```shell Command
-sglang serve \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
-  --model-path Meta-Llama/Llama-3.1-70B\
+  --model Meta-Llama/Llama-3.1-70B \
   --dataset-name random \
   --random-input-len 8000 \
   --random-output-len 1000 \
@@ -527,9 +527,9 @@ Max ITL (ms):                            23.08
 ##### 5.1.2.2 Medium Concurrency
 
 ```shell Command
-sglang serve \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
-  --model-path Meta-Llama/Llama-3.1-70B \
+  --model Meta-Llama/Llama-3.1-70B \
   --dataset-name random \
   --random-input-len 8000 \
   --random-output-len 1000 \
@@ -579,9 +579,9 @@ Max ITL (ms):                            2529.51
 ##### 5.1.2.3 High Concurrency
 
 ```shell Command
-sglang serve \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
-  --model-path Meta-Llama/Llama-3.1-70B \
+  --model Meta-Llama/Llama-3.1-70B \
   --dataset-name random \
   --random-input-len 8000 \
   --random-output-len 1000 \

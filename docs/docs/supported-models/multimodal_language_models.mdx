@@ -9,9 +9,9 @@ These models accept multi-modal inputs (e.g., images and text) and generate text
 
 ```bash Launch Server
 python3 -m sglang.launch_server \
-  --model-path meta-llama/Llama-3.2-11B-Vision-Instruct \  # example HF/local path
+  --model-path meta-llama/Llama-3.2-11B-Vision-Instruct \
   --host 0.0.0.0 \
-  --port 30000 \
+  --port 30000
 ```
 
 > See the [OpenAI APIs section](../basic_usage/openai_api_vision) for how to send multimodal requests.
@@ -437,9 +437,9 @@ python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --enable-multimodal \
   --dtype bfloat16 \
-  --attention-backend triton \ # Use Triton attention backend
-  --disable-decode-cuda-graph --disable-prefill-cuda-graph \ # Disable Cuda Graph
-  --chunked-prefill-size -1 # Disable Chunked Prefill
+  --attention-backend triton \
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph \
+  --chunked-prefill-size -1
 ```
 
 If higher serving performance is required and a certain degree of accuracy loss is acceptable, you may choose to use other attention backends, and you can also enable features like CUDA Graph and Chunked Prefill for better performance, but note that the model will fall back to using causal attention instead of bidirectional attention.

@@ -164,7 +164,7 @@ drun -p 30000:30000 \
     --env "HF_TOKEN=<secret>" \
     sglang_image \
     python3 -m sglang.launch_server \
-    --model-path deepseek-ai/DeepSeek-V3 \ # <- here
+    --model-path deepseek-ai/DeepSeek-V3 \
     --tp 8 \
     --trust-remote-code \
     --host 0.0.0.0 \
@@ -184,7 +184,7 @@ drun -p 30000:30000 \
     --env "HF_TOKEN=<secret>" \
     sglang_image \
     python3 -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \ # <- here
+    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --tp 8 \
     --trust-remote-code \
     --host 0.0.0.0 \

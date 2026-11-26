@@ -107,15 +107,17 @@ docker run \
 Example command to launch SGLang serving:
 
 ```bash
-sglang serve                         \
-    --model-path <MODEL_ID_OR_PATH>  \
-    --trust-remote-code              \
-    --device xpu                     \
-    --host 0.0.0.0                   \
-    --tp 2                           \   # using multi GPUs
-    --attention-backend intel_xpu    \   # using intel optimized XPU attention backend
-    --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
+sglang serve \
+    --model-path <MODEL_ID_OR_PATH> \
+    --trust-remote-code \
+    --device xpu \
+    --host 0.0.0.0 \
+    --tp 2 \
+    --attention-backend intel_xpu \
+    --page-size 128
 ```
+
+`--tp 2` runs on two GPUs, and `--attention-backend intel_xpu` selects the Intel-optimized XPU attention backend. That backend supports a `--page-size` of 1, 64 or 128, or of 16, 32, 64 or 128 for MLA models.
 
 To run the vision encoder and the language model of a multimodal model as separate servers, see [EPD disaggregation on Intel XPU](/docs/advanced_features/epd_disaggregation#intel-xpu).
 
