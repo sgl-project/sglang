@@ -1149,6 +1149,40 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
+    def test_npu_pd_hicache_opt_in_returns_saved_bytes_to_token_capacity(self, _):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        mr = _make_model_runner(
+            self, num_layers=78, use_mla_backend=True, disaggregation_mode="prefill"
+        )
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+        capacity = []
+        for enabled, producer_layers in ((False, 78), (True, 21)):
+            with (
+                self.subTest(enabled=enabled),
+                mock_cpu_env(kv_size=2),
+                get_memory().override(enable_hierarchical_cache=True),
+                patch("sglang.srt.mem_cache.kv_cache_configurator._is_npu", True),
+                patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+                patch(
+                    "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                    return_value=False,
+                ),
+                envs.SGLANG_NPU_COMPACT_DSA_INDEXER.override(enabled),
+            ):
+                cfg = DefaultPoolConfigurator(mr)
+                self.assertEqual(cfg._cell_size, (576 * 78 + 128 * producer_layers) * 2)
+                sizes = cfg.calculate_pool_sizes(100_000_000, page_size=128)
+                capacity.append(sizes.max_total_num_tokens)
+        self.assertGreater(capacity[1], capacity[0])
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
     def test_non_arch35_npu_budget_uses_compact_indexer_capacity(
         self,
         _mock_calculate_mla_kv_cache_dim,
