@@ -1,7 +1,7 @@
 """Ascend Ops MoE communication dispatcher.
 
 Expert regrouping is handled by the Ascend runner hooks. This module owns the
-AllGather, AllToAllV, and MC2 communication paths.
+AllGather, AllToAllV and MC2 communication paths and selects the fused MegaMoE path.
 """
 
 from __future__ import annotations
@@ -21,7 +21,13 @@ from sglang.srt.hardware_backend.npu.moe.routing import (
     npu_moe_finalize_routing,
     npu_moe_init_routing,
 )
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dp_attention import (
+    ascend_allgather_row_sizes_for_batch,
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -35,7 +41,12 @@ from sglang.srt.layers.moe.utils import AscendOpsConfig, DispatcherOutputDtype
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_prefill_graph_scope,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_schedule,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -67,7 +78,7 @@ _TORCH_DTYPE_TO_ATEN = {
 
 
 class AscendOpsDispatchOutput(NamedTuple):
-    """Dispatcher output shared by the three Ascend execution paths."""
+    """Dispatcher output shared by the Ascend execution paths."""
 
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
@@ -130,7 +141,18 @@ class _AllToAllVState:
     local_expanded_row_idx: Optional[torch.Tensor] = None
 
 
-AscendOpsForwardState = _MC2State | _AllGatherState | _AllToAllVState
+@dataclass
+class _MegaMoEState:
+    group: Any
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    # Size of the single shared EP buffer. Both phases reuse it: the provider
+    # registers peermem per process group, so a second buffer on the same group
+    # makes the MegaMoE tiling fail with "Failed to get peermem base".
+    buffer_capacity: int
+
+
+AscendOpsForwardState = _MC2State | _AllGatherState | _AllToAllVState | _MegaMoEState
 
 
 class AscendOpsDispatcher(BaseDispatcher):
@@ -156,6 +178,11 @@ class AscendOpsDispatcher(BaseDispatcher):
         self.quant_config: Optional[dict] = None
         self._ep_comm_name: Optional[str] = None
         self._pad_buffers: dict[tuple, tuple] = {}
+        # Resolved once per layer: the symmetric EP buffer identity is the
+        # process group and the model geometry is fixed at load time.
+        self._mega_moe_symm_buffer: Any = None
+        if self.moe_ascend_ops_config.uses_fused_op:
+            self._init_fused_op(moe_runner_config)
         if self.moe_ascend_ops_config.prefill == "allgather":
             if not (
                 parallel.tp_size == parallel.moe_ep_size
@@ -166,6 +193,56 @@ class AscendOpsDispatcher(BaseDispatcher):
                     "NPU AllGather requires TP=EP, contiguous expert placement "
                     "and no fused shared experts"
                 )
+
+    def _init_fused_op(self, config: MoeRunnerConfig) -> None:
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        if (
+            self.ep_size < 2
+            or self.num_local_experts * self.ep_size != self.num_experts
+            or config.num_fused_shared_experts
+        ):
+            raise ValueError(
+                "ascend_ops fused_op requires EP >= 2, evenly partitioned "
+                "experts and no fused shared experts"
+            )
+        if config.apply_router_weight_on_input or config.no_combine:
+            raise ValueError(
+                "ascend_ops fused_op applies routing weights to expert outputs "
+                "and returns a combined result"
+            )
+        if not config.is_gated:
+            raise ValueError("ascend_ops fused_op requires a gated expert FFN")
+
+        is_arch35 = is_npu_arch35()
+        if self.moe_ascend_ops_config.prefill == "fused_op":
+            prefill_capacity = (
+                max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+            )
+            self._fused_prefill_capacity = (
+                prefill_capacity if is_arch35 else min(prefill_capacity, 4096)
+            )
+        if self.moe_ascend_ops_config.decode == "fused_op":
+            decode_capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            if decode_capacity <= 0 or (not is_arch35 and decode_capacity > 4096):
+                raise ValueError(
+                    "ascend_ops fused_op decode requires a positive "
+                    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK "
+                    "(at most 4096 on arch22)"
+                )
+            self._fused_decode_capacity = decode_capacity
+
+        # One shared EP buffer for both phases. The provider registers peermem
+        # per process group, so creating a second buffer on the same group makes
+        # the MegaMoE tiling fail with "Failed to get peermem base".
+        self._fused_buffer_capacity = max(
+            capacity
+            for capacity in (
+                getattr(self, "_fused_prefill_capacity", None),
+                getattr(self, "_fused_decode_capacity", None),
+            )
+            if capacity
+        )
 
     def set_quant_config(self, quant_config: dict) -> None:
         """Store quantization settings used by the routing kernels."""
@@ -178,7 +255,17 @@ class AscendOpsDispatcher(BaseDispatcher):
         topk_weights, topk_ids, _ = topk_output
         # Capture forces is_extend_in_batch False; the scope term keeps a
         # prefill graph on the prefill path instead of the decode MC2 path.
-        if get_is_extend_in_batch() or is_in_prefill_graph_scope():
+        is_prefill = get_is_extend_in_batch() or is_in_prefill_graph_scope()
+        mode = (
+            self.moe_ascend_ops_config.prefill
+            if is_prefill
+            else self.moe_ascend_ops_config.decode
+        )
+        if mode == "fused_op":
+            return self._dispatch_fused_op(
+                hidden_states, topk_weights, topk_ids, is_prefill
+            )
+        if is_prefill:
             if self.moe_ascend_ops_config.prefill == "allgather":
                 return self._dispatch_allgather(
                     hidden_states, topk_weights, topk_ids, self.tp_group
@@ -202,7 +289,44 @@ class AscendOpsDispatcher(BaseDispatcher):
             return self._combine_alltoallv(combine_input.hidden_states, state)
         if isinstance(state, _MC2State):
             return self._combine_mc2(combine_input.hidden_states, state)
+        if isinstance(state, _MegaMoEState):
+            return self._combine_fused_op(combine_input.hidden_states, state)
         raise TypeError(f"unknown Ascend Ops forward state: {type(state)!r}")
+
+    def _dispatch_fused_op(self, hidden_states, topk_weights, topk_ids, is_prefill):
+        capacity = (
+            self._fused_prefill_capacity if is_prefill else self._fused_decode_capacity
+        )
+        num_tokens = hidden_states.shape[0]
+        dp_rows = get_dp_global_num_tokens() if is_dp_attention_enabled() else None
+        max_rows = max(num_tokens, max(dp_rows or (), default=0))
+        if max_rows > capacity:
+            phase = "prefill" if is_prefill else "decode"
+            raise ValueError(
+                f"ascend_ops fused_op {phase} received up to {max_rows} tokens "
+                f"per rank, exceeding the MegaMoE capacity of {capacity}"
+            )
+        return AscendOpsDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            expert_tokens=None,
+            group_list_type=1,
+            exec_mode="fused_op",
+            forward_state=_MegaMoEState(
+                self.ep_group,
+                topk_ids,
+                topk_weights,
+                buffer_capacity=self._fused_buffer_capacity,
+            ),
+        )
+
+    def _combine_fused_op(
+        self, hidden_states: torch.Tensor, _state: _MegaMoEState
+    ) -> torch.Tensor:
+        """Return the output already combined by MegaMoE."""
+        return hidden_states
 
     # Decode (MC2 low latency)
 
@@ -429,7 +553,16 @@ class AscendOpsDispatcher(BaseDispatcher):
         return [int(rows.item()) for rows in gathered_rows]
 
     def _resolve_allgather_row_sizes(self, local_rows: int, group, device) -> list[int]:
-        row_sizes = get_forward().ascend_allgather_row_sizes
+        forward = get_forward()
+        row_sizes = forward.ascend_allgather_row_sizes
+        if row_sizes is None:
+            batch = forward.forward_batch
+            if batch is not None:
+                row_sizes = ascend_allgather_row_sizes_for_batch(
+                    batch,
+                    use_cp=is_cp_active(batch),
+                    use_tp_attn_a2a_scatter=forward.moe_input_attn_tp_sliced,
+                )
         # Use the same branch on every rank. A local mismatch is an invariant
         # violation, so it cannot switch this rank to a different collective.
         if row_sizes is None or len(row_sizes) != dist.get_world_size(group):
