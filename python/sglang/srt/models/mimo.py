@@ -76,8 +76,8 @@ class MiMoForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.get_input_embeddings()
 
     @torch.no_grad()
     def forward(

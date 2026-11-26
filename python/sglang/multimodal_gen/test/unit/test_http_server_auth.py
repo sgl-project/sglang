@@ -13,6 +13,7 @@ def _app(api_key=None, admin_api_key=None):
     # Both optional routers mounted, so every route the server can serve is here.
     args = SimpleNamespace(
         enable_metrics=False,
+        media_gateway_key_file=None,
         api_key=api_key,
         admin_api_key=admin_api_key,
         pipeline_config=SimpleNamespace(
