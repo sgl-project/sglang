@@ -15,6 +15,11 @@ import enum
 import torch
 
 
+def pa_nd_num_pages(size: int, page_size: int) -> int:
+    """Physical pages including the reserved page in a PA_ND pool."""
+    return (size + page_size + 1) // page_size
+
+
 def get_a3_c2_state_bank_count(num_req_slots: int) -> int:
     from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 

@@ -183,6 +183,37 @@ class Dsv4NpuRoPE:
             )
 
 
+def draft_rope_(x, positions, freqs_cis, rope_dim, *, inverse=False):
+    cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
+        positions, x.dtype, view_4d=True, inverse=inverse, cache_dtype=torch.float32
+    )
+    Dsv4NpuRoPE.apply_rotary_mul_inplace(x, None, cos, sin, x.shape[-1] - rope_dim)
+
+
+def draft_query_rope(q, positions, freqs_cis, rope_dim, norm_weight, eps, q_out):
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch22
+
+    # The 910 path indexes real cos/sin tables (no complex gather). Keep the
+    # 950 no-norm path and its fused FP8 output when requested.
+    if norm_weight is None and not is_npu_arch22():
+        if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
+            from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope
+
+            fused_q_norm_rope(q, q_out, None, freqs_cis, positions)
+            return q_out
+        tail = q[..., -rope_dim:]
+        pairs = torch.view_as_complex(tail.float().unflatten(-1, (-1, 2)))
+        rotated = pairs * freqs_cis[positions][:, None, :]
+        tail.copy_(torch.view_as_real(rotated).flatten(-2))
+    else:
+        if norm_weight is not None:
+            import torch_npu
+
+            q = torch_npu.npu_rms_norm(q, norm_weight, eps)[0]
+        draft_rope_(q, positions, freqs_cis, rope_dim)
+    return q if q_out is None else q_out.copy_(q)
+
+
 # Per-forward memo of position-gathered (cos, sin), stashed on the ForwardBatch
 # under this attribute by prime_rope_cos_sin (the single writer).
 _ROPE_MEMO_ATTR = "_dsv4_npu_rope_memo"

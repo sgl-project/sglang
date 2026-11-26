@@ -2342,6 +2342,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
 
     def test_other_backends_keep_existing_byte_contract(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+        from sglang.srt.platforms.npu import NPUSRTPlatform
 
         # Exercise sizing guards only; this does not assert these backends can
         # serve a low-ratio model or use the FlashMLA layouts.
@@ -2357,13 +2358,23 @@ class TestDSV4LowRatioBudget(CustomTestCase):
                 planner.kv_bytes = kv_bytes
                 planner.low_ratio_index_bytes = 68
                 planner.stage_owner_layers = {1: [0], 2: [1]}
-                with (
-                    patch("sglang.srt.model_executor.pool_configurator._is_npu", npu),
-                    patch(
-                        "sglang.srt.mem_cache.deepseek_v4_memory_pool.select_dsv4_kv_layout",
-                        side_effect=AssertionError(
-                            "this backend does not use FlashMLA pages"
-                        ),
+                if npu:
+                    # Arch35 uses its historical row estimate, not FlashMLA pages.
+                    with patch(
+                        "sglang.srt.hardware_backend.npu.dsv4.dsv4_pool_layout.is_npu_arch35",
+                        return_value=True,
+                    ):
+                        planner._paged_layout = (
+                            NPUSRTPlatform().get_dsv4_paged_pool_layout(
+                                SimpleNamespace(
+                                    model_config=SimpleNamespace(compress_ratios=[1, 2])
+                                )
+                            )
+                        )
+                with patch(
+                    "sglang.srt.mem_cache.deepseek_v4_memory_pool.select_dsv4_kv_layout",
+                    side_effect=AssertionError(
+                        "this backend does not use FlashMLA pages"
                     ),
                 ):
                     for ratio in (1, 2):
@@ -2372,6 +2383,44 @@ class TestDSV4LowRatioBudget(CustomTestCase):
                             (kv_bytes + 68) / ratio,
                         )
                     self.assertEqual(planner._get_low_ratio_kv_padding_bytes(256), 0)
+
+    def test_bf16_paged_pool_counts_draft_pages_and_padded_pair_banks(self):
+        from sglang.srt.platforms.npu import NPUSRTPlatform
+
+        _publish_config(self, enable_encoder_swa_bounded_replay=False)
+        kvc = SimpleNamespace(
+            model_config=SimpleNamespace(compress_ratios=[0, 1, 2]),
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: True),
+            spec_aux_config=SimpleNamespace(dspark_num_stages=3),
+        )
+        with patch(
+            "sglang.srt.hardware_backend.npu.dsv4.dsv4_pool_layout.is_npu_arch35",
+            return_value=False,
+        ):
+            layout = NPUSRTPlatform().get_dsv4_paged_pool_layout(kvc)
+        self.assertEqual(layout.draft_swa_layers, 3)
+        self.assertEqual(layout.low_ratio_index_row_bytes(128), 256)
+        pool = SimpleNamespace(
+            page_size=128,
+            num_layers_total=3,
+            num_layers=lambda ratio: 1,
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            low_ratio_index_bytes=256,
+        )
+        with patch(
+            "sglang.srt.hardware_backend.npu.dsv4.dsv4_pool_layout.DSV41_INDEX_PAGE_SIZE",
+            128,
+        ):
+            # At 256 tokens: SWA reserves 6 pages, C1/C2 reserve 128/64
+            # main rows, and both indexers need 256/128 extra rows.
+            expected = (6 * 128 + 128 + 64) * 1024 + (256 + 128) * 256
+            self.assertEqual(layout.low_ratio_padding_bytes(pool, 256), expected)
+        with patch(
+            "sglang.srt.layers.dp_attention.get_eager_max_batch_size", return_value=16
+        ):
+            # 10 logical slots cost 16 physical banks plus the reserved tail.
+            self.assertEqual(layout.pair_state_rows(10, 8), 144)
 
 
 if __name__ == "__main__":
