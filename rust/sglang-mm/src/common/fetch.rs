@@ -49,6 +49,21 @@ impl ByteBudget {
         self.claim(n as u64).map_err(|()| over_budget(what))
     }
 
+    /// Charge before loading a payload and refund if the loader declines it.
+    pub fn charge_if_loaded<T>(
+        &self,
+        n: usize,
+        what: &str,
+        load: impl FnOnce() -> Option<T>,
+    ) -> Result<Option<T>, String> {
+        self.charge_existing(n, what)?;
+        let loaded = load();
+        if loaded.is_none() {
+            self.release(n as u64);
+        }
+        Ok(loaded)
+    }
+
     /// Give back bytes claimed for a chunk but not filled by the read.
     fn release(&self, n: u64) {
         self.0.fetch_add(n, std::sync::atomic::Ordering::AcqRel);

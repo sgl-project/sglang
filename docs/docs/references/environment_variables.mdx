@@ -2151,7 +2151,7 @@ MPS and does not read them.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_RUST_MMAP_LOCAL_MEDIA</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set to <code>1</code> to memory-map local media files of at least 32 MiB in Rust serving on Linux 5.14 or later. The opened file must have fs-verity enabled or have Linux file seals that prohibit writes, growth, and shrinkage. Other local media continue through buffered reads.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set to <code>1</code> to memory-map local media files of at least 32 MiB in Rust serving. Mapping requires Linux 5.14 or later and a file protected by fs-verity or Linux file seals that prohibit writes, growth, and shrinkage. If the file cannot be mapped and populated, it is read through the buffered path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>

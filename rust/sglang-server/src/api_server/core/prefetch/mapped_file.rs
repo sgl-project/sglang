@@ -25,7 +25,9 @@ pub(super) fn enabled() -> bool {
 pub(super) fn fetch(src: &str, budget: &ByteBudget) -> Result<Bytes, String> {
     let path = src.strip_prefix("file://").unwrap_or(src);
     let file = File::open(path).map_err(|err| format!("media fetch: {path}: {err}"))?;
-    if let Some(bytes) = map_if_immutable(&file, path, budget, MIN_MAPPED_BYTES)? {
+    if let Some(bytes) =
+        map_if_immutable(&file, path, budget, MIN_MAPPED_BYTES, MappedFile::populate)?
+    {
         return Ok(bytes);
     }
     read_local_file_budgeted(file, path, budget).map(Bytes::from)
@@ -36,6 +38,7 @@ fn map_if_immutable(
     path: &str,
     budget: &ByteBudget,
     minimum: u64,
+    populate: impl FnOnce(&MappedFile) -> rustix::io::Result<()>,
 ) -> Result<Option<Bytes>, String> {
     let metadata = file
         .metadata()
@@ -86,18 +89,30 @@ fn map_if_immutable(
         return Ok(None);
     };
     let region = MappedFile { address, len };
-    budget.charge_existing(len, path)?;
-    // Fault pages in on the blocking prefetch worker. In particular, this
-    // surfaces storage errors as an I/O result before the decoder sees bytes.
-    // SAFETY: region owns a live read-only mapping of exactly len bytes.
-    unsafe { madvise(addr, len, Advice::LinuxPopulateRead) }
-        .map_err(|err| format!("media fetch: populate {path}: {err}"))?;
-    Ok(Some(Bytes::from_owner(region)))
+    // Populate while on the blocking worker. If the kernel cannot populate
+    // the mapping, discard it and let the buffered reader handle the file.
+    budget.charge_if_loaded(len, path, || {
+        populate(&region).ok()?;
+        Some(Bytes::from_owner(region))
+    })
 }
 
 struct MappedFile {
     address: NonNull<u8>,
     len: usize,
+}
+
+impl MappedFile {
+    fn populate(&self) -> rustix::io::Result<()> {
+        // SAFETY: self owns a live read-only mapping of exactly len bytes.
+        unsafe {
+            madvise(
+                self.address.as_ptr().cast(),
+                self.len,
+                Advice::LinuxPopulateRead,
+            )
+        }
+    }
 }
 
 // SAFETY: this owns an immutable mapping, which is unmapped only when its
@@ -138,7 +153,7 @@ mod tests {
     fn sealed_media_stays_live_after_close_and_charges_budget() {
         let file = fixture(IMMUTABLE_SEALS);
         let budget = ByteBudget::new(16);
-        let bytes = map_if_immutable(&file, "image", &budget, 1)
+        let bytes = map_if_immutable(&file, "image", &budget, 1, |_| Ok(()))
             .unwrap()
             .unwrap();
         assert!(file.set_len(0).is_err());
@@ -152,13 +167,13 @@ mod tests {
         let budget = ByteBudget::new(13);
         let mutable = fixture(SealFlags::WRITE);
         assert!(
-            map_if_immutable(&mutable, "image", &budget, 1)
+            map_if_immutable(&mutable, "image", &budget, 1, MappedFile::populate)
                 .unwrap()
                 .is_none()
         );
         let sealed = fixture(IMMUTABLE_SEALS);
         assert!(
-            map_if_immutable(&sealed, "image", &budget, 14)
+            map_if_immutable(&sealed, "image", &budget, 14, MappedFile::populate)
                 .unwrap()
                 .is_none()
         );
@@ -168,7 +183,27 @@ mod tests {
     #[test]
     fn mapped_media_rejects_an_over_budget_file() {
         let sealed = fixture(IMMUTABLE_SEALS);
-        let error = map_if_immutable(&sealed, "image", &ByteBudget::new(12), 1).unwrap_err();
+        let error = map_if_immutable(&sealed, "image", &ByteBudget::new(12), 1, |_| {
+            panic!("an over-budget mapping must not populate")
+        })
+        .unwrap_err();
         assert!(error.contains("budget"));
+    }
+
+    #[test]
+    fn populate_failure_refunds_budget_for_buffered_read() {
+        use std::io::{Seek, SeekFrom};
+
+        let mut sealed = fixture(IMMUTABLE_SEALS);
+        sealed.seek(SeekFrom::Start(0)).unwrap();
+        let budget = ByteBudget::new(13);
+        let mapped = map_if_immutable(&sealed, "image", &budget, 1, |_| {
+            Err(rustix::io::Errno::INVAL)
+        })
+        .unwrap();
+        assert!(mapped.is_none());
+        let bytes = read_local_file_budgeted(sealed, "image", &budget).unwrap();
+        assert_eq!(bytes, b"image payload");
+        assert!(budget.charge_existing(1, "second image").is_err());
     }
 }
