@@ -88,26 +88,24 @@ def load_scheduler_tokenizer(*, is_multimodal: bool):
 
 
 def maybe_prewarm_scheduler_tokenizer():
-    """Populate the local HF modules cache before concurrent scheduler loads."""
-    serving = get_serving()
-    parallel = get_parallel()
-    if (
-        serving.skip_tokenizer_init
-        or not get_model().trust_remote_code
-        or parallel.tp_size * parallel.pp_size * parallel.dp_size <= parallel.nnodes
-        or not Path(serving.tokenizer_path).is_dir()
-    ):
-        return
-
-    # huggingface/transformers#50843: a late copier can truncate a module
-    # another scheduler is importing. Populate the cache before spawning either.
+    """Best-effort cache warmup before concurrent scheduler loads."""
     try:
+        serving = get_serving()
+        parallel = get_parallel()
+        if (
+            serving.skip_tokenizer_init
+            or not get_model().trust_remote_code
+            or parallel.tp_size * parallel.pp_size * parallel.dp_size <= parallel.nnodes
+            or not Path(serving.tokenizer_path).is_dir()
+        ):
+            return
+
+        # huggingface/transformers#50843: a late copier can truncate a module
+        # another scheduler is importing. Populate the cache before spawning either.
         load_scheduler_tokenizer(is_multimodal=process_model_config().is_multimodal)
     except Exception:
         logger.warning(
-            "Could not prewarm the HF modules cache for %s. "
-            "Schedulers will retry loading during startup.",
-            serving.tokenizer_path,
+            "Could not prewarm the HF modules cache. Continuing with scheduler startup.",
             exc_info=True,
         )
 

@@ -26,6 +26,48 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestLocalModulePrewarm(CustomTestCase):
+    def test_prewarm_failure_preserves_scheduler_launch(self):
+        from sglang.srt.entrypoints.engine import Engine
+        from sglang.srt.hf_transformers import processor
+
+        self.addCleanup(reset_context)
+        with tempfile.TemporaryDirectory() as model:
+            args = ServerArgs(
+                model_path="dummy",
+                tokenizer_path=model,
+                device="cpu",
+                tp_size=2,
+                trust_remote_code=True,
+            )
+            publish(args, role="tokenizer")
+            for failing_step in ("get_serving", "load_scheduler_tokenizer"):
+                for launch_error in (None, OSError("scheduler startup failed")):
+                    with (
+                        self.subTest(step=failing_step, launch_error=launch_error),
+                        patch.object(processor, "process_model_config"),
+                        patch.object(
+                            processor,
+                            failing_step,
+                            side_effect=ValueError("prewarm failed"),
+                        ) as step,
+                        self.assertLogs(processor.logger, level="WARNING") as logs,
+                        patch(
+                            "multiprocessing.Process.start", side_effect=launch_error
+                        ) as start,
+                    ):
+                        if launch_error is None:
+                            _, processes = Engine._launch_scheduler_processes(
+                                args, None, None
+                            )
+                            self.assertEqual(len(processes), 2)
+                            self.assertEqual(start.call_count, 2)
+                        else:
+                            with self.assertRaises(OSError) as raised:
+                                Engine._launch_scheduler_processes(args, None, None)
+                            self.assertIs(raised.exception, launch_error)
+                        step.assert_called_once()
+                        self.assertIn("prewarm failed", "\n".join(logs.output))
+
     def test_prewarm_only_for_concurrent_local_custom_code(self):
         self.addCleanup(reset_context)
         with tempfile.TemporaryDirectory() as model:
