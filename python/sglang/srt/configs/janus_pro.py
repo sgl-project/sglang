@@ -18,18 +18,9 @@ from transformers import (
 )
 from transformers.image_utils import to_numpy_array
 
+from sglang.srt.configs.deepseekvl2 import DictOutput
 from sglang.srt.configs.utils import register_image_processor, register_processor
 from sglang.srt.multimodal.mm_utils import expand2square
-
-
-class DictToObject(dict):
-    def __init__(self, dictionary):
-        super(self).__init__(dictionary)
-
-        for key, value in dictionary.items():
-            if isinstance(value, dict):
-                value = DictToObject(value)
-            setattr(self, key, value)
 
 
 class VisionConfig(PretrainedConfig):
@@ -281,23 +272,6 @@ class VLMImageProcessor(BaseImageProcessor):
     @property
     def default_shape(self):
         return [3, self.image_size, self.image_size]
-
-
-class DictOutput(object):
-    def items(self):
-        return self.__dict__.items()
-
-    def keys(self):
-        return self.__dict__.keys()
-
-    def __getitem__(self, item):
-        return self.__dict__[item]
-
-    def __contains__(self, key):
-        return key in self.__dict__
-
-    def __setitem__(self, key, value):
-        self.__dict__[key] = value
 
 
 @dataclass
@@ -591,43 +565,6 @@ class VLChatProcessor(ProcessorMixin):
         )
 
         return batched_prepares
-
-
-class VLMImageProcessorConfig(PretrainedConfig):
-    model_type = "deepseek_vlm"
-    image_size: int = None
-    min_size: int = None
-    image_mean: Union[Tuple[float, float, float], List[float]] = None
-    image_std: Union[Tuple[float, float, float], List[float]] = None
-    rescale_factor: float = None
-    do_normalize: bool = None
-
-    def __init__(
-        self,
-        image_size: int,
-        min_size: int = 14,
-        image_mean: Union[Tuple[float, float, float], List[float]] = (
-            0.48145466,
-            0.4578275,
-            0.40821073,
-        ),
-        image_std: Union[Tuple[float, float, float], List[float]] = (
-            0.26862954,
-            0.26130258,
-            0.27577711,
-        ),
-        rescale_factor: float = 1.0 / 255.0,
-        do_normalize: bool = True,
-        **kwargs,
-    ):
-        self.image_size = image_size
-        self.min_size = min_size
-        self.image_mean = image_mean
-        self.image_std = image_std
-        self.rescale_factor = rescale_factor
-        self.do_normalize = do_normalize
-
-        super().__init__(**kwargs)
 
 
 register_processor(MultiModalityConfig, VLChatProcessor)
