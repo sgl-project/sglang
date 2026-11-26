@@ -1703,6 +1703,57 @@ class TestSchedulingVPPCore(CustomTestCase):
 
 
 class TestSchedulerVPP(CustomTestCase):
+    def test_wavefront_batch_does_not_publish_a_parked_chunk(self):
+        for chunk_runs in (False, True):
+            with self.subTest(chunk_runs=chunk_runs):
+                running = SimpleNamespace(
+                    rid="running", origin_input_ids=list(range(16)), beam_group=None
+                )
+                parked = SimpleNamespace(rid="parked")
+                chunk = running if chunk_runs else parked
+                batch = SimpleNamespace(
+                    reqs=[running],
+                    chunked_req=chunk,
+                    chunked_req_next_prompt_token=7,
+                    prefix_lens=[4],
+                    extend_lens=[4],
+                    return_hidden_states=False,
+                )
+                scheduler = SchedulerVPPMixin()
+                scheduler.mbs = [None, None]
+                scheduler.running_mbs = [object(), object()]
+                scheduler.last_mbs = [None, None]
+                scheduler.mb_metadata = [None, None]
+                scheduler.chunked_reqs = [chunk]
+                scheduler.process_pending_chunked_abort = lambda: None
+                scheduler.process_prefill_chunk = lambda **kwargs: None
+                scheduler.get_new_batch_prefill = lambda running_batch: SimpleNamespace(
+                    batch_to_run=batch, running_batch=running_batch
+                )
+                scheduler.dp_attn_adapter = SimpleNamespace(
+                    maybe_prepare_mlp_sync_batch=lambda value: value
+                )
+                seen = []
+
+                def prepare(value, chunked_req):
+                    seen.append(chunked_req)
+                    return value
+
+                scheduler.ngram_embedding_manager = SimpleNamespace(
+                    prepare_for_forward=prepare
+                )
+                owners = [None, None]
+                result = scheduler._pp_vpp_prepare_wavefront_batch(0, owners)
+                expected = running if chunk_runs else None
+                self.assertIs(result.chunked_req, expected)
+                self.assertEqual(seen, [expected])
+                self.assertEqual(result.disagg_prefill_chunk_end_by_rid, {"running": 8})
+                self.assertEqual(scheduler.chunked_reqs, [chunk])
+                self.assertEqual(owners, [0, None])
+                self.assertEqual(
+                    result.chunked_req_next_prompt_token, 7 if chunk_runs else None
+                )
+
     def test_prefix_match_respects_vpp_frontier_and_existing_caps(self):
         """A local cache hit cannot advance past the agreed pipeline frontier."""
         from sglang.srt.managers.schedule_batch import Req

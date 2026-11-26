@@ -299,6 +299,15 @@ class SchedulerVPPMixin(SchedulingVPPCore):
             self._vpp_admit_manifest = None
         batch = plan.batch_to_run
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+        if (
+            batch is not None
+            and batch.chunked_req is not None
+            and not any(req is batch.chunked_req for req in batch.reqs)
+        ):
+            # Native planning can retain a parked chunk in this field. VPP
+            # publishes only the request spans that actually ran in the batch.
+            batch.chunked_req = None
+            batch.chunked_req_next_prompt_token = None
         batch = self.ngram_embedding_manager.prepare_for_forward(
             batch, chunked_req=batch.chunked_req if batch is not None else None
         )
