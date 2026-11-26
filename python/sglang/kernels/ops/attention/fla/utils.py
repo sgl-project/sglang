@@ -15,6 +15,7 @@ import torch
 import triton
 from packaging import version
 
+import sglang.kernels.ops.attention.triton_block_ptr_compat  # noqa: F401
 from sglang.srt.utils.common import torch_release
 
 logger = logging.getLogger(__name__)
