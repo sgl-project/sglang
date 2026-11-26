@@ -146,7 +146,7 @@ class BuilderAdapter:
                 disable=False,
                 req_to_token_pool=ReqToTokenPool(
                     size=4,
-                    max_context_len=256 * self.page_size,
+                    row_width=256 * self.page_size,
                     device=self.device,
                     enable_memory_saver=False,
                 ),
