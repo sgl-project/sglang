@@ -62,8 +62,11 @@ launch settings. A platform can implement `requires_megakernel()` for
 checkpoints or launch modes that need a provider even when no entry registered.
 A platform that sets `accepts_legacy_megakernel_flag` accepts the existing
 NVIDIA flag as a deprecated explicit request. The launcher records the selection
-for the tokenizer and model workers to verify. Installation in an out-of-tree
-model worker requires the platform execution lifecycle.
+for the tokenizer and model workers to verify. After loading weights, SGLang
+builds the provider and asks the platform for its whole-step dispatch. An
+optional model-scoped layout selects KV and recurrent-state pool classes before
+allocation. The dispatch can prepare once those pools and attention backends
+exist. It owns input staging when called from the eager runner.
 
 ## Operators
 

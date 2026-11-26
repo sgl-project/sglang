@@ -114,8 +114,6 @@ class TestOutOfTreeMegakernelSelection(unittest.TestCase):
         self.assertIs(
             megakernel.load_selected_oot_megakernel(child_args), self.provider.SPEC
         )
-        with self.assertRaisesRegex(ValueError, "does not yet support installing"):
-            megakernel.check_oot_megakernel_worker(child_args)
 
     def test_architecture_default_and_foreign_target_keep_the_regular_path(self):
         registry.register(architecture=ARCH, path="unused_cuda_provider:SPEC")
@@ -125,7 +123,6 @@ class TestOutOfTreeMegakernelSelection(unittest.TestCase):
         with patch.object(registry.importlib, "import_module") as import_module:
             args = self.select()
             megakernel.validate_oot_megakernel(args)
-            megakernel.check_oot_megakernel_worker(args)
             import_module.assert_not_called()
 
     def test_required_launch_refuses_when_the_plugin_did_not_register(self):
@@ -199,6 +196,50 @@ class TestOutOfTreeMegakernelSelection(unittest.TestCase):
         self.platform.target = "different"
         with self.assertRaisesRegex(ValueError, "this process cannot serve"):
             megakernel.load_selected_oot_megakernel(args)
+
+    def test_install_and_prepare_platform_delegate_once(self):
+        self.register_provider()
+        args = self.select()
+        model = SimpleNamespace()
+        runner = SimpleNamespace(
+            server_args=args,
+            model=model,
+            model_config=self.model,
+            is_draft_worker=False,
+            decode_num_tokens_per_req=lambda: 1,
+        )
+        calls = []
+        built = SimpleNamespace(widths=(1, 2))
+
+        def dispatch(*args):
+            pass
+
+        dispatch.prepare = lambda mr: calls.append(mr)
+        self.provider.SPEC = replace(self.provider.SPEC, build=lambda *args: built)
+        self.platform.install_megakernel_dispatch = lambda **kwargs: dispatch
+        with (
+            patch.object(megakernel, "_gather_tp", side_effect=lambda obj: [obj]),
+            patch.object(
+                megakernel,
+                "get_device",
+                return_value=SimpleNamespace(watchdog_timeout=None),
+            ),
+        ):
+            megakernel.install_oot_megakernel(runner)
+            megakernel.prepare_oot_megakernel(runner)
+            megakernel.prepare_oot_megakernel(runner)
+        self.assertIs(megakernel.oot_built_megakernel(model), built)
+        self.assertIs(megakernel.oot_megakernel_dispatch(model), dispatch)
+        self.assertEqual(calls, [runner])
+
+    def test_local_phase_reports_remote_failure_before_the_next_phase(self):
+        with patch.object(
+            megakernel, "_gather_tp", return_value=[None, "ValueError: invalid layout"]
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "rank 1: ValueError: invalid layout"
+            ):
+                megakernel._local_phase("build", lambda: None)
 
 
 if __name__ == "__main__":

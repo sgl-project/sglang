@@ -125,6 +125,26 @@ class SRTPlatform(DeviceMixin):
         """
         return False
 
+    def install_megakernel_dispatch(self, *, model, built, binding) -> Callable:
+        """Return a whole-step callable with the model forward signature.
+
+        The callable owns eager input staging. An optional ``prepare(model_runner)``
+        method prepares the same delegate before eager or platform graph execution.
+        """
+        raise NotImplementedError
+
+    def activate_megakernel_pool_layout(self, pool_layout) -> None:
+        """Validate a layout before sizing. The layout remains scoped to the model."""
+        raise NotImplementedError
+
+    def get_megakernel_kv_pool_cls(self, *, kind: KVPoolKind, pool_layout) -> type:
+        """Return the compatible KV pool class for a model's declared layout."""
+        raise NotImplementedError
+
+    def get_megakernel_state_pool_cls(self, *, pool_layout) -> type | None:
+        """Return the layout's recurrent state pool class, if it declares one."""
+        return None
+
     def apply_profile_request_defaults(self, req: ProfileReq) -> None:
         """Fill platform defaults for fields a profile request leaves unset.
 

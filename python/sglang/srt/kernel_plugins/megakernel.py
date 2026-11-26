@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 import msgspec
+import torch.distributed as dist
 
 from sglang.kernels.plugin_kernels.megakernel.spec import (
     MEGAKERNEL_API_VERSION,
+    BuildContext,
+    BuiltMegakernel,
     MegakernelSpec,
     find_spec,
     find_target_registration,
@@ -17,8 +21,10 @@ from sglang.kernels.plugin_kernels.megakernel.spec import (
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.plugins import load_plugins
+from sglang.srt.runtime_context import get_device, get_parallel
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -158,10 +164,144 @@ def validate_oot_megakernel(server_args: ServerArgs) -> None:
         )
 
 
-def check_oot_megakernel_worker(server_args: ServerArgs) -> None:
-    """Keep a selected provider from reaching the stock model worker."""
-    if load_selected_oot_megakernel(server_args) is not None:
-        raise ValueError(
-            "this SGLang build can select the out-of-tree megakernel but "
-            "does not yet support installing it in a model worker"
+@dataclass
+class _InstalledMegakernel:
+    built: BuiltMegakernel
+    dispatch: Callable
+    pool_layout: Any
+    prepared: bool = False
+
+
+def _installed(model) -> _InstalledMegakernel | None:
+    return getattr(model, "_oot_megakernel", None)
+
+
+def oot_built_megakernel(model) -> BuiltMegakernel | None:
+    installed = _installed(model)
+    return None if installed is None else installed.built
+
+
+def oot_megakernel_dispatch(model) -> Callable | None:
+    installed = _installed(model)
+    return None if installed is None else installed.dispatch
+
+
+def oot_megakernel_pool_layout(model) -> Any:
+    installed = _installed(model)
+    return None if installed is None else installed.pool_layout
+
+
+def _gather_tp(value: Any) -> list[Any]:
+    group = get_parallel().tp_group
+    if group.world_size == 1:
+        return [value]
+    values = [None] * group.world_size
+    dist.all_gather_object(values, value, group=group.cpu_group)
+    return values
+
+
+_T = TypeVar("_T")
+
+
+def _local_phase(name: str, run: Callable[[], _T]) -> _T:
+    """Report rank-local failures before peers enter another bootstrap phase."""
+    try:
+        result = run()
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+    else:
+        local_error = None
+    errors = [
+        f"rank {rank}: {error}"
+        for rank, error in enumerate(_gather_tp(local_error))
+        if error is not None
+    ]
+    if errors:
+        raise ValueError(f"out-of-tree megakernel {name} failed: " + "; ".join(errors))
+    return result
+
+
+def install_oot_megakernel(model_runner: ModelRunner) -> None:
+    """Build the selected provider after weights are loaded, before KV sizing."""
+    selection = get_oot_megakernel_selection(model_runner.server_args)
+    if selection is None or model_runner.is_draft_worker:
+        return
+
+    from sglang.srt.kernel_plugins.nvidia.binding import deadline_s
+    from sglang.srt.platforms import current_platform
+
+    model = model_runner.model
+    hf_config = model_runner.model_config.hf_config
+
+    def preflight():
+        spec = load_selected_oot_megakernel(model_runner.server_args)
+        if selection.architecture not in (hf_config.architectures or ()):
+            raise ValueError(f"loaded model does not match the selected {selection}")
+        if (
+            spec.binding
+            or spec.tensor_verify_build
+            or spec.prepare
+            or spec.prefill_graph
+        ):
+            raise ValueError("the selected provider uses CUDA-specific binding entries")
+        if spec.requires.resident_blocks:
+            raise ValueError("the selected provider requires a CUDA SM residency check")
+        if spec.model_disable_reasons is not None:
+            reasons = spec.model_disable_reasons(model, hf_config)
+            if reasons:
+                raise ValueError("; ".join(reasons))
+        return spec
+
+    spec = _local_phase("model validation", preflight)
+
+    def build():
+        tokens = model_runner.decode_num_tokens_per_req()
+        context = BuildContext(
+            widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
+            tokens_per_request=tokens,
+            deadline_s=deadline_s(get_device().watchdog_timeout),
         )
+        built = spec.build(model, hf_config, context)
+        if spec.max_rows > 0 and not built.widths:
+            raise ValueError(f"{spec.name} built no widths from {context.widths}")
+        layout = getattr(built, "pool_layout", None)
+        if layout is not None:
+            if model_runner.spec_algorithm.is_speculative():
+                raise ValueError(
+                    "a custom megakernel pool layout cannot share pools with a speculative draft"
+                )
+            current_platform.activate_megakernel_pool_layout(layout)
+        dispatch = current_platform.install_megakernel_dispatch(
+            model=model, built=built, binding=context.binding
+        )
+        if not callable(dispatch):
+            raise TypeError("the platform must return a whole-step megakernel callable")
+        return _InstalledMegakernel(built, dispatch, layout)
+
+    installed = _local_phase("build", build)
+    layout = installed.pool_layout
+    signature = (
+        selection,
+        tuple(installed.built.widths),
+        type(layout).__module__,
+        type(layout).__qualname__,
+    )
+    if any(other != signature for other in _gather_tp(signature)):
+        raise ValueError(
+            f"ranks disagree on the selected megakernel or its build: {signature}"
+        )
+    model.__dict__["_oot_megakernel"] = installed
+    model._derived_weight_cache_error = (
+        f"Online weight updates are not supported with {spec.name}"
+    )
+
+
+def prepare_oot_megakernel(model_runner: ModelRunner) -> None:
+    """Prepare the installed delegate once the pools and backends exist."""
+    installed = _installed(model_runner.model)
+    if installed is None or installed.prepared:
+        return
+    prepare = getattr(installed.dispatch, "prepare", None)
+    if prepare is not None:
+        prepare(model_runner)
+    installed.prepared = True
