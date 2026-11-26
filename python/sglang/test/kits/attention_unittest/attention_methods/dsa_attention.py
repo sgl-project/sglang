@@ -1090,11 +1090,20 @@ def run_dsa_sparse_attention_case(
         index_pattern=index_pattern,
         loc_layout=loc_layout,
     )
-    if case.forward_mode.is_decode() and fixture.backend.use_fused_topk:
-        # The eager fixture bypasses the indexer. Fused decode consumes the
-        # physical slots that the indexer would have emitted on these pages.
+    speculative = (
+        case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend_v2()
+    )
+    if fixture.backend.use_fused_topk and (
+        case.forward_mode.is_decode() or speculative
+    ):
+        # The fixture bypasses the fused indexer, which emits physical slots
+        # for decode and for each query row of a speculative request.
         logical = fixture.topk_indices
         req_ids = fixture.forward_batch.req_pool_indices.long().unsqueeze(1)
+        if speculative:
+            req_ids = req_ids.repeat_interleave(
+                fixture.backend.speculative_num_draft_tokens, dim=0
+            )
         locations = fixture.runner.req_to_token_pool.req_to_token
         slots = locations[req_ids, logical.long().clamp_min(0)]
         fixture.topk_indices = slots.masked_fill(logical < 0, -1).to(logical.dtype)
@@ -1622,6 +1631,7 @@ def run_dsa_sparse_speculative_forward_mode_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = DEFAULT_DEVICE,
     dsa_decode_backend: str = "flashmla_kv",
+    fp8_kv_cache: bool = False,
 ) -> None:
     """Run a sparse case with a speculative forward mode (TARGET_VERIFY,
     DRAFT_EXTEND, or DRAFT_EXTEND_V2). DSA dispatches both
@@ -1648,6 +1658,7 @@ def run_dsa_sparse_speculative_forward_mode_case(
         dtype=dtype,
         device=device,
         dsa_decode_backend=dsa_decode_backend,
+        fp8_kv_cache=fp8_kv_cache,
     )
 
 

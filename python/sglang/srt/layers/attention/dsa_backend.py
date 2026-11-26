@@ -2985,6 +2985,9 @@ class DeepseekSparseAttnBackend(
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
+            elif dsa_impl == "flashmla_sparse" and self.dsa_kv_cache_store_fp8:
+                # PAGED top-k indices address physical slots, including during MTP.
+                kv_cache, page_table_1 = gather_sparse_decode_kv(kv_cache, page_table_1)
 
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)

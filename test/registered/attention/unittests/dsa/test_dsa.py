@@ -245,6 +245,13 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, mode=case.forward_mode.name):
                 run_dsa_sparse_speculative_forward_mode_case(self, case)
 
+    def test_sparse_fp8_speculative_flashmla_sparse(self):
+        for case in self.SPECULATIVE_FORWARD_MODE_CASES:
+            with self.subTest(mode=case.forward_mode.name):
+                run_dsa_sparse_speculative_forward_mode_case(
+                    self, case, dsa_decode_backend="flashmla_sparse", fp8_kv_cache=True
+                )
+
     # FP8 KV cache (`dsa_kv_cache_store_fp8=True`) — the production
     # deployment dtype. Switches `DSATokenToKVPool` to packed
     # FP8-nope/BF16-rope storage at 656 bytes/token; `set_mla_kv_buffer`
