@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+import torch
+
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
@@ -609,8 +611,6 @@ def _dsv4_full_page_index_row(
     GPU index buffers are 2-D rows; NPU buffers are 4-D PA_ND pages whose
     native K slots must be folded into one full logical page.
     """
-    import torch
-
     page = buffer[: full_pages * index_pages_per_full_page]
     if page.ndim == 4:
         return page.reshape(full_pages, slots_per_full_page, *page.shape[2:])
@@ -640,8 +640,6 @@ def _dsv4_low_ratio_regions(
 ) -> list[tuple[PoolName, Any, list, dict[int, int]]]:
     """(name, device_pool, buffers, layer_mapping) per shared source KV and
     indexer buffer group, in FULL-page units."""
-    import torch
-
     regions = []
     for ratio, names in (
         (
