@@ -3670,19 +3670,18 @@ class Scheduler(
                 return
             top_k = req.sampling_params.top_k
             sampling_mask_cap = self.server_args.sampling_mask_max_tokens
-            # Ordinary sampling packs actual positive weights up to the transport
-            # cap. Speculative verification still sizes capture from top_k.
+            # The sampling probability threshold does not bound the record size.
+            # The producer must return an exact row within the cap or abort.
             top_p_only = (
                 top_k == TOP_K_ALL
                 and req.sampling_params.top_p < 1
                 and req.sampling_params.min_p == 0
-                and self.spec_algorithm.is_none()
             )
             finite_top_k = top_k != TOP_K_ALL and 1 <= top_k <= sampling_mask_cap
             if not (finite_top_k or top_p_only):
                 error_msg = (
                     f"return_sampling_mask requires 1 <= top_k <= {sampling_mask_cap} "
-                    "or top-p-only sampling without speculative decoding "
+                    "or top-p-only sampling "
                     "(top_p < 1, min_p = 0, top_k unset or -1)."
                 )
                 self._reject_bad_request(req, error_msg)

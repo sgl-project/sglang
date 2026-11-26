@@ -25,7 +25,10 @@ from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
 )
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.sampling_pipeline import _adjust_after_watermark
+from sglang.srt.speculative import spec_sampling_mask
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -55,6 +58,30 @@ _INVALID_SAMPLING_MASK_ERROR = "return_sampling_mask requires 1 <= top_k"
 
 
 class TestSamplingMaskCapture(CustomTestCase):
+    def test_dflash_family_capture_still_requires_finite_top_k(self):
+        req = SimpleNamespace(sampling_params=SimpleNamespace(top_k=TOP_K_ALL, min_p=0))
+        spec = SimpleNamespace(
+            speculative_accept_threshold_single=1.0,
+            speculative_accept_threshold_acc=1.0,
+        )
+        with (
+            patch.object(spec_sampling_mask, "get_spec", return_value=spec),
+            patch.object(
+                spec_sampling_mask,
+                "is_dflash_sampling_verify_available",
+                return_value=True,
+            ),
+            spec_sampling_mask.envs.SGLANG_SIMULATE_ACC_LEN.override(0),
+        ):
+            for alg in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+                with self.subTest(alg=alg):
+                    self.assertIn(
+                        "finite top_k",
+                        spec_sampling_mask.validate_spec_sampling_mask_request(
+                            req, alg
+                        ),
+                    )
+
     def setUp(self):
         # The renorm policy (sampling_renorm.py) reads the published parallel /
         # exec config on every call; the sampler's own get_exec is patched per
