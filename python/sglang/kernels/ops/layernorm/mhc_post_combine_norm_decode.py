@@ -13,7 +13,7 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.srt.utils import get_device_core_count
 from sglang.srt.utils.custom_op import register_custom_op
 
-MAX_ROWS = 1024
+MAX_ROWS = 2048
 SPLIT4_MAX_ROWS = 128
 SPLIT2_MAX_ROWS = 640
 

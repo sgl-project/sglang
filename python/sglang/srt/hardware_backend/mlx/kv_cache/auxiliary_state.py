@@ -247,14 +247,14 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         self,
         *,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         auxiliary_state_size: int,
     ):
         super().__init__(
             size=size,
-            max_context_len=max_context_len,
+            row_width=row_width,
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
