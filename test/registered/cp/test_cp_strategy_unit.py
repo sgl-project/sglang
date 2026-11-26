@@ -948,7 +948,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         input_ids = torch.arange(1, 20)
         with (
             get_context().override_server_args(device="cpu", moe_a2a_backend="none"),
-            get_parallel().override(attn_cp_size=4),
+            get_parallel().override(tp_size=4, attn_cp_size=4, moe_tp_size=4),
         ):
             pad_logical_token_to_physical(metadata)
             packed = cp_interleave_input_ids(input_ids, batch)

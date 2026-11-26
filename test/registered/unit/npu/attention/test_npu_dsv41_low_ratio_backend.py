@@ -1260,6 +1260,9 @@ class TestDSV41PrefillCP(CustomTestCase):
                 ) as qli_metadata,
             ):
                 backend, batch = self._init_cp_batch(InterleaveCPStrategy)
+                full_positions = batch.positions
+                backend.prepare_dsv4_cp_metadata(batch)
+                self.assertIs(batch.positions, full_positions)
                 fm = backend.forward_metadata
                 read = fm.dsv41_cp_read
                 self.assertEqual(read.positions.tolist(), [6, 8, 10, 12, 128, 130, 132])
