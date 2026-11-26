@@ -155,7 +155,7 @@ def _build_storage(cfg):
         cfg._unified_plan,
         # The table's rows carry four columns of headroom past the context.
         msgspec.structs.replace(
-            cfg._unified_sized, row_width=cfg.model_config.context_len + 4
+            cfg._unified_sized, req_to_token_row_width=cfg.model_config.context_len + 4
         ),
         UnifiedBuildContext(
             device="cpu",

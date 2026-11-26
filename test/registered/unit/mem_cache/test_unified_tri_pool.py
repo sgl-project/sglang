@@ -854,7 +854,7 @@ class TestTriFactorySizing(_PoolTestCase):
             swa_max_total_num_tokens=32,
             max_mamba_cache_size=20,
             model_context_len=16,
-            row_width=20,
+            req_to_token_row_width=20,
             max_num_reqs=4,
             enable_memory_saver=False,
             enable_mamba_extra_buffer=False,
@@ -1050,7 +1050,7 @@ class TestTriFactorySizing(_PoolTestCase):
                             # headroom wide, not the factory's 20.
                             configurator._unified_sized = msgspec.structs.replace(
                                 planned.sized,
-                                row_width=cfg.get_req_to_token_row_width(
+                                req_to_token_row_width=cfg.get_req_to_token_row_width(
                                     model.context_len
                                 ),
                             )
@@ -1387,7 +1387,7 @@ class TestTriFactorySizing(_PoolTestCase):
                 **self._factory_kwargs(
                     unified_total_bytes=1024,  # << ctx * e_f alone
                     model_context_len=100_000,
-                    row_width=100_004,
+                    req_to_token_row_width=100_004,
                     sliding_window_size=64,
                 )
             )

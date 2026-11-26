@@ -1285,7 +1285,7 @@ class FlashInferMLAMultiStepDraftBackend:
         assert_buffer_fits(
             required_kv_indices_len,
             kv_indices_buffer.shape[1],
-            "EAGLE draft kv_indices row (size max_bs * topk * row_width)",
+            "EAGLE draft kv_indices row (size max_bs * topk * req_to_token_row_width)",
             bs=bs,
             seq_lens_sum=seq_lens_sum,
         )

@@ -150,7 +150,7 @@ def _storage(
             state_slots=4 if state else 0,
             max_running_requests=3,
             context_len=256,
-            row_width=256,
+            req_to_token_row_width=256,
             alignment=1,
         ),
     )

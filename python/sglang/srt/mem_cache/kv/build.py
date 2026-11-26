@@ -106,7 +106,7 @@ def _build_request_table(
         size=sized.max_running_requests,
         reserved_rows=sized.request_rows,
         pre_alloc_size=ctx.decode_pre_alloc_size,
-        row_width=sized.row_width,
+        row_width=sized.req_to_token_row_width,
         state_sub_pool=None if state is None else state.name,
         tracking=(
             None

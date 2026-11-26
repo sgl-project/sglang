@@ -117,7 +117,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 state_slots=0,
                 max_running_requests=2,
                 context_len=1024,
-                row_width=1024,
+                req_to_token_row_width=1024,
                 alignment=1,
             ),
         )

@@ -1013,7 +1013,7 @@ class AiterAttnBackend(AttentionBackend):
         # Read once by Scheduler.init_overlap (decide_needs_cpu_seq_lens). Under
         # DFLASH a decode step reaches this backend only as TARGET_VERIFY, whose
         # unified-verify metadata is built from device seq_lens and sized by
-        # row_width, so the FutureMap's per-step seq_lens D2H (on HIP a host
+        # req_to_token_row_width, so the FutureMap's per-step seq_lens D2H (on HIP a host
         # Event.synchronize behind the previous step's accept) buys nothing; the
         # DFLASH worker plans from its host reservation bound (nxt_kv_lens_cpu).
         # Extend batches keep their scheduler-built host lengths either way.
@@ -3957,7 +3957,7 @@ class AiterAttnBackend(AttentionBackend):
         swa_page_table = None
         triton_mla_tables = triton_mla_seqused_k = None
         # Unified verify never reads this host max (replay sizes from
-        # row_width); torch.max(seq_lens).item() would sync every replay.
+        # req_to_token_row_width); torch.max(seq_lens).item() would sync every replay.
         max_kv_len = (
             seq_lens_cpu.max().item()
             if seq_lens_cpu is not None

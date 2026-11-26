@@ -140,7 +140,7 @@ def _build(plan, full_tokens=64):
             state_slots=4,
             max_running_requests=2,
             context_len=64,
-            row_width=64,
+            req_to_token_row_width=64,
             alignment=1,
         ),
     )

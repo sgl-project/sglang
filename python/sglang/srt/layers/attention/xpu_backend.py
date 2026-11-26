@@ -1978,7 +1978,7 @@ class XPUAttentionBackend(AttentionBackend):
         - cu_seqlens_q gets its own buffer (never aliased to cu_seqlens_k,
           unlike eager no-prefix path) so prefix replays stay correct;
         - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
-          (num_tokens in this bucket / row_width): the kernel reads real
+          (num_tokens in this bucket / req_to_token_row_width): the kernel reads real
           work extents from the cu_seqlens / cache_seqlens device buffers;
         - page_table is page-granularity (one column per `page_size` tokens),
           converted from the token-granularity req_to_token table via strided

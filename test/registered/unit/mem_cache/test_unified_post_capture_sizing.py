@@ -95,7 +95,7 @@ def _bundle(
         post_capture_active=post_capture_active,
         need_sort=False,
         model_context_len=256,
-        row_width=256,
+        req_to_token_row_width=256,
         sliding_window_size=64,
     )
 
@@ -107,7 +107,7 @@ def _final_config(bundle):
         KVSizingInputs(
             budget_bytes=_FINAL_BYTES,
             context_len=256,
-            row_width=256,
+            req_to_token_row_width=256,
             floor_window=64,
             max_running_requests=1,
             state_slots=16,
@@ -210,7 +210,7 @@ def _mla_draft_bundle(
         total_bytes=total_bytes,
         max_num_reqs=2,
         model_context_len=512,
-        row_width=512,
+        req_to_token_row_width=512,
         fused_draft=placement,
         lazy_compaction=True,
         post_capture_active=post_capture_active,
@@ -1082,7 +1082,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             max_running_requests=4,
             radix_cache=False,
             context_len=16,
-            row_width=16,
+            req_to_token_row_width=16,
             alignment=1,
         )
         captured = size_plan(plan, inputs)
@@ -1161,7 +1161,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 max_running_requests=10,
                 radix_cache=False,
                 context_len=16,
-                row_width=16,
+                req_to_token_row_width=16,
                 alignment=1,
             ),
         )
@@ -1210,7 +1210,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 max_running_requests=10,
                 radix_cache=False,
                 context_len=16,
-                row_width=16,
+                req_to_token_row_width=16,
                 alignment=1,
             ),
             frozen=captured,

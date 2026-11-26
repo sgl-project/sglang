@@ -718,8 +718,8 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         cols = self._block_cols(max_block)
         rows = forward_batch.req_pool_indices.long()
         # Flattened gather reads only the requested page starts.
-        row_width = self.req_to_token.shape[1]
-        linear = rows[:, None] * row_width + cols[None, :]
+        req_to_token_row_width = self.req_to_token.shape[1]
+        linear = rows[:, None] * req_to_token_row_width + cols[None, :]
         gathered = (
             self.req_to_token.reshape(-1)
             .gather(0, linear.reshape(-1))

@@ -43,7 +43,7 @@ def _build():
             max_total_tokens=4096,
             max_running_requests=2,
             context_len=4096,
-            row_width=4096,
+            req_to_token_row_width=4096,
             alignment=1,
         ),
     )

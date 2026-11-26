@@ -66,7 +66,7 @@ def _storage():
             state_slots=0,
             max_running_requests=4,
             context_len=_CONTEXT,
-            row_width=_CONTEXT,
+            req_to_token_row_width=_CONTEXT,
             alignment=_PAGE,
         ),
     )

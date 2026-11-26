@@ -495,7 +495,7 @@ class FlashAttentionBackend(AttentionBackend):
         return LocalAttentionMetadataBuilder(
             attention_chunk_size=model_runner.attention_chunk_size,
             page_size=self.page_size,
-            row_width=self.req_to_token_pool.row_width,
+            req_to_token_row_width=self.req_to_token_pool.row_width,
             device=self.device,
             swa_translate=(
                 functools.partial(self.runner_ids.ids_in, IdSpaceKind.SLIDING_WINDOW)
@@ -858,7 +858,7 @@ class FlashAttentionBackend(AttentionBackend):
           aliases it to cu_seqlens_k — under capture that would permanently
           weld q to the k buffer and break prefix replays);
         - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
-          (the bucket's num_tokens / row_width): the kernel reads real
+          (the bucket's num_tokens / req_to_token_row_width): the kernel reads real
           work extents from the cu_seqlens / cache_seqlens device buffers.
         """
         bs = forward_batch.batch_size
@@ -869,12 +869,12 @@ class FlashAttentionBackend(AttentionBackend):
             m.cu_seqlens_q = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             m.cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             # Block table sized in PAGES. For page_size == 1 max_num_pages ==
-            # row_width, so this reduces to the per-token layout.
+            # req_to_token_row_width, so this reduces to the per-token layout.
             m.page_table = torch.zeros(
                 (bs, self.max_num_pages), dtype=torch.int32, device=device
             )
             # Page-start token offsets for the strided block-table gather. For
-            # page_size == 1 this is arange(row_width) and the gather + //1
+            # page_size == 1 this is arange(req_to_token_row_width) and the gather + //1
             # below reduces to the plain per-token req_to_token copy.
             self.full_cg_prefill_strided_indices = torch.arange(
                 0, self.req_to_token_pool.row_width, self.page_size, device=device
@@ -1045,7 +1045,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Eager (non-cuda-graph) path: max_seq_len_k only feeds Python-side
         # page-table slicing and the scheduler_metadata heuristic -- never the
         # kernel. Use the CPU mirror when published; otherwise the static
-        # row_width bound (over-wide page table, slightly suboptimal
+        # req_to_token_row_width bound (over-wide page table, slightly suboptimal
         # split heuristic, but no D2H sync).
         seq_lens_cpu = forward_batch.seq_lens_cpu
         eager_max_k = (
@@ -1353,7 +1353,7 @@ class FlashAttentionBackend(AttentionBackend):
                     max_pf = int(seq_lens_cpu[:batch_size].max().item())
                 else:
                     # Ratchet needs a true upper bound; a local D2H beats
-                    # poisoning it with row_width forever.
+                    # poisoning it with req_to_token_row_width forever.
                     max_pf = int(forward_batch.seq_lens[:batch_size].max().item())
                 if max_pf > self._pa_swa_max_prefill_len:
                     self._pa_swa_max_prefill_len = max_pf
@@ -3355,7 +3355,7 @@ class FlashAttentionBackend(AttentionBackend):
         """
         seq_lens = seq_lens[:bs]
         # The sync-free path passes seq_lens_cpu=None; branches that still need a
-        # host max fall back to the static row_width, so no D2H is forced here.
+        # host max fall back to the static req_to_token_row_width, so no D2H is forced here.
         seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
         req_pool_indices = req_pool_indices[:bs]
         device = seq_lens.device

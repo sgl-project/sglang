@@ -154,7 +154,7 @@ def _build(
         state_slots=16,
         max_running_requests=3,
         context_len=64,
-        row_width=64,
+        req_to_token_row_width=64,
         alignment=1,
     )
     sized = size_plan(plan, inputs)
@@ -220,7 +220,7 @@ class TestDeclaredParts(CustomTestCase):
                 state_slots=4,
                 max_running_requests=1,
                 context_len=64,
-                row_width=64,
+                req_to_token_row_width=64,
                 alignment=1,
             ),
         )
@@ -753,7 +753,7 @@ class TestDeclaredParts(CustomTestCase):
                         max_total_tokens=cap,
                         max_running_requests=1,
                         context_len=2048,
-                        row_width=2048,
+                        req_to_token_row_width=2048,
                         alignment=1,
                     ),
                 )
@@ -798,7 +798,7 @@ class TestDeclaredParts(CustomTestCase):
             budget_bytes=1 << 22,
             max_running_requests=4,
             context_len=2048,
-            row_width=2048,
+            req_to_token_row_width=2048,
             window_ratio=0.8,
             alignment=4096,
         )
@@ -918,7 +918,7 @@ class TestDeclaredParts(CustomTestCase):
                 budget_bytes=65536,
                 max_running_requests=2,
                 context_len=64,
-                row_width=64,
+                req_to_token_row_width=64,
                 alignment=1,
             ),
         )
@@ -979,7 +979,7 @@ class TestDeclaredParts(CustomTestCase):
         inp = KVSizingInputs(
             budget_bytes=512 * 1024 * 1024,
             context_len=1024,
-            row_width=1024,
+            req_to_token_row_width=1024,
             max_running_requests=48,
             state_share=0.1,
             alignment=4096,
@@ -1141,7 +1141,7 @@ class TestDeclaredParts(CustomTestCase):
         inp = KVSizingInputs(
             budget_bytes=1 << 20,
             context_len=64,
-            row_width=64,
+            req_to_token_row_width=64,
             max_running_requests=3,
             state_share=0.2,
             alignment=256,
@@ -1179,7 +1179,7 @@ class TestDeclaredParts(CustomTestCase):
         inp = KVSizingInputs(
             budget_bytes=1 << 20,
             context_len=64,
-            row_width=64,
+            req_to_token_row_width=64,
             max_running_requests=3,
             alignment=256,
         )
@@ -1908,7 +1908,7 @@ class TestDeclaredParts(CustomTestCase):
                 budget_bytes=8192,
                 max_running_requests=2,
                 context_len=32,
-                row_width=32,
+                req_to_token_row_width=32,
                 alignment=1,
             ),
         )
@@ -1956,7 +1956,7 @@ class TestDeclaredParts(CustomTestCase):
                     state_slots=16,
                     max_running_requests=3,
                     context_len=64,
-                    row_width=64,
+                    req_to_token_row_width=64,
                     max_total_tokens=32,
                     alignment=1,
                 ),
@@ -2210,7 +2210,7 @@ class TestDeclaredParts(CustomTestCase):
             KVSizingInputs(
                 budget_bytes=81920,
                 context_len=1024,
-                row_width=1024,
+                req_to_token_row_width=1024,
                 max_running_requests=3,
                 alignment=1,
             ),
@@ -3175,7 +3175,7 @@ class TestDeclaredParts(CustomTestCase):
                     full_tokens=256,
                     window_tokens=128,
                     context_len=64,
-                    row_width=64,
+                    req_to_token_row_width=64,
                     floor_window=16,
                     alignment=1,
                 ),
@@ -3501,7 +3501,7 @@ class TestDeclaredParts(CustomTestCase):
                             budget_bytes=65536,
                             max_running_requests=2,
                             context_len=64,
-                            row_width=64,
+                            req_to_token_row_width=64,
                             alignment=1,
                         ),
                     )
@@ -3641,7 +3641,7 @@ class TestDeclaredParts(CustomTestCase):
                 inp = KVSizingInputs(
                     budget_bytes=1 << 20,
                     context_len=16,
-                    row_width=16,
+                    req_to_token_row_width=16,
                     max_running_requests=10,
                     radix_cache=False,
                     alignment=1,
@@ -3823,7 +3823,7 @@ class TestDeclaredParts(CustomTestCase):
                         full_tokens=256,
                         state_slots=10,
                         context_len=64,
-                        row_width=64,
+                        req_to_token_row_width=64,
                         max_running_requests=8,
                         alignment=1,
                         state_strategy=strategy,

@@ -1409,7 +1409,7 @@ class FlashInferAttnBackend(AttentionBackend):
         captured bucket. The request-slot count is fixed at capture (the
         runner pads real batches up to it with zero-length sentinel
         requests); kv indices cover up to num_slots sequences of
-        row_width.
+        req_to_token_row_width.
         """
         device = self.workspace_buffer.device
         self.full_cg_prefill_req_slots = num_slots
@@ -2762,7 +2762,7 @@ class FlashInferMultiStepDraftBackend:
         assert_buffer_fits(
             required_kv_indices_len,
             kv_indices_buffer.shape[1],
-            "EAGLE draft kv_indices row (size max_bs * topk * row_width)",
+            "EAGLE draft kv_indices row (size max_bs * topk * req_to_token_row_width)",
             bs=bs,
             seq_lens_sum=seq_lens_sum,
         )
@@ -2941,7 +2941,7 @@ class FlashInferMultiStepDraftBackend:
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         # generate_draft_decode_kv_indices packs topk per-branch sequences per row,
         # so the row needs the topk factor -- same as the eager init_forward_metadata
-        # (batch_size * topk * row_width). Dropping it overflows the buffer.
+        # (batch_size * topk * req_to_token_row_width). Dropping it overflows the buffer.
         kv_indices_width = draft_kv_indices_buffer_width(
             max_bs, self.topk, self.req_to_token_pool.row_width
         )

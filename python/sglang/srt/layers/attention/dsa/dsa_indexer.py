@@ -599,10 +599,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
             if max_positions:
-                row_width = get_req_to_token_row_width(max_positions)
+                req_to_token_row_width = get_req_to_token_row_width(max_positions)
                 prealloc_workspace(
                     device=torch.device("cuda", torch.cuda.current_device()),
-                    max_cols=(-(-row_width // 64) + _PAGE_SLACK) * 64,
+                    max_cols=(-(-req_to_token_row_width // 64) + _PAGE_SLACK) * 64,
                     fp8_dtype=fp8_dtype,
                 )
 

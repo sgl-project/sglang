@@ -182,7 +182,7 @@ def _multi_window_state_allocator(
             state_strategy=strategy,
             max_running_requests=4,
             context_len=2 * tokens,
-            row_width=2 * tokens,
+            req_to_token_row_width=2 * tokens,
             alignment=1,
         ),
     )

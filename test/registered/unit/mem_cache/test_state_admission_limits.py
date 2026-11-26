@@ -59,7 +59,7 @@ def _build(*, window, lazy):
                 max_total_tokens=512,
                 max_running_requests=2,
                 context_len=512,
-                row_width=512,
+                req_to_token_row_width=512,
                 alignment=1,
             ),
         ),
@@ -331,7 +331,7 @@ def _build_token_heavy(
             budget_bytes=budget_bytes,
             max_running_requests=2,
             context_len=context_len,
-            row_width=context_len,
+            req_to_token_row_width=context_len,
             alignment=page_size,
         ),
     )

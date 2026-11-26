@@ -37,13 +37,13 @@ class LocalAttentionMetadataBuilder:
         *,
         attention_chunk_size: int,
         page_size: int,
-        row_width: int,
+        req_to_token_row_width: int,
         device: torch.device,
         swa_translate: Optional[Callable[[torch.Tensor], torch.Tensor]],
     ):
         self.attention_chunk_size = attention_chunk_size
         self.page_size = page_size
-        self.row_width = row_width
+        self.req_to_token_row_width = req_to_token_row_width
         self.device = device
         self.swa_translate = swa_translate
 
@@ -54,7 +54,7 @@ class LocalAttentionMetadataBuilder:
         page_size = self.page_size or 1
         attn_chunk_size = self.attention_chunk_size
         max_virtual_batches = max_bs * (
-            (self.row_width + attn_chunk_size - 1) // attn_chunk_size
+            (self.req_to_token_row_width + attn_chunk_size - 1) // attn_chunk_size
         )
         max_pages_per_block = (attn_chunk_size + page_size - 1) // page_size
         return {

@@ -406,7 +406,7 @@ class TestDecodeLaunchCounts(CustomTestCase):
                 full_tokens=PAGES * PAGE,
                 max_running_requests=self.BS,
                 context_len=PAGES * PAGE,
-                row_width=PAGES * PAGE,
+                req_to_token_row_width=PAGES * PAGE,
                 alignment=1,
             ),
         )

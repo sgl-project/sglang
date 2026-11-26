@@ -129,7 +129,7 @@ class TestBudgetSizing(unittest.TestCase):
                             max_total_tokens=cap,
                             max_running_requests=2,
                             context_len=4096,
-                            row_width=4096,
+                            req_to_token_row_width=4096,
                             floor_window=16,
                             alignment=1,
                         ),
@@ -270,7 +270,7 @@ class TestBs1FeasibilityFloor(unittest.TestCase):
             _swa_factory(
                 total_bytes=8 * _entry_bytes(),
                 model_context_len=4096,
-                row_width=4096,
+                req_to_token_row_width=4096,
                 sliding_window_size=4096,
             )
         self.assertIn("bs=1 floor", str(ctx.exception))
@@ -292,7 +292,7 @@ class TestBs1FeasibilityFloor(unittest.TestCase):
                 bundle = _swa_factory(
                     total_bytes=200 * e + table_bytes,
                     model_context_len=model_context_len,
-                    row_width=model_context_len,
+                    req_to_token_row_width=model_context_len,
                     sliding_window_size=sliding_window_size,
                 )
                 self.assertEqual(

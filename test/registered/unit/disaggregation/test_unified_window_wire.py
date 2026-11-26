@@ -64,7 +64,7 @@ def _storage(windows):
             state_slots=0,
             max_running_requests=3,
             context_len=64,
-            row_width=64,
+            req_to_token_row_width=64,
             alignment=1,
         ),
     )

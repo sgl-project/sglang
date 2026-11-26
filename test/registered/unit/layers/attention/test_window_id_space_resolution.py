@@ -57,7 +57,7 @@ def _unified(target_window, placement):
             state_slots=0,
             max_running_requests=2,
             context_len=256,
-            row_width=256,
+            req_to_token_row_width=256,
             alignment=1,
         ),
     )

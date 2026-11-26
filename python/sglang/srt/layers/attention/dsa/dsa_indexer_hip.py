@@ -216,8 +216,8 @@ def hist_topk_workspace(indexer, config):
     if not max_positions or loader.modules_or_none() is None:
         return None
     # the req_to_token row width, then 4 more pages of slack
-    row_width = get_req_to_token_row_width(max_positions)
-    max_cols = (-(-row_width // 64) + 4) * 64
+    req_to_token_row_width = get_req_to_token_row_width(max_positions)
+    max_cols = (-(-req_to_token_row_width // 64) + 4) * 64
     device = torch.device("cuda", torch.cuda.current_device())
     prealloc_workspace(device=device, max_cols=max_cols, fp8_dtype=fp8_dtype)
     workspace = _WORKSPACES.get(_workspace_key(device, fp8_dtype))

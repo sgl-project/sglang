@@ -1624,7 +1624,9 @@ class KVCacheConfigurator:
         return 0
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
-        row_width = get_req_to_token_row_width(self.model_config.context_len)
+        req_to_token_row_width = get_req_to_token_row_width(
+            self.model_config.context_len
+        )
 
         disagg = get_disagg()
         if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
@@ -1632,23 +1634,23 @@ class KVCacheConfigurator:
             if self.mambaish_config:
                 return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
-                    row_width=row_width,
+                    req_to_token_row_width=req_to_token_row_width,
                     pre_alloc_size=pre_alloc_size,
                 )
             return self._build_decode_req_pool(
                 max_num_reqs=max_num_reqs,
-                row_width=row_width,
+                req_to_token_row_width=req_to_token_row_width,
                 pre_alloc_size=pre_alloc_size,
             )
 
         if self.mambaish_config:
             return self._build_hybrid_req_pool(
                 max_num_reqs=max_num_reqs,
-                row_width=row_width,
+                req_to_token_row_width=req_to_token_row_width,
             )
         return self._build_default_req_pool(
             max_num_reqs=max_num_reqs,
-            row_width=row_width,
+            req_to_token_row_width=req_to_token_row_width,
         )
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
@@ -1687,7 +1689,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        row_width: int,
+        req_to_token_row_width: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
         from sglang.srt.disaggregation.decode import (
@@ -1696,7 +1698,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
-            row_width=row_width,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
@@ -1733,7 +1735,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        row_width: int,
+        req_to_token_row_width: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
         if _is_npu and is_deepseek_v4(self.model_config.hf_config):
@@ -1745,7 +1747,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = DecodeReqToTokenPool(
             size=max_num_reqs,
-            row_width=row_width,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
@@ -1756,13 +1758,13 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        row_width: int,
+        req_to_token_row_width: int,
     ) -> ReqToTokenPool:
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
-            row_width=row_width,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
@@ -1803,7 +1805,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        row_width: int,
+        req_to_token_row_width: int,
     ) -> ReqToTokenPool:
         # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
         # swa/c4/c128/c{4,128}_state tables; others stay on the stock one.
@@ -1817,7 +1819,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = req_to_token_pool_cls(
             size=max_num_reqs,
-            row_width=row_width,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
         )
@@ -3596,7 +3598,9 @@ class KVCacheConfigurator:
         inp = KVSizingInputs(
             budget_bytes=budget_bytes,
             context_len=self.model_config.context_len,
-            row_width=get_req_to_token_row_width(self.model_config.context_len),
+            req_to_token_row_width=get_req_to_token_row_width(
+                self.model_config.context_len
+            ),
             pre_alloc_rows=pre_alloc,
             max_running_requests=None
             if requested is None
