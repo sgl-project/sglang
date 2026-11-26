@@ -868,7 +868,7 @@ class Scheduler(
             device_module=tp_group.device_module,
         )
         logger.info("HCCL DP prewarm done: rank=%s", rank)
-        if self.server_args.hicache_storage_backend in ("npu_memcache", "mooncake"):
+        if self.server_args.hicache_storage_backend == "mooncake":
             from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
                 prewarm_dsv4_aicpu,
             )
