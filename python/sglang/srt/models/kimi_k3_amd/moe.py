@@ -836,21 +836,29 @@ def _init_dcp_ll_comm_for_model(model) -> None:
     from sglang.srt.layers.communication.dcp_a2a_lse_hip import (
         init_dcp_ll_comm_hip,
     )
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
     from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
         DeepseekMLARocmForwardMixin,
     )
 
+    lora_opti = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+    # Every MLA layer, so a checkpoint that leaves some o_proj quantized gets both
+    # head dims; uniform layers hit init_dcp_ll_comm_hip's cache after the first.
     for layer in model.layers[model.start_layer : model.end_layer]:
         attn = layer.self_attn
         if isinstance(attn, DeepseekMLARocmForwardMixin):
-            head_dim = (
-                attn.v_head_dim
-                if attn._dcp_project_before_merge()
-                else attn.kv_lora_rank
+            # _dcp_project_before_merge() needs w_vc_qrep, which
+            # _prepare_replicated_q_proj gathers only after the KV pool is sized,
+            # so predict it from what is known now. A layer that later skips the
+            # q-replicate gather keeps the lazy D=kv_lora_rank allocation.
+            project_before_merge = (
+                parallel.dcp_replicate_q_proj
+                and isinstance(attn.o_proj.quant_method, UnquantizedLinearMethod)
+                and not lora_opti
             )
+            head_dim = attn.v_head_dim if project_before_merge else attn.kv_lora_rank
             init_dcp_ll_comm_hip(
                 dcp_group,
                 head_dim=head_dim,
                 num_local_heads=attn.num_local_heads,
             )
-            return
