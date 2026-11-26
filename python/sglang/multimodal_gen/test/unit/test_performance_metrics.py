@@ -470,6 +470,20 @@ def test_peak_vram_validation_uses_independent_tolerances():
             validator.validate_peak_vram(runtime_regression, 10_000.0, 10_000.0)
 
 
+@pytest.mark.parametrize("phase", ["load", "warmup", "serving"])
+def test_auto_placement_requires_device_headroom_in_each_phase(phase):
+    scenario = ScenarioConfig({}, {}, 0, 0, 0, min_free_vram_mb=4096)
+    validator = PerformanceValidator(scenario, ToleranceConfig(0, 0, 0, 0, 0), ())
+    summary = PerformanceSummary(0, 0, 0, {}, [], {}, {}, 14000, 22000)
+    with pytest.raises(AssertionError, match="Missing load or serving"):
+        validator.validate_peak_vram(summary, 14000, 22000)
+    summary.min_free_vram_mb = {"load": 4096, "warmup": 4096, "serving": 4096}
+    validator.validate_peak_vram(summary, 14000, 22000)
+    summary.min_free_vram_mb[phase] -= 1
+    with pytest.raises(AssertionError, match=f"{phase} minimum free VRAM"):
+        validator.validate_peak_vram(summary, 14000, 22000)
+
+
 def test_peak_vram_validation_enforces_allocated_when_baselined():
     validator = PerformanceValidator(
         scenario=ScenarioConfig({}, {}, 0.0, 0.0, 0.0),

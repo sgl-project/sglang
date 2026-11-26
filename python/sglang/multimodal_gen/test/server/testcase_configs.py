@@ -134,6 +134,8 @@ class ScenarioConfig:
     # rather than by the code under test. VRAM guards keep the profile
     # tolerance -- they are what such a case actually protects.
     timing_tolerance: float | None = None
+    # auto-placement can trade resident weights for faster requests on this GPU
+    min_free_vram_mb: float | None = None
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
@@ -158,6 +160,7 @@ class ScenarioConfig:
             runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
             host_anon_tolerance=optional_float("host_anon_tolerance"),
             timing_tolerance=optional_float("timing_tolerance"),
+            min_free_vram_mb=optional_float("min_free_vram_mb"),
         )
 
 
@@ -628,6 +631,7 @@ class PerformanceSummary:
     avg_frame_time_ms: float | None = None
     denoising_stages: set[str] = field(default_factory=set)
     load_time_ms: float | None = None
+    min_free_vram_mb: dict[str, float] = field(default_factory=dict)
 
     @staticmethod
     def from_req_perf_record(
