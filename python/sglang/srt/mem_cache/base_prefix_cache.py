@@ -485,6 +485,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         None  # metrics collector for the cache
     )
     cache_controller: Optional[HiCacheController] = None
+
+    def observe_prefill_tokens(self, num_tokens: int) -> None:
+        """Called once per prefill batch with its input tokens."""
+
     buffer_pipeline: Optional[BufferModePipeline] = None
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.

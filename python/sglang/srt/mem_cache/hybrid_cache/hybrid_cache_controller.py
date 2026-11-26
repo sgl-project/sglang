@@ -246,6 +246,9 @@ class PrefetchOperation(StorageOperation):
         self.sidecar_hit_pages = 0
         # Cut by the stop policy, not a storage shortfall: the span is still stored.
         self.deadline_expired = False
+        # earliest_completion policy: True once the scheduler decided to wait
+        # for this read, False once it released the request to prefill.
+        self.fetch_decided: Optional[bool] = None
 
     def mark_terminate(self):
         with self._lock:

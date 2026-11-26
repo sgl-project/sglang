@@ -34,7 +34,12 @@ logger = logging.getLogger(__name__)
 
 # Kept in sync with the server-args choices; validated here so an admin request
 # carrying a bad policy is rejected before it can touch the controller.
-_PREFETCH_POLICIES = ("best_effort", "wait_complete", "timeout")
+_PREFETCH_POLICIES = (
+    "best_effort",
+    "wait_complete",
+    "timeout",
+    "earliest_completion",
+)
 _WRITE_POLICIES = ("write_back", "write_through", "write_through_selective")
 
 

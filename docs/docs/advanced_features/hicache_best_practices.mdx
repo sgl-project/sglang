@@ -88,6 +88,8 @@ Guidelines:
 --hicache-storage-prefetch-policy wait_complete
 # Timeout: Balance between completion and best-effort
 --hicache-storage-prefetch-policy timeout
+# Earliest-completion: Read or prefill each hit, whichever is estimated to finish first
+--hicache-storage-prefetch-policy earliest_completion
 ```
 
 ### Integration with PD Disaggregation

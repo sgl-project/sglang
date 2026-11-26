@@ -184,8 +184,13 @@ class Memory(msgspec.Struct):
     hicache_storage_prefetch_policy: A[
         str,
         Arg(
-            help="Control when prefetching from the storage backend should stop.",
-            choices=["best_effort", "wait_complete", "timeout"],
+            help=(
+                "Control when prefetching from the storage backend should stop. "
+                "earliest_completion decides once per storage hit: the request "
+                "waits for the read when it is estimated to finish before "
+                "prefilling the same tokens would, within the timeout budget."
+            ),
+            choices=["best_effort", "wait_complete", "timeout", "earliest_completion"],
         ),
     ] = "timeout"
     hicache_storage_backend_extra_config: A[

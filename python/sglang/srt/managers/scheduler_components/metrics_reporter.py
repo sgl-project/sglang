@@ -724,6 +724,9 @@ class SchedulerMetricsReporter:
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
+        self.scheduler.tree_cache.observe_prefill_tokens(
+            prefill_stats.log_input_tokens + prefill_stats.log_replay_tokens
+        )
         if (
             not self.is_stats_logging_rank
             and not self.current_scheduler_metrics_enabled
