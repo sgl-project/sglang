@@ -1633,6 +1633,12 @@ class Envs:
     # sglang.kernels.jit.debug.trace, "naive-debug" also detects overwritten
     # records. Like the flags above, it gets its own cache entry.
     SGLANG_JIT_DEBUG_TRACE = EnvStr(None)
+    # Drop --use_fast_math / -use_fast_math from every JIT build, the way the
+    # HIP path already does: a switch for ruling nvcc fast math in or out when
+    # chasing a numerical difference. Like the flags above, it changes the
+    # build flags, so it gets its own cache entry and leaves the default build
+    # untouched.
+    SGLANG_JIT_DISABLE_FAST_MATH = EnvBool(False)
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
