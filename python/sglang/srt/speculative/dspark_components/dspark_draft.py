@@ -11,7 +11,12 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
-from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.kernels.ops.speculative.dspark.markov_sample import (
+    MarkovFold,
+    MarkovSampleStep,
+    markov_fold_step,
+    use_fold,
+)
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -203,6 +208,7 @@ def _draft_step(
     temperatures: torch.Tensor,
     noise: DraftNoise,
     step: int,
+    last_step: bool,
     logits_out: Optional[torch.Tensor],
     sharded_accept: bool,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -223,6 +229,26 @@ def _draft_step(
                 w2_weight=w2_weight,
             )
             return tokens, state
+    fold = markov_head.fold_gemv()
+    if fold is not None and use_fold(rows=len(prev_tokens), weight=fold[0]):
+        latent, state = markov_head.step_latent(
+            prev_tokens, hidden_states=hidden_states, state=state
+        )
+        tokens = markov_fold_step(
+            base_logits=base_logits,
+            fold=MarkovFold(latent=latent, weight=fold[0], bias=fold[1]),
+            keep_in_l2=not last_step,
+            temperatures=temperatures,
+            key=noise.key,
+            offset=noise.offset,
+            step=step,
+            step_dtype=markov_head.step_logits_dtype(base_logits.dtype),
+            logits_out=logits_out,
+            has_sampled_rows=None if logits_out is not None else False,
+            softcap=markov_head.step_softcap,
+            vocab_limit=markov_head.step_vocab_limit,
+        )
+        return tokens, state
     bias, state = markov_head.step_bias(
         prev_tokens, hidden_states=hidden_states, state=state
     )
@@ -291,6 +317,7 @@ def draft_markov_block(
             temperatures=step_temperatures,
             noise=noise,
             step=step,
+            last_step=step == gamma - 1,
             logits_out=None if greedy_draft else logits_out[:, step],
             sharded_accept=sharded_accept,
         )

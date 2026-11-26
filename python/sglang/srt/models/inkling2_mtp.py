@@ -8,6 +8,7 @@ from sglang.kernels.ops.speculative.inkling2_mtp import (
     rnn_gates,
     rnn_inputs,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed.device_communicators.vocab_gather import (
     make_vocab_gather,
 )
@@ -25,7 +26,7 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     project_through_lm_head,
 )
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
 
 
 class Inkling2MTPHead(BaseDSparkMarkovHead):
@@ -42,6 +43,10 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         self._fold_bias = None
         self._gather_logits = None
         self._get_staged_f = None
+        self._fused_step = (
+            get_platform().is_sm120
+            and not get_exec().deterministic.enable_deterministic_inference
+        )
 
     @torch.no_grad()
     def attach_fold(self, weight, multiplier):
@@ -95,6 +100,21 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         if self.vocab_shard is None:
             bias = self._gather_logits(bias)
         return bias, (state, f_rnn)
+
+    def step_latent(self, prev_tokens, *, hidden_states, state):
+        state, f_rnn = state
+        state, latent = self._rnn_step(state, prev_tokens, hidden_states, f_rnn)
+        return latent.to(self._fold_weight.dtype), (state, f_rnn)
+
+    def fold_gemv(self):
+        if (
+            not self._fused_step
+            or self.vocab_shard is not None
+            or self._fold_weight is None
+            or is_batch_invariant_mode_enabled()
+        ):
+            return None
+        return self._fold_weight, self._fold_bias
 
     def step_logits_dtype(self, base_dtype):
         return torch.promote_types(base_dtype, self._fold_weight.dtype)

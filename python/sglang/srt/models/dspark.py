@@ -190,6 +190,11 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         token's embedding, for the fused greedy kernel; otherwise None."""
         return None
 
+    def fold_gemv(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """(weight, bias) when the step bias is exactly addmm(bias, latent, weight^T)
+        of step_latent's latent, for the fused step kernel; otherwise None."""
+        return None
+
     # Step logits = softcap(base + bias), masked from step_vocab_limit on.
     step_softcap: Optional[float] = None
     step_vocab_limit: Optional[int] = None
