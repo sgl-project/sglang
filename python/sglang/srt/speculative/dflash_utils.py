@@ -14,6 +14,7 @@ from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
+from sglang.srt.configs.speculators_dspark import parse_int_layer_ids
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import top_p_normalize_probs_torch
@@ -727,20 +728,27 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         _cfg_get(draft_hf_config, "target_layer_ids", None),
     )
     parsed_target_layer_ids: Optional[List[int]]
-    if layer_ids is None:
-        parsed_target_layer_ids = None
+    if layer_ids is not None:
+        parsed_target_layer_ids = parse_int_layer_ids(
+            layer_ids, field_name="DFLASH dflash_config.target_layer_ids"
+        )
+    elif (
+        aux_layer_ids := dflash_cfg.get(
+            "aux_hidden_state_layer_ids",
+            _cfg_get(draft_hf_config, "aux_hidden_state_layer_ids", None),
+        )
+    ) is not None:
+        # Speculators aux_hidden_state_layer_ids are 1-based (0 = embeddings).
+        parsed_target_layer_ids = [
+            idx - 1
+            for idx in parse_int_layer_ids(
+                aux_layer_ids,
+                field_name="DFLASH aux_hidden_state_layer_ids",
+                min_value=1,
+            )
+        ]
     else:
-        if not isinstance(layer_ids, (list, tuple)):
-            raise ValueError(
-                "DFLASH dflash_config.target_layer_ids must be a list of ints, "
-                f"got type={type(layer_ids).__name__}."
-            )
-        parsed_target_layer_ids = [int(x) for x in layer_ids]
-        if len(parsed_target_layer_ids) <= 0:
-            raise ValueError(
-                "DFLASH dflash_config.target_layer_ids must be non-empty. "
-                f"Got len(target_layer_ids)={len(parsed_target_layer_ids)}."
-            )
+        parsed_target_layer_ids = None
 
     mask_token = dflash_cfg.get(
         "mask_token", _cfg_get(draft_hf_config, "mask_token", None)

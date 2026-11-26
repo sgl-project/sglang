@@ -158,10 +158,17 @@ _LONGCAT_ARCHS = {
 }
 
 
-def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
-    config_dict, _ = PretrainedConfig.get_config_dict(
-        model, revision=revision, **kwargs
-    )
+def _try_load_longcat_config(
+    model,
+    revision: Optional[str],
+    *,
+    config_dict: Optional[dict] = None,
+    **kwargs,
+):
+    if config_dict is None:
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
     architectures = config_dict.get("architectures") or []
     if not any(arch in _LONGCAT_ARCHS for arch in architectures):
         return None
@@ -171,7 +178,13 @@ def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     )
 
 
-def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
+def _try_load_raw_mamba_config(
+    model,
+    revision: Optional[str],
+    *,
+    config_dict: Optional[dict] = None,
+    **kwargs,
+):
     """Recognize the original state-spaces Mamba-1 checkpoints.
 
     The raw `state-spaces/mamba-*` repos (e.g. mamba-130m/790m/2.8b, as opposed
@@ -183,9 +196,10 @@ def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
     expects. Uses `get_config_dict` (which does not require a model_type) so
     this runs before the failing `AutoConfig` path.
     """
-    config_dict, _ = PretrainedConfig.get_config_dict(
-        model, revision=revision, **kwargs
-    )
+    if config_dict is None:
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
     # Raw state-spaces Mamba: has d_model + ssm_cfg, and no model_type/arch.
     if config_dict.get("model_type") or config_dict.get("architectures"):
         return None
@@ -212,6 +226,19 @@ def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _promote_text_config_attrs(config, model) -> None:
+    text_config = get_hf_text_config(config=config)
+    if isinstance(model, str) and text_config is not None:
+        items = (
+            text_config.items()
+            if hasattr(text_config, "items")
+            else vars(text_config).items()
+        )
+        for key, val in items:
+            if not hasattr(config, key) and val is not None:
+                setattr(config, key, val)
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -221,15 +248,31 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
+        config = _try_load_longcat_config(
+            model, revision, config_dict=config_dict, **kwargs
+        )
         if config is None:
-            config = _try_load_raw_mamba_config(model, revision, **kwargs)
+            config = _try_load_raw_mamba_config(
+                model, revision, config_dict=config_dict, **kwargs
+            )
         if config is None:
             from sglang.srt.configs.speculators_dspark import (
                 try_load_speculators_dspark_config,
             )
 
-            config = try_load_speculators_dspark_config(model, revision, **kwargs)
+            config = try_load_speculators_dspark_config(
+                model,
+                revision=revision,
+                config_registry=_CONFIG_REGISTRY,
+                config_dict=config_dict,
+                **kwargs,
+            )
+            if config is not None:
+                _promote_text_config_attrs(config, model)
+                return config
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,
@@ -261,17 +304,7 @@ class HfModelConfigParser(ModelConfigParserBase):
         ]:
             config.model_type = "longcat_flash"
 
-        text_config = get_hf_text_config(config=config)
-
-        if isinstance(model, str) and text_config is not None:
-            items = (
-                text_config.items()
-                if hasattr(text_config, "items")
-                else vars(text_config).items()
-            )
-            for key, val in items:
-                if not hasattr(config, key) and val is not None:
-                    setattr(config, key, val)
+        _promote_text_config_attrs(config, model)
 
         is_ocr = _is_deepseek_ocr_model(config)
         is_ocr2 = _is_deepseek_ocr2_model(config)
@@ -421,6 +454,14 @@ def get_config(
     if model_override_args:
         if isinstance(config, DeepseekV41Config):
             model_override_args = normalize_deepseek_v41_config(model_override_args)
+        from sglang.srt.configs.speculators_dspark import (
+            prepare_speculators_override_args,
+            reconcile_speculators_causality_overrides,
+        )
+
+        model_override_args = prepare_speculators_override_args(
+            config, model_override_args
+        )
         # A plain update() setattrs a dict-valued override straight onto the
         # config, so '{"text_config": {...}}' on a VLM would replace the whole
         # sub-config with a dict and break attribute access downstream.
@@ -438,6 +479,7 @@ def get_config(
                 setattr(config, key, {**current, **value})
             else:
                 setattr(config, key, value)
+        reconcile_speculators_causality_overrides(config, model_override_args)
 
     if is_gguf and not gguf_has_sidecar_config:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:

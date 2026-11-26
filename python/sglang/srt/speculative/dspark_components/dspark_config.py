@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import msgspec
 
 from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.configs.speculators_dspark import parse_int_layer_ids
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_model,
@@ -331,16 +332,9 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     )
 
     if prefixed_target_layer_ids is not None:
-        if not isinstance(prefixed_target_layer_ids, (list, tuple)) or not len(
-            prefixed_target_layer_ids
-        ):
-            raise ValueError(
-                "DSpark dspark_target_layer_ids must be a non-empty list of ints, "
-                f"got {prefixed_target_layer_ids!r}."
-            )
-        target_layer_ids: Optional[List[int]] = [
-            int(x) for x in prefixed_target_layer_ids
-        ]
+        target_layer_ids: Optional[List[int]] = parse_int_layer_ids(
+            prefixed_target_layer_ids, field_name="DSpark dspark_target_layer_ids"
+        )
     else:
         target_layer_ids = base.target_layer_ids
 
