@@ -398,7 +398,7 @@ def handle_tag_run_ci(
     Labels added here start no run (GITHUB_TOKEN label events trigger no
     workflow); the callers re-run the gated runs. Returns True on success.
     """
-    ok, approved = _approve_head(gh_repo, pr, comment, user_perms)
+    ok, _ = _approve_head(gh_repo, pr, comment, user_perms)
     if not ok:
         return False
 
@@ -406,17 +406,6 @@ def handle_tag_run_ci(
     print(f"Adding labels: {labels}.")
     for label in labels:
         pr.add_to_labels(label)
-
-    user_login = comment.user.login
-    if approved:
-        pr.create_issue_comment(
-            f"✅ Approved by {user_login}: CI runs on {pr.head.sha}."
-        )
-    else:
-        pr.create_issue_comment(
-            f"✅ `run-ci` added by {user_login}: {pr.user.login} may approve, so CI "
-            "runs on every push."
-        )
 
     if react_on_success:
         comment.create_reaction("+1")
@@ -444,19 +433,8 @@ def handle_approve_ci(gh_repo, pr, comment, user_perms):
     ok, approved = _approve_head(gh_repo, pr, comment, user_perms)
     if not ok:
         return False
-    if not approved:
-        pr.create_issue_comment(
-            f"✅ Nothing to approve: {pr.user.login} may approve, so `run-ci` "
-            "alone runs CI on every push."
-        )
-        comment.create_reaction("+1")
-        return False
-
-    pr.create_issue_comment(
-        f"✅ Approved by {comment.user.login}: CI runs on {pr.head.sha}."
-    )
     comment.create_reaction("+1")
-    return True
+    return approved
 
 
 def _rerun_gated_runs_after_approval(gh_repo, pr):
