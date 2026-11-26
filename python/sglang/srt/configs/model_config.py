@@ -336,6 +336,21 @@ def is_dspark_draft(config) -> bool:
     return _hf_arch(config) in ("DSparkDraftModel", "DSparkMiniMaxDraftModel")
 
 
+def translated_dspark_draft_config(config):
+    """A DSpark draft checkpoint's config as ModelConfig builds the draft from it."""
+    if _hf_arch(config) == "DSparkMiniMaxDraftModel":
+        from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark
+
+        return configure_minimax_m3_dspark(config)
+    if _hf_arch(config) == "Inkling2ForConditionalGeneration":
+        from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2MTPConfig
+
+        if isinstance(config, dict):
+            config = Inkling2MMConfig(**config)
+        return Inkling2MTPConfig.from_target(config)
+    return config
+
+
 # The decision_config.json attention mode whose full-attention layers read the whole prompt.
 NONCAUSAL_FULL_ATTENTION = "noncausal_full_attention"
 

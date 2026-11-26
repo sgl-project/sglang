@@ -12,7 +12,10 @@ from sglang.srt.runtime_context import (
     get_model,
     get_spec,
 )
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dflash_utils import (
+    get_dflash_attention_sliding_window_size,
+    parse_dflash_draft_config,
+)
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
@@ -67,6 +70,54 @@ def draft_uses_compressed_kv_attention() -> bool:
         model_config_parser=get_model().model_config_parser,
     )
     return draft_hf_config is not None and uses_compressed_kv_attention(draft_hf_config)
+
+
+def draft_attention_traits(
+    *,
+    draft_model_path: Optional[str],
+    trust_remote_code: bool,
+    revision: Optional[str],
+    json_model_override_args: str,
+    model_config_parser: Any,
+) -> Optional[tuple[bool, bool]]:
+    """(is_mla, has_sliding_window) of the DSpark draft checkpoint, None if none is named."""
+    from sglang.srt.configs.model_config import translated_dspark_draft_config
+    from sglang.srt.hf_transformers import get_config
+
+    if not draft_model_path:
+        return None
+    draft_hf_config = get_config(
+        draft_model_path,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        model_override_args=json.loads(json_model_override_args),
+        model_config_parser=model_config_parser,
+    )
+    if draft_hf_config is None:
+        return None
+    draft_hf_config = translated_dspark_draft_config(draft_hf_config)
+    return (
+        parse_dspark_draft_config(draft_hf_config=draft_hf_config).is_mla,
+        get_dflash_attention_sliding_window_size(draft_hf_config) is not None,
+    )
+
+
+def _runtime_draft_attention_traits() -> tuple[bool, bool]:
+    return draft_attention_traits(
+        draft_model_path=get_spec().speculative_draft_model_path,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_spec().speculative_draft_model_revision,
+        json_model_override_args=get_model().json_model_override_args,
+        model_config_parser=get_model().model_config_parser,
+    ) or (False, False)
+
+
+def draft_is_mla() -> bool:
+    return _runtime_draft_attention_traits()[0]
+
+
+def draft_has_sliding_window() -> bool:
+    return _runtime_draft_attention_traits()[1]
 
 
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:

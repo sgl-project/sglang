@@ -7,11 +7,14 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp import planner as dcp_planner
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -58,6 +61,7 @@ def _unified_verify_backend():
     backend.device = torch.device("cpu")
     backend.use_mla = False
     backend._use_unified_verify = True
+    backend._graph_reads_flat_kv_indices = True
     backend.use_sliding_window_kv_pool = False
     backend.use_muse_attention_paths = False
     backend.muse_reuse_verify_lengths = False
@@ -133,6 +137,237 @@ class TestAiterUnifiedVerifyWithoutHostSeqLens(CustomTestCase):
         )
 
 
+class _CountingKernel:
+    def __init__(self):
+        self.launches = 0
+
+    def __getitem__(self, _grid):
+        def launch(*_args, **_kwargs):
+            self.launches += 1
+
+        return launch
+
+
+class TestUnifiedVerifyGraphBuffers(CustomTestCase):
+    def setUp(self):
+        self.kv_index_kernel = _CountingKernel()
+        for target, replacement in (
+            ("reset_verify_attn_plan_cache", lambda: None),
+            ("create_flashinfer_kv_indices_triton", self.kv_index_kernel),
+        ):
+            patcher = patch.object(aiter_backend, target, replacement, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _init_graph_state(self, *, use_unified_verify, reads_flat_kv_indices):
+        backend = _unified_verify_backend()
+        backend._use_unified_verify = use_unified_verify
+        backend._graph_reads_flat_kv_indices = reads_flat_kv_indices
+        backend.skip_prefill = False
+        backend.dcp_world_size = 1
+        backend.decode_uses_page_table = True
+        backend.mask_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int64)
+        backend.init_cuda_graph_state(
+            max_bs=_BATCH_SIZE, max_num_tokens=_BATCH_SIZE * _VERIFY_TOKENS_PER_REQ
+        )
+        return backend
+
+    def test_dspark_draft_skips_the_buffers_unified_verify_never_reads(self):
+        """A DSpark draft runner on unified verify allocates no flat KV-index buffer,
+        custom mask, or replay flat indices."""
+        backend = self._init_graph_state(
+            use_unified_verify=True, reads_flat_kv_indices=False
+        )
+        self.assertIsNone(backend.cuda_graph_kv_indices)
+        self.assertIsNone(backend.cuda_graph_custom_mask)
+        backend.init_forward_metadata_out_graph(_verify_batch(), in_capture=False)
+        self.assertEqual(self.kv_index_kernel.launches, 0)
+
+    def test_other_runners_keep_their_graph_buffers(self):
+        """Every other runner keeps the flat KV indices and custom mask,
+        and its unified verify replay still builds the flat indices."""
+        for use_unified_verify in (False, True):
+            with self.subTest(use_unified_verify=use_unified_verify):
+                backend = self._init_graph_state(
+                    use_unified_verify=use_unified_verify, reads_flat_kv_indices=True
+                )
+                self.assertIsNotNone(backend.cuda_graph_kv_indices)
+                self.assertIsNotNone(backend.cuda_graph_custom_mask)
+        backend.init_forward_metadata_out_graph(_verify_batch(), in_capture=False)
+        self.assertEqual(self.kv_index_kernel.launches, 1)
+
+    def test_a_mode_needing_flat_indices_fails_loudly_on_a_dspark_draft(self):
+        """Another graph mode on a DSpark draft runner raises,
+        not indexes a None buffer."""
+        backend = self._init_graph_state(
+            use_unified_verify=True, reads_flat_kv_indices=False
+        )
+        backend.topk = 1
+        backend.num_draft_tokens = _VERIFY_TOKENS_PER_REQ
+        backend.speculative_num_steps = 1
+        batch = _verify_batch()
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        with self.assertRaisesRegex(RuntimeError, "no flat CUDA-graph KV indices"):
+            backend.init_forward_metadata_out_graph(batch, in_capture=False)
+        self.assertEqual(self.kv_index_kernel.launches, 0)
+
+
+class _FakeKVPool:
+    def __init__(self, cache):
+        self.cache = cache
+        self.start_layer = 0
+        self.layer_num = 1
+        self.layer_transfer_counter = None
+        self.layer_router = PlainPoolRouter(self, "full")
+
+    def get_kv_buffer(self, _layer_id):
+        return self.cache, self.cache
+
+
+class TestUnifiedVerifyCausalFlag(CustomTestCase):
+    """aiter unified verify masks causally only for non-ENCODER_ONLY layers;
+    the GPU reference cannot see this on an AITER without causal=False."""
+
+    def _verify(
+        self,
+        attn_type,
+        *,
+        num_q_heads,
+        head_dim,
+        kv_dtype,
+        prefix_lens,
+        sliding_window_size=None,
+        muse_verify_kernels=frozenset(),
+    ):
+        bs, draft_num, page_size, num_kv_heads = len(prefix_lens), 4, 16, 2
+        pages = -(-(max(prefix_lens) + draft_num) // page_size)
+        backend = object.__new__(aiter_backend.AiterAttnBackend)
+        backend.use_mla = False
+        backend._use_unified_verify = True
+        backend.kv_cache_dtype = kv_dtype
+        backend.page_size = page_size
+        backend.use_muse_attention_paths = False
+        backend.muse_verify_kernels = muse_verify_kernels
+        backend.k_scale = backend.v_scale = torch.ones(1)
+        backend.token_to_kv_pool = _FakeKVPool(
+            torch.zeros(bs * pages, page_size, num_kv_heads, head_dim, dtype=kv_dtype)
+        )
+        backend.forward_metadata = SimpleNamespace(
+            kv_indices=torch.arange(bs * pages, dtype=torch.int32).view(bs, pages),
+            swa_page_table=None,
+            qo_indptr=torch.arange(0, bs * draft_num + 1, draft_num, dtype=torch.int32),
+            max_q_len=draft_num,
+            verify_seqused_k=None,
+            verify_seqlen_k=None,
+            verify_seqlen_k_i32=None,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            attn_type=attn_type,
+            is_cross_attention=False,
+            sliding_window_size=sliding_window_size,
+            tp_q_head_num=num_q_heads,
+            tp_k_head_num=num_kv_heads,
+            tp_v_head_num=num_kv_heads,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            k_scale=None,
+            v_scale=None,
+            scaling=head_dim**-0.5,
+            logit_cap=0.0,
+        )
+        forward_batch = SimpleNamespace(
+            attn_attend_prefix_cache=False,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc=None,
+            seq_lens=torch.tensor(prefix_lens, dtype=torch.int64),
+        )
+        calls = []
+        with (
+            patch.object(
+                aiter_backend,
+                "unified_attention",
+                lambda **kw: calls.append(("unified", kw["causal"])),
+                create=True,
+            ),
+            patch.object(
+                aiter_backend,
+                "unified_attention_3d_mtp_func",
+                lambda **_kw: calls.append(("mtp", None)),
+                create=True,
+            ),
+            patch.object(
+                aiter_backend,
+                "_muse_verify_attention",
+                lambda *_a, **_kw: calls.append(("muse", None)) or True,
+                create=True,
+            ),
+            patch.object(aiter_backend, "_muse_gfx95_like", lambda: True),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+        ):
+            backend.forward_extend(
+                torch.zeros(
+                    bs * draft_num, num_q_heads, head_dim, dtype=torch.bfloat16
+                ),
+                None,
+                None,
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+            )
+        return calls
+
+    def test_encoder_only_verify_is_not_causal_and_skips_the_mtp_kernel(self):
+        shapes = {
+            "dspark": dict(
+                num_q_heads=8,
+                head_dim=64,
+                kv_dtype=torch.bfloat16,
+                prefix_lens=(37, 3000),
+            ),
+            "mtp": dict(
+                num_q_heads=32,
+                head_dim=256,
+                kv_dtype=aiter_backend.fp8_dtype,
+                prefix_lens=(600, 1500),
+            ),
+        }
+        expected = {
+            ("dspark", AttentionType.DECODER): [("unified", True)],
+            ("dspark", AttentionType.ENCODER_ONLY): [("unified", False)],
+            ("mtp", AttentionType.DECODER): [("mtp", None)],
+            ("mtp", AttentionType.ENCODER_ONLY): [("unified", False)],
+        }
+        for (name, attn_type), calls in expected.items():
+            with self.subTest(shape=name, attn_type=attn_type.name):
+                self.assertEqual(self._verify(attn_type, **shapes[name]), calls)
+
+    def test_muse_verify_kernels_serve_only_causal_layers(self):
+        shape = dict(
+            num_q_heads=8,
+            head_dim=64,
+            kv_dtype=torch.bfloat16,
+            prefix_lens=(37, 3000),
+            muse_verify_kernels=frozenset({"verify"}),
+        )
+        self.assertEqual(self._verify(AttentionType.DECODER, **shape), [("muse", None)])
+        self.assertEqual(
+            self._verify(AttentionType.ENCODER_ONLY, **shape), [("unified", False)]
+        )
+
+    def test_encoder_only_sliding_window_verify_raises(self):
+        """unified_attention takes no sliding window with causal=False, so it raises."""
+        with self.assertRaisesRegex(ValueError, "no sliding window"):
+            self._verify(
+                AttentionType.ENCODER_ONLY,
+                num_q_heads=8,
+                head_dim=64,
+                kv_dtype=torch.bfloat16,
+                prefix_lens=(37, 3000),
+                sliding_window_size=128,
+            )
+
+
 _DCP_SIZE = 8
 _DRAFT_TOKENS = 8
 _DCP_MAX_CONTEXT_LEN = 128
@@ -152,6 +387,7 @@ def _dcp_verify_backend(asm_cprr):
     backend.use_mla = True
     backend.use_mla_dcp_asm = False
     backend._use_unified_verify = False
+    backend._graph_reads_flat_kv_indices = True
     backend.use_sliding_window_kv_pool = False
     backend.use_muse_attention_paths = False
     backend.muse_reuse_verify_lengths = False
@@ -260,7 +496,12 @@ class _MHAPool:
         return torch.empty(1, 1, 8, 128)
 
 
-def _init_mha_backend(kv_cache_layout):
+def _init_mha_backend(
+    kv_cache_layout,
+    *,
+    spec_algorithm=SpeculativeAlgorithm.NONE,
+    sliding_window_size=None,
+):
     pool = _MHAPool(kv_cache_layout)
     model_config = SimpleNamespace(
         dtype=torch.bfloat16,
@@ -270,6 +511,7 @@ def _init_mha_backend(kv_cache_layout):
         get_num_kv_heads=lambda _tp_size: 8,
         attention_arch=AttentionArch.MHA,
         context_len=4096,
+        hf_config=None,
     )
     model_runner = SimpleNamespace(
         model_config=model_config,
@@ -280,7 +522,9 @@ def _init_mha_backend(kv_cache_layout):
         ),
         runner_ids=None,
         token_to_kv_pool=pool,
-        is_draft_worker=False,
+        is_draft_worker=spec_algorithm != SpeculativeAlgorithm.NONE,
+        spec_algorithm=spec_algorithm,
+        sliding_window_size=sliding_window_size,
         token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
     )
     spec = SimpleNamespace(
@@ -297,6 +541,11 @@ def _init_mha_backend(kv_cache_layout):
         patch.object(aiter_backend, "get_exec", lambda: exec_config),
         patch.object(aiter_backend, "get_spec", lambda: spec),
         patch.object(aiter_backend, "get_parallel", lambda: parallel),
+        patch.object(
+            aiter_backend,
+            "get_memory",
+            lambda: SimpleNamespace(enable_unified_memory=False),
+        ),
     ):
         return aiter_backend.AiterAttnBackend(model_runner, skip_prefill=True)
 
@@ -311,6 +560,37 @@ class TestAiterDecodeWorkspace(CustomTestCase):
             for layout in ("nhd", "vectorized_5d")
         }
         self.assertEqual(allocated, {"nhd": True, "vectorized_5d": False})
+
+
+class TestAiterDSparkDraftInit(CustomTestCase):
+    """AiterAttnBackend wires a DSpark draft runner to unified verify, or rejects it."""
+
+    def _draft(self, *, non_causal=True, **kwargs):
+        with (
+            patch(
+                "sglang.srt.utils.aiter.aiter_unified_attention_supports_non_causal",
+                return_value=non_causal,
+            ),
+            envs.SGLANG_USE_AITER_UNIFIED_ATTN.override(False),
+        ):
+            return _init_mha_backend(
+                "nhd", spec_algorithm=SpeculativeAlgorithm.DSPARK, **kwargs
+            )
+
+    def test_draft_runner_uses_unified_verify_without_flat_graph_indices(self):
+        draft = self._draft()
+        self.assertTrue(draft.use_triton_unified_attention)
+        self.assertTrue(draft._use_unified_verify)
+        self.assertFalse(draft._graph_reads_flat_kv_indices)
+        with envs.SGLANG_USE_AITER_UNIFIED_ATTN.override(True):
+            target = _init_mha_backend("nhd")
+        self.assertTrue(target._graph_reads_flat_kv_indices)
+
+    def test_unsupported_draft_raises(self):
+        for case in (dict(sliding_window_size=128), dict(non_causal=False)):
+            with self.subTest(**case):
+                with self.assertRaisesRegex(ValueError, "cannot run this DSpark draft"):
+                    self._draft(**case)
 
 
 if __name__ == "__main__":

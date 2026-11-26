@@ -1,6 +1,7 @@
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -27,6 +28,10 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_sail
+from sglang.srt.utils.aiter import (
+    aiter_dspark_draft_default_on_this_device,
+    aiter_dspark_draft_reject_reason,
+)
 
 _is_musa = is_musa()
 _is_npu = is_npu()
@@ -52,6 +57,27 @@ def register_attention_backend(name):
         return fn
 
     return decorator
+
+
+class NonCausalDraftAttention(msgspec.Struct, frozen=True):
+    """A backend's declaration that it can run a DSpark draft's non-causal MHA verify."""
+
+    # Why the backend cannot run the draft, or None; keyword-only draft_is_mla,
+    # draft_has_sliding_window, enable_unified_memory, enable_deterministic_inference.
+    reject_reason: Callable[..., Optional[str]]
+    # Whether a model hook may pick the backend for the draft unasked on this device.
+    default_on_this_device: Callable[[], bool]
+
+
+# Backends that declared NonCausalDraftAttention.
+# They serve a DSpark draft only when --speculative-draft-attention-backend names them.
+NONCAUSAL_DRAFT_ATTENTION_BACKENDS: dict[str, NonCausalDraftAttention] = {}
+
+
+def register_noncausal_draft_attention(
+    name: str, declaration: NonCausalDraftAttention
+) -> None:
+    NONCAUSAL_DRAFT_ATTENTION_BACKENDS[name] = declaration
 
 
 def register_oot_linear_attention_backend(backend_class_name, factory, platform_key):
@@ -149,6 +175,15 @@ def create_aiter_backend(runner):
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
     return AiterAttnBackend(runner)
+
+
+register_noncausal_draft_attention(
+    "aiter",
+    NonCausalDraftAttention(
+        reject_reason=aiter_dspark_draft_reject_reason,
+        default_on_this_device=aiter_dspark_draft_default_on_this_device,
+    ),
+)
 
 
 @register_attention_backend("wave")
