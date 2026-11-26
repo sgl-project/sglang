@@ -131,7 +131,7 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = default_port())]
     pub port: u16,
 
-    /// Port for the native gRPC server (`sglang.runtime.v1.SglangService`, which
+    /// Port for the native gRPC server (`sglang.api.v1.SglangService`, which
     /// engines serve with `--grpc-port`); requests reach engines over their gRPC port.
     #[arg(long)]
     pub grpc_port: Option<u16>,
@@ -3185,6 +3185,26 @@ mod tests {
             err.contains("--cache-pending-prefix-max-followers"),
             "{err}"
         );
+    }
+
+    /// Reorg's cache-aware groups build their own prefix provider; it must honor
+    /// --cache-pending-prefix-consult-below like the other routing path does.
+    #[tokio::test]
+    async fn reorg_prefix_provider_honors_pending_consult_below() {
+        let state = crate::state::kv_events::KvEventIndex::new();
+        let provider = |argv: &str| {
+            let config = cfg_of(argv).unwrap();
+            crate::policies_reorg::factory::local_prefix_provider(&config.model, &state)
+        };
+        let set = provider(
+            "--chat-routing reorg --policy cache_aware --cache-pending-prefix-ttl-ms 60000 \
+             --cache-pending-prefix-consult-below 0.8",
+        );
+        assert_eq!(set.pending_consult_below(), Some(0.8));
+        let unset = provider(
+            "--chat-routing reorg --policy cache_aware --cache-pending-prefix-ttl-ms 60000",
+        );
+        assert_eq!(unset.pending_consult_below(), None);
     }
 
     #[test]
