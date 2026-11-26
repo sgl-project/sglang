@@ -14,6 +14,9 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    normalize_output_seeds,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -34,6 +37,30 @@ _DROP_IDX = 34
 _SUFFIX_START_IDX = 5
 _MAX_LENGTH = 512
 _SELECT_LAYERS = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35)
+
+
+def _output_seeds(batch: Req, num_prompts: int, num_outputs: int) -> list[int]:
+    """One seed per output row, prompt-major, as InputValidationStage assigns them."""
+    dynamic_seeds = batch.extra.get("dynamic_batch_seeds")
+    seed = batch.seed if batch.seed is not None else 0
+    seeds = []
+    for prompt_index in range(num_prompts):
+        if dynamic_seeds is not None:
+            seeds += normalize_output_seeds(
+                dynamic_seeds[prompt_index], num_outputs_per_prompt=num_outputs
+            )
+        elif isinstance(seed, list):
+            seeds += normalize_output_seeds(
+                seed,
+                num_outputs_per_prompt=num_outputs,
+                num_prompts=num_prompts,
+                prompt_index=prompt_index,
+            )
+        else:
+            seeds += normalize_output_seeds(
+                seed + prompt_index * num_outputs, num_outputs_per_prompt=num_outputs
+            )
+    return seeds
 
 
 class Krea2BeforeDenoisingStage(PipelineStage):
@@ -117,8 +144,15 @@ class Krea2BeforeDenoisingStage(PipelineStage):
             prompt_embeds, prompt_mask = self._encode(prompts, device, dtype)
             neg_embeds, neg_mask = self._encode(neg_prompts, device, dtype)
 
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+        if num_outputs > 1:
+            prompt_embeds, prompt_mask, neg_embeds, neg_mask = (
+                t.repeat_interleave(num_outputs, dim=0)
+                for t in (prompt_embeds, prompt_mask, neg_embeds, neg_mask)
+            )
+
         # Initial noise latents, packed to [B, S_img, channels*patch**2].
-        seed = batch.seed if batch.seed is not None else 0
+        seeds = _output_seeds(batch, n, num_outputs)
         lat_h, lat_w = height // vsf, width // vsf
         noise = torch.cat(
             [
@@ -129,9 +163,9 @@ class Krea2BeforeDenoisingStage(PipelineStage):
                     lat_w,
                     device=device,
                     dtype=dtype,
-                    generator=torch.Generator(device=device).manual_seed(seed + i),
+                    generator=torch.Generator(device=device).manual_seed(row_seed),
                 )
-                for i in range(n)
+                for row_seed in seeds
             ],
             dim=0,
         )
@@ -163,5 +197,6 @@ class Krea2BeforeDenoisingStage(PipelineStage):
         batch.timesteps = scheduler.sigmas[:num_inference_steps]
         batch.num_inference_steps = num_inference_steps
         batch.sigmas = None
-        batch.generator = torch.Generator(device=device).manual_seed(seed)
+        generators = [torch.Generator(device=device).manual_seed(s) for s in seeds]
+        batch.generator = generators[0] if len(generators) == 1 else generators
         return batch
