@@ -374,37 +374,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     f"--enable-encoder-swa-bounded-replay does not support {feature} yet"
                 )
 
-    if cfg.pp_size > 1 and cfg.pp_virtual_stages == 1:
-        # Contiguous PP uses the eager stage handoff for lagged mHC and shared KV.
-        # Keep other execution modes closed until their transport is validated.
-        unsupported_pp = (
-            ("non-CUDA execution", not get_platform().is_cuda),
-            ("execution outside PD prefill", cfg.disaggregation_mode != "prefill"),
-            ("vision", not cfg.language_model_only),
-            ("attention DP", cfg.attn_dp_size != 1),
-            ("attention CP", cfg.attn_cp_size != 1 or cfg.enable_prefill_cp),
-            ("speculative decoding", cfg.speculative_algorithm is not None),
-            ("sequence parallelism", cfg.enable_layernorm_sp),
-            ("attention input scattering", cfg.enable_attn_tp_input_scattered),
-            ("encoder bounded SWA replay", cfg.enable_encoder_swa_bounded_replay),
-            (
-                "CUDA graphs",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
-                or cfg.cuda_graph_config.decode.backend != Backend.DISABLED,
-            ),
-            (
-                "hidden-state output",
-                cfg.enable_return_hidden_states or cfg.enable_return_aux_hidden_states,
-            ),
-            ("routed-expert output", cfg.enable_return_routed_experts),
-            ("torch.compile", cfg.enable_torch_compile),
-        )
-        for feature, enabled in unsupported_pp:
-            if enabled:
-                raise ValueError(
-                    f"DeepSeek-V4.1 contiguous PP does not support {feature} yet"
-                )
-
     unsupported = (
         (
             "speculative decoding other than DSpark",
@@ -418,6 +387,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
+        ("pipeline parallelism", cfg.pp_size > 1 and cfg.pp_virtual_stages == 1),
     )
     for feature, enabled in unsupported:
         if enabled:

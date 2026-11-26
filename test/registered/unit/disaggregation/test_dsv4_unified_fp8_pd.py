@@ -30,14 +30,10 @@ class TestDSV4UnifiedFp8PpSlice(CustomTestCase):
     BF16_KV_LEN = 7
     FP8_KV_LEN = 11
 
-    def test_contiguous_v41_pp_maps_shared_sources_to_pp1(self):
-        ownership = [list(range(20)), list(range(20, 40))]
-        self.assertEqual(
-            vpp_transfer_layers(
-                SimpleNamespace(vpp_layout=None, pp_transfer_layers=ownership)
-            ),
-            ownership,
-        )
+    def test_v41_vpp_maps_shared_sources_to_pp1(self):
+        layout = VPPLayout(40, 2, partition=(20, 1, 1, 18))
+        ownership = vpp_transfer_layers(SimpleNamespace(vpp_layout=layout))
+        self.assertIsNone(vpp_transfer_layers(SimpleNamespace(vpp_layout=None)))
         ratios = [0, 0] + [2] * 18 + [1] * 20 + [0] * 3
         full = [20, 20, 2, 8, 14, 2, 8, 14]
         strides = [149760, 65536] + [74880] * 3 + [32768] * 3

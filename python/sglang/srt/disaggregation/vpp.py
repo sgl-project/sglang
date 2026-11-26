@@ -1,4 +1,4 @@
-"""Pipeline ownership on the PD wire and compressed-MLA buffer selection."""
+"""VPP ownership on the PD wire and compressed-MLA buffer selection."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 def vpp_transfer_layers(model) -> list[list[int]] | None:
     layout = getattr(model, "vpp_layout", None)
     if layout is None:
-        return getattr(model, "pp_transfer_layers", None)
+        return None
     return [
         list(layout.layer_ids_for_rank(rank)) for rank in range(layout.physical_size)
     ]

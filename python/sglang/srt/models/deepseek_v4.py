@@ -4633,7 +4633,7 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
-        """Share the eager state handoff between contiguous PP and VPP."""
+        """Execute a validated VPP stage with eager state handoff."""
         parallel = get_parallel()
         if not _is_cuda:
             raise NotImplementedError("DSV4 VPP stage forward requires CUDA")
@@ -4853,11 +4853,7 @@ class DeepseekV4Model(nn.Module):
             hidden_states, last_pre = state.residual, state.pre
         else:
             hidden_states, last_pre = state, None
-        logical_size = (
-            self.vpp_layout.logical_size
-            if self.vpp_layout is not None
-            else self.pp_group.world_size
-        )
+        logical_size = self.vpp_layout.logical_size
         if stage.stage_id != logical_size - 1:
             tensors = {"hidden_states": hidden_states.flatten(1)}
             if in_tail:
@@ -4931,17 +4927,9 @@ class DeepseekV4Model(nn.Module):
                 "forward_vpp_stage"
             )
         if self.config.model_type == "deepseek_v41" and self.pp_group.world_size > 1:
-            from sglang.srt.distributed.vpp_layout import VPPStage
-
-            rank = get_parallel().pp_rank
-            stage = VPPStage(rank, rank, self.start_layer, self.end_layer)
-            return self._forward_pipeline_stage(
-                stage,
-                input_ids,
-                positions,
-                forward_batch,
-                input_embeds,
-                pp_proxy_tensors,
+            raise NotImplementedError(
+                "DeepSeek-V4.1 pipeline execution requires a VPP layout and "
+                "forward_vpp_stage"
             )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -5269,27 +5257,6 @@ class DeepseekV4ForCausalLM(
 
         # Expose local ownership; the VPP range is only a compatibility envelope.
         self.vpp_layout = self.model.vpp_layout
-        self.pp_transfer_layers = None
-        if (
-            _is_cuda
-            and config.model_type == "deepseek_v41"
-            and self.vpp_layout is None
-            and self.model.pp_group.world_size > 1
-        ):
-            from sglang.srt.distributed import get_pp_indices
-
-            self.pp_transfer_layers = [
-                list(
-                    range(
-                        *get_pp_indices(
-                            config.num_hidden_layers,
-                            rank,
-                            self.model.pp_group.world_size,
-                        )
-                    )
-                )
-                for rank in range(self.model.pp_group.world_size)
-            ]
         self.vpp_stages = self.model.vpp_stages
         self.layer_ids = self.model.layer_ids
         self.start_layer = self.model.start_layer
@@ -5568,17 +5535,7 @@ class DeepseekV4ForCausalLM(
         if not self.pp_group.is_last_rank:
             return hidden_states
 
-        tail = (
-            get_attn_backend().tail_forward_metadata.late_layer_tail
-            if self.model.config.model_type == "deepseek_v41"
-            and self.pp_group.world_size > 1
-            and self.model.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-            else None
-        )
-        return self._postprocess_output(
-            hidden_states, input_ids, forward_batch, tail=tail
-        )
+        return self._postprocess_output(hidden_states, input_ids, forward_batch)
 
     def _get_dspark_prefill_tail(self, forward_batch):
         if (

@@ -1151,13 +1151,18 @@ class TestVPPResolution(CustomTestCase):
                     self.assertEqual(cfg.cuda_graph_config.decode.backend, "disabled")
                     self.assertEqual(cfg.cuda_graph_config.prefill.backend, "disabled")
                     self.assertTrue(cfg.enable_decoder_swa_bounded_replay)
-            with self.assertRaisesRegex(ValueError, "outside PD prefill"):
-                ServerArgs(
-                    model_path=path,
-                    device="cuda",
-                    pp_size=2,
-                    language_model_only=True,
-                ).resolve_once()
+            for role in ("null", "prefill", "decode"):
+                with (
+                    self.subTest(ordinary_pp_role=role),
+                    self.assertRaisesRegex(ValueError, "pipeline parallelism"),
+                ):
+                    ServerArgs(
+                        model_path=path,
+                        device="cuda",
+                        pp_size=2,
+                        language_model_only=True,
+                        disaggregation_mode=role,
+                    ).resolve_once()
 
     def test_default_pp_does_not_resolve_a_vpp_model(self):
         from sglang.srt.arg_groups.vpp_hook import handle_vpp
