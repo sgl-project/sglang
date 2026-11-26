@@ -47,7 +47,6 @@ import time
 import weakref
 from array import array
 from collections import OrderedDict
-from contextlib import nullcontext
 from itertools import chain
 
 from sglang.srt.environ import envs
@@ -344,8 +343,9 @@ class _SegmentEncoder:
         self.max_cut_len = max(map(len, self.raw_ids), default=0)
         self.cuts = {}
         self.lock = threading.Lock()
-        self.encode_lock = threading.Lock()
         self.cache = OrderedDict()
+        # Key -> _InFlightEncode of a text that one call is encoding now.
+        self.in_flight = {}
         self.cached_bytes = 0
 
     def cut_id(self, segment):
@@ -374,21 +374,24 @@ class _SegmentEncoder:
             layout.append("".join(run))
 
         known = {}
-        missing = self._cached(
-            [item for item in layout if isinstance(item, str)], known, cache_salt
-        )
-        if missing:
-            long = (
-                max(map(len, missing))
-                >= envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
-            )
-            # One long encode at a time: concurrent requests sharing a long
-            # history wait and then hit the cache instead of encoding it again.
-            with self.encode_lock if long else nullcontext():
-                if long:
-                    missing = self._cached(missing, known, cache_salt)
-                if missing:
-                    known.update(self._encode(missing, cache_salt))
+        texts = [item for item in layout if isinstance(item, str)]
+        while texts:
+            # Distinct texts encode in parallel; a text another call is already
+            # encoding is waited for, not encoded again.
+            own, waits = self._claim(texts, known, cache_salt)
+            if own:
+                encoded = {}
+                try:
+                    encoded = self._encode(own, cache_salt)
+                finally:
+                    self._publish(own, encoded, cache_salt)
+                known.update(encoded)
+            for text, pending in waits.items():
+                pending.done.wait()
+                if pending.ids is not None:
+                    known[text] = pending.ids
+            # Left only if the encode waited for raised: encode them here.
+            texts = [text for text in waits if text not in known]
 
         ids = []
         for item in layout:
@@ -398,16 +401,24 @@ class _SegmentEncoder:
                 ids.append(item)
         return ids
 
-    def _cached(self, texts, known, cache_salt):
-        """Copy the cached ids of `texts` into `known`; return the rest, once each."""
+    def _claim(self, texts, known, cache_salt):
+        """Copy the cached ids of `texts` into `known`. Of the rest, return the
+        texts this call must encode (now claimed, once each) and
+        {text: _InFlightEncode} of those another call is encoding."""
+        own, waits = [], {}
         with self.lock:
-            for text in texts:
+            for text in dict.fromkeys(texts):
                 key = (cache_salt, text)
                 ids = self.cache.get(key)
                 if ids is not None:
                     self.cache.move_to_end(key)
                     known[text] = ids
-        return [text for text in dict.fromkeys(texts) if text not in known]
+                elif key in self.in_flight:
+                    waits[text] = self.in_flight[key]
+                else:
+                    self.in_flight[key] = _InFlightEncode()
+                    own.append(text)
+        return own, waits
 
     def _encode(self, texts, cache_salt):
         min_chars = envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
@@ -428,17 +439,35 @@ class _SegmentEncoder:
                 chain.from_iterable(e.ids for e in encodings[start : start + count]),
             )
             start += count
+        return encoded
 
+    def _publish(self, texts, encoded, cache_salt):
+        """Cache the ids of the claimed `texts` and release their claims, in one
+        step under the lock, so a text is always cached, in flight or unclaimed.
+        A text missing from `encoded` (its encode raised) wakes its waiters
+        with no ids."""
         with self.lock:
-            for text, ids in encoded.items():
+            for text in texts:
                 key = (cache_salt, text)
-                size = _entry_bytes(key, ids)
-                if key not in self.cache and size <= _SEGMENT_CACHE_MAX_ENTRY_BYTES:
-                    self.cache[key] = ids
-                    self.cached_bytes += size
+                ids = encoded.get(text)
+                if ids is not None:
+                    size = _entry_bytes(key, ids)
+                    if key not in self.cache and size <= _SEGMENT_CACHE_MAX_ENTRY_BYTES:
+                        self.cache[key] = ids
+                        self.cached_bytes += size
+                pending = self.in_flight.pop(key)
+                pending.ids = ids
+                pending.done.set()
             while self.cached_bytes > _SEGMENT_CACHE_MAX_BYTES:
                 self.cached_bytes -= _entry_bytes(*self.cache.popitem(last=False))
-        return encoded
+
+
+class _InFlightEncode:
+    """A text's encode in progress; `ids` is set before `done`."""
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.ids = None
 
 
 def _samples_merges(backend):

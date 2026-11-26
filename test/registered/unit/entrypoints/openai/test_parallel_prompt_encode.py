@@ -19,7 +19,6 @@ comparisons do not depend on it.
 import random
 import sys
 import threading
-import time
 import unittest
 import unittest.mock
 import weakref
@@ -661,6 +660,91 @@ class TestPromptSegments(_EncodeCase):
             [["hello world"], ["fresh text"]],
         )
 
+    def _hold_encode_of(self, held_text):
+        """Patch `_SegmentEncoder._encode`: the encode of `held_text` sets
+        `entered`, then waits for `proceed`."""
+        entered, proceed = threading.Event(), threading.Event()
+        self.addCleanup(proceed.set)
+        encode = ppe._SegmentEncoder._encode
+
+        def held_encode(encoder, texts, cache_salt):
+            if held_text in texts:
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return encode(encoder, texts, cache_salt)
+
+        patch = unittest.mock.patch.object(
+            ppe._SegmentEncoder, "_encode", autospec=True, side_effect=held_encode
+        )
+        return patch, entered, proceed
+
+    def _run_in_thread(self, results, tokenizer, text):
+        def run():
+            results.append(
+                list(ppe.encode_prompt_segments(tokenizer, ["<|user|>", text]))
+            )
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        return thread
+
+    def test_distinct_long_texts_encode_concurrently(self):
+        """A long text being encoded must not hold off the encode of a different
+        long text: cold prompts of distinct conversations encode in parallel."""
+        self._set_min_chars(64)
+        first, second = "hello world " * 50, "the quick brown fox " * 50
+        # Its own tokenizer: a retried attempt must not share an encoder with
+        # threads the failed attempt left blocked.
+        tokenizer = _tokenizer()
+        patch, entered, proceed = self._hold_encode_of(first)
+        first_ids, second_ids = [], []
+        with patch:
+            first_thread = self._run_in_thread(first_ids, tokenizer, first)
+            self.assertTrue(entered.wait(10))
+            self._run_in_thread(second_ids, tokenizer, second).join(5)
+            self.assertEqual(second_ids, [tokenizer.encode("<|user|>" + second)])
+            proceed.set()
+            first_thread.join()
+        self.assertEqual(first_ids, [tokenizer.encode("<|user|>" + first)])
+
+    def test_a_text_being_encoded_is_waited_for_not_encoded_again(self):
+        """Concurrent requests that share a missing history encode it once: the
+        later ones wait for the encode in flight and take its ids."""
+        self._set_min_chars(64)
+        text = "hello world " * 50
+        tokenizer = _tokenizer()
+        patch, entered, proceed = self._hold_encode_of(text)
+        found_in_flight = threading.Semaphore(0)
+        claim = ppe._SegmentEncoder._claim
+
+        def observed_claim(encoder, texts, known, cache_salt):
+            own, waits = claim(encoder, texts, known, cache_salt)
+            if waits:
+                found_in_flight.release()
+            return own, waits
+
+        results = []
+        with (
+            patch as encode,
+            unittest.mock.patch.object(
+                ppe._SegmentEncoder,
+                "_claim",
+                autospec=True,
+                side_effect=observed_claim,
+            ),
+        ):
+            threads = [self._run_in_thread(results, tokenizer, text)]
+            self.assertTrue(entered.wait(10))
+            threads += [self._run_in_thread(results, tokenizer, text) for _ in range(2)]
+            for _ in threads[1:]:
+                self.assertTrue(found_in_flight.acquire(timeout=10))
+            self.assertEqual(results, [])
+            proceed.set()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(encode.call_count, 1)
+        self.assertEqual(results, [tokenizer.encode("<|user|>" + text)] * 3)
+
     def test_long_text_between_cut_points_is_split(self):
         self._set_min_chars(4096)
         long_text = "the quick brown fox jumps over the lazy dog\n" * 300
@@ -1123,40 +1207,6 @@ class TestRenderedPrompt(_EncodeCase):
                 self.assertEqual(tokenizer.decode(ids), text)
         self.assertEqual(fallback.call_count, 2)
         self.assertFalse(ppe._rendered_checks(tokenizer).failed)
-
-    def test_concurrent_requests_encode_a_shared_history_once(self):
-        self._set_min_chars(64)
-        text = "<|user|>" + "hello world " * 50 + "<|assistant|>"
-        started, release = threading.Event(), threading.Event()
-        encode = ppe._SegmentEncoder._encode
-
-        def slow_encode(encoder, texts, cache_salt):
-            started.set()
-            release.wait(10)
-            return encode(encoder, texts, cache_salt)
-
-        results = []
-        threads = [
-            threading.Thread(
-                target=lambda: results.append(
-                    list(ppe.encode_rendered_prompt(self.tokenizer, text))
-                )
-            )
-            for _ in range(4)
-        ]
-        with unittest.mock.patch.object(
-            ppe._SegmentEncoder, "_encode", autospec=True, side_effect=slow_encode
-        ) as patched:
-            threads[0].start()
-            self.assertTrue(started.wait(10))
-            for thread in threads[1:]:
-                thread.start()
-            time.sleep(0.2)  # the others reach the encode lock
-            release.set()
-            for thread in threads:
-                thread.join()
-        self.assertEqual(patched.call_count, 1)
-        self.assertEqual(results, [self.tokenizer.encode(text)] * 4)
 
 
 if __name__ == "__main__":
