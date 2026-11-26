@@ -1083,6 +1083,16 @@ class MqaAttentionBase(nn.Module):
         fuse: bool = (
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
+        # Separate ModelSlim projections carry their own INT8 quantization
+        # parameters, which the native weight/FP8-scale fusion cannot merge.
+        if (
+            fuse
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+            and add_prefix("wqkv_a.weight", prefix)
+            not in quant_config.quant_description
+        ):
+            fuse = False
         fp8: bool = (
             wo_a_fp8_gemm_enabled(quant_config) if wo_a_fp8 is None else wo_a_fp8
         )
@@ -1238,6 +1248,14 @@ class MqaAttentionBase(nn.Module):
     def _kernel_num_heads(self, num_tokens: int) -> int:
         if self.attn_tp_size == 1:
             return self.n_local_heads
+
+        if _is_npu and self.is_dsv41:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            # A3 BF16 SMLA accepts the per-rank width (e.g. TP16/DP8: 32).
+            # The A5 mixed-quant kernel retains its existing 64-head padding.
+            if not is_npu_arch35():
+                return self.n_local_heads
 
         if get_platform().is_sm120:
             # Prefill already accepts the native per-rank query width.
@@ -1588,7 +1606,9 @@ class MQALayer(MqaAttentionBase):
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
-        if self.indexer is not None and hasattr(self.indexer.compressor, "fp4_cos"):
+        if isinstance(self.indexer, C4Indexer) and hasattr(
+            self.indexer.compressor, "fp4_cos"
+        ):
             self.indexer.compressor.fp4_cos = self.cos_cache[:, 0, 0, :]
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
@@ -3044,6 +3064,10 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache,
                 )
             else:
+                # Only HIP receives inv_rope; share its kwargs dict with decode DP.
+                attn_kwargs = {} if inv_rope is None else {"inv_rope": inv_rope}
+                if decode_dp is not None:
+                    attn_kwargs["query_layout"] = decode_dp
                 o = attn_backend.forward(
                     q=attn_q,
                     k=attn_k,
@@ -3053,9 +3077,7 @@ class MQALayer(MqaAttentionBase):
                     compress_ratio=self.compress_ratio,
                     attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
-                    **({"query_layout": decode_dp} if decode_dp is not None else {}),
-                    # HIP only, for the same reason as rope_kwargs above
-                    **({} if inv_rope is None else {"inv_rope": inv_rope}),
+                    **attn_kwargs,
                 )
             o = o[:, tp_slice, :]
         o = self._project_wo_a(
@@ -4432,6 +4454,9 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     input_ids=input_ids,
                     cp_all_tokens=cp_extend,
+                    gate_basis=(
+                        getattr(self, "engram_gate_basis", None) if _is_npu else None
+                    ),
                 )
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
@@ -5377,6 +5402,81 @@ class DeepseekV4ForCausalLM(
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
+    def _load_npu_engram_gate_basis(self) -> None:
+        """Load the ModelSlim sidecar once, shared by this rank's Engram layers."""
+        if (
+            not _is_npu
+            or self.quant_config is None
+            or self.quant_config.get_name() != "modelslim"
+        ):
+            return
+        rotation = getattr(self.config, "engram_rotation_config", None)
+        if not rotation:
+            return
+        expected = {
+            "value_projection_rotated": True,
+            "value_basis": "quarot_global",
+            "key_and_gate_basis": "original",
+            "runtime_delta_rotation": False,
+        }
+        if not isinstance(rotation, dict) or any(
+            rotation.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError(f"Unsupported ModelSlim Engram rotation: {rotation}")
+        if getattr(self.model, "engram_gate_basis", None) is not None:
+            return
+        engram = next(
+            (
+                layer.engram
+                for layer in self.model.layers
+                if getattr(layer, "engram", None) is not None
+            ),
+            None,
+        )
+        if engram is None:
+            return
+        if engram.q_weight.is_meta:
+            raise ValueError("Load Engram weights before loading the gate rotation")
+
+        from pathlib import Path
+
+        from safetensors import safe_open
+
+        from sglang.srt.runtime_context import get_context, get_model
+
+        if get_context().is_config_namespace_published("model"):
+            from sglang.srt.model_loader.loader import loaded_checkpoint_files
+
+            # A checkpoint's config can still name a different, existing directory.
+            config = get_model()
+            loaded = loaded_checkpoint_files(config.model_path, config.revision)
+            model_path = loaded[0] if loaded is not None else config.model_path
+        else:
+            model_path = getattr(self.config, "_name_or_path", None)
+        if not model_path:
+            raise ValueError("ModelSlim Engram rotation requires the checkpoint path")
+        path = Path(model_path) / "optional" / "quarot.safetensors"
+        if not path.is_file():
+            raise FileNotFoundError(f"ModelSlim Engram rotation requires {path}")
+        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            if "global_rotation" not in tensors.keys():
+                raise ValueError(f"Missing global_rotation in {path}")
+            basis = tensors.get_tensor("global_rotation")
+        dim = self.config.hidden_size
+        if basis.shape != (dim, dim) or not basis.is_floating_point():
+            raise ValueError(
+                f"global_rotation must be a floating-point [{dim}, {dim}] tensor"
+            )
+        basis = basis.float()
+        if not torch.isfinite(basis).all():
+            raise ValueError("global_rotation contains non-finite values")
+        self.model.register_buffer(
+            "engram_gate_basis",
+            basis.to(device=engram.q_weight.device),
+            persistent=False,
+        )
+        logger.info("Loaded ModelSlim Engram gate rotation from %s", path)
+
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
@@ -5387,6 +5487,7 @@ class DeepseekV4ForCausalLM(
 
         if is_nextn:
             return
+        self._load_npu_engram_gate_basis()
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
@@ -5608,7 +5709,6 @@ class DeepseekV4ForCausalLM(
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
         skipped_by_group: dict[str, int] = {}
         # V4 checkpoints must load every compressor / indexer tensor.
@@ -5843,9 +5943,12 @@ class DeepseekV4ForCausalLM(
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
                             elif (
-                                fuse_wqa_wkv
-                                and ".compressor." not in name
+                                ".compressor." not in name
                                 and ".engram." not in name
+                                and name.replace(".wq_a.", ".wqkv_a.").replace(
+                                    ".wkv.", ".wqkv_a."
+                                )
+                                in params_dict
                                 and (
                                     name.endswith(".wq_a.weight")
                                     or name.endswith(".wq_a.weight_scale_inv")

@@ -438,6 +438,29 @@ def test_ar_fusion_finalize_push_norm_stress():
         torch.testing.assert_close(x, ref2, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("num_tokens", [80, 160, 256, 288])
+@pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_ar_fusion_finalize_push_norm_extended(num_tokens: int, w_dtype: torch.dtype):
+    """Deferred MoE finalize + 1shot push AR + RMSNorm across the full 2 MB V2
+    push slot window (M = 74..292)."""
+    comm = _init_comm()
+    world = comm.world_size
+    eps = 1e-6
+    g = torch.Generator(device="cpu").manual_seed(777 + num_tokens)
+    norm_w = (torch.rand(NORM_DIM, generator=g) + 0.5).to(torch.bfloat16).to(_device())
+    gemm2, idx, weights = _build_permuted_layout(
+        num_tokens, seed=9500 + num_tokens, w_dtype=w_dtype
+    )
+    ref = _finalize_norm_ref(gemm2, idx, weights, norm_w, eps)
+    out = torch.empty(num_tokens, NORM_DIM, dtype=torch.bfloat16, device=_device())
+    all_reduce.finalize_all_reduce_push_norm(
+        world, out, gemm2, idx, weights, norm_w, eps
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("num_blocks", [1, 4, 16])
 @pytest.mark.parametrize("unroll", [4, 8])
 @torch.inference_mode()
