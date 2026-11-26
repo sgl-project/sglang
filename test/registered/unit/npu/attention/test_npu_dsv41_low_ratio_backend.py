@@ -2830,7 +2830,7 @@ class TestV41PrefillCapability(unittest.TestCase):
             Dsv4PrefillGraphMetadata,
         )
 
-    def test_unsupported_parallel_and_arch_are_rejected(self):
+    def test_unsupported_parallel_is_rejected_and_a3_stays_eager(self):
         with self._patch(cp=2):
             with self.assertRaisesRegex(ValueError, "without CP/DCP"):
                 self._backend()._supports_dsv4_prefill_graph_capture()
@@ -2838,8 +2838,9 @@ class TestV41PrefillCapability(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires PP=1"):
                 self._backend()._supports_dsv4_prefill_graph_capture()
         with self._patch(arch35=False):
-            with self.assertRaisesRegex(ValueError, "needs arch35"):
-                self._backend()._supports_dsv4_prefill_graph_capture()
+            # A3 has no C1/C2 index or candidate buffers; the capability gate
+            # falls back to eager instead of raising.
+            self.assertFalse(self._backend()._supports_dsv4_prefill_graph_capture())
 
 
 class TestV41PrefillAdmission(unittest.TestCase):
