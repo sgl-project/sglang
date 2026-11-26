@@ -18,9 +18,40 @@ def _gemm_module():
         "inkling2_moe_gemm_lowm_sm120",
         cuda_files=["inkling2/moe_lowm_sm120.cuh"],
         cuda_wrappers=[
+            (
+                "nvfp4_gemm_lowm_scaled",
+                "inkling2_moe_lowm_sm120::nvfp4_gemm_lowm_scaled",
+            ),
             ("mxfp8_gemm_lowm", "inkling2_moe_lowm_sm120::mxfp8_gemm_lowm"),
         ],
     )
+
+
+def nvfp4_expert_matmul_lowm_scaled(
+    values, scales, weight, weight_scales, offsets, x_amax, w_amax, w_denom
+):
+    if offsets.numel() != _NUM_EXPERTS + 1:
+        raise ValueError(
+            f"nvfp4_expert_matmul_lowm_scaled requires {_NUM_EXPERTS} experts, "
+            f"got {offsets.numel() - 1}"
+        )
+    out = torch.empty(
+        (values.shape[0], weight.shape[1]), dtype=torch.bfloat16, device=values.device
+    )
+    if values.shape[0]:
+        _gemm_module().nvfp4_gemm_lowm_scaled(
+            values,
+            weight,
+            scales,
+            weight_scales.view(torch.uint8),
+            out,
+            offsets,
+            x_amax,
+            w_amax,
+            w_denom,
+            current_arch().num_sms,
+        )
+    return out
 
 
 def mxfp8_expert_matmul_lowm(values, scales_cute_t, weight, weight_scales_raw, offsets):
