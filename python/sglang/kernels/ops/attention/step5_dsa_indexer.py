@@ -8,6 +8,7 @@ top 512 completed regions plus its own region. QSA (qsa_indexer.py) also scores
 compressed blocks, but mean-pools raw keys and applies norm and RoPE afterwards.
 """
 
+import msgspec
 import torch
 import triton
 import triton.language as tl
@@ -233,6 +234,27 @@ def _build_request_metadata(
     tl.store(QuerySlots + row * WIDTH + depth, tl.where(active, raw, 0), depth < WIDTH)
 
 
+class Step5CompressionPlan(msgspec.Struct, frozen=True, kw_only=True):
+    """Compression access plan shared by every DSA layer of one forward.
+
+    R = request rows, G = maximum completed blocks per request. Request rows need
+    not equal query rows: prefill packs a variable number of tokens per request.
+    """
+
+    request_slots: torch.Tensor  # [R], request-pool row, zero means padding
+    input_start_positions: torch.Tensor  # [R], absolute logical token position
+    input_start_rows: torch.Tensor  # [R], offset into this forward's packed K/Z
+    input_lengths: torch.Tensor  # [R], number of input K/Z rows for the request
+    # [G, R], flattened compressed-key address, NOT a physical KV page number;
+    # ordinal g names block floor(input_start_positions / 8) + g.
+    compressed_key_write_indices: torch.Tensor
+    num_input_tokens: int  # capacity of this forward's packed K/Z, including padding
+    # Input validity, shared by all layers; it does not cover layer-local ring tags.
+    request_active: torch.Tensor  # bool [R], live request row, excluding slot 0
+    request_mapping_valid: torch.Tensor  # bool [R], admission from input checks
+    request_count_valid: torch.Tensor  # bool [1], live count fits request capacity
+
+
 def step5_dsa_build_compression_metadata(
     *,
     request_slots: torch.Tensor,
@@ -241,7 +263,7 @@ def step5_dsa_build_compression_metadata(
     req_to_token: torch.Tensor,
     compressed_index_key_pages: int,
     context_len: int,
-) -> tuple[dict, torch.Tensor, torch.Tensor]:
+) -> tuple[Step5CompressionPlan, torch.Tensor, torch.Tensor]:
     """Build the decode compression plan (one input token per request).
 
     Returns the plan fields plus int32 per-query request slots and positions.
@@ -250,7 +272,7 @@ def step5_dsa_build_compression_metadata(
     rows = request_slots.numel()
     num_slots, token_capacity = req_to_token.shape
     num_blocks = 1
-    result = dict(
+    plan = Step5CompressionPlan(
         request_slots=torch.empty(rows, dtype=torch.int64, device=device),
         input_start_positions=torch.empty(rows, dtype=torch.int64, device=device),
         input_start_rows=torch.empty(rows, dtype=torch.int64, device=device),
@@ -275,14 +297,14 @@ def step5_dsa_build_compression_metadata(
         valid_rows,
         req_to_token,
         uses,
-        result["request_slots"],
-        result["input_start_positions"],
-        result["input_start_rows"],
-        result["input_lengths"],
-        result["request_active"],
-        result["request_mapping_valid"],
-        result["request_count_valid"],
-        result["compressed_key_write_indices"],
+        plan.request_slots,
+        plan.input_start_positions,
+        plan.input_start_rows,
+        plan.input_lengths,
+        plan.request_active,
+        plan.request_mapping_valid,
+        plan.request_count_valid,
+        plan.compressed_key_write_indices,
         query_slots,
         query_positions,
         rows,
@@ -297,7 +319,7 @@ def step5_dsa_build_compression_metadata(
         num_blocks,
         num_warps=4,
     )
-    return result, query_slots, query_positions
+    return plan, query_slots, query_positions
 
 
 @triton.jit

@@ -213,14 +213,14 @@ class Step5Indexer(nn.Module):
         state = metadata.layer_states[self.layer_id]
         # Read the old ring before publishing this forward's pending inputs.
         step5_dsa_append_ring(
-            slots=metadata.request_slots,
-            bases=metadata.input_start_positions,
-            sources=metadata.input_start_rows,
-            lengths=metadata.input_lengths,
-            active=metadata.request_active,
-            admitted=metadata.request_mapping_valid,
-            count_valid=metadata.request_count_valid,
-            physical_blocks=metadata.compressed_key_write_indices,
+            slots=metadata.compression.request_slots,
+            bases=metadata.compression.input_start_positions,
+            sources=metadata.compression.input_start_rows,
+            lengths=metadata.compression.input_lengths,
+            active=metadata.compression.request_active,
+            admitted=metadata.compression.request_mapping_valid,
+            count_valid=metadata.compression.request_count_valid,
+            physical_blocks=metadata.compression.compressed_key_write_indices,
             enabled=metadata.compression_enabled,
             success=metadata.compression_success,
             index_key=index_key,
@@ -555,7 +555,7 @@ class Step5Attention(nn.Module):
             if metadata is None:
                 output.zero_()
                 return
-            num_tokens = metadata.num_input_tokens
+            num_tokens = metadata.compression.num_input_tokens
             kwargs["index_selection"] = self.indexer(
                 hidden_states[:num_tokens], positions[:num_tokens], metadata
             )

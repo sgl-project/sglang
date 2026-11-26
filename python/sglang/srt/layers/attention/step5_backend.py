@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.ops.attention.step5_dsa_indexer import (
     STEP5_HISTORY_BLOCKS,
+    Step5CompressionPlan,
     can_use_step5_dsa_topk_deepselect,
     deepselect_score_width,
     step5_dsa_build_compression_metadata,
@@ -63,28 +64,12 @@ class Step5SelectionWorkspace(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Step5IndexerMetadata(msgspec.Struct, frozen=True, kw_only=True):
-    """Indexer metadata for one forward; R = compression request rows, Q = query rows,
-    G = maximum completed blocks per request."""
+    """Indexer metadata for one forward; R = compression request rows, Q = query rows."""
 
     # Borrowed references; storage and lifetime remain owned by the backend and pools.
     layer_states: dict[int, Step5LayerIndexerState]
     req_to_token: torch.Tensor
-
-    # Compression access plan. Request rows need not equal query rows: prefill
-    # packs a variable number of input tokens per request.
-    request_slots: torch.Tensor  # [R], request-pool row, zero means padding
-    input_start_positions: torch.Tensor  # [R], absolute logical token position
-    input_start_rows: torch.Tensor  # [R], offset into this forward's packed K/Z
-    input_lengths: torch.Tensor  # [R], number of input K/Z rows for the request
-    # [G, R], flattened compressed-key address, NOT a physical KV page number;
-    # ordinal g names block floor(input_start_positions / 8) + g.
-    compressed_key_write_indices: torch.Tensor
-    num_input_tokens: int  # capacity of this forward's packed K/Z, including padding
-
-    # Input validity, shared by all layers; it does not cover layer-local ring tags.
-    request_active: torch.Tensor  # bool [R], live request row, excluding slot 0
-    request_mapping_valid: torch.Tensor  # bool [R], admission from input checks
-    request_count_valid: torch.Tensor  # bool [1], live count fits request capacity
+    compression: Step5CompressionPlan
 
     # Query/scoring layout, complete at construction (no later replace/binding).
     query_request_slots: torch.Tensor  # [Q], request slot for each query
@@ -143,25 +128,55 @@ def _allocate_selection_workspace(
             if use_deepselect
             else None
         ),
-        tiles=tuple(
-            (start, min(start + capacity, rows))
-            for start in range(0, rows, capacity or 1)
-        ),
+        tiles=_selection_tiles(rows=rows, capacity=capacity),
     )
 
 
-def _build_prefill_compression_inputs(
+def _selection_tiles(*, rows: int, capacity: int) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        (start, min(start + capacity, rows)) for start in range(0, rows, capacity or 1)
+    )
+
+
+def _slice_selection_workspace(
+    workspace: Step5SelectionWorkspace,
+    *,
+    rows: int,
+    row_to_req: torch.Tensor,
+    positions: torch.Tensor,
+) -> Step5SelectionWorkspace:
+    capacity = min(rows, workspace.indexer_logits.shape[0])
+    topk_lengths = None
+    if workspace.use_deepselect:
+        topk_lengths = workspace.topk_lengths[:rows]
+        topk_lengths.copy_(
+            torch.where(row_to_req > 0, positions // STEP5_COMPRESSION_RATIO, 0)
+        )
+    return Step5SelectionWorkspace(
+        packed=workspace.packed[:rows],
+        counts=workspace.counts[:rows],
+        lengths=workspace.lengths[:rows],
+        indexer_logits=workspace.indexer_logits[:capacity],
+        ids=workspace.ids[:capacity],
+        use_deepselect=workspace.use_deepselect,
+        topk_lengths=topk_lengths,
+        topk_ids=(workspace.topk_ids[:capacity] if workspace.use_deepselect else None),
+        tiles=_selection_tiles(rows=rows, capacity=capacity),
+    )
+
+
+def _build_prefill_compression_plan(
     *,
     request_slots: torch.Tensor,
     prefix_lengths: list[int],
     append_lengths: list[int],
     req_to_token: torch.Tensor,
     compressed_index_key_pages: int,
-) -> dict:
+) -> Step5CompressionPlan:
     """Build the prefill compression plan shared by every DSA layer.
 
-    A request with any invalid completed block is disabled in full; padding rows
-    consume input rows but never own ring cells or destinations.
+    A live request with an invalid completed block fails the ring admission assert;
+    padding rows consume input rows but never own ring cells or destinations.
     """
     rows, source = [], 0
     for base, length in zip(prefix_lengths, append_lengths):
@@ -193,7 +208,7 @@ def _build_prefill_compression_inputs(
         & (first.remainder(ratio) == 0)
         & (mapped == first[:, :, None] + offsets).all(2)
     )
-    return dict(
+    return Step5CompressionPlan(
         request_slots=slots,
         input_start_positions=bases,
         input_start_rows=sources,
@@ -214,7 +229,7 @@ def wrap_step5_attention_backend(runner, full_attn_backend: AttentionBackend):
     """Compose target sparse attention with the configured public SWA backend."""
     if get_spec().speculative_algorithm is not None:
         raise ValueError("Step5 sparse attention does not support speculative decoding")
-    return Step5AttentionBackend(
+    return Step5AttnBackend(
         swa_backend=full_attn_backend,
         kv_pool=runner.token_to_kv_pool,
         req_to_token_pool=runner.req_to_token_pool,
@@ -305,25 +320,27 @@ def _build_prefill_request_spans(fb: ForwardBatch) -> tuple[list[int], list[int]
     tokens = sum(lengths)
     padded_tokens = fb.input_ids.numel()
     if tokens != padded_tokens:
-        # DP attention pads tokens without adding a request; give that tail an
-        # ownerless padding row so it never extends a live request's frontier.
+        # Prefill graphs and DP attention pad tokens without adding a request; give
+        # that tail an ownerless padding row so it never extends a live frontier.
         prefixes.append(0)
         lengths.append(padded_tokens - tokens)
     return prefixes, lengths
 
 
-def _prefill_query_layout(compression_inputs: dict):
-    starts = compression_inputs["input_start_positions"]
-    sources = compression_inputs["input_start_rows"]
-    lengths = compression_inputs["input_lengths"]
-    num_tokens = compression_inputs["num_input_tokens"]
+def _prefill_query_layout(
+    plan: Step5CompressionPlan,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    starts = plan.input_start_positions
+    sources = plan.input_start_rows
+    lengths = plan.input_lengths
+    num_tokens = plan.num_input_tokens
     device = lengths.device
     token_requests = torch.repeat_interleave(
         torch.arange(lengths.numel(), device=device),
         lengths,
         output_size=num_tokens,
     )
-    requests = compression_inputs["request_slots"][token_requests].to(torch.int32)
+    requests = plan.request_slots[token_requests].to(torch.int32)
     positions = (
         starts[token_requests]
         + torch.arange(num_tokens, device=device)
@@ -332,7 +349,7 @@ def _prefill_query_layout(compression_inputs: dict):
     return requests, torch.where(requests != 0, positions, 0)
 
 
-class Step5AttentionBackend(AttentionBackend):
+class Step5AttnBackend(AttentionBackend):
     plans_padded_extend_rows = True
 
     def __init__(
@@ -363,6 +380,7 @@ class Step5AttentionBackend(AttentionBackend):
         # Metadata storage only. CUDA graph objects belong to the public runner.
         self._cuda_graph_metadata: dict[int, Step5IndexerMetadata] = {}
         self._graph_valid_rows: torch.Tensor | None = None
+        self._graph_workspace: Step5SelectionWorkspace | None = None
         self.forward_metadata: Step5IndexerMetadata | None = None
 
     def window_capacity_children(self) -> list:
@@ -392,30 +410,32 @@ class Step5AttentionBackend(AttentionBackend):
     def _build_indexer_metadata(
         self,
         *,
-        compression_inputs: dict,
+        plan: Step5CompressionPlan,
         row_to_req: torch.Tensor,
         positions: torch.Tensor,
         score_width: int,
+        selection_workspace: Step5SelectionWorkspace | None = None,
     ) -> Step5IndexerMetadata:
         req_to_token = self.req_to_token_pool.req_to_token
-        request_slots = compression_inputs["request_slots"]
-        return Step5IndexerMetadata(
-            layer_states=self.indexer_states,
-            req_to_token=req_to_token,
-            **compression_inputs,
-            query_request_slots=row_to_req,
-            query_positions=positions,
-            score_width=score_width,
-            selection_workspace=_allocate_selection_workspace(
+        if selection_workspace is None:
+            selection_workspace = _allocate_selection_workspace(
                 rows=positions.numel(),
                 score_width=score_width,
-                device=request_slots.device,
+                device=plan.request_slots.device,
                 max_score_width=req_to_token.shape[1] // STEP5_COMPRESSION_RATIO,
                 row_to_req=row_to_req,
                 positions=positions,
-            ),
-            compression_enabled=torch.empty_like(request_slots, dtype=torch.bool),
-            compression_success=torch.empty_like(request_slots, dtype=torch.bool),
+            )
+        return Step5IndexerMetadata(
+            layer_states=self.indexer_states,
+            req_to_token=req_to_token,
+            compression=plan,
+            query_request_slots=row_to_req,
+            query_positions=positions,
+            score_width=score_width,
+            selection_workspace=selection_workspace,
+            compression_enabled=torch.empty_like(plan.request_slots, dtype=torch.bool),
+            compression_success=torch.empty_like(plan.request_slots, dtype=torch.bool),
         )
 
     def _build_prefill_metadata(self, fb: ForwardBatch) -> Step5IndexerMetadata:
@@ -424,20 +444,20 @@ class Step5AttentionBackend(AttentionBackend):
         slots = fb.req_pool_indices
         if len(lengths) > fb.batch_size:
             slots = torch.cat((slots, slots.new_zeros(1)))
-        compression_inputs = _build_prefill_compression_inputs(
+        plan = _build_prefill_compression_plan(
             request_slots=slots,
             prefix_lengths=prefixes,
             append_lengths=lengths,
             req_to_token=req_to_token,
             compressed_index_key_pages=self.full_num_pages,
         )
-        requests, positions = _prefill_query_layout(compression_inputs)
+        requests, positions = _prefill_query_layout(plan)
         score_width = max(
             1,
             _num_blocks(max((p + n for p, n in zip(prefixes, lengths)), default=0)),
         )
         return self._build_indexer_metadata(
-            compression_inputs=compression_inputs,
+            plan=plan,
             row_to_req=requests,
             positions=positions,
             score_width=score_width,
@@ -459,23 +479,35 @@ class Step5AttentionBackend(AttentionBackend):
         return self._build_decode_metadata(fb, valid_rows=valid_rows)
 
     def _build_decode_metadata(
-        self, fb: ForwardBatch, *, valid_rows: torch.Tensor
+        self,
+        fb: ForwardBatch,
+        *,
+        valid_rows: torch.Tensor,
+        graph_workspace: Step5SelectionWorkspace | None = None,
     ) -> Step5IndexerMetadata:
-        compression_inputs, row_to_req, positions = (
-            step5_dsa_build_compression_metadata(
-                request_slots=fb.req_pool_indices,
-                positions=fb.positions,
-                valid_rows=valid_rows,
-                req_to_token=self.req_to_token_pool.req_to_token,
-                compressed_index_key_pages=self.full_num_pages,
-                context_len=self.context_len,
-            )
+        plan, row_to_req, positions = step5_dsa_build_compression_metadata(
+            request_slots=fb.req_pool_indices,
+            positions=fb.positions,
+            valid_rows=valid_rows,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            compressed_index_key_pages=self.full_num_pages,
+            context_len=self.context_len,
         )
         return self._build_indexer_metadata(
-            compression_inputs=compression_inputs,
+            plan=plan,
             row_to_req=row_to_req,
             positions=positions,
             score_width=_num_blocks(self.context_len),
+            selection_workspace=(
+                None
+                if graph_workspace is None
+                else _slice_selection_workspace(
+                    graph_workspace,
+                    rows=positions.numel(),
+                    row_to_req=row_to_req,
+                    positions=positions,
+                )
+            ),
         )
 
     def init_forward_metadata_out_graph(
@@ -496,7 +528,9 @@ class Step5AttentionBackend(AttentionBackend):
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         self.forward_metadata = self._build_decode_metadata(
-            forward_batch, valid_rows=self._graph_valid_rows
+            forward_batch,
+            valid_rows=self._graph_valid_rows,
+            graph_workspace=self._graph_workspace,
         )
         self._cuda_graph_metadata[forward_batch.batch_size] = self.forward_metadata
         self.swa_backend.init_forward_metadata_in_graph(forward_batch)
@@ -512,6 +546,18 @@ class Step5AttentionBackend(AttentionBackend):
         self.forward_metadata = None
         self._graph_valid_rows = torch.zeros(
             1, dtype=torch.int32, device=req_to_token.device
+        )
+        self._graph_workspace = _allocate_selection_workspace(
+            rows=max_bs,
+            score_width=_num_blocks(self.context_len),
+            max_score_width=req_to_token.shape[1] // STEP5_COMPRESSION_RATIO,
+            row_to_req=torch.zeros(
+                max_bs, dtype=torch.int32, device=req_to_token.device
+            ),
+            positions=torch.zeros(
+                max_bs, dtype=torch.int32, device=req_to_token.device
+            ),
+            device=req_to_token.device,
         )
         self.swa_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
@@ -562,7 +608,7 @@ class Step5AttentionBackend(AttentionBackend):
             forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and forward_batch.dp_padding_mode is not None
         ):
-            # SWA writes only the real rows; keep the DP-padded tail finite
+            # SWA writes only the real rows; keep the padded tail finite
             # before residuals and subsequent KV writes.
             real_tokens = forward_batch._original_num_tokens
             if real_tokens is not None and real_tokens < output.shape[0]:
