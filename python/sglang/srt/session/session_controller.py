@@ -96,7 +96,9 @@ class Session:
         new input. Returns (input_ids, input_ids_unpadded, carry_fill);
         carry_fill (== the new origin) spares the first fill_ids rebuild.
         """
-        out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+        out_tail = last_req.output_ids_through_stop[
+            : last_req.sampling_params.max_new_tokens
+        ]
 
         input_ids = last_req.origin_input_ids
         del input_ids[self.committed_origin_len :]
@@ -136,7 +138,9 @@ class Session:
         last_req: Req, req: TokenizedGenerateReqInput, session_params
     ):
         """Copy-based assembly for non-streaming turns."""
-        out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+        out_tail = last_req.output_ids_through_stop[
+            : last_req.sampling_params.max_new_tokens
+        ]
 
         input_ids = last_req.origin_input_ids + out_tail
         if session_params.drop_previous_output:
