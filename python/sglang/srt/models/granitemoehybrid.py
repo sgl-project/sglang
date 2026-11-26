@@ -24,6 +24,9 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
@@ -38,7 +41,11 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel
 
-from .granitemoe import GraniteMoeMoE, GraniteMoeSharedMLP
+from .granitemoe import (
+    GraniteMoeMoE,
+    GraniteMoeSharedMLP,
+    granitemoe_load_split_experts,
+)
 
 
 def _has_moe(config: GraniteMoeHybridConfig) -> bool:
@@ -183,7 +190,6 @@ class GraniteMoeHybridAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.causal = True
         self.hidden_size = config.hidden_size
         self.attention_bias = config.attention_bias
         self.attention_multiplier = config.attention_multiplier
@@ -475,10 +481,6 @@ class GraniteMoeHybridForCausalLM(
         "in_proj": ["in_proj"],
         "input_linear": ["input_linear"],
     }
-    embedding_modules = {
-        "embed_tokens": "input_embeddings",
-        "lm_head": "output_embeddings",
-    }
 
     def __init__(
         self,
@@ -617,42 +619,18 @@ class GraniteMoeHybridForCausalLM(
             weight_loader(param, p, name, shard_id=shard_id, expert_id=expert_id)
             loaded_params.add(n)
 
-        def _load_quant_expert(name, loaded_weight):
-            for mapping in expert_params_mapping:
-                param_name, weight_name, expert_id, shard_id = mapping
-
-                if weight_name not in name:
-                    continue
-
-                name_mapped = name.replace(weight_name, param_name)
-
-                # Skip layers on other devices.
-                # if is_pp_missing_parameter(name_mapped, self):
-                #     continue
-
-                param = params_dict[name_mapped]
-                weight_loader = param.weight_loader
-                success = False
-
-                if weight_loader is not None:
-                    success = weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-
-                if success:
-                    return name_mapped
-            return None
+        # llmcompressor checkpoints store one tensor per expert and projection.
+        weights = granitemoe_load_split_experts(
+            weights,
+            expert_params_mapping=expert_params_mapping,
+            params_dict=params_dict,
+        )
 
         for n, p in weights:
             if "A_log" in n:
                 n = n.replace("A_log", "A")
 
-            if self.quant_config is not None and (
+            if isinstance(self.quant_config, CompressedTensorsConfig) and (
                 scale_name := self.quant_config.get_cache_scale(n)
             ):
                 # Loading kv cache quantization scales
@@ -662,9 +640,6 @@ class GraniteMoeHybridForCausalLM(
                 )
                 _load(scale_name, loaded_weight)
                 loaded_params.add(scale_name)
-                continue
-
-            if _load_quant_expert(n, p):
                 continue
 
             # Logic analogous to: https://github.com/vllm-project/vllm/blob/f49e5aff11c986ed4d45202b1716c5d74786efa9/vllm/model_executor/models/granitemoeshared.py#L215

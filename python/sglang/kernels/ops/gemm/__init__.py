@@ -423,6 +423,35 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.sm12x_bf16_gemv",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.gemm.sm12x_bf16_gemv:b12x_bf16_gemv",
+        capabilities=_SM12X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm12x_bf16_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.sm12x_bf16_gemv:sm12x_bf16_gemv",
+        capabilities=_SM12X,
+    )
+)
+for _name, _backend in (
+    ("nvfp4_expert_matmul", KernelBackend.FLASHINFER),
+    ("mxfp8_expert_matmul", KernelBackend.FLASHINFER),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.inkling2_{_name}_sm120",
+            backend=_backend,
+            target=f"sglang.kernels.ops.gemm.inkling2_grouped_sm120:{_name}",
+            capabilities=_SM12X,
+        )
+    )
+del _name, _backend
+register_kernel(
+    KernelSpec(
         op="gemm.fp8_blockwise_scaled_mm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.fp8_blockwise_gemm:fp8_blockwise_scaled_mm",
