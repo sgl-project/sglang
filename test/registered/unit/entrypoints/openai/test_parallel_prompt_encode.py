@@ -965,6 +965,28 @@ class TestRenderedPrompt(_EncodeCase):
                 ppe.encode_rendered_prompt(self.tokenizer, f"<|user|>turn {i}")
         self.assertEqual(whole.call_count, ppe._RENDERED_PROMPT_CHECKS)
 
+    def test_prompts_the_split_does_not_serve_are_not_counted_as_checks(self):
+        """A prompt that falls back to the whole encode (here it asks for the
+        BOS the post-processor adds) must not use up the checks, or the first
+        prompts that are split would return their ids unchecked."""
+        tokenizer = _tokenizer(_post_processor_adds_bos)
+        # The plan refuses a tokenizer whose encode is patched: build it first.
+        self.assertIsNotNone(ppe._segment_encoder_for(tokenizer))
+        with unittest.mock.patch.object(
+            tokenizer, "encode", wraps=tokenizer.encode
+        ) as whole:
+            for i in range(ppe._RENDERED_PROMPT_CHECKS):
+                ppe.encode_rendered_prompt(
+                    tokenizer, f"<|user|>turn {i}", {"add_special_tokens": True}
+                )
+            whole.reset_mock()
+            text = "<|user|>split<|assistant|>"
+            ids = ppe.encode_rendered_prompt(
+                tokenizer, text, {"add_special_tokens": False}
+            )
+        whole.assert_called_once_with(text, add_special_tokens=False)
+        self.assertEqual(ids, tokenizer.encode(text, add_special_tokens=False))
+
     def test_a_mismatch_switches_the_tokenizer_to_the_whole_encode(self):
         text = "<|user|>hello world<|assistant|>"
         expected = self.tokenizer.encode(text)

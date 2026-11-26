@@ -495,16 +495,14 @@ def _segment_encoder_for(tokenizer):
     return encoder
 
 
-def encode_prompt_segments(tokenizer, segments, encode_kwargs=None, cache_salt=None):
-    """Drop-in for ``parallel_prompt_encode(tokenizer, "".join(segments),
-    encode_kwargs)``. Cached ids are shared only between requests with the same
-    ``cache_salt``."""
-    encode_kwargs = encode_kwargs or {}
-    encoder = None
-    if envs.SGLANG_PARALLEL_PROMPT_ENCODE.get() and not (
+def _usable_segment_encoder(tokenizer, encode_kwargs):
+    """The tokenizer's segment encoder, or None where its ids could differ from
+    ``tokenizer.encode(text, **encode_kwargs)``."""
+    if not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get() or (
         set(encode_kwargs) - {"add_special_tokens"}
     ):
-        encoder = _segment_encoder_for(tokenizer)
+        return None
+    encoder = _segment_encoder_for(tokenizer)
     if (
         encoder is None
         or (encode_kwargs.get("add_special_tokens", True) and encoder.specials_added)
@@ -513,6 +511,17 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None, cache_salt=N
         or encoder.backend.encode_special_tokens
         or _samples_merges(encoder.backend)
     ):
+        return None
+    return encoder
+
+
+def encode_prompt_segments(tokenizer, segments, encode_kwargs=None, cache_salt=None):
+    """Drop-in for ``parallel_prompt_encode(tokenizer, "".join(segments),
+    encode_kwargs)``. Cached ids are shared only between requests with the same
+    ``cache_salt``."""
+    encode_kwargs = encode_kwargs or {}
+    encoder = _usable_segment_encoder(tokenizer, encode_kwargs)
+    if encoder is None:
         return parallel_prompt_encode(tokenizer, "".join(segments), encode_kwargs)
     return encoder.encode(segments, cache_salt)
 
@@ -562,18 +571,19 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
     checks still running finish, so no split ids are returned while a check
     that could still fail is in flight."""
     encode_kwargs = encode_kwargs or {}
-    plan = None
+    encoder = None
     if (
-        envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
-        and isinstance(text, str)
+        isinstance(text, str)
         and len(text) >= envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
         and not _rendered_split_failed(tokenizer)
     ):
-        plan = _plan_for(tokenizer)
-    if plan is None or plan[2] is None or _samples_merges(plan[0]):
+        encoder = _usable_segment_encoder(tokenizer, encode_kwargs)
+    # Only prompts the segment encoder serves are checked: a fallback compared
+    # with the whole encode would count as a pass without testing the split.
+    if encoder is None or encoder.pattern is None:
         return parallel_prompt_encode(tokenizer, text, encode_kwargs)
     segments, pos = [], 0
-    for m in plan[2].finditer(text):
+    for m in encoder.pattern.finditer(text):
         segments.append(text[pos : m.start()])
         segments.append(m.group())
         pos = m.end()
