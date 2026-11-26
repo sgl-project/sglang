@@ -83,11 +83,7 @@ DEEPSWE_EVAL_IMAGE = (
 DEEPSWE_DIND_IMAGE = "docker:dind"
 # The dind daemon cannot reach Docker Hub directly, so give it docker.io
 # registry mirrors (tried in order).
-DEEPSWE_DIND_REGISTRY_MIRRORS = (
-    "https://swr.cn-southwest-2.myhuaweicloud.com",
-    "https://docker.mirrors.ustc.edu.cn",
-    "https://mirror.ccs.tencentyun.com",
-)
+DEEPSWE_DIND_REGISTRY_MIRRORS = ("https://docker.m.daocloud.io",)
 DEEPSWE_EVAL_NODE_ARCH = os.environ.get("DEEPSWE_EVAL_NODE_ARCH") or "amd64"
 # Time to get the pod scheduled and the eval container up (image pulls, node
 # availability) versus the wall-clock budget of the evaluation itself.
@@ -720,6 +716,7 @@ def run_evalscope_on_x86_pod(
         f"Creating DeepSWE eval pod {pod_name} on "
         f"kubernetes.io/arch={DEEPSWE_EVAL_NODE_ARCH}, "
         f"image={DEEPSWE_EVAL_IMAGE}, dind={DEEPSWE_DIND_IMAGE}, "
+        f"dind_mirrors={list(DEEPSWE_DIND_REGISTRY_MIRRORS)}, "
         f"datasets={datasets}, limit={limit}, timeout={timeout}s, "
         f"api_url={env_vars['DEEPSWE_API_URL']}, metrics_dir={metrics_dir}"
     )
