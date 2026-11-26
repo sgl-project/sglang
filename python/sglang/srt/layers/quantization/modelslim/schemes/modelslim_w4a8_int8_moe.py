@@ -74,7 +74,8 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         else:  # w2
             out_features = hidden_size // 2
             in_features = intermediate_size_per_partition
-            bias_last_dim = 16 // self.tp_size
+            # The channel loader copies all segments; _update_bias selects the TP shard.
+            bias_last_dim = 16
 
         prefix = self.weight_prefix
 
@@ -129,8 +130,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             layer.register_parameter(f"{prefix}_weight_offset_second", offset_second)
             set_weight_attrs(offset_second, extra_weight_attrs)
 
-        # ---- bias for scale (activation clip path) ----
-        # This parameter is always created; the kernel uses it only when activation_use_clip is True.
+        # ---- activation-shift compensation ----
         scale_bias = torch.nn.Parameter(
             torch.empty(
                 num_experts, 2 * out_features, bias_last_dim, dtype=torch.float32

@@ -396,6 +396,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_unified_cache_external_linker = False
         scheduler.draft_worker = None
         scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+        object.__setattr__(scheduler.request_receiver, "input_blocker", None)
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,

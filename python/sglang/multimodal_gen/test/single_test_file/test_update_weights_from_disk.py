@@ -128,7 +128,6 @@ import threading
 from collections.abc import Callable
 
 import pytest
-import requests
 from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -151,6 +150,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     is_in_ci,
 )
+from sglang.test.test_utils import admin_post
 
 logger = init_logger(__name__)
 
@@ -302,7 +302,7 @@ class _UpdateWeightsApiMixin:
         payload = {"model_path": model_path, "flush_cache": flush_cache}
         if target_modules is not None:
             payload["target_modules"] = target_modules
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/update_weights_from_disk",
             json=payload,
             timeout=timeout,
@@ -318,7 +318,7 @@ class _UpdateWeightsApiMixin:
         payload = {}
         if module_names is not None:
             payload["module_names"] = module_names
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/get_weights_checksum",
             json=payload,
             timeout=timeout,
@@ -494,7 +494,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         assert status_code == 400, f"Expected 400, got {status_code}"
         assert not result.get("success", True), "Should fail for nonexistent model"
 
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/update_weights_from_disk",
             json={},
             timeout=30,

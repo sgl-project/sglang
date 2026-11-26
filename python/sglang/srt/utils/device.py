@@ -1225,6 +1225,8 @@ def get_device_core_count(device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).multi_processor_count
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_properties(device_id).gpu_eu_count
+    elif is_mlu():
+        return torch.mlu.get_device_properties(device_id).multi_processor_count
 
     return 0
 
