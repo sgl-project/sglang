@@ -87,11 +87,8 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable release yet, so the following
-commands use the validated build tags `cann9.1.0-a3-B105` (A3 Series) and `cann9.1.0-950-B105` (950PR/DT Series).
+Both **stable releases** and **daily builds** are available.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
-
-{/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tags below to the stable release once it is published. */}
 
 The commands require
 [Ascend Docker Runtime](/docs/hardware-platforms/ascend-npus/getting-started/installation#install-ascend-docker-runtime)
@@ -101,9 +98,18 @@ on the host; each selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
   <Tab title="A3 Series">
 
 ```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
+# ============================================================
+# Before running, update the following variables or use default values:
+#   NAME: container name
+# ============================================================
 
-docker run -itd --shm-size=16g --name ${NAME} \
+NAME=sglang-deepseek-v4-flash
+
+# pull image
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+
+# create container
+docker run -itd --shm-size=16g --name "$NAME" \
 --privileged=true --net=host \
 -e ASCEND_VISIBLE_DEVICES=0-15 \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -111,16 +117,28 @@ docker run -itd --shm-size=16g --name ${NAME} \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+
+# enter container
+docker exec -it "$NAME" bash
 ```
 
   </Tab>
   <Tab title="950PR/DT Series">
 
 ```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B105
+# ============================================================
+# Before running, update the following variables or use default values:
+#   NAME: container name
+# ============================================================
 
-docker run -itd --shm-size=16g --name ${NAME} \
+NAME=sglang-deepseek-v4-flash
+
+# pull image
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050
+
+# create container
+docker run -itd --shm-size=16g --name "$NAME" \
 --privileged=true --net=host \
 -e ASCEND_VISIBLE_DEVICES=0-7 \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -128,7 +146,10 @@ docker run -itd --shm-size=16g --name ${NAME} \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B105
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050
+
+# enter container
+docker exec -it "$NAME" bash
 ```
 
   </Tab>
@@ -137,7 +158,6 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
   container, for example: `-v /path/to/models:/models`.
-- Replace `${NAME}` with your own container name or remove `--name` to use default name.
 </Tip>
 
 ## Online service deployment

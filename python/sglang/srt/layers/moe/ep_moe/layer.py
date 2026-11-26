@@ -46,7 +46,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, is_sail
+from sglang.srt.utils import is_hip, is_npu, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
