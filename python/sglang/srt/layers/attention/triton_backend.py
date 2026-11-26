@@ -257,6 +257,7 @@ class TritonAttnBackend(AttentionBackend):
         if _is_hip:
             _hip.init_m31_draft(self, model_runner.model_config.hf_config)
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
@@ -362,7 +363,7 @@ class TritonAttnBackend(AttentionBackend):
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,
                 self.device_core_count,
-                self.req_to_token_pool.row_width,
+                self.max_kv_len,
             )
             if _is_gfx942:
                 # gfx942's 304 CUs round up to 512 splits, doubling the persistent
@@ -399,7 +400,7 @@ class TritonAttnBackend(AttentionBackend):
 
         if self.split_tile_size is not None:
             self.max_kv_splits = (
-                self.req_to_token_pool.row_width + self.split_tile_size - 1
+                self.max_kv_len + self.split_tile_size - 1
             ) // self.split_tile_size
 
         assert not (
@@ -1069,7 +1070,7 @@ class TritonAttnBackend(AttentionBackend):
                     # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
                     seq_lens_sum = forward_batch.seq_lens_sum
                     if seq_lens_sum is None:
-                        seq_lens_sum = bs * self.req_to_token_pool.row_width
+                        seq_lens_sum = bs * self.max_kv_len
                     kv_indices = torch.empty(
                         seq_lens_sum, dtype=torch.int64, device=self.device
                     )
@@ -1161,7 +1162,7 @@ class TritonAttnBackend(AttentionBackend):
             # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:
-                seq_lens_sum = bs * self.req_to_token_pool.row_width
+                seq_lens_sum = bs * self.max_kv_len
             kv_indices = (
                 None
                 if self.verify_reads_window_kv_only
@@ -1208,7 +1209,7 @@ class TritonAttnBackend(AttentionBackend):
                 if forward_batch.extend_prefix_lens_cpu is not None:
                     kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
                 else:
-                    kv_indices_len = bs * self.req_to_token_pool.row_width
+                    kv_indices_len = bs * self.max_kv_len
                 kv_indices = torch.empty(
                     kv_indices_len,
                     dtype=torch.int64,
@@ -1334,7 +1335,7 @@ class TritonAttnBackend(AttentionBackend):
                 0 if self.mla_dcp_window_verify is not None else max_num_tokens
             )
             self.cuda_graph_kv_indices = torch.zeros(
-                (rail_tokens * self.req_to_token_pool.row_width),
+                (rail_tokens * self.max_kv_len),
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -1347,7 +1348,7 @@ class TritonAttnBackend(AttentionBackend):
             is_draft_runner=self.is_draft_runner,
             skip_prefill=self.skip_prefill,
             max_bs=max_bs,
-            max_context_len=self.req_to_token_pool.row_width,
+            max_context_len=self.max_kv_len,
             num_draft_tokens=self.num_draft_tokens,
             device=self.device,
             is_read=True,
@@ -2724,6 +2725,7 @@ class TritonMultiStepDraftBackend:
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.attn_backends[0].max_kv_len
         self.page_size = get_schedule().page_size
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
             model_runner
@@ -2765,7 +2767,7 @@ class TritonMultiStepDraftBackend:
         if seq_lens_sum is None:
             # seq_lens_sum here only slice-clamps a preallocated kv_indices buffer;
             # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
-            seq_lens_sum = num_seqs * self.req_to_token_pool.row_width
+            seq_lens_sum = num_seqs * self.max_kv_len
 
         src = self.runner_ids.read_source(
             forward_batch.iteration_ids,
@@ -2834,7 +2836,7 @@ class TritonMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
-            forward_batch.batch_size, self.topk, self.req_to_token_pool.row_width
+            forward_batch.batch_size, self.topk, self.max_kv_len
         )
         kv_indices = torch.empty(
             (self.speculative_num_steps, kv_indices_width),
@@ -2879,7 +2881,7 @@ class TritonMultiStepDraftBackend:
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         kv_indices_width = draft_kv_indices_buffer_width(
-            max_bs, self.topk, self.req_to_token_pool.row_width
+            max_bs, self.topk, self.max_kv_len
         )
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),
