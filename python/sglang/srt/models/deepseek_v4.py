@@ -4593,17 +4593,24 @@ class DeepseekV4Model(nn.Module):
                 for child in forward_batch.tbo_children:
                     residual_batch.clear(child)
 
-    def _pp_full_page_ids(self, forward_batch: ForwardBatch) -> torch.Tensor:
+    def _pp_source_page_ids(self, forward_batch: ForwardBatch) -> torch.Tensor:
         req_to_token = get_req_to_token_pool().req_to_token
         page_size = get_token_to_kv_pool().page_size
         pages = [
             req_to_token[
                 forward_batch.req_pool_indices[index],
-                torch.arange(0, int(length), page_size, device=req_to_token.device),
+                torch.arange(
+                    int(prefix) // page_size * page_size,
+                    int(length),
+                    page_size,
+                    device=req_to_token.device,
+                ),
             ]
             // page_size
-            for index, length in enumerate(forward_batch.seq_lens_cpu)
-            if int(length) > 0
+            for index, (prefix, length) in enumerate(
+                zip(forward_batch.extend_prefix_lens_cpu, forward_batch.seq_lens_cpu)
+            )
+            if int(length) > int(prefix)
         ]
         return (
             torch.cat(pages).to(torch.int64)
@@ -4628,7 +4635,7 @@ class DeepseekV4Model(nn.Module):
                 {
                     f"pp_source_{name}": value
                     for name, value in pool.export_source_pages(
-                        source, self._pp_full_page_ids(forward_batch)
+                        source, self._pp_source_page_ids(forward_batch)
                     ).items()
                 }
             )
@@ -4657,7 +4664,7 @@ class DeepseekV4Model(nn.Module):
         if "pp_source_layer" in tensors:
             pool.install_source_pages(
                 tensors["pp_source_layer"],
-                self._pp_full_page_ids(forward_batch),
+                self._pp_source_page_ids(forward_batch),
                 {
                     name.removeprefix("pp_source_"): value
                     for name, value in tensors.items()
