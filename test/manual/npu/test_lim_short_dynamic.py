@@ -94,7 +94,7 @@ def test_prefill_attention_and_short_residency():
         cache_tokens=capacity,
         copy_sfa_query_heads=heads,
     )
-    budget.bind_native_pool(index_pool)
+    budget.bind_index_k_pool(index_pool)
     index_pool.sparse_kv_budget_plan = budget
     manager = None
     with (
@@ -253,7 +253,7 @@ def test_short_sparse_graph_lifecycle(
         copy_sfa_query_heads=heads,
         max_query_width=width,
     )
-    budget.bind_native_pool(index_pool)
+    budget.bind_index_k_pool(index_pool)
     index_pool.sparse_kv_budget_plan = budget
     manager = None
     with (

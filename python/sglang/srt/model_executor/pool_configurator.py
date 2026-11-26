@@ -385,7 +385,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             calculate_mla_kv_cache_dim,
                         )
 
-                        # Charge native MLA KV for the draft layers.
+                        # Charge the full MLA KV for the draft layers.
                         draft_kv_size = (
                             calculate_mla_kv_cache_dim(
                                 model_config=kvc.model_config,
@@ -868,7 +868,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             return get_sparse_kv_budget(
                 **options,
                 pd_available_bytes=pool_bytes,
-                native_kv_bytes_per_token=self._cell_size,
+                index_k_and_draft_bytes_per_token=self._cell_size,
             )
 
         budget = get_sparse_kv_budget(**options)
@@ -877,8 +877,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             token_cap = get_schedule().max_total_tokens
             if token_cap is not None:
                 min_tokens = min(min_tokens, token_cap)
-            native_bytes = ceil_align(min_tokens, page_size) * self._cell_size
-            if budget.managed_hbm_bytes + native_bytes > pool_bytes:
+            index_k_and_draft_bytes = (
+                ceil_align(min_tokens, page_size) * self._cell_size
+            )
+            if budget.managed_hbm_bytes + index_k_and_draft_bytes > pool_bytes:
                 return budget.without_prefill_workspace()
         return budget
 
@@ -901,13 +903,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             SparseKVHBMSizing,
         )
 
-        native_kv_bytes = max_total_num_tokens * self._cell_size
+        index_k_and_draft_bytes = max_total_num_tokens * self._cell_size
         return SparseKVHBMSizing(
             available_bytes=available_bytes,
             planned_bytes=self._fixed_overhead_bytes
             + budget.managed_hbm_bytes
-            + native_kv_bytes,
-            native_kv_bytes=native_kv_bytes,
+            + index_k_and_draft_bytes,
+            index_k_and_draft_bytes=index_k_and_draft_bytes,
             full_context_bytes_per_request=budget.full_context_bytes_per_request(
                 self._cell_size
             ),

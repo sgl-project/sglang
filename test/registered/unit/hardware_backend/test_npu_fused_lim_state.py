@@ -67,7 +67,7 @@ class TestLIMState(CustomTestCase):
         self.assertNotIn("query_scale", large.adapter_buffers)
         self.assertEqual(large.managed_hbm_bytes, small.managed_hbm_bytes)
 
-    def test_native_source_addressing_limit(self):
+    def test_lim_source_addressing_limit(self):
         options = self.options()
         options["context_len"] = 2**21
         self.assertEqual(resolve_sparse_kv_budget(**options).context_len, 2**21)
@@ -140,10 +140,10 @@ class TestLIMState(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "query"):
                 resolve_sparse_kv_budget(**self.options(max_query_width=width))
 
-    def test_pool_sizing_reserves_native_capacity_before_workspace(self):
+    def test_pool_sizing_reserves_token_capacity_before_workspace(self):
         from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 
-        for cap, native_floor, fits in (
+        for cap, min_pool_tokens, fits in (
             (65536, 32768, True),
             (65536, 32768, False),
             (129, 256, True),
@@ -167,7 +167,7 @@ class TestLIMState(CustomTestCase):
             required = (
                 configurator._fixed_overhead_bytes
                 + plan.managed_hbm_bytes
-                + native_floor * configurator._cell_size
+                + min_pool_tokens * configurator._cell_size
             )
             with (
                 patch(
@@ -193,9 +193,9 @@ class TestLIMState(CustomTestCase):
             self.assertEqual(plan.prefill_workspace_tokens, 129)
             self.assertEqual(selected.prefill_workspace_tokens, 129 if fits else 0)
             if fits:
-                self.assertEqual(result.max_total_num_tokens, native_floor)
+                self.assertEqual(result.max_total_num_tokens, min_pool_tokens)
             else:
-                self.assertGreater(result.max_total_num_tokens, native_floor)
+                self.assertGreater(result.max_total_num_tokens, min_pool_tokens)
             # A later configurator uses the shared finalized decision.
             later = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
             later._kvc = configurator._kvc
@@ -338,7 +338,7 @@ class TestLIMState(CustomTestCase):
         pool.sparse_kv_budget_plan = plan
         pool.indexer_layer_ids = (1,)
         pool.get_index_k_buffer = Mock(return_value=pool.get_index_k_buffer(0))
-        plan.bind_native_pool(pool)
+        plan.bind_index_k_pool(pool)
         if compact_pd:
             from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 
@@ -690,7 +690,7 @@ class TestLIMState(CustomTestCase):
 
     def test_host_bytes_are_unavailable_before_physical_pool_binding(self):
         plan = resolve_sparse_kv_budget(**self.options())
-        with self.assertRaisesRegex(RuntimeError, "Bind the native KV pool"):
+        with self.assertRaisesRegex(RuntimeError, "Bind the Indexer K pool"):
             _ = plan.host_kv_bytes
 
     def test_tp_suffix_does_not_extend_actual_query_windows(self):

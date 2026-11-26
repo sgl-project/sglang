@@ -540,8 +540,8 @@ class TestDefaultConfigurator(CustomTestCase):
             self.assertEqual(second_cfg.calculate_pool_sizes(available, 128), sizes)
             self.assertIs(mr.sparse_kv_budget_plan, selected_plan)
 
-        # The compact target indexer and the draft's full native CKV/KPE
-        # plus indexer remain in HBM; native BF16 LIM needs no scale buffer.
+        # The compact target Indexer K and the draft's CKV/KPE and Indexer K
+        # stay in HBM. BF16 LIM uses unscaled keys.
         self.assertEqual(len(owner_ids), 21)
         self.assertEqual(cfg._cell_size, (21 + 1) * 128 * 2 + 576 * 2)
         self.assertEqual(
@@ -1133,8 +1133,8 @@ class TestAllSWAConfigurator(CustomTestCase):
 class TestEagleConfigurator(CustomTestCase):
     """EAGLE: draft KV cache must be accounted for so total allocation fits in budget."""
 
-    def test_sparse_mtp_reserves_target_manager_and_native_draft_kv(self):
-        """Target admission reserves native draft KV without a draft offload manager."""
+    def test_sparse_mtp_reserves_target_manager_and_full_draft_kv(self):
+        """Target admission reserves full draft KV alongside the target offload manager."""
         import torch
 
         from sglang.srt.environ import envs
@@ -1426,8 +1426,8 @@ class TestEagleConfigurator(CustomTestCase):
                 dp_size=attn_dp_size, attn_tp_size=1, attn_dp_size=attn_dp_size
             ),
         ):
-            # Target and draft index-K, plus the draft's native MLA payload.
-            native_bytes_per_token = 5 * 128 * 2 + 576 * 2
+            # Target and draft Indexer K plus the draft's full MLA KV.
+            index_k_and_draft_bytes_per_token = 5 * 128 * 2 + 576 * 2
 
             context_len = (
                 mr.model_config.context_len + get_req_to_token_extra_context_len()
@@ -1437,22 +1437,22 @@ class TestEagleConfigurator(CustomTestCase):
             fixed_slot_map_bytes = 2 * slot_map_bytes_per_request
             request_bytes = (
                 cache_tokens * 4 * 576 * 2
-                + aligned_context_len * native_bytes_per_token
+                + aligned_context_len * index_k_and_draft_bytes_per_token
                 + slot_map_bytes_per_request
             )
 
             # A cap that aligns to one page limits admission independently of residency.
-            native_bs_limit = page_size // 2
+            token_limited_bs = page_size // 2
             for available, cap, resident_bs, bs in (
                 (2 * request_bytes + fixed_slot_map_bytes - 1, None, 1, 1),
                 (2 * request_bytes + fixed_slot_map_bytes, None, 2, 2),
                 (3 * request_bytes + fixed_slot_map_bytes, token_limit, 3, 3),
                 (5 * request_bytes + fixed_slot_map_bytes, None, 4, 4),
                 (
-                    (native_bs_limit + 1) * request_bytes + fixed_slot_map_bytes,
+                    (token_limited_bs + 1) * request_bytes + fixed_slot_map_bytes,
                     page_size + 1,
-                    native_bs_limit + 1,
-                    native_bs_limit,
+                    token_limited_bs + 1,
+                    token_limited_bs,
                 ),
             ):
                 with self.subTest(available=available, cap=cap):
@@ -1478,19 +1478,21 @@ class TestEagleConfigurator(CustomTestCase):
                     plan = mr.sparse_kv_budget_plan
                     tokens = (
                         available - plan.managed_hbm_bytes
-                    ) // native_bytes_per_token
+                    ) // index_k_and_draft_bytes_per_token
                     if cap is not None:
                         tokens = min(tokens, cap)
                     tokens = tokens // page_size * page_size
                     self.assertEqual(sizes.max_total_num_tokens, tokens)
-                    native_bytes = tokens * native_bytes_per_token
-                    planned_bytes = plan.managed_hbm_bytes + native_bytes
+                    index_k_and_draft_bytes = tokens * index_k_and_draft_bytes_per_token
+                    planned_bytes = plan.managed_hbm_bytes + index_k_and_draft_bytes
                     self.assertEqual(
                         sizing.full_context_bytes_per_request, request_bytes
                     )
                     self.assertEqual(sizing.available_bytes, available)
                     self.assertEqual(sizing.planned_bytes, planned_bytes)
-                    self.assertEqual(sizing.native_kv_bytes, native_bytes)
+                    self.assertEqual(
+                        sizing.index_k_and_draft_bytes, index_k_and_draft_bytes
+                    )
                     self.assertEqual(plan.resident_rows, resident_bs + 1)
                     self.assertEqual(plan.request_rows, resident_bs + extra_rows + 1)
                     for name in ("device_k_buffer", "device_v_buffer"):

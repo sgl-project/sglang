@@ -74,8 +74,8 @@ class FusedSparseKVCacheManager:
         # Shared host components use [physical_pages, page_size, head_num, width].
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
 
-        # Radix prefixes use native physical token IDs. Keep host payloads in that
-        # same address space; request slots own only bounded HBM residency maps.
+        # Radix prefixes use physical token IDs from the Indexer K pool.
+        # Host KV shares that address space. C residency is tracked per request.
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
             HostKVPool,
         )

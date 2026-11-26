@@ -151,7 +151,7 @@ def _run_manager_lifecycle(
         copy_sfa_query_heads=heads,
         max_query_width=Q,
     )
-    budget.bind_native_pool(index_pool)
+    budget.bind_index_k_pool(index_pool)
     index_pool.sparse_kv_budget_plan = budget
     inputs = SimpleNamespace(
         batch_size=batch,

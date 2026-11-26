@@ -65,7 +65,7 @@ class TestPDSplitKVPool(CustomTestCase):
             )
             configurator.kv_cache_dtype = torch.bfloat16
             configurator.device = "cpu"
-            configurator.server_args = SimpleNamespace(indexer_kv_cache_dtype="auto")
+            configurator.server_args = SimpleNamespace(indexer_kv_cache_dtype=None)
             configurator.spec_algorithm = SimpleNamespace(is_dspark=lambda: False)
             configurator.modelslim_cache_layout = None
             with (
@@ -145,7 +145,7 @@ class TestPDSplitKVPool(CustomTestCase):
         api = ModuleType(
             "sgl_kernel_npu.operators.attention.fused_scatter_copy_sparse_flash_attention_split"
         )
-        for fused, mode, draft, native in (
+        for fused, mode, draft, keeps_full_kv in (
             (True, "decode", False, False),
             (True, "null", False, False),
             (True, "prefill", False, True),
@@ -178,14 +178,14 @@ class TestPDSplitKVPool(CustomTestCase):
                     index_head_dim=128,
                     is_draft_worker=draft,
                 )
-                self.assertEqual(pool.k_buffer is not None, native)
-                self.assertEqual(pool.v_buffer is not None, native)
+                self.assertEqual(pool.k_buffer is not None, keeps_full_kv)
+                self.assertEqual(pool.v_buffer is not None, keeps_full_kv)
                 if fused and mode == "decode" and not draft:
                     validate.assert_called_once_with(512, 64, 128, torch.bfloat16)
                 else:
                     validate.assert_not_called()
 
-    def test_native_combined_export_uses_upstream_layout(self):
+    def test_full_kv_export_uses_upstream_layout(self):
         pool = _make_pool()
         pool.use_combined_kv_buffer = True
         pool.kv_buffer = torch.zeros(2, 2, 128, 1, 576, dtype=torch.bfloat16)

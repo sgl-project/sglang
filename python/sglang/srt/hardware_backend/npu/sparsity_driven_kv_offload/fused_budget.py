@@ -45,12 +45,12 @@ class SparseKVHBMSizing(msgspec.Struct, frozen=True, kw_only=True):
 
     available_bytes: int
     planned_bytes: int
-    native_kv_bytes: int
+    index_k_and_draft_bytes: int
     full_context_bytes_per_request: int
 
 
 class BudgetPlan:
-    """Persistent buffer geometry and accounting for one native KV pool."""
+    """Persistent sparse KV buffer geometry tied to one Indexer K pool."""
 
     def __init__(
         self,
@@ -183,14 +183,16 @@ class BudgetPlan:
             + self.resident_buffers["last_prefix"].nbytes
         )
 
-    def full_context_bytes_per_request(self, native_kv_bytes_per_token: int) -> int:
+    def full_context_bytes_per_request(
+        self, index_k_and_draft_bytes_per_token: int
+    ) -> int:
         return get_sparse_kv_full_context_bytes_per_request(
             cache_tokens=self.cache_tokens,
             context_len=self.context_len,
             resident_kv_bytes_per_token=(
                 self.num_layers * self.kv_cache_dim * self.kv_dtype.itemsize
             ),
-            native_kv_bytes_per_token=native_kv_bytes_per_token,
+            index_k_and_draft_bytes_per_token=index_k_and_draft_bytes_per_token,
             slot_map_bytes_per_request=_slot_map_row_bytes(
                 self.context_len, self.num_layers
             ),
@@ -198,9 +200,9 @@ class BudgetPlan:
 
     @property
     def host_kv_bytes(self) -> int:
-        """Report the physical Host allocation only after native pool binding."""
+        """Report the physical Host allocation after binding the Indexer K pool."""
         if self.host_kv_spec is None:
-            raise RuntimeError("Bind the native KV pool before reading Host KV bytes.")
+            raise RuntimeError("Bind the Indexer K pool before reading Host KV bytes.")
         return self.host_kv_spec.nbytes
 
     def without_prefill_workspace(self) -> BudgetPlan:
@@ -215,24 +217,28 @@ class BudgetPlan:
         result.prefill_workspace_bytes = 0
         return result
 
-    def bind_native_pool(self, pool) -> BudgetPlan:
-        """Bind the physical layout once after native pool creation."""
+    def bind_index_k_pool(self, index_k_pool) -> BudgetPlan:
+        """Bind the Host KV layout to the physical Indexer K pool."""
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
             MLA_KV_HEAD_NUM,
         )
 
-        indexer_layer_ids = getattr(pool, "indexer_layer_ids", (pool.start_layer,))
+        indexer_layer_ids = getattr(
+            index_k_pool, "indexer_layer_ids", (index_k_pool.start_layer,)
+        )
         if not indexer_layer_ids:
             raise ValueError("Native LIM requires at least one indexer K layer.")
-        key = pool.get_index_k_buffer(indexer_layer_ids[0])
+        key = index_k_pool.get_index_k_buffer(indexer_layer_ids[0])
         if (
             key.dtype != torch.bfloat16
             or key.ndim != 4
             or tuple(key.shape[1:]) != (self.page_size, 1, self.index_head_dim)
         ):
-            raise ValueError("Native index keys do not match the model budget plan.")
+            raise ValueError(
+                "Indexer K pool layout does not match the model budget plan."
+            )
         # get_index_k_buffer returns one layer: [pages, page_size, 1, head_dim].
-        # Its pages already include the native allocator's dummy page.
+        # Its pages already include the Indexer K allocator's dummy page.
         host_token_capacity = key.shape[0] * self.page_size
         self.host_token_capacity = host_token_capacity
         self.host_kv_spec = BufferSpec(
@@ -321,13 +327,13 @@ def get_sparse_kv_full_context_bytes_per_request(
     cache_tokens: int,
     context_len: int,
     resident_kv_bytes_per_token: int,
-    native_kv_bytes_per_token: int,
+    index_k_and_draft_bytes_per_token: int,
     slot_map_bytes_per_request: int,
 ) -> int:
-    """Estimate one request's resident KV, native context, and slot map."""
+    """Estimate resident KV, full-context Indexer K and draft KV, and the slot map."""
     return (
         cache_tokens * resident_kv_bytes_per_token
-        + context_len * native_kv_bytes_per_token
+        + context_len * index_k_and_draft_bytes_per_token
         + slot_map_bytes_per_request
     )
 
@@ -340,7 +346,7 @@ def fit_pd_sparse_running_requests(
     context_len: int,
     num_layers: int,
     kv_bytes_per_token: int,
-    native_kv_bytes_per_token: int,
+    index_k_and_draft_bytes_per_token: int,
 ) -> int:
     """Return the P/D Decode concurrency that fits the full-context budget."""
     slot_map_bytes_per_request = _slot_map_row_bytes(context_len, num_layers)
@@ -348,7 +354,7 @@ def fit_pd_sparse_running_requests(
         cache_tokens=cache_tokens,
         context_len=context_len,
         resident_kv_bytes_per_token=num_layers * kv_bytes_per_token,
-        native_kv_bytes_per_token=native_kv_bytes_per_token,
+        index_k_and_draft_bytes_per_token=index_k_and_draft_bytes_per_token,
         slot_map_bytes_per_request=slot_map_bytes_per_request,
     )
     # The map includes the dummy resident row and one additional row.

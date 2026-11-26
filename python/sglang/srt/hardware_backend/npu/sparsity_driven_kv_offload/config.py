@@ -84,7 +84,7 @@ def is_fused_sparse_kv_offload_enabled(
     is_draft_worker: bool = False,
 ) -> bool:
     """Return whether this worker uses fused LIM and Copy-SFA offload."""
-    # Draft attention keeps its native KV pool even when it inherits the flags.
+    # Draft attention keeps its full KV pool even when it inherits the flags.
     if not use_fused_sparse_kv_offload() or is_draft_worker:
         return False
     if not is_sparsity_driven_kv_offload_enabled(
@@ -95,7 +95,7 @@ def is_fused_sparse_kv_offload_enabled(
 
     disagg = get_disagg()
     if disagg.disaggregation_mode == "prefill":
-        # Prefill publishes native KV pages; fused offload belongs to decode.
+        # Prefill publishes full KV pages to the decode worker.
         return False
     parallel = get_parallel()
     if parallel.pp_size != 1 or parallel.dcp_enabled:
@@ -255,7 +255,7 @@ def get_sparse_kv_budget(
     resident_rows: Optional[int] = None,
     kv_dtype: torch.dtype = torch.bfloat16,
     pd_available_bytes: int | None = None,
-    native_kv_bytes_per_token: int | None = None,
+    index_k_and_draft_bytes_per_token: int | None = None,
 ) -> BudgetPlan:
     resident_rows = request_rows if resident_rows is None else resident_rows
     schedule = get_schedule()
@@ -270,8 +270,10 @@ def get_sparse_kv_budget(
     )
     prefill_rows = 0
     if pd_available_bytes is not None:
-        if native_kv_bytes_per_token is None:
-            raise ValueError("P/D sparse KV sizing requires native KV bytes per token.")
+        if index_k_and_draft_bytes_per_token is None:
+            raise ValueError(
+                "P/D sparse KV sizing requires per-token bytes for Indexer K and any draft KV."
+            )
         running_rows = fit_pd_sparse_running_requests(
             resident_rows - 1,
             pd_available_bytes,
@@ -279,7 +281,7 @@ def get_sparse_kv_budget(
             context_len=aligned_context,
             num_layers=num_layers,
             kv_bytes_per_token=kv_bytes_per_token,
-            native_kv_bytes_per_token=native_kv_bytes_per_token,
+            index_k_and_draft_bytes_per_token=index_k_and_draft_bytes_per_token,
         )
         extra_rows = request_rows - resident_rows
         resident_rows = running_rows + 1

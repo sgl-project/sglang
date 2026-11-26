@@ -97,7 +97,7 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         enabled()
 
-    def test_fused_prefill_keeps_native_pool_without_changing_legacy(self):
+    def test_fused_prefill_keeps_full_kv_pool_and_legacy_mode(self):
         from sglang.srt.environ import envs
 
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."

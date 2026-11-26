@@ -955,13 +955,13 @@ class KVCacheConfigurator:
 
         budget = self.sparse_kv_budget_plan
         if budget is not None and not self.is_draft_worker:
-            budget.bind_native_pool(token_to_kv_pool)
+            budget.bind_index_k_pool(token_to_kv_pool)
             token_to_kv_pool.sparse_kv_budget_plan = budget
             if sparse_kv_hbm_sizing is not None:
                 logger.info(
                     "Fused sparse KV pool allocated (per attention DP rank): "
                     "available_hbm_bytes=%d, planned_hbm_bytes=%d, remaining_hbm_bytes=%d, "
-                    "bs=%d, resident_bs=%d, native_kv_bytes=%d, resident_kv_bytes=%d, "
+                    "bs=%d, resident_bs=%d, index_k_and_draft_bytes=%d, resident_kv_bytes=%d, "
                     "indexer_k_tokens=%d, indexer_k_physical_tokens=%d, indexer_k_hbm=%.3f GiB, "
                     "C=%d, context_len=%d, model_context_len=%d, full_context_bytes_per_request=%d",
                     sparse_kv_hbm_sizing.available_bytes,
@@ -970,7 +970,7 @@ class KVCacheConfigurator:
                     - sparse_kv_hbm_sizing.planned_bytes,
                     sizes.max_running_requests,
                     budget.resident_rows - 1,
-                    sparse_kv_hbm_sizing.native_kv_bytes,
+                    sparse_kv_hbm_sizing.index_k_and_draft_bytes,
                     budget.device_kv_bytes,
                     sizes.max_total_num_tokens,
                     budget.host_token_capacity,

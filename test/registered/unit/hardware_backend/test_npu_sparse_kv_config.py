@@ -148,7 +148,7 @@ def test_fused_draft_bypasses_target_validation(monkeypatch):
         )
 
 
-def test_fused_draft_keeps_native_kv_cell_price(monkeypatch):
+def test_fused_draft_keeps_full_kv_cell_size(monkeypatch):
     monkeypatch.setattr(config, "is_npu", lambda: True)
     with (
         envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
