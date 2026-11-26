@@ -399,7 +399,9 @@ from sglang.srt.rust_server.server import (
     drain_notify_name,
 )
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
+from sglang.srt.sampling.sampler_params import SamplerParamsPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -421,7 +423,6 @@ from sglang.srt.utils import (
     disable_transparent_hugepages,
     freeze_gc,
     get_available_gpu_memory,
-    get_bool_env_var,
     get_int_env_var,
     is_cuda,
     is_hip,
@@ -696,6 +697,7 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                cache_controller.forward_on_fence_stream = self.enable_overlap
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -704,6 +706,7 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
         self.init_penalty_status_pool()
+        self.init_sampler_params_pool()
 
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
@@ -876,16 +879,6 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
-        if _is_npu:
-            # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
-            # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
-            from sglang.srt.dllm.config import DllmConfig
-
-            self.dllm_config = (  # For diffusion LLM
-                DllmConfig.from_server_args(self.server_args)
-                if get_exec().dllm.dllm_algorithm is not None
-                else None
-            )
 
     def init_metrics_collector(self) -> None:
         self.metrics_collector_context = SchedulerMetricsCollector.init_new(
@@ -1406,6 +1399,12 @@ class Scheduler(
             device=self.req_to_token_pool.device,
         )
 
+    def init_sampler_params_pool(self) -> None:
+        self.sampler_params_pool = SamplerParamsPool(
+            num_rows=self.req_to_token_pool.req_to_token.shape[0],
+            device=self.req_to_token_pool.device,
+        )
+
     def init_running_status(self):
         self.tp_size = get_parallel().tp_size
         # Set by a runtime PD role switch to break out of the current event loop.
@@ -1649,7 +1648,7 @@ class Scheduler(
         self.recv_skipper = SchedulerRecvSkipper.maybe_create()
         self.input_blocker = (
             SchedulerInputBlocker(noop=get_parallel().attn_tp_rank != 0)
-            if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+            if envs.SGLANG_ENABLE_COLOCATED_BATCH_GEN.get()
             else None
         )
 
@@ -2728,13 +2727,7 @@ class Scheduler(
         return get_serving().tokenizer_path
 
     def _target_model_runner(self) -> "ModelRunner":
-        # Spec workers have no .model_runner of their own.
-        target_worker = (
-            self.tp_worker.target_worker
-            if isinstance(self.tp_worker, BaseSpecWorker)
-            else self.tp_worker
-        )
-        return target_worker.model_runner
+        return self.tp_worker.model_runner
 
     def maybe_init_uocr_runtime(self) -> None:
         """Initialize Unlimited-OCR v2 split-document KV reuse and prefetch."""
@@ -2771,7 +2764,6 @@ class Scheduler(
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
-            server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
             request_retirer=self.request_retirer,
@@ -2782,15 +2774,8 @@ class Scheduler(
         )
 
     def init_dp_attn_adapter(self) -> None:
-        # Spec workers have no .model_runner of their own; the prefill graph
-        # runner that votes belongs to the target model.
-        target_worker = (
-            self.tp_worker.target_worker
-            if isinstance(self.tp_worker, BaseSpecWorker)
-            else self.tp_worker
-        )
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
-            model_runner=target_worker.model_runner,
+            model_runner=self.tp_worker.model_runner,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
@@ -2938,7 +2923,6 @@ class Scheduler(
             global_tokens = from_cp_sharded(global_tokens)
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
-            server_args=self.server_args,
             # The worker reports logical DCP capacity; add KV shard widening.
             max_total_num_tokens=global_tokens,
             max_running_requests=self.max_running_requests,
@@ -3115,12 +3099,17 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
+        # max_req_len is the largest number of tokens that can be forwarded for
+        # one request. The last generated token is sampled but never forwarded,
+        # so a request may generate max_req_len - input_len + 1 tokens.
+        context_max_new_tokens = self.max_req_len - input_len + 1
+
         # Keep this bound consistent with PrefillAdder's admission budget.
         max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                context_max_new_tokens,
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
@@ -3465,6 +3454,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
                 token_indices_to_pool=recv_req.token_indices_to_pool,
+                filler_seed=recv_req.filler_seed,
             )
             req.tokenizer = self.tokenizer
 
@@ -3538,6 +3528,7 @@ class Scheduler(
                 recv_req.sampling_params,
                 vocab_size=self.model_config.token_id_vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                filler_seed=recv_req.filler_seed,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
@@ -4354,8 +4345,8 @@ class Scheduler(
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
 
-        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            batch, self.model_config.vocab_size
+        batch.sampling_info = SamplingBatchInfo(
+            vocab_size=self.model_config.vocab_size, device=batch.device
         )
         # todo hisparse, maybe other info to contain for the new batch
         return batch
@@ -5035,6 +5026,7 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        self.sampler_params_pool.write(new_batch.reqs)
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)
 
@@ -5476,9 +5468,22 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            # A beam tail's member rows follow the requests' rows; they take no params.
+            num_reqs = len(batch.reqs)
+            batch.sampling_info.set_sampler_params(
+                self.sampler_params_pool.gather(
+                    batch.req_pool_indices[:num_reqs],
+                    batch.req_pool_indices_cpu[:num_reqs],
+                )
+            )
             batch.sampling_info.step_penalties = StepPenalties.build(
                 batch.reqs, self.penalty_status_pool
             )
+            batch.sampling_info.watermark = build_watermark_rows(
+                batch.reqs, batch.device
+            )
+            batch.sampling_info.set_plugin_state(batch.reqs)
+            batch.sampling_info.set_seeds_and_mask_rows(batch.reqs)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -5925,9 +5930,8 @@ class Scheduler(
         self._copy_result_to_cpu(batch_result, cur_batch)
 
         # Release the closure and large GPU tensors that are no longer needed.
-        # The delay_sample_func closure captures forward_batch (which holds
-        # sampling_info with vocab_mask) and logits_output (which holds
-        # next_token_logits). Without clearing these, they stay alive via
+        # The delay_sample_func closure captures forward_batch and logits_output
+        # (which holds next_token_logits). Without clearing these, they stay alive via
         # batch_result in result_queue and batch_record_buf until the next
         # iteration, causing a steady VRAM leak with structured output.
         batch_result.delay_sample_func = None
@@ -6810,10 +6814,10 @@ class Scheduler(
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
             before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
             after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
             logger.info(
-                f"[continue_generation] torch.cuda.empty_cache() called: "
+                f"[continue_generation] empty_cache() called: "
                 f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )

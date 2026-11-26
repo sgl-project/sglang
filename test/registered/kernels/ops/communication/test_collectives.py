@@ -348,6 +348,6 @@ if __name__ == "__main__":
     multigpu_pytest_main(
         __name__,
         __file__,
-        num_gpus=(4, 8),
+        num_gpus=(2, 4, 8),
         pre_launch_fn=_precompile,
     )
