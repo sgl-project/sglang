@@ -255,9 +255,8 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
             server_args=SimpleNamespace(speculative_attention_mode=spec_mode),
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,
-            req_to_token_pool=None,
+            req_to_token_pool=SimpleNamespace(max_context_len=2048),
             runner_ids=None,
-            model_config=SimpleNamespace(context_len=2048),
         )
         # The backend takes the mode from the published configuration, not from
         # the runner it is handed.

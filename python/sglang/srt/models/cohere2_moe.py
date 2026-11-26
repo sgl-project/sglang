@@ -33,19 +33,9 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.commandr import layer_norm_func
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import get_compiler_backend, is_cuda
-
-
-@torch.compile(backend=get_compiler_backend())
-def _cohere_layer_norm(hidden_states, weight, variance_epsilon):
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-    mean = hidden_states.mean(-1, keepdim=True)
-    variance = (hidden_states - mean).pow(2).mean(-1, keepdim=True)
-    hidden_states = (hidden_states - mean) * torch.rsqrt(variance + variance_epsilon)
-    hidden_states = weight.to(torch.float32) * hidden_states
-    return hidden_states.to(input_dtype)
+from sglang.srt.utils import is_cuda
 
 
 class Cohere2MoeLayerNorm(nn.Module):
@@ -57,7 +47,7 @@ class Cohere2MoeLayerNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        return _cohere_layer_norm(hidden_states, self.weight, self.variance_epsilon)
+        return layer_norm_func(hidden_states, self.weight, self.variance_epsilon)
 
 
 def cohere2_sigmoid_topk(

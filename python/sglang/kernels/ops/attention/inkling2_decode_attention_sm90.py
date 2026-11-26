@@ -1,11 +1,17 @@
-"""Paged decode attention with a compact relative bias for Hopper: the split-KV
-partials of paged_rel_bias_decode (unnormalized o, max, sum), reduced by
+"""Paged decode attention with a compact relative bias for Hopper and SM120: the
+split-KV partials of paged_rel_bias_decode (unnormalized o, max, sum), reduced by
 combine_gate_sink, for one query per sequence or a causal block of queries per
 sequence (MTP verify). Each split takes an equal share of the sequence's own keys."""
 
 import torch
 import triton
 import triton.language as tl
+
+from sglang.kernels.ops.kvcache.mxfp8_dequant_paged import (
+    MXFP8_PAGE,
+    mxfp8_dequant_rows,
+    mxfp8_scale_words,
+)
 
 MAX_SPLITS = 64
 
@@ -15,6 +21,8 @@ def _decode_partials(
     Q,
     K,
     V,
+    KScale,
+    VScale,
     PageTable,
     SeqLens,
     Bias,
@@ -28,6 +36,8 @@ def _decode_partials(
     SK0: tl.constexpr,
     SK1: tl.constexpr,
     SK2: tl.constexpr,
+    SS0: tl.constexpr,
+    SS1: tl.constexpr,
     SP: tl.constexpr,
     SB0: tl.constexpr,
     SB1: tl.constexpr,
@@ -40,6 +50,7 @@ def _decode_partials(
     EXTENT: tl.constexpr,
     WINDOW: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    MXFP8: tl.constexpr,
 ):
     tl.extra.cuda.gdc_wait()
     tl.extra.cuda.gdc_launch_dependents()
@@ -87,7 +98,11 @@ def _decode_partials(
                 + hk * SK2
                 + d[None, :]
             )
-        k = tl.load(K + kv_offset, valid[:, None], other=0)
+        k = tl.load(K + kv_offset, valid[:, None], other=0.0)
+        if MXFP8:
+            # PAGE is a multiple of BLOCK_N: page is the tile's one page.
+            scale_offset = page * SS0 + hk * SS1
+            k = mxfp8_dequant_rows(k, KScale + scale_offset, slot, valid, D)
         s = tl.dot(q, tl.trans(k)) * scale
         dist = q_pos[:, None] - pos[None, :]
         keep = valid[None, :] & (dist >= 0)
@@ -104,7 +119,9 @@ def _decode_partials(
         alpha = tl.exp2((m - m_ref) * 1.4426950408889634)
         p = tl.exp2((s - m_ref[:, None]) * 1.4426950408889634)
         l = l * alpha + tl.sum(p, 1)
-        v = tl.load(V + kv_offset, valid[:, None], other=0)
+        v = tl.load(V + kv_offset, valid[:, None], other=0.0)
+        if MXFP8:
+            v = mxfp8_dequant_rows(v, VScale + scale_offset, slot, valid, D)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m = m_new
     stat = (split * batch * QLEN + token) * (HEADS_K * GROUP) + qh
@@ -123,12 +140,16 @@ def decode_partials(
     softmax_scale,
     *,
     window_size_left=None,
+    k_scale=None,
+    v_scale=None,
 ):
     """q (tokens, heads_q, d) with tokens = batch * qlen, the last qlen positions
     of each sequence, attending causally; k/v cache (pages, page_size, heads_k, d);
     rel_bias (tokens, heads_q, rel_extent), indexed by query-key distance. Keys
-    beyond the extent get bias 0, or are masked with a window. Returns partials
-    shaped (splits, tokens, 1, heads_q[, d])."""
+    beyond the extent get bias 0, or are masked with a window. With k/v_scale, the
+    cache is MXFP8: e4m3 data and the pool's interleaved UE8M0 scales
+    (pages, heads_k, 32, 4, d // 32), 128-token pages. Returns partials shaped
+    (splits, tokens, 1, heads_q[, d])."""
     tokens, heads_q, head_dim = q.shape
     batch = seqused_k.shape[0]
     qlen = tokens // max(batch, 1)
@@ -144,6 +165,19 @@ def decode_partials(
     max_splits = max(1, min(2 * sms // max(1, batch * heads_k), MAX_SPLITS))
     block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32
     splits = min(triton.cdiv(span, block_n), max_splits)
+    mxfp8 = k_scale is not None
+    if mxfp8:
+        assert v_scale is not None and page_size == MXFP8_PAGE
+        assert page_size % block_n == 0
+        assert k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
+        assert q.dtype == torch.bfloat16
+        k_words, v_words = (
+            mxfp8_scale_words(k_scale, head_dim),
+            mxfp8_scale_words(v_scale, head_dim),
+        )
+        assert k_words.stride() == v_words.stride()
+    else:
+        k_words = v_words = k_cache
     o = torch.empty(
         (splits, tokens, 1, heads_q, head_dim), dtype=torch.float32, device=q.device
     )
@@ -153,6 +187,8 @@ def decode_partials(
         q,
         k_cache,
         v_cache,
+        k_words,
+        v_words,
         page_table,
         seqused_k,
         rel_bias,
@@ -166,6 +202,8 @@ def decode_partials(
         k_cache.stride(0),
         k_cache.stride(1),
         k_cache.stride(2),
+        k_words.stride(0) if mxfp8 else 0,
+        k_words.stride(1) if mxfp8 else 0,
         page_table.stride(0),
         rel_bias.stride(0),
         rel_bias.stride(1),
@@ -178,6 +216,7 @@ def decode_partials(
         rel_bias.shape[-1],
         -1 if window_size_left is None else window_size_left,
         block_n,
+        mxfp8,
         num_warps=4,
         num_stages=2 if qlen == 1 else 3,
         launch_pdl=True,
