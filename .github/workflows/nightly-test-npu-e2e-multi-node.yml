@@ -216,7 +216,14 @@ jobs:
       - name: Clear resources
         run: |
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
-          kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
+          # The generated k8s_multi_pd_*.yaml files are removed by the runner as
+          # soon as the test ends, so the glob often matches nothing. Iterate
+          # instead of passing the literal pattern to kubectl, which would error
+          # with "the path ... does not exist".
+          for k8s_yaml in ./k8s_multi_pd_*.yaml; do
+            [ -e "${k8s_yaml}" ] || continue
+            kubectl delete -f "${k8s_yaml}" --ignore-not-found=true || true
+          done
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
@@ -424,7 +431,14 @@ jobs:
         run: |
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
           kubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME
-          kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
+          # The generated k8s_multi_pd_*.yaml files are removed by the runner as
+          # soon as the test ends, so the glob often matches nothing. Iterate
+          # instead of passing the literal pattern to kubectl, which would error
+          # with "the path ... does not exist".
+          for k8s_yaml in ./k8s_multi_pd_*.yaml; do
+            [ -e "${k8s_yaml}" ] || continue
+            kubectl delete -f "${k8s_yaml}" --ignore-not-found=true || true
+          done
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
