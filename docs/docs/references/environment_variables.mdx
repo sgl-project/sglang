@@ -1918,6 +1918,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_GLM_ROUTE_SORT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx942/gfx950 with <code>SGLANG_USE_AITER=1</code>, route GLM-5.2 (256 experts, sigmoid with correction bias, top-8 plus the fused shared expert), build the AITER <code>fused_moe</code> MoE sort and zero its output in one HIP launch, for batches of up to 64 tokens. Only batch sizes that <code>fused_moe</code> sorts on its general path use it; others route and sort as before. Requires an AITER whose <code>register_presorted_moe</code> accepts <code>layout="plain"</code>; without it the flag has no effect.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_MOE_GU_ITLV</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the AITER MoE gate/up tile layout: <code>true</code> interleaves, <code>false</code> uses the separated layout.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
