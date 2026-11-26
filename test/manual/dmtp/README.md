@@ -1,5 +1,12 @@
 # DMTP regression checks
 
+The optional `SGLANG_DMTP_FUSED_T1_STATE=1` path requires
+`SGLANG_MTP_PREFIX_TWO_DRAFT_GRAPHS=1`. It fuses request-slot T1 state
+transport and validation; the default remains off. Slot reuse invalidates
+cached proposals. The shared state module has no QSA attention dependency.
+Use `test_turbo_fused_state.py` for byte-exact transport, request reuse,
+sampling invalidation, and CPU/CUDA coverage.
+
 Run from the repository root with a matching SGLang runtime:
 
 ```bash
@@ -18,4 +25,4 @@ embedding/conditioner replacement and sampling-row refresh.
 
 These operator and lifecycle tests do not replace real-model CUDA Graph, KV
 parity, or tensor-parallel generation checks. QSA-specific optimizations are
-maintained on the separate `dmtp-qsa` branch.
+maintained on `main`; this PR contains only common runtime changes.
