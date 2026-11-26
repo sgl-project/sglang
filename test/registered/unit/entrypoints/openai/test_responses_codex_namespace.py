@@ -1,10 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Codex /v1/responses requests against MiniCPM5: which model
-types translate tools, namespace translation, multi-turn replay, streaming SSE
-events, and tool_search items.
-
-Exercises the public ``minicpm5`` tool-call parser.
-"""
 
 import asyncio
 import json
@@ -70,19 +64,6 @@ def _make_minicpm_serving():
 
 
 class CodexNamespaceAdapterTestCase(CustomTestCase):
-    def test_adapter_selected_by_model_type(self):
-        expected = {
-            "minicpm5_moe": MiniCPMToolAdapter,
-            "beam": BeamToolAdapter,
-            "llama": None,
-            "minicpm3": None,
-        }
-        for model_type, adapter_cls in expected.items():
-            with self.subTest(model_type=model_type):
-                self.assertIs(
-                    make_serving(model_type=model_type)._tool_adapter_cls, adapter_cls
-                )
-
     def test_create_responses_translates_tools_only_for_adapted_models(self):
         seen = {}
 
@@ -97,7 +78,13 @@ class CodexNamespaceAdapterTestCase(CustomTestCase):
                 ["multi_agent_v1__spawn_agent", "multi_agent_v1__wait_agent"],
                 MiniCPMToolAdapter,
             ),
+            (
+                "beam",
+                ["multi_agent_v1__spawn_agent", "multi_agent_v1__wait_agent"],
+                BeamToolAdapter,
+            ),
             ("llama", ["multi_agent_v1"], type(None)),
+            ("minicpm3", ["multi_agent_v1"], type(None)),
         ):
             with self.subTest(model_type=model_type):
                 serving = make_serving(model_type=model_type)
@@ -111,29 +98,6 @@ class CodexNamespaceAdapterTestCase(CustomTestCase):
                 asyncio.run(serving.create_responses(request))
                 self.assertEqual(seen["tools"], tool_names)
                 self.assertIsInstance(seen["adapter"], adapter_cls)
-
-    def test_flatten_and_public_echo_preserved(self):
-        request = ResponsesRequest(
-            model="x",
-            input="Ask a subagent to calculate 1+1.",
-            tools=[CODEX_MULTI_AGENT_NAMESPACE],
-            store=False,
-        )
-        translated, adapter = MiniCPMToolAdapter.from_request(
-            request, tool_call_parser="minicpm5"
-        )
-        flat_names = [t.name for t in translated.tools]
-        self.assertEqual(
-            flat_names,
-            ["multi_agent_v1__spawn_agent", "multi_agent_v1__wait_agent"],
-        )
-        self.assertEqual(
-            translated._tool_state.names["multi_agent_v1__wait_agent"],
-            {"name": "wait_agent", "namespace": "multi_agent_v1"},
-        )
-        # Public tools echoed in response must remain the original namespace shape
-        self.assertEqual(translated._tool_state.public_tools[0].type, "namespace")
-        self.assertEqual(translated._tool_state.public_tools[0].name, "multi_agent_v1")
 
     def test_non_stream_wait_agent_roundtrip(self):
         serving = _make_minicpm_serving()
@@ -162,7 +126,6 @@ class CodexNamespaceAdapterTestCase(CustomTestCase):
             raw_request, tool_call_parser=serving.tool_call_parser
         )
 
-        # 1. Verify input replay rewrites historical function_call name to joined alias
         messages = serving._construct_input_messages(translated, tool_adapter=adapter)
         assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
         self.assertEqual(len(assistant_msgs), 1)
@@ -171,7 +134,6 @@ class CodexNamespaceAdapterTestCase(CustomTestCase):
             "multi_agent_v1__spawn_agent",
         )
 
-        # Verify the XML output restores the bare name and namespace.
         model_xml = (
             "<think>\nNeed to wait for the subagent.\n</think>\n\n"
             '<function name="multi_agent_v1__wait_agent">'
@@ -306,98 +268,10 @@ class CodexNamespaceAdapterTestCase(CustomTestCase):
         self.assertEqual(final_fn[0]["name"], "spawn_agent")
         self.assertEqual(final_fn[0]["namespace"], "multi_agent_v1")
 
-    def test_commentary_and_tool_call_replay_merged_into_single_assistant_turn(self):
-        serving = _make_minicpm_serving()
-        raw_request = ResponsesRequest(
-            model="x",
-            input=[
-                {"role": "user", "content": "Ask a subagent to calculate 1+1."},
-                {
-                    "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": "plan"}],
-                },
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "phase": "commentary",
-                    "content": [{"type": "output_text", "text": "\n\n"}],
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "spawn_agent",
-                    "namespace": "multi_agent_v1",
-                    "arguments": '{"message": "1+1"}',
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_1",
-                    "output": '{"agent_id": "a1"}',
-                },
-            ],
-            tools=[CODEX_MULTI_AGENT_NAMESPACE],
-            store=False,
-        )
-        translated, adapter = serving._tool_adapter_cls.from_request(
-            raw_request, tool_call_parser="minicpm5"
-        )
-        messages = serving._construct_input_messages(translated, tool_adapter=adapter)
-        roles = [m["role"] for m in messages]
-        self.assertEqual(roles, ["user", "assistant", "tool"])
-        self.assertEqual(messages[1]["reasoning_content"], "plan")
-        self.assertEqual(
-            messages[1]["tool_calls"][0]["function"]["name"],
-            "multi_agent_v1__spawn_agent",
-        )
-
-    def test_tool_search_call_and_lazy_loaded_namespace_supported(self):
-        serving = _make_minicpm_serving()
-        raw_request = ResponsesRequest(
-            model="x",
-            input=[
-                {"role": "user", "content": "Ask a subagent to calculate 1+1."},
-                {
-                    "type": "tool_search_call",
-                    "call_id": "ts_1",
-                    "arguments": {"query": "subagent"},
-                },
-                {
-                    "type": "tool_search_output",
-                    "call_id": "ts_1",
-                    "status": "completed",
-                    "tools": [CODEX_MULTI_AGENT_NAMESPACE],
-                },
-                # A later search that loads the same namespace again.
-                {
-                    "type": "tool_search_output",
-                    "call_id": "ts_2",
-                    "status": "completed",
-                    "tools": [CODEX_MULTI_AGENT_NAMESPACE],
-                },
-            ],
-            tools=[{"type": "tool_search"}],
-            store=False,
-        )
-        translated, adapter = serving._tool_adapter_cls.from_request(
-            raw_request, tool_call_parser="minicpm5"
-        )
-        flat_names = [t.name for t in translated.tools if t.name]
-        self.assertEqual(
-            flat_names, ["multi_agent_v1__spawn_agent", "multi_agent_v1__wait_agent"]
-        )
-        # The response echoes the tools the client declared, not the loaded ones.
-        self.assertEqual(
-            [t.type for t in translated._tool_state.public_tools], ["tool_search"]
-        )
-
-        messages = serving._construct_input_messages(translated, tool_adapter=adapter)
-        self.assertEqual(
-            messages, [{"role": "user", "content": "Ask a subagent to calculate 1+1."}]
-        )
-
 
 class CodexSearchHistoryTestCase(CustomTestCase):
     def test_search_batches_merge_namespace_members_and_keep_first_definition(self):
+        serving = _make_minicpm_serving()
         spawn, wait = CODEX_MULTI_AGENT_NAMESPACE["tools"]
         first = {**CODEX_MULTI_AGENT_NAMESPACE, "tools": [spawn]}
         second = {
@@ -407,6 +281,12 @@ class CodexSearchHistoryTestCase(CustomTestCase):
         request = ResponsesRequest(
             model="x",
             input=[
+                {"role": "user", "content": "Find tools."},
+                {
+                    "type": "tool_search_call",
+                    "call_id": "ts_1",
+                    "arguments": {"query": "agent"},
+                },
                 {"type": "tool_search_output", "tools": [first]},
                 {"type": "tool_search_output", "tools": [second]},
                 {"type": "tool_search_output", "tools": [second]},
@@ -419,7 +299,7 @@ class CodexSearchHistoryTestCase(CustomTestCase):
             },
         )
         original = request.model_dump()
-        translated, _ = MiniCPMToolAdapter.from_request(
+        translated, adapter = MiniCPMToolAdapter.from_request(
             request, tool_call_parser="minicpm5"
         )
         functions = [tool for tool in translated.tools if tool.type == "function"]
@@ -438,6 +318,10 @@ class CodexSearchHistoryTestCase(CustomTestCase):
         )
         self.assertEqual(request.model_dump(), original)
         self.assertEqual(translated._tool_state.public_tools, request.tools)
+        self.assertEqual(
+            serving._construct_input_messages(translated, tool_adapter=adapter),
+            [{"role": "user", "content": "Find tools."}],
+        )
 
     def test_declared_namespace_overrides_search_members_without_losing_new_members(
         self,

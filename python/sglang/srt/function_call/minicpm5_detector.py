@@ -25,18 +25,6 @@ _FUNCTION_TRANSITION_RE = re.compile(
 _CDATA_PARAM_OPEN_RE = re.compile(_PARAM_OPEN_RE.pattern + re.escape(CDATA_START))
 
 
-def get_argument_type(
-    func_name: str, arg_key: str, name_to_tool: Dict[str, Tool]
-) -> Optional[str]:
-    tool = name_to_tool.get(func_name)
-    if not tool:
-        return None
-    params = tool.function.parameters or {}
-    if not isinstance(params, dict):
-        return None
-    return get_schema_properties(params).get(arg_key, {}).get("type")
-
-
 def parse_arguments(json_value):
     try:
         try:
@@ -57,7 +45,6 @@ def _convert_param_value(key: str, val_text: str, props: dict) -> object:
 
 
 def _extract_param_value(text: str, start: int, block_end: int) -> Tuple[str, int]:
-    """Extract a param value within its function and return its end position."""
     if text.startswith(CDATA_START, start, block_end):
         cdata_content_start = start + len(CDATA_START)
         cdata_end = text.find(CDATA_END, cdata_content_start, block_end)
@@ -94,7 +81,6 @@ def _extract_param_value(text: str, start: int, block_end: int) -> Tuple[str, in
 def _find_function_close(
     text: str, start: int, *, allow_broken_cdata: bool = True
 ) -> int:
-    """Skip CDATA when locating the function boundary."""
     pos = start
     while True:
         idx = text.find(FUNCTION_CLOSE, pos)
@@ -127,12 +113,6 @@ def _find_function_close(
 def _parse_function_block(
     text: str, start: int, name_to_props: Dict[str, dict]
 ) -> Tuple[Optional[dict], int, bool]:
-    """
-    Parse one <function>...</function> block starting at `start`.
-
-    Returns:
-        (call_dict or None, end_pos, is_complete)
-    """
     m = _FUNC_OPEN_RE.match(text, start)
     if not m:
         return None, start + 1, False

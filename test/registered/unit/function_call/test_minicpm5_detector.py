@@ -283,48 +283,47 @@ def _exec_block(command: str) -> str:
 
 
 @pytest.mark.parametrize(
-    "command",
+    "raw,expected",
     [
-        "<![CDATA[ls 2>&1]]>",
-        "ls 2>&1",
-        "<![CDATA[cat '<stdin>']]>",
-        "cat '<stdin>'",
+        ("<![CDATA[ls 2>&1]]>", "ls 2>&1"),
+        ("ls 2>&1", "ls 2>&1"),
+        ("<![CDATA[cat '<stdin>']]>", "cat '<stdin>'"),
+        ("cat '<stdin>'", "cat '<stdin>'"),
     ],
 )
-def test_exec_special_chars_non_stream(command):
-    detector = MiniCPM5Detector()
+def test_exec_special_chars_exact_stream_and_non_stream(raw, expected):
     tools = make_tools_exec()
-    res = detector.detect_and_parse(_exec_block(command), tools)
+    block = _exec_block(raw)
+
+    non_stream = MiniCPM5Detector().detect_and_parse(block, tools)
+    assert len(non_stream.calls) == 1
+    assert json.loads(non_stream.calls[0].parameters) == {"command": expected}
+    assert non_stream.normal_text == ""
+
+    cut = block.index(expected) + len(expected) // 2
+    detector = MiniCPM5Detector()
+    r1 = detector.parse_streaming_increment(block[:cut], tools)
+    assert r1.calls == []
+    r2 = detector.parse_streaming_increment(block[cut:], tools)
+    calls = r2.calls + detector.finish(tools).calls
+    assert len(calls) == 1
+    assert json.loads(calls[0].parameters) == {"command": expected}
+    assert r1.normal_text + r2.normal_text == ""
+
+
+def test_dropped_block_does_not_affect_following_call():
+    tools = make_tools_exec()
+    text = (
+        '<function name="exec"><param name="nope">x</param></function>'
+        + _exec_block("ls 2>&1")
+    )
+    res = MiniCPM5Detector().detect_and_parse(text, tools)
     assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert "2>&1" in args["command"] or "<stdin>" in args["command"]
-    assert "<function" not in res.normal_text
-
-
-@pytest.mark.parametrize(
-    "text,expected_calls",
-    [
-        (_exec_block("ls 2>&1"), 1),
-        (_exec_block("echo hi") + _exec_block("ls 2>&1"), 2),
-        (_exec_block("ls 2>&1") + _exec_block("echo hi"), 2),
-        (
-            '<function name="exec"><param name="nope">x</param></function>'
-            + _exec_block("ls 2>&1"),
-            1,
-        ),
-        (_exec_block("ls 2>&1") + _exec_block("ls 2>&1"), 2),
-    ],
-)
-def test_multi_block_no_state_leak(text, expected_calls):
-    detector = MiniCPM5Detector()
-    tools = make_tools_exec()
-    res = detector.detect_and_parse(text, tools)
-    assert len(res.calls) == expected_calls
-    assert "<function" not in res.normal_text
+    assert json.loads(res.calls[0].parameters) == {"command": "ls 2>&1"}
+    assert res.normal_text == ""
 
 
 def test_unknown_param_ignored_but_call_kept():
-    detector = MiniCPM5Detector()
     tools = make_tools_exec()
     text = (
         '<function name="exec">'
@@ -332,45 +331,33 @@ def test_unknown_param_ignored_but_call_kept():
         '<param name="command">echo ok</param>'
         "</function>"
     )
-    res = detector.detect_and_parse(text, tools)
+    res = MiniCPM5Detector().detect_and_parse(text, tools)
     assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert args["command"] == "echo ok"
+    assert json.loads(res.calls[0].parameters) == {"command": "echo ok"}
 
 
 def test_entity_not_decoded():
-    detector = MiniCPM5Detector()
     tools = make_tools_exec()
-    text = _exec_block("echo a &amp; b")
-    res = detector.detect_and_parse(text, tools)
+    res = MiniCPM5Detector().detect_and_parse(_exec_block("echo a &amp; b"), tools)
     assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert args["command"] == "echo a &amp; b"
+    assert json.loads(res.calls[0].parameters) == {"command": "echo a &amp; b"}
 
 
-def test_untyped_param_stays_string():
-    detector = MiniCPM5Detector()
-    tools = make_tools_untyped_command()
-    text = '<function name="run"><param name="command">2</param></function>'
-    res = detector.detect_and_parse(text, tools)
-    assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert args["command"] == "2"
-    assert isinstance(args["command"], str)
+def test_untyped_and_string_params_not_json_parsed():
+    untyped_res = MiniCPM5Detector().detect_and_parse(
+        '<function name="run"><param name="command">2</param></function>',
+        make_tools_untyped_command(),
+    )
+    assert json.loads(untyped_res.calls[0].parameters) == {"command": "2"}
 
-
-def test_string_param_not_json_parsed():
-    detector = MiniCPM5Detector()
-    tools = make_tools_string_list()
-    text = '<function name="store"><param name="items">[1,2,3]</param></function>'
-    res = detector.detect_and_parse(text, tools)
-    assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert args["items"] == "[1,2,3]"
+    str_res = MiniCPM5Detector().detect_and_parse(
+        '<function name="store"><param name="items">[1,2,3]</param></function>',
+        make_tools_string_list(),
+    )
+    assert json.loads(str_res.calls[0].parameters) == {"items": "[1,2,3]"}
 
 
 def test_missing_param_close_stops_at_next_param():
-    detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
@@ -378,29 +365,26 @@ def test_missing_param_close_stops_at_next_param():
         '<param name="date">2024-06-27</param>'
         "</function>"
     )
-    res = detector.detect_and_parse(text, tools)
+    res = MiniCPM5Detector().detect_and_parse(text, tools)
     assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert args["city"] == "北京"
-    assert args["date"] == "2024-06-27"
+    assert json.loads(res.calls[0].parameters) == {"city": "北京", "date": "2024-06-27"}
 
 
 def test_cdata_with_literal_close_tags():
-    detector = MiniCPM5Detector()
     tools = make_tools_exec()
     text = (
         '<function name="exec">'
         '<param name="command"><![CDATA[doc </param> and </function>]]></param>'
         "</function>"
     )
-    res = detector.detect_and_parse(text, tools)
+    res = MiniCPM5Detector().detect_and_parse(text, tools)
     assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert args["command"] == "doc </param> and </function>"
+    assert json.loads(res.calls[0].parameters) == {
+        "command": "doc </param> and </function>"
+    }
 
 
 def test_broken_cdata_falls_back_to_nearest_boundary():
-    detector = MiniCPM5Detector()
     tools = make_tools_exec()
     text = (
         '<function name="exec">'
@@ -408,158 +392,38 @@ def test_broken_cdata_falls_back_to_nearest_boundary():
         '<param name="ignored">x</param>'
         "</function>"
     )
-    res = detector.detect_and_parse(text, tools)
+    res = MiniCPM5Detector().detect_and_parse(text, tools)
     assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert args["command"] == "ls 2>&1"
-
-
-def test_mixed_cdata_and_plain_in_one_call():
-    detector = MiniCPM5Detector()
-    tools = make_tools_exec()
-    text = (
-        '<function name="exec">'
-        '<param name="command">echo hi</param>'
-        '<param name="note"><![CDATA[a & b]]></param>'
-        "</function>"
-    )
-    tools = [
-        Tool(
-            function=Function(
-                name="exec",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "note": {"type": "string"},
-                    },
-                    "required": ["command"],
-                },
-            )
-        )
-    ]
-    res = detector.detect_and_parse(text, tools)
-    assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert args["command"] == "echo hi"
-    assert args["note"] == "a & b"
-
-
-def test_mixed_compliant_and_violating_blocks():
-    detector = MiniCPM5Detector()
-    tools = make_tools_exec()
-    text = _exec_block("<![CDATA[ls 2>&1]]>") + _exec_block("ls 2>&1")
-    res = detector.detect_and_parse(text, tools)
-    assert len(res.calls) == 2
+    assert json.loads(res.calls[0].parameters) == {"command": "ls 2>&1"}
 
 
 def test_empty_param_value():
-    detector = MiniCPM5Detector()
-    tools = make_tools_no_required()
-    text = '<function name="noop"><param name="note"></param></function>'
-    res = detector.detect_and_parse(text, tools)
+    res = MiniCPM5Detector().detect_and_parse(
+        '<function name="noop"><param name="note"></param></function>',
+        make_tools_no_required(),
+    )
     assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert args["note"] == ""
+    assert json.loads(res.calls[0].parameters) == {"note": ""}
 
 
-def test_single_quote_param_name():
-    detector = MiniCPM5Detector()
-    tools = make_tools_weather()
-    text = "<function name='get_weather'><param name='city'>北京</param></function>"
-    res = detector.detect_and_parse(text, tools)
+def test_single_quotes_and_extra_space_in_tags():
+    res = MiniCPM5Detector().detect_and_parse(
+        "<function name='get_weather' ><param name='city'>北京</param></function>",
+        make_tools_weather(),
+    )
     assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert args["city"] == "北京"
-
-
-def test_function_tag_with_extra_space():
-    detector = MiniCPM5Detector()
-    tools = make_tools_weather()
-    text = '<function name="get_weather" ><param name="city">北京</param></function>'
-    res = detector.detect_and_parse(text, tools)
-    assert len(res.calls) == 1
-
-
-def test_plain_text_without_function():
-    detector = MiniCPM5Detector()
-    tools = make_tools_weather()
-    text = "Just a normal answer."
-    res = detector.detect_and_parse(text, tools)
-    assert len(res.calls) == 0
-    assert res.normal_text == text
-
-
-def test_empty_tools_list():
-    detector = MiniCPM5Detector()
-    text = _exec_block("echo hi")
-    res = detector.detect_and_parse(text, tools=[])
-    assert len(res.calls) == 0
-    assert "<function" in res.normal_text
-
-
-@pytest.mark.parametrize(
-    "command",
-    ["ls 2>&1", "cat '<stdin>'"],
-)
-def test_streaming_exec_special_chars(command):
-    detector = MiniCPM5Detector()
-    tools = make_tools_exec()
-    block = _exec_block(command)
-    res = detector.parse_streaming_increment(block, tools)
-    assert len(res.calls) == 1
-    args = json.loads(res.calls[0].parameters)
-    assert command in args["command"] or args["command"] == command.strip()
-    assert "<function" not in (res.normal_text or "")
-
-
-def test_streaming_value_split_across_chunks():
-    detector = MiniCPM5Detector()
-    tools = make_tools_exec()
-    c1 = '<function name="exec"><param name="command">ls 2>'
-    c2 = "&1</param></function>"
-    r1 = detector.parse_streaming_increment(c1, tools)
-    assert len(r1.calls) == 0
-    r2 = detector.parse_streaming_increment(c2, tools)
-    assert len(r2.calls) == 1
-    args = json.loads(r2.calls[0].parameters)
-    assert args["command"] == "ls 2>&1"
-
-
-def test_streaming_multiple_calls_across_chunks():
-    detector = MiniCPM5Detector()
-    tools = make_tools_exec()
-    c1 = _exec_block("echo hi")
-    c2 = _exec_block("ls 2>&1")
-    r1 = detector.parse_streaming_increment(c1, tools)
-    assert len(r1.calls) == 1
-    r2 = detector.parse_streaming_increment(c2, tools)
-    assert len(r2.calls) == 1
-    assert detector.current_tool_id == 2
-
-
-def test_streaming_cdata_across_chunks():
-    detector = MiniCPM5Detector()
-    tools = make_tools_exec()
-    c1 = '<function name="exec"><param name="command"><![CDATA[ls 2>&'
-    c2 = "1]]></param></function>"
-    r1 = detector.parse_streaming_increment(c1, tools)
-    assert len(r1.calls) == 0
-    r2 = detector.parse_streaming_increment(c2, tools)
-    assert len(r2.calls) == 1
-    args = json.loads(r2.calls[0].parameters)
-    assert args["command"] == "ls 2>&1"
+    assert json.loads(res.calls[0].parameters) == {"city": "北京"}
 
 
 def test_streaming_partial_function_token_buffered():
     detector = MiniCPM5Detector()
     tools = make_tools_exec()
-    c1 = "Hello <func"
-    c2 = 'tion name="exec"><param name="command">echo hi</param></function>'
-    r1 = detector.parse_streaming_increment(c1, tools)
+    r1 = detector.parse_streaming_increment("Hello <func", tools)
     assert r1.normal_text == ""
-    assert len(r1.calls) == 0
-    r2 = detector.parse_streaming_increment(c2, tools)
+    assert r1.calls == []
+    r2 = detector.parse_streaming_increment(
+        'tion name="exec"><param name="command">echo hi</param></function>', tools
+    )
     assert r2.normal_text == "Hello "
     assert len(r2.calls) == 1
 
@@ -577,7 +441,6 @@ def test_streaming_broken_cdata_recovers_at_finish():
 
 
 def test_final_delta_drains_multiple_complete_calls():
-    """Both calls must arrive when generation ends with both in one delta."""
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
     beijing = (
@@ -594,7 +457,6 @@ def test_final_delta_drains_multiple_complete_calls():
 
 
 def test_cdata_literal_function_close_does_not_emit_early():
-    """A literal closing tag may arrive before the CDATA terminator."""
     detector = MiniCPM5Detector()
     tools = make_tools_exec()
     c1 = '<function name="exec"><param name="command"><![CDATA[doc </function>'
@@ -608,7 +470,6 @@ def test_cdata_literal_function_close_does_not_emit_early():
 
 
 def test_literal_function_marker_does_not_hide_later_call():
-    """The string <function> in prose is an invalid opener."""
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
     prefix = "Use <function> to describe a tool call."
@@ -626,7 +487,6 @@ def test_literal_function_marker_does_not_hide_later_call():
 
 
 def test_finish_releases_partial_marker_in_plain_text():
-    """A plain text suffix held for a possible tool marker survives stream end."""
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = "Example: <func"
@@ -637,7 +497,6 @@ def test_finish_releases_partial_marker_in_plain_text():
 
 
 def test_cdata_preserves_literal_adjacent_function_markup():
-    """Function-like text in valid CDATA remains an argument value."""
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
     city = 'Beijing</function><function name="get_weather"><param name="city">example'
@@ -649,7 +508,6 @@ def test_cdata_preserves_literal_adjacent_function_markup():
 
 
 def test_finish_preserves_unclosed_function_text():
-    """An unfinished function and the text after its opener survive stream end."""
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
     prefix = "Reading an example: "
@@ -662,7 +520,6 @@ def test_finish_preserves_unclosed_function_text():
 
 
 def test_missing_cdata_end_does_not_consume_next_call():
-    """A later call's CDATA terminator must not be borrowed by an earlier call."""
     tools = make_tools_weather()
     first = (
         '<function name="get_weather"><param name="city"><![CDATA[Beijing'

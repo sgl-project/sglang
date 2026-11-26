@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Translate MiniCPM Responses tools using Beam's flat function format.
-
-Merge tools loaded by searches across the effective input history. Keep search
-items out of the prompt because MiniCPM's chat template cannot render them.
-"""
+"""Adapt MiniCPM Responses tools via Beam's flat format; drop search items MiniCPM's template cannot render."""
 
 import msgspec
 
@@ -11,7 +7,6 @@ from sglang.srt.entrypoints.openai.responses_tools.beam import BeamToolAdapter
 
 
 def tools_with_search_results(request, input_items):
-    """Keep request definitions first, then add new tools and namespace members."""
     from sglang.srt.entrypoints.openai.protocol import ResponseTool
 
     tools = list(request.tools)
