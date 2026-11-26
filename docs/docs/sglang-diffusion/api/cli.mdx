@@ -118,6 +118,8 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--otlp-traces-endpoint {HOST:PORT}`: OTLP collector endpoint used with `--enable-trace` (default: `localhost:4317`).
 - `--otlp-service-name {NAME}`: `service.name` attached to exported traces. Resolution order is this flag, `OTEL_SERVICE_NAME`, then `sglang-diffusion`.
 - `--enable-metrics`: expose Prometheus metrics at `/metrics` (default: disabled). Includes request counts, queue time, host-side stage timing and LoRA state, separated by role and DP replica. See [Production metrics](/docs/sglang-diffusion/production_metrics) for metric semantics and disaggregated scraping.
+- `--api-key {KEY}`: require `Authorization: Bearer {KEY}` on every endpoint except `/health`, `/health_generate`, and `/metrics` (default: unset, no key needed).
+- `--admin-api-key {KEY}`: unlock the admin endpoints (`/update_weights_from_*`, `/get_weights_checksum`, `/release_memory_occupation`, `/resume_memory_occupation`, `/v1/set_lora`, `/v1/merge_lora_weights`, `/v1/unmerge_lora_weights`, `/start_profile`, `/stop_profile`). They answer HTTP 403 until it is set, and `--api-key` does not unlock them. Defaults to `SGLANG_ADMIN_API_KEY`.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 - `--prompt-enhancer-config {JSON_FILE}`: configure an independent SRT LLM/VLM for opt-in HTTP prompt rewriting. Requests use `enhance_prompt=true`; no enhancer runs by default. See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).
 
@@ -526,6 +528,9 @@ check; it only validates its own routing loop and broker.
 
 Do not use `/health` as a liveness probe: a long server warmup can legitimately
 keep it at `503` for several minutes.
+
+`/liveness`, `/health`, `/health_generate`, and `/metrics` never need a key, so
+probes work unchanged with `--api-key`.
 
 ### Request time limit
 

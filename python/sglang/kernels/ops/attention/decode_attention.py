@@ -28,7 +28,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.arch import current_arch
-from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
+from sglang.kernels.ops.attention.score_mod import (
+    relative_bias_score_mod,
+    unpack_aux_tensors,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_device_core_count,
@@ -42,6 +45,8 @@ from sglang.srt.utils import (
 _MAX_SPLIT_PROGRAMS = 32
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+# ROCm stage 2 tree-merges up to this many FP32 values (splits x padded head dim)
+STAGE2_TREE_MAX_ELEMENTS = 16384
 
 logger = logging.getLogger(__name__)
 
@@ -582,6 +587,7 @@ def _fwd_grouped_kernel_stage1(
     IS_GFX1250: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
+    SCORE_MOD_BAND: tl.constexpr = False,
     Aux0=None,
     aux0_stride_t=0,
     aux0_stride_h=0,
@@ -750,7 +756,11 @@ def _fwd_grouped_kernel_stage1(
                 if xai_temperature_len > 0:
                     qk *= xai_temperature_reg[:, None]
 
-                if SCORE_MOD is not None:
+                # the relative bias is zero from aux0_len on: skip tiles past it
+                in_band = True
+                if SCORE_MOD_BAND:
+                    in_band = cur_batch_seq_len - 1 - (start_n + BLOCK_N - 1) < aux0_len
+                if SCORE_MOD is not None and in_band:
                     qk = SCORE_MOD(
                         qk,
                         cur_batch_seq_len - 1,
@@ -966,6 +976,7 @@ def _decode_grouped_att_m_fwd(
         IS_GFX1250=_is_gfx1250,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
+        SCORE_MOD_BAND=_is_hip and score_mod is relative_bias_score_mod,
         Aux0=aux0,
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
@@ -1001,6 +1012,14 @@ def _fwd_kernel_stage2(
     USE_PDL: tl.constexpr = False,
     FORCED_KV_SPLITS: tl.constexpr = 0,
     DYNAMIC_SPLIT_END: tl.constexpr = False,
+    Lse_Out=None,
+    stride_lse_b=0,
+    Gate=None,
+    GateSink=None,
+    stride_gate_b=0,
+    stride_sink_b=0,
+    TREE_MERGE: tl.constexpr = False,
+    SPLITS_P2: tl.constexpr = 1,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -1044,32 +1063,76 @@ def _fwd_kernel_stage2(
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
 
-    for split_kv_id in tl.range(0, split_end, num_stages=2):
-        split_kv_start = kv_len_per_split * split_kv_id
-        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-
-        if split_kv_end > split_kv_start:
-            tv = tl.load(
-                Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
+    if TREE_MERGE:
+        # ROCm: merge all splits at once (max, then sums); reassociates the FP32 merge, empty splits weigh 0
+        splits = tl.arange(0, SPLITS_P2)
+        starts = kv_len_per_split * splits
+        valid = (splits < split_end) & (
+            tl.minimum(starts + kv_len_per_split, cur_batch_seq_len) > starts
+        )
+        tlogics = tl.load(
+            Mid_O_1 + offs_logic + (splits * stride_mid_os) // Lv,
+            mask=valid,
+            other=float("-inf"),
+        )
+        tvs = tl.load(
+            Mid_O + offs_v[None, :] + splits[:, None] * stride_mid_os,
+            mask=valid[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        e_max = tl.max(tlogics, 0)
+        # No valid split: the loop's state (acc 0, e_sum 0) with a finite e_max.
+        e_max = tl.where(e_max == float("-inf"), 0.0, e_max)
+        weights = tl.exp(tlogics - e_max)
+        e_sum = tl.sum(weights, 0)
+        acc = tl.sum(weights[:, None] * tvs, 0)
+    else:
+        for split_kv_id in tl.range(0, split_end, num_stages=2):
+            split_kv_start = kv_len_per_split * split_kv_id
+            split_kv_end = tl.minimum(
+                split_kv_start + kv_len_per_split, cur_batch_seq_len
             )
-            tlogic = tl.load(Mid_O_1 + offs_logic + split_kv_id * stride_mid_os // Lv)
-            n_e_max = tl.maximum(tlogic, e_max)
 
-            old_scale = tl.exp(e_max - n_e_max)
-            acc *= old_scale
-            exp_logic = tl.exp(tlogic - n_e_max)
-            acc += exp_logic * tv
+            if split_kv_end > split_kv_start:
+                tv = tl.load(
+                    Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
+                )
+                tlogic = tl.load(
+                    Mid_O_1 + offs_logic + split_kv_id * stride_mid_os // Lv
+                )
+                n_e_max = tl.maximum(tlogic, e_max)
 
-            e_sum = e_sum * old_scale + exp_logic
-            e_max = n_e_max
+                old_scale = tl.exp(e_max - n_e_max)
+                acc *= old_scale
+                exp_logic = tl.exp(tlogic - n_e_max)
+                acc += exp_logic * tv
+
+                e_sum = e_sum * old_scale + exp_logic
+                e_max = n_e_max
+
+    if Lse_Out is not None or Gate is not None:
+        lse = tl.where(e_sum > 0, e_max + tl.log(e_sum), float("-inf"))
+    if Lse_Out is not None:
+        tl.store(Lse_Out + cur_batch * stride_lse_b + cur_head, lse)
 
     if HAS_SINK:
         cur_sink = tl.load(sink_ptr + cur_head)
         e_sum += tl.exp(cur_sink - e_max)
 
+    out = acc / e_sum * v_scale
+    if Gate is not None:
+        # Inkling2's output gate and query sink: o * sigmoid(gate) * sigmoid(lse - sink).
+        gate = tl.load(
+            Gate + cur_batch * stride_gate_b + cur_head * Lv + offs_d,
+            mask=mask_d,
+            other=0,
+        ).to(tl.float32)
+        sink = tl.load(GateSink + cur_batch * stride_sink_b + cur_head).to(tl.float32)
+        out = out * (1.0 / (1.0 + tl.exp(-gate)))
+        out = out * (1.0 / (1.0 + tl.exp(sink - lse)))
     tl.store(
         O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
-        acc / e_sum * v_scale,
+        out,
         mask=mask_d,
     )
 
@@ -1088,8 +1151,11 @@ def _decode_softmax_reducev_fwd(
     use_pdl=False,
     forced_kv_splits: int = 0,
     stop_at_request_splits: bool = False,
+    lse_out=None,
+    gate_sink=None,
 ):
     batch, head_num = q.shape[0], q.shape[1]
+    gate, gate_sinks = gate_sink if gate_sink is not None else (None, None)
     Lv = v_buffer.shape[-1]
     BLOCK_DV = triton.next_power_of_2(Lv)
 
@@ -1103,6 +1169,9 @@ def _decode_softmax_reducev_fwd(
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     grid = (batch, head_num)
+    splits_p2 = triton.next_power_of_2(
+        forced_kv_splits if forced_kv_splits > 0 else MAX_KV_SPLITS
+    )
     _fwd_kernel_stage2[grid](
         logits,
         lse,
@@ -1124,6 +1193,16 @@ def _decode_softmax_reducev_fwd(
         USE_PDL=use_pdl,
         FORCED_KV_SPLITS=forced_kv_splits,
         DYNAMIC_SPLIT_END=stop_at_request_splits and not forced_kv_splits,
+        Lse_Out=lse_out,
+        stride_lse_b=lse_out.stride(0) if lse_out is not None else 0,
+        Gate=gate,
+        GateSink=gate_sinks,
+        stride_gate_b=gate.stride(0) if gate is not None else 0,
+        stride_sink_b=gate_sinks.stride(0) if gate_sinks is not None else 0,
+        TREE_MERGE=_is_hip
+        and (lse_out is not None or gate is not None)
+        and splits_p2 * BLOCK_DV <= STAGE2_TREE_MAX_ELEMENTS,
+        SPLITS_P2=splits_p2,
         num_warps=4,
         num_stages=2,
         **({"launch_pdl": True} if use_pdl else {}),
@@ -1152,6 +1231,8 @@ def decode_attention_fwd_normal(
     aux_tensors=None,
     uneven_batch=None,
     stop_at_request_splits: bool = False,
+    lse_out=None,
+    gate_sink=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -1183,6 +1264,8 @@ def decode_attention_fwd_normal(
         max_kv_splits,
         sinks,
         stop_at_request_splits=stop_at_request_splits,
+        lse_out=lse_out,
+        gate_sink=gate_sink,
     )
 
 
@@ -1209,6 +1292,8 @@ def decode_attention_fwd_grouped(
     aux_tensors=None,
     uneven_batch=None,
     stop_at_request_splits: bool = False,
+    lse_out=None,
+    gate_sink=None,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1247,6 +1332,8 @@ def decode_attention_fwd_grouped(
         use_pdl=use_pdl,
         forced_kv_splits=forced_kv_splits,
         stop_at_request_splits=stop_at_request_splits,
+        lse_out=lse_out,
+        gate_sink=gate_sink,
     )
 
 
@@ -1279,11 +1366,22 @@ def decode_attention_fwd(
     lean_locks=None,
     uneven_batch=None,
     stop_at_request_splits: bool = False,
+    lse_out=None,
+    gate_sink=None,
 ):
     """``stop_at_request_splits``: the merge walks each request's own split count
     instead of the whole budget. It skips the empty tail of a large budget
     (deterministic mode sizes it by the context length) but can move the result a
-    few ULP (see ``_fwd_kernel_stage2``), so only deterministic mode turns it on."""
+    few ULP (see ``_fwd_kernel_stage2``), so only deterministic mode turns it on.
+
+    lse_out (batch, heads) FP32, if given, receives each query's natural-log LSE.
+    gate_sink (gate (batch, heads * dv), sinks (batch, heads)), if given, scales the
+    output by sigmoid(gate) * sigmoid(lse - sink) in the reduction."""
+    assert gate_sink is None or sinks is None, (
+        "the gate-sink epilogue replaces the sink path"
+    )
+    if lse_out is not None or gate_sink is not None:
+        enable_lean = False
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
     assert q.shape[0] <= attn_logits.shape[0]
@@ -1356,6 +1454,8 @@ def decode_attention_fwd(
             aux_tensors=aux_tensors,
             uneven_batch=uneven_batch,
             stop_at_request_splits=stop_at_request_splits,
+            lse_out=lse_out,
+            gate_sink=gate_sink,
         )
     else:
         # GQA/MQA/MLA
@@ -1382,6 +1482,8 @@ def decode_attention_fwd(
             aux_tensors=aux_tensors,
             uneven_batch=uneven_batch,
             stop_at_request_splits=stop_at_request_splits,
+            lse_out=lse_out,
+            gate_sink=gate_sink,
         )
 
 

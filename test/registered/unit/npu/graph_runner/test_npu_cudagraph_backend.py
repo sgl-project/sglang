@@ -35,7 +35,9 @@ def _make_backend(runner=None):
             device_module=_device_module_stub(), enable_torch_compile=False
         )
     with (
-        get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
+        get_parallel().override(
+            tp_group=SimpleNamespace(world_size=1, barrier=mock.Mock())
+        ),
         mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None),
     ):
         return mod.NPUCudaGraphBackend(runner), runner

@@ -31,15 +31,6 @@ _is_sm120 = is_sm120_supported()
 _STANDARD_CONTIG_MIN_TOKENS = 1024
 
 
-def is_supported() -> bool:
-    """True when this build can serve the SM120 standard-layout MoE path.
-
-    Off SM120 the shared masked path is correct, so this is vacuously true;
-    on SM120 it reports whether the contiguous implementation is present.
-    """
-    return True
-
-
 def use_swizzle() -> bool:
     """SM120's contiguous GEMM consumes standard-layout activations only."""
     return not _is_sm120

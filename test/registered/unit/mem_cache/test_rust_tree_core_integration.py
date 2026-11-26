@@ -154,6 +154,7 @@ def _insert(core: RustUnifiedTreeCore, token_ids: list[int], indices: list[int])
 
 
 def _binding(**init_overrides):
+    init_overrides.setdefault("empty_device_indices", torch.empty(0, dtype=torch.int64))
     return mem_cache.RustUnifiedTreeCoreBinding(
         mem_cache.TreeCoreInitParamsBinding(**init_overrides),
         _slots(ComponentType.FULL),
@@ -1037,6 +1038,7 @@ def test_joint_eviction_order_matches_the_python_tree_core(build):
 def test_unified_bindings_forward_the_joint_walk(binding_cls):
     binding = binding_cls(
         mem_cache.TreeCoreInitParamsBinding(
+            torch.empty(0, dtype=torch.int64),
             page_size=1,
             swa_sliding_window_size=4,
             eviction_policy="joint_lru",
@@ -2587,6 +2589,24 @@ def test_empty_cache_salt_uses_the_default_namespace_at_the_binding():
     ).tolist() == [10]
 
 
+@pytest.mark.parametrize("device", ["cpu", "cpu:0"])
+def test_native_core_uses_the_prototype_device(device):
+    binding = _binding(
+        empty_device_indices=torch.empty(0, dtype=torch.int64, device=device)
+    )
+    binding.insert(
+        mem_cache.InsertParamsBinding(
+            key=array("q", [1, 2]), value=torch.tensor([10, 11], dtype=torch.int64)
+        )
+    )
+    result = binding.match_prefix(mem_cache.MatchParamsBinding(array("q", [1, 2])))
+    indices = binding.collect_full_device_indices(
+        result.last_device_node_id, binding.root_node_handle(None)
+    )
+    assert indices.device == torch.device("cpu")
+    assert indices.tolist() == [10, 11]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_core_resolves_the_current_device():
     core = _tree_core(
@@ -2614,18 +2634,20 @@ def test_cuda_core_resolves_the_current_device():
 def test_unsupported_component_sets_are_rejected():
     with pytest.raises(ValueError, match="slot families are supported"):
         mem_cache.RustUnifiedTreeCoreBinding(
-            mem_cache.TreeCoreInitParamsBinding(), _slots(ComponentType.SWA)
+            mem_cache.TreeCoreInitParamsBinding(torch.empty(0, dtype=torch.int64)),
+            _slots(ComponentType.SWA),
         )
     with pytest.raises(ValueError, match="slot families are supported"):
         mem_cache.RustUnifiedTreeCoreBinding(
-            mem_cache.TreeCoreInitParamsBinding(), _slots(ComponentType.MAMBA)
+            mem_cache.TreeCoreInitParamsBinding(torch.empty(0, dtype=torch.int64)),
+            _slots(ComponentType.MAMBA),
         )
 
 
 def test_swa_requires_the_sliding_window_size():
     with pytest.raises(ValueError, match="requires swa_sliding_window_size"):
         mem_cache.RustUnifiedTreeCoreBinding(
-            mem_cache.TreeCoreInitParamsBinding(),
+            mem_cache.TreeCoreInitParamsBinding(torch.empty(0, dtype=torch.int64)),
             _slots(ComponentType.FULL, ComponentType.SWA),
         )
 
@@ -3124,7 +3146,7 @@ def _swa_cache(
         ServerArgs(model_path="dummy", page_size=page_size)
     )
     req_to_token_pool = ReqToTokenPool(
-        size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+        size=4, row_width=64, device="cpu", enable_memory_saver=False
     )
     kv_pool = SWAKVPool(
         size=64,
@@ -4808,7 +4830,9 @@ def test_kv_canary_rows_exclude_mamba_slots():
 
 def test_component_set_guard_accepts_the_mamba_set():
     mem_cache.RustUnifiedTreeCoreBinding(
-        mem_cache.TreeCoreInitParamsBinding(mamba_cache_chunk_size=256),
+        mem_cache.TreeCoreInitParamsBinding(
+            torch.empty(0, dtype=torch.int64), mamba_cache_chunk_size=256
+        ),
         _slots(ComponentType.FULL, ComponentType.MAMBA),
     )
 
@@ -4816,7 +4840,9 @@ def test_component_set_guard_accepts_the_mamba_set():
 def test_component_set_guard_accepts_the_hybrid_swa_mamba_set():
     mem_cache.RustUnifiedTreeCoreBinding(
         mem_cache.TreeCoreInitParamsBinding(
-            swa_sliding_window_size=8, mamba_cache_chunk_size=256
+            torch.empty(0, dtype=torch.int64),
+            swa_sliding_window_size=8,
+            mamba_cache_chunk_size=256,
         ),
         _slots(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
     )
@@ -4862,7 +4888,9 @@ def test_component_set_guard_still_rejects_invalid_sets():
         with pytest.raises(ValueError, match="slot families"):
             mem_cache.RustUnifiedTreeCoreBinding(
                 mem_cache.TreeCoreInitParamsBinding(
-                    swa_sliding_window_size=8, mamba_cache_chunk_size=256
+                    torch.empty(0, dtype=torch.int64),
+                    swa_sliding_window_size=8,
+                    mamba_cache_chunk_size=256,
                 ),
                 _slots(*components),
             )
@@ -4874,20 +4902,23 @@ def test_a_slot_takes_the_driver_of_its_family():
     with pytest.raises(ValueError, match="driver serves slot"):
         mem_cache.RustUnifiedTreeCoreBinding(
             mem_cache.TreeCoreInitParamsBinding(
-                swa_sliding_window_size=8, mamba_cache_chunk_size=256
+                torch.empty(0, dtype=torch.int64),
+                swa_sliding_window_size=8,
+                mamba_cache_chunk_size=256,
             ),
             [(int(ComponentType.FULL), "token"), (int(ComponentType.MAMBA), "window")],
         )
     with pytest.raises(ValueError, match="unknown tree slot family"):
         mem_cache.RustUnifiedTreeCoreBinding(
-            mem_cache.TreeCoreInitParamsBinding(), [(int(ComponentType.FULL), "full")]
+            mem_cache.TreeCoreInitParamsBinding(torch.empty(0, dtype=torch.int64)),
+            [(int(ComponentType.FULL), "full")],
         )
 
 
 def test_mamba_requires_the_chunk_size_through_the_binding():
     with pytest.raises(ValueError, match="requires mamba_cache_chunk_size"):
         mem_cache.RustUnifiedTreeCoreBinding(
-            mem_cache.TreeCoreInitParamsBinding(),
+            mem_cache.TreeCoreInitParamsBinding(torch.empty(0, dtype=torch.int64)),
             _slots(ComponentType.FULL, ComponentType.MAMBA),
         )
 
@@ -6159,7 +6190,7 @@ def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
     # release_kv_cache reads the serving config off the published bags.
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
     req_to_token_pool = ReqToTokenPool(
-        size=2, max_context_len=16, device="cpu", enable_memory_saver=False
+        size=2, row_width=16, device="cpu", enable_memory_saver=False
     )
     allocator = TokenToKVPoolAllocator(
         size=16, dtype=torch.float32, device="cpu", kvcache=None, need_sort=False
@@ -6209,7 +6240,10 @@ if __name__ == "__main__":
 def test_load_back_action_tuple_preserves_chunk_order_and_tensor_ownership():
     binding = mem_cache.RustUnifiedTreeCoreBinding(
         mem_cache.TreeCoreInitParamsBinding(
-            page_size=1, swa_sliding_window_size=8, enable_hicache=True
+            torch.empty(0, dtype=torch.int64),
+            page_size=1,
+            swa_sliding_window_size=8,
+            enable_hicache=True,
         ),
         _slots(ComponentType.FULL, ComponentType.SWA),
     )

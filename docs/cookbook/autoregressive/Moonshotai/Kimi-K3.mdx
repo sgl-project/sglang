@@ -39,8 +39,8 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 <Tab title="NPU">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:main-cann9.1.0-a3   # Ascend A3 Series
-docker pull lmsysorg/sglang:main-cann9.1.0-950        # Ascend 950PR/DT Series
+docker pull quay.io/ascend/sglang:main-cann9.2.0-a3   # Ascend A3 Series
+docker pull lmsysorg/sglang:main-cann9.2.0-950        # Ascend 950PR/DT Series
 ```
 
 For host and platform setup, see the
