@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV: bool = False
     SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION: bool = False
     SGLANG_DIFFUSION_TORCH_PROFILER_DIR: str | None = None
+    SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING: bool = False
     SGLANG_DIFFUSION_CACHE_ROOT: str = os.path.expanduser("~/.cache/sgl_diffusion")
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
@@ -300,6 +301,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # profiling. Falls back to SGLANG_TORCH_PROFILER_DIR, then ./logs.
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
         "SGLANG_DIFFUSION_TORCH_PROFILER_DIR"
+    ),
+    # Opt-in for per-request torch profiling over HTTP (profile /
+    # profile_all_stages / num_profiled_timesteps). Off by default so a client
+    # cannot make the server write unbounded profiler traces to disk; the
+    # CLI and Python API (--profile) are not affected.
+    "SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING"
     ),
     # Kill-switch for the courier thread that ships checkpoint-mapped layers to
     # the device off the compute thread. The courier already falls back to the

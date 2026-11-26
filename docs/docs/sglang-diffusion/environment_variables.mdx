@@ -54,6 +54,11 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Directory for the torch profiler traces of requests that ask for profiling (<code>profile</code> / <code>--profile</code>); it does not enable profiling by itself. Falls back to <code>SGLANG_TORCH_PROFILER_DIR</code>, then <code>./logs</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Allow HTTP inference requests to enable per-request torch profiling with <code>profile</code>, <code>profile_all_stages</code>, and <code>num_profiled_timesteps</code>. When unset, requests that set these fields are rejected with <code>400</code> so a client cannot make the server write profiler traces to disk. CLI and Python API profiling (<code>--profile</code>) is not affected.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_CACHE_ROOT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>~/.cache/sgl_diffusion</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Root directory for cache files</td>

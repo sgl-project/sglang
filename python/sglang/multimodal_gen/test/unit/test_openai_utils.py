@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size_or_raise,
     _save_upload_to_path,
     _validate_positive_int,
+    _validate_request_profiling,
     build_sampling_params,
     process_generation_batch,
     request_field_value,
@@ -357,3 +358,93 @@ def test_build_sampling_params_resolves_size_and_explicit_dimensions(monkeypatch
         build_sampling_params("request-id", **request_fields)
 
         assert (captured["width"], captured["height"]) == expected
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"profile": True},
+        {"profile_all_stages": True},
+        {"num_profiled_timesteps": 3},
+        {"profile": True, "num_profiled_timesteps": -1, "profile_all_stages": True},
+    ],
+)
+def test_validate_request_profiling_rejects_when_disabled(monkeypatch, kwargs):
+    monkeypatch.delenv("SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING", raising=False)
+
+    with pytest.raises(Exception) as exc_info:
+        _validate_request_profiling(kwargs)
+
+    assert exc_info.value.status_code == 400
+    assert "SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING" in exc_info.value.detail
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"profile": False},
+        {"profile": False, "profile_all_stages": False, "num_profiled_timesteps": None},
+    ],
+)
+def test_validate_request_profiling_allows_no_profiling_request(monkeypatch, kwargs):
+    monkeypatch.delenv("SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING", raising=False)
+
+    _validate_request_profiling(kwargs)
+
+
+@pytest.mark.parametrize("num_steps", [-1, 0, 5, 1000])
+def test_validate_request_profiling_allows_when_enabled(monkeypatch, num_steps):
+    monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING", "1")
+
+    _validate_request_profiling({"profile": True, "num_profiled_timesteps": num_steps})
+
+
+@pytest.mark.parametrize("num_steps", [-2, 1001, "3", 3.5, True])
+def test_validate_request_profiling_bounds_num_profiled_timesteps(
+    monkeypatch, num_steps
+):
+    monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING", "1")
+
+    with pytest.raises(Exception) as exc_info:
+        _validate_request_profiling(
+            {"profile": True, "num_profiled_timesteps": num_steps}
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "num_profiled_timesteps" in exc_info.value.detail
+
+
+def test_build_sampling_params_rejects_profiling_when_disabled(monkeypatch):
+    monkeypatch.delenv("SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING", raising=False)
+    server_args = SimpleNamespace(model_path="zai-org/GLM-Image")
+    monkeypatch.setattr(openai_utils, "get_global_server_args", lambda: server_args)
+
+    with pytest.raises(Exception) as exc_info:
+        build_sampling_params("request-id", prompt="a cat", profile=True)
+
+    assert exc_info.value.status_code == 400
+
+
+def test_build_sampling_params_forwards_profiling_when_enabled(monkeypatch):
+    monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING", "1")
+    server_args = SimpleNamespace(model_path="zai-org/GLM-Image")
+    monkeypatch.setattr(openai_utils, "get_global_server_args", lambda: server_args)
+    captured = {}
+
+    def fake_from_user_sampling_params_args(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_user_sampling_params_args",
+        fake_from_user_sampling_params_args,
+    )
+
+    build_sampling_params(
+        "request-id", prompt="a cat", profile=True, num_profiled_timesteps=3
+    )
+
+    assert captured["profile"] is True
+    assert captured["num_profiled_timesteps"] == 3
