@@ -1,8 +1,23 @@
-from typing import Any
+from typing import Any, TypedDict
 
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+# config.json architectures of the target model; looped checkpoints use the second.
+INKLING2_ARCHS = (
+    "Inkling2ForConditionalGeneration",
+    "Inkling2LoopForConditionalGeneration",
+)
+
+
+class Inkling2LoopConfig(TypedDict):
+    core_start: int
+    core_end: int
+    num_passes: int
+    gate_rank: int
+    # True when the checkpoint was trained to run any number of passes.
+    is_varloop: bool
 
 
 class Inkling2ModelConfig(InklingModelConfig):
@@ -21,6 +36,10 @@ class Inkling2ModelConfig(InklingModelConfig):
         attn_res_normalize_values: bool = True,
         mlp_gate_softcap: float = 4.0,
         mlp_up_softcap: float = 25.0,
+        loop_config: Inkling2LoopConfig | None = None,
+        # What the checkpoint writes between <|message_model|> and <|content_invoke_tool_json|>;
+        # the default of --inkling2-tool-call-author-name-mode.
+        tool_call_author_name_mode: str = "tool_name",
         **kwargs: Any,
     ) -> None:
         fixed = dict(
@@ -68,6 +87,13 @@ class Inkling2ModelConfig(InklingModelConfig):
         self.attn_res_normalize_values = attn_res_normalize_values
         self.mlp_gate_softcap = mlp_gate_softcap
         self.mlp_up_softcap = mlp_up_softcap
+        self.loop_config = loop_config
+        if tool_call_author_name_mode not in ("tool_name", "independent", "drop_name"):
+            raise ValueError(
+                "tool_call_author_name_mode must be 'tool_name', 'independent' or "
+                f"'drop_name', got {tool_call_author_name_mode!r}"
+            )
+        self.tool_call_author_name_mode = tool_call_author_name_mode
         if mlp_gate_softcap < 0 or mlp_up_softcap < 0:
             raise ValueError("MLP softcaps must be nonnegative")
         if not 0 < n_layers_per_attn_res_block <= self.num_hidden_layers:
@@ -84,10 +110,110 @@ class Inkling2ModelConfig(InklingModelConfig):
             )
         if qk_l2_clip_threshold <= 0 or rel_l2_clip_threshold <= 0:
             raise ValueError("L2 clipping thresholds must be positive")
+        if loop_config is not None:
+            self._validate_loop_config(loop_config)
+        self.loop_share_cache = False
+        self._set_cache_layout()
+
+    def configure_loop(self, *, num_passes: int | None, share_cache: bool) -> None:
+        """Override the pass count or share KV across passes (variable-loop only)."""
+        if self.loop_config is None or not self.loop_config["is_varloop"]:
+            raise ValueError(
+                "--inkling2-loop-num-passes and --inkling2-loop-share-cache need a "
+                "checkpoint with loop_config.is_varloop=true"
+            )
+        if num_passes is not None:
+            self._check_num_passes(num_passes)
+            self.loop_config = {**self.loop_config, "num_passes": num_passes}
+        self.loop_share_cache = share_cache
+        self._set_cache_layout()
+
+    def _set_cache_layout(self) -> None:
+        # Each extra core pass gets its own KV cache layers, appended after the
+        # physical layers, unless the passes share them (see cache_layer_id).
+        cache_layers = list(range(self.num_hidden_layers))
+        if self.loop_config is not None and not self.loop_share_cache:
+            cache_layers += list(self.loop_core_layers) * (
+                self.loop_config["num_passes"] - 1
+            )
+        self.num_attention_layers = len(cache_layers)
         self.is_hybrid_swa = True
         self.hybrid_layer_pattern = [
-            int(i in self.local_layer_ids) for i in range(self.num_hidden_layers)
+            int(i in self.local_layer_ids) for i in cache_layers
         ]
+
+    def _validate_loop_config(self, loop_config: Inkling2LoopConfig) -> None:
+        if not self.attn_res_normalize_values:
+            raise ValueError("Loop K/V messages require attn_res_normalize_values=True")
+        int_fields = {"core_start", "core_end", "num_passes", "gate_rank"}
+        if (
+            set(loop_config) != int_fields | {"is_varloop"}
+            or any(type(loop_config[name]) is not int for name in int_fields)
+            or type(loop_config["is_varloop"]) is not bool
+        ):
+            raise ValueError(
+                f"loop_config requires integer fields {sorted(int_fields)} and a "
+                f"boolean is_varloop, got {loop_config}"
+            )
+        start, end = loop_config["core_start"], loop_config["core_end"]
+        if not 0 <= start < end <= self.num_hidden_layers:
+            raise ValueError(
+                f"Loop core [{start}, {end}) must lie within "
+                f"{self.num_hidden_layers} physical layers"
+            )
+        block = self.n_layers_per_attn_res_block
+        if start % block or end % block:
+            raise ValueError(
+                f"Loop core [{start}, {end}) must align with attention residual "
+                f"blocks of {block} layers"
+            )
+        if loop_config["gate_rank"] <= 0:
+            raise ValueError(f"Looping requires gate_rank > 0, got {loop_config}")
+        self._check_num_passes(loop_config["num_passes"])
+
+    def _check_num_passes(self, num_passes: int) -> None:
+        min_passes = 1 if self.loop_config["is_varloop"] else 2
+        if type(num_passes) is not int or num_passes < min_passes:
+            raise ValueError(
+                f"This loop checkpoint needs at least {min_passes} passes, "
+                f"got {num_passes!r}"
+            )
+
+    @property
+    def loop_core_layers(self) -> range:
+        loop = self.loop_config
+        return range(0) if loop is None else range(loop["core_start"], loop["core_end"])
+
+    @property
+    def num_layer_visits(self) -> int:
+        if self.loop_config is None:
+            return self.num_hidden_layers
+        extra_passes = self.loop_config["num_passes"] - 1
+        return self.num_hidden_layers + extra_passes * len(self.loop_core_layers)
+
+    def cache_layer_id(self, layer_id: int, pass_idx: int = 0) -> int:
+        """KV cache layer of a layer visit; shared caches reuse the physical layer."""
+        if self.loop_share_cache:
+            return layer_id
+        return self.conv_layer_id(layer_id, pass_idx)
+
+    def conv_layer_id(self, layer_id: int, pass_idx: int = 0) -> int:
+        """Conv-state layer of a layer visit; every visit keeps its own."""
+        if pass_idx == 0:
+            return layer_id
+        core = self.loop_core_layers
+        assert layer_id in core and 0 < pass_idx < self.loop_config["num_passes"]
+        return (
+            self.num_hidden_layers + (pass_idx - 1) * len(core) + layer_id - core.start
+        )
+
+    @property
+    def conv_layer_ids(self) -> list[int]:
+        return list(range(self.num_layer_visits))
+
+    @property
+    def full_attention_layer_ids(self) -> list[int]:
+        return list(range(self.num_attention_layers))
 
 
 class Inkling2MMConfig(InklingMMConfig):
@@ -107,6 +233,14 @@ class Inkling2MMConfig(InklingMMConfig):
             if isinstance(text_config, Inkling2ModelConfig)
             else Inkling2ModelConfig(**(text_config or {}))
         )
+        # transformers builds a default instance (no text_config) to diff against.
+        if text_config is not None and (self.text_config.loop_config is not None) != (
+            self.model_type == "inkling2_loop"
+        ):
+            raise ValueError(
+                "Looped Inkling2 checkpoints use model_type inkling2_loop with a "
+                f"loop_config; got model_type {self.model_type!r}"
+            )
         self.vision_config = vision_config
         self.mtp_config = mtp_config
         # The Hub config.json carries a quantization_config stub (modelopt for NVFP4,
@@ -116,6 +250,27 @@ class Inkling2MMConfig(InklingMMConfig):
         if isinstance(stub, dict) and stub.get("quant_method") in ("modelopt", "fp8"):
             del kwargs["quantization_config"]
         PretrainedConfig.__init__(self, **kwargs)
+
+
+class Inkling2LoopMMConfig(Inkling2MMConfig):
+    model_type = "inkling2_loop"
+
+    # transformers generates __init__ for config subclasses that define none,
+    # which would skip building text_config.
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
+    def configure_loop(self, *, num_passes: int | None, share_cache: bool) -> None:
+        self.text_config.configure_loop(num_passes=num_passes, share_cache=share_cache)
+
+
+def inkling2_config_from_dict(config: dict[str, Any]) -> Inkling2MMConfig:
+    cls = (
+        Inkling2LoopMMConfig
+        if config.get("model_type") == "inkling2_loop"
+        else Inkling2MMConfig
+    )
+    return cls(**config)
 
 
 class Inkling2MTPConfig(PretrainedConfig):
@@ -169,15 +324,16 @@ class Inkling2MTPConfig(PretrainedConfig):
         ):
             raise ValueError("MTP local_layer_ids must be unique valid layer indices")
         features = draft["target_layer_ids"]
+        num_visits = text.num_layer_visits
         if (
             len(features) < 2
             or features != sorted(set(features))
-            or features[-1] != text.num_hidden_layers
-            or any(i < 0 or i >= text.num_hidden_layers for i in features[:-1])
+            or features[-1] != num_visits
+            or any(i < 0 or i >= num_visits for i in features[:-1])
         ):
             raise ValueError(
-                "MTP target_layer_ids must contain sorted unique target layer indices "
-                "followed by the final-norm sentinel num_hidden_layers"
+                "MTP target_layer_ids must contain sorted unique target layer visits "
+                f"followed by the final-norm sentinel {num_visits}, got {features}"
             )
         if draft["num_attention_heads"] % draft["num_key_value_heads"]:
             raise ValueError("MTP query heads must be divisible by KV heads")
@@ -204,7 +360,7 @@ class Inkling2MTPConfig(PretrainedConfig):
             mask_token_id=0,
             dflash_config=dict(
                 block_size=draft["block_size"],
-                num_target_layers=text.num_hidden_layers,
+                num_target_layers=num_visits,
                 target_layer_ids=list(features[:-1]),
             ),
         )
