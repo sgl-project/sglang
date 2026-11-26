@@ -436,6 +436,7 @@ for _fn in (
 for _fn in (
     "route_topk_meta_lowm",
     "route_metadata_lowm",
+    "nvfp4_quant_dedup_lowm",
     "moe_combine_bf16",
 ):
     register_kernel(
