@@ -433,6 +433,7 @@ def test_bootstrap_failure_releases_kept_rows_before_admission(kept_rows):
     scheduler = _admission_scheduler()
     scheduler.process_pending_chunked_abort = Mock()
     scheduler._process_hicache_events = Mock()
+    scheduler.enable_hicache_storage = False
     scheduler.resolve_waiting_queue_bootstrap = Mock()
 
     def bootstrap_failed(last_batch, running_batch):
@@ -513,10 +514,18 @@ def test_weights_only_memory_release_drops_kept_rows(kept_rows):
             # shows the release comes from the manager itself.
             flush_cache=Mock(return_value=True),
             is_fully_idle=lambda **kwargs: True,
-            scheduler=SimpleNamespace(_engine_paused=False),
         )
 
-    with patch("torch.get_device_module"):
+    weight_updater = "sglang.srt.managers.scheduler_components.weight_updater"
+    with (
+        # One rank, whose gather returns its own verdict.
+        patch(
+            f"{weight_updater}.control_request_all_gather_object",
+            side_effect=lambda obj: [obj],
+        ),
+        patch(f"{weight_updater}.control_request_barrier"),
+        patch("torch.get_device_module"),
+    ):
         manager.release_memory_occupation(
             ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH])
         )
