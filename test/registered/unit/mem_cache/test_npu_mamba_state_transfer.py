@@ -60,7 +60,9 @@ class TestNPUMambaStateTransfer(unittest.TestCase):
         for draft, layer in ((False, 1), (True, 2)):
             with self.subTest(draft=draft):
                 pool = _pool(draft=draft)
-                with patch.object(mamba, "transfer_kv_per_layer_direct_pf_lf") as op:
+                with patch.object(
+                    mamba, "transfer_kv_per_layer_direct_pf_lf", create=True
+                ) as op:
                     _load(pool, layer)
                 self.assertEqual(op.call_count, 2)  # temporal and conv
                 for call in op.call_args_list:
@@ -82,7 +84,9 @@ class TestNPUMambaStateTransfer(unittest.TestCase):
         for draft in (False, True):
             with self.subTest(draft=draft):
                 pool = _pool(draft=draft)
-                with patch.object(mamba, "transfer_kv_all_layer_direct_lf_pf") as op:
+                with patch.object(
+                    mamba, "transfer_kv_all_layer_direct_lf_pf", create=True
+                ) as op:
                     _backup(pool)
                 self.assertEqual(op.call_count, 2)
                 for call in op.call_args_list:
@@ -108,8 +112,8 @@ class TestNPUMambaStateTransfer(unittest.TestCase):
                 pool = _pool(side_shape=shape)
                 pool.slot_state_buffers[0][1].fill_(7)
                 with (
-                    patch.object(mamba, "transfer_kv_per_layer_direct_pf_lf"),
-                    patch.object(mamba, "transfer_kv_all_layer_direct_lf_pf"),
+                    patch.object(mamba, "transfer_kv_per_layer_direct_pf_lf", create=True),
+                    patch.object(mamba, "transfer_kv_all_layer_direct_lf_pf", create=True),
                 ):
                     _load(pool)
                     self.assertTrue(
@@ -130,7 +134,7 @@ class TestNPUMambaStateTransfer(unittest.TestCase):
             kw["dst"].index_fill_(0, kw["dst_indices"], 7)
 
         with patch.object(
-            mamba, "transfer_kv_per_layer_direct_pf_lf", side_effect=copy
+            mamba, "transfer_kv_per_layer_direct_pf_lf", side_effect=copy, create=True
         ) as op:
             _load(pool, 1)
         self.assertEqual(op.call_args_list[0].kwargs["dst"].stride(0), 8)
@@ -144,7 +148,9 @@ class TestNPUMambaStateTransfer(unittest.TestCase):
         pool.buffer_info = MambaStateBufferInfo(
             temporal=wide[:, ::2], conv=pool.buffer_info.conv
         )
-        with patch.object(mamba, "transfer_kv_all_layer_direct_lf_pf") as op:
+        with patch.object(
+            mamba, "transfer_kv_all_layer_direct_lf_pf", create=True
+        ) as op:
             _backup(pool)
         source = op.call_args_list[0].kwargs["device_states"][0]
         self.assertEqual(source.shape, (2, 1, 2, 4))

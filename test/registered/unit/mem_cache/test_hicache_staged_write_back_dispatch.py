@@ -52,6 +52,7 @@ MEMORY_POOL_HOST_MODULE = "sglang.srt.mem_cache.memory_pool_host"
 DSA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.dsa"
 MHA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mha"
 MLA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mla"
+MAMBA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mamba"
 
 
 def _indices(start: int, end: int) -> torch.Tensor:
@@ -1019,22 +1020,52 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host.temporal_device_ptrs = torch.empty(0, dtype=torch.uint64)
         host.conv_device_ptrs = [torch.empty(0, dtype=torch.uint64)]
 
-        host.backup_from_device_all_layer(
-            device_pool,
-            host_indices,
-            device_indices,
-            io_backend="kernel_ascend",
-        )
-        device_pool.mamba_cache.temporal.zero_()
-        device_pool.mamba_cache.conv[0].zero_()
-        for layer_id in range(num_layers):
-            host.load_to_device_per_layer(
+        def copy_to_host(
+            *, device_states, host_states, device_indices, host_indices, impl
+        ):
+            self.assertEqual(impl, "auto")
+            for device, host_buffer in zip(device_states, host_states):
+                values = device.index_select(1, device_indices).transpose(0, 1)
+                host_buffer.index_copy_(0, host_indices, values.unsqueeze(2))
+
+        def copy_to_device(*, src, dst, src_indices, dst_indices, layer_id, impl):
+            self.assertEqual(impl, "auto")
+            values = src.index_select(0, src_indices)[:, layer_id, 0]
+            dst.index_copy_(0, dst_indices, values)
+
+        # CPU CI has no NPU imports. Emulate the two transfer operations while
+        # retaining the roundtrip data checks below.
+        with (
+            mock.patch(
+                f"{MAMBA_POOL_HOST_MODULE}.transfer_kv_all_layer_direct_lf_pf",
+                side_effect=copy_to_host,
+                create=True,
+            ) as d2h_op,
+            mock.patch(
+                f"{MAMBA_POOL_HOST_MODULE}.transfer_kv_per_layer_direct_pf_lf",
+                side_effect=copy_to_device,
+                create=True,
+            ) as h2d_op,
+        ):
+            host.backup_from_device_all_layer(
                 device_pool,
                 host_indices,
                 device_indices,
-                layer_id,
                 io_backend="kernel_ascend",
             )
+            device_pool.mamba_cache.temporal.zero_()
+            device_pool.mamba_cache.conv[0].zero_()
+            for layer_id in range(num_layers):
+                host.load_to_device_per_layer(
+                    device_pool,
+                    host_indices,
+                    device_indices,
+                    layer_id,
+                    io_backend="kernel_ascend",
+                )
+
+        self.assertEqual(d2h_op.call_count, 2)
+        self.assertEqual(h2d_op.call_count, 2 * num_layers)
 
         self.assertTrue(
             torch.equal(
