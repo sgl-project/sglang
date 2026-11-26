@@ -644,6 +644,8 @@ class GenerateReqInput:
             self.sampling_params = self.sampling_params.copy()
         if self.rid is None:
             self.rid = uuid.uuid4().hex
+        elif not isinstance(self.rid, str):
+            raise ValueError("rid should be a string for a single request.")
         if self.return_logprob is None:
             self.return_logprob = False
         if self.logprob_start_len is None:
@@ -1525,6 +1527,8 @@ class EmbeddingReqInput:
         if self.is_single:
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
+            elif not isinstance(self.rid, str):
+                raise ValueError("rid should be a string for a single request.")
             if self.sampling_params is None:
                 self.sampling_params = {}
             else:
@@ -3035,12 +3039,12 @@ def msgpack_decode(data: bytes) -> Any:
     return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
 
 
-def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0):
+    """Return enqueue completion for async sockets; sync sockets return None."""
     if _USE_PICKLE_IPC:
-        socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
-        return
+        return socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
 
-    socket.send(msgpack_encode(obj), flags=flags)
+    return socket.send(msgpack_encode(obj), flags=flags)
 
 
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:

@@ -55,6 +55,47 @@ class TestWanTI2VHelpers(unittest.TestCase):
         torch.testing.assert_close(batch.latents[:, :, :1], image_latent)
         torch.testing.assert_close(batch.latents[:, :, 1:], latents[:, :, 1:])
 
+    def test_conditioning_mask_covers_every_output_of_n_gt_1(self):
+        # n > 1 gives one latent per output against a single conditioning image.
+        latents = torch.arange(2 * 2 * 3 * 4 * 4).reshape(2, 2, 3, 4, 4).float()
+        image_latent = torch.full((1, 2, 1, 4, 4), 0.25)
+        vae = SimpleNamespace(
+            encode=lambda image: SimpleNamespace(mean=image_latent),
+            scaling_factor=1.0,
+            shift_factor=None,
+        )
+        batch = SimpleNamespace(
+            image_latent=None,
+            condition_image=torch.zeros(1, 3, 1, 64, 64),
+            num_frames=9,
+            height=64,
+            width=64,
+        )
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_ti2v.get_local_torch_device",
+                return_value="cpu",
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_ti2v.get_sp_world_size",
+                return_value=1,
+            ),
+        ):
+            _, _, masks = prepare_wan_ti2v_latents(
+                vae,
+                latents,
+                torch.bfloat16,
+                torch.float32,
+                batch,
+                SimpleNamespace(pipeline_config=Wan2_2_TI2V_5B_Config()),
+            )
+        self.assertEqual(masks[0].shape, (2, 3, 4, 4))
+        self.assertEqual(batch.latents.shape, latents.shape)
+        torch.testing.assert_close(
+            batch.latents[:, :, :1], image_latent.expand(2, -1, -1, -1, -1)
+        )
+        torch.testing.assert_close(batch.latents[:, :, 1:], latents[:, :, 1:])
+
     def test_sp_mask_is_padded_before_sharding(self):
         mask = torch.ones(1, 21, 4, 4)
         mask[:, 0] = 0
