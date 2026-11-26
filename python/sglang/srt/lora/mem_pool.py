@@ -685,21 +685,16 @@ class LoRAMemoryPool:
 
         def init_embedding_buffer(
             buffer: Dict[str, torch.Tensor],
-            target_modules: Set[str],
-            get_lora_shape_fn: Callable[[int], Tuple[int]],
+            module_name: str,
+            get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
         ):
-            target_modules = target_modules & set(EMBEDDING_NAMES)
-            for module_name in target_modules:
-                buffer[module_name] = torch.zeros(
-                    get_lora_shape_fn(
-                        module_name,
-                        base_model,
-                        self.max_lora_rank,
-                        0,
-                    ),
-                    dtype=self.dtype,
-                    device=device,
-                )
+            if module_name not in self.target_modules:
+                return
+            buffer[module_name] = torch.zeros(
+                get_lora_shape_fn(module_name, base_model, self.max_lora_rank, 0),
+                dtype=self.dtype,
+                device=device,
+            )
 
         if self.lora_added_tokens_size > 0 and self.has_embed_tokens_lora:
             self.new_embeddings_buffer["input_embeddings"] = torch.zeros(
@@ -715,26 +710,26 @@ class LoRAMemoryPool:
         if self.has_embed_tokens_lora:
             init_embedding_buffer(
                 self.embedding_A_buffer,
-                self.target_modules,
+                "embed_tokens",
                 self.get_embedding_lora_A_shape,
             )
 
             init_embedding_buffer(
                 self.embedding_B_buffer,
-                self.target_modules,
+                "embed_tokens",
                 self.get_embedding_lora_B_shape,
             )
 
         if self.has_lm_head_lora:
             init_embedding_buffer(
                 self.lm_head_A_buffer,
-                self.target_modules,
+                "lm_head",
                 self.get_embedding_lora_A_shape,
             )
 
             init_embedding_buffer(
                 self.lm_head_B_buffer,
-                self.target_modules,
+                "lm_head",
                 self.get_embedding_lora_B_shape,
             )
 

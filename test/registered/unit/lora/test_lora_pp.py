@@ -314,6 +314,18 @@ def _load_into_mem_pool(pool, uid, adapter):
 
 
 class TestStagePool(CustomTestCase):
+    def test_embedding_buffers_only_allocate_their_own_target(self):
+        """Targeting both vocabulary modules allocates only one A/B pair each."""
+        pool = _stage_pool(layers=range(NUM_LAYERS), embed_tokens=True, lm_head=True)
+        for buffer_name, target in (
+            ("embedding_A_buffer", "embed_tokens"),
+            ("embedding_B_buffer", "embed_tokens"),
+            ("lm_head_A_buffer", "lm_head"),
+            ("lm_head_B_buffer", "lm_head"),
+        ):
+            with self.subTest(buffer_name=buffer_name):
+                self.assertEqual(set(getattr(pool, buffer_name)), {target})
+
     def test_hybrid_mlp_allocates_dense_and_expert_buffers_on_local_stage(self):
         """A dense prefix needs 3D buffers even without shared experts; off-stage
         layers must still be left unallocated."""
