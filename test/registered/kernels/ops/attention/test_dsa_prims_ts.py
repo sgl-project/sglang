@@ -5,8 +5,9 @@ and the DCP combine must merge them base e."""
 
 from __future__ import annotations
 
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import torch
@@ -131,6 +132,32 @@ class TestShardedDcpPrimsTs(CustomTestCase):
         # Past the exact-plan limit: power-of-two packed capacity with qo_indptr.
         self._check_dcp8_partials_merge_to_full(rows=_EXACT_PLAN_MAX_ROWS + 1)
 
+    def test_prepare_compiles_every_kernel_before_serving(self):
+        """After prepare() a forward of any row count up to max_rows compiles nothing."""
+        self._require_prims_ts()
+        from flashinfer.attention.prims_ts import mla_decode
+
+        heads, max_rows = 96, _EXACT_PLAN_MAX_ROWS + 1
+        runner = PrimsTSSparseMLA(torch.device("cuda"))
+        runner.prepare(heads=heads, max_rows=max_rows, width=TOPK)
+        misses = mla_decode._get_compiled_mla_decode.cache_info().misses
+        gen = torch.Generator(device="cuda").manual_seed(5)
+        kv = (torch.randn(4096, DIM, generator=gen, device="cuda") * 0.5).to(FP8)
+        for rows in (1, 5, 24, 153, _EXACT_PLAN_MAX_ROWS, max_rows):
+            runner.forward(
+                q=torch.randn(rows, heads, DIM, generator=gen, device="cuda").to(FP8),
+                kv_cache=kv,
+                indices=torch.randint(
+                    0, 4096, (rows, TOPK), generator=gen, device="cuda"
+                ).int(),
+                lengths=torch.full((rows,), TOPK, device="cuda", dtype=torch.int32),
+                sm_scale=SM_SCALE,
+                kv_scale=1.0,
+            )
+        self.assertEqual(
+            mla_decode._get_compiled_mla_decode.cache_info().misses, misses
+        )
+
 
 class TestPrimsTsDcpLseBase(CustomTestCase):
     """Prims-TS partials carry a natural-log LSE, and the DCP combine picks the LSE
@@ -167,6 +194,44 @@ class TestPrimsTsDcpLseBase(CustomTestCase):
             _validate_prims_ts_dcp(dcp_size=2, shards_index_k=False)
         # Without DCP there is no merge.
         _validate_prims_ts_dcp(dcp_size=1, shards_index_k=False)
+
+
+# CPU torch: no stream is capturing.
+@mock.patch.object(torch.cuda, "is_current_stream_capturing", new=lambda: False)
+class TestPrimsTsPrepare(CustomTestCase):
+    """prepare() plans every plan key a launch of up to max_rows rows can use, so
+    serving plans nothing prepare() did not. A stand-in FlashInfer records plans."""
+
+    def test_prepare_plans_every_key_forward_can_plan(self):
+        planned = []
+
+        class Wrapper:
+            def plan(self, *args, **kwargs):
+                planned.append((args, tuple(sorted(kwargs.items()))))
+
+            def run(self, *args, **kwargs):
+                pass
+
+        names = ("flashinfer", "flashinfer.attention", "flashinfer.attention.prims_ts")
+        modules = {name: ModuleType(name) for name in names}
+        modules[names[-1]].BatchSparseMLADecodePagedTSWrapper = Wrapper
+        heads, max_rows = 12, 2 * _EXACT_PLAN_MAX_ROWS + 1
+        runner = PrimsTSSparseMLA(torch.device("cpu", 0))
+        with mock.patch.dict(sys.modules, modules):
+            runner.prepare(heads=heads, max_rows=max_rows, width=TOPK)
+            prepared = set(planned)
+            self.assertEqual(len(prepared), len(planned))
+            self.assertEqual(runner._plans, {})
+            for rows in range(1, max_rows + 1):
+                runner.forward(
+                    q=torch.empty(1, heads, DIM, dtype=FP8).expand(rows, -1, -1),
+                    kv_cache=torch.empty(1, DIM, dtype=FP8),
+                    indices=torch.empty(1, TOPK, dtype=torch.int32).expand(rows, -1),
+                    lengths=torch.empty(1, dtype=torch.int32).expand(rows),
+                    sm_scale=SM_SCALE,
+                    kv_scale=1.0,
+                )
+        self.assertEqual(set(planned), prepared)
 
 
 if __name__ == "__main__":
