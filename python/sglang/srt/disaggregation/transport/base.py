@@ -29,7 +29,13 @@ class BufferKey(ABC):
 
 
 class RemoteBuffers:
-    """Opaque peer registration passed to write(); compared by identity."""
+    """Opaque result of import_buffers(), passed to write() and release_remote();
+    compared by identity."""
+
+
+class BufferExport:
+    """Opaque description of registered buffers from export_buffers(); the
+    protocol carries it to the peer, which passes it to import_buffers()."""
 
 
 class Handle:
@@ -80,6 +86,26 @@ class Transport(ABC):
     def deregister(self, keys: Sequence[BufferKey]) -> None:
         """Unregister `keys`, preserving regions still used by other keys.
         Leave backing memory allocated and the Transport usable."""
+
+    # Not abstract: a backend whose protocol still exchanges registrations
+    # itself does not implement the next three.
+    def export_buffers(self, keys: Sequence[BufferKey]) -> BufferExport:
+        """Describe the buffers registered under `keys`, in that order, for a
+        peer to write into. Covers registrations made before the call."""
+        raise NotImplementedError
+
+    def import_buffers(
+        self, desc: BufferExport, keys: Sequence[BufferKey]
+    ) -> RemoteBuffers:
+        """Import a peer's export_buffers() result. `keys` names the peer's
+        buffers for write(), in the peer's export order."""
+        raise NotImplementedError
+
+    def release_remote(self, remote: RemoteBuffers) -> None:
+        """Drop the state import_buffers() created for `remote`; later imports
+        of the same peer stay usable. The caller ensures no write to `remote`
+        can still access memory."""
+        raise NotImplementedError
 
     @abstractmethod
     def write(
