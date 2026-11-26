@@ -2419,8 +2419,8 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         with patch(
             "sglang.srt.layers.dp_attention.get_eager_max_batch_size", return_value=16
         ):
-            # 10 logical slots cost 16 physical banks plus the reserved tail.
-            self.assertEqual(layout.pair_state_rows(10, 8), 144)
+            # 10 logical slots cost 16 physical banks, aligned to one ring.
+            self.assertEqual(layout.pair_state_banks(10, 8), (16, 8))
 
 
 if __name__ == "__main__":

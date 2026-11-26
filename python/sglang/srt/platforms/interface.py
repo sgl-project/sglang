@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.managers.io_struct import ProfileReq
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-    from sglang.srt.model_executor.pool_configurator import DSV4PagedPoolLayout
     from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
         BaseBreakableGraphBackend,
     )
@@ -230,9 +229,7 @@ class SRTPlatform(DeviceMixin):
             )
         return legacy()
 
-    def get_dsv4_paged_pool_layout(
-        self, kvc: KVCacheConfigurator
-    ) -> DSV4PagedPoolLayout | None:
+    def get_dsv4_paged_pool_layout(self, kvc: KVCacheConfigurator):
         """Override physical storage accounting for non-default DSV4 pools."""
         return None
 

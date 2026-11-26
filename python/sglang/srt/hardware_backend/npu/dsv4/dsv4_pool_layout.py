@@ -6,13 +6,16 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
     pa_nd_num_pages,
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
-from sglang.srt.model_executor.pool_configurator import DSV4PagedPoolLayout
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DSV41_INDEX_PAGE_SIZE,
+    get_dsv4_indexer_bytes_per_token,
+)
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import ceil_align
 
 
-class NPUDSV4PagedPoolLayout(DSV4PagedPoolLayout):
+class NPUDSV4PagedPoolLayout:
+    draft_swa_layers = 0
+
     def __init__(self, kvc):
         # A3 SMLA consumes native BF16 KV/index rows; A5 keeps its existing
         # mixed-quant pricing. V4 C4/C128 keep the existing budget on both.
@@ -40,7 +43,7 @@ class NPUDSV4PagedPoolLayout(DSV4PagedPoolLayout):
 
     def low_ratio_index_row_bytes(self, head_dim):
         if self.index_layout is None:
-            return super().low_ratio_index_row_bytes(head_dim)
+            return get_dsv4_indexer_bytes_per_token(head_dim, use_fp4_indexer=True)
         k, s, kd, sd = self.index_layout.indexer_kv_info(head_dim)
         return k * kd.itemsize + s * sd.itemsize
 
@@ -75,9 +78,8 @@ class NPUDSV4PagedPoolLayout(DSV4PagedPoolLayout):
             )
         return padding
 
-    def pair_state_rows(self, num_slots, ring_size):
+    def pair_state_banks(self, num_slots, ring_size):
         if self.index_layout is not NPUDSV4KVLayout.V41_BF16:
-            return super().pair_state_rows(num_slots, ring_size)
+            return num_slots, 2
         # CompressorV2's 3-D state cache requires a full ring per padded TP bank.
-        banks = get_a3_c2_state_bank_count(num_slots)
-        return ceil_align(banks * ring_size + ring_size + 1, ring_size)
+        return get_a3_c2_state_bank_count(num_slots), ring_size

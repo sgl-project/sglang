@@ -1194,67 +1194,6 @@ class _DSV4PoolSizes:
     c128_state_pool_size: int
 
 
-class DSV4PagedPoolLayout:
-    """Physical storage accounting; the shared solver owns token and layer counts."""
-
-    draft_swa_layers = 0
-
-    def low_ratio_index_row_bytes(self, head_dim: int) -> int:
-        return get_dsv4_indexer_bytes_per_token(head_dim, use_fp4_indexer=True)
-
-    def kv_row_bytes(self, pool: DSV4PoolConfigurator, compress_ratio: int) -> float:
-        if pool._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
-            return pool.kv_bytes
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            resolve_compressed_kv_layout,
-            select_dsv4_kv_layout,
-        )
-
-        layout, compressed_option = select_dsv4_kv_layout()
-        page_size = pool.page_size
-        if compress_ratio:
-            layout = resolve_compressed_kv_layout(
-                layout, compress_ratio, compressed_option
-            )
-            page_size = pool.page_size // compress_ratio
-        return layout.page_bytes(page_size) / page_size
-
-    def low_ratio_padding_bytes(
-        self, pool: DSV4PoolConfigurator, full_tokens: int
-    ) -> float:
-        if pool._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
-            return 0
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DSV41_INDEX_PAGE_SIZE,
-            _num_dsv4_physical_kv_pages,
-        )
-
-        padding_bytes = 0
-        for ratio in (1, 2):
-            num_layers = pool.num_layers(ratio)
-            if not num_layers:
-                continue
-            # Main KV reserves a full logical page of compressed slots. Indexer
-            # size includes the compressed logical page, then the indexer pool
-            # reserves its own page on top (same page count as the pool).
-            main_padding = pool.page_size * self.kv_row_bytes(pool, ratio)
-            index_size = (full_tokens + pool.page_size) // ratio
-            index_slots = (
-                _num_dsv4_physical_kv_pages(
-                    index_size, DSV41_INDEX_PAGE_SIZE, DSV41_INDEX_PAGE_SIZE
-                )
-                * DSV41_INDEX_PAGE_SIZE
-            )
-            index_padding = (
-                index_slots - full_tokens // ratio
-            ) * pool.low_ratio_index_bytes
-            padding_bytes += (main_padding + index_padding) * num_layers
-        return padding_bytes
-
-    def pair_state_rows(self, num_slots: int, ring_size: int) -> int:
-        return ceil_align(num_slots * ring_size + ring_size + 1, 2)
-
-
 class DSV4PoolConfigurator(MemoryPoolConfigurator):
     """DSV4 compressed attention budgets, including speculative draft storage.
 
@@ -1263,7 +1202,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
-    _paged_layout = DSV4PagedPoolLayout()
+    _paged_layout = None
+    _draft_swa_layers = 0
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
@@ -1284,9 +1224,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         from sglang.srt.platforms import current_platform
 
-        layout = current_platform.get_dsv4_paged_pool_layout(kvc)
-        if layout is not None:
-            self._paged_layout = layout
+        self._paged_layout = current_platform.get_dsv4_paged_pool_layout(kvc)
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified = is_unified_kv_triton()
         self._unified_fp8 = is_unified_kv_fp8()
@@ -1366,9 +1304,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         }
 
         self.num_layers_total = len(self.stage_compress_ratios)
-        self.low_ratio_index_bytes = self._paged_layout.low_ratio_index_row_bytes(
-            self.indexer_head_dim
-        )
+        if self._paged_layout is None:
+            self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
+                self.indexer_head_dim, use_fp4_indexer=True
+            )
+        else:
+            self.low_ratio_index_bytes = self._paged_layout.low_ratio_index_row_bytes(
+                self.indexer_head_dim
+            )
+            self._draft_swa_layers = self._paged_layout.draft_swa_layers
+            if self._draft_swa_layers:
+                self._draft_kv_priced_exactly = True
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
@@ -1480,8 +1426,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             else self._resolve_swa_cap_tokens()
         )
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
-        if self._paged_layout.draft_swa_layers:
-            self._draft_kv_priced_exactly = True
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if (
             self.is_speculative
@@ -1591,7 +1535,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
-        return self._paged_layout.kv_row_bytes(self, compress_ratio)
+        if self._paged_layout is not None:
+            return self._paged_layout.kv_row_bytes(self, compress_ratio)
+        if self._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
+            return self.kv_bytes
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            resolve_compressed_kv_layout,
+            select_dsv4_kv_layout,
+        )
+
+        layout, compressed_option = select_dsv4_kv_layout()
+        page_size = self.page_size
+        if compress_ratio:
+            layout = resolve_compressed_kv_layout(
+                layout, compress_ratio, compressed_option
+            )
+            page_size = self.page_size // compress_ratio
+        return layout.page_bytes(page_size) / page_size
 
     @property
     def num_swa_layers(self) -> int:
@@ -1610,7 +1570,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
         return self._get_paged_kv_bytes_per_token() * (
-            self.num_swa_layers + self._paged_layout.draft_swa_layers
+            self.num_swa_layers + self._draft_swa_layers
         ) + (
             c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
@@ -1634,7 +1594,37 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return 1 / 128 * self._get_paged_kv_bytes_per_token(128)
 
     def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
-        return self._paged_layout.low_ratio_padding_bytes(self, full_tokens)
+        """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
+        if self._paged_layout is not None:
+            return self._paged_layout.low_ratio_padding_bytes(self, full_tokens)
+        if self._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
+            return 0
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DSV41_INDEX_PAGE_SIZE,
+            _num_dsv4_physical_kv_pages,
+        )
+
+        padding_bytes = 0
+        for ratio in (1, 2):
+            num_layers = self.num_layers(ratio)
+            if not num_layers:
+                continue
+            # Main KV reserves a full logical page of compressed slots. Indexer
+            # size includes the compressed logical page, then the indexer pool
+            # reserves its own page on top (same page count as the pool).
+            main_padding = self.page_size * self._get_paged_kv_bytes_per_token(ratio)
+            index_size = (full_tokens + self.page_size) // ratio
+            index_slots = (
+                _num_dsv4_physical_kv_pages(
+                    index_size, DSV41_INDEX_PAGE_SIZE, DSV41_INDEX_PAGE_SIZE
+                )
+                * DSV41_INDEX_PAGE_SIZE
+            )
+            index_padding = (
+                index_slots - full_tokens // ratio
+            ) * self.low_ratio_index_bytes
+            padding_bytes += (main_padding + index_padding) * num_layers
+        return padding_bytes
 
     def _get_bytes_per_full_token(self) -> float:
         # Cap mode and ring mode both move the SWA pool and the c4 state that
@@ -1738,7 +1728,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[2]
-        state_rows = self._paged_layout.pair_state_rows(num_req_slots, ring_size)
+        row_alignment = 2
+        if self._paged_layout is not None:
+            num_req_slots, row_alignment = self._paged_layout.pair_state_banks(
+                num_req_slots, ring_size
+            )
+        state_rows = num_req_slots * ring_size + ring_size + 1
+        state_rows = ceil_align(state_rows, row_alignment)
         state_last_dim = 2 * self.attn_head_dim
         return state_rows * state_last_dim * torch.float32.itemsize * num_layers
 
