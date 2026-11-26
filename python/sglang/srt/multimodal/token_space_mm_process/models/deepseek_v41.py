@@ -24,6 +24,9 @@ from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
 
 # Per-image token counts the expansion reads; not a model input.
 _NUM_IMAGE_TOKENS = "num_image_tokens"
+_NO_VISION_TOWER = (
+    "This checkpoint has no vision tower, so image input is not supported"
+)
 
 
 class _VisionSettings(msgspec.Struct, frozen=True):
@@ -110,9 +113,7 @@ class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
 
     def load_image(self, source):
         if self._vision is None:
-            raise ValueError(
-                "This checkpoint has no vision tower, so image input is not supported"
-            )
+            raise ValueError(_NO_VISION_TOWER)
         return super().load_image(source)
 
     # Legacy loads images only; reject other media before decoding it.
@@ -148,10 +149,13 @@ class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
     # each placeholder becomes a run of itself, one token per position of the image's span.
     def get_mm_token_expansion_spec(self, media_features, *, encode_expansion_text):
         image_token_id = self.mm_token_expansion_params["image_token_id"]
-        if image_token_id is None:
-            return {}
         counts = media_features.get(_NUM_IMAGE_TOKENS)
         counts = [] if counts is None else counts.tolist()
+        if image_token_id is None:
+            # Cache hits skip load_image, and a processor with a vision tower may have filled them.
+            if counts:
+                raise ValueError(_NO_VISION_TOWER)
+            return {}
         return {image_token_id: [[image_token_id] * count for count in counts]}
 
 
