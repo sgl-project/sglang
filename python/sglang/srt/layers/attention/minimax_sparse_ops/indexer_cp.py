@@ -119,7 +119,7 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         block_size=backend.block_size_k,
         topk=backend.topk_blocks,
         score_type=backend.score_type,
-        max_context_len=backend.max_context_len,
+        max_context_len=backend.req_to_token_pool.row_width,
         radix_topk=envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get(),
         draft_is_chain=draft_is_chain_layout(
             spec.speculative_algorithm, spec.speculative_eagle_topk

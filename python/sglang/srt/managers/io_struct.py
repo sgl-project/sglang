@@ -3015,12 +3015,12 @@ def msgpack_decode(data: bytes) -> Any:
     return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
 
 
-def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0):
+    """Return enqueue completion for async sockets; sync sockets return None."""
     if _USE_PICKLE_IPC:
-        socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
-        return
+        return socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
 
-    socket.send(msgpack_encode(obj), flags=flags)
+    return socket.send(msgpack_encode(obj), flags=flags)
 
 
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:

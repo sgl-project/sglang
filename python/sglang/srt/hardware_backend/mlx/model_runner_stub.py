@@ -297,7 +297,7 @@ class MlxModelRunnerStub(ModelRunner):
                 )
             self.req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
                 size=self.max_running_requests,
-                max_context_len=self.model_config.context_len,
+                row_width=self.model_config.context_len,
                 device="cpu",
                 enable_memory_saver=False,
                 auxiliary_state_size=auxiliary_state_size,
@@ -305,7 +305,7 @@ class MlxModelRunnerStub(ModelRunner):
         else:
             self.req_to_token_pool = ReqToTokenPool(
                 size=self.max_running_requests,
-                max_context_len=self.model_config.context_len,
+                row_width=self.model_config.context_len,
                 device="cpu",
                 enable_memory_saver=False,
             )
