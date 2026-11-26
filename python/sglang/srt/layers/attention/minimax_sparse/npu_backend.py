@@ -188,7 +188,7 @@ class MiniMaxNPUSparseAttnBackend(MiniMaxSparseBaseBackend):
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
-            self._max_seqlen_k = self.req_to_token_pool.row_width
+            self._max_seqlen_k = self.max_kv_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
 
@@ -219,13 +219,13 @@ class MiniMaxNPUSparseAttnBackend(MiniMaxSparseBaseBackend):
                     .reshape(-1)
                     .to(torch.int32)
                 )
-                _mb = self.req_to_token.shape[1] // self.page_size
+                _mb = self.max_kv_len // self.page_size
                 _bt_cols = (
                     torch.arange(
                         _mb, device=_vmeta.per_query_req.device, dtype=torch.long
                     )
                     * self.page_size
-                ).clamp(max=self.req_to_token.shape[1] - 1)
+                ).clamp(max=self.max_kv_len - 1)
                 _vmeta.native_bt = (
                     self.req_to_token[_vmeta.per_query_req][:, _bt_cols]
                     // self.page_size
@@ -253,11 +253,11 @@ class MiniMaxNPUSparseAttnBackend(MiniMaxSparseBaseBackend):
                     int(ndt)
                 )
                 # Captured block_table for the native verify op (re-runs at replay).
-                _mb = self.req_to_token.shape[1] // self.page_size
+                _mb = self.max_kv_len // self.page_size
                 _bt_cols = (
                     torch.arange(_mb, device=per_query_req.device, dtype=torch.long)
                     * self.page_size
-                ).clamp(max=self.req_to_token.shape[1] - 1)
+                ).clamp(max=self.max_kv_len - 1)
                 _native_bt = (
                     self.req_to_token[per_query_req][:, _bt_cols] // self.page_size
                 ).to(torch.int32)
@@ -421,7 +421,7 @@ class MiniMaxNPUSparseAttnBackend(MiniMaxSparseBaseBackend):
         """Logical->physical page table for the native sparse main op."""
         blk_cols = (
             torch.arange(max_blocks, device=device, dtype=torch.long) * self.page_size
-        ).clamp(max=self.req_to_token.shape[1] - 1)
+        ).clamp(max=self.max_kv_len - 1)
         return (self.req_to_token[req_indices][:, blk_cols] // self.page_size).to(
             torch.int32
         )
@@ -494,7 +494,7 @@ class MiniMaxNPUSparseAttnBackend(MiniMaxSparseBaseBackend):
             )
         else:
             req_idx = forward_batch.req_pool_indices.long()
-            max_cols = self.req_to_token.shape[1]
+            max_cols = self.max_kv_len
             blk_cols = (
                 torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
             ).clamp(max=max_cols - 1)
@@ -634,7 +634,7 @@ class MiniMaxNPUSparseAttnBackend(MiniMaxSparseBaseBackend):
                 sanitize_page_ids=True,
             )
         else:
-            max_cols = self.req_to_token.shape[1]
+            max_cols = self.max_kv_len
             blk_cols = (
                 torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
             ).clamp(max=max_cols - 1)
