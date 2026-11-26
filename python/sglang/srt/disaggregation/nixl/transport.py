@@ -212,25 +212,42 @@ class NixlTransport(Transport):
             ]
         )
         registered_regions = set(self._registrations.values())
-        new_regions = []
+        # Keys of each region NIXL has not registered yet, recorded only once it
+        # has, so a retry after a failed call registers them again.
+        pending: Dict[_Region, List[BufferKey]] = {}
         for r in registrations:
             if r.length == 0:
                 # An elided entry keeps its position; nothing writes it.
                 continue
             region = (r.ptr, r.length, r.device)
-            if region not in registered_regions:
-                registered_regions.add(region)
-                new_regions.append(region)
-            self._registrations[r.key] = region
-        for kind, regions in self._by_mem_kind(new_regions).items():
+            if region in registered_regions:
+                self._registrations[r.key] = region
+            else:
+                pending.setdefault(region, []).append(r.key)
+        for kind, regions in self._by_mem_kind(pending).items():
             descs = self._agent.register_memory(self._reg_descs(regions), kind)
             if not descs:
                 raise RuntimeError(
                     f"NIXL memory registration failed for {len(regions)} {kind} regions"
                 )
+            for region in regions:
+                for key in pending[region]:
+                    self._registrations[key] = region
 
     def deregister(self, keys: Sequence[BufferKey]) -> None:
-        """Unregister `keys`, preserving regions still held by other keys."""
+        """Unregister `keys`, preserving regions still held by other keys.
+
+        A key keeps its address while a local prepared layout uses it: that
+        dlist holds the address it had when prepared."""
+        in_use = {
+            run.key
+            for layout in self._layouts.get("", {}).values()
+            for run in layout.runs
+        }.intersection(keys)
+        if in_use:
+            raise ValueError(
+                f"Buffers {sorted(map(str, in_use))} back a prepared layout"
+            )
         released_regions = {
             self._registrations.pop(key) for key in keys if key in self._registrations
         }

@@ -18,15 +18,25 @@ from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.disaggregation.nixl.buffers import BufferKeys, copy_ranges
+from sglang.srt.disaggregation.nixl.buffers import (
+    BufferKeys,
+    BufferKind,
+    NixlBufferKey,
+    copy_ranges,
+)
 from sglang.srt.disaggregation.nixl.conn import (
+    _STATE_LAYOUT,
     KVArgsRegisterInfo,
     NixlKVManager,
     NixlKVReceiver,
     NixlKVSender,
     TransferInfo,
 )
-from sglang.srt.disaggregation.nixl.transport import NixlHandle, NixlTransport
+from sglang.srt.disaggregation.nixl.transport import (
+    NixlHandle,
+    NixlTransport,
+    StridedRun,
+)
 from sglang.srt.disaggregation.transport.base import Copy, Result, Status
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -1412,6 +1422,20 @@ class TestNixlTransportWrites(CustomTestCase):
             ],
         )
 
+    def test_failed_registration_is_registered_again_on_retry(self):
+        """A registration NIXL rejected must not count as registered: retrying
+        it has to call NIXL again rather than return as if it had succeeded."""
+        agent = StagingFakeAgent(register_result=[])
+        transport = NixlTransport(agent=agent)
+        key = NixlBufferKey(BufferKind.STAGING, 0)
+        with self.assertRaises(RuntimeError):
+            transport.register(key, 0x1000, 64, 0)
+
+        agent.register_result = ["desc"]
+        transport.register(key, 0x1000, 64, 0)
+
+        self.assertEqual(len(agent.register_memory_calls), 2)
+
 
 class DlistCaptureAgent:
     """Records prep_xfer_dlist descriptor arrays so tests can inspect them."""
@@ -1752,6 +1776,41 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
 
         mgr.transport.reload(remote)
 
+        (handle,) = mgr.send_kvcache(
+            "dropped",
+            np.array([1], dtype=np.int32),
+            np.array([2], dtype=np.int32),
+        )
+        self.assertEqual(handle.xfer, ("dropped", self.agent.sections["dropped"]))
+
+    def test_state_dlist_failing_to_rebuild_leaves_kv_on_the_peer(self):
+        """A reload whose state dlist cannot be rebuilt must keep the peer loaded
+        with its prepared KV path and send state generically, not drop the peer."""
+        mgr = self._make_manager(["dropped"])
+        peer = mgr._peers["dropped"]
+        mgr.transport.prepare(
+            remote=peer.remote,
+            layout=_STATE_LAYOUT,
+            runs=[
+                StridedRun(
+                    key=peer.keys.kv[0], offset=0x100, length=16, stride=16, count=1
+                )
+            ],
+        )
+        mgr._prepared_state_plans["dropped"] = object()
+        self.agent.remove_remote_agent("dropped")
+        prep = self.agent.prep_xfer_dlist
+
+        def prep_failing_state(name, descs, mem_kind):
+            if 0x3100 in np.asarray(descs)[:, 0]:
+                raise RuntimeError("NIXL_ERR_NOT_FOUND")
+            return prep(name, descs, mem_kind)
+
+        with patch.object(self.agent, "prep_xfer_dlist", prep_failing_state):
+            mgr._reload_invalidated_peers(dict.fromkeys(["dropped"]))
+
+        self.assertTrue(self.agent.check_remote_metadata("dropped"))
+        self.assertNotIn("dropped", mgr._prepared_state_plans)
         (handle,) = mgr.send_kvcache(
             "dropped",
             np.array([1], dtype=np.int32),

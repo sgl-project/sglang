@@ -2281,7 +2281,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     # Every room with this peer has the same peer set and shards to
                     # this worker, so none writes to it while reload() rebuilds.
+                    # State is planned again after the load: a state dlist that
+                    # fails to rebuild leaves state generic, not the peer dropped.
+                    self._prepared_state_plans.pop(agent_name, None)
+                    self.transport.discard_prepared(remote=remote, layout=_STATE_LAYOUT)
                     self.transport.reload(remote)
+                    self._prepare_state_xfer(self.decode_kv_args_table[agent_name])
             except Exception:
                 logger.exception(
                     "Failed to reload NIXL metadata for remote agent %s", agent_name
