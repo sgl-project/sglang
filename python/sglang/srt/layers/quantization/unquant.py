@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import logging
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
@@ -42,6 +43,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx11_supported,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -68,6 +70,7 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx11 = _is_hip and is_gfx11_supported()
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -391,6 +394,101 @@ def get_bf16_gemm_backend() -> Bf16GemmBackend:
     return _BF16_GEMM_BACKEND
 
 
+# On gfx11 a weight row stride that is a multiple of 2 KiB puts the rows a skinny GEMM
+# reads together on the same L2/MALL channel; one 128 B cache line of pad spreads them.
+# Same rule as vLLM's cache_aliasing_pad_elems; measured on gfx1151.
+_GFX11_ALIASING_ROW_BYTES = 2048
+_GFX11_ROW_PAD_BYTES = 128
+# Only 16-bit weights were measured; fp32 (e.g. MoE router gates) is left alone.
+_GFX11_PADDED_DTYPES = (torch.bfloat16, torch.float16)
+# First load logs at INFO; weight updates (e.g. every RL sync) log at DEBUG.
+_gfx11_padding_logged = False
+
+
+def _gfx11_row_pad_elems(*, k: int, itemsize: int) -> int:
+    if (k * itemsize) % _GFX11_ALIASING_ROW_BYTES != 0:
+        return 0
+    return _GFX11_ROW_PAD_BYTES // itemsize
+
+
+def maybe_pad_weight_for_gfx11(weight: torch.Tensor) -> torch.Tensor:
+    """Return ``weight`` as a same-shape view with a non-aliasing row stride on gfx11.
+
+    K is the tensor's own dim 1, so a tensor-parallel row shard is judged by its
+    slice, not the full checkpoint K. Non-contiguous weights, including ones
+    already padded, come back unchanged, which keeps a reload from padding twice.
+    """
+    if not _is_gfx11 or envs.SGLANG_DISABLE_GFX11_WEIGHT_PADDING.get():
+        return weight
+    if weight.dim() != 2 or not weight.is_contiguous():
+        return weight
+    if weight.dtype not in _GFX11_PADDED_DTYPES:
+        return weight
+    pad = _gfx11_row_pad_elems(k=weight.shape[1], itemsize=weight.element_size())
+    if pad == 0:
+        return weight
+    return F.pad(weight, (0, pad))[:, :-pad]
+
+
+def finalize_gfx11_weight_padding(model: torch.nn.Module) -> None:
+    """Pad unquantized lm_head weights and log which linear and head shapes were padded.
+
+    Runs on the whole model because a tied head is often the input embedding module
+    itself (``lm_head = model.embed_tokens``), which its quant method cannot tell
+    apart from an untied input embedding; only the model's module names show it.
+    Also runs after every weight update; already-padded weights are skipped, so
+    storage pointers stay stable for CUDA graphs.
+    """
+    if not _is_gfx11 or envs.SGLANG_DISABLE_GFX11_WEIGHT_PADDING.get():
+        return
+    for head in _unquantized_lm_heads(model):
+        head.weight.data = maybe_pad_weight_for_gfx11(head.weight.data)
+    _log_gfx11_padding(model)
+
+
+def _unquantized_lm_heads(model: torch.nn.Module):
+    # Imported here to avoid an import cycle; vocab_parallel_embedding imports this module.
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+
+    seen = set()
+    # Heads named otherwise (e.g. embed_out) are not found; that costs speed only.
+    for name, module in model.named_modules(remove_duplicate=False):
+        is_head = isinstance(module, ParallelLMHead) or (
+            isinstance(module, VocabParallelEmbedding)
+            and name.rsplit(".", 1)[-1] == "lm_head"
+        )
+        if (
+            is_head
+            and isinstance(module.quant_method, UnquantizedEmbeddingMethod)
+            and id(module) not in seen
+        ):
+            seen.add(id(module))
+            yield module
+
+
+def _log_gfx11_padding(model: torch.nn.Module) -> None:
+    # Imported here to avoid an import cycle through sglang.srt.layers.quantization.
+    from sglang.srt.layers.linear import LinearBase
+
+    padded, skipped = collections.Counter(), collections.Counter()
+    weights = [
+        m.weight
+        for m in model.modules()
+        if isinstance(m, LinearBase)
+        and isinstance(m.quant_method, UnquantizedLinearMethod)
+    ] + [head.weight for head in _unquantized_lm_heads(model)]
+    for weight in weights:
+        is_padded = weight.dim() == 2 and weight.stride(0) > weight.shape[1]
+        (padded if is_padded else skipped)[tuple(weight.shape)] += 1
+    global _gfx11_padding_logged
+    log = logger.debug if _gfx11_padding_logged else logger.info
+    _gfx11_padding_logged = True
+    log("gfx11 weight padding: padded %s; skipped %s", dict(padded), dict(skipped))
+
+
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -457,6 +555,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        else:
+            layer.weight.data = maybe_pad_weight_for_gfx11(layer.weight.data)
 
     def apply(
         self,
