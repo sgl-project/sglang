@@ -172,6 +172,23 @@ print("AOT extension:", sgl_kernel.common_ops.__file__)
 PY
 python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 
+# FlashInfer builds its sampling/topk JIT modules lazily on first use. On PPU a
+# cold hgcc compile of those modules takes minutes, but the sanity suite issues a
+# top-k sampling request with a hard 60s timeout and SGLANG_TEST_MAX_RETRY=0, so a
+# compile triggered inside that request fails the run. Pre-build the modules into
+# the shared FlashInfer JIT cache (under this phase's HOME) before any test server
+# starts, so the first real request loads a warm module instead of blocking on hgcc.
+python3 - <<'PY'
+import torch
+import flashinfer.sampling as sampling
+import flashinfer.topk as topk
+
+assert torch.cuda.device_count() >= 1
+sampling.get_sampling_module()
+topk.get_topk_module()
+print("FlashInfer sampling/topk JIT modules pre-warmed")
+PY
+
 cd "$artifacts"
 python3 "$repo/test/run_suite.py" --hw ppu --suite extra-test-1-gpu-ppu --timeout-per-file 1200 \
     2>&1 | tee "$artifacts/sanity.log"
