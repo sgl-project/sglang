@@ -48,12 +48,9 @@ def reset_caches() -> None:
     """Forget what was read from the environment (tests)."""
     for cached in (ar_fusion, verify_widths):
         cached.cache_clear()
-    _seen.clear()
 
 
-# (the forward is a target verify, the stream is capturing a CUDA graph)
-_verify: ContextVar = ContextVar("k3_target_verify_forward", default=(False, False))
-_seen = set()
+_verify: ContextVar = ContextVar("k3_target_verify_forward", default=False)
 _summary = dict(layers=0, logged=False)
 
 
@@ -65,12 +62,7 @@ def target_forward(fn):
     @wraps(fn)
     def scoped(self, input_ids, positions, forward_batch, *args, **kwargs):
         _log_startup()
-        token = _verify.set(
-            (
-                forward_batch.forward_mode.is_target_verify(),
-                torch.cuda.is_current_stream_capturing(),
-            )
-        )
+        token = _verify.set(forward_batch.forward_mode.is_target_verify())
         try:
             return fn(self, input_ids, positions, forward_batch, *args, **kwargs)
         finally:
@@ -81,25 +73,7 @@ def target_forward(fn):
 
 def takes(rows: int) -> bool:
     """Whether a routed call of `rows` rows in the current forward runs on MegaMoE."""
-    return _verify.get()[0] and rows in verify_widths()
-
-
-def dispatch(rows: int) -> bool:
-    """`takes`, logging each new (rows, mode, kernel) combination once at DEBUG."""
-    taken = takes(rows)
-    if logger.isEnabledFor(logging.DEBUG) and len(_seen) < 512:
-        target, capturing = _verify.get()
-        key = (int(rows), target, taken, capturing)
-        if key not in _seen:
-            _seen.add(key)
-            logger.debug(
-                "K3 die-local routed MoE dispatch: rows=%d target_verify=%s kernel=%s capturing=%s",
-                key[0],
-                target,
-                "mega_moe" if taken else "trtllm_gen",
-                capturing,
-            )
-    return taken
+    return _verify.get() and rows in verify_widths()
 
 
 def _ineligible(layer: torch.nn.Module) -> Optional[str]:
@@ -317,7 +291,7 @@ def stack_final(parts: List[torch.Tensor]) -> torch.Tensor:
     return dest
 
 
-def finish(layer: torch.nn.Module, prefix: str) -> None:
+def finish(layer: torch.nn.Module) -> None:
     """Expose the layer's weights and scales to MegaMoE as zero-copy views."""
     w13, s13 = layer.w13_weight, layer.w13_weight_scale
     w2, s2 = layer.w2_weight, layer.w2_weight_scale
@@ -333,14 +307,6 @@ def finish(layer: torch.nn.Module, prefix: str) -> None:
         rank=layer.moe_ep_rank,
         experts=w13.shape[0],
         weight_bytes=w13.nbytes + w2.nbytes,
-    )
-    logger.debug(
-        "K3 die-local routed MoE: %s rank %d on %s, w13 %d bytes, w2 %d bytes",
-        prefix,
-        layer.moe_ep_rank,
-        w13.device,
-        w13.nbytes,
-        w2.nbytes,
     )
 
 

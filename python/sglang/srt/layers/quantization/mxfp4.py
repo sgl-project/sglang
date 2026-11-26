@@ -984,7 +984,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 precision=self.flashinfer_mxfp4_moe_precision,
             )
             if die_local:
-                k3_die_local_moe.finish(layer, self.prefix)
+                k3_die_local_moe.finish(layer)
             return
         if self.use_aiter_moe:
             if getattr(layer, "w13_weight_bias", None) is not None:

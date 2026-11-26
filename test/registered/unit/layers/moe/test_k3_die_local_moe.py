@@ -31,7 +31,7 @@ def _env(ar_fusion=False):
 
 
 def _taken(verify):
-    token = policy._verify.set((verify, False))
+    token = policy._verify.set(verify)
     try:
         return [rows for rows in range(1, 300) if policy.takes(rows)]
     finally:

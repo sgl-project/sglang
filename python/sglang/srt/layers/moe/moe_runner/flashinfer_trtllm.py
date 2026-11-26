@@ -1706,12 +1706,11 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 device=x_quant.device,
             )
 
+    run_mega_moe = False
     if quant_info.mega_l1_weights is not None:
         from sglang.srt.layers.moe import k3_die_local_moe
 
-        run_mega_moe = k3_die_local_moe.dispatch(num_tokens)
-    else:
-        run_mega_moe = False
+        run_mega_moe = k3_die_local_moe.takes(num_tokens)
     if run_mega_moe:
         from sglang.srt.layers.moe import k3_deepgemm_routed, route_quant_handoff
 
