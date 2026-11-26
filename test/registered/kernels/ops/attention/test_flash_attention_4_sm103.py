@@ -1,4 +1,4 @@
-"""SM103 FA4 tests for the softmax row max from tcgen05.ld.red.
+"""SM103 FA4 forward and combine tests.
 
 The output and LSE must match the FMNMX path (the forward kernel built with
 tmem_load_red_max=False) bit for bit and stay within FA4's usual tolerance of
@@ -297,6 +297,54 @@ def test_red_max_features(monkeypatch, case):
     )
     kwargs.update(case)
     _check_red_max(monkeypatch, **kwargs)
+
+
+def test_split_kv_combine_query_bound():
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(0)
+    splits, total_q, heads, head_dim = 4, 8, 16, 128
+    partial_out = torch.randn(
+        splits, total_q, heads, head_dim, device=device, generator=generator
+    )
+    partial_lse = torch.randn(
+        splits, heads, total_q, device=device, generator=generator
+    ).transpose(-1, -2)
+    cu_seqlens = torch.tensor([0, 2, 5, 5, 8], device=device, dtype=torch.int32)
+    out = torch.empty(total_q, heads, head_dim, device=device, dtype=torch.bfloat16)
+    lse = torch.empty(heads, total_q, device=device).transpose(-1, -2)
+
+    def combine(max_seqlen_q):
+        fa4_interface._flash_attn_fwd_combine(
+            partial_out,
+            partial_lse,
+            out,
+            lse,
+            cu_seqlens,
+            max_seqlen_q=max_seqlen_q,
+        )
+
+    def assert_matches_unbounded():
+        expected_out, expected_lse = fa4_interface.flash_attn_combine(
+            partial_out, partial_lse, out_dtype=out.dtype, cu_seqlens=cu_seqlens
+        )
+        torch.testing.assert_close(out, expected_out, atol=0, rtol=0)
+        torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
+
+    combine(3)
+    assert_matches_unbounded()
+    cu_seqlens.copy_(torch.tensor([0, 2, 3, 3, 8], device=device, dtype=torch.int32))
+    combine(5)
+    assert_matches_unbounded()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        combine(5)
+    cu_seqlens.copy_(torch.tensor([0, 5, 5, 7, 8], device=device, dtype=torch.int32))
+    partial_out.mul_(0.5)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    assert_matches_unbounded()
 
 
 if __name__ == "__main__":
