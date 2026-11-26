@@ -58,10 +58,12 @@ def sample_openai_requests(
                 break
             if line.strip():
                 try:
-                    dataset.append(json.loads(line))
+                    data = json.loads(line)
                 except json.JSONDecodeError:
                     # Skip invalid JSON lines
                     continue
+                if data.get("messages"):
+                    dataset.append(data)
 
     # Fields that should NOT be passed through extra_request_body
     # These are either handled separately or are metadata
@@ -71,9 +73,7 @@ def sample_openai_requests(
 
     filtered_dataset: List[DatasetRow] = []
     for data in dataset:
-        messages = data.get("messages", [])
-        if not messages:
-            continue
+        messages = data["messages"]
 
         # Use max_tokens from the request, or fall back to fixed_output_len
         output_len = fixed_output_len or data.get("max_tokens", 256)
