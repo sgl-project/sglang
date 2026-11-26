@@ -256,7 +256,7 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         )
 
     def test_native_v_scale_swizzle_reference(self):
-        from sglang.srt.layers.quantization.nvfp4_kv_cache import (
+        from sglang.test.kernels.nvfp4_kv_reference import (
             nvfp4_v_scale_swizzle_indices,
         )
 

@@ -437,6 +437,46 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         self.assertIs(capture.runner, prefill_runner)
 
+    def test_no_fitting_capture_size_falls_back_to_eager(self):
+        """When every prefill bucket exceeds what a capture batch can hold, the
+        caller must get an eager capture record, not a startup AttributeError."""
+        eager_runner = object()
+        override = get_context().override_server_args(
+            enable_lora=False,
+            enable_prefill_cp=False,
+            pp_size=1,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(bs=[4096], backend=Backend.BREAKABLE)
+            ),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        model_runner = SimpleNamespace(
+            device="cuda",
+            is_draft_worker=False,
+            lora_manager=None,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
+            server_args=SimpleNamespace(),
+            model=SimpleNamespace(),
+            # One request of 512 tokens is the largest capture batch.
+            model_config=SimpleNamespace(context_len=512),
+            req_to_token_pool=SimpleNamespace(size=1),
+        )
+
+        with (
+            patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                graph_setup, "resolve_language_model", return_value=SimpleNamespace()
+            ),
+        ):
+            capture = capture_prefill_graph(
+                model_runner=model_runner,
+                eager_runner=eager_runner,
+            )
+
+        self.assertIs(capture.runner, eager_runner)
+        self.assertEqual(capture.memory_usage, {"prefill": 0})
+
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()
         # The server-side hidden-state ceiling and graph config are bag leaves.

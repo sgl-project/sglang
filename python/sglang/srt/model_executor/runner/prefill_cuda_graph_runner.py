@@ -437,7 +437,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
         self._validate_max_context_capacity(
             max_context_size=self.max_context_size,
-            table_width=model_runner.req_to_token_pool.req_to_token.shape[1],
+            req_to_token_row_width=model_runner.req_to_token_pool.req_to_token.shape[1],
         )
         if (
             self.prefill_backend_name == Backend.TC_PIECEWISE
@@ -1107,24 +1107,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     @staticmethod
     def _max_addressable_prefix_len(model_runner) -> int:
-        table_width = model_runner.req_to_token_pool.req_to_token.shape[1]
+        req_to_token_row_width = model_runner.req_to_token_pool.req_to_token.shape[1]
         # This runner's own resolved context (a draft runs at the target's
         # positions), not the launcher's flag, which may be unset.
         configured_context = model_runner.model_config.context_len
         return (
-            min(table_width, configured_context)
+            min(req_to_token_row_width, configured_context)
             if configured_context is not None and configured_context > 0
-            else table_width
+            else req_to_token_row_width
         )
 
     @staticmethod
     def _validate_max_context_capacity(
-        *, max_context_size: Optional[int], table_width: int
+        *, max_context_size: Optional[int], req_to_token_row_width: int
     ) -> None:
-        if max_context_size is not None and max_context_size > table_width:
+        if max_context_size is not None and max_context_size > req_to_token_row_width:
             raise ValueError(
                 "--cuda-graph-prefill-max-context exceeds the request-to-token "
-                f"pool capacity: requested size {max_context_size} > {table_width}"
+                f"pool capacity: requested size {max_context_size} > {req_to_token_row_width}"
             )
 
     def _ignore_max_context_size(self, execution_path: str) -> None:
@@ -2529,13 +2529,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return output
         assert isinstance(output, PPProxyTensors)
         return _slice_output_rows(output, self.raw_num_tokens)
-
-    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
-        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
-            raise RuntimeError(
-                "The runtime hidden-state mode exceeds the fixed CUDA graph "
-                f"capture mode ({self.capture_hidden_mode.name})."
-            )
 
     def _wait_for_layer_loads(self) -> None:
         # Full replay skips the pool accessors. BCG's dynamic KDA waits do not

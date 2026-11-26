@@ -2,8 +2,10 @@
 window sub-pools: each layer reads and writes its own window's pages, and matches
 attention computed from positions with that layer's window."""
 
+import os
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -90,6 +92,7 @@ def _storage(
             state_slots=0,
             max_running_requests=4,
             context_len=_CONTEXT,
+            req_to_token_row_width=_CONTEXT,
             alignment=1,
         ),
     )
@@ -100,7 +103,6 @@ def _storage(
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=4,
-        model_context_len=_CONTEXT,
         lazy_compaction=True,
     )
     return build_kv_storage(plan, sized, ctx)
@@ -525,6 +527,19 @@ class TestTritonSeveralWindows(SeveralWindowsCase):
             {80: 80, 96: 96},
         )
         self.assertEqual(backend.cuda_graph_attn_logits.shape[-1], 64)
+
+    def test_static_kv_splits_env_accepts_every_boolean_spelling(self):
+        """The decode kernel and the backend read one switch: a spelling only the
+        kernel accepts would leave the backend filling per-sequence split counts
+        that the kernel treats as fixed."""
+        for value in ("1", "yes"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(
+                    os.environ, {"SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS": value}
+                ),
+            ):
+                self.assertTrue(_Model((8,)).backend.static_kv_splits)
 
     def test_deterministic_extend_reads_the_window_ids(self):
         """Deterministic inference extends through one kernel that reads the

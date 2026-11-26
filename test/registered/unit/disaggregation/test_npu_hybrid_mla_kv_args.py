@@ -97,6 +97,27 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
         self.assertTrue(kv_args.is_hybrid_mla_backend)
         self.assertIn(StateType.MAMBA, kv_args.state_types)
 
+    def test_hybrid_dsa_constructs_the_npu_kpool(self):
+        pool = HybridLinearKVPool(
+            **_MLA,
+            head_num=1,
+            head_dim=16,
+            full_attention_layer_ids=[0],
+            mamba_pool=_recurrent_state([1]),
+            use_mla=True,
+            kv_lora_rank=16,
+            qk_rope_head_dim=0,
+            use_dsa=True,
+            index_head_dim=128,
+            kv_cache_dim=16,
+            index_kpool=4,
+            index_kpool_compress=True,
+            max_running_requests=2,
+            full_kv_pool_class=NPUMLATokenToKVPool,
+        )
+        self.assertIsInstance(pool.full_kv_pool, NPUMLATokenToKVPool)
+        self.assertTrue(pool.full_kv_pool.kpool_use_compress)
+
     def test_a_hybrid_draft_counts_the_layers_of_its_token_kv_view(self):
         """Hybrid drafts expose the KV layer count through their token view;
         PD registration must not read a missing layer count from the wrapper."""

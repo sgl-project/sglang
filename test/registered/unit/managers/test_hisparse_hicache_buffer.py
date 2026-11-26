@@ -39,7 +39,7 @@ class TestHiSparseHiCacheBuffer(CustomTestCase):
             index_buf_size=3 * size + page,
         )
         self.reqs = ReqToTokenPool(
-            size=4, max_context_len=512, device="cuda", enable_memory_saver=False
+            size=4, row_width=512, device="cuda", enable_memory_saver=False
         )
         self.cache = HiSparseHiCacheBuffer(
             req_to_token_pool=self.reqs,

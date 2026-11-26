@@ -78,6 +78,7 @@ def _storage():
             state_slots=16,
             max_running_requests=3,
             context_len=64,
+            req_to_token_row_width=64,
             alignment=1,
         ),
     )
@@ -88,7 +89,6 @@ def _storage():
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=3,
-        model_context_len=64,
         lazy_compaction=True,
         enable_mamba_extra_buffer=False,
         state_cache_params=SimpleNamespace(layers=(1, 2)),
@@ -288,7 +288,7 @@ class TestStaticRowStateReset(CustomTestCase):
             size=4,
             mamba_size=4,
             mamba_spec_state_size=4,
-            max_context_len=64,
+            row_width=64,
             device="cuda",
             enable_memory_saver=False,
             cache_params=Mamba2CacheParams(shape=shape, layers=[0]),
@@ -326,7 +326,7 @@ class TestStaticRowStateReset(CustomTestCase):
     def test_reused_row_cursors_reset_when_a_draft_table_forwards_first(self):
         table, allocator = self._static_pools()
         draft_table = ReqToTokenPool(
-            size=4, max_context_len=64, device="cuda", enable_memory_saver=False
+            size=4, row_width=64, device="cuda", enable_memory_saver=False
         )
         row, cursors = self._reuse_dirty_row(table, allocator)
         _forward(draft_table, allocator)

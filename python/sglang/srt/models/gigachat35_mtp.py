@@ -13,6 +13,7 @@ standalone from the GigaChat modules.
 
 from __future__ import annotations
 
+import copy
 from typing import Iterable, Optional
 
 import torch
@@ -35,6 +36,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     NextNEnabledConfig,
 )
 from sglang.srt.models.gigachat35 import (
+    _GIGACHAT_WEIGHT_MAPPER,
     GigaChat35DecoderLayer,
     _remap_gigachat_weight_names,
     build_norm,
@@ -44,6 +46,8 @@ from sglang.srt.utils import BumpAllocator
 
 
 class GigaChat35ModelNextN(nn.Module):
+    decoder_layer_cls = GigaChat35DecoderLayer
+
     def __init__(
         self,
         config: GigaChat35Config,
@@ -67,7 +71,7 @@ class GigaChat35ModelNextN(nn.Module):
         self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         with layer_stack():
-            self.decoder = GigaChat35DecoderLayer(
+            self.decoder = self.decoder_layer_cls(
                 config=config,
                 layer_id=0,
                 quant_config=quant_config,
@@ -133,6 +137,9 @@ class GigaChat35ModelNextN(nn.Module):
 
 
 class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
+    hf_to_sglang_mapper = _GIGACHAT_WEIGHT_MAPPER
+    model_cls = GigaChat35ModelNextN
+
     def __init__(
         self,
         config: GigaChat35Config,
@@ -142,12 +149,15 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
+        quant_config = self.own_quant_config(
+            config, quant_config, draft_model_idx=self.draft_model_idx
+        )
+        self.quant_config = quant_config
 
-        self.model = GigaChat35ModelNextN(
+        self.model = self.model_cls(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -205,6 +215,55 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
             nextn_layer_prefix=f"model.layers.{nextn_layer_id}",
             nextn_spec_weight_names=["shared_head.norm", "eh_proj", "enorm", "hnorm"],
         )
+
+    @staticmethod
+    def own_quant_config(hf_config, quant_config, *, draft_model_idx: int = 0):
+        if (
+            quant_config is None
+            or quant_config.get_name() not in ("fp8", "mxfp8")
+            or not quant_config.ignored_layers
+        ):
+            return quant_config
+
+        nextn_layer_id = (
+            0
+            if hf_config.num_hidden_layers == 1
+            else hf_config.num_hidden_layers + draft_model_idx
+        )
+        prefixes = (
+            f"model.layers.{nextn_layer_id}",
+            f"layers.{nextn_layer_id}",
+        )
+        nextn_roots = ("shared_head", "eh_proj", "enorm", "hnorm")
+        runtime_roots = ["model.decoder", *(f"model.{root}" for root in nextn_roots)]
+
+        def map_name(name):
+            name = name.rstrip(".")
+            if name in ("layers", "model.layers"):
+                return runtime_roots
+            for prefix in prefixes:
+                if name == prefix:
+                    return runtime_roots
+                if name.startswith(prefix + "."):
+                    suffix = name[len(prefix) + 1 :]
+                    root = suffix.split(".", 1)[0]
+                    if root in nextn_roots:
+                        return ["model." + suffix]
+                    return ["model.decoder." + suffix]
+            return [name]
+
+        # Head-specific exclusions preserve the quant/KV dtype predicted before build.
+        quant_config = copy.copy(quant_config)
+        quant_config.ignored_layers = list(
+            dict.fromkeys(
+                mapped
+                for name in _GIGACHAT_WEIGHT_MAPPER.apply_list(
+                    quant_config.ignored_layers
+                )
+                for mapped in map_name(name)
+            )
+        )
+        return quant_config
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         self.do_load_weights(_remap_gigachat_weight_names(weights), is_nextn=True)

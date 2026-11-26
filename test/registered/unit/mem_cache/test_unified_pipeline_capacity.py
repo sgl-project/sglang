@@ -147,11 +147,16 @@ def _small_configurator(rank, state_counts=(6, 9)):
 
 
 def _build_storage(cfg):
+    import msgspec
+
     from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 
     return build_kv_storage(
         cfg._unified_plan,
-        cfg._unified_sized,
+        # The table's rows carry four columns of headroom past the context.
+        msgspec.structs.replace(
+            cfg._unified_sized, req_to_token_row_width=cfg.model_config.context_len + 4
+        ),
         UnifiedBuildContext(
             device="cpu",
             start_layer=0,
@@ -161,8 +166,6 @@ def _build_storage(cfg):
             need_sort=False,
             head_num=1,
             head_dim=8,
-            model_context_len=cfg.model_config.context_len,
-            extra_max_context_len=4,
             state_cache_params=NS(layers=cfg._unified_plan.sub_pool("mamba").layer_ids),
         ),
     )

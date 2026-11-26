@@ -50,7 +50,7 @@ def _build_swa_allocator(
 
     req_to_token_pool = ReqToTokenPool(
         size=req_size,
-        max_context_len=max_context_len,
+        row_width=max_context_len,
         device=device,
         enable_memory_saver=False,
     )

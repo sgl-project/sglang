@@ -170,8 +170,11 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.native = SimpleNamespace(
             k=Buffer((3, 8, 128, 1, 512)),
             v=Buffer((3, 8, 128, 1, 64)),
-            index_k=Buffer((2, 8, 128, 1, 128)),
-            index_scales=Buffer((2, 8, 128, 1)),
+            # BF16 index K: under a packed one-byte main KV the indexer keeps
+            # its own dtype, and the host mirror must follow it.
+            index_k=Buffer((2, 8, 128, 1, 128), SimpleNamespace(itemsize=2)),
+            # FP32 scales: the host mirror is sized from the device scale dtype.
+            index_scales=Buffer((2, 8, 128, 1), SimpleNamespace(itemsize=4)),
             index_layer_indices=(0, 2),
             index_width=128,
             k_width=512,
@@ -407,7 +410,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
         h._transfer_device = SimpleNamespace(type="npu")
         h.device, h.pin_memory, h.allocator = "cpu", True, None
         h.kv_lora_rank, h.qk_rope_head_dim = 512, 64
-        allocate = Mock(side_effect=lambda shape, **_: Buffer(shape))
+        allocate = Mock(
+            side_effect=lambda shape, dtype="bf16", **_: Buffer(shape, dtype)
+        )
         reserve = Mock()
         empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
         self.namespace.update(
@@ -437,15 +442,14 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     self.assertEqual(h.k_buffer.shape, (*kv_dims, self.native.k_width))
                     self.assertEqual(h.v_buffer.shape, (*kv_dims, v_width))
                     self.assertEqual(h.index_k_buffer.shape, (*index_dims, 128))
+                    self.assertIs(h.index_k_buffer.dtype, self.native.index_k.dtype)
                     self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
                     expected_blocks = [
                         8 * 128 * 3 * self.native.k_width * h.dtype.itemsize
                     ]
                     if v_width:
                         expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
-                    expected_blocks.extend(
-                        [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
-                    )
+                    expected_blocks.extend([8 * 128 * 2 * 128 * 2, 8 * 128 * 2 * 4])
                     reserve.assert_called_once_with(sum(expected_blocks), 0)
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
@@ -457,7 +461,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
         h._transfer_device = SimpleNamespace(type="npu")
         h.device, h.pin_memory, h.allocator = "cpu", True, None
         h.kv_lora_rank, h.qk_rope_head_dim = 512, 64
-        allocate = Mock(side_effect=lambda shape, **_: Buffer(shape))
+        allocate = Mock(
+            side_effect=lambda shape, dtype="bf16", **_: Buffer(shape, dtype)
+        )
         reserve = Mock()
         empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
         self.namespace.update(
@@ -487,15 +493,14 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     self.assertEqual(h.k_buffer.shape, (*kv_dims, self.native.k_width))
                     self.assertEqual(h.v_buffer.shape, (*kv_dims, v_width))
                     self.assertEqual(h.index_k_buffer.shape, (*index_dims, 128))
+                    self.assertIs(h.index_k_buffer.dtype, self.native.index_k.dtype)
                     self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
                     expected_blocks = [
                         8 * 128 * 3 * self.native.k_width * h.dtype.itemsize
                     ]
                     if v_width:
                         expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
-                    expected_blocks.extend(
-                        [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
-                    )
+                    expected_blocks.extend([8 * 128 * 2 * 128 * 2, 8 * 128 * 2 * 4])
                     reserve.assert_called_once_with(sum(expected_blocks), 0)
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)

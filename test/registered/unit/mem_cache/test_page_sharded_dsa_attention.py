@@ -982,7 +982,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
         ):
             results.append(
                 dsa_indexer.Indexer._get_topk_ragged(
-                    indexer, False, batch, layer_id, query, weights, metadata
+                    indexer, batch, layer_id, query, weights, metadata
                 )
             )
         starts, ends = metadata.get_indexer_kvcache_range()

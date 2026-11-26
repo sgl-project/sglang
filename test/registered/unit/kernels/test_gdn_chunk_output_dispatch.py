@@ -48,6 +48,7 @@ class TestGDNChunkOutputDispatch(CustomTestCase):
                 next_power_of_2=lambda n: 1 << (n - 1).bit_length(),
             ),
             "use_gfx115_kernels": Mock(return_value=True),
+            "is_batch_invariant_mode_enabled": Mock(return_value=False),
             "prepare_chunk_indices": Mock(side_effect=AssertionError("rebuilt table")),
             "chunk_fwd_kernel_o": generic_kernel,
             "chunk_fwd_kernel_o_grouped_three_head": grouped_kernel,

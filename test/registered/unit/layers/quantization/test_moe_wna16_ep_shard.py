@@ -1,11 +1,12 @@
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Method
+from sglang.srt.layers.quantization import moe_wna16
+from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config, MoeWNA16Method
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
@@ -110,6 +111,23 @@ class TestMoeWNA16QzerosShardUnderEP(CustomTestCase):
                     self.assertTrue(torch.equal(stored[1], self.expected[weight][0]))
                     self.assertFalse(stored[0].any())
                     self.assertFalse(_load_qzeros(layer, weight, expert_id=0).any())
+
+
+class TestMoeWNA16AwqWithoutDeviceCapability(CustomTestCase):
+    def test_awq_reports_unsupported_device(self):
+        """moe_wna16 + AWQ on a device without a compute capability is rejected with
+        the unsupported-GPU error, not a TypeError from the capability arithmetic."""
+        config = {
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 128,
+            "zero_point": True,
+        }
+        with (
+            patch.object(moe_wna16, "get_device_capability", return_value=(None, None)),
+            self.assertRaisesRegex(ValueError, "not supported for the current GPU"),
+        ):
+            MoeWNA16Config.from_config(config)
 
 
 if __name__ == "__main__":

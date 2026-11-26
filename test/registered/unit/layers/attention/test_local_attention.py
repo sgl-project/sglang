@@ -72,11 +72,11 @@ class TestVirtualBatches(CustomTestCase):
 
 
 class TestLocalAttentionMetadataBuilder(CustomTestCase):
-    def _builder(self, swa_translate=None, max_context_len=16):
+    def _builder(self, swa_translate=None, req_to_token_row_width=16):
         return LocalAttentionMetadataBuilder(
             attention_chunk_size=4,
             page_size=1,
-            max_context_len=max_context_len,
+            req_to_token_row_width=req_to_token_row_width,
             device=CPU,
             swa_translate=swa_translate,
         )
@@ -106,8 +106,8 @@ class TestLocalAttentionMetadataBuilder(CustomTestCase):
         torch.testing.assert_close(swa.local_block_table, plain.local_block_table + 100)
 
     def test_cuda_graph_buffers_fit_the_worst_case_decomposition(self):
-        """Buffer sizing must match the most virtual batches max_bs x max_context_len can produce."""
-        b = self._builder(max_context_len=16)
+        """Buffer sizing must match the most virtual batches max_bs x req_to_token_row_width can produce."""
+        b = self._builder(req_to_token_row_width=16)
         bufs = b.alloc_cuda_graph_buffers(max_bs=2)
         md = b.build(
             cu_seqlens_q=torch.tensor([0, 16, 32], dtype=torch.int32),
@@ -150,7 +150,7 @@ class TestLocalAttentionMetadataBuilder(CustomTestCase):
         return LocalAttentionMetadataBuilder(
             attention_chunk_size=32,
             page_size=16,
-            max_context_len=64,
+            req_to_token_row_width=64,
             device=CPU,
             swa_translate=swa_translate,
         )

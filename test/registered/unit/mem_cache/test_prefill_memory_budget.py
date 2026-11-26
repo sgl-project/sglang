@@ -182,6 +182,7 @@ def _multi_window_state_allocator(
             state_strategy=strategy,
             max_running_requests=4,
             context_len=2 * tokens,
+            req_to_token_row_width=2 * tokens,
             alignment=1,
         ),
     )
@@ -195,7 +196,6 @@ def _multi_window_state_allocator(
             enable_memory_saver=False,
             need_sort=False,
             max_num_reqs=4,
-            model_context_len=2 * tokens,
             lazy_compaction=lazy_compaction,
             state_cache_params=SimpleNamespace(layers=(2,)),
         ),

@@ -30,6 +30,9 @@ from PIL import Image
 from sglang.srt.multimodal import media_io
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.transformers_auto import (
+    TransformersAutoMultimodalProcessor,
+)
 from sglang.srt.utils.nvjpeg_decoder import _NvJpegDecoderPool
 from sglang.test.test_utils import CustomTestCase
 
@@ -212,6 +215,26 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         self.assertIn(":fancy_upsampling=1", decoder.kwargs["options"])
         self.assertIs(pool._decode_params.sample_format, fake_format)
         self.assertFalse(pool._decode_params.apply_exif_orientation)
+
+
+class TestTransformersAutoImageLoad(CustomTestCase):
+    def test_jpeg_on_cuda_host_is_loaded_as_rgb_pil(self):
+        """The generic Transformers-backend processor feeds PIL images to the
+        HF processor: a JPEG on a CUDA host must not come back as a device
+        tensor from the nvJPEG path."""
+        processor = object.__new__(TransformersAutoMultimodalProcessor)
+        with (
+            patch.object(media_io, "is_cuda", return_value=True),
+            patch(
+                "torchvision.io.decode_jpeg",
+                return_value=torch.zeros((3, 8, 8), dtype=torch.uint8),
+            ),
+        ):
+            images = processor._load_images([_jpeg_bytes()])
+
+        self.assertEqual(len(images), 1)
+        self.assertIsInstance(images[0], Image.Image)
+        self.assertEqual(images[0].mode, "RGB")
 
 
 if __name__ == "__main__":

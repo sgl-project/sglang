@@ -57,6 +57,7 @@ def _unified(target_window, placement):
             state_slots=0,
             max_running_requests=2,
             context_len=256,
+            req_to_token_row_width=256,
             alignment=1,
         ),
     )
@@ -67,7 +68,6 @@ def _unified(target_window, placement):
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=2,
-        model_context_len=256,
         lazy_compaction=True,
     )
     return build_kv_storage(plan, sized, ctx), plan

@@ -132,7 +132,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                     patch.multiple(
                         autotune,
                         flashinfer_autotune_cache_path=lambda _: cache_path,
-                        get_flashinfer_autotune_skip_ops=lambda _: skip_ops,
+                        get_flashinfer_autotune_skip_ops=lambda: skip_ops,
                         get_exec=lambda: SimpleNamespace(
                             moe=SimpleNamespace(moe_runner_backend="flashinfer_megamoe")
                         ),
@@ -183,7 +183,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                 patch.multiple(
                     autotune,
                     flashinfer_autotune_cache_path=lambda _: cache_path,
-                    get_flashinfer_autotune_skip_ops=lambda _: set(),
+                    get_flashinfer_autotune_skip_ops=lambda: set(),
                     get_exec=lambda: SimpleNamespace(
                         moe=SimpleNamespace(moe_runner_backend="triton")
                     ),
@@ -427,6 +427,12 @@ class TestAutotuneCachePhases(CustomTestCase):
                     )
                 )
             with (
+                # The per-rank JSON cache, which multi-rank and MegaMoE keep.
+                patch.object(
+                    autotune,
+                    "uses_flashinfer_managed_autotune_cache",
+                    return_value=False,
+                ),
                 patch.object(
                     autotune,
                     "flashinfer_autotune_cache_path",

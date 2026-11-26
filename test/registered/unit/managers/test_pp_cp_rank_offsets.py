@@ -55,9 +55,6 @@ def _make_receiver() -> SchedulerRequestReceiver:
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        server_args=SimpleNamespace(
-            enable_dp_attention_local_control_broadcast=False,
-        ),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
         request_retirer=None,

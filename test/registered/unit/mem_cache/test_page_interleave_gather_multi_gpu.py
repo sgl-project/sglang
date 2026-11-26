@@ -63,6 +63,7 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.device_communicators.gated_transfer import CopyChunk
 from sglang.srt.distributed.device_communicators.multicast_all_gather import (
     _multicast_address,
     has_multicast_support,
@@ -887,15 +888,28 @@ def _run_multicast_mla(rank, world, port):
     pool, req_to_token, prefix_len, seq_len = _run_mla(
         rank, world, port, multicast=True
     )
-    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    gather = pool._multicast_gather
+    output_start = gather._multicast_ptr
+    output_end = output_start + gather.output.nbytes
+    copies = []
+    enqueue = CopyChunk.__call__
+
+    def enqueue_counted(chunk, stream):
+        # The barrier signals target the control buffer, outside the output.
+        if output_start <= chunk.dst < output_end:
+            copies.append(chunk.nbytes)
+        enqueue(chunk, stream)
+
+    # Counted as enqueued, not profiled: the profiler of torch 2.14.1+cu130
+    # records none of these copies.
+    with unittest.mock.patch.object(CopyChunk, "__call__", enqueue_counted):
+        activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    assert activity, "the profiler recorded no GPU activity"
     nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
     assert not nccl_kernels, f"gather ran NCCL kernels: {nccl_kernels}"
-    # The multicast chunk copies are peer copies; the plan's own host syncs
-    # are device-to-host copies.
     block_bytes = pool._send_rows.numel() * pool._slots[0].tensors["kv"][0].nbytes
-    chunks = math.ceil(block_bytes / pool._multicast_gather.chunk_bytes)
-    copies = activity.count("Memcpy PtoP (Device -> Device)")
-    assert chunks > 1 and copies == _GATHER_LAYER_NUM * chunks, (copies, chunks)
+    chunks = math.ceil(block_bytes / gather.chunk_bytes)
+    assert chunks > 1 and len(copies) == _GATHER_LAYER_NUM * chunks, (copies, chunks)
     torch.distributed.barrier()
 
 

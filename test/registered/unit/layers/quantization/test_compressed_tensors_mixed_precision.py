@@ -404,5 +404,18 @@ class TestMixedPrecisionFormat(CustomTestCase):
         self.assertEqual(scheme.group_size, 128)
 
 
+class TestCheckSchemeSupportedError(CustomTestCase):
+    def test_error_is_one_message(self):
+        """The unsupported-capability error reads as a sentence, not a tuple repr."""
+        quant_config = CompressedTensorsConfig.__new__(CompressedTensorsConfig)
+        with (
+            mock.patch.object(torch.cuda, "get_device_capability", return_value=(7, 0)),
+            self.assertRaises(RuntimeError) as ctx,
+        ):
+            quant_config._check_scheme_supported(min_capability=90)
+        self.assertEqual(len(ctx.exception.args), 1, ctx.exception.args)
+        self.assertIn("Min capability: 90. Current capability: 70.", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -162,7 +162,7 @@ def create_bench_cache(
             size=max_num_reqs,
             mamba_size=max(max_num_reqs * 2, 200),
             mamba_spec_state_size=max_num_reqs,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
@@ -175,7 +175,7 @@ def create_bench_cache(
 
         req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
         )

@@ -243,9 +243,6 @@ class SchedulerMetricsReporter:
         self.current_scheduler_metrics_enabled = (
             self.metrics_collector_context.current_scheduler_metrics_enabled
         )
-        self.enable_kv_cache_events = (
-            self.metrics_collector_context.enable_kv_cache_events
-        )
         parallel = get_parallel()
         # The max/mean token ratio is engine-wide; one scheduler reports it.
         self.reports_dp_token_imbalance_ratio = (
@@ -1213,9 +1210,7 @@ class SchedulerMetricsReporter:
         if not self.scheduler.enable_hierarchical_cache:
             return
 
-        host_pool = getattr(
-            self.scheduler.tree_cache, "token_to_kv_pool_host", None
-        ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
+        host_pool = getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
         assert host_pool is not None, "Host pool not found"
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
@@ -1513,6 +1508,10 @@ class SchedulerMetricsReporter:
         self._reset_device_timer_window()
         if not self.current_scheduler_metrics_enabled:
             return
+        if self.scheduler_status_logger is not None:
+            self.scheduler_status_logger.maybe_dump(
+                self.scheduler.running_batch, self.scheduler.waiting_queue
+            )
         # The running-reqs gauge holds the last batch report until the next
         # one (on PD prefill that is the last forward-batch snapshot, which
         # no later report zeroes). If it disagrees with running_batch -- the

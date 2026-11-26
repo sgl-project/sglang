@@ -466,6 +466,41 @@ def test_warmups_wait_for_the_scheduler_loop(listener, registered_warmup):
     instance.server.finish_custom_warmups.assert_called_once_with()
 
 
+def test_launch_keeps_its_core_partition(listener):
+    """The instance keeps the launch and server cores `_partition_cores`
+    chose and the CPU share it chose them from, for a subclass that places its
+    own threads."""
+    with (
+        get_context().override_server_args(host="127.0.0.1", port=listener.port),
+        get_parallel().override(
+            tp_rank=0, attn_tp_rank=0, attn_cp_rank=0, attn_dp_rank=0
+        ),
+        patch.object(rust_extensions, "load_rust_extension"),
+        patch.object(
+            rust_server, "_partition_cores", return_value=([0, 1], [2, 3, 4, 5])
+        ),
+        patch.object(rust_server, "_build_server_args"),
+        patch.object(rust_server.RustServer, "_watch_startup_failure"),
+        # Would SIGQUIT pytest's parent.
+        patch.object(rust_server.RustServer, "_fail_startup"),
+        patch.object(rust_server.RustServer, "drain_state", return_value=0),
+    ):
+        instance = rust_server.RustServer.launch(
+            SimpleNamespace(
+                server_args=SimpleNamespace(),
+                model_config=SimpleNamespace(is_multimodal=False, is_generation=True),
+            ),
+            frontend_cpu_share=(1, 2),
+        )
+        instance.server.recv_requests.return_value = []
+        instance.server.drain_complete.return_value = False
+        instance.drain(1)
+        if instance.warmup_thread is not None:
+            instance.warmup_thread.join(timeout=30)
+    assert (instance.launch_cores, instance.server_cores) == ([0, 1], [2, 3, 4, 5])
+    assert instance.frontend_cpu_share == (1, 2)
+
+
 @pytest.mark.parametrize(
     ("host", "url"),
     [

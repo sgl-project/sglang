@@ -1,0 +1,40 @@
+name: Prefetch Hugging Face models
+description: >-
+  Download the given Hugging Face repos into the runner's cache. Use it only
+  from the trusted checkout (.ci-prefetch) of the workflow's own commit, never
+  from the PR checkout: it is where the token is used.
+
+inputs:
+  hf-token:
+    description: Token for gated repos; only the download step sees it.
+    required: true
+  repo-ids:
+    description: Whitespace-separated repo ids, from check-changes or the diffusion plan.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # No token here. -I and --isolated: no PR checkout on sys.path, and no
+    # user site, PYTHON*, pip config, or PIP_* left on the persistent runner.
+    - name: Install prefetch dependencies
+      if: inputs.repo-ids != ''
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      run: |
+        python3 -I -m pip install --isolated --disable-pip-version-check --quiet \
+          --no-cache-dir --no-deps --only-binary=:all: --index-url https://pypi.org/simple \
+          --target "$RUNNER_TEMP/hf-prefetch" \
+          -r "$GITHUB_ACTION_PATH/../../../scripts/ci/utils/prefetch_requirements.txt"
+
+    # -S: no site-packages of the runner, only the libraries installed above.
+    - name: Download the repos
+      if: inputs.repo-ids != ''
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      env:
+        HF_TOKEN: ${{ inputs.hf-token }}
+        REPO_IDS: ${{ inputs.repo-ids }}
+      run: |
+        PYTHONPATH="$RUNNER_TEMP/hf-prefetch" python3 -S \
+          "$GITHUB_ACTION_PATH/../../../scripts/ci/utils/prefetch_hf_models.py"

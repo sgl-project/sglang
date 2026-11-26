@@ -179,7 +179,6 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
                 topk=1,
                 num_draft_tokens=2,
                 device="cpu",
-                metadata_ready_pre_pad=False,
                 finalize_tree_path=True,
                 post_verify_graphs=SimpleNamespace(run=lambda **_: post),
             )

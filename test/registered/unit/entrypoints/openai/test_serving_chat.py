@@ -774,6 +774,53 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertEqual(canonical, messages)
 
+    def test_jinja_text_tool_result_order_follows_model_not_parser(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        cases = (
+            ("gigachat4", None, ["call-a", "call-b"]),
+            ("gigachat4", "gigachat4", ["call-a", "call-b"]),
+            ("gigachat3_5", None, ["call-b", "call-a"]),
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Compare both results."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": call_id, "arguments": "{}"},
+                        }
+                        for call_id in ("call-a", "call-b")
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-b", "content": "result-b"},
+                {"role": "tool", "tool_call_id": "call-a", "content": "result-a"},
+            ],
+        )
+        self.tm.tokenizer.apply_chat_template.return_value = "rendered"
+        for model_type, parser, expected_order in cases:
+            with self.subTest(model_type=model_type, parser=parser):
+                self.tm.model_config.hf_config.model_type = model_type
+                self.tm.server_args.tool_call_parser = parser
+                chat = OpenAIServingChat(self.tm, self.template_manager)
+
+                chat._apply_jinja_template(request, None, is_multimodal=False)
+
+                rendered = self.tm.tokenizer.apply_chat_template.call_args[0][0]
+                self.assertEqual(
+                    [m["tool_call_id"] for m in rendered if m["role"] == "tool"],
+                    expected_order,
+                )
+                self.assertEqual(
+                    [m.tool_call_id for m in request.messages if m.role == "tool"],
+                    ["call-b", "call-a"],
+                )
+
     def test_jinja_path_recovers_tool_result_images_only_when_template_needs_it(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "openai"
@@ -967,6 +1014,27 @@ class ServingChatTestCase(CustomTestCase):
                 return_value=Mock(allow_auto_truncate=True),
             ):
                 self.assertIsNone(self.chat._validate_request(above_limit))
+
+    def test_request_stop_joins_non_list_template_stop_str(self):
+        """A request's stop joins the template's stop strings when the template
+        declares stop_str as a string or a tuple, not only as a list."""
+        cases = {
+            "phi-4-mm": ["<|end|>"],
+            "minicpmv": ["<|im_end|>", "<|endoftext|>"],
+        }
+        for template_name, template_stop in cases.items():
+            for request_stop in ("x", ["x", "y"]):
+                with self.subTest(template=template_name, stop=request_stop):
+                    self.template_manager.chat_template_name = template_name
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        stop=request_stop,
+                    )
+                    result = self.chat._apply_conversation_template(
+                        request, is_multimodal=False
+                    )
+                    self.assertEqual(result.stop, template_stop + list(request_stop))
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
@@ -4055,9 +4123,9 @@ class ServingChatTestCase(CustomTestCase):
             first_chunk_call.tool_index = 0
             first_chunk_call.name = "get_weather"
             first_chunk_call.parameters = ""
-            parser_instance.parse_stream_chunk.side_effect = [
-                ("", [first_chunk_call]),
-                ("", []),
+            parser_instance.parse_stream_segments.side_effect = [
+                [("", [first_chunk_call])],
+                [("", [])],
             ]
 
             async def collect_first_tool_chunk():
@@ -4086,6 +4154,43 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(payload["created"], 123)
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
+
+    def test_tool_call_stream_keeps_generation_order_within_a_delta(self):
+        """Text after a call in the same delta is sent after that call."""
+        self.chat.tool_call_parser = "glm47"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=True,
+        )
+        delta = (
+            "Sure.<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>Paris</arg_value></tool_call> Done."
+        )
+
+        async def collect():
+            return [
+                line
+                async for line in self.chat._process_tool_call_stream(
+                    index=0,
+                    delta=delta,
+                    parser_dict={},
+                    content={"meta_info": {"id": "chatcmpl-test"}},
+                    request=req,
+                    has_tool_calls={},
+                    created=0,
+                )
+            ]
+
+        lines = get_or_create_event_loop().run_until_complete(collect())
+        order = []
+        for line in lines:
+            message = json.loads(line[len("data: ") :])["choices"][0]["delta"]
+            part = message["content"] or "<call>"
+            if not order or part != order[-1]:
+                order.append(part)
+        self.assertEqual(order, ["Sure.", "<call>", " Done."])
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
@@ -4670,6 +4775,53 @@ class ServingChatTestCase(CustomTestCase):
         ]
         self.assertEqual(tokens, ["b", "c"])
         self.assertEqual(alternatives, [["b", "y"], ["c", "z"]])
+
+    def test_gigachat4_reasoning_mode_follows_each_request(self):
+        self.chat.reasoning_parser = "gigachat4"
+        self.chat._reasoning_detector = ReasoningParser("gigachat4").detector
+        for enabled in (True, False, True):
+            text = (
+                "Thought</think>\n\nAnswer."
+                if enabled
+                else "Answer mentioning <think>literally</think>."
+            )
+            expected = ("Thought", "\n\nAnswer.") if enabled else ("", text)
+            request = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                chat_template_kwargs={"reasoning": enabled},
+                separate_reasoning=True,
+            )
+            self.assertEqual(self.chat._get_reasoning_from_request(request), enabled)
+            self.assertEqual(
+                ReasoningParser(
+                    "gigachat4",
+                    force_reasoning=self.chat._get_reasoning_from_request(request),
+                    request=request,
+                ).parse_non_stream(text),
+                expected,
+            )
+            for chunks in ([text], list(text)):
+                with self.subTest(reasoning=enabled, chunks=chunks):
+                    parsers = {}
+                    results = [
+                        self.chat._process_reasoning_stream(
+                            0, chunk, parsers, {}, request
+                        )
+                        for chunk in chunks
+                    ]
+                    results.append(
+                        self.chat._process_reasoning_stream(
+                            0, "", parsers, {}, request, finish_reason_type="stop"
+                        )
+                    )
+                    self.assertEqual(
+                        tuple(
+                            "".join(result[i] or "" for result in results)
+                            for i in (0, 1)
+                        ),
+                        expected,
+                    )
 
     def test_streaming_logprobs_attached_with_reasoning_parser(self):
         """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""

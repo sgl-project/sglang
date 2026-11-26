@@ -79,6 +79,8 @@ _PREBUILT_STATE = re.compile(
     r"Prebuilt capture state: (\d+) MoE dispatchers, (\d+) logits gatherers\."
 )
 _CAPTURE_BEGIN = re.compile(r"Capture [\w ]*CUDA graph begin\.")
+# Multi-GPU ranks share one log; each line's prefix names its process.
+_LOG_PID = re.compile(r" PID\d+\]")
 # SGLang's own startup timers (the launcher prints them once the schedulers are up).
 _STARTUP_TIMINGS = re.compile(r"Engine startup timings \(s\): (.*)")
 _STARTUP_FIELDS = re.compile(r"scheduler_e2e=([0-9.]+), cuda_graph=\{([^}]*)\}")
@@ -154,6 +156,20 @@ def _write_toml(path: str, workspace: str) -> str:
             f'workspace_root = "{workspace}"\nscratch_space_size = "1024MB"\n'
         )
     return path
+
+
+def _line_prefix(log: str, match: re.Match) -> str:
+    return log[log.rfind("\n", 0, match.start()) + 1 : match.start()]
+
+
+def _capture_begin_of(log: str, prebuilt: re.Match) -> Optional[re.Match]:
+    # The first capture-begin line from the process that printed `prebuilt`;
+    # another rank's line can land first in the shared log.
+    pid = _LOG_PID.search(_line_prefix(log, prebuilt))
+    for capture in _CAPTURE_BEGIN.finditer(log):
+        if pid is None or pid.group(0) in _line_prefix(log, capture):
+            return capture
+    return None
 
 
 def _startup_seconds(log: str):
@@ -438,7 +454,7 @@ class TestFoundryGraphPersistence(CustomTestCase):
             with self.subTest(engine=engine):
                 prebuilt = _PREBUILT_STATE.search(log)
                 if prebuilt is not None:
-                    capture = _CAPTURE_BEGIN.search(log)
+                    capture = _capture_begin_of(log, prebuilt)
                     self.assertIsNotNone(capture, "no capture-begin line in the log")
                     self.assertLess(prebuilt.start(), capture.start())
 

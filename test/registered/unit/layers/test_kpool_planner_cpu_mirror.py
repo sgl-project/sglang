@@ -199,7 +199,6 @@ class TestKPoolPlannerCpuMirror(unittest.TestCase):
                 "kpool_build_ragged_layout",
                 return_value=(torch.empty(0), torch.empty(0), torch.empty(0)),
             ),
-            patch.object(kpool_plan, "dsa_use_prefill_cp", return_value=False),
             patch.object(kpool_plan, "_RAGGED_SCRATCH_K_U8", None),
             patch.object(kpool_plan, "_RAGGED_SCRATCH_K_SCALE", None),
             patch.object(

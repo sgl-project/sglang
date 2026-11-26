@@ -81,6 +81,84 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
     return req
 
 
+def naive_load_topk(
+    coordinator,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k_tokens: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    """Per-request reference for swap_in_selected_pages (non-dsv4 path): load the
+    selected tokens of each request into device memory and return their device
+    indices, shape (num_reqs, top_k)."""
+    assert not coordinator.is_dsv4_hisparse, (
+        "naive_load_topk is not implemented for dsv4 hisparse"
+    )
+    num_reqs = req_pool_indices.size(0)
+    top_k_indices = torch.full(
+        (num_reqs, coordinator.top_k), -1, dtype=torch.int32, device=coordinator.device
+    )
+
+    for i in range(num_reqs):
+        seq_len = int(seq_lens[i].item())
+        top_n = min(seq_len, coordinator.top_k)
+        if top_n == 0:
+            continue
+
+        req_idx = int(req_pool_indices[i].item())
+        selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
+
+        assert torch.all(selected_tokens >= 0), (
+            f"Req {req_idx}: selected tokens contain negative positions"
+        )
+        assert torch.all(selected_tokens < seq_len), (
+            f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
+            f"out of range for seq_len={seq_len}"
+        )
+
+        if seq_len <= coordinator.device_buffer_size:
+            device_indices = coordinator.req_to_device_buffer[req_idx, selected_tokens]
+        else:
+            device_indices = torch.empty(
+                top_n, dtype=torch.int64, device=coordinator.device
+            )
+
+            is_latest_token = selected_tokens == (seq_len - 1)
+            needs_host_load = ~is_latest_token
+
+            device_indices[is_latest_token] = coordinator.req_to_device_buffer[
+                req_idx, coordinator.device_buffer_size
+            ]
+
+            num_to_load = int(needs_host_load.sum().item())
+            if num_to_load > 0:
+                tokens_to_load = selected_tokens[needs_host_load]
+                host_locs = coordinator.req_to_host_pool[req_idx, tokens_to_load]
+
+                invalid_mask = host_locs < 0
+                if torch.any(invalid_mask):
+                    bad_positions = tokens_to_load[invalid_mask].tolist()
+                    raise AssertionError(
+                        f"Req {req_idx} (seq_len={seq_len}, layer={layer_id}): "
+                        f"missing host backup at token positions {bad_positions}"
+                    )
+
+                buffer_locs = coordinator.req_to_device_buffer[req_idx, :num_to_load]
+                device_indices[needs_host_load] = buffer_locs
+
+                coordinator.mem_pool_host.load_to_device_per_layer(
+                    coordinator.mem_pool_device,
+                    host_locs,
+                    buffer_locs,
+                    layer_id,
+                    io_backend="kernel",
+                )
+
+        top_k_indices[i, :top_n] = device_indices.to(torch.int32)
+
+    return top_k_indices
+
+
 class TestHiSparseUnit(unittest.TestCase):
     """Test class that builds a minimal HiSparse component stack."""
 
@@ -148,7 +226,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         cls.req_to_token_pool = ReqToTokenPool(
             size=MAX_NUM_REQS,
-            max_context_len=MAX_CONTEXT_LEN,
+            row_width=MAX_CONTEXT_LEN,
             device=DEVICE,
             enable_memory_saver=False,
         )
@@ -341,7 +419,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
     def _assert_matches_naive(self, rpi, sls, batch, kernel_locs, layer_id, msg=""):
         """Assert kernel swap_in KV data matches naive_load_topk KV data."""
-        naive_locs = self.coordinator.naive_load_topk(rpi, sls, batch, layer_id)
+        naive_locs = naive_load_topk(self.coordinator, rpi, sls, batch, layer_id)
         for b in range(batch.shape[0]):
             for i in range(TOP_K):
                 if batch[b, i] < 0:
@@ -416,7 +494,7 @@ class TestHiSparseUnit(unittest.TestCase):
         rpi, sls = self._make_batch_tensors([req], [fill_len])
 
         for lid in range(LAYER_NUM):
-            naive_locs = self.coordinator.naive_load_topk(rpi, sls, batch, lid)
+            naive_locs = naive_load_topk(self.coordinator, rpi, sls, batch, lid)
             kernel_locs = self._swap_in_selected_pages(rpi, sls, batch, lid)
             valid = batch[0] >= 0
             self.assertTrue(
@@ -450,7 +528,7 @@ class TestHiSparseUnit(unittest.TestCase):
         rpi, sls = self._make_batch_tensors([req], [fill_len])
 
         for lid in range(LAYER_NUM):
-            naive_locs = self.coordinator.naive_load_topk(rpi, sls, batch, lid)
+            naive_locs = naive_load_topk(self.coordinator, rpi, sls, batch, lid)
             kernel_locs = self._swap_in_selected_pages(rpi, sls, batch, lid)
             self.assertTrue(torch.all(naive_locs[0, :TOP_K] >= 0))
             self.assertTrue(torch.all(kernel_locs[0, :TOP_K] >= 0))

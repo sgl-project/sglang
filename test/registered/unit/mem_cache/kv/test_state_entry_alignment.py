@@ -81,6 +81,7 @@ class TestStateEntryAlignment(CustomTestCase):
                         state_slots=8,
                         max_running_requests=1,
                         context_len=16,
+                        req_to_token_row_width=16,
                         alignment=1,
                     ),
                 )

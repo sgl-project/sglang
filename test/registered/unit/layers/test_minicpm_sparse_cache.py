@@ -70,7 +70,7 @@ def make_pool_and_req(capacity: int = 64):
     allocator = RecordingAllocator(capacity)
     pool = ReqToTokenPool(
         size=2,
-        max_context_len=64,
+        row_width=64,
         device="cpu",
         enable_memory_saver=False,
     )
@@ -158,7 +158,7 @@ def test_reserve_leaves_only_dense_capacity_visible():
     allocator = RecordingAllocator(capacity=69)
     pool = ReqToTokenPool(
         size=2,
-        max_context_len=64,
+        row_width=64,
         device="cpu",
         enable_memory_saver=False,
     )
@@ -340,7 +340,7 @@ def test_attach_compressed_cache_is_idempotent():
     allocator = RecordingAllocator(capacity=64)
     pool = ReqToTokenPool(
         size=2,
-        max_context_len=64,
+        row_width=64,
         device="cpu",
         enable_memory_saver=False,
     )

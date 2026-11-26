@@ -379,7 +379,7 @@ class TestW4A8MoE(unittest.TestCase):
                     patch.object(layer.w2_kernel, "apply", return_value=x) as down,
                 ):
                     result = runner.run(
-                        SimpleNamespace(
+                        ascend_runner.AscendRunnerInput(
                             hidden_states=x,
                             hidden_states_scale=None,
                             expert_tokens=torch.tensor([1, 2]),

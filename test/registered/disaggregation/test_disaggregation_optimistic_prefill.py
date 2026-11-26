@@ -416,7 +416,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             size=4,
             mamba_size=self.MAMBA_SIZE,
             mamba_spec_state_size=4,
-            max_context_len=64,
+            row_width=64,
             device=device,
             enable_memory_saver=False,
             cache_params=cache_params,
@@ -534,7 +534,7 @@ class TestOptimisticPrefillWriteThroughRetryPublish(CustomTestCase):
             need_sort=False,
         )
         req_to_token_pool = ReqToTokenPool(
-            size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+            size=4, row_width=64, device="cpu", enable_memory_saver=False
         )
         tree = UnifiedRadixCache(
             params=CacheInitParams(
