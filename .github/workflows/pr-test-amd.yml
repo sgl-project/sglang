@@ -7,14 +7,16 @@ on:
   schedule:
     # Daily AMD order (UTC), rocm10 first, all ending before the 02:00-11:00 PR peak:
     # images (09:00-11:00) -> rocm10 PR test (13:00) -> rocm10 nightly (16:00)
-    # -> rocm724/rocm720 PR test (19:00) -> rocm724/rocm720 nightly (21:00)
     # -> MILES (22:00).
-    # rocm10 runs every day. rocm724 runs on even days of the month and rocm720 on
-    # odd days, here and in nightly-test-amd.yml, so the PR test and the nightly
-    # of one ROCm version always land on the same day.
+    # The weekend ROCm 7.2 lanes start in the morning so a run (about 18-20 h)
+    # finishes within the weekend, before the Monday peak: rocm724 on Saturday
+    # and rocm720 on Sunday, PR test 04:00 and nightly 06:00.
+    # rocm10 runs every day. The ROCm 7.2 lanes run on weekends only: rocm724 on
+    # Saturday and rocm720 on Sunday, here and in nightly-test-amd.yml, so the
+    # PR test and the nightly of one ROCm version always land on the same day.
     - cron: '0 1,13 * * *'  # rocm10: every 12 hours, 13:00 first after the 09:00 UTC rocm10 image
-    - cron: '0 19 2-30/2 * *'  # rocm724: even days of the month
-    - cron: '0 19 1-31/2 * *'  # rocm720: odd days of the month
+    - cron: '0 4 * * 6'  # rocm724: Saturday 04:00
+    - cron: '0 4 * * 0'  # rocm720: Sunday 04:00
   pull_request:
     paths:
       - "python/**"
@@ -48,7 +50,6 @@ on:
           - base-a-jit-kernel-unit-test-amd
           - base-a-jit-kernel-benchmark-test-amd
           - base-b-test-1-gpu-small-amd
-          - base-b-test-1-gpu-small-amd-nondeterministic
           - base-b-test-1-gpu-small-amd-mi35x
           - base-b-test-1-gpu-large-amd
           - base-b-test-2-gpu-large-amd
@@ -172,10 +173,10 @@ jobs:
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
-      # Keep rocm10 on the twice-daily cadence. The 19:00 UTC schedules run
-      # rocm724 on even days and rocm720 on odd days. Dispatch/call inputs select one version
+      # Keep rocm10 on the twice-daily cadence. The 04:00 UTC schedules run
+      # rocm724 on Saturday and rocm720 on Sunday. Dispatch/call inputs select one version
       # or all three, while a pull_request falls through to the rocm10 default.
-      rocm_versions: ${{ inputs.rocm_version == 'all' && '["rocm10","rocm724","rocm720"]' || inputs.rocm_version && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 19 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 19 1-31/2 * *' && '["rocm720"]' || '["rocm10"]' }}
+      rocm_versions: ${{ inputs.rocm_version == 'all' && '["rocm10","rocm724","rocm720"]' || inputs.rocm_version && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 4 * * 6' && '["rocm724"]' || github.event.schedule == '0 4 * * 0' && '["rocm720"]' || '["rocm10"]' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -550,39 +551,6 @@ jobs:
         timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 90 || 75 }}
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 8 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-
-  base-b-test-1-gpu-small-amd-nondeterministic:
-    name: ${{ format('base-b-test-1-gpu-small-amd-nondeterministic ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
-    needs: [check-changes, wait-for-base-a-amd]
-    if: |
-      always() &&
-      (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-b-test-1-gpu-small-amd-nondeterministic,')) ||
-        (
-          !(inputs.target_stage || inputs.target_stage_select) &&
-          ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - uses: ./.github/actions/setup-amd-ci
-        with:
-          rocm_version: ${{ matrix.rocm_version }}
-
-      - name: Run test
-        timeout-minutes: 75
-        run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # Waits for the MI300 base-b jobs, like base-c: the MI35x 1-GPU pool is the
   # scarcest AMD runner pool, so a PR run only asks it for a runner once its
@@ -1259,7 +1227,10 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       # Cache-only: no sgl-router-build here. amd_ci_exec.sh maps the path into the container.
+      # Credentialed job: build from source; the cache may hold a pull_request_target run's files.
       - uses: ./.github/actions/download-sgl-router
+        with:
+          from_source: ${{ env.DOCKERHUB_AMD_TOKEN != '' }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
@@ -1394,7 +1365,6 @@ jobs:
         base-a-jit-kernel-benchmark-test-amd,
         wait-for-base-b-amd,
         base-b-test-1-gpu-small-amd,
-        base-b-test-1-gpu-small-amd-nondeterministic,
         base-b-test-1-gpu-small-amd-mi35x,
         base-b-test-1-gpu-large-amd,
         base-b-test-2-gpu-large-amd,

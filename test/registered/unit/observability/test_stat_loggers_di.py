@@ -226,6 +226,24 @@ class TestHiCacheMetrics(unittest.TestCase):
             [({**labels, "reason": "device_capacity"}, 7)],
         )
 
+    def test_backup_storage_duration_metrics(self):
+        # _drain_backup reads operation.enqueue_time on every L2->L3 ack; a
+        # StorageOperation without the field (renamed or dropped) would crash
+        # the scheduler drain path instead of merely missing one sample.
+        from sglang.srt.managers.cache_controller import StorageOperation
+
+        operation = StorageOperation(host_indices=None, token_ids=[1, 2, 3])
+        self.assertIsInstance(operation.enqueue_time, float)
+        self.assertGreater(operation.enqueue_time, 0)
+
+        labels = {"model_name": "test"}
+        collector = _RecordingStorageMetricsCollector(labels=labels)
+        collector.observe_backup_storage_duration(0.5)
+        self.assertEqual(
+            collector.backup_storage_duration_seconds.observations,
+            [(labels, 0.5)],
+        )
+
 
 class TestDeferredKVReleaseMetrics(CustomTestCase):
     def setUp(self):
@@ -276,6 +294,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue.queue = []
         queue._deferred_releases = [object(), object(), object()]
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler_status_logger = None
         reporter.scheduler = SimpleNamespace(
             enable_hierarchical_cache=False,
             disaggregation_mode=DisaggregationMode.DECODE,
@@ -504,8 +523,9 @@ class TestHiCacheHostMambaStats(CustomTestCase):
 
     def _reporter(self, entry_map):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler_status_logger = None
         tree_cache = MagicMock(spec=UnifiedRadixCache)
-        tree_cache.token_to_kv_pool_host = SimpleNamespace(
+        tree_cache.full_kv_pool_host = SimpleNamespace(
             logical_size=1000, available_size=lambda: 400
         )
         tree_cache.host_pool_group = SimpleNamespace(entry_map=entry_map)
@@ -577,7 +597,7 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         reporter = self._reporter(
             {PoolName.MAMBA: SimpleNamespace(host_pool=mamba_pool)}
         )
-        reporter.scheduler.tree_cache.token_to_kv_pool_host = SimpleNamespace(
+        reporter.scheduler.tree_cache.full_kv_pool_host = SimpleNamespace(
             logical_size=1000, available_size=lambda: 1000
         )
         reporter.scheduler.disaggregation_mode = DisaggregationMode.NULL

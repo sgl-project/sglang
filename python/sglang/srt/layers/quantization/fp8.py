@@ -83,6 +83,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
 from sglang.srt.layers.quantization.mxfp8_block_convert import (
     mxfp8_block_convert_required,
@@ -198,27 +199,7 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 _DENSE_MXSCALE_LOGGED: set = set()
 
-DSV4_DEQUANT_FP4_TABLE = torch.tensor(
-    [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        -0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
-    ],
-    dtype=torch.float32,
-)
+DSV4_DEQUANT_FP4_TABLE = torch.tensor(E2M1_VALUES, dtype=torch.float32)
 
 
 def cast_e2m1fn_to_e4m3fn(
@@ -534,7 +515,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
         if _is_cuda:
-            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            force_marlin = envs.SGLANG_FORCE_FP8_MARLIN.get()
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
 
@@ -3234,6 +3215,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
+            # The Parameter wrap drops the is_shuffled tag shuffle_weight sets;
+            # aiter's gfx950 fp8 CK MoE rejects untagged per-tensor weights.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
             layer._aiter_gate_up_interleaved = False
 
             # ROCm (_use_aiter): using column-wise scaling
@@ -3258,6 +3243,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            elif (
+                _is_gfx1250_supported
+                and _use_aiter
+                and not (self.is_fp4_expert or self.use_mxfp8 or _use_hip_int4)
+            ):
+                # aiter's only gfx1250 MoE kernel takes MXFP4 weights.
+                logger.warning_once(
+                    "aiter has no FP8 MoE kernel on gfx1250; using the triton runner."
+                )
+                moe_runner_backend = MoeRunnerBackend.TRITON
             elif (
                 _is_hip
                 and (_use_aiter or _use_hip_int4)

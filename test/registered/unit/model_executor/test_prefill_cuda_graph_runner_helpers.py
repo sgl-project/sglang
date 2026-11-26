@@ -72,6 +72,25 @@ def _make_breakable_capture_recorder():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_input_embeds_buffer_takes_declared_dtype(self):
+        def create(**kwargs):
+            return PrefillInputBuffers.create(
+                device=torch.device("cpu"),
+                max_bs=1,
+                max_num_tokens=8,
+                cache_loc_dtype=torch.int64,
+                is_multimodal=True,
+                hidden_size=4,
+                dtype=torch.bfloat16,
+                enable_mamba_track=False,
+                **kwargs,
+            )
+
+        self.assertEqual(create().input_embeds.dtype, torch.bfloat16)
+        fp32 = create(input_embeds_dtype=torch.float32)
+        self.assertEqual(fp32.input_embeds.dtype, torch.float32)
+        self.assertEqual(fp32.input_embeds.shape, (8, 4))
+
     def test_attention_padding_respects_cuda_moe_and_quantization(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = True

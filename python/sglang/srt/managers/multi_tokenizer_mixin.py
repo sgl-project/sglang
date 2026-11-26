@@ -66,6 +66,7 @@ from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
     zmq_reader_owner,
 )
+from sglang.srt.managers.mm_utils import discard_shm_features
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.trace import process_tracing_init
 from sglang.srt.runtime_context import get_observability
@@ -75,7 +76,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     kill_process_tree,
 )
-from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.network import await_zmq_send, get_zmq_socket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
@@ -231,6 +232,7 @@ _UNCHECKED_LENGTH_FIELDS = frozenset(
         "input_top_logprobs_val_flat",
         "input_top_logprobs_idx_flat",
         "input_top_logprobs_flat_null_prefix",
+        "input_top_logprobs_weights",
         "output_top_logprobs_val",
         "output_top_logprobs_idx",
         "input_token_ids_logprobs_val",
@@ -429,7 +431,7 @@ class MultiTokenizerRouter:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._task = asyncio.run_coroutine_threadsafe(
-            self.router_worker_obj(), self._loop
+            print_exception_wrapper(self.router_worker_obj), self._loop
         )
         self._handle_task = asyncio.run_coroutine_threadsafe(
             print_exception_wrapper(self.handle_loop), self._loop
@@ -514,7 +516,19 @@ class MultiTokenizerRouter:
                     await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
-            await async_sock_send(self.send_to_scheduler, recv_obj)
+            forwarded = False
+
+            def mark_forwarded():
+                nonlocal forwarded
+                forwarded = True
+
+            try:
+                await await_zmq_send(
+                    sock_send(self.send_to_scheduler, recv_obj), mark_forwarded
+                )
+            finally:
+                if not forwarded:
+                    discard_shm_features(recv_obj)
 
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker."""
@@ -646,10 +660,6 @@ async def print_exception_wrapper(func):
         await func()
     except Exception:
         logger.error(f"MultiTokenizerRouter hit an exception: {traceback.format_exc()}")
-        if hasattr(func, "__self__") and isinstance(
-            func.__self__, MultiTokenizerRouter
-        ):
-            func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
 

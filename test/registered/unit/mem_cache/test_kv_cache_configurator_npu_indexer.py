@@ -1,5 +1,6 @@
 """CPU regressions for NPU DSA indexer pool layer ownership."""
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -48,6 +49,10 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
                 kcc,
                 "get_parallel",
                 return_value=SimpleNamespace(attn_dcp_size=2),
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_parallel",
+                return_value=SimpleNamespace(enable_dsa_cache_layer_split=False),
             ),
             patch.object(
                 kcc,
@@ -212,7 +217,17 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
         ]
         for quant_mode, dtype, kv_cache_dim, key_dtype, scale_dtype in cases:
             with self.subTest(quant_mode=quant_mode, dtype=dtype):
-                pool = self._build_pool(dtype, kv_cache_dim, quant_mode)
+                # The packed FP8 pool only builds on arch35.
+                arch35 = (
+                    patch(
+                        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                        return_value=True,
+                    )
+                    if dtype == torch.float8_e4m3fn
+                    else contextlib.nullcontext()
+                )
+                with arch35:
+                    pool = self._build_pool(dtype, kv_cache_dim, quant_mode)
                 scale = pool.index_k_scale_buffer
                 self.assertEqual(pool.index_k_buffer.dtype, key_dtype)
                 self.assertEqual(None if scale is None else scale.dtype, scale_dtype)
