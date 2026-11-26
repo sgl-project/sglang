@@ -1,0 +1,26 @@
+# PyPI packaging of the sgl-router binary, published by release-sgl-router.yml.
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sgl-router"
+dynamic = ["version"]
+# maturin does not carry these over from Cargo.toml once [project] is present.
+description = "Slim KV-aware OpenAI-compatible router for SGLang workers"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/sgl-project/sglang/tree/main/sgl-router"
+Repository = "https://github.com/sgl-project/sglang"
+
+[tool.maturin]
+bindings = "bin"

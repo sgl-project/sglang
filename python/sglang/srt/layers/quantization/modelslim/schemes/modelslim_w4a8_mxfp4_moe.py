@@ -32,7 +32,7 @@ class ModelSlimW4A8MXFP4MoE(ModelSlimMoEScheme):
             )
         self.quant_config = quant_config
         self.weight_prefix = weight_prefix
-        self.kernel = NPUW4A8MXFP4MoEMethod()
+        self.kernel = NPUW4A8MXFP4MoEMethod(weight_prefix=weight_prefix)
 
     def create_weights(
         self,

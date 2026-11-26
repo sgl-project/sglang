@@ -65,7 +65,7 @@ def drop_hicache_atexit_pin(cache):
     atexit.unregister(cache.shutdown)
 
 
-def write_backup(cache, node, write_back: bool = False) -> int:
+def write_backup(cache, node, write_back: bool = False) -> int | None:
     """Back up one node's KV D->H via the tree's build+execute primitives."""
     return cache._execute_and_commit_kv_backup(
         BackupKV(node_ids=cache.tree_core.build_backup_node_ids(node, write_back)),
@@ -132,6 +132,7 @@ def build_fixture(
         model_path="dummy",
         page_size=cfg.page_size,
         enable_int8_mamba_checkpoint=cfg.enable_int8_mamba_checkpoint,
+        hybrid_cache_checkpoints_level=cfg.hybrid_cache_checkpoints_level,
     )
     # The dummy HF config cannot supply mamba_cache_chunk_size, so preset
     # FLA_CHUNK_SIZE.
@@ -162,18 +163,20 @@ def build_fixture(
             size=cfg.max_num_reqs,
             mamba_size=cfg.mamba_cache_size,
             mamba_spec_state_size=cfg.max_num_reqs,
-            max_context_len=cfg.max_context_len,
+            row_width=cfg.max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
             mamba_layer_ids=cfg.non_full_layer_ids,
             enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
+            enable_mamba_extra_buffer_lazy=cfg.enable_mamba_extra_buffer_lazy,
             speculative_num_draft_tokens=3,
+            enable_overlap_schedule=cfg.enable_overlap_schedule,
         )
     else:
         req_to_token_pool = ReqToTokenPool(
             size=cfg.max_num_reqs,
-            max_context_len=cfg.max_context_len,
+            row_width=cfg.max_context_len,
             device=device,
             enable_memory_saver=False,
         )
@@ -244,13 +247,18 @@ def build_fixture(
         # As the KV cache configurator does: the allocator carries the state.
         allocator.state = req_to_token_pool.state
 
+    # As the cache builder does: the storage owns each window's kept tail.
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+    kv_storage_of(req_to_token_pool, allocator).bind_window_retention(
+        cfg.sliding_window_size, {"swa": cfg.draft_swa_window}
+    )
     cache_init_params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
         page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
-        draft_window_reaches={"swa": cfg.draft_swa_window},
         decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
         tree_slots=tree_slots_of(
             cfg.components,

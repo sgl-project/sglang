@@ -13,22 +13,22 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
-from sglang.kernels.ops.attention.unlimited_ocr_dash.attend import (
-    dash_sparse_attn,
-    dash_sparse_attn_decode,
-)
 from sglang.kernels.ops.attention.unlimited_ocr_dash.decode_meta import (
     local_union_fused,
+)
+from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
+    dash_sparse_attn,
+    dash_sparse_attn_decode,
+    kbar_refresh_tail,
+    route_decode,
+    route_prefill,
+    win_bounds_decode,
 )
 from sglang.kernels.ops.attention.unlimited_ocr_dash.route import (
     SCAN_TILE,
     kbar_all_plan,
-    kbar_refresh_tail_triton,
     kbar_tail_plan,
     prefill_row2req,
-    route_decode_triton,
-    route_prefill_triton,
-    win_bounds_decode,
 )
 from sglang.srt.configs.model_config import get_unlimited_ocr_v2_sparse_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -55,6 +55,7 @@ from sglang.srt.layers.attention.unlimited_dash_ops.page_state import (
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as uocr_doc_reuse
+from sglang.srt.utils.device import is_device_stream_capturing
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -150,7 +151,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         self.q_chunk = int(sparse_cfg.get("dash_query_chunk", 2048))
         self.stage0 = resolve_stage0(sparse_cfg)
         self.num_layers = int(model_runner.model_config.num_hidden_layers)
-        self.max_context_len = int(model_runner.model_config.context_len)
+        self.model_config = model_runner.model_config
 
         assert self.kv_pool.page_size == self.block_size, (
             f"page_size ({self.kv_pool.page_size}) must equal sparse_block_size "
@@ -199,7 +200,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
 
         # Captured grid and reduction widths must not grow with sequence length.
         self.max_block_static = max(
-            1, triton.cdiv(self.max_context_len, self.block_size)
+            1, triton.cdiv(self.model_config.context_len, self.block_size)
         )
         # Set by init_cuda_graph_state; until then every buffer grows on demand.
         self.cg_max_bs = 0
@@ -207,6 +208,14 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         self._cg_ready = False
 
         self._init_prefill_buffer_slots()
+        if torch.device(self.device).type == "mps":
+            from sglang.kernels.ops.attention.unlimited_ocr_dash import metal
+
+            metal.compile_kernels(
+                head_dim=head_dim,
+                index_dim=self.idx_head_dim,
+                block_size=self.block_size,
+            )
 
         logger.info(
             "[Unlimited-OCR v2] DASH sparse attention: block=%d local=%d "
@@ -386,7 +395,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         self.coord_state = PageCoordState(
             sparse_cfg,
             max_reqs=max_reqs,
-            max_pages=page_capacity(self.max_context_len),
+            max_pages=page_capacity(self.model_config.context_len),
         )
         self.image_bucket_constraint = bool(
             sparse_cfg.get("image_bucket_constraint", False)
@@ -401,7 +410,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         Capture sizes share a graph pool, so reused addresses could corrupt
         state embedded in earlier graphs.
         """
-        if torch.cuda.is_current_stream_capturing():
+        if is_device_stream_capturing(torch.device(self.device)):
             raise RuntimeError(
                 f"[Unlimited-OCR v2] {what} would be allocated during cuda graph "
                 "capture. Every cross-step buffer must be sized in "
@@ -709,8 +718,8 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         cols = self._block_cols(max_block)
         rows = forward_batch.req_pool_indices.long()
         # Flattened gather reads only the requested page starts.
-        row_width = self.req_to_token.shape[1]
-        linear = rows[:, None] * row_width + cols[None, :]
+        req_to_token_row_width = self.req_to_token.shape[1]
+        linear = rows[:, None] * req_to_token_row_width + cols[None, :]
         gathered = (
             self.req_to_token.reshape(-1)
             .gather(0, linear.reshape(-1))
@@ -906,7 +915,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         md.slot_mapping = forward_batch.out_cache_loc
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if refresh_in_graph or seq_lens_cpu is None:
-            md.max_seq_len = self.max_context_len
+            md.max_seq_len = self.model_config.context_len
         else:
             md.max_seq_len = int(seq_lens_cpu.max().item())
         if _uses_static_width(
@@ -1278,7 +1287,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
                 device=self.device,
                 out=self._kbar_plan_buf,
             )
-        kbar_refresh_tail_triton(
+        kbar_refresh_tail(
             kv_cache=kv,
             k_bar=k_bar,
             block_table=md.block_table,
@@ -1289,7 +1298,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         )
         img = self._image_allow_decode(md) if router.image_only else None
         win = self._scan_window(md) if img is not None else None
-        return route_decode_triton(
+        return route_decode(
             idx_q=idx_q,
             k_bar=k_bar,
             block_table=md.block_table,
@@ -1344,7 +1353,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
                 device=self.device,
                 out=row2req_out,
             )
-        kbar_refresh_tail_triton(
+        kbar_refresh_tail(
             kv_cache=kv,
             k_bar=k_bar,
             block_table=md.block_table,
@@ -1354,7 +1363,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             plan=md.kbar_plan,
         )
         img = self._image_allow_prefill(md) if router.image_only else None
-        width, _, _ = route_prefill_triton(
+        width, _, _ = route_prefill(
             idx_q=idx_q,
             k_bar=k_bar,
             block_table=md.block_table,
@@ -1572,7 +1581,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             self.cg_max_bs,
             self.cg_max_tokens,
             w,
-            self.max_context_len,
+            self.model_config.context_len,
             self.block_size,
             SCAN_TILE if _ENT_WINDOW else 0,
         )
