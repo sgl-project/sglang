@@ -20,6 +20,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    Union,
     overload,
 )
 
@@ -30,7 +31,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
@@ -49,6 +50,10 @@ if TYPE_CHECKING:
         CommonKVManager,
         CommonKVReceiver,
         CommonKVSender,
+    )
+    from sglang.srt.managers.io_struct import (
+        GenerateReqInput,
+        TokenizedGenerateReqInput,
     )
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.storage import KVStorage
@@ -337,6 +342,45 @@ def _is_fake_transfer(req: Req) -> bool:
         req.bootstrap_host is None
         and get_disagg().disaggregation_transfer_backend == "fake"
     )
+
+
+def lacks_decode_peer(
+    req: Union[Req, GenerateReqInput, TokenizedGenerateReqInput],
+    *,
+    disaggregation_mode: DisaggregationMode,
+    transfer_backend: TransferBackend,
+) -> bool:
+    """Whether a request to a prefill server names no bootstrap host, so that
+    no decode can find its KV. The caller passes its own mode and backend."""
+    return (
+        req.bootstrap_host is None
+        and disaggregation_mode == DisaggregationMode.PREFILL
+        and transfer_backend != TransferBackend.FAKE
+    )
+
+
+def answered_by_prefill(
+    req: Req,
+    *,
+    disaggregation_mode: DisaggregationMode,
+    transfer_backend: TransferBackend,
+) -> bool:
+    """Whether the prefill server answers this admitted request by itself: it
+    has no decode peer, and asks for no more than the token prefill samples.
+
+    Distinct from ``Req.is_prefill_only`` (max_new_tokens == 0, no sampling):
+    this is true for a one-token request as well."""
+    if not lacks_decode_peer(
+        req,
+        disaggregation_mode=disaggregation_mode,
+        transfer_backend=transfer_backend,
+    ):
+        return False
+    assert req.sampling_params.max_new_tokens in (0, 1), (
+        f"{req.rid=} has no decode peer but asks for "
+        f"{req.sampling_params.max_new_tokens} tokens"
+    )
+    return True
 
 
 def pre_alloc_fill_len(req: Req) -> int:

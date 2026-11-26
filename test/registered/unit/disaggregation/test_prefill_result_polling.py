@@ -23,7 +23,10 @@ from sglang.srt.disaggregation.prefill import (
     _PP_PD_EARLY_SEND_STATE_TYPES,
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
+from sglang.srt.disaggregation.utils import (
+    ReqToMetadataIdxAllocator,
+    TransferBackend,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
@@ -184,6 +187,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.depths = []
         self.scheduler_stage_metrics = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.transfer_backend = TransferBackend.MOONCAKE
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.is_generation = True
         self.dllm_config = None
@@ -1407,6 +1411,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
         self.forward_sleep_time = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.transfer_backend = TransferBackend.MOONCAKE
         self.enable_staging = False
         self.enable_overlap = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)
