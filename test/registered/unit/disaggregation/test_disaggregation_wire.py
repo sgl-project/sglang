@@ -3929,7 +3929,7 @@ class TestAscendHybridLayerSplitMetadata(CustomTestCase):
         # Three buffer groups, one owned layer, fewer entries than model layers.
         pool.full_kv_pool = SimpleNamespace(
             get_kv_layer_ids=lambda: [2, 2, 2],
-            get_contiguous_buf_infos=lambda: ([10, 20, 30], [4096]*3, [256]*3),
+            get_contiguous_buf_infos=lambda: ([10, 20, 30], [4096] * 3, [256] * 3),
         )
         with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
             self.assertEqual(pool.get_kv_layer_ids(), [11, 11, 11])
@@ -3950,7 +3950,9 @@ class TestAscendHybridLayerSplitMetadata(CustomTestCase):
         root = SimpleNamespace(
             use_dsa=True,
             full_kv_pool=child,
-            layer_router=SimpleNamespace(sub_pool=lambda _: None, wrapped_view=lambda: child),
+            layer_router=SimpleNamespace(
+                sub_pool=lambda _: None, wrapped_view=lambda: child
+            ),
             get_state_buf_infos=lambda: ([10], [1024], [128]),
             get_state_layer_ids=lambda: [0],
         )

@@ -17,8 +17,8 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-    NPUMLATokenToKVPool,
     NPUDSATokenToKVPool,
+    NPUMLATokenToKVPool,
 )
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
