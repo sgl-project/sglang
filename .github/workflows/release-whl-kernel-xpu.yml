@@ -50,6 +50,17 @@ jobs:
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
           echo "Building sgl-kernel-xpu ${TAG_NAME} from ${BRANCH}"
 
+      - name: Refuse prebuilt wheels in the checkout
+        run: |
+          set -euo pipefail
+          # A PR could ship a wheel that the old export path would have uploaded and published.
+          found=$(find . -path ./sgl-kernel-xpu -prune -o -name '*.whl' -print)
+          if [ -n "${found}" ]; then
+            echo "::error::Checkout contains prebuilt wheels; refusing to build a release:"
+            echo "${found}"
+            exit 1
+          fi
+
       - name: Checkout SGLang XPU kernel
         uses: actions/checkout@v4
         with:
@@ -103,9 +114,24 @@ jobs:
               python scripts/build_rel_wheel.py
               ls -lh dist
             '
-          mkdir -p python/sglang/kernels/aot/dist
-          docker cp sgl_kernel_xpu_release_build:/root/sglang/sgl-kernel-xpu/dist/. python/sglang/kernels/aot/dist/
-          ls -lh python/sglang/kernels/aot/dist/sglang_kernel_xpu-*.whl
+          # Export outside the (possibly PR) checkout so only container-built wheels are uploaded.
+          WHEEL_DIR="${RUNNER_TEMP}/xpu-kernel-wheels"
+          rm -rf "${WHEEL_DIR}" && mkdir -p "${WHEEL_DIR}"
+          docker cp sgl_kernel_xpu_release_build:/root/sglang/sgl-kernel-xpu/dist/. "${WHEEL_DIR}/"
+          echo "WHEEL_DIR=${WHEEL_DIR}" >> "$GITHUB_ENV"
+
+      - name: Verify exported XPU kernel wheels
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.xpu_meta.outputs.version }}"
+          ls -la "${WHEEL_DIR}"
+          shopt -s nullglob
+          wheels=("${WHEEL_DIR}"/sglang_kernel_xpu-"${VERSION}"-*.whl)
+          others=$(find "${WHEEL_DIR}" -mindepth 1 -name '*.whl' ! -name "sglang_kernel_xpu-${VERSION}-*.whl")
+          if [ "${#wheels[@]}" -eq 0 ] || [ -n "${others}" ]; then
+            echo "::error::Expected only sglang_kernel_xpu-${VERSION}-*.whl in ${WHEEL_DIR}; unexpected: ${others:-<none built>}"
+            exit 1
+          fi
 
       - name: Cleanup XPU kernel build container
         if: always()
@@ -115,7 +141,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-xpu
-          path: python/sglang/kernels/aot/dist/sglang_kernel_xpu-*.whl
+          path: ${{ env.WHEEL_DIR }}/sglang_kernel_xpu-*.whl
+          if-no-files-found: error
 
   release-xpu:
     if: github.repository == 'sgl-project/sglang'
@@ -134,6 +161,22 @@ jobs:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-*-xpu
+
+      - name: Verify downloaded XPU kernel wheels
+        run: |
+          set -euo pipefail
+          VERSION="${TAG_NAME#v}"
+          DIST=python/sglang/kernels/aot/dist
+          ls -la "${DIST}"
+          shopt -s nullglob
+          wheels=("${DIST}"/sglang_kernel_xpu-"${VERSION}"-*.whl)
+          others=$(find "${DIST}" -mindepth 1 ! -name "sglang_kernel_xpu-${VERSION}-*.whl")
+          if [ "${#wheels[@]}" -eq 0 ] || [ -n "${others}" ]; then
+            echo "::error::Refusing to publish: expected only sglang_kernel_xpu-${VERSION}-*.whl; unexpected: ${others:-<none>}"
+            exit 1
+          fi
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
 
       - name: Release
         uses: softprops/action-gh-release@v2
