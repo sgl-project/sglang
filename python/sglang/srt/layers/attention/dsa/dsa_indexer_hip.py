@@ -234,12 +234,33 @@ def init_indexer_hip(indexer, config) -> None:
     )
     from sglang.srt.runtime_context import get_exec
 
-    # MXFP4 index-K (Kimi-K3.1 on gfx950 under DCP); the pool checks the setup
+    # MXFP4 index-K (Kimi-K3.1 on gfx950, DCP1 or DCP-sharded); the pool checks the setup
     indexer.fp4_index_k = get_exec().kernel.enable_dsa_fp4_indexer
-    # gfx950 decode / verify prologue of the NoPE (Kimi-K3.1) indexer
+    # gfx950 decode / verify / DCP1-FP4 draft-extend prologue of the NoPE indexer
     if _is_gfx95:
         indexer.rocm_nope_prologue = make_rocm_nope_prologue(indexer)
-    indexer._hist_topk = hist_topk_workspace(indexer, config)
+    if indexer.fp4_index_k:
+        if indexer.rocm_nope_prologue is None:
+            raise ValueError(
+                "--enable-dsa-fp4-indexer requires a gfx950 NoPE DSA indexer with "
+                "bf16 head gate and 128-dim head/block (e.g. Kimi-K3.1)"
+            )
+        if indexer.apply_hadamard:
+            raise ValueError(
+                "--enable-dsa-fp4-indexer requires index_apply_hadamard=False "
+                "(RocmNoPEPrologue does not apply Hadamard rotation)"
+            )
+        if indexer.n_heads <= 0 or indexer.n_heads % 16 != 0 or indexer.n_heads > 64:
+            raise ValueError(
+                "--enable-dsa-fp4-indexer requires index_n_heads to be a positive "
+                f"multiple of 16 up to 64, got {indexer.n_heads}"
+            )
+        # _prefill_lite_topk reads FP8 (k_fp8, k_scale), which fp4_index_k does not build.
+        indexer.use_prefill_lite_topk = False
+        # FP4 decode/verify uses fp4_topk_paged; skip allocating the FP8 hist-topk workspace.
+        indexer._hist_topk = None
+    else:
+        indexer._hist_topk = hist_topk_workspace(indexer, config)
     # pick the prefill logits kernel now, not inside a graph capture
     _prefill_mqa_logits_fn()
 
@@ -341,6 +362,7 @@ def fuse_index_k_norm(indexer, forward_batch) -> bool:
     if not (
         indexer.skip_rope
         and indexer.bf16_head_gate
+        and not indexer.fp4_index_k
         and not indexer.use_dsa_indexer_fusion
         and not indexer.use_aiter_fused_fp8_writer
         and indexer.head_dim == 128
@@ -385,16 +407,71 @@ def store_index_k_prenorm(indexer, forward_batch, layer_id: int, key) -> None:
     )
 
 
+def _fp4_fixed_table_cols(block_tables: torch.Tensor, page_size: int) -> int:
+    """Fixed block-table column width matching decode CUDA graph capture so eager
+    DCP1 batches share one AITER row-group variant and cannot evict captured graphs."""
+    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    attn_backend = get_attn_backend()
+    if isinstance(attn_backend, TboAttnBackend):
+        attn_backend = attn_backend.primary
+    if isinstance(attn_backend, HybridLinearAttnBackend):
+        attn_backend = attn_backend.full_attn_backend
+    if isinstance(attn_backend, HybridAttnBackend):
+        attn_backend = attn_backend.decode_backend
+    if not isinstance(attn_backend, DeepseekSparseAttnBackend):
+        return block_tables.shape[1]
+    cg_meta = attn_backend.__dict__.get("decode_cuda_graph_metadata")
+    if cg_meta is not None:
+        cg_table = cg_meta.get("real_page_table")
+        if cg_table is not None:
+            return max(block_tables.shape[1], cg_table.shape[1])
+    span = attn_backend.real_page_span
+    return max(
+        block_tables.shape[1],
+        (attn_backend.req_to_token.shape[1] + span - 1) // span,
+    )
+
+
 def fp4_request_rows(
-    forward_batch, layer_id: int, block_tables: torch.Tensor, q_offset: int, next_n: int
+    forward_batch,
+    layer_id: int,
+    block_tables: torch.Tensor,
+    q_offset: int,
+    next_n: int,
+    target_cols: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Each request's page-table row (dense, as AITER's row-group logits index it) and
     the start of its ``next_n`` query rows."""
-    key = (id(forward_batch), q_offset, next_n)
+    cols = (
+        block_tables.shape[1]
+        if target_cols is None
+        else max(block_tables.shape[1], target_cols)
+    )
+    key = (id(forward_batch), q_offset, next_n, cols)
+
+    def _build_tables() -> torch.Tensor:
+        base = block_tables[:q_offset:next_n]
+        if cols == base.shape[1] and base.stride(0) == cols and base.is_contiguous():
+            return base
+        padded = torch.empty(
+            (base.shape[0], cols), dtype=base.dtype, device=base.device
+        )
+        padded[:, : base.shape[1]] = base
+        if cols > base.shape[1]:
+            padded[:, base.shape[1] :].zero_()
+        return padded
+
     tables = _fp4_request_block_tables.get(
         key=key,
         layer_id=layer_id,
-        compute=lambda: block_tables[:q_offset:next_n].contiguous(),
+        compute=_build_tables,
     )
     starts = _fp4_query_starts.get(
         key=key,
@@ -414,17 +491,24 @@ def fp4_topk_paged(
     weights: torch.Tensor,
     metadata,
 ) -> torch.Tensor:
-    """Decode / verify top-k over the MXFP4 index-K: this rank's local KV slots, with
-    their counts in ``metadata.attn_metadata.dcp_topk_length`` (dcp_local_topk)."""
+    """Decode / verify top-k over the MXFP4 index-K (DCP1 or DCP-sharded)."""
     from sglang.kernels.ops.attention.dsa import fp4_index_hip
     from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import dcp_local_topk
     from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+    from sglang.srt.runtime_context import get_parallel
 
-    # AITER's row-group logits score each row up to its own rank-local length,
-    # the only columns the DCP top-k reads
     assert isinstance(query, fp4_index_hip.Fp4IndexQuery), (
         "FP4 index-K needs the FP4 prologue"
     )
+    dcp_size = get_parallel().attn_dcp_size
+    q_offset = sum(metadata.get_dsa_extend_len_cpu())
+    if q_offset == 0 and dcp_size == 1:
+        return torch.full(
+            (query.shape[0], indexer.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=query.device,
+        )
     pool = get_token_to_kv_pool()
     page_size = pool.index_page_size
     block_tables = metadata.get_page_table_64()
@@ -433,13 +517,27 @@ def fp4_topk_paged(
         seqlens_32 = metadata.get_seqlens_expanded()
     else:
         seqlens_32 = metadata.get_seqlens_int32()
-    q_offset = sum(metadata.get_dsa_extend_len_cpu())
     B = metadata.get_seqlens_int32().shape[0]
+    if dcp_size == 1:
+        assert B > 0 and q_offset % B == 0, (
+            f"fp4_topk_paged expects uniform rows per request, got q_offset={q_offset}, B={B}"
+        )
     next_n = max(q_offset // B if B > 0 else 1, 1)
-    # this rank's share of each row's length, built with the metadata
-    local_lens = metadata.paged_mqa_ctx_lens_2d.view(-1)[:q_offset]
+    row_ends = (
+        metadata.paged_mqa_ctx_lens_2d.view(-1)[:q_offset]
+        if dcp_size > 1
+        else seqlens_32.view(-1)[:q_offset]
+    )
+    target_cols = (
+        _fp4_fixed_table_cols(block_tables, page_size) if dcp_size == 1 else None
+    )
     request_tables, query_starts = fp4_request_rows(
-        forward_batch, layer_id, block_tables, q_offset, next_n
+        forward_batch,
+        layer_id,
+        block_tables,
+        q_offset,
+        next_n,
+        target_cols=target_cols,
     )
     logits = fp4_index_hip.fp4_paged_mqa_logits(
         query[:q_offset],
@@ -447,20 +545,33 @@ def fp4_topk_paged(
         *pool.get_index_k_fp4_buffers(layer_id),
         request_tables,
         query_starts,
-        local_lens,
+        row_ends,
         block_tables.shape[1] * page_size,
     )
-    # attention reads local KV slots and their counts
-    return dcp_local_topk(
-        logits,
-        local_lens,
-        seqlens_32.view(-1)[:q_offset],
-        block_tables,
-        indexer.index_topk,
-        page_size,
-        metadata.attn_metadata.topk_v2_plan,
-        metadata.attn_metadata.dcp_topk_length,
-    )
+    if dcp_size > 1:
+        # attention reads local KV slots and their counts
+        return dcp_local_topk(
+            logits,
+            row_ends,
+            seqlens_32.view(-1)[:q_offset],
+            block_tables,
+            indexer.index_topk,
+            page_size,
+            metadata.attn_metadata.topk_v2_plan,
+            metadata.attn_metadata.dcp_topk_length,
+        )
+    indexer._mask_init_and_local_tokens(logits, row_ends)
+    topk_result = metadata.topk_transform(logits, indexer.index_topk)
+    if topk_result.shape[0] < query.shape[0]:
+        pad_len = query.shape[0] - topk_result.shape[0]
+        padding = torch.full(
+            (pad_len, topk_result.shape[1]),
+            -1,
+            dtype=topk_result.dtype,
+            device=topk_result.device,
+        )
+        topk_result = torch.cat([topk_result, padding], dim=0)
+    return topk_result
 
 
 def fp4_dcp_gather_index_k(
@@ -477,6 +588,16 @@ def fp4_dcp_gather_index_k(
 
     parallel = get_parallel()
     dcp_size, dcp_rank = parallel.attn_dcp_size, parallel.attn_dcp_rank
+    if dcp_size == 1:
+        max_len = max(int(seq_lens_cpu.max()), 1) if seq_lens_cpu.numel() else 1
+        rows = fp4_index_hip.gather_fp4_index_k_rows(
+            *get_token_to_kv_pool().get_index_k_fp4_buffers(layer_id),
+            block_tables.contiguous(),
+            metadata.get_indexer_seq_len(),
+            int(seq_lens_cpu.sum()),
+            max_len,
+        )
+        return fp4_index_hip.stage_fp4_index_k_rows(rows)
     local_lens_cpu = get_dcp_lens(seq_lens_cpu, dcp_size, dcp_rank)
     rows = fp4_index_hip.gather_fp4_index_k_rows(
         *get_token_to_kv_pool().get_index_k_fp4_buffers(layer_id),

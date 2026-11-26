@@ -1,4 +1,4 @@
-"""Kimi-K3.1 NoPE indexer prologue for gfx950 decode and target verify."""
+"""Kimi-K3.1 NoPE indexer prologue for gfx950 decode, target verify, and draft extend v2."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
 from sglang.srt.layers.attention.dsa import dsa_indexer_hip
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.cp.utils import is_cp_active
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 
 def make_rocm_nope_prologue(indexer) -> Optional[RocmNoPEPrologue]:
@@ -24,17 +24,28 @@ def make_rocm_nope_prologue(indexer) -> Optional[RocmNoPEPrologue]:
     ):
         return RocmNoPEPrologue(
             mono_k_norm=aiter_can_use_preshuffle_paged_mqa()
-            and get_exec().kernel.enable_amd_monokernel
+            and get_exec().kernel.enable_amd_monokernel,
+            fp4_index_k=bool(indexer.fp4_index_k),
+            allow_draft_extend_v2=bool(
+                indexer.fp4_index_k and get_parallel().attn_dcp_size == 1
+            ),
         )
     return None
 
 
 class RocmNoPEPrologue:
-    def __init__(self, mono_k_norm: bool = False) -> None:
+    def __init__(
+        self,
+        mono_k_norm: bool = False,
+        fp4_index_k: bool = False,
+        allow_draft_extend_v2: bool = False,
+    ) -> None:
         # [wk | weights_proj] after merge_k_gate; the two weights become its views
         self.k_gate_weight: Optional[torch.Tensor] = None
         # the monokernel's index-K store may apply k_norm itself (fuse_index_k_norm)
         self.mono_k_norm = mono_k_norm
+        self.fp4_index_k = fp4_index_k
+        self.allow_draft_extend_v2 = allow_draft_extend_v2
 
     def merge_k_gate(self, indexer) -> None:
         if not (
@@ -47,13 +58,18 @@ class RocmNoPEPrologue:
         indexer.weights_proj.weight.data = merged[indexer.head_dim :]
         self.k_gate_weight = merged
 
-    @staticmethod
-    def applies(x, forward_batch, in_graph_split_op: bool, weights_proj_lora) -> bool:
+    def applies(
+        self, x, forward_batch, in_graph_split_op: bool, weights_proj_lora
+    ) -> bool:
         mode = forward_batch.forward_mode
         return (
-            (mode.is_decode_or_idle() or mode.is_target_verify())
+            (
+                mode.is_decode_or_idle()
+                or mode.is_target_verify()
+                or (self.allow_draft_extend_v2 and mode.is_draft_extend_v2())
+            )
             and not in_graph_split_op
-            and not weights_proj_lora
+            and (not weights_proj_lora or self.fp4_index_k)
             and (isinstance(x, torch.Tensor) or len(x) == 3)
             and not is_cp_active(forward_batch)
         )
@@ -79,7 +95,11 @@ class RocmNoPEPrologue:
             # AITER's fused RMSNorm hands (fp8, scale, bf16); wk and the gate read the bf16
             if isinstance(x, tuple):
                 x = x[2]
-            if self.k_gate_weight is None:
+            if (
+                self.k_gate_weight is None
+                or getattr(indexer.weights_proj, "set_lora", False)
+                or getattr(indexer.wk, "set_lora", False)
+            ):
                 key, gate = indexer.wk(x)[0], indexer.weights_proj(x)[0]
             else:
                 # wk's unquantized route; the K3.1 bf16 GEMM table tunes N = 160

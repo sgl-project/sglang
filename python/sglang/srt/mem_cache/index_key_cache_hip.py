@@ -14,11 +14,54 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+def validate_fp4_index_cache_config() -> None:
+    """Reject serving topologies and storage backends incompatible with split FP4 scales."""
+    from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+    from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
+
+    mem = get_memory()
+    dcp_size = get_parallel().attn_dcp_size
+    if not (dsa_shards_index_k() or dcp_size == 1):
+        raise ValueError(
+            "--enable-dsa-fp4-indexer requires either DCP1 or DCP-sharded index-K"
+        )
+    if mem.enable_flexkv or mem.radix_cache_backend == "flexkv":
+        raise ValueError(
+            "--enable-dsa-fp4-indexer is not supported with FlexKV "
+            "(split FP4 scale buffers are not transferred by FlexKVConnector)"
+        )
+    if mem.enable_unified_cache_external_linker:
+        raise ValueError(
+            "--enable-dsa-fp4-indexer is not supported with "
+            "--enable-unified-cache-external-linker (split FP4 scale buffers "
+            "are not transferred by the direct external linker)"
+        )
+    if mem.enable_hierarchical_cache and mem.hicache_storage_backend not in (
+        None,
+        "file",
+    ):
+        raise ValueError(
+            "--enable-dsa-fp4-indexer is not supported with "
+            f"--hicache-storage-backend {mem.hicache_storage_backend!r} "
+            "(INDEXER_SCALE sidecar is not supported in this L3 HiCache backend)"
+        )
+    if dcp_size == 1 and mem.enable_hierarchical_cache:
+        raise ValueError(
+            "--enable-dsa-fp4-indexer on DCP1 is not supported with "
+            "--enable-hierarchical-cache"
+        )
+    if dcp_size == 1 and get_disagg().disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-dsa-fp4-indexer on DCP1 is not supported with PD disaggregation"
+        )
+
+
 class Fp4IndexKeyCache(IndexKeyCache):
     """``buffer`` holds the e2m1 pages and ``scale_buffer`` their ue8m0 exponents,
     each dense as AITER's FP4 logits address them, on the same page ids."""
 
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
+        validate_fp4_index_cache_config()
         super().__init__(pool, index_buf_size)
         num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
         scale_bytes = pool.page_size // pool.index_kpool * pool.index_head_dim // 32
@@ -50,7 +93,33 @@ class Fp4IndexKeyCache(IndexKeyCache):
         del self.scale_buffer
 
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
-        assert tgt_loc.numel() == 0, "Moving FP4 index keys is not supported"
+        if tgt_loc.numel() == 0:
+            return
+        from sglang.srt.runtime_context import get_parallel
+
+        assert get_parallel().attn_dcp_size == 1, (
+            "Moving sharded FP4 index keys under DCP>1 is not supported"
+        )
+        assert self.pool.index_kpool == 1, (
+            "Moving pooled FP4 index keys is not supported"
+        )
+        page_size = self.pool.index_page_size
+        assert page_size == 64, (
+            f"FP4 index-K move expects page_size=64, got {page_size}"
+        )
+        tgt_flat = tgt_loc.view(-1).long()
+        src_flat = src_loc.view(-1).long()
+        tgt_page, tgt_slot = tgt_flat // page_size, tgt_flat % page_size
+        src_page, src_slot = src_flat // page_size, src_flat % page_size
+        tgt_s0, tgt_s1 = tgt_slot % 16, tgt_slot // 16
+        src_s0, src_s1 = src_slot % 16, src_slot // 16
+        for payload_buf, scale_buf in zip(self.buffer, self.scale_buffer):
+            if payload_buf.shape[0] == 0:
+                continue
+            payload = self._kernel_view(payload_buf).view(-1, 4, page_size, 16)
+            payload[tgt_page, :, tgt_slot, :] = payload[src_page, :, src_slot, :]
+            scale = scale_buf.view(-1, 4, 16, 4)
+            scale[tgt_page, :, tgt_s0, tgt_s1] = scale[src_page, :, src_s0, src_s1]
 
     def get_fp4_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         """[pages, 4096] e2m1 bytes and [pages, 256] exponents of the layer's FP4 keys."""
