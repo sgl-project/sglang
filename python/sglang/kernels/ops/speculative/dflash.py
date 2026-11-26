@@ -194,6 +194,134 @@ def _compute_dflash_accept_bonus_triton_unchecked(
 
 
 @triton.jit
+def _dflash_commit_block_kernel(
+    candidates_ptr,
+    num_correct_drafts_ptr,
+    bonus_tokens_ptr,
+    prefix_lens_ptr,
+    out_tokens_ptr,
+    num_accept_tokens_out_ptr,
+    new_seq_lens_out_ptr,
+    candidates_row_stride,
+    candidates_col_stride,
+    num_correct_stride,
+    bonus_stride,
+    prefix_lens_stride,
+    out_tokens_row_stride,
+    num_accept_stride,
+    new_seq_lens_stride,
+    block_size,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    num_correct = tl.load(num_correct_drafts_ptr + row * num_correct_stride)
+    bonus_token = tl.load(bonus_tokens_ptr + row * bonus_stride).to(tl.int64)
+    num_accept = num_correct.to(tl.int32) + 1
+    prefix_len = tl.load(prefix_lens_ptr + row * prefix_lens_stride)
+    tl.store(num_accept_tokens_out_ptr + row * num_accept_stride, num_accept)
+    tl.store(new_seq_lens_out_ptr + row * new_seq_lens_stride, prefix_len + num_accept)
+
+    drafts = tl.load(
+        candidates_ptr
+        + row * candidates_row_stride
+        + (cols + 1) * candidates_col_stride,
+        mask=cols < block_size - 1,
+        other=0,
+    ).to(tl.int64)
+    tl.store(
+        out_tokens_ptr + row * out_tokens_row_stride + cols,
+        tl.where(cols == num_correct, bonus_token, drafts),
+        mask=cols < block_size,
+    )
+
+
+def dflash_commit_block(
+    candidates: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    out_tokens: torch.Tensor,
+    num_accept_tokens_out: torch.Tensor,
+    new_seq_lens_out: torch.Tensor,
+) -> None:
+    """The committed block of an accept decided elsewhere, in one launch:
+    ``out_tokens`` [bs, block_size] int64 gets ``candidates[:, 1:]`` with a zero
+    last column and the bonus at ``num_correct_drafts``;
+    ``num_accept_tokens_out = int32(num_correct_drafts) + 1``;
+    ``new_seq_lens_out = prefix_lens + num_accept_tokens_out``.
+    Any batch and block size; inputs may be strided; no host sync."""
+    batch_size, block_size = candidates.shape
+    # Triton rejects an empty grid.
+    if batch_size == 0:
+        return
+    block = triton.next_power_of_2(block_size)
+    _dflash_commit_block_kernel[(batch_size,)](
+        candidates,
+        num_correct_drafts,
+        bonus_tokens,
+        prefix_lens,
+        out_tokens,
+        num_accept_tokens_out,
+        new_seq_lens_out,
+        candidates.stride(0),
+        candidates.stride(1),
+        num_correct_drafts.stride(0),
+        bonus_tokens.stride(0),
+        prefix_lens.stride(0),
+        out_tokens.stride(0),
+        num_accept_tokens_out.stride(0),
+        new_seq_lens_out.stride(0),
+        block_size,
+        BLOCK=block,
+        num_warps=_pick_num_warps(block),
+    )
+
+
+@triton.jit
+def _dflash_chain_accept_indices_kernel(
+    num_accept_tokens_ptr,
+    accept_indices_ptr,
+    num_accept_stride,
+    block_size,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    num_accept = tl.load(num_accept_tokens_ptr + row * num_accept_stride)
+    flat = row * block_size + cols
+    tl.store(
+        accept_indices_ptr + flat,
+        tl.where(cols < num_accept, flat, -1),
+        mask=cols < block_size,
+    )
+
+
+def dflash_chain_accept_indices(
+    num_accept_tokens: torch.Tensor, block_size: int
+) -> torch.Tensor:
+    """[bs, block_size] int64 flat offsets into the verify out_cache_loc of each
+    accepted chain position, -1 past ``num_accept_tokens`` (EAGLE accept_index
+    layout at topk 1). One launch, no host sync."""
+    batch_size = num_accept_tokens.shape[0]
+    accept_indices = torch.empty(
+        (batch_size, block_size), dtype=torch.int64, device=num_accept_tokens.device
+    )
+    # Triton rejects an empty grid.
+    if batch_size:
+        block = triton.next_power_of_2(block_size)
+        _dflash_chain_accept_indices_kernel[(batch_size,)](
+            num_accept_tokens,
+            accept_indices,
+            num_accept_tokens.stride(0),
+            block_size,
+            BLOCK=block,
+            num_warps=_pick_num_warps(block),
+        )
+    return accept_indices
+
+
+@triton.jit
 def _prepare_dflash_draft_block_contig_kernel(
     bonus_tokens_ptr,
     prefix_lens_ptr,

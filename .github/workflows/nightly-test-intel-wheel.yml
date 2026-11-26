@@ -33,6 +33,10 @@ concurrency:
   group: nightly-test-intel-wheel-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || format('{0}-{1}', github.ref, github.event.schedule) }}
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
+# Read-only GITHUB_TOKEN; nothing here writes through the API.
+permissions:
+  contents: read
+
 jobs:
   nightly-kernel-wheel-test-1-gpu-xpu:
     # sglang main + prebuilt sgl-kernel-xpu wheel: PR CI suites plus nightly-kernel-wheel-test-1-gpu-xpu.
@@ -54,6 +58,8 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
+          # Long-lived self-hosted host: keep the job token out of .git/config.
+          persist-credentials: false
 
       - name: Start CI container (pull intel/sglang-dev:latest)
         run: |

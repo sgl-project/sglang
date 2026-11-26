@@ -17,7 +17,11 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization import mxfp4 as mxfp4_module
-from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+from sglang.srt.layers.quantization.mxfp4 import (
+    Mxfp4DynamicQuantMoEMethod,
+    Mxfp4MoEMethod,
+)
+from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8MoEMethod
 from sglang.srt.runtime_context import get_context, get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -122,6 +126,33 @@ class TestMxfp4AiterRunnerSelection(CustomTestCase):
                     method.apply(layer, dispatch_output)
                     called = (apply_aiter.called, method.runner.run.called)
                     self.assertEqual(called, (expect_aiter, not expect_aiter))
+
+
+class TestAiterOnlyMoEMethodsRejectOtherRunners(CustomTestCase):
+    """Methods whose apply() only drives the AITER runner fail in create_moe_runner
+    when another runner is selected, not with an AttributeError on the first forward."""
+
+    def test_other_runner_is_rejected(self):
+        methods = {
+            "mxfp4_dynamic": Mxfp4DynamicQuantMoEMethod(),
+            # __init__ requires ROCm; create_moe_runner reads no instance state.
+            "quark_int4fp8": QuarkInt4Fp8MoEMethod.__new__(QuarkInt4Fp8MoEMethod),
+        }
+        selections = (("triton", "none"), ("auto", "flashinfer_nvlink_one_sided"))
+        for name, method in methods.items():
+            for runner_backend, a2a_backend in selections:
+                with (
+                    self.subTest(method=name, runner_backend=runner_backend),
+                    get_context().override_server_args(model_path="dummy"),
+                    get_flags().moe.override(
+                        runner_backend=MoeRunnerBackend(runner_backend),
+                        a2a_backend=MoeA2ABackend(a2a_backend),
+                    ),
+                    self.assertRaisesRegex(ValueError, "only on the aiter MoE runner"),
+                ):
+                    method.create_moe_runner(
+                        torch.nn.Module(), MoeRunnerConfig(activation="silu")
+                    )
 
 
 if __name__ == "__main__":
