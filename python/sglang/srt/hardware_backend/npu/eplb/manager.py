@@ -17,7 +17,6 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.hardware_backend.npu.eplb.coordinator import (
     ControlPoint,
-    Phase,
     RebalanceAborted,
     UnsafeRebalanceFailure,
 )
@@ -297,12 +296,8 @@ class NpuAsyncEPLBManager(EPLBManager):
             return False
         # Called at the same extend boundary on every rank. Keep scheduling
         # prefill before processing results while any rank has prompts pending.
-        all_finished, _ = coordinator.control.vote(
-            coordinator.epoch,
-            coordinator.phase,
-            ControlPoint.PREFILL_ADMISSION,
-            not has_pending_prefill,
-            False,
+        all_finished, _ = coordinator.vote(
+            ControlPoint.PREFILL_ADMISSION, not has_pending_prefill
         )
         return all_finished
 
@@ -321,22 +316,16 @@ class NpuAsyncEPLBManager(EPLBManager):
             >= get_exec().moe.expert_distribution_recorder_buffer_size
         )
 
-        def vote(point, ready, error):
-            return coordinator.control.vote(
-                coordinator.epoch, Phase.IDLE, point, ready, error
-            )
-
-        ready, _ = vote(ControlPoint.RECORDER_WINDOW, enough_samples, False)
+        ready, _ = coordinator.vote(ControlPoint.RECORDER_WINDOW, enough_samples)
         if not ready:
             return
         start = time.perf_counter()
         snapshot = recorder.snapshot_for_rebalance(
-            coordinator.runtime.spec, self._check_rebalance_needed, vote
+            coordinator.runtime.spec, self._check_rebalance_needed, coordinator.vote
         )
         snapshot_seconds = time.perf_counter() - start
         if snapshot is None:
             return
-        coordinator.control.wait_seconds = 0.0
         coordinator.start(coordinator.runtime.planner(snapshot))
         del snapshot
         try:
@@ -359,7 +348,7 @@ class NpuAsyncEPLBManager(EPLBManager):
             coordinator.epoch,
             coordinator.layers_installed,
             time.perf_counter() - start,
-            coordinator.control.wait_seconds,
+            coordinator.control_wait_seconds,
             runtime.stage_seconds,
             runtime.install_enqueue_seconds,
             snapshot_seconds,

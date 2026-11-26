@@ -40,6 +40,8 @@ class UnsafeRebalanceFailure(RuntimeError):
 
 
 class Control(Protocol):
+    wait_seconds: float
+
     # layer is a nonnegative layer ID or one of the reserved ControlPoint values.
     def vote(
         self, epoch: int, phase: int, layer: int, ready: bool, error: bool
@@ -84,7 +86,7 @@ class AsyncEplbCoordinator:
         *,
         planning_drain_timeout: float = 5,
     ):
-        self.control, self.runtime, self.timeout = control, runtime, timeout
+        self._control, self.runtime, self.timeout = control, runtime, timeout
         self._planning_drain_timeout = planning_drain_timeout
         self.phase = Phase.IDLE
         self.epoch = 0
@@ -101,12 +103,24 @@ class AsyncEplbCoordinator:
     def active(self) -> bool:
         return self.phase in (Phase.PLANNING, Phase.STAGING)
 
+    @property
+    def control_wait_seconds(self) -> float:
+        return self._control.wait_seconds
+
+    def vote(self, point: int, ready: bool, error: bool = False) -> tuple[bool, bool]:
+        """Vote at the forward thread's current epoch and phase."""
+        try:
+            return self._control.vote(self.epoch, self.phase, point, ready, error)
+        except Exception as exc:
+            self._fatal("EPLB control agreement failed", exc)
+
     def start(self, planner: Callable[[], Any]) -> None:
         if self.phase != Phase.IDLE or self._closed:
             raise RuntimeError("EPLB coordinator is not idle")
         self.epoch += 1
         self._layers = ()
         self.layers_installed = 0
+        self._control.wait_seconds = 0.0
         self.submission_wait_seconds = 0.0
         self._error = None
 
@@ -138,12 +152,7 @@ class AsyncEplbCoordinator:
 
     def _all_ranks_ready(self, layer: int) -> bool:
         ready = self._local_ready(layer)
-        try:
-            all_ready, any_error = self.control.vote(
-                self.epoch, int(self.phase), layer, ready, self._error is not None
-            )
-        except Exception as error:
-            self._fatal("EPLB control agreement failed", error)
+        all_ready, any_error = self.vote(layer, ready, self._error is not None)
         if any_error:
             cause = self._error
             if self.phase == Phase.STAGING:
@@ -250,7 +259,7 @@ class AsyncEplbCoordinator:
         try:
             # Keep the same collective as a forward vote. If a peer is still
             # polling, the phase mismatch is reported on both ranks.
-            drained, _ = self.control.vote(
+            drained, _ = self._control.vote(
                 self.epoch,
                 Phase.DISABLED,
                 ControlPoint.NO_LAYER,
@@ -270,7 +279,7 @@ class AsyncEplbCoordinator:
         self.cancel()
         try:
             self.runtime.close()
-            self.control.close()
+            self._control.close()
         except Exception as error:
             self._fatal("EPLB transport close failed", error)
         self._executor.shutdown(wait=True)
