@@ -470,7 +470,7 @@ jobs:
       # DeepSWE amd64 eval-pod images (cluster-local SWR mirror; adjust here if
       # the mirror path differs).
       deepswe_eval_image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/library/python:3.12'
-      deepswe_dind_image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/library/docker:27-dind'
+      deepswe_dind_image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/library/docker:dind'
 
   # Multi-node accuracy suites: one suite list per parity, chosen by the Beijing-date
 #   # parity resolved in set-image-config (odd day runs the odd-day suites, even day

@@ -82,7 +82,7 @@ DEEPSWE_EVAL_IMAGE = (
 )
 DEEPSWE_DIND_IMAGE = (
     os.environ.get("DEEPSWE_DIND_IMAGE")
-    or "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/library/docker:27-dind"
+    or "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/library/docker:dind"
 )
 DEEPSWE_EVAL_NODE_ARCH = os.environ.get("DEEPSWE_EVAL_NODE_ARCH") or "amd64"
 # Time to get the pod scheduled and the eval container up (image pulls, node

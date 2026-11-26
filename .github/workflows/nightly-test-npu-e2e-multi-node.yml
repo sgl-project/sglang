@@ -98,7 +98,7 @@ on:
         required: false
         type: string
         default: ''
-        description: "Image for the DeepSWE docker:dind sidecar; empty keeps the framework default (SWR-mirrored docker:27-dind)."
+        description: "Image for the DeepSWE docker:dind sidecar; empty keeps the framework default (SWR-mirrored docker:dind)."
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
