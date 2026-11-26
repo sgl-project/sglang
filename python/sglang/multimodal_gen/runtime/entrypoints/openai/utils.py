@@ -244,8 +244,6 @@ def choose_output_image_ext(
     return "jpg"
 
 
-# Per-request torch profiler options a client can set on inference requests.
-_PROFILING_REQUEST_FIELDS = ("profile", "profile_all_stages", "num_profiled_timesteps")
 # Upper bound for num_profiled_timesteps when request profiling is enabled;
 # -1 means "all denoising steps". Far above any pipeline's step count, it
 # only guards against absurd schedule values reaching torch.profiler.
@@ -261,11 +259,16 @@ def _validate_request_profiling(kwargs: dict[str, Any]) -> None:
     ordinary inference requests. Only network entry points call this; the
     CLI and Python API still accept ``--profile``.
     """
-    requested = [
-        name
-        for name in _PROFILING_REQUEST_FIELDS
-        if kwargs.get(name) not in (None, False)
-    ]
+    requested = []
+    for name in ("profile", "profile_all_stages"):
+        value = kwargs.get(name)
+        if value is not None and not isinstance(value, bool):
+            raise _bad_request(f"{name} must be a boolean")
+        if value:
+            requested.append(name)
+    num_steps = kwargs.get("num_profiled_timesteps")
+    if num_steps is not None:
+        requested.append("num_profiled_timesteps")
     if not requested:
         return
     if not envs.SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING:
@@ -274,7 +277,6 @@ def _validate_request_profiling(kwargs: dict[str, Any]) -> None:
             f"({', '.join(requested)}); start the server with "
             "SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING=1 to allow it"
         )
-    num_steps = kwargs.get("num_profiled_timesteps")
     if num_steps is not None and (
         isinstance(num_steps, bool)
         or not isinstance(num_steps, int)

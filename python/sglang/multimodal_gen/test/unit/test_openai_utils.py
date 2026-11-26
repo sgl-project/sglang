@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
@@ -366,6 +366,7 @@ def test_build_sampling_params_resolves_size_and_explicit_dimensions(monkeypatch
         {"profile": True},
         {"profile_all_stages": True},
         {"num_profiled_timesteps": 3},
+        {"num_profiled_timesteps": 0},
         {"profile": True, "num_profiled_timesteps": -1, "profile_all_stages": True},
     ],
 )
@@ -448,3 +449,18 @@ def test_build_sampling_params_forwards_profiling_when_enabled(monkeypatch):
 
     assert captured["profile"] is True
     assert captured["num_profiled_timesteps"] == 3
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("profile", "false"),
+        ("profile_all_stages", 0),
+        ("num_profiled_timesteps", False),
+    ],
+)
+def test_profile_options_validate_types_independently(monkeypatch, field, value):
+    monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING", "1")
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_request_profiling({field: value})
+    assert exc_info.value.status_code == 400
