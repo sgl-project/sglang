@@ -68,8 +68,7 @@ MAX_RETRY_COUNT = 3
 
 # Datasets whose evalscope adapter shells out to Docker (agent environments).
 # NPU pods have no Docker daemon, so these run on a separate amd64 pod that
-# provides DinD, while the NPU pods keep serving the model. See
-# ``deepswe-eval-plan.md`` (方案 A).
+# provides DinD, while the NPU pods keep serving the model.
 REMOTE_EVAL_DATASETS = frozenset({"deep_swe"})
 
 # DeepSWE eval pod: an amd64 node (kubernetes.io/arch=amd64) holding a
@@ -464,6 +463,11 @@ def _build_deepswe_eval_env(
         "HF_ENDPOINT": os.environ.get("HF_ENDPOINT") or "https://hf-mirror.com",
         "EVALSCOPE_PIP_MIRROR": os.environ.get("EVALSCOPE_PIP_MIRROR")
         or "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple",
+        # The eval image bundles torch_npu; on the amd64 eval node there is no
+        # Ascend driver, so torch auto-loading it crashes evalscope
+        # (libascend_hal.so missing). DeepSWE runs against a remote API and
+        # needs no NPU, so disable device-backend auto-loading.
+        "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
     }
     if dataset_args:
         env["DEEPSWE_DATASET_ARGS"] = json.dumps(dataset_args, ensure_ascii=False)

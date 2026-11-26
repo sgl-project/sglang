@@ -28,6 +28,12 @@ import re
 import subprocess
 import sys
 
+# The eval image may bundle torch_npu, but the amd64 eval node has no Ascend
+# driver; torch auto-loading it crashes evalscope. DeepSWE talks to the router
+# over HTTP and needs no NPU, so disable device-backend auto-loading. Belt and
+# braces with the pod env set by test_npu_accuracy_utils.
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
 E2E_DIR = os.path.dirname(os.path.abspath(__file__))
 WORK_DIR = "/tmp/deepswe_eval"
 VENV_PYTHON = os.path.join(WORK_DIR, "test_env_evalscope", "bin", "python")
