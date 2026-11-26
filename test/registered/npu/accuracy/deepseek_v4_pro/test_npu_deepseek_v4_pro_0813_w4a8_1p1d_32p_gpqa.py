@@ -103,7 +103,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "--max-running-requests",
     64,
     "--mem-fraction-static",
-    0.82,
+    0.85,
     "--quantization",
     "modelslim",
     "--max-prefill-tokens",

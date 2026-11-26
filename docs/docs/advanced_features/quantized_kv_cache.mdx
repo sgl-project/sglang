@@ -1,9 +1,9 @@
 ---
 title: "Quantized KV Cache"
 metatags:
-    description: "SGLang quantized KV cache: FP8 E4M3/E5M2 and FP4 E2M1 formats, memory savings up to 3.56x, scaling factors, accuracy benchmarks."
+    description: "SGLang quantized KV cache: FP8 E4M3/E5M2, FP4 E2M1 and Ascend INT8 formats, memory savings up to 3.56x, scaling factors, accuracy benchmarks."
 ---
-Quantized KV cache reduces the memory footprint of key-value cache storage by using lower-precision data types (FP8 or FP4) instead of the default model precision in BF16. During autoregressive generation, LLMs cache previously computed key-value pairs to avoid redundant calculations. The KV cache typically consumes a significant portion of GPU memory, especially for long sequences.
+Quantized KV cache reduces the memory footprint of key-value cache storage by using lower-precision data types (FP8, FP4 or INT8) instead of the default model precision in BF16. During autoregressive generation, LLMs cache previously computed key-value pairs to avoid redundant calculations. The KV cache typically consumes a significant portion of GPU memory, especially for long sequences.
 
 Quantized KV cache is a memory optimization technique that primarily benefits throughput by allowing more tokens to be cached, but may introduce minimal accuracy degradation depending on the quantization format used.
 
@@ -35,6 +35,33 @@ FP4 quantization is currently experimental.
 - **`nvfp4`**: NVIDIA FP4 with 16-value blocks, E4M3 block scales, and a per-tensor global scale.
 - **`fp4_mx_block16`**: An E2M1 block-size-16 compatibility recipe. It is distinct from the standard OCP MXFP4 block-size-32 format.
 
+### INT8 Format (Ascend NPU)
+
+`int8` is an Ascend recipe for DSA (sparse MLA) models such as GLM-5.2 on
+NPUs without an FP8 KV cache, such as Ascend 910B (A2). Each
+token's MLA KV is stored as one packed record (INT8 latent, BF16 rope,
+per-128-element FP32 scales; 656 bytes per layer for a 512-rank latent instead
+of 1152 in BF16), which the NPU sparse attention kernel reads back directly.
+The DSA indexer K cache stays BF16 by default; add
+`--indexer-kv-cache-dtype int8` to store it as INT8 as well, under that
+recipe's own restrictions (no HiCache). The record is the one `fp8_e4m3`
+stores on arch35, so `int8` supports what that path supports, including a
+speculative draft model, prefill context parallelism and HiCache.
+With `SGLANG_NPU_USE_MLAPO`, MLAProlog writes the record during decode; this
+needs dynamic INT8 QKV-A and Q-B projection weights, so a draft model with BF16
+weights needs `--speculative-draft-kv-cache-dtype bf16`. A draft that is not a
+DSA model cannot read the record and keeps its KV cache in the compute dtype.
+
+`--kv-cache-dtype int8` is rejected at startup on other platforms, for non-DSA
+models and on arch35 NPUs (use `fp8_e4m3` there). The kernel reading the record
+takes a 64-wide RoPE, and the record keeps its RoPE in BF16 next to a BF16
+query, so a DSA model with another `qk_rope_head_dim` and a `--dtype` other
+than `bfloat16` are rejected as well.
+It is also rejected
+with `--dcp-size` above 1 (the DCP read of the packed record is wired for
+`fp8_e4m3` on arch35 only), with `--enable-dsa-cache-layer-split` and, like
+`fp8_e4m3` on arch35, with sparse KV offload, which has no packed-record path.
+
 ### Platform-registered formats
 
 A hardware platform plugin can register further `--kv-cache-dtype` values for KV cache formats that only its own KV pool implements (see the [SGLang Plugin System](/docs/hardware-platforms/plugin#platform-registered-kv-cache-dtypes)). The platform defines each format's layout and attention kernels. Every in-tree platform rejects these values at startup, and PD disaggregation, hierarchical KV cache, LMCache and `--prefill-only-disable-kv-cache` are not supported with them.
@@ -65,6 +92,11 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-R1-0528 \
     --kv-cache-dtype fp4_mx_block16 \
+
+# Enable INT8 KV cache for a DSA model on an Ascend A2 NPU
+python3 -m sglang.launch_server \
+    --model-path zai-org/GLM-5.2 \
+    --kv-cache-dtype int8 \
 ```
 
 ### SM100 native NVFP4 recipes
