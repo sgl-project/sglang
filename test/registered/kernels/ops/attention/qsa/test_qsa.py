@@ -2612,6 +2612,48 @@ def test_qsa_rejects_hnd_kv_cache_early_and_in_paged_prefill(monkeypatch):
             q, k_hnd, v_hnd, SimpleNamespace(layer_id=0), fb, topk_indices=indices
         )
 
+    # 6. ROCm vectorized_5d and static page_major_layer_major are rejected on bind,
+    # lazy bind, forward_extend, and prewarm; nhd and unified-memory page_major pass.
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        prewarm_qsa_prefill_kernels,
+    )
+
+    for bad_layout in ("vectorized_5d", "page_major_layer_major"):
+        bad_pool = SimpleNamespace(
+            full_kv_pool=SimpleNamespace(use_hnd=False, kv_cache_layout=bad_layout),
+            qsa_token_topk=64,
+        )
+        with pytest.raises(ValueError, match=bad_layout):
+            QwenSparseAttnBackend(SimpleNamespace(token_to_kv_pool=bad_pool))
+
+        lazy_bad_runner = SimpleNamespace(token_to_kv_pool=None)
+        lazy_bad_backend = QwenSparseAttnBackend(lazy_bad_runner)
+        lazy_bad_runner.token_to_kv_pool = bad_pool
+        with pytest.raises(ValueError, match=bad_layout):
+            lazy_bad_backend._capture_cuda_graph_metadata(
+                bs=1,
+                num_tokens=1,
+                req_pool_indices=torch.zeros(1, dtype=torch.int32),
+                seq_lens=torch.ones(1, dtype=torch.int32),
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+            )
+
+        prewarm_backend = object.__new__(QwenSparseAttnBackend)
+        prewarm_backend.token_to_kv_pool = bad_pool
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        with pytest.raises(ValueError, match=bad_layout):
+            prewarm_qsa_prefill_kernels(
+                attn_backend=prewarm_backend, model=torch.nn.Module()
+            )
+
+    for ok_layout in ("nhd", "page_major"):
+        ok_pool = SimpleNamespace(
+            full_kv_pool=SimpleNamespace(use_hnd=False, kv_cache_layout=ok_layout)
+        )
+        ok_backend = QwenSparseAttnBackend(SimpleNamespace(token_to_kv_pool=ok_pool))
+        assert ok_backend.token_to_kv_pool is ok_pool
+
 
 def test_qsa_prewarm_uses_two_slot_scratch_without_dequantizing_fp4_pool(monkeypatch):
     """prewarm_qsa_prefill_kernels must read layer geometry from RadixAttention
@@ -2677,7 +2719,12 @@ def test_qsa_prewarm_uses_two_slot_scratch_without_dequantizing_fp4_pool(monkeyp
 
     captured_paged = []
     captured_flat = []
+    from sglang.srt.layers.attention.qsa import sparse_attn as sa_mod
+
+    sa_mod._prefill_config_table.cache_clear()
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _: "NVIDIA B300")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 3))
     monkeypatch.setattr(
         qsa_backend_module,
         "sparse_gqa_fwd_interface_triton",
@@ -2693,7 +2740,10 @@ def test_qsa_prewarm_uses_two_slot_scratch_without_dequantizing_fp4_pool(monkeyp
         or q,
     )
 
-    prewarm_qsa_prefill_kernels(attn_backend=backend, model=model)
+    try:
+        prewarm_qsa_prefill_kernels(attn_backend=backend, model=model)
+    finally:
+        sa_mod._prefill_config_table.cache_clear()
 
     assert captured_flat and all(dt == torch.float16 for dt, _, _ in captured_flat)
     assert captured_paged

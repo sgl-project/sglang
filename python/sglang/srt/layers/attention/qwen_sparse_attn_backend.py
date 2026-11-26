@@ -329,21 +329,34 @@ class QSAPoolView(msgspec.Struct, frozen=True):
     token_topk: int
 
 
-def _is_hnd_kv_pool(pool) -> bool:
+# Non-NPU QSA paths expect token-indexed 3D [slots, heads, dim] K/V views
+# ("nhd" or unified-memory "page_major"). On NPU, _npu_sparse_attention adapts
+# rank-4 paged/FIA buffers via a zero-copy view, so "paged_nhd" is permitted
+# only as an NPU platform exception.
+_SUPPORTED_QSA_KV_LAYOUTS = (
+    frozenset({"nhd", "page_major", "paged_nhd"})
+    if _is_npu
+    else frozenset({"nhd", "page_major"})
+)
+
+
+def _require_supported_kv_pool_layout(pool) -> None:
     if pool is None:
-        return False
+        return
     full_pool = getattr(pool, "full_kv_pool", pool)
-    return bool(
-        getattr(full_pool, "use_hnd", False)
-        or getattr(full_pool, "kv_cache_layout", None) == "hnd"
-    )
-
-
-def _require_nhd_kv_pool(pool) -> None:
-    if _is_hnd_kv_pool(pool):
+    layout = getattr(full_pool, "kv_cache_layout", None)
+    layout_name = getattr(layout, "value", layout)
+    if isinstance(layout_name, str):
+        layout_name = layout_name.lower()
+    if getattr(full_pool, "use_hnd", False) or layout_name == "hnd":
         raise ValueError(
-            "QwenSparseAttnBackend requires NHD KV cache layout; "
+            "QwenSparseAttnBackend requires token-indexed NHD KV cache layout; "
             "SGLANG_USE_HND_KVCACHE=1 (HND layout) is not supported."
+        )
+    if layout_name is not None and layout_name not in _SUPPORTED_QSA_KV_LAYOUTS:
+        raise ValueError(
+            "QwenSparseAttnBackend requires a supported KV cache layout "
+            f"({sorted(_SUPPORTED_QSA_KV_LAYOUTS)}); got {layout_name!r}."
         )
 
 
@@ -370,7 +383,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
-        _require_nhd_kv_pool(self.token_to_kv_pool)
+        _require_supported_kv_pool_layout(self.token_to_kv_pool)
         self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
             self.token_to_kv_pool
         )
@@ -1044,7 +1057,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch):
-        _require_nhd_kv_pool(
+        _require_supported_kv_pool_layout(
             getattr(self, "token_to_kv_pool", None)
             or getattr(forward_batch, "token_to_kv_pool", None)
         )
@@ -1199,7 +1212,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
                 self.token_to_kv_pool
             )
-        _require_nhd_kv_pool(self.token_to_kv_pool)
+        _require_supported_kv_pool_layout(self.token_to_kv_pool)
         if self.req_to_token is None:
             req_pool = getattr(self.runner, "req_to_token_pool", None)
             self.req_to_token = getattr(req_pool, "req_to_token", None)
@@ -1791,7 +1804,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
-        _require_nhd_kv_pool(
+        _require_supported_kv_pool_layout(
             getattr(self, "token_to_kv_pool", None)
             or getattr(forward_batch, "token_to_kv_pool", None)
         )
@@ -2370,7 +2383,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
-        _require_nhd_kv_pool(
+        _require_supported_kv_pool_layout(
             getattr(self, "token_to_kv_pool", None)
             or getattr(forward_batch, "token_to_kv_pool", None)
         )
@@ -2749,7 +2762,7 @@ def prewarm_qsa_prefill_kernels(
     pool = getattr(sparse_backend, "token_to_kv_pool", None)
     if pool is None or not hasattr(pool, "qsa_token_topk"):
         return
-    _require_nhd_kv_pool(pool)
+    _require_supported_kv_pool_layout(pool)
 
     tic = time.perf_counter()
     device = torch.device(sparse_backend.device or "cuda")
