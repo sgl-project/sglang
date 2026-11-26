@@ -353,7 +353,7 @@ def test_dflash_commit_block_graph(block_size, bs, accept):
         dflash_chain_accept_indices,
         dflash_commit_block,
     )
-    from sglang.srt.speculative.dflash_worker_v2 import _commit_accept
+    from sglang.srt.speculative.dflash_utils import commit_accept
 
     gen = torch.Generator(device="cuda").manual_seed(bs * 31 + block_size)
 
@@ -410,7 +410,7 @@ def test_dflash_commit_block_graph(block_size, bs, accept):
         bonus_tokens.copy_(bonus)
         graph.replay()
 
-        ref_tokens, ref_num_accept = _commit_accept(
+        ref_tokens, ref_num_accept = commit_accept(
             candidates, num_correct_drafts, bonus_tokens
         )
         expected = (

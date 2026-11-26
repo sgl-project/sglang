@@ -10,7 +10,10 @@ from sglang.srt.models.dflash import (
     _grouped_conv,
     candidate_topk,
 )
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dflash_utils import (
+    commit_accept,
+    parse_dflash_draft_config,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=42, suite="base-a-test-cpu")
@@ -598,7 +601,7 @@ def test_accept_commits_the_block_in_one_launch_into_the_accept_ring(
 
     def commit_block(**kwargs):
         launches.append(kwargs)
-        tokens, num_accept = worker_mod._commit_accept(
+        tokens, num_accept = commit_accept(
             kwargs["candidates"], kwargs["num_correct_drafts"], kwargs["bonus_tokens"]
         )
         kwargs["out_tokens"].copy_(tokens)
