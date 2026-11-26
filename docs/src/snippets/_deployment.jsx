@@ -88,8 +88,6 @@
 //                      A benchmarks entry may carry its own latencyPercentile to
 //                      override the page value per cell (entry → config → "P50").
 //                      Legacy "Mean" data is being re-measured to P50; drop once done
-//   benchmarkDeviceLabel optional — throughput denominator label (default "gpu");
-//                      e.g. "NPU device" for measurements divided by logical NPUs.
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
 //   dockerImages       optional — `docker run` image, keyed by
 //                      `hw|variant|quant` then `variant|quant` then
@@ -1023,13 +1021,12 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
     // derived metrics (preferred over measurement[key] when present).
     const pct = (entry && entry.latencyPercentile) || config.latencyPercentile || "P50";
-    const deviceLabel = config.benchmarkDeviceLabel || "gpu";
     const SPEED_LABELS = [
       ["ttft_ms",                `TTFT (${pct})`,      "ms"],
       ["tpot_ms",                `TPOT (${pct})`,      "ms"],
-      // Throughput is total(input+output)/elapsed/device. Keep the legacy GPU
-      // field key; benchmarkDeviceLabel names the denominator used by the data.
-      ["tokens_per_sec_per_gpu", `throughput per ${deviceLabel}`, "tok/s"],
+      // throughput per gpu = total(input+output)/elapsed/GPU;
+      // stored directly in the benchmarks file (= output tok/s/GPU × (isl+osl)/osl).
+      ["tokens_per_sec_per_gpu", "throughput per gpu", "tok/s"],
       ["interactivity",          "interactivity",   "tokens/s/user",
         (m) => (m.tpot_ms != null && m.tpot_ms !== 0)
           ? Math.round((1000 / m.tpot_ms) * 10) / 10
@@ -1174,7 +1171,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       return { title: "Speed", sharedText, colHeaders, rows,
                colCount: measurements.length,
                legend: [
-                 `throughput per ${deviceLabel} = (input+output tokens)/elapsed/${config.benchmarkDeviceLabel || "GPU"}`,
+                 `throughput per gpu = (input+output tokens)/elapsed/GPU`,
                  `interactivity = 1000/TPOT(ms) (tokens/s/user)`,
                ] };
     };
@@ -1216,9 +1213,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         </div>
         {isEmpty ? (
           <div style={s.benchEmpty}>
-            {config.showPlaygroundLink === false
-              ? "Benchmark data pending for this combination."
-              : "Benchmark data pending for this combination — submit yours via the Playground's Submit ↗ button."}
+            Benchmark data pending for this combination — submit yours via the Playground's Submit ↗ button.
           </div>
         ) : (
           <>

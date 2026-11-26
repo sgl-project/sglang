@@ -63,19 +63,21 @@ test('tensor parallel sizes count logical NPU devices rather than allocated A3 c
   ]) {
     assert.match(build(select(hw, variant, quant, strategy)), new RegExp(`--tp-size ${devices}(?:\\s|$)`));
   }
-  assert.equal(config.benchmarkDeviceLabel, 'NPU device');
   assert.deepEqual(config.runModes, ['python']);
 });
 
-test('completed recipes have measurements while partial 235B stays unverified', () => {
+test('235B targets v0.5.18 without promoting historical measurements to verified results', () => {
   const partial = select('a2', '235b-a22b', 'w8a8', 'high-throughput');
   assert.equal(cellVerifyStatus(partial, partial.match), 'unverified');
+  assert.match(partial.warn, /v0\.5\.18/);
+  assert.match(partial.warn, /not.*validated on v0\.5\.18/);
   const partialMeasurement = findBenchmark(benchmarks, partial.match);
   assert.ok(partialMeasurement);
   assert.equal(partialMeasurement.accuracy.gsm8k_200_pct, 96);
   assert.equal(partialMeasurement.accuracy.gsm8k_pct, undefined);
   assert.equal(partialMeasurement.speed, undefined);
-  assert.match(partial.warn, /timed out.*verification remains incomplete/);
+  assert.equal(partialMeasurement.sglang_version, 'main @ b44e248682');
+  assert.match(partialMeasurement.notes, /historical/i);
   for (const entry of benchmarks.filter((entry) => entry !== partialMeasurement)) {
     const cell = findCell(config.cells, entry.match);
     assert.ok(cell, 'Every measurement must resolve to a selectable recipe');

@@ -60,9 +60,20 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 
 ### 3.3 Ascend NPU deployment
 
+export const AscendTable = ({ headers, children, minWidth = 600 }) => (
+  <div style={{ maxWidth: "100%", overflowX: "auto" }}>
+    <table style={{ width: "100%", minWidth, tableLayout: "fixed", overflowWrap: "anywhere" }}>
+      <thead><tr>{headers.map((header) => (
+        <th key={header} style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>{header}</th>
+      ))}</tr></thead>
+      <tbody>{children}</tbody>
+    </table>
+  </div>
+);
+
 Use the selector below for **single-node, PD co-located** deployment: the same
 SGLang service handles prefill and decode. Select **A3** for the measured 8B and
-30B-A3B recipes, or **A2** for 32B recipes and the partially validated 235B-A22B recipe.
+30B-A3B recipes, or **A2** for 32B recipes and the unverified **v0.5.18** 235B-A22B recipe.
 Then select the model, quantization, and workload.
 
 An A3 physical card contains two 64 GB dies; an A2 card has one 64 GB device.
@@ -70,18 +81,14 @@ Tensor parallelism counts logical devices: TP4 requires four A2 cards or two A3
 cards. The selector shows the card and device requirements for each recipe.
 See the [Ascend hardware reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
-<div className="qwen3-ascend-table">
-
-| Model | Quantization | Workload | Hardware / physical cards | Logical devices / TP | Status |
-| --- | --- | --- | --- | --- | --- |
-| Qwen3-8B | W8A8 | Low latency | A3 / 1 | 2 | Measured |
-| Qwen3-8B | W8A8 | High throughput | A3 / 1 allocated | 1 | Measured; GPQA retest 112/198 (56.57%) |
-| Qwen3-30B-A3B | W8A8 | Low latency / high throughput | A3 / 1 | 2 | Measured |
-| Qwen3-32B | BF16 | Low latency | A2 / 4 | 4 | Measured |
-| Qwen3-32B | W8A8 | High throughput | A2 / 4 | 4 | Measured |
-| Qwen3-235B-A22B | W8A8 | High throughput | A2 / 8 | 8 | Startup and GSM8K measured; performance incomplete |
-
-</div>
+<AscendTable headers={["Model", "Quantization", "Workload", "Hardware / physical cards", "Logical devices / TP", "Status"]} minWidth={780}>
+  <tr><td>Qwen3-8B</td><td>W8A8</td><td>Low latency</td><td>A3 / 1</td><td>2</td><td>Measured</td></tr>
+  <tr><td>Qwen3-8B</td><td>W8A8</td><td>High throughput</td><td>A3 / 1 allocated</td><td>1</td><td>Measured; GPQA retest 112/198 (56.57%)</td></tr>
+  <tr><td>Qwen3-30B-A3B</td><td>W8A8</td><td>Low latency / high throughput</td><td>A3 / 1</td><td>2</td><td>Measured</td></tr>
+  <tr><td>Qwen3-32B</td><td>BF16</td><td>Low latency</td><td>A2 / 4</td><td>4</td><td>Measured</td></tr>
+  <tr><td>Qwen3-32B</td><td>W8A8</td><td>High throughput</td><td>A2 / 4</td><td>4</td><td>Measured</td></tr>
+  <tr><td>Qwen3-235B-A22B</td><td>W8A8</td><td>High throughput</td><td>A2 / 8</td><td>8</td><td>Targets v0.5.18; no device validation on that version</td></tr>
+</AscendTable>
 
 The 32B W8A8 recipe follows the command in the
 [A2 best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series).
@@ -99,9 +106,10 @@ targets. The 32B W8A8 recipe passed startup, temperature-0/1 inference,
 its complete performance workload, and full GPQA evaluation with the corrected
 output budget. The 32B BF16
 recipe passed startup, temperature-0/1 inference, performance, and full GSM8K
-evaluation. The 235B W8A8 recipe passed model loading, service health, first
+evaluation. The historical 235B W8A8 run at `b44e248` passed model loading, service health, first
 inference, and the 200-question GSM8K evaluation described below. Its performance
-workload timed out and remains incomplete; this does not validate the A3 TP16/DP16 recipe.
+workload timed out and remains incomplete. These results validate neither the
+v0.5.18 target recipe nor the A3 TP16/DP16 recipe.
 
 <Info>
 The [235B model tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b#model-weights)
@@ -122,25 +130,46 @@ model, or workload requires a new performance measurement.
 #### Prepare the environment and weights
 
 Complete [SGLang installation with NPU support](/docs/hardware-platforms/ascend-npus/getting-started/installation)
-and check `npu-smi info` before launching a recipe. These commands target SGLang
-**main**. Use the dependency combination documented for your CANN version and
-record the exact SGLang commit and runtime versions used for your run. The linked
-Ascend tutorials describe v0.5.16; earlier releases can use different flags.
+and check `npu-smi info` before launching a recipe. The **235B-A22B NPU recipe
+targets [v0.5.18](https://github.com/sgl-project/sglang/releases/tag/v0.5.18)**,
+at commit `71de97b264b04dcd514cf904003028aefe9775c8`. Its startup, accuracy,
+and performance have **not been run on v0.5.18**. The other recipes retain
+their recorded `main` revisions below. Use the dependency combination documented
+for your CANN version and record the exact SGLang commit and runtime versions.
+The historical runtime table is not a v0.5.18 compatibility matrix.
+
+For 235B, prepare the dependencies in the
+[v0.5.18 NPU installation guide](https://github.com/sgl-project/sglang/blob/v0.5.18/docs/docs/hardware-platforms/ascend-npus/getting-started/installation.mdx),
+then install the pinned source in that environment. Use a fresh checkout:
+
+```bash
+git clone --branch v0.5.18 --depth 1 https://github.com/sgl-project/sglang.git sglang-v0.5.18
+cd sglang-v0.5.18
+test "$(git rev-parse HEAD)" = "71de97b264b04dcd514cf904003028aefe9775c8" && \
+  cp python/pyproject_npu.toml python/pyproject.toml && \
+  python -m pip install -e 'python[all_npu]'
+```
+
+Before using the 235B selector command, confirm the active environment:
+
+```bash
+python -c "from importlib.metadata import version; v = version('sglang'); assert v == '0.5.18', f'Expected SGLang 0.5.18, got {v}'; print(v)"
+```
+
+The launch flags, `sglang serve`, `sglang.benchmark.serving`, and
+`sglang.test.run_eval` were checked against this tag's source. These static checks
+do not establish NPU startup, numerical accuracy, or performance.
 
 The A3 measurements and A2 32B validation use the following environments:
 
-<div className="qwen3-ascend-table">
-
-| Component | A3, 2026-09-12 | A2 32B, 2026-09-22–23 |
-| :--- | :--- | :--- |
-| SGLang | `main` at `c389dd086340878934bf96bc209534f1fbb8440c` | `main` at `b44e2486824e2fbde9cbcb09adad10bce5593c16` |
-| CANN | `9.0.0` | `9.0.0` |
-| PyTorch / torch-npu | `2.10.0+cpu` / `2.10.0` | `2.10.0+cpu` / `2.10.0` |
-| sgl-kernel-npu | `2026.9.0` | `2026.9.0`, 910B / aarch64 package |
-| triton-ascend | `3.2.1.dev20260530` | `3.2.1.dev20260530` |
-| Transformers | `5.8.1` | `5.12.1` |
-
-</div>
+<AscendTable headers={["Component", "A3, 2026-09-12", "A2 32B, 2026-09-22\u201323"]} minWidth={600}>
+  <tr><td>SGLang</td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>main</code> at <code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>c389dd086340878934bf96bc209534f1fbb8440c</code></td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>main</code> at <code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>b44e2486824e2fbde9cbcb09adad10bce5593c16</code></td></tr>
+  <tr><td>CANN</td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>9.0.0</code></td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>9.0.0</code></td></tr>
+  <tr><td>PyTorch / torch-npu</td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>2.10.0+cpu</code> / <code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>2.10.0</code></td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>2.10.0+cpu</code> / <code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>2.10.0</code></td></tr>
+  <tr><td>sgl-kernel-npu</td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>2026.9.0</code></td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>2026.9.0</code>, 910B / aarch64 package</td></tr>
+  <tr><td>triton-ascend</td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>3.2.1.dev20260530</code></td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>3.2.1.dev20260530</code></td></tr>
+  <tr><td>Transformers</td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>5.8.1</code></td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>5.12.1</code></td></tr>
+</AscendTable>
 
 The 2026-10-21 A3 8B TP1 GPQA retest used the same versions listed in the A3
 column, with Python 3.11.15, `memfabric-hybrid 1.0.8`, and `memfabric-zbal 1.1.1`.
@@ -177,15 +206,11 @@ The A2 32B assets are pinned to these **ModelScope** repository revisions. Their
 complete file manifests were checked against the downloaded sizes and SHA256
 digests; these revision identifiers refer to ModelScope, not Hugging Face.
 
-<div className="qwen3-ascend-table">
-
-| ModelScope checkpoint | Revision |
-| :--- | :--- |
-| `vllm-ascend/Qwen3-32B-W8A8` | `9ecdf711a9629fbf2385b17b47359c8a604e39ed` |
-| `Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh` | `d7272a49b25d36d75f7ec629503fb704f67268db` |
-| `Qwen/Qwen3-32B` | `d64d397e66908737784bb9172614b88e085b2ad1` |
-
-</div>
+<AscendTable headers={["ModelScope checkpoint", "Revision"]} minWidth={600}>
+  <tr><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>vllm-ascend/Qwen3-32B-W8A8</code></td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>9ecdf711a9629fbf2385b17b47359c8a604e39ed</code></td></tr>
+  <tr><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh</code></td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>d7272a49b25d36d75f7ec629503fb704f67268db</code></td></tr>
+  <tr><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>Qwen/Qwen3-32B</code></td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>d64d397e66908737784bb9172614b88e085b2ad1</code></td></tr>
+</AscendTable>
 
 In the NPU container, load the environment scripts supplied by your installation:
 
@@ -214,16 +239,50 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config as ascendConfig } from "/src/snippets/configs/Qwen/qwen3-ascend.jsx";
 import { benchmarks as ascendBenchmarks } from "/src/snippets/configs/Qwen/qwen3-ascend-benchmarks.jsx";
 
-<Deployment config={ascendConfig} benchmarks={ascendBenchmarks} />
+<Deployment config={ascendConfig} />
+
+#### Recorded Ascend measurements
 
 <Note>
-The benchmark card contains measurements of the selected Cookbook recipe.
+These tables retain the measured revision for each recipe. In particular, the
+235B result is historical evidence from `b44e248`, not a v0.5.18 result.
 Throughput per NPU device divides total input and output throughput by the number
 of logical devices used by that recipe. Reference TPOT values in the table below
 come from the existing best practices. A measured performance result does not
-imply that accuracy or every other recipe has been verified; check the cell's
-status and measurement notes.
+imply that accuracy or every other recipe has been verified. The selector's status
+applies to the target recipe; the tables and notes below describe the recorded runs.
 </Note>
+
+<AscendTable headers={["Recipe", "Measured SGLang revision", "Mean TTFT (ms)", "Mean TPOT (ms)", "Total throughput per NPU device (tok/s)"]} minWidth={780}>
+      {ascendBenchmarks.filter((entry) => entry.speed).map((entry) => (
+        <tr key={JSON.stringify(entry.match)}>
+          <td>{`${entry.match.hw.toUpperCase()} / Qwen3-${entry.match.variant.toUpperCase()} / ${entry.match.quant.toUpperCase()} / ${entry.match.strategy}`}</td>
+          <td>{entry.sglang_version}</td>
+          <td>{entry.speed[0].ttft_ms}</td><td>{entry.speed[0].tpot_ms}</td>
+          <td>{entry.speed[0].tokens_per_sec_per_gpu}</td>
+        </tr>
+      ))}
+</AscendTable>
+
+<AscendTable headers={["Recipe", "Measured SGLang revision", "Accuracy protocol", "Score"]} minWidth={680}>
+      {ascendBenchmarks.map((entry) => (
+        <tr key={JSON.stringify(entry.match)}>
+          <td>{`${entry.match.hw.toUpperCase()} / Qwen3-${entry.match.variant.toUpperCase()} / ${entry.match.quant.toUpperCase()} / ${entry.match.strategy}`}</td>
+          <td>{entry.sglang_version}</td>
+          <td>{ascendConfig.accuracyLabels.find(([key]) => entry.accuracy[key] !== undefined)[1]}</td>
+          <td>{`${Object.values(entry.accuracy)[0]}%`}</td>
+        </tr>
+      ))}
+</AscendTable>
+
+<Accordion title="Measurement notes by recipe">
+  {ascendBenchmarks.map((entry) => (
+    <p key={JSON.stringify(entry.match)}>
+      <strong>{`${entry.match.hw.toUpperCase()} / Qwen3-${entry.match.variant.toUpperCase()} / ${entry.match.quant.toUpperCase()} / ${entry.match.strategy}`}</strong>
+      <br />{entry.notes}
+    </p>
+  ))}
+</Accordion>
 
 #### Verify the selected recipe
 
@@ -244,15 +303,11 @@ The existing Ascend tests evaluate 8B and 32B W8A8 on **GPQA Diamond (198 questi
 temperature 1.0. Run the full dataset against the running service; a short
 request that returns `Paris` only checks that inference works.
 
-<div className="qwen3-ascend-table">
-
-| Model | `EVAL_DATASET` | Maximum output tokens | Client concurrency |
-| :--- | :--- | ---: | ---: |
-| Qwen3-8B W8A8 | `gpqa_diamond` | 38000 | 64 |
-| Qwen3-32B W8A8 | `gpqa_diamond` | 38000 | 64 |
-| Qwen3-30B-A3B W8A8 | `aime25` | 32768 | 16 |
-
-</div>
+<AscendTable headers={["Model", "EVAL_DATASET", "Maximum output tokens", "Client concurrency"]} minWidth={600}>
+  <tr><td>Qwen3-8B W8A8</td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>gpqa_diamond</code></td><td>38000</td><td>64</td></tr>
+  <tr><td>Qwen3-32B W8A8</td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>gpqa_diamond</code></td><td>38000</td><td>64</td></tr>
+  <tr><td>Qwen3-30B-A3B W8A8</td><td><code style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>aime25</code></td><td>32768</td><td>16</td></tr>
+</AscendTable>
 
 The measured 8B and 32B checkpoints have a 40,960-token context limit. In the initial runs, one GPQA
 input was reported as 2,829 tokens, so the upstream 40,000-token output budget
@@ -345,7 +400,7 @@ The A2 BF16 run scored **1139/1314 (86.68%)** with all requests successful;
 GSM8K and GPQA measure different capabilities; report the dataset, prompt format,
 and question count with each score.
 
-The A2 235B W8A8 run on 2026-10-25 scored **192/200 (96.0%)** on GSM8K,
+The **historical** A2 235B W8A8 run on 2026-10-25 scored **192/200 (96.0%)** on GSM8K,
 using five demonstrations (rows 0–4) and the following 200 test rows (5–204).
 It used plain `Question:`/`Answer:` completion prompts, a 512-token output budget,
 temperature 0, top-p 1, and 128 client threads with at most eight server requests.
@@ -355,7 +410,9 @@ The run used eight A2 910B3 devices, TP8, SGLang commit
 `b44e2486824e2fbde9cbcb09adad10bce5593c16`, and model revision
 `aa1470b37a666db251ef9bbc76256fa611a1d87c` of
 `vllm-ascend/Qwen3-235B-A22B-W8A8` on ModelScope; all 66 model files passed SHA256 checks.
-Reproduce this subset against the running TP8 service with the same dataset:
+This result does not validate v0.5.18. To evaluate that version, first use the
+v0.5.18 environment and TP8 recipe above, then run this same subset protocol
+against the running service. Record the new result separately:
 
 ```bash
 python -m sglang.test.run_eval \
@@ -372,7 +429,8 @@ GSM8K test file SHA256 was
 `3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14`.
 The 235B performance attempt used 32 requests at concurrency 8 and a separate
 warmup. It exited with timeout code 124 after 900 seconds, without final metrics;
-no throughput or latency result is reported from that attempt.
+no throughput or latency result is reported from that attempt. Startup, accuracy,
+and performance on v0.5.18 are all **not run**.
 
 Record the report's score and evaluated question count, request failures, model
 and draft revisions, dataset revision, SGLang commit, and dependency versions.
@@ -385,22 +443,19 @@ for other datasets and evaluation methods.
 
 Linked rows use the workloads from the Ascend best practices. The other A2 rows
 define task-specific workloads, without a reference latency target. The 32B BF16
-workload is measured; the 235B workload remains incomplete after a 900-second timeout. ISL and OSL are input and output token counts
+workload is measured; the historical 235B workload at `b44e248` timed out after
+900 seconds, and its v0.5.18 performance run has not been attempted. ISL and OSL are input and output token counts
 per request.
 
-<div className="qwen3-ascend-table">
-
-| Hardware | Model / quantization | Workload | ISL | OSL | Concurrency | Requests | Reference TPOT |
-| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| A3 | Qwen3-8B / W8A8 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-5ms) | 3500 | 1500 | 1 | 4 | 5 ms |
-| A3 | Qwen3-8B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-37ms) | 3500 | 1500 | 64 | 256 | 37 ms |
-| A3 | Qwen3-30B-A3B / W8A8 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-10ms) | 3500 | 1500 | 1 | 1 | 10 ms |
-| A3 | Qwen3-30B-A3B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) | 3500 | 1500 | 160 | 640 | 50 ms |
-| A2 | Qwen3-32B / BF16 | Low latency | 18000 | 4000 | 1 | 4 | No reference target |
-| A2 | Qwen3-32B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series) | 3584 | 1536 | 100 | 400 | 55 ms (source) |
-| A2 | Qwen3-235B-A22B / W8A8 | Throughput candidate | 3500 | 1500 | 8 | 32 | Incomplete (timeout); no final metrics |
-
-</div>
+<AscendTable headers={["Hardware", "Model / quantization", "Workload", "ISL", "OSL", "Concurrency", "Requests", "Reference TPOT"]} minWidth={1000}>
+  <tr><td>A3</td><td>Qwen3-8B / W8A8</td><td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-5ms">Low latency</a></td><td>3500</td><td>1500</td><td>1</td><td>4</td><td>5 ms</td></tr>
+  <tr><td>A3</td><td>Qwen3-8B / W8A8</td><td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-37ms">High throughput</a></td><td>3500</td><td>1500</td><td>64</td><td>256</td><td>37 ms</td></tr>
+  <tr><td>A3</td><td>Qwen3-30B-A3B / W8A8</td><td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-10ms">Low latency</a></td><td>3500</td><td>1500</td><td>1</td><td>1</td><td>10 ms</td></tr>
+  <tr><td>A3</td><td>Qwen3-30B-A3B / W8A8</td><td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms">High throughput</a></td><td>3500</td><td>1500</td><td>160</td><td>640</td><td>50 ms</td></tr>
+  <tr><td>A2</td><td>Qwen3-32B / BF16</td><td>Low latency</td><td>18000</td><td>4000</td><td>1</td><td>4</td><td>No reference target</td></tr>
+  <tr><td>A2</td><td>Qwen3-32B / W8A8</td><td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series">High throughput</a></td><td>3584</td><td>1536</td><td>100</td><td>400</td><td>55 ms (source)</td></tr>
+  <tr><td>A2</td><td>Qwen3-235B-A22B / W8A8</td><td>v0.5.18 candidate</td><td>3500</td><td>1500</td><td>8</td><td>32</td><td>v0.5.18 not run; historical run timed out</td></tr>
+</AscendTable>
 
 The A2 32B reference's card-count inconsistency prevents treating its published
 55 ms as a matched-hardware baseline until the source topology is clarified.
@@ -409,7 +464,8 @@ hardware, checkpoint pair, runtime, and workload match.
 
 For example, run the 8B low-latency workload on current main as follows. Set
 `MODEL_PATH` to the checkpoint used by the running service. For another row,
-replace the four workload arguments with that row's values.
+replace the four workload arguments with that row's values. For 235B, use the
+pinned v0.5.18 environment; that release also provides `sglang.benchmark.serving`.
 
 ```bash
 MODEL_PATH=/models/main-checkpoint

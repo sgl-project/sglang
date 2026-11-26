@@ -12,7 +12,7 @@
 // A2 ModelScope main revision: 9ecdf711a9629fbf2385b17b47359c8a604e39ed;
 // draft revision: d7272a49b25d36d75f7ec629503fb704f67268db.
 // The legacy tokens_per_sec_per_gpu field is divided by the logical NPU device
-// count; this config labels that denominator "NPU device" in the shared UI.
+// count; the Qwen3 page labels it "NPU device" in its local results table.
 // ShareGPT corpus SHA-256:
 // 35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4.
 // Fixed input/output lengths, seed 1, range ratio 1, flush-cache, one measured run.
@@ -31,7 +31,7 @@ export const benchmarks = [
     match: { hw: "a2", variant: "235b-a22b", quant: "w8a8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "main @ b44e248682",
     accuracy: { gsm8k_200_pct: 96.0 },
-    notes: "Measured on 2026-10-25: 8 Ascend 910B3 devices, 64 GiB each, TP8, no EAGLE3 or DP. GSM8K: 192/200 correct; 200 natural stops, no recorded API errors or missing responses. Five demonstration rows followed by 200 scored rows; raw completion, temperature 0, top-p 1, maximum output 512, 128 client threads and at most 8 server requests. This is a fixed subset, not full GSM8K. ModelScope revision aa1470b37a666db251ef9bbc76256fa611a1d87c of vllm-ascend/Qwen3-235B-A22B-W8A8. The 32-request performance attempt (3500 input/1500 output, concurrency 8) timed out after 900 seconds with no final metrics. No performance result or A3 equivalence is claimed; full recipe verification remains incomplete.",
+    notes: "Historical result from 2026-10-25 at b44e2486824e2fbde9cbcb09adad10bce5593c16, not validation of the v0.5.18 target recipe. 8 Ascend 910B3 devices, 64 GiB each, TP8, no EAGLE3 or DP. GSM8K: 192/200 correct; 200 natural stops, no recorded API errors or missing responses. Five demonstration rows followed by 200 scored rows; raw completion, temperature 0, top-p 1, maximum output 512, 128 client threads and at most 8 server requests. This is a fixed subset, not full GSM8K. ModelScope revision aa1470b37a666db251ef9bbc76256fa611a1d87c of vllm-ascend/Qwen3-235B-A22B-W8A8. The 32-request performance attempt (3500 input/1500 output, concurrency 8) timed out after 900 seconds with no final metrics. No performance result or A3 equivalence is claimed; v0.5.18 startup, accuracy, and performance have not been run.",
   },
   {
     match: { hw: "a2", variant: "32b", quant: "bf16", strategy: "low-latency", nodes: "single" },

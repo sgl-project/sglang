@@ -81,7 +81,6 @@ export const config = {
   ],
   "showPlaygroundLink": false,
   "latencyPercentile": "Mean",
-  "benchmarkDeviceLabel": "NPU device",
   "accuracyLabels": [
     [
       "gpqa_diamond_pct",
@@ -104,9 +103,6 @@ export const config = {
       "%"
     ]
   ],
-  "benchmarkCommands": {
-    "speed": "python -m sglang.benchmark.serving \\\n  --backend sglang \\\n  --host {{CURL_HOST}} --port {{CURL_PORT}} \\\n  --model \"{{MODEL_PATH}}\" \\\n  --dataset-name {{DATASET}} \\\n  --random-input-len {{ISL}} --random-output-len {{OSL}} \\\n  --max-concurrency {{MAX_CONCURRENCY}} --num-prompts {{NUM_PROMPTS}} \\\n  --random-range-ratio 1 --seed 1 \\\n  --flush-cache --output-details \\\n  --output-file qwen3-ascend-results.jsonl"
-  },
   "placeholders": {
     "MODEL_PATH": {
       "target": "command",
@@ -439,7 +435,7 @@ export const config = {
       },
       "verified": false,
       "verificationStatus": "unverified",
-      "warn": "A2 validation candidate: 8 cards with 64 GB each on one node (TP=8). Uses the tutorial's recommended W8A8 device count, pure tensor parallelism, eight concurrent requests, and no EAGLE3 or graph capture. Model loading, service health, first inference, and GSM8K 192/200 (96.0%) completed on A2 910B3 with SGLang b44e248. The 32-request performance workload timed out after 900 seconds without final metrics; full recipe verification remains incomplete. See the accuracy protocol below. BF16 needs separate two-node resource validation and is not offered by this single-node selector.",
+      "warn": "Targets SGLang v0.5.18 on A2: 8 cards with 64 GB each on one node (TP=8), eight concurrent requests, no EAGLE3 or graph capture. This recipe has not been device-validated on v0.5.18: startup, accuracy, and performance require new runs. Historical startup and GSM8K 192/200 (96.0%) used b44e248, not v0.5.18; that version's performance attempt timed out without final metrics. See the version setup and historical results below. BF16 needs separate two-node resource validation and is not offered by this single-node selector.",
       "env": [
         "GLOO_SOCKET_IFNAME={{GLOO_IFNAME}}",
         "HCCL_SOCKET_IFNAME={{HCCL_IFNAME}}",
