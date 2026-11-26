@@ -620,7 +620,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_prefetch_threshold=storage_prefetch_threshold,
             )
             self.buffer_pipeline = self.component_of(TREE_TOKEN).create_buffer_pipeline(
-                max_context_len=get_model().context_length or 0,
+                context_length=get_model().context_length or 0,
                 swa_component=swa,
                 further_window_components=further_windows,
                 # Leak backstop only: the queue is charged once per unique node

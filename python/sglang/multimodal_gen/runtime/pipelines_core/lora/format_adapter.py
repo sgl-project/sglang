@@ -31,6 +31,7 @@ class LoRAFormat(str, Enum):
     KOHYA_MINIMAX_H3 = "kohya-minimax-h3"
     KOHYA_QWEN_IMAGE = "kohya-qwen-image"
     KOHYA_Z_IMAGE = "kohya-z-image"
+    MUSUBI_WAN = "musubi-wan"
     WAN = "wan"
     AI_TOOLKIT_FLUX = "ai-toolkit-flux"
 
@@ -130,6 +131,34 @@ def _convert_kohya_minimax_h3(
             ", ".join(_sample_keys(unmatched, 8)),
         )
     return out
+
+
+_MUSUBI_WAN_KEY = re.compile(
+    r"^lora_unet_blocks_(\d+)_"
+    r"(self_attn_(?:q|k|v|o)|cross_attn_(?:q|k|v|o|k_img|v_img)|ffn_(?:0|2))"
+    r"\.(lora_down\.weight|lora_up\.weight|alpha)$"
+)
+
+
+def _looks_like_musubi_wan(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """musubi-tuner Wan LoRA (its default save format): lora_unet_blocks_N_*."""
+    keys = list(state_dict.keys())
+    return bool(keys) and all(_MUSUBI_WAN_KEY.match(k) for k in keys)
+
+
+def _convert_musubi_wan(
+    state_dict: Mapping[str, torch.Tensor],
+    log: logging.Logger,
+) -> Dict[str, torch.Tensor]:
+    """lora_unet_blocks_N_self_attn_q.* -> diffusion_model.blocks.N.self_attn.q.*,
+    the official Wan layout the WAN path already converts (with alpha)."""
+    renamed: Dict[str, torch.Tensor] = {}
+    for key, tensor in state_dict.items():
+        block, module, suffix = _MUSUBI_WAN_KEY.match(key).groups()
+        module = re.sub(r"^(self_attn|cross_attn|ffn)_", r"\1.", module)
+        renamed[f"diffusion_model.blocks.{block}.{module}.{suffix}"] = tensor
+    log.info("[LoRAFormatAdapter] renamed %d musubi Wan keys", len(renamed))
+    return convert_lora_state_dict_by_format(renamed, LoRAFormat.WAN, log)
 
 
 def _looks_like_kohya_flux(state_dict: Mapping[str, torch.Tensor]) -> bool:
@@ -291,6 +320,8 @@ def detect_lora_format_from_state_dict(
     # feed-forward names to recognize it by.
     if _is_z_image_dit(dit_class_name) and _has_prefix_key(keys, "lora_unet_"):
         return LoRAFormat.KOHYA_Z_IMAGE
+    if _looks_like_musubi_wan(state_dict):
+        return LoRAFormat.MUSUBI_WAN
 
     if _looks_like_wan_lora(state_dict):
         return LoRAFormat.WAN
@@ -975,6 +1006,9 @@ def convert_lora_state_dict_by_format(
             _Z_IMAGE_MODULE_NAME_FIXUPS,
             alpha_patterns,
         )
+
+    if fmt == LoRAFormat.MUSUBI_WAN:
+        return _convert_musubi_wan(state_dict, log)
 
     if fmt == LoRAFormat.WAN:
         maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
