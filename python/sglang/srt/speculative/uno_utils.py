@@ -130,7 +130,6 @@ def _sparse_rejection_from_support(
     return accepted_counts, bonus
 
 
-@torch.compile(dynamic=True)
 def _build_sparse_target_support_tensors(
     next_token_logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -141,14 +140,41 @@ def _build_sparse_target_support_tensors(
     max_top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build compact support using the fastest available top-k primitive."""
-    rows = batch_size * forward_width
+    # Runs outside torch.compile: Dynamo cannot trace FlashInfer's stream-keyed
+    # scratch-buffer lookup, which calls torch._C._cuda_getCurrentRawStream since 0.7.4.
     topk_logits, topk_ids = _flashinfer_top_k(
         next_token_logits.contiguous(),
         max_top_k,
         sorted=True,
         deterministic=False,
     )
+    return _sparse_target_support_from_topk(
+        topk_logits=topk_logits,
+        topk_ids=topk_ids,
+        next_token_logits=next_token_logits,
+        temperatures=temperatures,
+        top_ks=top_ks,
+        top_ps=top_ps,
+        batch_size=batch_size,
+        forward_width=forward_width,
+        max_top_k=max_top_k,
+    )
 
+
+@torch.compile(dynamic=True)
+def _sparse_target_support_from_topk(
+    *,
+    topk_logits: torch.Tensor,
+    topk_ids: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor | None,
+    batch_size: int,
+    forward_width: int,
+    max_top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = batch_size * forward_width
     expanded_temperatures = torch.repeat_interleave(
         temperatures,
         forward_width,

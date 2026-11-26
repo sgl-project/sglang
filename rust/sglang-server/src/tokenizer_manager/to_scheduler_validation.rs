@@ -1,5 +1,6 @@
 //! Request validation for scheduler intake.
 
+use crate::message::config::HiddenStatesMode;
 use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::types::TokenIds;
 use crate::utils::{
@@ -21,8 +22,7 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
 
     // The rid is the request's identity everywhere downstream: it keys the detok
     // table, and it rides on EVERY chunk of EVERY decode step. An unbounded
-    // client-supplied rid is therefore a per-step cost, not a one-off. Python's is
-    // a 32-byte uuid hex, so this is generous.
+    // client-supplied rid is therefore a per-step cost, not a one-off.
     // Measured on the CLIENT-facing form: the uniquifier `Rid::from_client` appends
     // is this server's own overhead, and charging the client for bytes it did not
     // send would reject a rid exactly at the documented limit.
@@ -79,16 +79,30 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
         }
     }
 
-    // The scheduler only computes hidden states when launched for it, so without
-    // this the request would 200 with `meta_info.hidden_states` silently absent
-    // (Python `TokenizerManager._validate_one_request`).
-    if !limits.enable_return_hidden_states
-        && matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states)
-    {
+    // Python `TokenizerManager._validate_one_request`.
+    // A request above the server's mode raises in a CUDA graph captured for the lower mode.
+    let requested = match &req.kind {
+        RequestKind::Generate(g) if g.return_hidden_states => HiddenStatesMode::Full,
+        _ => HiddenStatesMode::Null,
+    };
+    if requested > limits.return_hidden_states_mode {
         return Err(Error::Validation(
-            "The server is not configured to return the hidden states. \
-             Please set `--enable-return-hidden-states` to enable this feature."
-                .into(),
+            match limits.return_hidden_states_mode {
+                HiddenStatesMode::Null => {
+                    "The server is not configured to return hidden states. \
+                     Please set `--return-hidden-states-mode last`, \
+                     `--return-hidden-states-mode full`, or the legacy \
+                     `--enable-return-hidden-states` flag."
+                }
+                // Nothing is above `full`, so the exceeded maximum is `last`.
+                HiddenStatesMode::Last | HiddenStatesMode::Full => {
+                    "The requested return_hidden_states mode exceeds the server \
+                     maximum `last`. Please launch with \
+                     `--return-hidden-states-mode full` to allow \
+                     return_hidden_states=True."
+                }
+            }
+            .into(),
         ));
     }
 

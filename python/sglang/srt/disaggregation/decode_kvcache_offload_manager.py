@@ -4,14 +4,20 @@ import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Optional
 from weakref import WeakKeyDictionary as WeakKeyDict
 
+import msgspec
 import torch
 
-from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    ReqList,
+    move,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -44,6 +50,15 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+class OffloadedState(msgspec.Struct):
+    """Decode-side offload progress for one request, keyed by Req in the manager."""
+
+    # Decode-incremental length already submitted for D2H offload.
+    inc_len: int = 0
+    # Tail of the page hash chain, extended as each offloaded chunk is backed up.
+    last_hash: Optional[str] = None
 
 
 class DecodeKVCacheOffloadManager:
@@ -135,7 +150,12 @@ class DecodeKVCacheOffloadManager:
         # in flight); weak keys so a dropped Req is never pinned here.
         self.offloaded_state: WeakKeyDict[Req, OffloadedState] = WeakKeyDict()
         self.offload_inflight: WeakKeyDict[Req, int] = WeakKeyDict()
+        # Finished requests whose release waits for their offloads in flight.
+        self.offloading_reqs = IndexedReqList(ListKind.PD_OFFLOADING)
         logger.info("Enable offload kv cache for decode side")
+
+    def request_lists(self) -> Dict[ListKind, ReqList]:
+        return {ListKind.PD_OFFLOADING: self.offloading_reqs}
 
     def release_host_resources(self) -> None:
         self.decode_host_mem_pool.destroy()
@@ -327,17 +347,11 @@ class DecodeKVCacheOffloadManager:
                 if req in self.offloaded_state:
                     self.offloaded_state[req].last_hash = last_hash
 
-                if req.finished() and not self._has_inflight_offload(req):
+                if req in self.offloading_reqs and not self._has_inflight_offload(req):
                     self._release_finished_req(req)
             finish_count -= 1
 
     def _release_finished_req(self, req: Req):
-        # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
-        # so a previously-released request must be skipped here to avoid
-        # non-idempotent side effects (double free, double unlock).
-        if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
-            return
-
         # Only at finish: a mid-decode free races with admission over live slots.
         # No checkpoint: the offloaded host copy keeps this KV, not the tree.
         self.request_retirer.release(req, checkpoint=False)
@@ -402,7 +416,7 @@ class DecodeKVCacheOffloadManager:
         return page_hashes
 
     def finalize_release_on_finish(self, req: Req):
-        """Free any remaining tail KV that was not offloaded due to non-aligned length."""
         if self._has_inflight_offload(req):
+            move([req], self.offloading_reqs)
             return
         self._release_finished_req(req)

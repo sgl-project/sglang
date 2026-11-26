@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.token_demand import demand_windows
+from sglang.test.unified_allocator_fixtures import largest_take
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -56,18 +57,17 @@ def _build(lazy: bool):
 
 
 def _assert_read_fresh(test, allocator):
-    """The memoized capacity reads must equal the same reads recomputed with
-    every memo dropped (the snapshot and the largest-fit memos)."""
+    """Capacity questions answered on the kept pricing snapshot must equal
+    the same questions answered on a fresh one."""
     names = [b.sub_pool_name for b in allocator.bands]
     memoized = (
-        allocator.available_size(),
-        [allocator.units_available(n) for n in names],
+        largest_take(allocator),
+        [largest_take(allocator, n) for n in names],
     )
-    allocator._fit_memo.clear()
     allocator._snapshot_key = None
     fresh = (
-        allocator.available_size(),
-        [allocator.units_available(n) for n in names],
+        largest_take(allocator),
+        [largest_take(allocator, n) for n in names],
     )
     test.assertEqual(memoized, fresh)
 
@@ -252,7 +252,7 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
                     )
 
                     def check_boundary():
-                        capacity = allocator.available_size()
+                        capacity = largest_take(allocator)
                         self.assertTrue(
                             allocator.admits(
                                 KVDemand(
@@ -363,210 +363,27 @@ class TestPagedStepKeepsTheEpoch(unittest.TestCase):
                 _ids(0), _ids(0), _ids(2), _ids(2), _ids(-1), 2
             )
             self.assertIsNotNone(out)
-            allocator.available_size()
+            allocator.pricing_snapshot()
             epoch = owner._chain_capacity_epoch()
             for seq_len in (3, 4):
                 out = allocator.alloc_decode(_ids(seq_len), _ids(seq_len), _ids(0))
                 self.assertIsNotNone(out)
                 self.assertEqual(owner._chain_capacity_epoch(), epoch)
             with (
-                patch.object(
-                    allocator, "units_fit", wraps=allocator.units_fit
-                ) as joint,
+                patch("sglang.srt.mem_cache.kv.alloc.chain.snapshot_chain") as snapshot,
                 patch.object(
                     owner, "_available_tokens", wraps=owner._available_tokens
                 ) as own,
             ):
-                allocator.available_size()
+                allocator.pricing_snapshot()
                 owner.available_size()
-            joint.assert_not_called()
+            snapshot.assert_not_called()
             own.assert_not_called()
             # The fifth token opens the request's second page.
             out = allocator.alloc_decode(_ids(5), _ids(5), _ids(0))
             self.assertIsNotNone(out)
             self.assertGreater(owner._chain_capacity_epoch(), epoch)
         self.assertEqual(allocator.verify_byte_accounting(), [])
-
-
-class TestOneDemandShapeOneSearch(CustomTestCase):
-    """Regression: on a chain without a window, `available_size` and
-    `full_available_size` share one memo entry, so a read runs one search."""
-
-    def test_the_two_owner_reads_share_one_search(self):
-        from sglang.test.unified_allocator_fixtures import (
-            UnifiedGeometry,
-            build_unified_bundle,
-            setup_allocator_context,
-        )
-
-        setup_allocator_context()
-        allocator = build_unified_bundle(
-            UnifiedGeometry(
-                chain="full",
-                full_layer_ids=(0,),
-                full_tokens=256,
-                context_len=256,
-            )
-        ).token_to_kv_pool_allocator
-        calls = []
-        real = type(allocator).units_fit
-
-        def counting(alloc, demands):
-            calls.append(dict(demands))
-            return real(alloc, demands)
-
-        with patch.object(type(allocator), "units_fit", counting):
-            for _ in range(3):
-                allocator.free(allocator.alloc(1))  # moves the epoch
-                calls.clear()
-                tokens = allocator.available_size()
-                searched = len(calls)
-                self.assertGreater(searched, 0)
-                self.assertEqual(allocator.full_available_size(), tokens)
-                self.assertEqual(len(calls), searched)
-
-
-class TestEndsOnlyCapacityArithmetic(CustomTestCase):
-    """On a chain with no float, capacity reads are answered by arithmetic that
-    equals the layout search on random chains, and most reads skip the search."""
-
-    def _chain(self, chain):
-        from sglang.test.unified_allocator_fixtures import (
-            UnifiedGeometry,
-            build_unified_bundle,
-            setup_allocator_context,
-        )
-
-        setup_allocator_context()
-        geometry = dict(full_layer_ids=(0,), full_tokens=256, context_len=256)
-        if chain == "mamba":
-            geometry.update(state_layer_ids=(1,), state_slots=16)
-        return build_unified_bundle(
-            UnifiedGeometry(chain=chain, page_size=4, **geometry)
-        ).token_to_kv_pool_allocator
-
-    def _searched(self, allocator, name):
-        allocator._fit_memo.clear()
-        with patch.object(type(allocator), "_ends_only_fit", lambda *a: None):
-            return allocator.units_available(name)
-
-    def test_the_arithmetic_equals_the_search(self):
-        rng = random.Random(20261107)
-        answered = asked = 0
-        real = None
-        for chain in ("full", "mamba"):
-            for _ in range(40):
-                allocator = self._chain(chain)
-                real = type(allocator)._ends_only_fit
-                owner = allocator.full_attn_allocator
-                state = allocator.mamba_allocator
-                held, slots = [], []
-                for _ in range(rng.randint(4, 30)):
-                    roll = rng.random()
-                    if roll < 0.45:
-                        ids = allocator.alloc(4 * rng.randint(1, 4))
-                        if ids is not None:
-                            held.append(ids)
-                    elif roll < 0.7 and held:
-                        allocator.free(held.pop(rng.randrange(len(held))))
-                    elif roll < 0.8 and state is not None:
-                        slot = allocator.alloc_state_slots(1)
-                        if slot is not None:
-                            slots.append(slot)
-                    elif roll < 0.85 and slots:
-                        state.free(slots.pop(rng.randrange(len(slots))))
-                    elif roll < 0.92:
-                        # Frees under an unprocessed forward stay pending.
-                        steps = allocator.forward_steps
-                        steps.forward_launched()
-                        steps.forward_recorded(None)
-                        if held:
-                            allocator.free(held.pop())
-                    elif held:
-                        page = int(owner.ids.virtual_to_physical[int(held[0][0]) // 4])
-                        owner.fix_pages(("test", page), [page])
-                names = [owner.sub_pool_name]
-                if state is not None:
-                    names.append(state.sub_pool_name)
-                for name in names:
-                    with self.subTest(chain=chain, name=name):
-                        allocator._fit_memo.clear()
-                        calls = []
-
-                        def counting(alloc, *args, _calls=calls):
-                            out = real(alloc, *args)
-                            _calls.append(out is not None)
-                            return out
-
-                        with patch.object(type(allocator), "_ends_only_fit", counting):
-                            fast = allocator.units_available(name)
-                        asked += 1
-                        answered += bool(calls and calls[0])
-                        self.assertEqual(fast, self._searched(allocator, name))
-        self.assertGreater(answered, asked // 2)
-
-    def test_joint_reads_of_two_ends_equal_the_search(self):
-        """A FULL + window chain whose two bands are ends: the joint read
-        (each band takes every token) by arithmetic equals the search."""
-        from sglang.test.unified_allocator_fixtures import (
-            UnifiedGeometry,
-            build_unified_bundle,
-            setup_allocator_context,
-        )
-
-        rng = random.Random(20261108)
-        answered = asked = 0
-        for _ in range(40):
-            setup_allocator_context()
-            allocator = build_unified_bundle(
-                UnifiedGeometry(
-                    chain="swa",
-                    full_layer_ids=(0,),
-                    swa_layer_ids=(1,),
-                    page_size=4,
-                    full_tokens=256,
-                    swa_tokens=256,
-                    context_len=256,
-                )
-            ).token_to_kv_pool_allocator
-            if any(b.grow_direction == "float" for b in allocator.bands):
-                self.skipTest("this chain's window floats")
-            real = type(allocator)._ends_only_fit
-            window = allocator.swa_attn_allocator
-            held = []
-            for _ in range(rng.randint(4, 30)):
-                roll = rng.random()
-                if roll < 0.5:
-                    ids = allocator.alloc(4 * rng.randint(1, 4))
-                    if ids is not None:
-                        held.append(ids)
-                elif roll < 0.75 and held:
-                    allocator.free(held.pop(rng.randrange(len(held))))
-                elif roll < 0.9 and held:
-                    allocator.free_window(window.sub_pool_name, held[-1])
-                else:
-                    steps = allocator.forward_steps
-                    steps.forward_launched()
-                    steps.forward_recorded(None)
-                    if held:
-                        allocator.free(held.pop())
-            allocator._fit_memo.clear()
-            calls = []
-
-            def counting(alloc, *args, _calls=calls):
-                out = real(alloc, *args)
-                _calls.append(out is not None)
-                return out
-
-            with patch.object(type(allocator), "_ends_only_fit", counting):
-                fast = allocator.available_size()
-            asked += 1
-            answered += bool(calls and calls[0])
-            allocator._fit_memo.clear()
-            with patch.object(type(allocator), "_ends_only_fit", lambda *a: None):
-                searched = allocator.available_size()
-            self.assertEqual(fast, searched)
-        self.assertGreater(answered, asked // 2)
 
 
 if __name__ == "__main__":

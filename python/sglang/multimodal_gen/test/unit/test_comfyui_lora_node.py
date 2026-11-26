@@ -19,6 +19,7 @@ import sglang.multimodal_gen.runtime.layers.quantization  # noqa: F401
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
 )
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 
@@ -121,11 +122,6 @@ def test_chained_lora_nodes_keep_every_lora() -> None:
     assert merged.model_options["sgld_lora_input"]["merge_mode"] == "merge"
 
 
-class _TupleLinear(torch.nn.Linear):
-    def forward(self, x):
-        return super().forward(x), None
-
-
 class _Pipeline(LoRAPipeline):
     def create_pipeline_stages(self, args):
         return None
@@ -133,7 +129,7 @@ class _Pipeline(LoRAPipeline):
 
 def _one_layer_pipeline():
     """Identity 2x2 layer; adapter A adds to output 0 and B to output 1."""
-    linear = _TupleLinear(2, 2, bias=False)
+    linear = ReplicatedLinear(2, 2, bias=False)
     linear.weight.data.copy_(torch.eye(2))
     layer = BaseLayerWithLoRA(linear)
     p = object.__new__(_Pipeline)
@@ -218,6 +214,67 @@ def test_each_sampler_run_uses_exactly_its_models_loras() -> None:
                     torch.testing.assert_close(
                         layer.weight, torch.eye(2), rtol=0, atol=0
                     )
+
+
+def test_rebuilt_worker_loads_only_this_runs_loras() -> None:
+    """ComfyUI reuses a cached MODEL across prompts. When the sampler wrapper
+    rebuilds the worker, the new worker must load this run's LoRAs, not the
+    ones the cached executor served for the previous prompt."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
+        SGLDiffusionGenerator,
+    )
+
+    runtime = SGLDiffusionGenerator()
+    workers = []
+
+    def load_model(**kwargs):
+        runtime.generator = Mock()
+        workers.append(runtime.generator)
+
+    runtime.load_model = load_model
+    runtime._is_live = lambda: True
+    ex = _executor(Mock())  # a worker this runtime no longer owns
+    ex._sgld_reload = {"model_path": "z.safetensors"}
+    ex._ensure_runtime = runtime.ensure_executor
+    for previous, current in (([("A", 0.5)], []), ([("A", 0.5)], [("B", 0.25)])):
+        ex._lora_input = _lora_input(previous)
+        runtime.generator = None  # the previous worker was replaced
+        ex.sampler_sample_wrapper(lambda *a, **k: None, _sampler(current))
+        worker = workers[-1]
+        worker.unmerge_lora_weights.assert_not_called()
+        if current:
+            worker.set_lora.assert_called_once_with(**_lora_input(current))
+            assert ex._lora_input == _lora_input(current)
+        else:
+            worker.set_lora.assert_not_called()
+            assert ex._lora_input is None
+
+
+def test_comfy_weight_patches_on_an_sgld_model_are_rejected() -> None:
+    """A LoRA node other than SGLDLoraLoader that adds weight patches directly
+    would be dropped: the SGLD worker owns the diffusion model's weights."""
+    import importlib
+
+    class ModelPatcher:
+        def add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
+            raise AssertionError("ComfyUI must not record SGLD weight patches")
+
+    comfy = types.ModuleType("comfy")
+    comfy.model_patcher = types.ModuleType("comfy.model_patcher")
+    comfy.model_patcher.ModelPatcher = ModelPatcher
+    name = "sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.model_patcher"
+    with mock.patch.dict(
+        sys.modules, {"comfy": comfy, "comfy.model_patcher": comfy.model_patcher}
+    ):
+        sys.modules.pop(name, None)
+        try:
+            patcher_cls = importlib.import_module(name).SGLDModelPatcher
+        finally:
+            sys.modules.pop(name, None)
+    patcher = object.__new__(patcher_cls)
+    assert patcher.add_patches({}) == []
+    with pytest.raises(ValueError, match="SGLDLoraLoader"):
+        patcher.add_patches({"diffusion_model.blocks.0.attn.to_q.weight": ()}, 1.0)
 
 
 def test_failed_lora_switch_is_not_recorded_as_active() -> None:

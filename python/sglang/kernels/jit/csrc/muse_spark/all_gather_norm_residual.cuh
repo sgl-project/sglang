@@ -12,13 +12,12 @@ namespace sglang {
 
 namespace muse_ag_norm {
 
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 
 struct Params {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
   uint8_t* ws_mc;         // multicast VA of the push workspace base (push)
-  Counter* counter;       // per-block phase counters
-  uint32_t num_counters;  // PushPlane::num_blocks
+  EpochCounter* counter;  // the push plane's phase word
   uint32_t half_bytes;    // world_size * slot_bytes
   uint32_t rank;
   uint32_t num_rows;
@@ -27,6 +26,7 @@ struct Params {
 };
 
 inline constexpr uint32_t kVec = 8;  // bf16 per 16B
+using Lamport = device::distributed::LamportTrait<bf16_t, kVec, /*kAtom=*/4>;
 
 SGL_DEVICE fp32x2_t mul_pair(fp32x2_t a, fp32x2_t b) {
   return {a.x * b.x, a.y * b.y};
@@ -36,18 +36,6 @@ SGL_DEVICE fp32x2_t fma_pair(fp32x2_t a, fp32x2_t b, fp32x2_t c) {
   return {fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y)};
 }
 
-// Reads this block's phase and advances the counters no block of this grid owns.
-template <int kNumThreads>
-SGL_DEVICE uint32_t begin_phase(const Params& params) {
-  const uint32_t phase = params.counter[blockIdx.x].get() & 1;
-  if (blockIdx.x == 0) {
-    for (uint32_t i = gridDim.x + threadIdx.x; i < params.num_counters; i += kNumThreads) {
-      params.counter[i].set(phase ^ 1);
-    }
-  }
-  return phase;
-}
-
 template <uint32_t kNLocal, int kNumThreads>
 SGL_DEVICE void push_local_slice(const Params& params, uint32_t half_off) {
   const uint32_t num_local = params.num_rows * kNLocal;
@@ -55,20 +43,10 @@ SGL_DEVICE void push_local_slice(const Params& params, uint32_t half_off) {
   const uint32_t stride = gridDim.x * kNumThreads * kVec;
   for (uint32_t elem = worker * kVec; elem < num_local; elem += stride) {
     uint4 raw = *reinterpret_cast<const uint4*>(params.local + elem);
-    uint32_t* w = reinterpret_cast<uint32_t*>(&raw);
-#pragma unroll
-    for (uint32_t j = 0; j < 4; ++j) {
-      if ((w[j] & 0xffffu) == 0) w[j] |= 0x8000u;
-      if ((w[j] >> 16) == 0) w[j] |= 0x80000000u;
-    }
+    Lamport::clear_pos_zero(&raw);
     const uint32_t byte_off = half_off + (params.rank * num_local + elem) * sizeof(bf16_t);
     device::ptx::st_multimem_16B(raw, params.ws_mc + byte_off, 0);
   }
-}
-
-SGL_DEVICE bool vector_pending(uint4 raw) {
-  return (raw.x & 0xffffu) == 0 || (raw.x >> 16) == 0 || (raw.y & 0xffffu) == 0 || (raw.y >> 16) == 0 ||
-         (raw.z & 0xffffu) == 0 || (raw.z >> 16) == 0 || (raw.w & 0xffffu) == 0 || (raw.w >> 16) == 0;
 }
 
 // Spins until every rank's copy of the vector at (row, col) arrived, then clears the slot.
@@ -79,7 +57,7 @@ SGL_DEVICE uint4 take_gathered(bf16_t* gathered, uint32_t num_rows, uint32_t row
   bool pending;
   do {
     device::ptx::ld_relaxed_16B(raw, src, 0);
-    pending = vector_pending(raw);
+    pending = Lamport::has_pos_zero(&raw);
   } while (pending);
   device::AlignedVector<uint32_t, 4> zero;
   zero.fill(0);
@@ -99,7 +77,7 @@ receive_pack(bf16_t* gathered, uint32_t num_rows, uint32_t row, uint32_t col, in
       do {
         device::ptx::ld_relaxed_16B(cache[0], src0, 0);
         device::ptx::ld_relaxed_16B(cache[1], src1, 0);
-        pending = vector_pending(cache[0]) | vector_pending(cache[1]);
+        pending = Lamport::has_pos_zero(&cache[0]) | Lamport::has_pos_zero(&cache[1]);
       } while (pending);
       device::AlignedVector<uint32_t, 4> zero;
       zero.fill(0);
@@ -165,7 +143,7 @@ __global__ void __launch_bounds__(kNumThreads)
   ptx::cluster_arrive_relaxed();
 
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = muse_ag_norm::begin_phase<kNumThreads>(params);
+  const uint32_t phase = params.counter->load();
   const uint32_t half_off = phase * params.half_bytes;
   muse_ag_norm::push_local_slice<kNLocal, kNumThreads>(params, half_off);
   PDLTriggerSecondary<kUsePDL>();
@@ -300,7 +278,7 @@ __global__ void __launch_bounds__(kNumThreads)
 
   // Every slot this block consumed was reset above; publish the next phase.
   __syncthreads();
-  if (threadIdx.x == 0) params.counter[blockIdx.x].set(phase ^ 1);
+  if (threadIdx.x == 0) params.counter->commit();
 }
 
 // C == 1: persistent kernels, each owning rows bx, bx + grid, ...
@@ -341,7 +319,7 @@ __global__ void __launch_bounds__(kNumThreads)
   const bool pre_bf16 = norm.pre_norm_bf16;
 
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = muse_ag_norm::begin_phase<kNumThreads>(params);
+  const uint32_t phase = params.counter->load();
   const uint32_t half_off = phase * params.half_bytes;
   muse_ag_norm::push_local_slice<kNLocal, kNumThreads>(params, half_off);
   PDLTriggerSecondary<kUsePDL>();
@@ -497,7 +475,7 @@ __global__ void __launch_bounds__(kNumThreads)
   }
 
   __syncthreads();
-  if (threadIdx.x == 0) params.counter[blockIdx.x].set(phase ^ 1);
+  if (threadIdx.x == 0) params.counter->commit();
 }
 
 using host::distributed::CommunicatorRef;
@@ -570,18 +548,13 @@ struct MuseSparkAllGatherNormResidual {
         int64_t(num_rows) * kHidden * 2 <= int64_t(push.slot_bytes), "gathered rows exceed the push slot size");
     uint32_t grid = num_rows * kClusterSize;
     if constexpr (kClusterSize == 1) {
-      grid = std::min<uint32_t>(num_rows, push.num_blocks);
-    } else {
-      RuntimeCheck(
-          int64_t(num_rows) * kClusterSize <= int64_t(push.num_blocks),
-          "M * cluster_size exceeds the push plane's block counters");
+      grid = std::min<uint32_t>(num_rows, push.default_blocks);
     }
 
     const auto params = muse_ag_norm::Params{
         .ws_local = push.workspaces[push.rank],
         .ws_mc = push.mc_workspace,
         .counter = push.counter,
-        .num_counters = push.num_blocks,
         .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
         .rank = push.rank,
         .num_rows = num_rows,

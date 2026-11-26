@@ -13,7 +13,8 @@ the code can decide. Neighbors:
   that never run; hand them over with the evidence.
 - Proving a move or split is a pure relocation:
   [mechanical-refactor-verify](../mechanical-refactor-verify/SKILL.md).
-- Where a kernel belongs: [kernel-organization](../kernel-organization/SKILL.md). Env vars:
+- Where a kernel belongs, and which of several implementations of one kernel contract
+  survives: [kernel-organization](../kernel-organization/SKILL.md). Env vars:
   [env-var-conventions](../env-var-conventions/SKILL.md). The frozen large classes:
   [large-class-style](../large-class-style/SKILL.md). Comments:
   `.claude/rules/comment-style.md` (a comment-only diff never touches one-line comments).

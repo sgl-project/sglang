@@ -1,6 +1,6 @@
 import copy
 from array import array
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -22,20 +22,6 @@ from sglang.srt.multimodal.modality import Modality
 
 
 class Qwen2VisionTransformerForNavitPOINTS(Qwen2VisionTransformer):
-    def __init__(
-        self,
-        vision_config: POINTSV15ChatConfig,
-        norm_eps: float = 1e-6,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(
-            vision_config,
-            norm_eps=norm_eps,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-
     def forward(
         self,
         x: torch.Tensor,
@@ -144,7 +130,6 @@ class POINTSV15ChatModel(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -167,14 +152,10 @@ class POINTSV15ChatModel(nn.Module):
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

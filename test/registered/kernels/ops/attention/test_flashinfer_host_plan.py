@@ -48,8 +48,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
             )
         )
         obj.page_size = page_size
-        obj.pool_len = pool_len
-        obj.req_to_token_pool = SimpleNamespace(req_to_token=pool)
+        obj.req_to_token_pool = SimpleNamespace(req_to_token=pool, row_width=pool_len)
         obj.kv_indptr = torch.zeros(
             (steps, n * topk + 1), device="cuda", dtype=torch.int32
         )
@@ -288,6 +287,9 @@ class TestFlashInferVerifyHostPlan(CustomTestCase):
                         "q_data_type": q.dtype,
                         "kv_data_type": dtype,
                         "custom_mask": mask,
+                        # call_begin_forward passes uniform_q_len for EAGLE verify.
+                        # Pass the same value here so the plans can be compared.
+                        "uniform_q_len": width,
                     }
                     wrappers[0].plan(*args, **kwargs)
                     if step == 0:

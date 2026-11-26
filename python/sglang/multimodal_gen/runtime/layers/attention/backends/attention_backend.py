@@ -37,11 +37,6 @@ def trailing_padding_used_len(
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
-    # For some attention backends, we allocate an output tensor before
-    # calling the custom op. When piecewise cudagraph is enabled, this
-    # makes sure the output tensor is allocated inside the cudagraph.
-    accept_output_buffer: bool = False
-
     @staticmethod
     @abstractmethod
     def get_enum() -> AttentionBackendEnum:
@@ -69,11 +64,6 @@ class AttentionBackend(ABC):
         if requirements.packed_varlen and not cls.supports_packed_varlen():
             return ("packed varlen attention",)
         return ()
-
-    @staticmethod
-    @abstractmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        raise NotImplementedError
 
     @staticmethod
     @abstractmethod
