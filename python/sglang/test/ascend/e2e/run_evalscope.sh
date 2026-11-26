@@ -13,6 +13,16 @@ pip_mirror_source="${EVALSCOPE_PIP_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/
 # system environment (SGLang pins openai==2.6.1).
 EVALSCOPE_WITH_PIER="${EVALSCOPE_WITH_PIER:-0}"
 
+# datacurve-pier requires Python >= 3.12. The base images we can pull ship an
+# older interpreter, so provision a matching one when needed.
+EVALSCOPE_MIN_PYTHON="${EVALSCOPE_MIN_PYTHON:-3.12}"
+# Miniconda installer / conda channel (Tsinghua mirror; the pip mirror above is
+# already served from there).
+CONDA_INSTALLER_URL="${CONDA_INSTALLER_URL:-https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-$(uname -m).sh}"
+CONDA_CHANNEL="${CONDA_CHANNEL:-https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main}"
+CONDA_PREFIX="${CONDA_PREFIX:-/opt/py312}"
+CONDA_HOME="${CONDA_HOME:-/opt/miniconda3}"
+
 # Bound key deps so the resolver cannot fall back to ancient versions.
 EVALSCOPE_CONSTRAINTS=(
     "aiohttp>=3.11,<4"
@@ -21,6 +31,45 @@ EVALSCOPE_CONSTRAINTS=(
 
 # Fail fast when the pip install hangs instead of timing out the whole job.
 EVALSCOPE_INSTALL_TIMEOUT=1200
+
+py_ge_min() {
+    "$1" -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= tuple(int(x) for x in '${EVALSCOPE_MIN_PYTHON}'.split('.')) else 1)" >/dev/null 2>&1
+}
+
+find_python_ge_min() {
+    for candidate in python3.13 python3.12 python3 python; do
+        if command -v "${candidate}" >/dev/null 2>&1 && py_ge_min "${candidate}"; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+install_python_via_conda() {
+    if [ -x "${CONDA_PREFIX}/bin/python" ] && py_ge_min "${CONDA_PREFIX}/bin/python"; then
+        echo "${CONDA_PREFIX}/bin/python"
+        return 0
+    fi
+    local installer=/tmp/miniconda.sh
+    echo "No Python >= ${EVALSCOPE_MIN_PYTHON} found; installing Miniconda from ${CONDA_INSTALLER_URL}"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 --connect-timeout 15 -o "${installer}" "${CONDA_INSTALLER_URL}" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "${installer}" "${CONDA_INSTALLER_URL}" || return 1
+    else
+        echo "Neither curl nor wget is available to download Miniconda" >&2
+        return 1
+    fi
+    bash "${installer}" -b -p "${CONDA_HOME}" >/dev/null || return 1
+    "${CONDA_HOME}/bin/conda" create -y --override-channels -c "${CONDA_CHANNEL}" \
+        -p "${CONDA_PREFIX}" "python=${EVALSCOPE_MIN_PYTHON}" >/dev/null || return 1
+    if [ -x "${CONDA_PREFIX}/bin/python" ] && py_ge_min "${CONDA_PREFIX}/bin/python"; then
+        echo "${CONDA_PREFIX}/bin/python"
+        return 0
+    fi
+    return 1
+}
 
 # The venv is usable only when it provides everything this caller needs.
 evalscope_env_ready() {
@@ -79,9 +128,23 @@ log_env_versions() {
     fi
 }
 
-# Highest priority: reuse a system-wide evalscope (e.g. pre-installed in the
-# image); create ${PYTHON_FOR_EVALSCOPE} with --system-site-packages when needed.
-if python -c "import evalscope" >/dev/null 2>&1; then
+# Pick the interpreter used to create the venv. Only the pier path needs the
+# newer interpreter; other accuracy callers keep using the system python.
+BASE_PYTHON="python"
+if [ "${EVALSCOPE_WITH_PIER}" = "1" ]; then
+    if BASE_PYTHON="$(find_python_ge_min)"; then
+        echo "Using ${BASE_PYTHON} (>= ${EVALSCOPE_MIN_PYTHON})"
+    elif BASE_PYTHON="$(install_python_via_conda)"; then
+        echo "Using conda python ${BASE_PYTHON} (>= ${EVALSCOPE_MIN_PYTHON})"
+    else
+        echo "ERROR: datacurve-pier requires Python >= ${EVALSCOPE_MIN_PYTHON} and none could be provisioned." >&2
+        exit 1
+    fi
+fi
+
+# Highest priority (non-pier callers only): reuse a system-wide evalscope
+# (e.g. pre-installed in the image) via a --system-site-packages venv.
+if [ "${EVALSCOPE_WITH_PIER}" != "1" ] && python -c "import evalscope" >/dev/null 2>&1; then
     echo "evalscope found in the system python, reuse it instead of installing."
     if [ ! -x "${PYTHON_FOR_EVALSCOPE}" ]; then
         python -m venv --system-site-packages ${PYTHON_ENV_FOR_EVALSCOPE}
@@ -90,22 +153,19 @@ if python -c "import evalscope" >/dev/null 2>&1; then
         log_env_versions
         exit 0
     fi
-    install_pier
-    if evalscope_env_ready; then
-        log_env_versions
-        exit 0
-    fi
-    echo "The env still cannot provide evalscope, install it instead."
+    echo "The env cannot provide evalscope, install it instead."
 fi
 
-# Otherwise reuse the virtual env when it already provides what is needed.
+# Reuse the existing venv when it already provides what is needed.
 if evalscope_env_ready; then
     echo "evalscope already exists in ${PYTHON_ENV_FOR_EVALSCOPE}, skip installation."
     log_env_versions
     exit 0
 fi
 
-[ -x "${PYTHON_FOR_EVALSCOPE}" ] || python -m venv ${PYTHON_ENV_FOR_EVALSCOPE}
+if [ ! -x "${PYTHON_FOR_EVALSCOPE}" ]; then
+    "${BASE_PYTHON}" -m venv ${PYTHON_ENV_FOR_EVALSCOPE}
+fi
 
 if ! ${PYTHON_FOR_EVALSCOPE} -c "import evalscope" >/dev/null 2>&1; then
     install_evalscope
