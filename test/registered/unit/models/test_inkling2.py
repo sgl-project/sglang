@@ -35,6 +35,7 @@ from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
 from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.parser.inkling_renderer import render_inkling_messages
 from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
+from sglang.srt.utils.device import is_host_cpu_arm64
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.inkling2_test_utils import precision_group
 
@@ -614,7 +615,10 @@ def encoder():
 def test_multiple_images_have_independent_attention(encoder):
     patches = torch.randn(3, 2, 4, 4, 3, dtype=torch.bfloat16)
     grid = torch.tensor([[1, 1, 1], [1, 1, 2]])
-    with torch.inference_mode():
+    # Workaround for #53277: the 4-gpu-gb300 host g++ rejects Inductor's CPU
+    # -march=armv9-a; drop once that runner has GCC >= 12.
+    stance = "force_eager" if is_host_cpu_arm64() else "default"
+    with torch.compiler.set_stance(stance), torch.inference_mode():
         expected = encoder(patches, grid)
         modified = patches.clone()
         modified[1:] *= -2

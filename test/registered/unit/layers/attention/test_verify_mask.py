@@ -201,7 +201,7 @@ class TestTrtllmMhaVerifyMask(CustomTestCase):
             topk=topk,
             is_draft_runner=draft,
             skip_prefill=False,
-            req_to_token_pool=SimpleNamespace(row_width=_MAX_CONTEXT_LEN),
+            max_kv_len=_MAX_CONTEXT_LEN,
             speculative_num_draft_tokens=_DRAFT,
             device="cpu",
         )
