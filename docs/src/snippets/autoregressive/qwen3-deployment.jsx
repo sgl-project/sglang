@@ -24,7 +24,7 @@ export const Qwen3Deployment = () => {
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
       xeon:   { tp: 3, ep: 0, bf16: true, fp8: true },
-      arc_b:  { tp: 4, ep: 0, bf16: true, fp8: true },
+      arc_b:  { tp: 4, ep: 0, bf16: true, fp8: false },
     },
     '32b': {
       baseName: '32B',
@@ -37,7 +37,7 @@ export const Qwen3Deployment = () => {
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
       xeon:   { tp: 6, ep: 0, bf16: true, fp8: true },
-      arc_b:  { tp: 4, ep: 0, bf16: true, fp8: true }
+      arc_b:  { tp: 4, ep: 0, bf16: true, fp8: false }
     },
     '14b': {
       baseName: '14B',
@@ -355,16 +355,11 @@ export const Qwen3Deployment = () => {
 
     // Add tool call parser
     if (toolcall === 'enabled') {
-      cmd += ' \\\n  --tool-call-parser qwen';
+      cmd += ' \\\n  --tool-call-parser qwen25';
     }
 
     if (hardware === 'b300') {
       cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
-    }
-
-    if (hardware === 'arc_b') {
-      cmd += ' \\\n  --attention-backend intel_xpu \\\n  --page-size 64';
-      cmd += ' \\\n  --cuda-graph-backend-decode full \\\n  --cuda-graph-backend-prefill breakable';
     }
 
     return cmd;
