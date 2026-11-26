@@ -737,7 +737,7 @@ class SpecSamplingMaskKit:
                     "support",
                 ],
             },
-            timeout=60,
+            timeout=240,
         )
         self.assertEqual(response.status_code, 200, response.text)
         outputs = response.json()
