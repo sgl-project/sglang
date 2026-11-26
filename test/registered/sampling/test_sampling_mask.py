@@ -475,6 +475,20 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             sampling_logprobs[mask.index(token)], expected, delta=1e-2
         )
 
+    def test_zero_output_has_empty_sampling_rows(self):
+        for mode in ("selected", "support"):
+            with self.subTest(mode=mode):
+                response = self._post_generate(
+                    {"max_new_tokens": 0, "top_k": 2}, sampling_logprobs_mode=mode
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                output = response.json()
+                self.assertEqual(output["output_ids"], [])
+                meta = output["meta_info"]
+                self.assertEqual(meta["output_token_sampling_mask_length"], 0)
+                self.assertEqual(meta["output_token_sampling_mask"], [])
+                self.assertEqual(meta["output_token_sampling_logprobs"], [])
+
     def test_sampling_logprobs_default_to_selected_token(self):
         response = self._post_generate(
             {"top_k": _TOP_K, "top_p": _TOP_P},

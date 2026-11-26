@@ -3628,19 +3628,21 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self._lacks_decode_peer(req):
-            if req.sampling_params.max_new_tokens not in (0, 1):
-                self._reject_bad_request(
-                    req,
-                    "A prefill request without a bootstrap host has no decode to "
-                    "continue it, so max_new_tokens must be 0 or 1; got "
-                    f"max_new_tokens={req.sampling_params.max_new_tokens}.",
-                )
-                return
-            if req.sampling_params.max_new_tokens == 0:
-                # The client still gets empty output rows from the tokenizer.
-                # Prefill has no output token for the sampler to capture.
-                req.return_sampling_mask = False
+        standalone_prefill = self._lacks_decode_peer(req)
+        if standalone_prefill and req.sampling_params.max_new_tokens not in (0, 1):
+            self._reject_bad_request(
+                req,
+                "A prefill request without a bootstrap host has no decode to "
+                "continue it, so max_new_tokens must be 0 or 1; got "
+                f"max_new_tokens={req.sampling_params.max_new_tokens}.",
+            )
+            return
+        if req.sampling_params.max_new_tokens == 0 and (
+            self.disaggregation_mode == DisaggregationMode.NULL or standalone_prefill
+        ):
+            # The tokenizer returns empty rows. Capture has no output token,
+            # even in a mixed batch where another request runs the sampler.
+            req.return_sampling_mask = False
 
         if (
             self.disaggregation_mode != DisaggregationMode.NULL
@@ -3670,7 +3672,7 @@ class Scheduler(
                 return
             if (
                 self.disaggregation_mode != DisaggregationMode.NULL
-                and not self._lacks_decode_peer(req)
+                and not standalone_prefill
                 and not self.disagg_metadata_buffers.enable_sampling_mask
             ):
                 self._reject_bad_request(
