@@ -1764,6 +1764,34 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
+    def test_last_pool_keeps_view_when_unregister_fails(self):
+        full, swa = _build_unified_host_pair(_build_unified_swa_pool())
+        self.addCleanup(full.destroy)
+        self.addCleanup(swa.destroy)
+        backing = swa.shared_allocation_domain
+        full.release_memory_occupation()
+        old_view = swa._host_page_buffer_view
+        implementation = "sglang.srt.mem_cache.kv.memory.host_backing"
+        with (
+            patch.object(backing, "pin_memory", True),
+            patch(implementation + "._is_cuda", True),
+            patch(
+                implementation + "._cuda_host_unregister",
+                side_effect=[RuntimeError("unregister"), None],
+            ) as unregister,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unregister"):
+                swa.release_memory_occupation()
+            self.assertIs(swa._host_page_buffer_view, old_view)
+            self.assertIsNotNone(backing.raw)
+            self.assertNotIn(swa.pool_label, backing._released_users)
+            swa.release_memory_occupation()
+            self.assertEqual(unregister.call_count, 2)
+        self.assertIsNone(backing.raw)
+        self.assertIsNone(swa._host_page_buffer_view)
+        swa.resume_memory_occupation()
+        self.assertIsNotNone(swa.alloc(swa.page_size))
+
     def test_release_resume_shared_host_backing(self):
         """The shared backing is freed only once every sharing pool offloads."""
         full, swa = _build_unified_host_pair(_build_unified_swa_pool())
