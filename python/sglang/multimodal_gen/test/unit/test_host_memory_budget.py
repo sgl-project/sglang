@@ -1,5 +1,6 @@
 """Pinned host memory is planned against the cgroup cap, not the whole machine."""
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -12,6 +13,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     host_copies_would_not_fit,
     host_memory_available_bytes,
     module_weight_bytes,
+    page_cache_cannot_hold,
     pin_benefit_bytes,
 )
 
@@ -19,12 +21,16 @@ _V2_FILES = ("memory.max", "memory.current")
 _V1_FILES = ("memory.limit_in_bytes", "memory.usage_in_bytes")
 
 
-def _write_cgroup(directory, files, values):
-    """Lay out one cgroup directory's limit and usage files."""
+def _write_cgroup(directory, files, values, stat=None):
+    """Lay out one cgroup directory's limit, usage and memory.stat files."""
     directory.mkdir(parents=True, exist_ok=True)
     if values is not None:
         for name, value in zip(files, values):
             (directory / name).write_text(str(value))
+    if stat is not None:
+        (directory / "memory.stat").write_text(
+            "".join(f"{key} {value}\n" for key, value in stat.items())
+        )
     return directory
 
 
@@ -194,7 +200,96 @@ class TestNestedCgroup:
         assert cgroup_memory_limit_bytes() == (32 * GIB_BYTES, 0)
 
 
+class TestCgroupPageCache:
+    @staticmethod
+    def _capped(monkeypatch, tmp_path, *, v2=None, v1=None, stat):
+        # psutil sees a large machine, so the cgroup reading decides
+        _point_at(monkeypatch, tmp_path, v2=v2, v1=v1)
+        version, files, values = ("v2", _V2_FILES, v2) if v2 else ("v1", _V1_FILES, v1)
+        _write_cgroup(tmp_path / version, files, values, stat=stat)
+        monkeypatch.setattr(
+            host_memory_budget.psutil,
+            "virtual_memory",
+            lambda: type("VM", (), {"available": 900 * GIB_BYTES})(),
+        )
+
+    def test_page_cache_charged_to_a_capped_cgroup_counts_as_available(
+        self, monkeypatch, tmp_path
+    ):
+        """Cache left in a capped cgroup is reclaimed under the cap, so it must count
+        as available the way MemAvailable counts it outside a cgroup."""
+        # a 56 GiB scope right after another engine read its checkpoint there
+        self._capped(
+            monkeypatch,
+            tmp_path,
+            v2=(56 * GIB_BYTES, 38 * GIB_BYTES),
+            stat={
+                "anon": 14 * GIB_BYTES,
+                "file": 24 * GIB_BYTES,
+                "active_file": 10 * GIB_BYTES,
+                "inactive_file": 14 * GIB_BYTES,
+            },
+        )
+        assert host_memory_available_bytes() == 42 * GIB_BYTES
+        assert not host_copies_would_not_fit(30 * GIB_BYTES)
+
+    def test_a_mapping_the_cache_already_holds_is_room_for_itself(
+        self, monkeypatch, tmp_path
+    ):
+        # A streamed mapping sits on the active list. Counting only inactive
+        # cache would send a mapping that is already cached to direct reads.
+        self._capped(
+            monkeypatch,
+            tmp_path,
+            v2=(56 * GIB_BYTES, 50 * GIB_BYTES),
+            stat={"active_file": 30 * GIB_BYTES, "inactive_file": 0},
+        )
+        assert not page_cache_cannot_hold(30 * GIB_BYTES)
+
+    def test_shmem_charged_to_the_cgroup_is_not_available(self, monkeypatch, tmp_path):
+        # v2 "file" includes tmpfs and shm, which only swap can reclaim
+        self._capped(
+            monkeypatch,
+            tmp_path,
+            v2=(32 * GIB_BYTES, 24 * GIB_BYTES),
+            stat={
+                "file": 20 * GIB_BYTES,
+                "shmem": 8 * GIB_BYTES,
+                "active_file": 6 * GIB_BYTES,
+                "inactive_file": 6 * GIB_BYTES,
+            },
+        )
+        assert host_memory_available_bytes() == 20 * GIB_BYTES
+
+    def test_v1_subtracts_the_cache_of_the_whole_subtree(self, monkeypatch, tmp_path):
+        # v1 usage_in_bytes covers descendants; the unprefixed stat keys do not
+        self._capped(
+            monkeypatch,
+            tmp_path,
+            v1=(32 * GIB_BYTES, 20 * GIB_BYTES),
+            stat={
+                "active_file": 0,
+                "inactive_file": 0,
+                "total_active_file": 4 * GIB_BYTES,
+                "total_inactive_file": 6 * GIB_BYTES,
+            },
+        )
+        assert host_memory_available_bytes() == 22 * GIB_BYTES
+
+
 class TestHostPinBudget:
+    def test_local_workers_split_one_node_allowance(self, monkeypatch):
+        monkeypatch.setattr(
+            host_memory_budget,
+            "host_memory_available_bytes",
+            lambda: 40 * GIB_BYTES,
+        )
+
+        budget = HostPinBudget.for_local_worker(4)
+
+        # The node keeps one 2 GiB reserve, then workers split the remainder.
+        assert budget.spendable_bytes == int(9.5 * GIB_BYTES)
+
     def test_a_component_that_fits_is_granted(self):
         budget = HostPinBudget(available_bytes=40 * GIB_BYTES)
         assert budget.request(component_name="dit", weight_bytes=20 * GIB_BYTES)
@@ -217,6 +312,17 @@ class TestHostPinBudget:
             component_name="text_encoder", weight_bytes=20 * GIB_BYTES
         )
 
+    def test_released_allowance_can_be_reassigned(self):
+        budget = HostPinBudget(available_bytes=40 * GIB_BYTES)
+        assert budget.request(component_name="encoder", weight_bytes=30 * GIB_BYTES)
+        budget.release(20 * GIB_BYTES)
+        assert budget.request(component_name="dit", weight_bytes=20 * GIB_BYTES)
+
+    def test_cannot_release_uncommitted_allowance(self):
+        budget = HostPinBudget(available_bytes=40 * GIB_BYTES)
+        with pytest.raises(ValueError, match="more pinned-host memory"):
+            budget.release(GIB_BYTES)
+
     def test_the_cap_binds_even_for_the_first_component(self):
         # priority comes from asking first, not from being allowed to overrun
         budget = HostPinBudget(available_bytes=8 * GIB_BYTES)
@@ -225,6 +331,44 @@ class TestHostPinBudget:
     def test_a_weightless_component_needs_no_budget(self):
         budget = HostPinBudget(available_bytes=0)
         assert budget.request(component_name="scheduler", weight_bytes=0)
+
+    def test_node_local_ranks_share_one_hosts_headroom(self, monkeypatch):
+        """N ranks on one node must not plan against the same bytes N times.
+
+        Each GPU worker process constructs its own budget from one host-wide
+        free-memory reading with no cross-rank coordination, so without the
+        divisor 4 ranks on a 32 GiB host could book ~128 GiB of pins.
+        """
+        monkeypatch.setenv("SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB", "32")
+        ranks = 4
+        booked = 0
+        for _ in range(ranks):
+            budget = HostPinBudget(node_local_ranks=ranks)
+            # each rank pins as much as its budget will grant, 1 GiB at a time
+            while budget.request(component_name="dit", weight_bytes=GIB_BYTES):
+                booked += GIB_BYTES
+        assert 0 < booked <= 32 * GIB_BYTES
+
+    def test_the_reserve_scales_with_the_per_rank_share(self):
+        # 5% of the 100 GiB share, not of the undivided 800 GiB host
+        budget = HostPinBudget(available_bytes=800 * GIB_BYTES, node_local_ranks=8)
+        assert budget.reserve_bytes == 5 * GIB_BYTES
+
+    def test_planner_quota_can_be_applied_and_restored(self):
+        budget = HostPinBudget(
+            available_bytes=40 * GIB_BYTES,
+            reserve_bytes=2 * GIB_BYTES,
+        )
+
+        previous = budget.set_spendable_capacity(12 * GIB_BYTES)
+        assert budget.available_bytes == 12 * GIB_BYTES
+        assert budget.reserve_bytes == 0
+        assert budget.planning_capacity_bytes == 38 * GIB_BYTES
+
+        budget.restore_capacity(previous)
+        assert budget.available_bytes == 40 * GIB_BYTES
+        assert budget.reserve_bytes == 2 * GIB_BYTES
+        assert budget.planning_capacity_bytes == 38 * GIB_BYTES
 
 
 class TestModuleWeightBytes:

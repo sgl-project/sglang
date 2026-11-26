@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
@@ -5,7 +6,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -19,6 +19,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -40,6 +41,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -47,11 +50,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import (
-    add_prefix,
-    is_cuda,
-    make_pp_layers,
-)
+from sglang.srt.utils import is_cuda
 
 Step3p5Config = None
 
@@ -67,6 +66,8 @@ class Step3p5MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         reduce_results: bool = True,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -76,6 +77,7 @@ class Step3p5MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            parallel_group=parallel_group,
             prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
@@ -83,6 +85,7 @@ class Step3p5MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            parallel_group=parallel_group,
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
         )
@@ -156,6 +159,10 @@ class Step3p5MoEMLP(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
             gemm1_clamp_limit=self.limit,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -182,6 +189,7 @@ class Step3p5MoEMLP(nn.Module):
 
         if (
             not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_ops()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self.forward_normal(hidden_states, shared_output)
@@ -246,10 +254,6 @@ class Step3p5MoEMLP(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -287,7 +291,6 @@ class Step3p5Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.total_num_heads = num_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -318,8 +321,7 @@ class Step3p5Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -327,8 +329,7 @@ class Step3p5Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -339,8 +340,7 @@ class Step3p5Attention(nn.Module):
                 hidden_size,
                 self.total_num_heads,
                 bias=False,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=add_prefix("g_proj", prefix),
             )
 
@@ -421,11 +421,10 @@ class Step3p5DecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         max_position_embeddings = config.max_position_embeddings
         head_dim = config.head_dim
-        moe_layers_set = {int(x) for x in config.moe_layers_enum.split(",")}
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_attention_groups
-        self.is_moe_layer = layer_id in moe_layers_set
-        self.is_next_layer_sparse = (layer_id + 1) in moe_layers_set
+        self.is_moe_layer = self._is_moe_layer(config, layer_id)
+        self.is_next_layer_sparse = self._is_moe_layer(config, layer_id + 1)
         num_hidden_layers = config.num_hidden_layers
 
         if (
@@ -490,8 +489,9 @@ class Step3p5DecoderLayer(nn.Module):
                 prefix=add_prefix("share_expert", prefix),
                 reduce_results=False,
                 **(
-                    dict(tp_rank=0, tp_size=1)
+                    dict(parallel_group="replicated")
                     if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
                     or get_moe_a2a_backend().is_mooncake()
                     or get_moe_a2a_backend().is_nixl()
                     or get_moe_a2a_backend().is_mori()
@@ -518,18 +518,31 @@ class Step3p5DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_moe_layer,
-                    next_layer_sparse=self.is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
         self.layer_id = layer_id
+
+    @classmethod
+    def stage_facts(cls, config: Step3p5Config, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_moe_layer(config, layer_id),
+                next_layer_sparse=cls._is_moe_layer(config, layer_id + 1),
+            ),
+        )
+
+    @staticmethod
+    def _is_moe_layer(config: Step3p5Config, layer_id: int) -> bool:
+        moe_layers_set = {int(x) for x in config.moe_layers_enum.split(",")}
+        return layer_id in moe_layers_set
 
     def forward(
         self,
@@ -595,7 +608,6 @@ class Step3p5Model(nn.Module):
 
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
-            # 1,
             lambda idx, prefix: Step3p5DecoderLayer(
                 layer_id=idx,
                 config=config,
@@ -604,17 +616,12 @@ class Step3p5Model(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(Step3p5DecoderLayer.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
-
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.config, "scale_emb"):
-            return self.get_input_embeddings()(input_ids) * self.config.scale_emb
-        else:
-            return self.get_input_embeddings()(input_ids)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -642,7 +649,6 @@ class Step3p5Model(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states, forward_batch)
-            # break
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
         else:
@@ -652,7 +658,6 @@ class Step3p5Model(nn.Module):
                 return residual_batch.to_pp(hidden_states, forward_batch)
             else:
                 if hidden_states.shape[0] > 0:
-                    # if forward_batch.return_hidden_states_before_norm:
                     hidden_states_before_norm = residual_batch.snapshot(
                         hidden_states, forward_batch
                     )
@@ -703,38 +708,18 @@ class Step3p5ForCausalLM(nn.Module):
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
-        self.tie_word_embeddings = False
-        self.num_fused_shared_experts = 0
-
         # handle the lm head on different pp ranks
         if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                prefix=add_prefix("lm_head", prefix),
+            )
         else:
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
-
-        # perform weight tying for PP
-        if self.pp_group.world_size > 1 and self.tie_word_embeddings:
-            if self.pp_group.is_first_rank:
-                self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.world_size - 1
-                )
-            elif self.pp_group.is_last_rank:
-                emb_token_weight = self.pp_group.recv(
-                    size=self.lm_head.weight.shape,
-                    dtype=next(self.model.parameters()).dtype,
-                    src=0,
-                )
-                self.lm_head.weight.copy_(emb_token_weight)
 
         self.logits_processor = LogitsProcessor(config)
 
@@ -805,14 +790,11 @@ class Step3p5ForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-        if self.num_fused_shared_experts > 0:
-            assert self.num_fused_shared_experts == 1
-
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.moe_num_experts + self.num_fused_shared_experts,
+            num_experts=self.config.moe_num_experts,
         )
 
         params_dict = dict(self.named_parameters())
@@ -851,11 +833,6 @@ class Step3p5ForCausalLM(nn.Module):
                                 else self.config.num_hidden_layers
                             )
                             if layer_id != nextn_layer_id:
-                                # # nextn/MTP load: only keep the appended nextn layers.
-                                # # Expected layer ids: [num_hidden_layers, num_hidden_layers + num_nextn_layers).
-                                # start = self.config.num_hidden_layers
-                                # end = self.config.num_hidden_layers + num_nextn_layers
-                                # if not (start <= layer_id < end):
                                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -894,12 +871,9 @@ class Step3p5ForCausalLM(nn.Module):
 
                     for mapping in expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
-                        if expert_id == self.config.moe_num_experts:
-                            continue
                         if not match_expert_and_shard_ids(name, weight_name):
                             continue
                         part_name = weight_name.split(".")[-2]
-                        fake_weight_name = name.replace(part_name, weight_name[:-1])
                         actual_param_name = name.replace(part_name + ".", param_name)
                         if actual_param_name not in params_dict:
                             continue

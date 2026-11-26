@@ -6,12 +6,53 @@ import triton
 import triton.language as tl
 
 
-def transform_index_page_table_prefill(**kwargs):
-    return transform_index_page_table_prefill_fast(**kwargs)
+@triton.jit
+def transform_index_page_table_dcp_kernel(
+    page_table_ptr,
+    result_ptr,
+    counts_ptr,
+    row_stride: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_TOPK)
+    slots = tl.load(
+        page_table_ptr + row * row_stride + offsets, mask=offsets < TOPK, other=-1
+    )
+    owned = (slots >= 0) & (slots % DCP_SIZE == DCP_RANK)
+    packed_offsets = tl.cumsum(owned.to(tl.int32), axis=0) - 1
+    count = tl.sum(owned.to(tl.int32), axis=0)
+    tl.store(result_ptr + row * TOPK + packed_offsets, slots // DCP_SIZE, mask=owned)
+    tl.store(result_ptr + row * TOPK + count + offsets, -1, mask=offsets < TOPK - count)
+    tl.store(counts_ptr + row, count)
 
 
-def transform_index_page_table_decode(**kwargs):
-    return transform_index_page_table_decode_fast(**kwargs)
+def transform_index_page_table_dcp(
+    page_table: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_rows, topk = page_table.shape
+    result = torch.empty_like(page_table)
+    counts = torch.empty(num_rows, dtype=torch.int32, device=page_table.device)
+    if num_rows == 0 or topk == 0:
+        return result, counts.zero_()
+    assert page_table.stride(1) == 1
+    transform_index_page_table_dcp_kernel[(num_rows,)](
+        page_table,
+        result,
+        counts,
+        page_table.stride(0),
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        TOPK=topk,
+        BLOCK_TOPK=triton.next_power_of_2(topk),
+        num_warps=4,
+    )
+    return result, counts
 
 
 @triton.jit
@@ -221,7 +262,7 @@ def transform_index_page_table_prefill_kernel(
     )
 
 
-def transform_index_page_table_decode_fast(
+def transform_index_page_table_decode(
     page_table: torch.Tensor,
     topk_indices: torch.Tensor,
     result: Optional[torch.Tensor] = None,
@@ -273,7 +314,7 @@ def transform_index_page_table_decode_fast(
     return result
 
 
-def transform_index_page_table_prefill_fast(
+def transform_index_page_table_prefill(
     page_table: torch.Tensor,
     topk_indices: torch.Tensor,
     extend_lens_cpu: List[int],
@@ -321,57 +362,4 @@ def transform_index_page_table_prefill_fast(
         BLOCK_TOPK=block_topk,
         num_warps=4,
     )
-    return result
-
-
-def transform_index_page_table_decode_ref(
-    page_table: torch.Tensor,
-    topk_indices: torch.Tensor,
-    result: Optional[torch.Tensor] = None,
-    page_size: int = 1,
-) -> torch.Tensor:
-    assert page_size == 1
-    assert page_table.shape[0] == topk_indices.shape[0]
-    if result is None:
-        result = torch.empty_like(topk_indices, dtype=torch.int32)
-    assert result.shape == topk_indices.shape
-    torch.gather(
-        page_table.to(result.dtype),
-        dim=1,
-        index=topk_indices.clamp(min=0),
-        out=result,
-    )
-    result[topk_indices < 0] = -1
-    return result
-
-
-def transform_index_page_table_prefill_ref(
-    page_table: torch.Tensor,
-    topk_indices: torch.Tensor,
-    extend_lens_cpu: List[int],
-    page_size: int = 1,
-    output_num_tokens: Optional[int] = None,
-    page_table_is_expanded: bool = False,
-) -> torch.Tensor:
-    assert page_size == 1
-    real_num_tokens = sum(extend_lens_cpu)
-    result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
-
-    if page_table_is_expanded:
-        if real_num_tokens > 0:
-            transform_index_page_table_decode_ref(
-                page_table[:real_num_tokens],
-                topk_indices[:real_num_tokens],
-                result=result[:real_num_tokens],
-            )
-        return result
-
-    offset = 0
-    for i, l in enumerate(extend_lens_cpu):
-        transform_index_page_table_decode_ref(
-            page_table[i].unsqueeze(0).expand(l, -1),
-            topk_indices[offset : offset + l],
-            result=result[offset : offset + l],
-        )
-        offset += l
     return result

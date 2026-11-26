@@ -71,8 +71,8 @@ from sglang.kernels.ops.attention.flash_attn.cute.utils import AuxData
 class FlashAttentionForwardSm120(FlashAttentionForwardBase):
     """SM120 warp-MMA forward kernel with TMA fused into the QK warps."""
 
-    # Experimental same-page paged-KV TMA path. Scratch benchmarks set this on
-    # the kernel instance; qualified dispatch keeps it disabled.
+    # Same-page paged-KV TMA path. Off in this class; the qualified packed decode
+    # kernel, FlashAttentionForwardSm120DecodeTranspose, turns it on.
     paged_tma = False
 
     def __init__(

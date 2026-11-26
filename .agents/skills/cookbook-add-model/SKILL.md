@@ -264,5 +264,5 @@ git add docs/src/snippets/configs/<hf-org>/<slug>.jsx \
         docs/docs.json docs/cookbook/<category>/intro.mdx
 git commit -m "Add <Display-Name> cookbook"
 git push -u origin add-<model>-cookbook
-gh pr create --title "Add <Display-Name> cookbook" --body "..."
+gh pr create --title "[Doc] cookbook: Add <Display-Name> cookbook" --body "..."
 ```

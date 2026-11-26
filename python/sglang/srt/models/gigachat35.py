@@ -26,10 +26,11 @@ from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -39,8 +40,9 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BumpAllocator, add_prefix, make_pp_layers
+from sglang.srt.utils import BumpAllocator
 
 _GATED_NORM_LOW_RANK = 16
 
@@ -48,7 +50,7 @@ _GATED_NORM_LOW_RANK = 16
 class GigaChat35GatedRMSNorm(nn.Module):
     """RMSNorm (optionally zero-centered) followed by a low-rank sigmoid gate.
 
-    ``scale`` folds the optional MLA ``alpha`` factor into the q/kv a-norms.
+    ``scale`` applies the optional MLA ``alpha`` factor after the gated norm.
     Supports the fused residual-add convention used by sglang decoder layers:
     ``forward(x, residual)`` returns ``(normed, residual + x)``.
     """
@@ -112,12 +114,8 @@ def build_norm(
     config: GigaChat35Config, hidden_size: int, scale: float = 1.0
 ) -> nn.Module:
     """Construct the configured norm for a GigaChat 3.5 module."""
-    norm_type = getattr(config, "norm_type", "LlamaRMSNorm")
+    norm_type = config.norm_type
     eps = config.rms_norm_eps
-    if norm_type == "LlamaRMSNorm":
-        return RMSNorm(hidden_size, eps=eps)
-    if norm_type == "ZeroCenteredRMSNorm":
-        return GemmaRMSNorm(hidden_size, eps=eps)
     if norm_type in ("ZeroCenteredGatedNorm", "GatedNorm"):
         return GigaChat35GatedRMSNorm(
             hidden_size,
@@ -179,19 +177,17 @@ class GigaChat35MlpPrepNorm(nn.Module):
         return self.pre_layernorm(merged), merged
 
 
-_GIGACHAT_WEIGHT_NAME_REMAP = (
-    (".gate_up_projection.", ".gate_up_lowrank."),
-    (".gate_down_projection.", ".gate_down_lowrank."),
-    (".self_attn.gate_proj.", ".self_attn.attn_gate."),
+_GIGACHAT_WEIGHT_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "gate_up_projection": "gate_up_lowrank",
+        "gate_down_projection": "gate_down_lowrank",
+        "self_attn.gate_proj": "self_attn.attn_gate",
+    }
 )
 
 
 def _remap_gigachat_weight_names(weights):
-    for name, loaded_weight in weights:
-        for src, dst in _GIGACHAT_WEIGHT_NAME_REMAP:
-            if src in name:
-                name = name.replace(src, dst)
-        yield name, loaded_weight
+    return _GIGACHAT_WEIGHT_MAPPER.apply(weights)
 
 
 class GigaChat35GatedDeltaNet(Qwen3GatedDeltaNet):
@@ -268,24 +264,15 @@ class GigaChat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
             alt_stream=alt_stream,
         )
 
-        self._norm_type = getattr(config, "norm_type", "LlamaRMSNorm")
         use_scaling = bool(getattr(config, "use_mla_scaling_factor", False))
         q_hidden = hidden_size if q_lora_rank is None else q_lora_rank
         kv_hidden = kv_lora_rank
         alpha_q = (hidden_size / q_hidden) ** 0.5 if use_scaling else 1.0
         alpha_kv = (hidden_size / kv_hidden) ** 0.5 if use_scaling else 1.0
 
-        if self._norm_type != "LlamaRMSNorm":
-            if q_lora_rank is not None and hasattr(self, "q_a_layernorm"):
-                self.q_a_layernorm = build_norm(config, q_lora_rank, scale=alpha_q)
-            self.kv_a_layernorm = build_norm(config, kv_lora_rank, scale=alpha_kv)
-        else:
-            if use_scaling:
-                if q_lora_rank is not None and hasattr(self, "q_a_layernorm"):
-                    with torch.no_grad():
-                        self.q_a_layernorm.weight.mul_(alpha_q)
-                with torch.no_grad():
-                    self.kv_a_layernorm.weight.mul_(alpha_kv)
+        if q_lora_rank is not None and hasattr(self, "q_a_layernorm"):
+            self.q_a_layernorm = build_norm(config, q_lora_rank, scale=alpha_q)
+        self.kv_a_layernorm = build_norm(config, kv_lora_rank, scale=alpha_kv)
 
         self.gated_attention = bool(getattr(config, "gated_attention", False))
         self._gate_input: Optional[torch.Tensor] = None
@@ -296,8 +283,7 @@ class GigaChat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("attn_gate", prefix),
-                tp_rank=get_parallel().attn_tp_rank,
-                tp_size=get_parallel().attn_tp_size,
+                parallel_group="attn_tp",
             )
             self.o_proj.register_forward_pre_hook(self._o_proj_gate_hook)
 
@@ -316,12 +302,21 @@ class GigaChat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
     def dispatch_attn_forward_method(self, forward_batch: ForwardBatch):
         method = super().dispatch_attn_forward_method(forward_batch)
         AF = deepseek_v2.AttnForwardMethod
-        fused = [
-            getattr(AF, name, None)
-            for name in ("MLA_FUSED_ROPE", "MLA_FUSED_ROPE_ROCM", "MLA_FUSED_ROPE_CPU")
-        ]
-        if method in [m for m in fused if m is not None]:
+        if method in (AF.MLA_FUSED_ROPE_ROCM, AF.MLA_FUSED_ROPE_CPU):
             return AF.MLA
+        if method in (
+            AF.MLA_ROCM,
+            AF.MHA_ROCM,
+            AF.MHA_ONE_SHOT_ROCM,
+            AF.MHA_CHUNKED_KV_ROCM,
+            AF.MHA_NPU,
+            AF.MLA_NPU,
+            AF.DSA_NPU,
+        ):
+            raise NotImplementedError(
+                f"GigaChat gated q/kv norms are not supported by {method.name}; "
+                "its fused kernels read norm weights directly."
+            )
         return method
 
     def forward(
@@ -403,17 +398,13 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             )
             qkv_latent_func = self.self_attn.prepare_qkv_latent
 
-        self.is_sparse = self.is_layer_sparse
-
         swiglu_limit = float(getattr(config, "swiglu_limit", None) or 0.0)
         experts = getattr(self.mlp, "experts", None)
         runner_config = getattr(experts, "moe_runner_config", None)
         if swiglu_limit > 0 and runner_config is not None:
             runner_config.gemm1_clamp_limit = swiglu_limit
 
-        layernorm_type = getattr(config, "layernorm_type", "pre")
-        self._use_pre = layernorm_type in ("pre", "pre_post")
-        self._use_post = layernorm_type in ("post", "pre_post")
+        self._use_pre, self._use_post = self._norm_placement(config)
 
         self.input_layernorm = build_norm(config, config.hidden_size)
         self.post_attention_layernorm = build_norm(config, config.hidden_size)
@@ -435,25 +426,55 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             input_layernorm=attn_prepare_layernorm,
             post_attention_layernorm=mlp_prepare_layernorm,
             qkv_latent_func=qkv_latent_func,
-            attn_output=(
-                OutputTransform(self.post_self_attn_layernorm)
-                if self.post_self_attn_layernorm is not None
-                else None
-            ),
-            output=(
-                OutputTransform(self.post_feedforward_layernorm)
-                if self.post_feedforward_layernorm is not None
-                else None
-            ),
+            post_self_attn_layernorm=self.post_self_attn_layernorm,
+            post_feedforward_layernorm=self.post_feedforward_layernorm,
         )
 
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        if is_nextn:
-            return bool(getattr(self.config, "nextn_is_sparse", False))
+    @staticmethod
+    def _norm_placement(config: GigaChat35Config):
+        """Whether the layer norms each sublayer's input, and its output."""
+        layernorm_type = getattr(config, "layernorm_type", "pre")
         return (
-            self.config.n_routed_experts is not None
-            and layer_id >= self.config.first_k_dense_replace
-            and layer_id % self.config.moe_layer_freq == 0
+            layernorm_type in ("pre", "pre_post"),
+            layernorm_type in ("post", "pre_post"),
+        )
+
+    @classmethod
+    def stage_facts(
+        cls,
+        config: GigaChat35Config,
+        layer_id: int,
+        *,
+        is_nextn: bool = False,
+        post_self_attn_layernorm=None,
+        post_feedforward_layernorm=None,
+    ):
+        """The stages a GigaChat 3.5 layer declares, from the config alone:
+        the model's shared declaration function, which the layer declares
+        with too (see make_layers). The output norms, which the layer has
+        only when it norms the sublayers' outputs, are the output
+        transforms."""
+        _, use_post = cls._norm_placement(config)
+        return super().stage_facts(
+            config,
+            layer_id,
+            is_nextn=is_nextn,
+            attn_output=(
+                OutputTransform(post_self_attn_layernorm) if use_post else None
+            ),
+            output=OutputTransform(post_feedforward_layernorm) if use_post else None,
+        )
+
+    @staticmethod
+    def _is_layer_sparse(
+        config: GigaChat35Config, layer_id: int, is_nextn: bool
+    ) -> bool:
+        if is_nextn:
+            return bool(getattr(config, "nextn_is_sparse", False))
+        return (
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+            and layer_id % config.moe_layer_freq == 0
         )
 
     def forward(
@@ -495,6 +516,8 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
 
 
 class GigaChat35Model(nn.Module):
+    decoder_layer_cls = GigaChat35DecoderLayer
+
     def __init__(
         self,
         config: GigaChat35Config,
@@ -520,7 +543,7 @@ class GigaChat35Model(nn.Module):
 
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: GigaChat35DecoderLayer(
+            lambda idx, prefix: self.decoder_layer_cls(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
@@ -528,6 +551,7 @@ class GigaChat35Model(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: self.decoder_layer_cls.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:
@@ -579,6 +603,9 @@ class GigaChat35Model(nn.Module):
 
 
 class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
+    hf_to_sglang_mapper = _GIGACHAT_WEIGHT_MAPPER
+    model_cls = GigaChat35Model
+
     def __init__(
         self,
         config: GigaChat35Config,
@@ -591,7 +618,7 @@ class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = 0
 
-        self.model = GigaChat35Model(
+        self.model = self.model_cls(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         if self.pp_group.is_last_rank:

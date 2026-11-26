@@ -3,7 +3,7 @@
 
 Compares the legacy gather (``gather_dequant_requant_fp8_paged_legacy``:
 fresh ``torch.zeros`` destination + one program per (token, 128-elem
-slice)) against the new gather (``gather_dequant_requant_fp8_paged``:
+slice)) against the new gather (``gather_dequant_requant_fp8_paged_dsa``:
 no pre-zeroing needed, fused pad-row zero-fill, TOKENS_PER_PROG tokens
 per program with 16B-vectorized access), in three flavors:
 
@@ -43,6 +43,8 @@ import sys
 from pathlib import Path
 
 import torch
+import triton
+import triton.language as tl
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MOD_PATH = _REPO_ROOT / "python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py"
@@ -54,8 +56,127 @@ _spec = importlib.util.spec_from_file_location("dequant_k_cache", _MOD_PATH)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-gather_new = _mod.gather_dequant_requant_fp8_paged
-gather_legacy = _mod.gather_dequant_requant_fp8_paged_legacy
+gather_new = _mod.gather_dequant_requant_fp8_paged_dsa
+_infer_dsa_dims = _mod._infer_dsa_dims
+
+
+def gather_dequant_requant_fp8_paged_legacy(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    group_size: int = 128,
+    extra_rows: int = 0,
+) -> torch.Tensor:
+    """Legacy (pre-vectorization) gather + dequant + requant.
+
+    Kept as the bit-exactness / performance reference for
+    ``gather_dequant_requant_fp8_paged_dsa`` (see
+    ``benchmark/kernels/deepseek/benchmark_q8kv8_kv_gather.py``).  Allocates and zero-fills the
+    full destination each call, then launches one program per
+    (token, 128-elem slice).
+    """
+    dim_quant = quant_k_cache.shape[-1]
+    dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
+    quant_k_cache = quant_k_cache.view((-1, dim_quant))
+
+    num_tokens = page_table_1_flattened.shape[0]
+    assert quant_k_cache.dtype == torch.float8_e4m3fn
+    num_tiles = dim_nope // group_size
+    out_dim = dim_nope + dim_rope
+    assert num_tiles * group_size == dim_nope
+
+    total_rows = num_tokens + extra_rows
+    # Allocate a fresh zero-filled buffer.  The extra landing-pad rows at
+    # the tail must read as zeros (the kernel may over-read past
+    # num_tokens for masked indices).
+    output = torch.zeros(
+        (total_rows, 1, out_dim),
+        dtype=torch.float8_e4m3fn,
+        device=quant_k_cache.device,
+    )
+
+    num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
+
+    input_nope_q = quant_k_cache[:, :dim_nope]
+    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
+        torch.float32
+    )
+    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+
+    _gather_dequant_requant_fp8_paged_kernel[(num_tokens, num_blocks_per_token)](
+        output,
+        input_nope_q,
+        input_nope_s,
+        input_rope,
+        page_table_1_flattened,
+        output.stride(0),
+        input_nope_q.stride(0),
+        input_nope_s.stride(0),
+        input_rope.stride(0),
+        NUM_NOPE_BLOCKS=num_tiles,
+        GROUP_SIZE=group_size,
+        DIM_NOPE=dim_nope,
+        DIM_ROPE=dim_rope,
+    )
+
+    return output
+
+
+@triton.jit
+def _gather_dequant_requant_fp8_paged_kernel(
+    output_ptr,
+    input_nope_q_ptr,
+    input_nope_s_ptr,
+    input_rope_ptr,
+    page_table_1_ptr,
+    output_stride_0: int,
+    input_nope_q_stride_0: int,
+    input_nope_s_stride_0: int,
+    input_rope_stride_0: int,
+    NUM_NOPE_BLOCKS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+):
+    """Fused gather + dequant(per-group) + requant(per-tensor) -> fp8."""
+    token_id = tl.program_id(0)
+    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
+    raw_block_id = tl.program_id(1)
+
+    if raw_block_id < NUM_NOPE_BLOCKS:
+        # nope: read fp8, mul group scale -> f32, cast to fp8_e4m3fn
+        effective_block_id = raw_block_id
+        offs_q = effective_block_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        mask = offs_q < DIM_NOPE
+
+        ptr_q = input_nope_q_ptr + token_id_paged * input_nope_q_stride_0 + offs_q
+        ptr_s = (
+            input_nope_s_ptr
+            + token_id_paged * input_nope_s_stride_0
+            + effective_block_id
+        )
+
+        y_q = tl.load(ptr_q, mask=mask, other=0.0).to(tl.float32)
+        y_s = tl.load(ptr_s)
+
+        # dequant -> f32 -> requant to fp8
+        y = (y_q * y_s).to(tl.float8e4nv)
+
+        dst_ptr = output_ptr + token_id * output_stride_0 + offs_q
+        tl.store(dst_ptr, y, mask=mask)
+    else:
+        # rope: read bf16, cast to fp8
+        effective_block_id = raw_block_id - NUM_NOPE_BLOCKS
+        offs = effective_block_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        mask = offs < DIM_ROPE
+
+        src_ptr = input_rope_ptr + token_id_paged * input_rope_stride_0 + offs
+        dst_ptr = output_ptr + token_id * output_stride_0 + DIM_NOPE + offs
+
+        data = tl.load(src_ptr, mask=mask).to(tl.float8e4nv)
+        tl.store(dst_ptr, data, mask=mask)
+
+
+gather_legacy = gather_dequant_requant_fp8_paged_legacy
 
 PAGE_SIZE = 64
 DIM_QUANT = 656  # 512 nope fp8 + 16 scale bytes + 128 rope bytes

@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Iterable, Optional
 
 import torch
@@ -23,9 +24,13 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -35,31 +40,42 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import make_pp_layers
 
-from .granitemoe import GraniteMoeMoE, GraniteMoeSharedMLP
+from .granitemoe import (
+    GraniteMoeMoE,
+    GraniteMoeSharedMLP,
+    granitemoe_load_split_experts,
+)
 
 
-def _make_stages(layer):
-    """Both kinds of layer scale their mixer and FFN outputs by
-    residual_multiplier, add them in the activation dtype and normalize the sum
-    as a separate step."""
-    scale = OutputTransform(layer._scale_output)
-    sparse = layer.block_sparse_moe is not None
+def _has_moe(config: GraniteMoeHybridConfig) -> bool:
+    return getattr(config, "num_local_experts", 0) > 0
+
+
+def stage_facts(config: GraniteMoeHybridConfig, layer_idx: int, scale=None):
+    """The stages a layer of either kind declares, from the config alone: the
+    model's shared declaration function, which the layers declare with too
+    (see make_layers). Both kinds of layer scale their mixer and FFN outputs
+    by residual_multiplier (``scale``), add them in the activation dtype and
+    normalize the sum as a separate step."""
+    scale = OutputTransform(scale)
+    sparse = _has_moe(config)
+    return (
+        declare_attn(read=UNFUSED_NORM_READOUT, output_transform=scale),
+        declare_ffn(
+            sparse=sparse,
+            next_layer_sparse=sparse,
+            read=UNFUSED_NORM_READOUT,
+            output_transform=scale,
+        ),
+    )
+
+
+def _make_stages(layer, config: GraniteMoeHybridConfig, layer_idx: int):
+    attn, ffn = stage_facts(config, layer_idx, scale=layer._scale_output)
     return append_stages(
-        (
-            declare_attn(read=UNFUSED_NORM_READOUT, output_transform=scale),
-            layer.input_layernorm,
-        ),
-        (
-            declare_ffn(
-                sparse=sparse,
-                next_layer_sparse=sparse,
-                read=UNFUSED_NORM_READOUT,
-                output_transform=scale,
-            ),
-            layer.post_attention_layernorm,
-        ),
+        (attn, layer.input_layernorm),
+        (ffn, layer.post_attention_layernorm),
     )
 
 
@@ -91,7 +107,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
         )
 
         self.block_sparse_moe = None
-        if getattr(config, "num_local_experts", 0) > 0:
+        if _has_moe(config):
             self.block_sparse_moe = GraniteMoeMoE(
                 num_experts=config.num_local_experts,
                 top_k=config.num_experts_per_tok,
@@ -118,7 +134,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_boundary, self.ffn_boundary = _make_stages(self)
+        self.attn_boundary, self.ffn_boundary = _make_stages(self, config, layer_idx)
 
     def _scale_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states * self.residual_multiplier
@@ -174,7 +190,6 @@ class GraniteMoeHybridAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.causal = True
         self.hidden_size = config.hidden_size
         self.attention_bias = config.attention_bias
         self.attention_multiplier = config.attention_multiplier
@@ -282,7 +297,7 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         )
 
         self.block_sparse_moe = None
-        if getattr(config, "num_local_experts", 0) > 0:
+        if _has_moe(config):
             self.block_sparse_moe = GraniteMoeMoE(
                 num_experts=config.num_local_experts,
                 top_k=config.num_experts_per_tok,
@@ -309,7 +324,7 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_boundary, self.ffn_boundary = _make_stages(self)
+        self.attn_boundary, self.ffn_boundary = _make_stages(self, config, layer_idx)
 
     def _scale_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states * self.residual_multiplier
@@ -395,6 +410,7 @@ class GraniteMoeHybridModel(nn.Module):
             config.num_hidden_layers,
             get_layer,
             prefix=f"{prefix}.layers",
+            stage_facts=partial(stage_facts, config),
         )
 
         if self.pp_group.is_last_rank:
@@ -464,10 +480,6 @@ class GraniteMoeHybridForCausalLM(
         "conv1d": ["conv1d"],
         "in_proj": ["in_proj"],
         "input_linear": ["input_linear"],
-    }
-    embedding_modules = {
-        "embed_tokens": "input_embeddings",
-        "lm_head": "output_embeddings",
     }
 
     def __init__(
@@ -607,42 +619,18 @@ class GraniteMoeHybridForCausalLM(
             weight_loader(param, p, name, shard_id=shard_id, expert_id=expert_id)
             loaded_params.add(n)
 
-        def _load_quant_expert(name, loaded_weight):
-            for mapping in expert_params_mapping:
-                param_name, weight_name, expert_id, shard_id = mapping
-
-                if weight_name not in name:
-                    continue
-
-                name_mapped = name.replace(weight_name, param_name)
-
-                # Skip layers on other devices.
-                # if is_pp_missing_parameter(name_mapped, self):
-                #     continue
-
-                param = params_dict[name_mapped]
-                weight_loader = param.weight_loader
-                success = False
-
-                if weight_loader is not None:
-                    success = weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-
-                if success:
-                    return name_mapped
-            return None
+        # llmcompressor checkpoints store one tensor per expert and projection.
+        weights = granitemoe_load_split_experts(
+            weights,
+            expert_params_mapping=expert_params_mapping,
+            params_dict=params_dict,
+        )
 
         for n, p in weights:
             if "A_log" in n:
                 n = n.replace("A_log", "A")
 
-            if self.quant_config is not None and (
+            if isinstance(self.quant_config, CompressedTensorsConfig) and (
                 scale_name := self.quant_config.get_cache_scale(n)
             ):
                 # Loading kv cache quantization scales
@@ -652,9 +640,6 @@ class GraniteMoeHybridForCausalLM(
                 )
                 _load(scale_name, loaded_weight)
                 loaded_params.add(scale_name)
-                continue
-
-            if _load_quant_expert(n, p):
                 continue
 
             # Logic analogous to: https://github.com/vllm-project/vllm/blob/f49e5aff11c986ed4d45202b1716c5d74786efa9/vllm/model_executor/models/granitemoeshared.py#L215

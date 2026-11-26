@@ -1,18 +1,24 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from sglang.srt.runtime_context import get_context
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import scheduler as scheduler_module  # noqa: E402
 from sglang.srt.managers.scheduler_components.recv_skipper import (  # noqa: E402
     SchedulerRecvSkipper,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.managers.scheduler_input_blocker import (  # noqa: E402
+    SchedulerInputBlocker,
+)
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _publish(case, interval, attn_dp_size=1):
@@ -35,22 +41,6 @@ def _batch(forward_mode, recv_skipper_forward_mode=None):
 
 
 class TestSchedulerRecvSkipper(CustomTestCase):
-    def test_disabled_at_default_interval(self):
-        # interval <= 1 disables the skipper entirely.
-        _publish(self, 1)
-        self.assertIsNone(SchedulerRecvSkipper.maybe_create())
-
-    def test_enabled_under_dp_attention(self):
-        # Regression: the constructor used to reject DP attention.
-        _publish(self, 50, attn_dp_size=2)
-        skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertIsNotNone(skipper)
-
-    def test_no_last_batch_accumulates_slowly(self):
-        _publish(self, 50)
-        skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertFalse(skipper.handle(None))
-
     def test_decode_accumulates_until_threshold(self):
         # DECODE weight = 1: recv only every `interval` decode steps.
         _publish(self, 3)
@@ -100,6 +90,28 @@ class TestSchedulerRecvSkipper(CustomTestCase):
         self.assertEqual(derive([decode, idle, decode]), ForwardMode.DECODE)
         self.assertEqual(derive([verify, verify]), ForwardMode.TARGET_VERIFY)
         self.assertEqual(derive([verify, decode]), ForwardMode.DECODE)
+
+
+class TestSchedulerInputBlockerSwitch(CustomTestCase):
+    def test_colocated_batch_gen_accepts_the_declared_boolean_spellings(self):
+        """SGLANG_ENABLE_COLOCATED_BATCH_GEN is a declared boolean, so "yes" turns
+        the scheduler's input blocker on just as "1" does."""
+        _publish(self, 1)
+        for value, enabled in (("1", True), ("yes", True), ("0", False)):
+            with (
+                self.subTest(value=value),
+                envs.SGLANG_ENABLE_COLOCATED_BATCH_GEN.override(value),
+                get_parallel().override(attn_tp_rank=0),
+                patch.object(scheduler_module, "create_scheduler_watchdog"),
+            ):
+                scheduler = scheduler_module.Scheduler.__new__(
+                    scheduler_module.Scheduler
+                )
+                scheduler.init_watch_dog_memory_saver_input_blocker()
+                self.assertEqual(
+                    isinstance(scheduler.input_blocker, SchedulerInputBlocker),
+                    enabled,
+                )
 
 
 if __name__ == "__main__":

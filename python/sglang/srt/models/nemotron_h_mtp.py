@@ -17,7 +17,8 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from sglang.srt.configs import NemotronHConfig
+from sglang.srt.configs.nemotron_h import NemotronHConfig
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -26,6 +27,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4A16LinearMethod
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -38,7 +40,78 @@ from sglang.srt.models.nemotron_h import (
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
+
+
+def _init_mtp_step(
+    layer: nn.Module,
+    *,
+    config: NemotronHConfig,
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+    has_start_projections: bool,
+    has_end_norm: bool,
+) -> None:
+    layer.has_start_projections = has_start_projections
+    layer.has_end_norm = has_end_norm
+
+    if has_start_projections:
+        layer.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        layer.hnorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+
+        _dp_attn = is_dp_attention_enabled()
+        layer.eh_proj = ColumnParallelLinear(
+            input_size=config.hidden_size * 2,
+            output_size=config.hidden_size,
+            bias=False,
+            gather_output=not _dp_attn,
+            parallel_group="attn_tp" if _dp_attn else "tp",
+            params_dtype=(config.dtype if hasattr(config, "dtype") else torch.bfloat16),
+            quant_config=quant_config,
+            prefix=f"{prefix}.eh_proj",
+        )
+
+    if has_end_norm:
+        layer.final_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=getattr(config, "layer_norm_epsilon", 1e-5),
+        )
+
+
+def _forward_mtp_step(
+    layer: nn.Module,
+    base_forward,
+    *,
+    inputs_embeds: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    if layer.has_start_projections:
+        inputs_embeds_normed = layer.enorm(inputs_embeds)
+        previous_hidden_states_normed = layer.hnorm(hidden_states)
+
+        fused = torch.cat([inputs_embeds_normed, previous_hidden_states_normed], dim=-1)
+        hidden_states, _ = layer.eh_proj(fused)
+        if is_dp_attention_enabled():
+            hidden_states = get_parallel().attn_tp_group.all_gather(
+                hidden_states, dim=-1
+            )
+
+    if layer.has_start_projections:
+        hidden_states = residual_batch.set_written(hidden_states, forward_batch)
+
+    hidden_states = base_forward(
+        hidden_states=hidden_states,
+        forward_batch=forward_batch,
+    )
+
+    if layer.has_end_norm:
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+
+        hidden_states = residual_batch.set_written(
+            layer.final_layernorm(hidden_states), forward_batch
+        )
+
+    return hidden_states
 
 
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
@@ -57,33 +130,14 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
             quant_config=quant_config,
             prefix=prefix,
         )
-        self.has_start_projections = has_start_projections
-        self.has_end_norm = has_end_norm
-
-        if has_start_projections:
-            self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-            self.hnorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-
-            _dp_attn = is_dp_attention_enabled()
-            self.eh_proj = ColumnParallelLinear(
-                input_size=config.hidden_size * 2,
-                output_size=config.hidden_size,
-                bias=False,
-                gather_output=not _dp_attn,
-                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
-                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
-                params_dtype=(
-                    config.dtype if hasattr(config, "dtype") else torch.bfloat16
-                ),
-                quant_config=quant_config,
-                prefix=f"{prefix}.eh_proj",
-            )
-
-        if has_end_norm:
-            self.final_layernorm = RMSNorm(
-                config.hidden_size,
-                eps=getattr(config, "layer_norm_epsilon", 1e-5),
-            )
+        _init_mtp_step(
+            self,
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            has_start_projections=has_start_projections,
+            has_end_norm=has_end_norm,
+        )
 
     def forward(
         self,
@@ -92,35 +146,13 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.has_start_projections:
-            inputs_embeds_normed = self.enorm(inputs_embeds)
-            previous_hidden_states_normed = self.hnorm(hidden_states)
-
-            fused = torch.cat(
-                [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
-            )
-            hidden_states, _ = self.eh_proj(fused)
-            if is_dp_attention_enabled():
-                hidden_states = get_parallel().attn_tp_group.all_gather(
-                    hidden_states, dim=-1
-                )
-
-        if self.has_start_projections:
-            hidden_states = residual_batch.set_written(hidden_states, forward_batch)
-
-        hidden_states = super().forward(
+        return _forward_mtp_step(
+            self,
+            super().forward,
+            inputs_embeds=inputs_embeds,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-
-        if self.has_end_norm:
-            hidden_states = residual_batch.fold(hidden_states, forward_batch)
-
-            hidden_states = residual_batch.set_written(
-                self.final_layernorm(hidden_states), forward_batch
-            )
-
-        return hidden_states
 
 
 class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
@@ -138,34 +170,16 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=prefix,
+            is_nextn=True,
         )
-        self.has_start_projections = has_start_projections
-        self.has_end_norm = has_end_norm
-
-        if has_start_projections:
-            self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-            self.hnorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-
-            _dp_attn = is_dp_attention_enabled()
-            self.eh_proj = ColumnParallelLinear(
-                input_size=config.hidden_size * 2,
-                output_size=config.hidden_size,
-                bias=False,
-                gather_output=not _dp_attn,
-                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
-                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
-                params_dtype=(
-                    config.dtype if hasattr(config, "dtype") else torch.bfloat16
-                ),
-                quant_config=quant_config,
-                prefix=f"{prefix}.eh_proj",
-            )
-
-        if has_end_norm:
-            self.final_layernorm = RMSNorm(
-                config.hidden_size,
-                eps=getattr(config, "layer_norm_epsilon", 1e-5),
-            )
+        _init_mtp_step(
+            self,
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            has_start_projections=has_start_projections,
+            has_end_norm=has_end_norm,
+        )
 
     def forward(
         self,
@@ -174,35 +188,13 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.has_start_projections:
-            inputs_embeds_normed = self.enorm(inputs_embeds)
-            previous_hidden_states_normed = self.hnorm(hidden_states)
-
-            fused = torch.cat(
-                [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
-            )
-            hidden_states, _ = self.eh_proj(fused)
-            if is_dp_attention_enabled():
-                hidden_states = get_parallel().attn_tp_group.all_gather(
-                    hidden_states, dim=-1
-                )
-
-        if self.has_start_projections:
-            hidden_states = residual_batch.set_written(hidden_states, forward_batch)
-
-        hidden_states = super().forward(
+        return _forward_mtp_step(
+            self,
+            super().forward,
+            inputs_embeds=inputs_embeds,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-
-        if self.has_end_norm:
-            hidden_states = residual_batch.fold(hidden_states, forward_batch)
-
-            hidden_states = residual_batch.set_written(
-                self.final_layernorm(hidden_states), forward_batch
-            )
-
-        return hidden_states
 
 
 class NemotronHMultiTokenPredictor(nn.Module):
@@ -304,12 +296,13 @@ class NemotronHMultiTokenPredictor(nn.Module):
         hidden_states = forward_batch.spec_info.hidden_states
         residual_batch.start(forward_batch)
 
-        for i in range(self.pattern_len):
-            hidden_states = self.layers[str(i)](
-                inputs_embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            for i in range(self.pattern_len):
+                hidden_states = self.layers[str(i)](
+                    inputs_embeds=inputs_embeds,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
         return residual_batch.take_output(hidden_states, forward_batch)
 
 
@@ -329,6 +322,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         self.config = config
         self.quant_config = quant_config
         self._owns_lm_head = False
+        self.loaded_input_embedding = False
         # Required for parent's load_weights
         self.pp_group = get_parallel().pp_group
 
@@ -378,13 +372,18 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
     ):
         has_mtp_layers = False
         has_target_layers = False
+        has_embedding = False
         head_weights = set()
 
         def normalized_weights():
-            nonlocal has_mtp_layers, has_target_layers
+            nonlocal has_mtp_layers, has_target_layers, has_embedding
             for name, weight in weights:
                 name = name.removeprefix("language_model.")
                 has_mtp_layers |= name.startswith("mtp.layers.")
+                has_embedding |= name in (
+                    "backbone.embeddings.weight",
+                    "model.embed_tokens.weight",
+                )
                 has_target_layers |= name.startswith(
                     ("backbone.layers.", "model.layers.")
                 )
@@ -395,6 +394,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         # Inspect names while streaming: buffering a full target checkpoint here
         # would double its host-memory footprint during embedded MTP loading.
         super().load_weights(normalized_weights(), is_mtp=True)
+        self.loaded_input_embedding = has_embedding
         self._owns_lm_head = bool(
             has_mtp_layers and not has_target_layers and head_weights
         )

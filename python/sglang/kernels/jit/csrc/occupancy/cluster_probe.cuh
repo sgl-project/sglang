@@ -2,6 +2,7 @@
 
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 namespace sglang {
@@ -30,24 +31,27 @@ uint32_t get_max_active_clusters(uint32_t cluster_size, uint32_t num_waves) {
   const auto smem = (std::min(budget - std::min(budget, reserved), static_cast<uint32_t>(smem_per_block))) & ~1023u;
   const auto num_warps = std::max(1u, std::min(1024u, static_cast<uint32_t>(max_threads_per_sm) / num_waves) / 32);
 
-  // Widths above 8 are non-portable and the query rejects them without this.
-  CHECK_CUDA(cudaFuncSetAttribute(
-      reinterpret_cast<const void*>(dummy_probe_kernel), cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-  CHECK_CUDA(cudaFuncSetAttribute(
-      reinterpret_cast<const void*>(dummy_probe_kernel),
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem)));
-
-  cudaLaunchConfig_t config = {};  // stream/dynamicSmemBytes must not be garbage
-  config.gridDim = dim3{cluster_size, 1024u};
-  config.blockDim = dim3{32, num_warps};
+  const auto kernel = reinterpret_cast<const void*>(dummy_probe_kernel);
+  // Both attributes only permit: the queries below take their shared memory from their own arguments. Set
+  // them once per device to the widest allowed, so concurrent queries never change shared state. Widths above
+  // 8 are non-portable and the query rejects them without the first.
+  host::runtime::init_per_device(device, [=] {
+    CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+    host::runtime::set_max_dynamic_smem(kernel, smem_per_block);
+  });
+  const auto block_size = 32 * num_warps;
+  const auto probed_occupancy = host::runtime::get_blocks_per_sm(kernel, block_size, smem);
+  CHECK_HOST(probed_occupancy == num_waves);
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3{cluster_size};
+  config.blockDim = dim3{block_size};
   config.dynamicSmemBytes = smem;
   config.numAttrs = 1;
   cudaLaunchAttribute attr = {};
   attr.id = cudaLaunchAttributeClusterDimension;
   attr.val.clusterDim = {cluster_size, 1, 1};
   config.attrs = &attr;
-  CHECK_CUDA(cudaOccupancyMaxActiveClusters(&num_clusters, dummy_probe_kernel, &config));
+  CHECK_CUDA(cudaOccupancyMaxActiveClusters(&num_clusters, kernel, &config));
   return num_clusters;
 #endif
 }

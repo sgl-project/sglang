@@ -9,6 +9,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.sampling.penalties import uses_penalty
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
 
@@ -34,6 +35,9 @@ class DllmAlgorithm:
     supported_architectures: Tuple[str, ...] = ()
     requires_separate_context_encoding = False
     required_attention_backend: Optional[str] = None
+    reuse_forward_metadata: bool = False
+    supported_attention_backends: Tuple[str, ...] = ()
+    capture_input_preparation: bool = False
 
     def __init__(self, config: DllmConfig):
         self.block_size = config.block_size
@@ -55,6 +59,13 @@ class DllmAlgorithm:
     @classmethod
     def validate_request(cls, req: Req) -> Optional[str]:
         """Return an error for unsupported request features, if any."""
+        # A dLLM step bypasses the sampler, which keeps the penalty history.
+        if uses_penalty(req.sampling_params):
+            return (
+                "Diffusion LLMs do not support sampling penalties "
+                "(frequency_penalty, presence_penalty, repetition_penalty, "
+                "min_new_tokens)."
+            )
         return None
 
     def prepare_inputs(
@@ -95,9 +106,15 @@ class DllmAlgorithm:
         return self._run_sync(model_runner, forward_batch)
 
     def _block_start_list(self, forward_batch: ForwardBatch) -> List[int]:
+        return self._prompt_mask(forward_batch).sum(dim=1).tolist()
+
+    def _prompt_mask(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        prompt_mask = forward_batch.dllm_prompt_mask
+        if prompt_mask is not None:
+            return prompt_mask
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        return (input_ids != self.mask_id).sum(dim=1).tolist()
+        return input_ids != self.mask_id
 
     def _run_sync(
         self, model_runner: ModelRunner, forward_batch: ForwardBatch
@@ -113,11 +130,9 @@ class DllmAlgorithm:
         if all(start == self.block_size for start in start_list):
             return out.logits_output, [], None, None, out.can_run_graph
 
-        # NPU: attention metadata is stable across a block's denoise steps (the
-        # first forward above already planned it), so mark it ready once and let
-        # every later forward skip re-planning.
-        if _is_npu:
-            forward_batch.mark_forward_metadata_ready()
+        # The first forward has planned the fixed canvas's attention metadata.
+        if _is_npu or (self.reuse_forward_metadata and out.can_run_graph):
+            forward_batch.mark_forward_metadata_ready(replan_equivalent=not _is_npu)
         for _ in range(self.max_steps(self.block_size)):
             done = self.step(forward_batch, out.logits_output.full_logits, states)
             if all(done):

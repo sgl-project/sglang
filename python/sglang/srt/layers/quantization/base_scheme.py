@@ -59,6 +59,12 @@ class BaseMoEScheme(ABC):
     of different quantization schemes.
     """
 
+    runner = None
+
+    def get_moe_runner_backend(self, layer):
+        """Return the runner contract, or None for a direct standard/local-ID kernel."""
+        return self.runner.runner_backend if self.runner is not None else None
+
     @abstractmethod
     def create_weights(self, *args, **kwargs):
         """

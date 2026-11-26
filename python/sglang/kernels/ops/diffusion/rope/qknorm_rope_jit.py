@@ -23,6 +23,15 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_CACHE_DTYPES = (*_SUPPORTED_DTYPES, torch.float32)
 
 
+def _unvalidated_on_hip(
+    is_neox: bool, round_norm_before_rope: bool, pack_kv: bool
+) -> bool:
+    # Unrounded NeoX and KV packing have no AMD numerical coverage yet.
+    return torch.version.hip is not None and (
+        pack_kv or (is_neox and not round_norm_before_rope)
+    )
+
+
 @cache_once
 def _jit_qknorm_rope_module(
     head_dim: int,
@@ -34,8 +43,16 @@ def _jit_qknorm_rope_module(
     pack_kv: bool = False,
     cache_has_full_width: bool = False,
     out_of_place: bool = False,
+    half_warp: bool = True,
 ) -> Module:
-    args = make_cpp_args(
+    """``half_warp=False`` keeps the one-row-per-warp kernel where the two-rows
+    variant would apply; tests use it as the bit-exactness oracle."""
+    if _unvalidated_on_hip(is_neox, round_norm_before_rope, pack_kv):
+        variant = "KV packing" if pack_kv else "unrounded NeoX RoPE"
+        raise NotImplementedError(
+            f"Fused QKNorm+RoPE with {variant} requires numerical validation on HIP"
+        )
+    template_args = [
         head_dim,
         rope_dim,
         is_neox,
@@ -44,13 +61,16 @@ def _jit_qknorm_rope_module(
         cache_dtype,
         round_norm_before_rope,
         cache_has_full_width,
-    )
+    ]
     if pack_kv:
         op_name, kernel_name = "qknorm_rope_pack_kv", "QKNormRopePackKVKernel"
     elif out_of_place:
         op_name, kernel_name = "qknorm_rope_out_of_place", "QKNormRopeOutOfPlaceKernel"
     else:
         op_name, kernel_name = "qknorm_rope", "QKNormRopeKernel"
+    if not pack_kv:
+        template_args.append(half_warp)
+    args = make_cpp_args(*template_args)
     return load_jit(
         op_name,
         *args,
@@ -69,6 +89,8 @@ def _can_use_fused_qknorm_rope(
     pack_kv: bool,
     cache_has_full_width: bool,
 ) -> bool:
+    if _unvalidated_on_hip(is_neox, round_norm_before_rope, pack_kv):
+        return False
     if dtype not in _SUPPORTED_DTYPES or cache_dtype not in _SUPPORTED_CACHE_DTYPES:
         logger.warning(
             "Unsupported dtype pair (%s, %s) for JIT fused QKNorm+RoPE",

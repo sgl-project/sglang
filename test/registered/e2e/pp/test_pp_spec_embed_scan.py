@@ -9,14 +9,15 @@ import unittest
 import torch
 from transformers import MistralConfig, PretrainedConfig
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     publish_build_topology,
 )
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd")
 
 # Shrunk from inclusionAI/Ling-mini-2.0; the field names are the real
 # checkpoint's, only the sizes are cut down for test speed.

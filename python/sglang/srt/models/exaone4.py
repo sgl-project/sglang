@@ -1,3 +1,5 @@
+import logging
+import traceback
 from collections.abc import Iterable
 from typing import Any, List, Optional, Tuple, Union
 
@@ -28,6 +30,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -37,9 +41,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.utils import get_exception_traceback, logger
+
+logger = logging.getLogger(__name__)
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -112,9 +117,6 @@ class Exaone4Attention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_parallel().tp_size
 
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
-
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -144,8 +146,7 @@ class Exaone4Attention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -155,8 +156,7 @@ class Exaone4Attention(nn.Module):
             quant_config=quant_config,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         is_neox_style = True
@@ -204,16 +204,13 @@ class Exaone4Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Add qk-norm
-        q_shape = q.shape
-        q = q.reshape(-1, self.head_dim)
-        q = self.q_norm(q)
-        q = q.reshape(q_shape)
-
-        k_shape = k.shape
-        k = k.reshape(-1, self.head_dim)
-        k = self.k_norm(k)
-        k = k.reshape(k_shape)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=self.head_dim,
+        )
 
         if not self.sliding_window_pattern or self.is_sliding:
             q, k = self.rotary_emb(positions, q, k)
@@ -249,9 +246,7 @@ class Exaone4DecoderLayer(nn.Module):
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=getattr(
-                config, "num_key_value_heads", config.num_key_value_heads
-            ),
+            num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
@@ -272,25 +267,38 @@ class Exaone4DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
+        attn, ffn = self.stage_facts(
+            config,
+            layer_id,
+            post_attention_layernorm=self.post_attention_layernorm,
+            post_feedforward_layernorm=self.post_feedforward_layernorm,
+        )
+        self.attn_boundary, self.ffn_boundary = append_stages((attn, None), (ffn, None))
+
+    @staticmethod
+    def stage_facts(
+        config: Exaone4Config,
+        layer_id: int,
+        *,
+        post_attention_layernorm=None,
+        post_feedforward_layernorm=None,
+    ):
+        """The stages an EXAONE 4.0 layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers). The output norms are what the updates add."""
         # Post-LN: each stage reads the residual as it is, and its output is
         # normalized before it is added. The layer writes the FFN's itself.
-        ffn_update = PostNormAdd(self.post_feedforward_layernorm, applied_at_exit=True)
-        self.attn_boundary, self.ffn_boundary = append_stages(
-            (
-                declare_attn(
-                    read=PLAIN_READOUT,
-                    update=PostNormAdd(self.post_attention_layernorm),
-                ),
-                None,
+        ffn_update = PostNormAdd(post_feedforward_layernorm, applied_at_exit=True)
+        return (
+            declare_attn(
+                read=PLAIN_READOUT,
+                update=PostNormAdd(post_attention_layernorm),
             ),
-            (
-                declare_ffn(
-                    sparse=False,
-                    next_layer_sparse=False,
-                    read=PLAIN_READOUT,
-                    update=ffn_update,
-                ),
-                None,
+            declare_ffn(
+                sparse=False,
+                next_layer_sparse=False,
+                read=PLAIN_READOUT,
+                update=ffn_update,
             ),
         )
 
@@ -346,6 +354,7 @@ class Exaone4Model(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Exaone4DecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -383,11 +392,6 @@ class Exaone4Model(nn.Module):
 
 
 class Exaone4ForCausalLM(nn.Module):
-    _tied_weights_keys = ["lm_head.weight"]
-    _tp_plan = {"lm_head": "colwise_rep"}
-    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
-    base_model_prefix = "language_model"
-
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -417,6 +421,15 @@ class Exaone4ForCausalLM(nn.Module):
             "up_proj",
         ],
     }
+
+    stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        (".qkv_proj", ".q_proj", "q"),
+        (".qkv_proj", ".k_proj", "k"),
+        (".qkv_proj", ".v_proj", "v"),
+        (".gate_up_proj", ".gate_proj", 0),
+        (".gate_up_proj", ".up_proj", 1),
+    ]
 
     def __init__(
         self,
@@ -488,46 +501,6 @@ class Exaone4ForCausalLM(nn.Module):
         else:
             return hidden_states
 
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            forward_batch.hidden_states = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-            )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
-
     @property
     def start_layer(self):
         return self.model.start_layer
@@ -540,26 +513,12 @@ class Exaone4ForCausalLM(nn.Module):
         return get_attention_sliding_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
+            if layer_id is not None and (
+                layer_id < self.model.start_layer or layer_id >= self.model.end_layer
             ):
                 continue
             if "rotary_emb.inv_freq" in name or "projector" in name:
@@ -587,7 +546,7 @@ class Exaone4ForCausalLM(nn.Module):
                 if name is None:
                     continue
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
@@ -647,20 +606,16 @@ class Exaone4ForCausalLM(nn.Module):
             param = params_dict[mapped_name]
             if mapped_shard_id is not None:
                 if mapped_shard_id in ["q", "k", "v"]:
-                    num_heads = self.config.num_attention_heads // tp_size
-                    num_kv_heads = self.config.num_key_value_heads // tp_size
-                    head_dim = (
-                        self.config.hidden_size // self.config.num_attention_heads
-                    )
+                    attn = self.get_submodule(mapped_name.rsplit(".", 2)[0])
                     if mapped_shard_id == "q":
                         offset = 0
-                        size = num_heads * head_dim
+                        size = attn.q_size
                     elif mapped_shard_id == "k":
-                        offset = num_heads * head_dim
-                        size = num_kv_heads * head_dim
+                        offset = attn.q_size
+                        size = attn.kv_size
                     elif mapped_shard_id == "v":
-                        offset = (num_heads + num_kv_heads) * head_dim
-                        size = num_kv_heads * head_dim
+                        offset = attn.q_size + attn.kv_size
+                        size = attn.kv_size
                     weight = param.data.narrow(0, offset, size)
                 elif mapped_shard_id in [0, 1]:
                     intermediate_size = self.config.intermediate_size
@@ -685,7 +640,7 @@ class Exaone4ForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in Exaone4ForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in Exaone4ForCausalLM: {traceback.format_exc()}"
             )
             return None
 
@@ -700,9 +655,6 @@ class Exaone4ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def get_embed(self):
-        return self.model.embed_tokens.weight
-
     def set_embed(self, embed):
         # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
         if (
@@ -714,9 +666,6 @@ class Exaone4ForCausalLM(nn.Module):
         self.model.embed_tokens.weight = embed
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
 
 
 EntryClass = Exaone4ForCausalLM

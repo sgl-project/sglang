@@ -43,17 +43,17 @@ from sglang.srt.layers.rotary_embedding import (
 )
 from sglang.srt.layers.rotary_embedding.mrope import apply_interleaved_rope
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionRotaryEmbedding
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -576,31 +576,6 @@ class MossVLVisionModel(nn.Module):
         x = self.merger(x, deepstack_features)
         return x
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
-        stacked_params_mapping = [
-            ("attn.qkv.", "attn.q.", "q"),
-            ("attn.qkv.", "attn.k.", "k"),
-            ("attn.qkv.", "attn.v.", "v"),
-        ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set = set()
-
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
-
 
 # ==================== Cross-Attention Components ====================
 
@@ -802,10 +777,6 @@ class MossVLCrossAttentionDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.is_first_cross_attention_layer = (
-            bool(config.cross_attention_layers)
-            and layer_id == config.cross_attention_layers[0]
-        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -898,7 +869,6 @@ class MossVLSelfAttention(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -928,8 +898,7 @@ class MossVLSelfAttention(nn.Module):
             self.total_num_kv_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -937,8 +906,7 @@ class MossVLSelfAttention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -1189,7 +1157,6 @@ class MossVLForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.prefix = prefix
 
         vision_config = config.vision_config
         text_config = config.text_config
@@ -1315,7 +1282,7 @@ class MossVLForConditionalGeneration(nn.Module):
         pixel_values: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        """Run ViT encoder and insert separator tokens."""
+        """Run the ViT encoder; _insert_separator_tokens adds the separators."""
         hidden_states = self.visual(pixel_values, grid_thw=grid_thw)
         # hidden_states is packed: (total_vision_tokens, hidden_size)
         return hidden_states

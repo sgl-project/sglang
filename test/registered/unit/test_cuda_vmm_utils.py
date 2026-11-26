@@ -25,6 +25,7 @@ from sglang.kernels.jit.utils import cache_once
 from sglang.srt.utils import cuda_vmm_utils
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmGraphInputManager,
+    adjacent_runs,
     check_drv,
     exchange_posix_fds,
     export_shareable_handles,
@@ -396,6 +397,76 @@ def test_register_graph_inputs_follows_widest_input() -> None:
         check_drv(
             drv.cuMemAddressFree(span_va, size * len(handles)), "cuMemAddressFree"
         )
+
+
+def test_adjacent_runs_split_at_gaps() -> None:
+    """Allocations group into address-ordered runs that break wherever two are
+    not back to back."""
+    bases = [(300, 100), (100, 100), (500, 50), (200, 100), (550, 10)]
+    assert adjacent_runs(bases) == [[1, 3, 0], [2, 4]]
+    assert adjacent_runs([]) == []
+
+
+def test_register_graph_inputs_maps_each_allocation_once() -> None:
+    """Graph inputs that overlap on the same allocator chunks share one peer
+    mapping of each chunk, and every input still resolves to the peer bytes it
+    covers."""
+    group = _gloo_group()
+    rank = dist.get_rank(group)
+    world = dist.get_world_size(group)
+    spans = [_create_span(_POSIX_FD, n_chunks, _ALLOC_BYTES) for n_chunks in (5, 1)]
+    bases_info = []
+    for handles, span_va, size in spans:
+        for chunk in range(len(handles)):
+            va = span_va + chunk * size
+            check_drv(
+                drv.cuMemsetD8(va, _byte(rank, len(bases_info)), size), "cuMemsetD8"
+            )
+            bases_info.append((va, size))
+    torch.cuda.synchronize()
+    size = bases_info[0][1]
+    # (allocations covered, byte offset from the first one)
+    inputs = [
+        ([0, 1, 2], 0),
+        ([1, 2, 3], size // 2),
+        ([2, 3, 4], 4096),
+        ([0, 1, 2], 0),
+        ([4], 0),
+        ([5], size // 2),
+    ]
+
+    holder = _GraphInputHolder(
+        bases_info=bases_info,
+        chunk_indices=[chunks for chunks, _ in inputs],
+        offsets=[offset for _, offset in inputs],
+    )
+    manager = VmmGraphInputManager(obj=holder, group=group, rank=rank, world_size=world)
+    try:
+        manager.register_graph_inputs()
+        mapped = sum(len(chunks) for _, _, chunks in manager._peer_mappings)
+        assert mapped == (world - 1) * len(bases_info)
+        for (chunks, offset), row in zip(inputs, holder.peer_ptrs):
+            assert row[rank] == bases_info[chunks[0]][0] + offset
+            for peer in range(world):
+                if peer == rank:
+                    continue
+                _assert_region(row[peer], _byte(peer, chunks[0]), peer, chunks[0])
+                for position, chunk in enumerate(chunks):
+                    _assert_region(
+                        row[peer] - offset + position * size,
+                        _byte(peer, chunk),
+                        peer,
+                        chunk,
+                    )
+    finally:
+        manager.close()
+        for handles, span_va, size in spans:
+            for chunk, handle in enumerate(handles):
+                check_drv(drv.cuMemUnmap(span_va + chunk * size, size), "cuMemUnmap")
+                check_drv(drv.cuMemRelease(handle), "cuMemRelease")
+            check_drv(
+                drv.cuMemAddressFree(span_va, size * len(handles)), "cuMemAddressFree"
+            )
 
 
 if __name__ == "__main__":

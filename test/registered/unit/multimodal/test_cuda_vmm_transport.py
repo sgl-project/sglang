@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import gc
 import multiprocessing as mp
 import os
@@ -13,17 +15,24 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.cuda_vmm_transport_utils import (
+from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.transport import receive_budget
+from sglang.srt.multimodal.transport.cuda_vmm import (
+    CudaVmmFeatureTransport,
     CudaVmmMemoryPool,
     CudaVmmPackedTensorTransportProxy,
+    CudaVmmPoolRegion,
     _imported_pool_cache_clear,
     _PosixFdBroker,
 )
+from sglang.srt.multimodal.transport.receive_budget import ReceiveFeatureBudget
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=33, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=36, stage="base-c", runner_config="4-gpu-gb300")
 
 
 class _FabricUnavailableCudaVmmMemoryPool(CudaVmmMemoryPool):
@@ -55,13 +64,9 @@ def _produce_vmm_tensor(proxy_queue, consumer_done, result_queue, mode):
         proxy_queue.put((proxy, expected))
         if not consumer_done.wait(timeout=60):
             raise TimeoutError("consumers did not release the CUDA VMM tensor")
-        with pool._lock:
-            pool._recycle_chunks()
-            pool._merge_chunks()
-            if pool.occupied_chunks:
-                raise RuntimeError(
-                    "consumer acknowledgements did not recycle the slice"
-                )
+        pool._recycle_chunks()
+        if pool.occupied_chunks:
+            raise RuntimeError("consumer acknowledgements did not recycle the slice")
     except Exception as exc:  # noqa: BLE001  # pragma: no cover
         result_queue.put(("error", repr(exc)))
         return
@@ -121,6 +126,7 @@ class TestCudaVmmTransport(CustomTestCase):
             ):
                 torch.cuda.set_device(device)
                 with get_parallel().override(
+                    tp_rank=tp_rank,
                     attn_tp_size=2,
                     attn_tp_rank=tp_rank,
                     attn_cp_size=1,
@@ -156,17 +162,64 @@ class TestCudaVmmTransport(CustomTestCase):
     def test_auto_prefers_fabric_tensor_round_trip_and_recycling(self):
         self._run_round_trip(mode="auto")
 
+    def test_publication_waits_for_source_stream(self):
+        torch.cuda.set_device(0)
+        for mode in ("single", "packed", "async", "async_fallback"):
+            with self.subTest(mode=mode):
+                pool = CudaVmmMemoryPool(4 << 20, 60, 0, 1, allow_posix_fallback=True)
+                transport = object.__new__(CudaVmmFeatureTransport)
+                transport.pool = pool
+                try:
+                    # Make a wrong-stream copy observably read the previous value.
+                    size = 8 << 20 if mode == "async_fallback" else 1024
+                    source = torch.zeros(size, dtype=torch.uint8, device="cuda")
+                    torch.cuda.synchronize()
+                    stream = torch.cuda.Stream()
+                    with concurrent.futures.ThreadPoolExecutor(1) as executor:
+                        transport._publisher_executor = executor
+                        with torch.cuda.stream(stream):
+                            torch.cuda._sleep(200_000_000)
+                            source.fill_(73)
+                            if mode == "single":
+                                proxy = pool.wrap_tensor(source)
+                            elif mode == "packed":
+                                proxy = pool.wrap_tensors([source, source])[0]
+                            else:
+                                item = MultimodalDataItem(
+                                    modality=Modality.IMAGE, feature=source
+                                )
+                                asyncio.run(
+                                    transport.prepare_for_dispatch_async(
+                                        [MultimodalProcessorOutput(mm_items=[item])]
+                                    )
+                                )
+                                proxy = item.feature
+                    result = (
+                        proxy
+                        if isinstance(proxy, torch.Tensor)
+                        else proxy.reconstruct_on_target_device(0)
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            result.cpu(), torch.full((size,), 73, dtype=torch.uint8)
+                        )
+                    )
+                finally:
+                    torch.cuda.synchronize()
+                    _imported_pool_cache_clear()
+                    pool.shutdown()
+
     def test_reused_chunk_clears_acknowledgements(self):
         pool = CudaVmmMemoryPool(4 << 20, 60, 0, 2, allow_posix_fallback=True)
         try:
             old = pool.wrap_tensor(torch.ones(1024, dtype=torch.uint8, device="cuda:0"))
+            # VMM must bypass the CUDA IPC zero-copy borrow protocol.
+            self.assertIsNone(old.borrow_on_target_device(0))
             pool.memory_pool[old.control_offset : old.control_offset + 8].view(
                 torch.int32
             ).fill_(1)
             torch.cuda.synchronize(0)
-            with pool._lock:
-                pool._recycle_chunks()
-                pool._merge_chunks()
+            pool._recycle_chunks()
 
             pool.wrap_tensor(torch.ones(100, dtype=torch.uint8, device="cuda:0"))
             live = pool.wrap_tensor(torch.ones(256, dtype=torch.uint8, device="cuda:0"))
@@ -175,8 +228,7 @@ class TestCudaVmmTransport(CustomTestCase):
             ].view(torch.int32)
             self.assertTrue(torch.equal(control, torch.zeros_like(control)))
 
-            with pool._lock:
-                pool._recycle_chunks()
+            pool._recycle_chunks()
             self.assertIn(
                 live.control_offset,
                 [chunk.start for chunk in pool.occupied_chunks],
@@ -237,8 +289,7 @@ class TestCudaVmmTransport(CustomTestCase):
                     for tensor in reconstructed
                 )
             )
-            with pool._lock:
-                pool._recycle_chunks()
+            pool._recycle_chunks()
             self.assertFalse(pool.occupied_chunks)
         finally:
             del reconstructed, proxies, expected, sources
@@ -425,8 +476,7 @@ class TestCudaVmmTransport(CustomTestCase):
             ):
                 proxy.reconstruct_on_target_device(0, consumer_count=1)
             torch.cuda.synchronize(0)
-            with pool._lock:
-                pool._recycle_chunks()
+            pool._recycle_chunks()
             self.assertFalse(pool.occupied_chunks)
 
             with (
@@ -446,11 +496,11 @@ class TestCudaVmmTransport(CustomTestCase):
     def test_posix_export_fd_closes_when_allocation_setup_fails(self):
         with (
             patch(
-                "sglang.srt.utils.cuda_vmm_transport_utils.tensor_from_pointer",
+                "sglang.srt.multimodal.transport.cuda_vmm.tensor_from_pointer",
                 side_effect=RuntimeError("forced storage failure"),
             ),
             patch(
-                "sglang.srt.utils.cuda_vmm_transport_utils.os.close",
+                "sglang.srt.multimodal.transport.cuda_vmm.os.close",
                 wraps=os.close,
             ) as close_fd,
             self.assertRaisesRegex(RuntimeError, "forced storage failure"),
@@ -465,7 +515,7 @@ class TestCudaVmmTransport(CustomTestCase):
         close_broker = _PosixFdBroker.close
         with (
             patch(
-                "sglang.srt.utils.cuda_vmm_transport_utils.torch.cuda.Stream",
+                "sglang.srt.multimodal.transport.cuda_vmm.torch.cuda.Stream",
                 side_effect=RuntimeError("forced stream failure"),
             ),
             patch.object(
@@ -488,6 +538,254 @@ class TestCudaVmmTransport(CustomTestCase):
 
         close_fd_broker.assert_called_once()
         release_pool.assert_called_once()
+
+
+class TestCudaVmmExternalPublisher(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available() or torch.version.cuda is None:
+            raise unittest.SkipTest("An NVIDIA CUDA GPU is required")
+
+    def test_handed_over_pool_round_trips_what_the_external_publisher_copied(self):
+        pool = CudaVmmMemoryPool(4 << 20, 60, 0, 1, allow_posix_fallback=True)
+        proxies = reconstructed = None
+        try:
+            region = pool.hand_over()
+            self.assertEqual(
+                region,
+                CudaVmmPoolRegion(
+                    device_index=0,
+                    base=pool.memory_pool.data_ptr(),
+                    size=pool.allocation_size,
+                    control_size=pool.control_size,
+                    alignment=256,
+                    consumer_count=1,
+                ),
+            )
+            pool._recycle_thread.join(timeout=5)
+            self.assertFalse(pool._recycle_thread.is_alive())
+            # The pool keeps no chunk: what it would still publish stays on CPU.
+            self.assertTrue(pool.wrap_tensor(torch.ones(4)).is_cpu)
+            self.assertIsNone(pool.wrap_tensors([torch.ones(4), torch.ones(4)]))
+            with self.assertRaisesRegex(RuntimeError, "only an unused"):
+                pool.hand_over()
+
+            # As an external publisher lays them out: an f32 and a bf16 packed
+            # into the chunk at 0 (the bf16 at its element alignment), and an
+            # int64 alone in the chunk at 512.
+            sources = [
+                torch.arange(6, dtype=torch.float32).reshape(2, 3),
+                torch.arange(5, dtype=torch.bfloat16),
+                torch.arange(3, dtype=torch.int64),
+            ]
+            memory, control = pool.memory_pool, pool.control_size
+            for chunk, relative_offset, source in ((0, 0, 0), (0, 24, 1), (512, 0, 2)):
+                data = chunk + control + relative_offset
+                source_bytes = sources[source].reshape(-1).view(torch.uint8)
+                memory[chunk : chunk + control].zero_()
+                memory[data : data + source_bytes.numel()].copy_(source_bytes)
+            torch.cuda.synchronize(0)
+            proxies = pool.external_proxies(
+                0,
+                [
+                    (0, sources[0].shape, sources[0].dtype),
+                    (24, sources[1].shape, sources[1].dtype),
+                ],
+            ) + pool.external_proxies(512, [(0, sources[2].shape, sources[2].dtype)])
+            self.assertIs(proxies[0]._packed_owner, proxies[1]._packed_owner)
+            self.assertEqual(proxies[0]._packed_owner.data_nbytes, 34)
+            self.assertNotIsInstance(proxies[2], CudaVmmPackedTensorTransportProxy)
+
+            proxies = pickle.loads(pickle.dumps(proxies))
+            with get_parallel().override(
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+            ):
+                reconstructed = [
+                    proxy.reconstruct_on_target_device(0, consumer_count=1)
+                    for proxy in proxies
+                ]
+            torch.cuda.synchronize(0)
+            for actual, wanted in zip(reconstructed, sources, strict=True):
+                self.assertTrue(torch.equal(actual.cpu(), wanted))
+            # Each chunk's consumer acknowledged it, for the publisher to free.
+            for chunk in (0, 512):
+                self.assertNotEqual(
+                    memory[chunk : chunk + 4].view(torch.int32).item(), 0
+                )
+
+            with self.assertRaisesRegex(ValueError, "starts the chunk's data"):
+                pool.external_proxies(512, [(8, (1,), torch.int64)])
+            with self.assertRaisesRegex(ValueError, "not a chunk of this"):
+                pool.external_proxies(
+                    pool.allocation_size - 256, [(0, (64,), torch.float32)]
+                )
+            # A failed pool or POSIX FD broker fails publication loudly.
+            with patch.object(pool, "_pool_error", RuntimeError("injected")):
+                with self.assertRaisesRegex(RuntimeError, "pool failed"):
+                    pool.external_proxies(512, [(0, (3,), torch.int64)])
+        finally:
+            del reconstructed, proxies
+            _imported_pool_cache_clear()
+            pool.shutdown()
+
+
+class TestReceiveFeatureBudget(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available() or torch.version.cuda is None:
+            raise unittest.SkipTest("An NVIDIA CUDA GPU is required")
+
+    def setUp(self):
+        torch.cuda.set_device(0)
+        self.pool = CudaVmmMemoryPool(32 << 20, 60, 0, 1, allow_posix_fallback=True)
+        self.addCleanup(self.pool.shutdown)
+        self.addCleanup(_imported_pool_cache_clear)
+        host_room = patch.object(
+            receive_budget, "_host_allowance", return_value=1 << 40
+        )
+        host_room.start()
+        self.addCleanup(host_room.stop)
+
+    def _request(self, *sources, field="feature", hashed=True):
+        """A request as the scheduler receives it: unpickled VMM proxies."""
+        if len(sources) > 1:
+            proxies = self.pool.wrap_tensors(sources)
+        else:
+            proxies = [self.pool.wrap_tensor(sources[0])]
+        return MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    hash=index if hashed else None,
+                    **{field: proxy},
+                )
+                for index, proxy in enumerate(pickle.loads(pickle.dumps(proxies)), 1)
+            ]
+        )
+
+    @staticmethod
+    def _materialize(budget, request):
+        try:
+            return budget.materialize(request, requires_mm_token_modalities=False)
+        except RuntimeError:
+            for item in request.mm_items:
+                item.release_transport_proxies()
+            raise
+
+    def _assert_pool_drained(self):
+        torch.cuda.synchronize(0)
+        self.pool._recycle_chunks()
+        self.assertFalse(self.pool.occupied_chunks)
+
+    def test_copies_past_the_gpu_budget_are_staged_on_host(self):
+        """Queued requests beyond the per-rank reservation must not hold GPU copies."""
+        budget = ReceiveFeatureBudget(device_index=0, gpu_budget_bytes=1 << 20)
+        halves = [torch.full((256, 1024), i, dtype=torch.bfloat16) for i in range(2)]
+
+        queued = self._materialize(budget, self._request(*halves))
+        # The packed pair shares one copy.
+        self.assertEqual(budget.live_gpu_bytes, 1 << 20)
+        for item, source in zip(
+            self._materialize(budget, self._request(*halves)).mm_items, halves
+        ):
+            self.assertTrue(item.feature.is_pinned())
+            self.assertTrue(torch.equal(item.feature, source))
+        # The first prefill forward drops the GPU copy (offload to host).
+        del queued
+        torch.cuda.synchronize(0)
+        self.assertTrue(
+            self._materialize(budget, self._request(*halves))
+            .mm_items[0]
+            .feature.is_cuda
+        )
+        self._assert_pool_drained()
+
+    def test_host_staged_features_are_complete_when_materialize_returns(self):
+        budget = ReceiveFeatureBudget(device_index=0, gpu_budget_bytes=0)
+        budget._staging_stream = torch.cuda.Stream(device=0)
+        # A first cudaHostAlloc syncs the device; warm the pinned cache past it.
+        self._materialize(budget, self._request(torch.randn(1024, 1024, device="cuda")))
+        # A host source would leave its bytes in the pinned block staging reuses.
+        source = torch.randn(1024, 1024, device="cuda")
+        expected = source.cpu()
+        request = self._request(source, field="precomputed_embeddings")
+        with torch.cuda.stream(budget._staging_stream):
+            torch.cuda._sleep(100_000_000)
+
+        mm_inputs = self._materialize(budget, request)
+
+        staged = mm_inputs.mm_items[0].precomputed_embeddings
+        self.assertTrue(torch.equal(staged, expected))
+        self._assert_pool_drained()
+
+    def test_unhashed_item_gets_the_same_pad_value_on_gpu_and_host(self):
+        """Ranks may place one request differently; its pad values must agree."""
+        source = torch.arange(4096, dtype=torch.bfloat16).reshape(64, 64)
+        on_gpu, on_host = (
+            self._materialize(
+                ReceiveFeatureBudget(device_index=0, gpu_budget_bytes=gpu_budget),
+                self._request(source, hashed=False),
+            ).mm_items[0]
+            for gpu_budget in (1 << 30, 0)
+        )
+
+        self.assertTrue(on_gpu.feature.is_cuda)
+        self.assertTrue(on_host.feature.is_pinned())
+        self.assertEqual(on_host.pad_values, on_gpu.pad_values)
+        # GPU ranks would hash the feature buffer's float32 copy instead.
+        with envs.SGLANG_MM_BUFFER_SIZE_MB.override(1), self.assertRaises(RuntimeError):
+            self._materialize(
+                ReceiveFeatureBudget(device_index=0, gpu_budget_bytes=0),
+                self._request(source, hashed=False),
+            )
+        self._assert_pool_drained()
+
+    def test_freed_copy_stays_charged_until_its_stream_can_reuse_it(self):
+        budget = ReceiveFeatureBudget(device_index=0, gpu_budget_bytes=1 << 30)
+        mm_inputs = self._materialize(
+            budget, self._request(torch.ones(1 << 20, dtype=torch.uint8))
+        )
+        side = torch.cuda.Stream(device=0)
+
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(100_000_000)
+            # The first prefill forward's offload: record_stream, then drop the copy.
+            mm_inputs.mm_items[0].feature.record_stream(side)
+            del mm_inputs
+            self.assertEqual(budget.live_gpu_bytes, 1 << 20)
+        side.synchronize()
+        self.assertEqual(budget.live_gpu_bytes, 0)
+        self._assert_pool_drained()
+
+    def test_host_guard_releases_cached_pinned_blocks_before_refusing(self):
+        budget = ReceiveFeatureBudget(device_index=0, gpu_budget_bytes=0)
+        torch.accelerator.empty_host_cache()
+        held = torch.cuda.host_memory_stats()["allocated_bytes.current"]
+
+        def allowance():
+            # The OS counts pinned blocks torch keeps cached as used memory.
+            pinned = torch.cuda.host_memory_stats()["allocated_bytes.current"]
+            return (2 << 20) - (pinned - held)
+
+        # CUDA sources: publishing them pins nothing.
+        small, large = (
+            torch.ones(n << 20, dtype=torch.uint8, device="cuda") for n in (1, 2)
+        )
+        with (
+            patch.object(receive_budget, "_HOST_READ_INTERVAL_S", -1.0),
+            patch.object(receive_budget, "_host_allowance", side_effect=allowance),
+        ):
+            # Dropped at once; its pinned block stays cached until released.
+            self._materialize(budget, self._request(small))
+            staged = self._materialize(budget, self._request(small))
+            with self.assertRaises(RuntimeError):
+                self._materialize(budget, self._request(large))
+
+        self.assertTrue(staged.mm_items[0].feature.is_pinned())
+        self._assert_pool_drained()
 
 
 if __name__ == "__main__":

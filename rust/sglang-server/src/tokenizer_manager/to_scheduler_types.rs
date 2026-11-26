@@ -1,6 +1,6 @@
 //! Configuration and multimodal handles for scheduler intake.
 
-use crate::message::config::ServerArgs;
+use crate::message::config::{HiddenStatesMode, ServerArgs};
 use crate::message::request::Request;
 
 /// Dispatches multimodal requests onto the MM worker channel.
@@ -29,8 +29,8 @@ pub struct Limits {
     pub num_reserved_tokens: u64,
     /// Clamp `max_new_tokens` to what fits instead of rejecting the request.
     pub allow_auto_truncate: bool,
-    /// Whether the server can produce hidden states at all.
-    pub enable_return_hidden_states: bool,
+    /// The most a request's `return_hidden_states` may ask for.
+    pub return_hidden_states_mode: HiddenStatesMode,
 }
 
 impl From<&ServerArgs> for Limits {
@@ -41,7 +41,7 @@ impl From<&ServerArgs> for Limits {
             context_len: sa.model_config.context_len,
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
-            enable_return_hidden_states: sa.enable_return_hidden_states,
+            return_hidden_states_mode: sa.hidden_states_mode(),
         }
     }
 }

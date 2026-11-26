@@ -66,16 +66,14 @@ should give the same text output and very similar prefill logits:
 
 ### Add the Model to the Test Suite
 
-To ensure the new model is well maintained, add it to the test suite by including it in the `ALL_OTHER_MODELS` list in
-the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/registered/models/test_generation_models.py)
-file, test the new model on your local machine and report the results on demonstrative benchmarks (GSM8K, MMLU, MMMU,
-MMMU-Pro, etc.) in your PR. \\
+Compare the new model against HF Transformers on your local machine with
+[test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/registered/e2e/models/test_generation_models.py):
+add a `ModelCase` for it to `CI_MODELS` locally and run the command below. Report the results on demonstrative
+benchmarks (GSM8K, MMLU, MMMU, MMMU-Pro, etc.) in your PR. \\
 For VLMs, also include a test in `test_vision_openai_server_&#123;x&#125;.py` (e.g. [test_vision_openai_server_a.py](https://github.com/sgl-project/sglang/blob/main/test/registered/vlm/test_vision_openai_server_a.py)).
 
-This is an example command to run to test a new model on your local machine:
-
 ```bash Run Test
-ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others
+python3 -m unittest test_generation_models.TestGenerationModels
 ```
 
 ### Benchmark
@@ -135,6 +133,24 @@ ModelRegistry.models.update(import_new_model_classes())
 # Launch the server with your server arguments:
 launch_server(server_args)
 ```
+
+### Opt into MLA caching
+
+If your external model implements Multi-head Latent Attention (MLA), set `use_mla` to `true` in its Hugging Face text configuration to select the compressed latent KV cache. For a multimodal checkpoint, put these fields in the nested text configuration used by your model.
+
+```json Config
+{
+  "use_mla": true,
+  "kv_lora_rank": 512,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 96
+}
+```
+
+All four dimensions must be integers. `kv_lora_rank` and `v_head_dim` must be positive. The two Q/K dimensions may be zero individually, but their sum must be positive. Use dimensions that match your model implementation. This opt-in selects the MLA configuration; your model must implement MLA and use a compatible attention backend. It does not convert an MHA model to MLA or enable sparse attention.
+
+Providing the dimensions without `use_mla: true` keeps the existing attention selection. Built-in architectures retain their specialized configuration rules.
 
 ## Example: Implementing and Serving a Llama Wrapper Model
 
