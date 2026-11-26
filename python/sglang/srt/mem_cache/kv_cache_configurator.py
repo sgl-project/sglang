@@ -3559,14 +3559,11 @@ class KVCacheConfigurator:
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
-        budget = (
-            self.sparse_kv_budget_plan
-            if get_disagg().disaggregation_mode == "decode"
-            else None
-        )
+        budget = self.sparse_kv_budget_plan
         if budget is not None:
+            prealloc_rows = self._req_pool_pre_alloc_size() or 0
             config.max_running_requests = min(
-                config.max_running_requests, budget.resident_rows - 1
+                config.max_running_requests, budget.request_rows - prealloc_rows - 1
             )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)

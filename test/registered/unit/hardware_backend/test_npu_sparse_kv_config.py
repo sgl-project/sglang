@@ -49,7 +49,12 @@ def test_budget_validates_normalized_query_geometry(
     monkeypatch.setattr(
         config,
         "get_schedule",
-        lambda: SimpleNamespace(page_size=128, prefill_max_requests=None),
+        lambda: SimpleNamespace(
+            page_size=128,
+            prefill_max_requests=None,
+            max_running_requests=2,
+            max_total_tokens=None,
+        ),
     )
     monkeypatch.setattr(
         config,
@@ -70,7 +75,8 @@ def test_budget_validates_normalized_query_geometry(
     def make_plan():
         return config.get_sparse_kv_budget(
             model_config=model,
-            request_rows=3,
+            available_bytes=1 << 30,
+            index_k_and_draft_bytes_per_token=2 * 256,
             context_len=1024,
             num_layers=2,
             top_k=2048,

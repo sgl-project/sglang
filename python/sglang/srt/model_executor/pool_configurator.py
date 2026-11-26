@@ -352,9 +352,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             use_mla_backend=kvc.use_mla_backend,
             is_draft_worker=kvc.is_draft_worker,
         )
-        self._is_fused_sparse_offload_pd_decode_worker = (
-            self._fused_sparse_kv and get_disagg().disaggregation_mode == "decode"
-        )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -862,16 +859,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kv_dtype=kvc.kv_cache_dtype,
             num_layers=self._num_layers,
             attn_dp_size=kvc.attn_dp_size,
-            is_pd_decode_worker=self._is_fused_sparse_offload_pd_decode_worker,
         )
-        if self._is_fused_sparse_offload_pd_decode_worker:
-            return get_sparse_kv_budget(
-                **options,
-                pd_available_bytes=pool_bytes,
-                index_k_and_draft_bytes_per_token=self._cell_size,
-            )
-
-        budget = get_sparse_kv_budget(**options)
+        budget = get_sparse_kv_budget(
+            **options,
+            available_bytes=pool_bytes,
+            index_k_and_draft_bytes_per_token=self._cell_size,
+        )
         if budget.prefill_workspace_tokens:
             min_tokens = max(budget.context_len, 2 * (budget.request_rows - 1))
             token_cap = get_schedule().max_total_tokens

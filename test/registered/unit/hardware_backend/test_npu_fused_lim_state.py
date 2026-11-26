@@ -164,7 +164,6 @@ class TestLIMState(CustomTestCase):
             configurator = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
             configurator._fused_sparse_kv = True
             configurator._fixed_overhead_bytes = 256
-            configurator._is_fused_sparse_offload_pd_decode_worker = False
             configurator._kvc = SimpleNamespace(
                 sparse_kv_budget_plan=None,
                 model_config=None,
@@ -210,7 +209,6 @@ class TestLIMState(CustomTestCase):
             later._kvc = configurator._kvc
             later._fused_sparse_kv = True
             later._fixed_overhead_bytes = configurator._fixed_overhead_bytes
-            later._is_fused_sparse_offload_pd_decode_worker = False
             later._cell_size = 8
             with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
                 later.calculate_pool_sizes(0, 128)

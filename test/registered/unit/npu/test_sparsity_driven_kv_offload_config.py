@@ -177,7 +177,12 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             ),
             patch(
                 prefix + "get_schedule",
-                return_value=SimpleNamespace(page_size=128, prefill_max_requests=None),
+                return_value=SimpleNamespace(
+                    page_size=128,
+                    prefill_max_requests=None,
+                    max_running_requests=2,
+                    max_total_tokens=None,
+                ),
             ),
             patch(
                 prefix + "get_disagg",
@@ -193,7 +198,8 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     model.num_attention_heads = total_heads
                     plan = get_sparse_kv_budget(
                         model_config=model,
-                        request_rows=3,
+                        available_bytes=1 << 30,
+                        index_k_and_draft_bytes_per_token=2 * 256,
                         context_len=4097,
                         num_layers=2,
                         top_k=2048,
@@ -231,7 +237,12 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             ),
             patch(
                 prefix + "get_schedule",
-                return_value=SimpleNamespace(page_size=128, prefill_max_requests=None),
+                return_value=SimpleNamespace(
+                    page_size=128,
+                    prefill_max_requests=None,
+                    max_running_requests=17,
+                    max_total_tokens=None,
+                ),
             ),
             patch(
                 prefix + "get_spec",
@@ -252,7 +263,8 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                         index_topk=2048,
                     ),
                 ),
-                request_rows=18,
+                available_bytes=1 << 30,
+                index_k_and_draft_bytes_per_token=2 * 256,
                 context_len=4097,
                 num_layers=2,
                 top_k=2048,
@@ -270,6 +282,7 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             ("null", False, 8, 8),
             ("null", False, 0, 0),
             ("decode", False, 8, 0),
+            ("null", True, 1, 1),
         ):
             with (
                 self.subTest(mode=mode, switch=switch, cap=cap),
@@ -278,13 +291,18 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                 patch(
                     prefix + "get_disagg",
                     return_value=SimpleNamespace(
-                        disaggregation_mode=mode, enable_pd_role_switch=switch
+                        disaggregation_mode=mode,
+                        enable_pd_role_switch=switch,
+                        disaggregation_decode_extra_slots=3,
                     ),
                 ),
                 patch(
                     prefix + "get_schedule",
                     return_value=SimpleNamespace(
-                        page_size=128, prefill_max_requests=cap
+                        page_size=128,
+                        prefill_max_requests=cap,
+                        max_running_requests=None,
+                        max_total_tokens=None,
                     ),
                 ),
                 patch(
@@ -303,12 +321,17 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                         index_head_dim=128,
                         hf_config=SimpleNamespace(index_n_heads=64, index_topk=2048),
                     ),
-                    request_rows=3,
+                    available_bytes=2 * (2048 * 1152 + 256 * (256 + 4)) + 2 * 256 * 4,
+                    index_k_and_draft_bytes_per_token=256,
                     context_len=129,
                     num_layers=1,
                     top_k=2048,
                     kv_bytes_per_token=1152,
                     graph_batch_capacity=4,
+                )
+                self.assertEqual(plan.resident_rows, 6 if switch else 3)
+                self.assertEqual(
+                    plan.request_rows, 6 if mode == "decode" or switch else 3
                 )
                 self.assertEqual(plan.prefill_workspace_tokens, rows * 256)
 
@@ -442,7 +465,9 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     use_mla_backend=True,
                 )
 
-    def test_missing_request_capacity_rejects_sparse_kv_offload(self):
+    def test_missing_request_capacity_uses_fused_hbm_fit(self):
+        from sglang.srt.environ import envs
+
         with (
             patch.dict(
                 os.environ,
@@ -461,10 +486,23 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                 return_value=SimpleNamespace(max_running_requests=None),
             ),
         ):
-            with self.assertRaisesRegex(ValueError, "max_running_requests"):
-                is_sparsity_driven_kv_offload_enabled(
-                    model_config=_make_glm51_model_config(),
-                    use_mla_backend=True,
+            model = _make_glm51_model_config()
+            with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(False):
+                with self.assertRaisesRegex(ValueError, "max_running_requests"):
+                    is_sparsity_driven_kv_offload_enabled(
+                        model_config=model, use_mla_backend=True
+                    )
+            with (
+                envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+                patch(
+                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode="null"),
+                ),
+            ):
+                self.assertTrue(
+                    is_sparsity_driven_kv_offload_enabled(
+                        model_config=model, use_mla_backend=True
+                    )
                 )
 
 

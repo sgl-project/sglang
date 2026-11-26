@@ -274,9 +274,7 @@ def resolve_sparse_kv_budget(
     index_head_dim = model_config.index_head_dim
     if context_len > 2**21:
         raise ValueError("Native LIM requires context length <= 2**21.")
-    if not 1 <= max_query_width <= MAX_QUERY_WIDTH or not (
-        1 <= copy_sfa_query_heads <= 64 or copy_sfa_query_heads == 128
-    ):
+    if not (1 <= copy_sfa_query_heads <= 64 or copy_sfa_query_heads == 128):
         raise ValueError("Invalid native LIM query geometry.")
     if (
         kv_dtype != torch.bfloat16
@@ -284,8 +282,7 @@ def resolve_sparse_kv_budget(
         != kv_head_num * (kv_lora_rank + qk_rope_head_dim) * kv_dtype.itemsize
     ):
         raise ValueError("Native LIM requires BF16 MLA KV storage.")
-    if not cache_tokens:
-        cache_tokens = get_sparse_kv_cache_tokens(cache_tokens, max_query_width, top_k)
+    cache_tokens = get_sparse_kv_cache_tokens(cache_tokens, max_query_width, top_k)
     if (
         cache_tokens < max_query_width * top_k
         or cache_tokens + page_size > MISS_CAPACITY
@@ -319,6 +316,8 @@ def get_sparse_kv_cache_tokens(
     configured_cache_tokens: int, max_query_width: int, top_k: int
 ) -> int:
     """Return the configured resident capacity or the default query union size."""
+    if not 1 <= max_query_width <= MAX_QUERY_WIDTH:
+        raise ValueError("Invalid native LIM query geometry.")
     return configured_cache_tokens or max_query_width * top_k
 
 
@@ -342,17 +341,17 @@ def get_sparse_kv_full_context_bytes_per_request(
     )
 
 
-def fit_pd_sparse_running_requests(
-    requested_rows: int,
+def fit_sparse_running_requests(
     available_bytes: int,
     *,
+    max_total_tokens: int | None,
     cache_tokens: int,
     context_len: int,
     num_layers: int,
     kv_bytes_per_token: int,
     index_k_and_draft_bytes_per_token: int,
 ) -> int:
-    """Return the P/D Decode concurrency that fits the full-context budget."""
+    """Fit full-context requests under the HBM and token limits."""
     slot_map_bytes_per_request = _slot_map_row_bytes(context_len, num_layers)
     bytes_per_request = get_sparse_kv_full_context_bytes_per_request(
         cache_tokens=cache_tokens,
@@ -363,9 +362,7 @@ def fit_pd_sparse_running_requests(
     )
     # The map includes the dummy resident row and one additional row.
     fixed_slot_map_bytes = (1 + _SLOT_MAP_EXTRA_ROWS) * slot_map_bytes_per_request
-    fitting_rows = min(
-        requested_rows, (available_bytes - fixed_slot_map_bytes) // bytes_per_request
-    )
+    fitting_rows = (available_bytes - fixed_slot_map_bytes) // bytes_per_request
     if fitting_rows < 1:
         raise RuntimeError(
             "Cannot fit one sparse KV resident row: "
@@ -373,4 +370,11 @@ def fit_pd_sparse_running_requests(
             f"slot-map rows, have {available_bytes} bytes "
             f"(C={cache_tokens}, context_len={context_len})."
         )
+    if max_total_tokens is not None:
+        fitting_rows = min(fitting_rows, max_total_tokens // context_len)
+        if fitting_rows < 1:
+            raise RuntimeError(
+                f"max_total_tokens={max_total_tokens} cannot fit one full sparse KV "
+                f"context of {context_len} tokens after page alignment."
+            )
     return fitting_rows

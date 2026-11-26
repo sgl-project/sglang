@@ -15,7 +15,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     BudgetPlan,
-    fit_pd_sparse_running_requests,
+    fit_sparse_running_requests,
     get_sparse_kv_cache_tokens,
     resolve_sparse_kv_budget,
 )
@@ -65,7 +65,10 @@ def is_sparsity_driven_kv_offload_enabled(
             "(for example DeepSeek V3.2 or GLM-5.x) using the Ascend MLA "
             "attention backend."
         )
-    if get_schedule().max_running_requests is None:
+    if get_schedule().max_running_requests is None and (
+        not use_fused_sparse_kv_offload()
+        or get_disagg().disaggregation_mode == "prefill"
+    ):
         raise ValueError(
             "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD requires max_running_requests "
             "to be set to bound the per-process host KV allocation."
@@ -213,21 +216,11 @@ def build_sparse_kv_budget_options(
     kv_dtype: torch.dtype,
     num_layers: int,
     attn_dp_size: int,
-    is_pd_decode_worker: bool,
 ) -> dict[str, Any]:
     """Resolve the initial sparse budget inputs for this worker."""
-    disagg = get_disagg()
-    extra_rows = (
-        disagg.disaggregation_decode_extra_slots or 0
-        if is_pd_decode_worker or disagg.enable_pd_role_switch
-        else 0
-    )
-    running_rows = max(1, get_schedule().max_running_requests // attn_dp_size)
-    request_rows = running_rows + extra_rows + 1
     return dict(
         model_config=model_config,
-        request_rows=request_rows,
-        resident_rows=running_rows + 1 if is_pd_decode_worker else request_rows,
+        attn_dp_size=attn_dp_size,
         context_len=model_config.context_len + get_req_to_token_extra_context_len(),
         top_k=get_sparsity_driven_kv_offload_sparse_context_len(
             model_config=model_config
@@ -243,18 +236,16 @@ def build_sparse_kv_budget_options(
 def get_sparse_kv_budget(
     *,
     model_config: ModelConfig,
-    request_rows: int,
     context_len: int,
     num_layers: int,
     top_k: int,
     kv_bytes_per_token: int,
+    available_bytes: int,
+    index_k_and_draft_bytes_per_token: int,
+    attn_dp_size: int = 1,
     graph_batch_capacity: Optional[int] = None,
-    resident_rows: Optional[int] = None,
     kv_dtype: torch.dtype = torch.bfloat16,
-    pd_available_bytes: int | None = None,
-    index_k_and_draft_bytes_per_token: int | None = None,
 ) -> BudgetPlan:
-    resident_rows = request_rows if resident_rows is None else resident_rows
     schedule = get_schedule()
     disagg = get_disagg()
     page_size = schedule.page_size
@@ -265,25 +256,30 @@ def get_sparse_kv_budget(
         max_query_width,
         top_k,
     )
-    prefill_rows = 0
-    if pd_available_bytes is not None:
-        if index_k_and_draft_bytes_per_token is None:
-            raise ValueError(
-                "P/D sparse KV sizing requires per-token bytes for Indexer K and any draft KV."
-            )
-        running_rows = fit_pd_sparse_running_requests(
-            resident_rows - 1,
-            pd_available_bytes,
-            cache_tokens=cache_tokens,
-            context_len=aligned_context,
-            num_layers=num_layers,
-            kv_bytes_per_token=kv_bytes_per_token,
-            index_k_and_draft_bytes_per_token=index_k_and_draft_bytes_per_token,
+    running_rows = fit_sparse_running_requests(
+        available_bytes,
+        max_total_tokens=schedule.max_total_tokens,
+        cache_tokens=cache_tokens,
+        context_len=aligned_context,
+        num_layers=num_layers,
+        kv_bytes_per_token=kv_bytes_per_token,
+        index_k_and_draft_bytes_per_token=index_k_and_draft_bytes_per_token,
+    )
+    if schedule.max_running_requests is not None:
+        running_rows = min(
+            running_rows, max(1, schedule.max_running_requests // attn_dp_size)
         )
-        extra_rows = request_rows - resident_rows
-        resident_rows = running_rows + 1
-        request_rows = resident_rows + extra_rows
-    elif disagg.disaggregation_mode != "decode":
+    extra_rows = (
+        disagg.disaggregation_decode_extra_slots or 0
+        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch
+        else 0
+    )
+    request_rows = running_rows + extra_rows + 1
+    resident_rows = (
+        running_rows + 1 if disagg.disaggregation_mode == "decode" else request_rows
+    )
+    prefill_rows = 0
+    if disagg.disaggregation_mode != "decode":
         prefill_rows = schedule.prefill_max_requests
         if prefill_rows is None:
             prefill_rows = 1

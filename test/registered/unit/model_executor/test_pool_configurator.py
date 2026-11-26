@@ -1191,7 +1191,8 @@ class TestEagleConfigurator(CustomTestCase):
             cfg = DefaultPoolConfigurator(mr)
             options = dict(
                 model_config=mr.model_config,
-                request_rows=3,
+                available_bytes=1 << 40,
+                index_k_and_draft_bytes_per_token=5 * 128 * 2 + 576 * 2,
                 context_len=8192 + get_req_to_token_extra_context_len(),
                 top_k=2048,
                 kv_bytes_per_token=576 * 2,
@@ -1202,15 +1203,15 @@ class TestEagleConfigurator(CustomTestCase):
             # target owns bounded residency; BF16 index keys have no scales.
             cell_size = 5 * 128 * 2 + 576 * 2
             self.assertEqual(cfg._cell_size, cell_size)
-            available = manager_bytes + unpadded.context_len * cell_size
+            available = manager_bytes + 2 * unpadded.context_len * cell_size
             sizes = cfg.calculate_pool_sizes(available, 128)
-            self.assertEqual(sizes.max_total_num_tokens, unpadded.context_len)
+            self.assertEqual(sizes.max_total_num_tokens, 2 * unpadded.context_len)
             self.assertEqual(mr.sparse_kv_budget_plan.managed_hbm_bytes, manager_bytes)
             self.assertEqual(
                 cfg.get_sparse_kv_hbm_sizing(
                     available, sizes.max_total_num_tokens
                 ).planned_bytes,
-                available,
+                manager_bytes + sizes.max_total_num_tokens * cell_size,
             )
 
             # With automatic C, charge the plan for query width times TopK.
@@ -1352,6 +1353,12 @@ class TestEagleConfigurator(CustomTestCase):
                     mock_sparse_budget.assert_called_once()
 
     def test_pd_sparse_best_effort_sets_the_running_limit(self):
+        self._check_sparse_running_limit("decode", 3)
+
+    def test_mixed_sparse_best_effort_sets_the_running_limit(self):
+        self._check_sparse_running_limit("null", 0)
+
+    def _check_sparse_running_limit(self, mode, extra_rows):
         from sglang.srt.environ import envs
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
             resolve_sparse_kv_budget,
@@ -1361,8 +1368,8 @@ class TestEagleConfigurator(CustomTestCase):
         )
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
-        page_size, token_limit = 128, 8192
-        max_running_requests, attn_dp_size, extra_rows = 8, 2, 3
+        page_size = 128
+        max_running_requests, attn_dp_size = 8, 2
         cache_tokens = 6144
         mr = _make_model_runner(
             self,
@@ -1370,7 +1377,7 @@ class TestEagleConfigurator(CustomTestCase):
             use_mla_backend=True,
             page_size=page_size,
             max_running_requests=max_running_requests,
-            disaggregation_mode="decode",
+            disaggregation_mode=mode,
             disaggregation_decode_extra_slots=extra_rows,
             speculative_algorithm="EAGLE",
             speculative_num_steps=2,
@@ -1392,11 +1399,15 @@ class TestEagleConfigurator(CustomTestCase):
         mr.resolve_max_num_reqs.side_effect = lambda tokens: (
             KVCacheConfigurator.resolve_max_num_reqs(mr, tokens)
         )
+        mr._req_pool_pre_alloc_size.side_effect = lambda: (
+            KVCacheConfigurator._req_pool_pre_alloc_size(mr)
+        )
 
         server_args = dict(
             attention_backend="ascend",
-            disaggregation_mode="decode",
+            disaggregation_mode=mode,
             disaggregation_transfer_backend="ascend",
+            prefill_max_requests=0,
             disaggregation_decode_extra_slots=extra_rows,
             page_size=page_size,
             max_running_requests=max_running_requests,
@@ -1407,9 +1418,7 @@ class TestEagleConfigurator(CustomTestCase):
             speculative_eagle_topk=1,
         )
         with (
-            get_context().override_server_args(
-                **server_args, max_total_tokens=token_limit
-            ),
+            get_context().override_server_args(**server_args, max_total_tokens=None),
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(cache_tokens),
@@ -1442,30 +1451,24 @@ class TestEagleConfigurator(CustomTestCase):
                 + slot_map_bytes_per_request
             )
 
-            # A cap that aligns to one page limits admission independently of residency.
-            token_limited_bs = page_size // 2
-            for available, cap, resident_bs, bs in (
-                (2 * request_bytes + fixed_slot_map_bytes - 1, None, 1, 1),
-                (2 * request_bytes + fixed_slot_map_bytes, None, 2, 2),
-                (3 * request_bytes + fixed_slot_map_bytes, token_limit, 3, 3),
-                (5 * request_bytes + fixed_slot_map_bytes, None, 4, 4),
+            # The tightest of HBM, complete contexts and the per-rank request limit wins.
+            for available, cap, bs in (
+                (2 * request_bytes + fixed_slot_map_bytes - 1, None, 1),
+                (2 * request_bytes + fixed_slot_map_bytes, None, 2),
+                (5 * request_bytes + fixed_slot_map_bytes, 3 * aligned_context_len, 3),
                 (
-                    (token_limited_bs + 1) * request_bytes + fixed_slot_map_bytes,
-                    page_size + 1,
-                    token_limited_bs + 1,
-                    token_limited_bs,
+                    5 * request_bytes + fixed_slot_map_bytes,
+                    3 * aligned_context_len - 1,
+                    2,
                 ),
+                (2 * request_bytes + fixed_slot_map_bytes, 5 * aligned_context_len, 2),
+                (5 * request_bytes + fixed_slot_map_bytes, None, 4),
             ):
                 with self.subTest(available=available, cap=cap):
                     mr.sparse_kv_budget_plan = None
                     mr._profile_available_bytes.return_value = available
                     with (
-                        get_schedule().override(
-                            max_total_tokens=cap,
-                            max_running_requests=max(
-                                max_running_requests, resident_bs * attn_dp_size
-                            ),
-                        ),
+                        get_schedule().override(max_total_tokens=cap),
                         patch(
                             "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.resolve_sparse_kv_budget",
                             wraps=resolve_sparse_kv_budget,
@@ -1494,40 +1497,43 @@ class TestEagleConfigurator(CustomTestCase):
                     self.assertEqual(
                         sizing.index_k_and_draft_bytes, index_k_and_draft_bytes
                     )
-                    self.assertEqual(plan.resident_rows, resident_bs + 1)
-                    self.assertEqual(plan.request_rows, resident_bs + extra_rows + 1)
+                    self.assertEqual(plan.resident_rows, bs + 1)
+                    self.assertEqual(plan.request_rows, bs + extra_rows + 1)
                     for name in ("device_k_buffer", "device_v_buffer"):
-                        self.assertEqual(
-                            plan.resident_buffers[name].shape[0], resident_bs + 1
-                        )
+                        self.assertEqual(plan.resident_buffers[name].shape[0], bs + 1)
                     self.assertEqual(
                         plan.resident_buffers["device_slot_map"].shape[0],
-                        resident_bs + 2,
+                        bs + 2,
                     )
                     self.assertEqual(
                         plan.slot_map_bytes,
-                        (resident_bs + 2) * slot_map_bytes_per_request,
+                        (bs + 2) * slot_map_bytes_per_request,
                     )
                     self.assertEqual(
-                        plan.resident_buffers["last_prefix"].shape[0], resident_bs + 2
+                        plan.resident_buffers["last_prefix"].shape[0], bs + 2
                     )
 
-            # The estimate includes two fixed slot-map rows in addition to the
-            # per-request rows.
-            for available, error in (
+            for available, cap, error in (
+                (
+                    5 * request_bytes + fixed_slot_map_bytes,
+                    aligned_context_len - 1,
+                    rf"max_total_tokens={aligned_context_len - 1}",
+                ),
                 (
                     request_bytes + fixed_slot_map_bytes - 1,
+                    None,
                     "one sparse KV resident row",
                 ),
-                (request_bytes + fixed_slot_map_bytes, "Not enough memory"),
+                (request_bytes + fixed_slot_map_bytes, None, "Not enough memory"),
             ):
-                with self.subTest(available=available):
+                with self.subTest(available=available, cap=cap):
                     mr.sparse_kv_budget_plan = None
                     mr._profile_available_bytes.return_value = available
-                    with self.assertRaisesRegex(RuntimeError, error):
-                        KVCacheConfigurator._resolve_memory_pool_config(
-                            mr, pre_model_load_memory=0
-                        )
+                    with get_schedule().override(max_total_tokens=cap):
+                        with self.assertRaisesRegex(RuntimeError, error):
+                            KVCacheConfigurator._resolve_memory_pool_config(
+                                mr, pre_model_load_memory=0
+                            )
                     self.assertIsNone(mr.sparse_kv_budget_plan)
 
     def test_eagle_does_not_exceed_budget(self):
