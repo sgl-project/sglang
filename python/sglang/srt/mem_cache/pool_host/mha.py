@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import logging
-import threading
 from typing import Sequence
 
 import torch
@@ -44,12 +42,9 @@ from sglang.srt.mem_cache.pool_host._kvcacheio import require_kvcacheio_ops
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
-    host_memory_preflight,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
-    _cuda_host_unregister,
-    get_allocator_from_storage,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -96,8 +91,6 @@ if _is_npu:
         TransferDirection,
         transfer_kv_dim_exchange,
     )
-
-logger = logging.getLogger(__name__)
 
 
 def prepare_mha_write_back_staging(
@@ -980,53 +973,37 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                     f"dtype={buffer.dtype}, expected {tuple(first.shape[1:])}, "
                     f"{first.dtype}"
                 )
-        self._destroyed = False
         if _is_xpu:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
             )
         self.device_k_buffers = buffer_info.buffers
         self._transfer_device = first.device
-        self.page_size = anchor_host.page_size
-        self.layout = layout
-        self.pin_memory = pin_memory
-        self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
-        # HostPoolGroup ANDs this over its pools; this pool skips HostKVCache.__init__
-        self.can_use_write_back_jit = False
         self.dtype = first.dtype
         self.head_num, self.head_dim = first.shape[1:]
         self.layer_num = len(self.device_k_buffers)
-        # PoolEntry maps model layers onto this compact host buffer axis.
-        self.start_layer = 0
-        self.end_layer = self.layer_num - 1
+        self.target_layer_num = self.layer_num
         self.element_dim = self.head_num * self.head_dim
         self.token_stride_size = self.element_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
-        self.size = anchor_host.size
-        self.page_num = anchor_host.page_num
-        self.size_per_token = self.get_size_per_token()
-
-        allocation_bytes, available_bytes = host_memory_preflight(
-            self.get_mapping_lengths(), self.allocator, self._transfer_device
+        super().__init__(
+            dtype=self.dtype,
+            device_capacity_tokens=anchor_host.device_capacity_tokens,
+            size_per_token=self.get_size_per_token(),
+            # PoolEntry maps model layers onto this compact host buffer axis.
+            start_layer=0,
+            end_layer=self.layer_num - 1,
+            host_to_device_ratio=0,
+            host_size=0,
+            host_token_capacity=anchor_host.size,
+            page_size=anchor_host.page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
+            pool_label="index_k",
         )
-        if allocation_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for MiniMax index-K hierarchical cache. "
-                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
-        logger.info(
-            "Allocating %.2f GB host memory for MiniMax sparse index-K (layout=%s).",
-            allocation_bytes / 1e9,
-            layout,
-        )
-
-        self.init_kv_buffer()
-        self.lock = threading.RLock()
-        self.clear()
-
         self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
             page_size=self.page_size, element_size=self.token_stride_size
         )
@@ -1035,6 +1012,16 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self._transfer_device,
         )
+
+    @property
+    def k_buffer(self):
+        return self.kv_buffer
+
+    def _allocate_host_buffer(self) -> None:
+        super()._allocate_host_buffer()
+        self._post_init_host_buffers()
+
+    def _post_init_host_buffers(self) -> None:
         if self.layout == "page_first":
             transposed = self.k_buffer.transpose(0, 1)
             self.k_data_refs = [transposed[i] for i in range(self.layer_num)]
@@ -1049,12 +1036,8 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         )
 
     def destroy(self):
-        if self._destroyed:
-            return
-        if self.pin_memory and (_is_cuda or _is_hip):
-            _cuda_host_unregister(self.k_buffer)
-        self.k_buffer = None
         self.k_data_refs = []
+        self.k_data_ptrs = None
         super().destroy()
 
     def get_size_per_token(self):
@@ -1079,7 +1062,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
-        self.k_buffer = alloc_func(
+        return alloc_func(
             dims,
             dtype=self.dtype,
             device=self.device,
