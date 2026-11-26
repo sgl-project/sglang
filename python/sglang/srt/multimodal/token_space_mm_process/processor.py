@@ -1,12 +1,15 @@
 import asyncio
+import concurrent.futures
 import functools
 import itertools
 import logging
 import random
+import threading
 
 import torch
 import transformers
 
+from sglang.srt.multimodal.cache import MultimodalPreprocessCache
 from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
@@ -24,6 +27,8 @@ from sglang.version import __version__ as sglang_version
 logger = logging.getLogger(__name__)
 
 _MODALITIES = (Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
+# What a joined request receives when the item's owner published nothing.
+_RELEASED = object()
 
 
 def _device_type(device):
@@ -93,6 +98,13 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         # The share of hits computed again and compared with the cache; 0 or None is off.
         self._item_feature_cache_check_rate = item_feature_cache_check_rate
         self._item_feature_cache_check_rng = random.Random()
+        # Single-flight: key -> (future, generation) of the request computing it. Kept
+        # here, not in the cache, so a disk cache or a plain dict shares work too.
+        self._item_feature_flights = {}
+        self._item_feature_flights_lock = threading.Lock()
+        self._item_feature_generation = 0
+        # Strong references: a computation outlives the request that started it.
+        self._item_feature_tasks = set()
         if processor_config is None:
             processor_config = MultimodalProcessorConfig()
         self._initialize_processor(
@@ -261,15 +273,10 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                     )
                 )
             )
-            if self.keep_mm_features_on_device:
-                # A hit is loaded on the CPU; misses stay on their modality's device.
-                for (modality, *_), features in zip(media_items, item_features):
-                    device = media_options[modality].get("device")
-                    if features is None or device is None:
-                        continue
-                    for name in self.FEATURE_NAMES:
-                        if isinstance(features.get(name), torch.Tensor):
-                            features[name] = features[name].to(device)
+            # A hit is loaded on the CPU; misses stay on their modality's device.
+            self._move_to_request_devices(
+                media_items, item_features, range(len(media_items)), media_options
+            )
             # A key that leaves out something the features depend on fails here, not in training.
             if self._item_feature_cache_check_rate:
                 checked = {
@@ -284,12 +291,276 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         missed = [
             index for index, features in enumerate(item_features) if features is None
         ]
-        missed_items = [media_items[index] for index in missed]
+        if self._item_feature_cache is None:
+            # No keys, so nothing to share: every request computes its own items.
+            computed = await self._compute_items(media_items, missed, request_options)
+            for index, features in zip(missed, computed):
+                item_features[index] = features
+            return item_features
+
+        copies, pending = {}, missed
+        # At least once: a request whose items all hit still goes through the loader.
+        while True:
+            claim = self._claim_item_features(item_keys, pending, checked)
+            compute, owned, joined, round_copies = claim[:4]
+            copies.update(round_copies)
+            computing = self._compute_and_publish(
+                media_items,
+                compute,
+                owned,
+                checked,
+                item_keys,
+                request_options,
+                *claim[4:],
+            )
+            if owned:
+                # Shielded: cancelling this request must not cancel work others joined.
+                # Others may join until it settles, so it runs to the end and is cached
+                # even if nobody did: unlike before, a cancelled request's items finish.
+                computing = asyncio.shield(
+                    self._create_item_feature_task(
+                        computing,
+                        functools.partial(
+                            self._release_item_feature_flights,
+                            item_keys,
+                            owned,
+                            claim[4],
+                        ),
+                    )
+                )
+            computed, *joined_features = await asyncio.gather(
+                computing,
+                *(self._wait_for_item_feature_flight(f) for f in joined.values()),
+            )
+            for index, features in zip(compute, computed):
+                item_features[index] = features
+            received, pending, checked = [], [], {}
+            for index, features in zip(joined, joined_features):
+                if features is _RELEASED:
+                    # Its owner published nothing (loading failed, or a sampled check
+                    # did): claim it again, to join a new owner or compute it here.
+                    pending.append(index)
+                    continue
+                # Each request gets its own dict; tensors are shared, as with a hit.
+                item_features[index] = dict(features)
+                received.append(index)
+            # Another request computed them on its own device: move them like hits.
+            self._move_to_request_devices(
+                media_items, item_features, received, media_options
+            )
+            if not pending:
+                break
+        for index, first in copies.items():
+            item_features[index] = dict(item_features[first])
+        return item_features
+
+    def _claim_item_features(self, item_keys, missed, checked):
+        """Split the missed items into those this request computes and those it waits for.
+
+        Returns the indices to compute (owned and checked), {index: future} owned,
+        {index: future} joined from another request, {index: first index} for a key
+        repeated in this request, the generation the claims belong to, and the in-memory
+        cache's generation (None for other maps) its writes are made against.
+        """
+        compute, owned, joined, copies, first_index = [], {}, {}, {}, {}
+        cache = self._item_feature_cache
+        cache_generation = (
+            cache.generation if isinstance(cache, MultimodalPreprocessCache) else None
+        )
+        with self._item_feature_flights_lock:
+            generation = self._item_feature_generation
+            for index in missed:
+                if index in checked:
+                    # A sampled hit is computed again to be compared, never shared.
+                    compute.append(index)
+                    continue
+                key = item_keys[index]
+                if key in first_index:
+                    # Waiting on its own claim would deadlock this request.
+                    copies[index] = first_index[key]
+                    continue
+                first_index[key] = index
+                flight = self._item_feature_flights.get(key)
+                if flight is not None and flight[1] == generation:
+                    joined[index] = flight[0]
+                    continue
+                future = concurrent.futures.Future()
+                self._item_feature_flights[key] = (future, generation)
+                owned[index] = future
+                compute.append(index)
+        return compute, owned, joined, copies, generation, cache_generation
+
+    async def _compute_and_publish(
+        self,
+        media_items,
+        compute,
+        owned,
+        checked,
+        item_keys,
+        request_options,
+        generation,
+        cache_generation,
+    ):
+        """Compute this request's items, then give each owned one to its joined requests.
+
+        The request fails as before: with its first failed item, else a failed sampled
+        check. A joined request gets only what belongs to its item: the features, or
+        that item's own error. If loading fails (for the whole request) or a sampled
+        check does (the key leaves something out), nothing is published or written:
+        the claims are released and joined requests claim the items again. Otherwise
+        each item that succeeded is published and written even if another failed:
+        unlike before, a failing request still caches its good items, as joined
+        requests may need them.
+        """
+        try:
+            results = await self._compute_items(
+                media_items, compute, request_options, return_exceptions=True
+            )
+        except BaseException:
+            self._release_item_feature_flights(item_keys, owned, generation)
+            raise
+        by_index = dict(zip(compute, results))
+        failures = [result for result in results if isinstance(result, BaseException)]
+        check_error = None
+        for index, cached in checked.items():
+            if isinstance(by_index[index], BaseException):
+                continue
+            try:
+                _check_cached_features(media_items[index], cached, by_index[index])
+            except RuntimeError as error:
+                check_error = error
+                break
+        if check_error is None:
+            self._publish_item_features(
+                owned, by_index, item_keys, generation, cache_generation
+            )
+        else:
+            self._release_item_feature_flights(item_keys, owned, generation)
+        if failures:
+            for failure in failures[1:]:
+                logger.warning("Another media item also failed", exc_info=failure)
+            raise failures[0]
+        if check_error is not None:
+            raise check_error
+        return results
+
+    def _publish_item_features(
+        self, owned, by_index, item_keys, generation, cache_generation
+    ):
+        loop = asyncio.get_running_loop()
+        for index, future in owned.items():
+            key, result = item_keys[index], by_index[index]
+            if isinstance(result, BaseException):
+                # The item's own error: every request that joined it asked for it too.
+                self._end_item_feature_flight(key, future, generation)
+                future.set_exception(result)
+                future.exception()  # retrieved, as no request may have joined it
+                continue
+            future.set_result(result)
+            # Written behind the request. The key stays in flight until the write lands,
+            # so a request arriving before then joins the result instead of recomputing.
+            loop.run_in_executor(
+                None,
+                self._write_item_features,
+                key,
+                result,
+                cache_generation,
+                future,
+                generation,
+            ).add_done_callback(_log_failed_write)
+
+    def _release_item_feature_flights(self, item_keys, owned, generation, *_):
+        """Settle every owned claim not yet settled with nothing to share.
+
+        Also the done callback of the computation's task, so claims are released
+        however it ends, even cancelled before its first step.
+        """
+        for index, future in owned.items():
+            if future.done():
+                continue
+            # Unregistered first, so a woken joiner that claims again cannot rejoin it.
+            self._end_item_feature_flight(item_keys[index], future, generation)
+            future.set_result(_RELEASED)
+
+    def _write_item_features(self, key, features, cache_generation, future, generation):
+        try:
+            if cache_generation is None:
+                # A disk cache or plain map: a flush never removes its entries and a
+                # key fixes its value, so a write begun before a flush is still
+                # correct. No lock is held across the write, which may be slow disk IO.
+                self._item_feature_cache[key] = features
+            else:
+                # In memory: the cache drops it, atomically under its own lock, if a
+                # flush came after this computation was claimed.
+                self._item_feature_cache.put(
+                    key, features, _generation=cache_generation
+                )
+        finally:
+            # Here, not in a loop callback, so it happens even if the loop is gone.
+            self._end_item_feature_flight(key, future, generation)
+
+    def _end_item_feature_flight(self, key, future, generation):
+        with self._item_feature_flights_lock:
+            if self._item_feature_flights.get(key) == (future, generation):
+                del self._item_feature_flights[key]
+
+    async def _wait_for_item_feature_flight(self, future):
+        """Wait for another request's computation; cancelling this request leaves it running."""
+        return await asyncio.shield(asyncio.wrap_future(future))
+
+    def _create_item_feature_task(self, coroutine, release):
+        task = asyncio.create_task(coroutine)
+        self._item_feature_tasks.add(task)
+        task.add_done_callback(self._item_feature_task_done)
+        task.add_done_callback(release)
+        return task
+
+    def _item_feature_task_done(self, task):
+        self._item_feature_tasks.discard(task)
+        # Retrieved: the request that started it may have been cancelled.
+        if not task.cancelled():
+            task.exception()
+
+    def reset_item_feature_flights(self):
+        """Start a new generation of computations, e.g. on a cache flush.
+
+        Later requests compute again instead of joining earlier computations. Those
+        still reach the requests that joined them; an in-memory cache drops their
+        writes by its own generation, and a disk cache, which a flush keeps, takes them.
+        """
+        with self._item_feature_flights_lock:
+            self._item_feature_generation += 1
+            self._item_feature_flights.clear()
+
+    def _move_to_request_devices(
+        self, media_items, item_features, indices, media_options
+    ):
+        """Move features computed elsewhere to this request's modality devices."""
+        if not self.keep_mm_features_on_device:
+            return
+        for index in indices:
+            features = item_features[index]
+            device = media_options[media_items[index][0]].get("device")
+            if features is None or device is None:
+                continue
+            for name in self.FEATURE_NAMES:
+                if isinstance(features.get(name), torch.Tensor):
+                    features[name] = features[name].to(device)
+
+    async def _compute_items(
+        self, media_items, indices, request_options, return_exceptions=False
+    ):
+        """Load and process the items at `indices`, returning their features in that order.
+
+        Loading fails for all of them at once; with `return_exceptions`, a processing
+        failure is returned in its item's place instead of raised.
+        """
+        items = [media_items[index] for index in indices]
         loaded = await self._load_media_lists(
             *(
                 [
                     source
-                    for item_modality, source, *_ in missed_items
+                    for item_modality, source, *_ in items
                     if item_modality == modality
                 ]
                 or None
@@ -303,28 +574,16 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         loaded_items = [
             (modality, item, preprocess_kwargs, item_kwargs)
             for (modality, _, preprocess_kwargs, item_kwargs), item in zip(
-                missed_items, itertools.chain.from_iterable(loaded)
+                items, itertools.chain.from_iterable(loaded)
             )
         ]
-        missed_features = await self._process_items(loaded_items, request_options)
-        for index, features in zip(missed, missed_features):
-            item_features[index] = features
-        for index, cached in checked.items():
-            _check_cached_features(media_items[index], cached, item_features[index])
-        if self._item_feature_cache is not None:
-            # Written behind the request: a reader that comes first misses and computes.
-            loop = asyncio.get_running_loop()
-            for index in missed:
-                if index not in checked:
-                    loop.run_in_executor(
-                        None,
-                        self._item_feature_cache.__setitem__,
-                        item_keys[index],
-                        item_features[index],
-                    ).add_done_callback(_log_failed_write)
-        return item_features
+        return await self._process_items(
+            loaded_items, request_options, return_exceptions=return_exceptions
+        )
 
-    async def _process_items(self, media_items, request_options):
+    async def _process_items(
+        self, media_items, request_options, return_exceptions=False
+    ):
         """One worker task per item; decoders are closed once every task has finished."""
         item_features = await asyncio.gather(
             *(
@@ -347,6 +606,8 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                     item.close()
                 except Exception:
                     logger.warning("Failed to close a video decoder", exc_info=True)
+        if return_exceptions:
+            return item_features
         failures = [f for f in item_features if isinstance(f, BaseException)]
         if failures:
             for failure in failures[1:]:
