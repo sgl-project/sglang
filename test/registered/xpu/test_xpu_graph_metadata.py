@@ -10,7 +10,11 @@ from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import 
     _allocate_output_buffer,
     _copy_output_to_buffer,
 )
-from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+from sglang.srt.layers.attention.xpu_backend import (
+    XPUAttentionBackend,
+    _decode_layer_shapes,
+)
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -301,6 +305,55 @@ class TestXPUGraphMetadata(CustomTestCase):
         )
         self.assertEqual(m.max_seq_len_k, override_max_context)
 
+        backend.dcp_size = 1
+        backend.topk = 1
+        backend.use_mla = False
+        backend.num_splits = 0
+        backend.is_encoder_decoder = False
+        backend.bidirectional_block_ids = None
+        backend.bidirectional_sliding_layers_only = False
+        k_cache = torch.zeros((4, page_size, 1, 16))
+        v_cache = torch.zeros((4, page_size, 1, 16))
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(
+                read=lambda layer_id: SimpleNamespace(kv=lambda: (k_cache, v_cache))
+            )
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            sliding_window_size=-1,
+            is_cross_attention=False,
+            attn_type=None,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            tp_q_head_num=1,
+            head_dim=16,
+            v_head_dim=16,
+            scaling=0.25,
+            logit_cap=0.0,
+        )
+        forward_batch.forward_mode = SimpleNamespace(is_target_verify=lambda: False)
+        forward_batch._attn_output = None
+        captured = {}
+
+        def fake_fa(**kwargs):
+            captured.update(kwargs)
+            return torch.zeros((32, 1, 16))
+
+        with patch(
+            "sglang.srt.layers.attention.xpu_backend.flash_attn_with_kvcache",
+            side_effect=fake_fa,
+        ):
+            backend.forward_extend(
+                q=torch.zeros((32, 16)),
+                k=None,
+                v=None,
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=False,
+            )
+        self.assertEqual(captured["max_seqlen_k"], override_max_context)
+
     def test_xpu_attention_backend_max_context_capabilities(self):
         """Verify that XPUAttentionBackend declares prefill max context capability,
         while keeping chunked-prefix FullCG disabled (as XPU uses plain EXTEND full graph).
@@ -363,7 +416,6 @@ class TestXPUGraphMetadata(CustomTestCase):
         ):
             for variant, expected in (
                 ("short", 2048),
-                ("medium", 16384),
                 ("long", 32768),
                 (None, 32768),
             ):
@@ -375,6 +427,15 @@ class TestXPUGraphMetadata(CustomTestCase):
                         make_batch([1, 1]), in_capture=True
                     )
                     self.assertEqual(backend.forward_metadata.max_seq_len_k, expected)
+
+            with patch(
+                "sglang.srt.model_executor.runner_utils.capture_mode.get_capture_attention_variant",
+                return_value="unknown_tier",
+            ):
+                with self.assertRaises(ValueError):
+                    backend._init_full_cg_decode_metadata(
+                        make_batch([1, 1]), in_capture=True
+                    )
 
             backend._init_full_cg_decode_metadata(
                 make_batch([128, 64]), in_capture=False
@@ -389,48 +450,30 @@ class TestXPUGraphMetadata(CustomTestCase):
         backend.is_encoder_decoder = False
 
         # 1. Short context (<= 4096): single default tier (None returned -> 1 graph)
-        backend.max_context_len = 2048
+        backend.max_context_len = 4096
         self.assertIsNone(backend.get_decode_graph_variants(ForwardMode.DECODE, 1))
 
-        # 2. Medium context (8192): short and long tiers
-        backend.max_context_len = 8192
-        variants_med = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
-        self.assertIsNotNone(variants_med)
-        self.assertEqual(variants_med.capture_labels, ("short", "long"))
-        self.assertEqual(variants_med.graph_limits, (("short", 4096),))
-        self.assertEqual(variants_med.fallback_label, "long")
-
-        # 3. Large context (32768): short, medium, long tiers
+        # 2. Long context (> 4096): 2-tier short (<= 32 * page_size) and long (fallback)
         backend.max_context_len = 32768
         variants_large = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
         self.assertIsNotNone(variants_large)
-        self.assertEqual(variants_large.capture_labels, ("short", "medium", "long"))
-        self.assertEqual(
-            variants_large.graph_limits, (("short", 4096), ("medium", 16384))
-        )
+        self.assertEqual(variants_large.capture_labels, ("short", "long"))
+        self.assertEqual(variants_large.graph_limits, (("short", 4096),))
         self.assertEqual(variants_large.fallback_label, "long")
 
-        # 4. Selection based on seq_lens_cpu
-        fb_short = SimpleNamespace(seq_lens_cpu=torch.tensor([512], dtype=torch.int32))
+        # 3. Selection based on seq_lens_cpu across the 4096 boundary
+        fb_short = SimpleNamespace(seq_lens_cpu=torch.tensor([4096], dtype=torch.int32))
         self.assertEqual(variants_large.select(fb_short), "short")
-        fb_med = SimpleNamespace(seq_lens_cpu=torch.tensor([8192], dtype=torch.int32))
-        self.assertEqual(variants_large.select(fb_med), "medium")
-        fb_long = SimpleNamespace(seq_lens_cpu=torch.tensor([24000], dtype=torch.int32))
+        fb_long = SimpleNamespace(seq_lens_cpu=torch.tensor([4097], dtype=torch.int32))
         self.assertEqual(variants_large.select(fb_long), "long")
 
-        # 5. Large page size avoids duplicate/descending medium tier; encoder-decoder opts out.
-        backend.page_size = 512
-        variants_large_page = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
-        self.assertEqual(variants_large_page.capture_labels, ("short", "long"))
-        self.assertEqual(variants_large_page.graph_limits, (("short", 16384),))
-
+        # 4. page_size = 64 -> split_threshold = 32 * 64 = 2048
         backend.page_size = 64
         variants_small_page = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
-        self.assertEqual(
-            variants_small_page.graph_limits, (("short", 2048), ("medium", 16384))
-        )
+        self.assertEqual(variants_small_page.capture_labels, ("short", "long"))
+        self.assertEqual(variants_small_page.graph_limits, (("short", 2048),))
 
-        # 6. MLA, encoder-decoder, and fixed num_splits (1 or >1) opt out of tiers.
+        # 5. MLA, encoder-decoder, and fixed num_splits (1 or >1) opt out of tiers.
         backend.use_mla = True
         backend.page_size = 128
         backend.max_context_len = 32768
@@ -446,6 +489,73 @@ class TestXPUGraphMetadata(CustomTestCase):
         backend.num_splits = 4
         self.assertIsNone(backend.get_decode_graph_variants(ForwardMode.DECODE, 1))
         backend.num_splits = 0
+
+        # 6. Pure head_size_v >= 512 opts out of 32-page tiering.
+        backend._decode_layer_shapes = ((512, -1),)
+        self.assertIsNone(backend.get_decode_graph_variants(ForwardMode.DECODE, 1))
+        backend._decode_layer_shapes = ((256, -1),)
+        self.assertIsNotNone(backend.get_decode_graph_variants(ForwardMode.DECODE, 1))
+
+        # 7. _decode_layer_shapes inspects RadixAttention layers (v_head_dim & SWA).
+        class DummyHybridModel(torch.nn.Module):
+            def __init__(
+                self, full_v_dim: int, swa_window: int = 1023, full_window: int = -1
+            ):
+                super().__init__()
+                self.swa = RadixAttention(
+                    num_heads=8,
+                    head_dim=256,
+                    scaling=1.0,
+                    num_kv_heads=2,
+                    layer_id=0,
+                    sliding_window_size=swa_window,
+                )
+                self.full = RadixAttention(
+                    num_heads=8,
+                    head_dim=512 if full_v_dim == 512 else 192,
+                    v_head_dim=full_v_dim,
+                    scaling=1.0,
+                    num_kv_heads=1,
+                    layer_id=1,
+                    sliding_window_size=full_window,
+                )
+
+        # Gemma 4-style hybrid (SWA d_v=256/win=1023 + Full d_v=512/win=-1):
+        # SWA layers already stay <= 1024 (<= 4096) and Full layers have d_v=512 -> opts out!
+        backend.max_context_len = 262144
+        backend._decode_layer_shapes = _decode_layer_shapes(
+            SimpleNamespace(model=DummyHybridModel(full_v_dim=512, swa_window=1023))
+        )
+        self.assertIsNone(backend.get_decode_graph_variants(ForwardMode.DECODE, 1))
+
+        # Hybrid where SWA window (8192) > 4096 with d_v=256 -> SWA layers benefit from 'short'!
+        backend._decode_layer_shapes = _decode_layer_shapes(
+            SimpleNamespace(model=DummyHybridModel(full_v_dim=512, swa_window=8191))
+        )
+        self.assertEqual(
+            backend.get_decode_graph_variants(ForwardMode.DECODE, 1).graph_limits,
+            (("short", 4096),),
+        )
+
+        # Asymmetric KV (head_dim=192, v_head_dim=128) -> uses v_head_dim (128 < 512) -> enabled
+        backend.max_context_len = 32768
+        backend._decode_layer_shapes = _decode_layer_shapes(
+            SimpleNamespace(model=DummyHybridModel(full_v_dim=128))
+        )
+        self.assertEqual(
+            backend.get_decode_graph_variants(ForwardMode.DECODE, 1).graph_limits,
+            (("short", 4096),),
+        )
+
+        # All-SWA model with window=1024 <= 32 * 128 -> opts out
+        backend._decode_layer_shapes = _decode_layer_shapes(
+            SimpleNamespace(
+                model=DummyHybridModel(
+                    full_v_dim=256, swa_window=1023, full_window=1023
+                )
+            )
+        )
+        self.assertIsNone(backend.get_decode_graph_variants(ForwardMode.DECODE, 1))
 
     def test_forward_decode_passes_int_max_seqlen_k_when_zero(self):
         backend = XPUAttentionBackend.__new__(XPUAttentionBackend)

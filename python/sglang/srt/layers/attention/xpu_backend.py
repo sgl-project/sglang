@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.local_attention import (
     make_local_attention_virtual_batches,
 )
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
-from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -36,7 +36,6 @@ from sglang.srt.runtime_context import (
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import (
@@ -147,34 +146,67 @@ def _check_page_size_1_graph_compat(*, use_mla: bool, graphs_disabled: bool) -> 
         )
 
 
+def _decode_layer_shapes(model_runner: ModelRunner) -> tuple[tuple[int, int], ...]:
+    """Return unique (v_head_dim, sliding_window_size) pairs across decoder layers."""
+    model = getattr(model_runner, "model", None)
+    if isinstance(model, torch.nn.Module):
+        shapes = {
+            (
+                m.v_head_dim,
+                -1 if m.sliding_window_size is None else m.sliding_window_size,
+            )
+            for m in model.modules()
+            if isinstance(m, RadixAttention)
+            and not m.is_cross_attention
+            and m.attn_type == AttentionType.DECODER
+        }
+        if shapes:
+            return tuple(sorted(shapes))
+
+    mc = model_runner.model_config
+    v_dim = getattr(mc, "v_head_dim", None) or getattr(mc, "head_dim", 0) or 0
+    sw = getattr(model_runner, "sliding_window_size", None)
+    sw_val = -1 if sw is None else sw
+    if getattr(model_runner, "is_hybrid_swa", False):
+        swa_v_dim = (
+            getattr(mc, "swa_v_head_dim", None)
+            or getattr(mc, "swa_head_dim", 0)
+            or v_dim
+        )
+        return ((v_dim, -1), (swa_v_dim, sw_val))
+    return ((v_dim, sw_val),)
+
+
 def _decode_context_tier_limits(
-    max_context_len: int, page_size: int
+    max_context_len: int,
+    page_size: int,
+    layer_shapes: tuple[tuple[int, int], ...] = ((0, -1),),
 ) -> tuple[tuple[str, int], ...]:
     """Return ascending (label, max_seq_len_k) tiers before the 'long' fallback.
 
-    According to the XPU FlashAttention kernel:
-    - effective_blocks <= 32: non-split single-workgroup execution (num_splits = 1).
-    - effective_blocks > 32: split-KV multi-workgroup execution (num_splits > 1).
+    Mirrors the XPU FlashAttention decode split heuristic (flash_attentionXe20.cpp):
+    - effective_blocks <= 32 and head_size_v < 512: single-stage FmhaDecodeRunner
+      (num_splits = 1).
+    - effective_blocks > 32: two-stage FmhaSplitDecodeRunner + ReduceSplitK
+      (num_splits = min(num_splits, parallel_), already saturated past 32 blocks).
 
-    TODO(XPU): Encapsulate kernel split heuristics and thresholds inside
-    sgl-kernel-xpu and query via an API instead of hardcoding fallback thresholds here.
+    Captures a 'short' tier at 32 * page_size iff at least one decoder layer with
+    v_head_dim < 512 has an effective context bound exceeding 32 * page_size.
 
-    If max_context <= 32 * page_size:
-      A single default variant covers the entire model context without split overhead.
-    If max_context <= 16384:
-      2 tiers: short (<= 32 * page_size) and long (fallback up to max_context).
-    If max_context > 16384:
-      3 tiers: short (<= 32 * page_size), medium (<= 16384), and long (fallback up to max_context).
+    TODO(XPU): Sink per-architecture split heuristics into sgl-kernel-xpu and
+    query tier limits via a kernel API instead of duplicating rules here.
     """
-    split_threshold = 32 * page_size
-    if max_context_len <= split_threshold:
-        return ()
+    min_blocks_to_split = 32
+    always_split_head_size_v = 512
+    split_threshold = min_blocks_to_split * page_size
 
-    limits = [("short", split_threshold)]
-    medium_limit = 16384
-    if split_threshold < medium_limit and max_context_len > medium_limit:
-        limits.append(("medium", medium_limit))
-    return tuple(limits)
+    has_splittable_layer = any(
+        v_head_dim < always_split_head_size_v
+        and (min(max_context_len, sw + 1) if sw >= 0 else max_context_len)
+        > split_threshold
+        for v_head_dim, sw in layer_shapes
+    )
+    return (("short", split_threshold),) if has_splittable_layer else ()
 
 
 class XPUAttentionBackend(AttentionBackend):
@@ -226,6 +258,7 @@ class XPUAttentionBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self._decode_layer_shapes = _decode_layer_shapes(model_runner)
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         self._full_cg_prefill_context_len: Optional[int] = None
@@ -894,12 +927,14 @@ class XPUAttentionBackend(AttentionBackend):
             cu_seqlens_q = local_metadata.local_query_start_loc
             cache_seqlens = local_metadata.local_seqused_k
             max_seqlen_q = local_metadata.local_max_query_len
+            max_seqlen_k = int(getattr(local_metadata, "local_max_seq_len", 0) or 0)
         elif is_hybrid_swa and metadata.swa_spec_metadata is not None:
             swa_spec_metadata = metadata.swa_spec_metadata
             page_table = swa_spec_metadata.page_table
             cu_seqlens_q = swa_spec_metadata.cu_seqlens_q
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
+            max_seqlen_k = int(getattr(swa_spec_metadata, "max_seq_len_k", 0) or 0)
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
         else:
             page_table = metadata.page_table
@@ -913,6 +948,7 @@ class XPUAttentionBackend(AttentionBackend):
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
+            max_seqlen_k = int(getattr(metadata, "max_seq_len_k", 0) or 0)
             cu_seqlens_k = metadata.cu_seqlens_k
 
         # Use Flash Attention for prefill
@@ -950,6 +986,7 @@ class XPUAttentionBackend(AttentionBackend):
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
+                max_seqlen_k = int(getattr(metadata, "encoder_max_seq_len_k", 0) or 0)
                 window_size = (-1, -1)
 
             # Gemma-3 multimodal: prepare_attn_masks set bidirectional_block_ids (per
@@ -992,6 +1029,7 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k_new=None,
                 max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
                 softmax_scale=layer.scaling,
                 causal=causal_arg,
                 window_size=window_size,
@@ -1728,25 +1766,17 @@ class XPUAttentionBackend(AttentionBackend):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
+    def _get_decode_tier_limits(self) -> tuple[tuple[str, int], ...]:
+        return _decode_context_tier_limits(
+            self.max_context_len,
+            self.page_size,
+            getattr(self, "_decode_layer_shapes", ((0, -1),)),
+        )
+
     def get_decode_graph_variants(
         self, capture_forward_mode: ForwardMode, captured_req_width: int
     ) -> Optional[SeqLenBucketGraphVariants]:
-        """XPU context-aware graph variants derived from FlashAttention kernel split rules.
-
-        According to the XPU FlashAttention kernel:
-        - effective_blocks <= 32: non-split single-workgroup execution (num_splits = 1).
-        - effective_blocks > 32: split-KV multi-workgroup execution (num_splits > 1).
-
-        TODO(XPU): Encapsulate kernel split heuristics and thresholds inside
-        sgl-kernel-xpu and query via an API instead of hardcoding here.
-
-        If max_context <= 32 * page_size:
-          A single default variant covers the entire model context without split overhead.
-        If max_context <= 16384:
-          2 tiers: short (<= 32 * page_size) and long (fallback up to max_context).
-        If max_context > 16384:
-          3 tiers: short (<= 32 * page_size), medium (<= 16384), and long (fallback up to max_context).
-        """
+        """XPU context-aware decode graph variants aligned with FlashAttention split rules."""
         # MLA decode currently pins num_kv_splits=1 (matching eager),
         # encoder-decoder graphs are disabled, and non-zero num_splits bypasses
         # kernel split heuristics; in all these cases multi-tier graphs are skipped.
@@ -1759,7 +1789,7 @@ class XPUAttentionBackend(AttentionBackend):
         ):
             return None
 
-        limits = _decode_context_tier_limits(self.max_context_len, self.page_size)
+        limits = self._get_decode_tier_limits()
         if not limits:
             return None
         return SeqLenBucketGraphVariants(
@@ -2003,17 +2033,10 @@ class XPUAttentionBackend(AttentionBackend):
             )
 
             variant = get_capture_attention_variant()
-            tier_dict = dict(
-                _decode_context_tier_limits(self.max_context_len, self.page_size)
-            )
+            tier_dict = dict(self._get_decode_tier_limits())
+            if variant is not None and variant != "long" and variant not in tier_dict:
+                raise ValueError(f"Unknown XPU decode graph variant {variant!r}")
             metadata.max_seq_len_k = tier_dict.get(variant, self.max_context_len)
-            if (
-                metadata.local_attn_metadata is not None
-                and self.attention_chunk_size is not None
-            ):
-                metadata.local_attn_metadata.local_max_seq_len = min(
-                    self.attention_chunk_size, metadata.max_seq_len_k
-                )
 
         self.forward_metadata = metadata
 
