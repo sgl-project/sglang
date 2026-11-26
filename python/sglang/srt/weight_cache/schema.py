@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import msgspec
 
@@ -86,7 +86,13 @@ class StorageMeta(msgspec.Struct, frozen=True, kw_only=True):
     """One allocation of the owner's model, moved as raw bytes."""
 
     nbytes: int
-    device: str  # "cuda" or "cpu"
+    device: str  # device kind: "cuda", "xpu", "npu" or "cpu"
+    # The GPU that holds the owner's copy; a reader maps it only from that GPU.
+    device_uuid: Optional[str] = None
+    # A reader may map "shared_ro" storages read-only; it copies "private" ones.
+    sharing: Literal["shared_ro", "private"] = "private"
+    # Content digest a copying transport checks after fetch; None if not computed.
+    digest: Optional[str] = None
 
 
 class SnapshotManifest(msgspec.Struct, frozen=True, kw_only=True):

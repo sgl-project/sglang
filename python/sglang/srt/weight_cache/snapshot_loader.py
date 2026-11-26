@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Snapshot loading: the order every snapshot source follows (sgl-project/sglang#50943).
 
-Owners and readers first call pre_load_check to identify the load, look up a
-snapshot, preflight any hit and vote. A reader with a hit fetches, installs and
-validates it. Every prepared load votes on its result. An owner that loaded
-from a checkpoint can then export and publish it under the prepared identity.
+Owners and readers first call pre_load_check to identify the load, check that it
+may use a snapshot, look up a snapshot, preflight any hit and vote. A reader with
+a hit fetches, installs and validates it. Every prepared load votes on its
+result. An owner that loaded from a checkpoint can then export and publish it
+under the prepared identity.
 """
 
 from __future__ import annotations
@@ -12,10 +13,11 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import logging
+import time
 import uuid
 import weakref
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union
 
 import msgspec
 import torch
@@ -31,6 +33,7 @@ from sglang.srt.model_loader.loader import (
     require_checkpoint_loader,
 )
 from sglang.srt.model_loader.utils import on_model_constructed, set_default_torch_dtype
+from sglang.srt.platforms import current_platform
 from sglang.srt.weight_cache import load_diff, validator
 from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.coordinator import Ballot, vote
@@ -74,6 +77,34 @@ class _PreflightDeviceGuard(TorchFunctionMode):
         return func(*args, **kwargs)
 
 
+# Quantization methods a snapshot may carry. Add one only with its raw-load
+# parity record (roadmap E2).
+_SNAPSHOT_QUANT_METHODS = frozenset({""})  # unquantized
+
+
+def snapshot_support(spec: LoadSpec) -> Optional[str]:
+    """None if this load may use a snapshot, else why every rank loads raw."""
+    if spec.quant_method not in _SNAPSHOT_QUANT_METHODS:
+        return f"no snapshot parity record for quantization {spec.quant_method!r}"
+    if spec.enable_eplb:
+        return "EPLB rewrites expert weights in place"
+    return None
+
+
+class Found(NamedTuple):
+    """The source has this rank's snapshot."""
+
+    manifest: SnapshotManifest
+    transport: WeightTransport
+
+
+@dataclasses.dataclass(frozen=True)
+class Pending:
+    """The owner is still publishing; ask again after ``retry_after`` seconds."""
+
+    retry_after: float
+
+
 def _vote_or_close(
     *, loader: BaseModelLoader, group: Optional[GroupCoordinator], ballot: Ballot
 ) -> None:
@@ -109,7 +140,11 @@ def pre_load_check(
             device=device_config.device,
             draft_model_idx=loader.load_config.draft_model_idx,
         )
-        manifest = loader.lookup(spec=spec, device_config=device_config)
+        raw_only = snapshot_support(spec)
+        if raw_only is None:
+            manifest = loader.lookup(spec=spec, device_config=device_config)
+        else:
+            loader.close()  # drop any earlier lookup: every rank loads raw
         if manifest is not None:
             if manifest.spec_digest != spec.digest():
                 raise ValueError(
@@ -125,6 +160,7 @@ def pre_load_check(
     _vote_or_close(loader=loader, group=group, ballot=Ballot(error=error, agree=agree))
     if error is None and isinstance(loader, SnapshotLoader):
         loader._prepared_spec = spec
+        loader._publish_rejection = raw_only  # a raw-only owner cannot publish
         loader._prepared_group = group
         loader._ready_for_load = True
     return manifest
@@ -134,6 +170,7 @@ class Exported(msgspec.Struct, frozen=True, kw_only=True):
     """What one owner rank prepared to publish; it holds no reference to the model."""
 
     storages: dict[str, torch.Tensor]
+    shared: frozenset[str] = frozenset()  # storages that back an nn.Parameter
     spec: Optional[LoadSpec] = None
     load_diff: bytes = b""
     attestation: bytes = b""
@@ -149,9 +186,16 @@ class SnapshotLoader(BaseModelLoader):
     loading from a supported checkpoint format. One object serves one load.
     """
 
-    def __init__(self, load_config: LoadConfig, *, owner: bool = False):
+    def __init__(
+        self,
+        load_config: LoadConfig,
+        *,
+        owner: bool = False,
+        max_pending_wait: float = 300.0,
+    ):
         super().__init__(load_config)
         self._owner = owner
+        self._max_pending_wait = max_pending_wait  # seconds lookup waits on Pending
         self._prepared_spec: Optional[LoadSpec] = None
         self._prepared_group: Optional[GroupCoordinator] = None
         self._ready_for_load = False
@@ -161,16 +205,19 @@ class SnapshotLoader(BaseModelLoader):
         self._constructed: Optional[
             tuple[weakref.ReferenceType[nn.Module], tuple[Any, Any]]
         ] = None
-        self._checkpoint_rejection: Optional[str] = None
+        self._publish_rejection: Optional[str] = None
 
     @abstractmethod
     def _find(
         self, *, tag: str, group_tag: str, device_config: DeviceConfig
-    ) -> Optional[tuple[SnapshotManifest, WeightTransport]]:
+    ) -> Optional[Union[Found, Pending]]:
         """Find this rank's manifest and transport under ``tag``.
 
-        Return only the version selected by the shared commit marker under
-        ``group_tag``. This is read-only and must finish within a bounded time.
+        Return None if absent (every rank loads raw), Pending while the owner is
+        still publishing, and raise if the source cannot serve this load (every
+        rank stops; none loads raw). Return only the version selected by the
+        shared commit marker under ``group_tag``. This is read-only and must
+        finish within a bounded time.
         """
 
     @abstractmethod
@@ -197,11 +244,20 @@ class SnapshotLoader(BaseModelLoader):
         self, *, spec: LoadSpec, device_config: DeviceConfig
     ) -> Optional[SnapshotManifest]:
         self.close()
-        found = self._find(
-            tag=spec.digest(),
-            group_tag=spec.digest(include_rank=False),
-            device_config=device_config,
-        )
+        tag, group_tag = spec.digest(), spec.digest(include_rank=False)
+        deadline = time.monotonic() + self._max_pending_wait
+        while isinstance(
+            found := self._find(
+                tag=tag, group_tag=group_tag, device_config=device_config
+            ),
+            Pending,
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"The owner did not publish within {self._max_pending_wait:g} s"
+                )
+            time.sleep(min(found.retry_after, remaining))
         if found is not None:
             self._manifest, self._transport = found
         return self._manifest
@@ -234,7 +290,7 @@ class SnapshotLoader(BaseModelLoader):
         self._prepared_snapshot = None
         self._ready_for_load = False
         self._constructed = None
-        self._checkpoint_rejection = None
+        self._publish_rejection = None
         transport, self._transport = self._transport, None
         self._manifest = None
         if transport is not None:
@@ -252,8 +308,8 @@ class SnapshotLoader(BaseModelLoader):
         try:
             if self._prepared_spec is None:
                 raise RuntimeError("Run pre_load_check before the owner's raw load")
-            if self._checkpoint_rejection is not None:
-                raise ValueError(self._checkpoint_rejection)
+            if self._publish_rejection is not None:
+                raise ValueError(self._publish_rejection)
             if constructed is None or constructed[0]() is not model:
                 raise RuntimeError(
                     "Only a model that this owner loaded directly from a checkpoint can publish"
@@ -265,8 +321,14 @@ class SnapshotLoader(BaseModelLoader):
             )
         except Exception as e:  # voted on in publish_snapshot, so no rank waits
             return Exported(storages={}, error=repr(e))
+        params = {p.untyped_storage().data_ptr() for p in model.parameters()}
         return Exported(
             storages=storages,
+            shared=frozenset(
+                name
+                for name, t in storages.items()
+                if t.untyped_storage().data_ptr() in params
+            ),
             spec=self._prepared_spec,
             load_diff=payload,
             attestation=attestation,
@@ -310,7 +372,16 @@ class SnapshotLoader(BaseModelLoader):
                     payload += uuid.uuid4().bytes
                 # A transport may consume these storages even if it fails partway.
                 storages_meta = {
-                    name: StorageMeta(nbytes=t.nbytes, device=t.device.type)
+                    name: StorageMeta(
+                        nbytes=t.nbytes,
+                        device=t.device.type,
+                        device_uuid=(
+                            None
+                            if t.device.type == "cpu"
+                            else current_platform.get_device_uuid(t.device.index)
+                        ),
+                        sharing="shared_ro" if name in exported.shared else "private",
+                    )
                     for name, t in exported.storages.items()
                 }
                 source = transport.publish(storages=exported.storages)
@@ -428,7 +499,6 @@ class SnapshotLoader(BaseModelLoader):
         self, *, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
         self._constructed = None
-        self._checkpoint_rejection = None
         raw_config = dataclasses.replace(
             self.load_config,
             load_format=self.load_config.fallback_load_format,
@@ -437,12 +507,12 @@ class SnapshotLoader(BaseModelLoader):
         loader = get_model_loader(raw_config, model_config)
         if isinstance(loader, SnapshotLoader):
             raise ValueError(f"{raw_config.load_format} is not a raw load format")
-        if self._owner:
+        if self._owner and self._publish_rejection is None:
             try:
                 require_checkpoint_loader(loader)
             except ValueError as e:
-                self._checkpoint_rejection = str(e)
-        if not self._owner or self._checkpoint_rejection is not None:
+                self._publish_rejection = str(e)
+        if not self._owner or self._publish_rejection is not None:
             return loader.load_model(
                 model_config=model_config, device_config=device_config
             ).eval()

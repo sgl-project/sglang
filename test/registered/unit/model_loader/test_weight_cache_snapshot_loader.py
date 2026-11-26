@@ -111,9 +111,16 @@ class _MemoryTransport(WeightTransport):
 
 class _Source(snapshot_loader.SnapshotLoader):
     def __init__(
-        self, load_config, found=None, owner=False, *, staged=None, commits=None
+        self,
+        load_config,
+        found=None,
+        owner=False,
+        *,
+        staged=None,
+        commits=None,
+        max_pending_wait=300.0,
     ):
-        super().__init__(load_config, owner=owner)
+        super().__init__(load_config, owner=owner, max_pending_wait=max_pending_wait)
         self.found = found
         self.staged = {} if staged is None else staged
         self.commits = {} if commits is None else commits
@@ -148,13 +155,16 @@ def _load_tiny_model(loader, *, model_config, device_config):
     return model
 
 
-def _spec_digest(tp_rank=0, tp_size=2):
-    """The digest of the LoadSpec that _pre_load builds on rank ``tp_rank``."""
+def _spec(tp_rank=0, tp_size=2):
+    """The LoadSpec that _pre_load builds on rank ``tp_rank``."""
     with _topology(tp_rank, tp_size):
-        spec = build_load_spec(
+        return build_load_spec(
             _model_config(), checkpoint_id="rev1", device=_CPU.device
         )
-    return spec.digest()
+
+
+def _spec_digest(tp_rank=0, tp_size=2):
+    return _spec(tp_rank, tp_size).digest()
 
 
 def _manifest(*, tp_rank=0, version="v1", storages=None):
@@ -282,7 +292,8 @@ class TestSnapshotLoader(CustomTestCase):
         self.assertFalse(model.training)
         self.assertEqual(transport.published["proj"].numel(), 16)
         self.assertEqual(
-            manifest.storages, {"proj": StorageMeta(nbytes=16, device="cpu")}
+            manifest.storages,
+            {"proj": StorageMeta(nbytes=16, device="cpu", sharing="shared_ro")},
         )
         self.assertEqual(list(source.staged.values()), [(manifest, transport)])
         self.assertEqual(list(source.commits.values()), [manifest.version])
@@ -670,6 +681,103 @@ class TestSnapshotLoader(CustomTestCase):
         find.assert_not_called()
         self.assertEqual(len(vote.calls), 1)
         self.assertIn("checkpoint", vote.calls[0].error)
+
+    def test_only_parameter_storages_are_shared(self):
+        def export(*, model, constructed):
+            weight = model.proj.weight.data.view(torch.uint8)
+            return {
+                "proj": weight,
+                "scale": torch.zeros(4, dtype=torch.uint8),
+                "gpu": torch.empty(4, dtype=torch.uint8, device="meta"),
+            }, b""
+
+        with (
+            self._owner_parts(export=export),
+            mock.patch.object(
+                snapshot_loader.current_platform,
+                "get_device_uuid",
+                return_value="GPU-0",
+            ),
+        ):
+            _, manifest = self._publish(
+                _Source(LoadConfig(), owner=True), _MemoryTransport()
+            )
+        storages = manifest.storages
+        self.assertEqual(storages["proj"].sharing, "shared_ro")
+        self.assertEqual(storages["scale"].sharing, "private")
+        self.assertIsNone(storages["scale"].device_uuid)  # CPU memory has no GPU
+        self.assertEqual(storages["gpu"].device_uuid, "GPU-0")
+
+    def test_snapshot_support_reads_the_spec(self):
+        spec = _spec()
+        self.assertIsNone(snapshot_loader.snapshot_support(spec))
+        for unverified in (
+            msgspec.structs.replace(spec, quant_method="fp8"),
+            msgspec.structs.replace(spec, enable_eplb=True),
+        ):
+            self.assertIsNotNone(snapshot_loader.snapshot_support(unverified))
+
+    def test_an_unverified_load_is_raw_on_every_rank_and_never_publishes(self):
+        source, transport = _Source(LoadConfig(), owner=True), _MemoryTransport()
+        with (
+            self._owner_parts(),
+            _topology(),
+            mock.patch.object(snapshot_loader, "snapshot_support", return_value="awq"),
+            mock.patch.object(source, "_find") as find,
+        ):
+            self.assertIsNone(_pre_load(source, _model_config()))
+            model = source.load_model(model_config=_model_config(), device_config=_CPU)
+            exported = source.export_snapshot(model=model)
+            with self.assertRaisesRegex(RuntimeError, "awq"):
+                source.publish_snapshot(
+                    exported=exported, transport=transport, group=_GROUP
+                )
+        find.assert_not_called()
+        self.assertFalse(transport.published)
+        self.assertFalse(source.staged)
+
+    def test_lookup_waits_for_a_pending_owner(self):
+        manifest, transport = _manifest(), _MemoryTransport()
+        source = _Source(LoadConfig(), max_pending_wait=10)
+        source._find = mock.Mock(
+            side_effect=[snapshot_loader.Pending(1.0), (manifest, transport)]
+        )
+        with mock.patch.object(snapshot_loader.time, "sleep") as sleep:
+            self.assertIs(source.lookup(spec=_spec(), device_config=_CPU), manifest)
+        sleep.assert_called_once_with(1.0)
+
+    def test_lookup_waits_on_pending_until_the_deadline(self):
+        now = [0.0]
+        source = _Source(
+            LoadConfig(), found=snapshot_loader.Pending(5.0), max_pending_wait=12
+        )
+        with (
+            mock.patch.object(snapshot_loader.time, "monotonic", lambda: now[0]),
+            mock.patch.object(
+                snapshot_loader.time,
+                "sleep",
+                side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            ) as sleep,
+            self.assertRaisesRegex(RuntimeError, "did not publish within 12 s"),
+        ):
+            source.lookup(spec=_spec(), device_config=_CPU)
+        # It uses the time left, and never sleeps past the deadline.
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [5.0, 5.0, 2.0])
+
+    def test_a_source_that_cannot_serve_stops_every_rank(self):
+        source = _Source(LoadConfig())
+        source._find = mock.Mock(side_effect=RuntimeError("daemon out of memory"))
+        vote = _vote_failing_at()
+        with (
+            _topology(),
+            mock.patch.object(snapshot_loader, "vote", vote),
+            self.assertRaisesRegex(RuntimeError, "out of memory"),
+        ):
+            _pre_load(source, _model_config())
+        self.assertIn("out of memory", vote.calls[0].error)
+        # No rank falls back to a raw load.
+        with self.assertRaisesRegex(RuntimeError, "pre_load_check"):
+            source.load_model(model_config=_model_config(), device_config=_CPU)
 
     def test_load_diff_and_validator_share_only_the_schema(self):
         # A validator built on load-diff's logic would only check what load-diff did.

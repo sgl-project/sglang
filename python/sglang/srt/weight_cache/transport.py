@@ -150,7 +150,9 @@ class WeightTransport(ABC):
         """Reader: every storage of ``manifest`` as uint8 bytes, all or nothing.
 
         Returns once the bytes are visible on the current stream; raises otherwise,
-        leaving no mapped tensors exposed and the transport safe to close.
+        leaving no mapped tensors exposed and the transport safe to close. Maps a
+        storage only if it is "shared_ro" and on this GPU (``device_uuid``), and
+        then read-only; copies the rest, and checks ``digest`` when it is set.
         """
 
     @abstractmethod
