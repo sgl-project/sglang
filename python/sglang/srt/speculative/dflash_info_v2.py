@@ -6,6 +6,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
@@ -17,6 +18,10 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.device import is_pin_memory_available
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
+
+
+# SGLANG_OPT_DSV41_LEAN_ROUND_COPIES: one plan per (cur, nxt) destination layout
+_KV_LENS_COPY: dict = {}
 
 
 def _get_overlap_plan_stream(
@@ -103,6 +108,21 @@ class DFlashDraftInputV2(SpecInput):
                 (capacity,), dtype=torch.int32, device=device
             )
 
+    def _load_kv_lens(self, dsts, srcs) -> bool:
+        """Both pinned KV length loads in one small_field_copy launch under
+        SGLANG_OPT_DSV41_LEAN_ROUND_COPIES; False: the caller copies each."""
+        if not envs.SGLANG_OPT_DSV41_LEAN_ROUND_COPIES.get() or not all(
+            src.is_pinned() for src in srcs
+        ):
+            return False
+        key = tuple((d.data_ptr(), d.shape) for d in dsts)
+        plan = _KV_LENS_COPY.get(key)
+        if plan is None:
+            if len(_KV_LENS_COPY) >= 64:
+                _KV_LENS_COPY.clear()
+            plan = _KV_LENS_COPY[key] = SmallFieldCopyPlan(allow_pinned_src=True)
+        return plan(dsts, srcs)
+
     @classmethod
     def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
         return cls(
@@ -180,8 +200,11 @@ class DFlashDraftInputV2(SpecInput):
 
             cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
             nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
-            cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
-            nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
+            if not self._load_kv_lens(
+                [cur_kv_lens, nxt_kv_lens], [cur_kv_lens_cpu_t, nxt_kv_lens_cpu_t]
+            ):
+                cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
+                nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
 
             alloc_for_spec_decode(
                 batch.tree_cache,

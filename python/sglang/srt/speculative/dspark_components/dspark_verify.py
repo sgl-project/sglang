@@ -786,7 +786,7 @@ class DsparkVerifyEpilogue:
         capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
-        if capturing and out.next_token_logits_vocab_shard is None:
+        if capturing and getattr(out, "next_token_logits_vocab_shard", None) is None:
             # the sampling-accept region reads full-vocabulary logits
             self.static_io[bs] = io
         elif capturing:
