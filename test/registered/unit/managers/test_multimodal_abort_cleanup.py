@@ -42,7 +42,10 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.session_controller import Session
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import (
+    empty_request_lists,
+    idle_penalty_status_pool,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -114,6 +117,7 @@ def _queued_scheduler(req):
     scheduler.output_streamer = MagicMock()
     scheduler.collect_inflight_reqs = lambda: set()
     scheduler.hisparse_coordinator = None
+    scheduler.penalty_status_pool = idle_penalty_status_pool()
     scheduler.init_request_retirer()
     return scheduler
 

@@ -65,7 +65,7 @@ def drop_hicache_atexit_pin(cache):
     atexit.unregister(cache.shutdown)
 
 
-def write_backup(cache, node, write_back: bool = False) -> int:
+def write_backup(cache, node, write_back: bool = False) -> int | None:
     """Back up one node's KV D->H via the tree's build+execute primitives."""
     return cache._execute_and_commit_kv_backup(
         BackupKV(node_ids=cache.tree_core.build_backup_node_ids(node, write_back)),
@@ -163,7 +163,7 @@ def build_fixture(
             size=cfg.max_num_reqs,
             mamba_size=cfg.mamba_cache_size,
             mamba_spec_state_size=cfg.max_num_reqs,
-            max_context_len=cfg.max_context_len,
+            row_width=cfg.max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
@@ -176,7 +176,7 @@ def build_fixture(
     else:
         req_to_token_pool = ReqToTokenPool(
             size=cfg.max_num_reqs,
-            max_context_len=cfg.max_context_len,
+            row_width=cfg.max_context_len,
             device=device,
             enable_memory_saver=False,
         )

@@ -3,7 +3,7 @@
 Subclass of ``ReqToTokenPool`` that adds the one auxiliary per-request table
 needed by the DSV4 attention backend:
 
-  * ``req_to_c128_sidecar`` — one page id per C128 physical page
+  * ``req_to_c128_sidecar``: one page id per C128 physical page
 
 C4 locations are derived from the base full-token table, and SWA locations use
 the existing full-to-SWA mapping. The sidecar is populated by the existing
@@ -27,13 +27,12 @@ class DSV4ReqToTokenTablesMixin:
     (:class:`DSV4NPUDecodeReqToTokenPool`), which differ only in their base.
 
     Host class must call ``super().__init__(...)`` first (so ``_alloc_size``
-    exists) then ``self._init_dsv4_tables(...)``; ``free`` should call
+    and ``row_width`` exist) then ``self._init_dsv4_tables(...)``; ``free`` should call
     ``self._dsv4_free(req)`` before delegating to the base ``free``.
     """
 
     def _init_dsv4_tables(
         self,
-        max_context_len: int,
         device: str,
         enable_memory_saver: bool,
         c128_page_size: int,
@@ -53,7 +52,7 @@ class DSV4ReqToTokenTablesMixin:
             self.req_to_c128_sidecar = torch.zeros(
                 (
                     self._alloc_size,
-                    max(1, (max_context_len + group_tokens - 1) // group_tokens),
+                    max(1, (self.row_width + group_tokens - 1) // group_tokens),
                 ),
                 dtype=torch.int32,
                 device=device,
@@ -127,10 +126,25 @@ class DSV4ReqToTokenTablesMixin:
         return indices
 
     def _dsv4_free(self, req) -> None:
-        # Trigger C128 KV free/state clear via the allocator's unified path. May be None
-        # between __init__ and register_dsv4_allocator — defensive None check.
-        if self._dsv4_allocator is not None:
-            self._dsv4_allocator.free(req=req, req_to_token_pool=self)
+        """Drop this request's slot-scoped DSV4 state before the slot is reused.
+
+        The C128-owning allocator takes the req-aware ``free``. DeepSeek-V4.1 runs
+        on the generic SWA allocator: it has no C128 pages to release, but it
+        still keeps the ratio-2 pending pair per request slot.
+
+        ``_dsv4_allocator`` stays None between ``__init__`` and
+        ``register_dsv4_allocator``.
+        """
+        allocator = self._dsv4_allocator
+        if allocator is None:
+            return
+        if hasattr(allocator, "c128_attn_allocator"):
+            allocator.free(req=req, req_to_token_pool=self)
+            return
+        req_pool_idx = req.kv.req_pool_idx
+        if req_pool_idx is None:
+            return
+        allocator.get_kvcache().clear_request_scoped_state(int(req_pool_idx))
 
 
 class DSV4NPUReqToTokenPool(DSV4ReqToTokenTablesMixin, ReqToTokenPool):
@@ -146,13 +160,12 @@ class DSV4NPUReqToTokenPool(DSV4ReqToTokenTablesMixin, ReqToTokenPool):
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
     ):
-        super().__init__(size, max_context_len, device, enable_memory_saver)
+        super().__init__(size, row_width, device, enable_memory_saver)
         self._init_dsv4_tables(
-            max_context_len,
             device,
             enable_memory_saver,
             get_schedule().c128_page_size,
@@ -173,20 +186,19 @@ class DSV4NPUDecodeReqToTokenPool(DSV4ReqToTokenTablesMixin, DecodeReqToTokenPoo
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         pre_alloc_size: int,
     ):
         super().__init__(
             size=size,
-            max_context_len=max_context_len,
+            row_width=row_width,
             device=device,
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
         self._init_dsv4_tables(
-            max_context_len,
             device,
             enable_memory_saver,
             get_schedule().c128_page_size,

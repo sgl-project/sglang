@@ -10,7 +10,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadFormat
-from sglang.srt.layers.moe.paged_experts import expert_cache
+from sglang.srt.layers.moe.paged_experts import expert_cache, precopy
 from sglang.srt.layers.moe.paged_experts.disk_tier import (
     TieredExpertStore,
     fill_file,
@@ -215,8 +215,12 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
 
     @property
     def max_resident(self) -> int:
-        """At most this many slots: on the disk tier, a wave reads each of up to K experts
-        into a host row of its own."""
+        """At most this many slots: every expert untiered, ``disk_tier.max_slots`` on the
+        disk tier."""
+        if self.tiered:
+            from sglang.srt.layers.moe.paged_experts import disk_tier
+
+            return disk_tier.max_slots(self.host_rows)
         return self.host_rows
 
     def _expert_cache(self, layer) -> Optional[ExpertCache]:
@@ -351,6 +355,11 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
 
         # Decided from shapes alone, so a captured graph always takes the same path.
         topk_output = dispatch_output.topk_output
+        if (
+            self.device_executor is not None
+            and self.device_executor.precopy_next is not None
+        ):
+            precopy.maybe_log()  # the pre-copy counters, from eager steps
         if (
             self.device_executor is not None
             and topk_output.topk_ids.numel() <= self.num_resident
