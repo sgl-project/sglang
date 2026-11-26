@@ -1002,14 +1002,14 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
         # PP0 classifies the failure for every stage, so it needs each stage's
-        # reason. Only live rooms: a concluded room must not leak a key.
-        if (
-            isinstance(self.request_status, PPConsensusStore)
-            and bootstrap_room in self.request_status
-        ):
-            self.request_status[_pp_abort_key(bootstrap_room)] = int(
-                is_abort_failure_reason(failure_reason)
-            )
+        # reason. Only live rooms: a concluded room must not leak a key, and the
+        # status lock keeps clear() from popping the room between check and set.
+        if isinstance(self.request_status, PPConsensusStore):
+            with self._status_lock:
+                if bootstrap_room in self.request_status:
+                    self.request_status[_pp_abort_key(bootstrap_room)] = int(
+                        is_abort_failure_reason(failure_reason)
+                    )
 
     def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
         infos = self.transfer_infos.get(bootstrap_room)

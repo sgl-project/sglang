@@ -121,6 +121,8 @@ def poll_and_all_reduce_pp(
 # Failure reasons recorded for a transfer the client or decode asked to stop.
 ABORT_REASON_REQUEST = "Aborted by AbortReq."
 ABORT_REASON_DECODE = "Aborted by decode-side abort notification."
+# Reported by a rank that succeeded locally when the agreed outcome is an abort.
+ABORT_REASON_PEER = "Aborted by a requested abort on another rank."
 _ABORT_FAILURE_REASONS = frozenset({ABORT_REASON_REQUEST, ABORT_REASON_DECODE})
 
 
@@ -129,7 +131,8 @@ def is_abort_failure_reason(failure_reason: Optional[str]) -> bool:
 
 
 class TransferOutcome(IntEnum):
-    """Terminal outcome of a prefill KV transfer, ordered for MIN consensus."""
+    """Terminal outcome of a prefill KV transfer, derived on every rank from
+    the agreed poll and abort flags (see _all_reduce_transfer_outcomes)."""
 
     ERROR = 0
     ABORT = 1
@@ -146,6 +149,8 @@ def poll_and_all_reduce_prefill_pp(
     pp_poll_send_window: PPSyncSendWindow,
     p2p_tag: P2PTag,
 ) -> List[int]:
+    """PP0 polls every stage's status and forwards its polls to the other
+    stages."""
     polls: List[int] = []
     if pp_rank == 0:
         polls = _poll_with_failure_injection_pp(pollers)

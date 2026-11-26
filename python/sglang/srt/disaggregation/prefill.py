@@ -46,7 +46,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    ABORT_REASON_REQUEST,
+    ABORT_REASON_PEER,
     CustomizedInfoError,
     KVClassType,
     MetadataBuffers,
@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_transfer_buf_infos,
     get_pd_kv_layout,
     get_qsa_pending_state_indices,
+    is_abort_failure_reason,
     is_aborted,
     is_mla_backend,
     is_unadmitted_reject,
@@ -1568,7 +1569,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def handle_inflight_transfer_failure(
         self: Scheduler, req: Req, aborted_by_request: bool = False
-    ) -> Optional[Exception]:
+    ) -> None:
         """Conclude an inflight request whose KV transfer failed.
 
         aborted_by_request is the classification agreed across ranks. This
@@ -1596,7 +1597,13 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if not isinstance(req.finished_reason, FINISH_ABORT):
             if is_aborted_by_request:
-                prepare_abort(req, ABORT_REASON_REQUEST)
+                # This rank's own reason when it recorded one; a rank that
+                # succeeded locally only knows a peer recorded an abort.
+                reason = getattr(exc, "failure_reason", None)
+                prepare_abort(
+                    req,
+                    reason if is_abort_failure_reason(reason) else ABORT_REASON_PEER,
+                )
             else:
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR

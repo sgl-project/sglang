@@ -123,6 +123,7 @@ class _Stage(SchedulerDisaggregationPrefillMixin):
             request_status=self.store,
             failure_records={},
             failure_lock=threading.Lock(),
+            _status_lock=threading.Lock(),
         )
         self.pp_group = SimpleNamespace(
             recv_object=pp_group.recv_object, send_object=pp_group.send_object
