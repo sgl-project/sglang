@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
@@ -83,5 +83,14 @@ register_kernel(
         target=(
             "sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache:store_fp4_index_k_cache"
         ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="kvcache.transfer_page_runs",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.kvcache.page_runs:transfer_page_runs",
+        capabilities=CUDA_ONLY,
     )
 )
