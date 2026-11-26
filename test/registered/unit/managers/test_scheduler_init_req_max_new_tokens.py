@@ -12,7 +12,12 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.demand import WindowRetirement
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -28,11 +33,12 @@ def setUpModule():
     unittest.addModuleCleanup(patcher.stop)
 
 
-class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
+class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
-      1. context: input_len + max_new_tokens < max_req_len
+      1. context: input_len + max_new_tokens <= max_req_len + 1; the final
+         generated token is sampled but never forwarded into the KV cache
       2. admission budget (PrefillAdder):
          ceil_page(input_len) + max_new_tokens + page_size * shard_widening
          < max_total_num_tokens * shard_widening
@@ -57,7 +63,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls._scheduler_logger.setLevel(cls._old_level)
+        if hasattr(cls, "_scheduler_logger") and hasattr(cls, "_old_level"):
+            cls._scheduler_logger.setLevel(cls._old_level)
 
     def setUp(self):
         # Tests use an unsharded topology unless they explicitly override it.
@@ -120,7 +127,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
-            context_ok = input_len + candidate < scheduler.max_req_len
+            context_ok = input_len + candidate <= scheduler.max_req_len + 1
             budget_ok = (
                 paged_input_len + candidate + page_size * shard_widening
                 < scheduler.max_total_num_tokens * shard_widening
@@ -168,8 +175,25 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             scheduler = self._new_scheduler(max_req_len=max_req_len)
             req = self._new_req(max_new_tokens=64, input_len=input_len)
             self.assertEqual(
-                self._init_and_check(scheduler, req), max_req_len - input_len - 1
+                self._init_and_check(scheduler, req), max_req_len - input_len + 1
             )
+
+    def test_public_context_boundary_is_not_clipped(self):
+        """A request accepted at the public context limit keeps its full output."""
+        context_len, input_len = 4096, 4080
+        scheduler = self._new_scheduler(
+            max_req_len=context_len - 1,
+            max_total_num_tokens=1 << 20,
+        )
+        req = self._new_req(
+            max_new_tokens=context_len - input_len,
+            input_len=input_len,
+        )
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(
+            req.sampling_params.max_new_tokens,
+            context_len - input_len,
+        )
 
     def test_budget_rule_binds_tighter_than_limit(self):
         max_total_num_tokens, page_size, input_len = 24, 4, 8
@@ -315,7 +339,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         req.set_finish_with_abort = lambda msg: self.fail(f"aborted: {msg}")
         scheduler.init_req_max_new_tokens(req)
         self.assertEqual(
-            req.sampling_params.max_new_tokens, scheduler.max_req_len - input_len - 1
+            req.sampling_params.max_new_tokens, scheduler.max_req_len - input_len + 1
         )
 
     def test_pd_prefill_forces_one_handoff_token(self):
