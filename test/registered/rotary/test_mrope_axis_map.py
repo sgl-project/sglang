@@ -10,6 +10,7 @@ from sglang.srt.layers.rotary_embedding.mrope import (
     MRotaryEmbedding,
     apply_interleaved_rope,
 )
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -105,6 +106,31 @@ class TestMRopeAxisMap(CustomTestCase):
             mrope_section=[16, 16, 32],
         )
         self.assertIsNone(ernie.axis_map)
+
+    def test_ernie_text_positions_match_native(self):
+        """Ernie RoPE rotates 1-D (text-only) positions the way forward_native does on
+        every platform; the CUDA dispatch must not raise."""
+        head_size = 64
+        ernie = Ernie4_5_VLRotaryEmbedding(
+            head_size=head_size,
+            rotary_dim=head_size,
+            max_position_embeddings=64,
+            base=10000,
+            is_neox_style=True,
+            dtype=torch.float32,
+            mrope_section=[8, 8, 16],
+        )
+        # The rotation does not need the compiled wrapper.
+        ernie._apply_rotary_emb_wrapped = apply_rotary_emb
+        positions = torch.arange(5)
+        query, key = torch.randn(5, 2 * head_size), torch.randn(5, head_size)
+        want_query, want_key = ernie.forward_native(positions, query, key)
+
+        got_query, got_key = ernie(positions, query.clone(), key.clone())
+
+        torch.testing.assert_close(got_query, want_query, atol=0, rtol=0)
+        torch.testing.assert_close(got_key, want_key, atol=0, rtol=0)
+        self.assertFalse(torch.equal(got_query, query))
 
     def test_npu_dispatch_preserves_multimodal_positions(self):
         # The fused CANN op does only 1-D plain RoPE; 3-axis positions that

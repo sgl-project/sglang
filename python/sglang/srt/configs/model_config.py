@@ -219,6 +219,8 @@ def is_deepseek_dsa(config) -> bool:
             "HYV4FlashForConditionalGeneration",
             "Ernie5_5_MoeForCausalLM",
             "Ernie5_5_MoeForCausalLMNextN",
+            "GigaChat4ForCausalLM",
+            "GigaChat4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     ) or is_kimi_k31(config)
@@ -1298,6 +1300,8 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
         ):
             self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
+        if is_draft_model and self.hf_config.architectures[0] == "GigaChat4ForCausalLM":
+            self.hf_config.architectures[0] = "GigaChat4ForCausalLMNextN"
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
@@ -1557,6 +1561,7 @@ class ModelConfig:
                 setattr(self.hf_text_config, "head_dim", self.head_dim)
 
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
+        configured_v_head_dim = self.v_head_dim
         if self.v_head_dim is None or self.v_head_dim == 0:
             self.v_head_dim = self.head_dim
             setattr(self.hf_text_config, "v_head_dim", self.v_head_dim)
@@ -1602,6 +1607,8 @@ class ModelConfig:
             or "GigaChat35ForCausalLM" in self.hf_config.architectures
             or "GigaChat35ForCausalLMNextN" in self.hf_config.architectures
             or "Xing4_0ForCausalLM" in self.hf_config.architectures
+            or "GigaChat4ForCausalLM" in self.hf_config.architectures
+            or "GigaChat4ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1733,6 +1740,9 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self._init_mla_scaling(self.hf_config.rope_scaling)
+        elif getattr(self.hf_text_config, "use_mla", False) is True:
+            # External models can opt in without extending the architecture list.
+            self._init_configured_mla(v_head_dim=configured_v_head_dim)
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -1841,6 +1851,38 @@ class ModelConfig:
             "Inkling2ForConditionalGenerationMTP",
         }:
             self.vocab_size = self.hf_text_config.padded_vocab_size
+
+    def _init_configured_mla(self, *, v_head_dim: Optional[int]) -> None:
+        dimensions = {
+            "kv_lora_rank": getattr(self.hf_text_config, "kv_lora_rank", None),
+            "qk_nope_head_dim": getattr(self.hf_text_config, "qk_nope_head_dim", None),
+            "qk_rope_head_dim": getattr(self.hf_text_config, "qk_rope_head_dim", None),
+            # Check the checkpoint value before the generic MHA default filled it.
+            "v_head_dim": v_head_dim,
+        }
+        for name, value in dimensions.items():
+            minimum = 0 if name in ("qk_nope_head_dim", "qk_rope_head_dim") else 1
+            if type(value) is not int or value < minimum:
+                raise ValueError(
+                    f"use_mla=True requires {name} to be an integer >= {minimum}; "
+                    f"got {value!r}"
+                )
+        if dimensions["qk_nope_head_dim"] + dimensions["qk_rope_head_dim"] == 0:
+            raise ValueError(
+                "use_mla=True requires qk_nope_head_dim + qk_rope_head_dim > 0"
+            )
+
+        for name, value in dimensions.items():
+            setattr(self, name, value)
+        self.attention_arch = AttentionArch.MLA
+        self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.swa_kv_lora_rank = self.kv_lora_rank
+        self.swa_qk_rope_head_dim = self.qk_rope_head_dim
+        self.index_head_dim = None
+        rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
+            self.hf_text_config, "rope_scaling", None
+        )
+        self._init_mla_scaling(rope_scaling)
 
     def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
         """Base MLA attention scale from the head dims, then the rope mscale."""

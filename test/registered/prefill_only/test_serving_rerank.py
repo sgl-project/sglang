@@ -191,6 +191,20 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
         self.assertEqual([r.index for r in res], [1, 0, 2])
         self.assertAlmostEqual(res[0].score, 0.9)
 
+    def test_build_rerank_response_returns_multimodal_documents(self):
+        """A document sent as content parts is returned with return_documents on
+        (the default), the same as a text document."""
+        parts = [
+            {"type": "text", "text": "a cat"},
+            {"type": "image_url", "image_url": {"url": "http://host/cat.png"}},
+        ]
+        req = V1RerankReqInput(query="q", documents=[parts, "plain"])
+        res = self.handler._build_rerank_response([0.9, 0.2], req)
+        self.assertEqual(res[1].document, "plain")
+        returned = res[0].model_dump()["document"]
+        self.assertEqual(returned[0], {"type": "text", "text": "a cat"})
+        self.assertEqual(returned[1]["image_url"]["url"], "http://host/cat.png")
+
     def test_build_rerank_response_top_n(self):
         """Test that top_n limits the number of returned results"""
         req = V1RerankReqInput(
