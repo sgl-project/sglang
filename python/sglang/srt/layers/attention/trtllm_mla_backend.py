@@ -534,7 +534,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Initialize CUDA graph state for TRTLLM MLA."""
 
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        max_blocks_per_seq = self._calc_padded_blocks(self.max_kv_len)
 
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
@@ -578,7 +578,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             is_draft_runner=self.is_draft_runner,
             skip_prefill=self.skip_prefill,
             max_bs=max_bs,
-            max_context_len=self.max_context_len,
+            max_context_len=self.max_kv_len,
             num_draft_tokens=self.num_draft_tokens,
             device=self.device,
             is_read=False,
@@ -637,10 +637,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
 
         # Capture with full width so future longer sequences are safe during replay.
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        max_blocks_per_seq = self._calc_padded_blocks(self.max_kv_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
         metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = self.max_context_len
+        metadata.max_seq_len_k = self.max_kv_len
 
         if get_parallel().dcp_enabled:
             if metadata.global_seq_lens_k is None:
@@ -650,7 +650,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     (bs,), dtype=torch.int32, device=device
                 )
             metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
-                self.max_context_len
+                self.max_kv_len
                 + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
             )
 
@@ -883,7 +883,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # scheduling hint, so the static context bound is a safe fallback.
             seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
             if seq_lens_cpu is None:
-                max_seq = self.max_context_len
+                max_seq = self.max_kv_len
             elif seq_lens_cpu.numel() == 0:
                 max_seq = 1
             else:

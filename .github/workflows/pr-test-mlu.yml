@@ -42,12 +42,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite:
-          - extra-test-1-mlu
-          - extra-test-2-mlu
+        include:
+          - suite: extra-test-1-mlu
+            label: mlu-1card
+          - suite: extra-test-2-mlu
+            label: mlu-2card
     runs-on:
-      group: mlu-ci
-      labels: mlu-pr
+      group: mlu-ci-runners
+      labels: ${{ matrix.label }}
     timeout-minutes: 120
     steps:
       # Fetch the helper from the trusted workflow commit, never the PR/test ref.
