@@ -8,6 +8,9 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
+from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+    MultimemAllGatherer,
+)
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
@@ -31,6 +34,12 @@ from sglang.srt.models.inkling_common.inkling2_attn_res import (
     Inkling2AttnRes,
     Inkling2AttnResState,
 )
+from sglang.srt.models.inkling_common.inkling2_loop import (
+    Inkling2MessageController,
+    LoopMessageBank,
+    scaled_loop_queries,
+    stack_controller_weights,
+)
 from sglang.srt.models.inkling_common.inkling2_moe import (
     Inkling2Experts,
     Inkling2MoE,
@@ -45,6 +54,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
     get_parallel,
+    get_platform,
     get_spec,
 )
 
@@ -54,6 +64,7 @@ VERIFY_ROUTED_EPILOGUE_MAX_TOKENS = 32
 class Inkling2DecoderLayer(nn.Module):
     def __init__(self, config, layer_id, quant_config, prefix):
         super().__init__()
+        self.config = config
         self.layer_id = layer_id
         self.is_local = layer_id in config.local_layer_ids
         self.attn = Inkling2Attention(
@@ -94,35 +105,85 @@ class Inkling2DecoderLayer(nn.Module):
             tp_rank=0,
             tp_size=1,
         )
+        self.controllers = (
+            nn.ModuleDict(
+                {
+                    module: Inkling2MessageController(
+                        config.hidden_size, config.loop_config["gate_rank"]
+                    )
+                    for module in ("attn", "mlp", "k", "v")
+                }
+            )
+            if layer_id in config.loop_core_layers
+            else None
+        )
+        self.controller_weights = None
 
-    def forward(self, state, positions, forward_batch):
-        streams = state.attention_input(self.layer_id)
-        if self.is_local:
-            attn_input = self.attn_norm(streams[0])
-        else:
-            stacked = streams[0].new_empty(
-                (3, *streams[0].shape),
-                dtype=self.q_input_norm.output_dtype or streams[0].dtype,
+    def _attention_input(self, streams, messages):
+        if messages is not None:
+            # Later passes mix a separate message into each of the Q, K and V inputs,
+            # so a local layer's single input stream splits into three.
+            mixed = messages.mix(
+                self.layer_id - self.config.loop_core_layers.start,
+                streams * 3 if self.is_local else streams,
+                self.controller_weights,
+                "attn",
             )
-            attn_input = AttentionSources(
-                self.q_input_norm(streams[0], out=stacked[0]),
-                self.k_input_norm(streams[1], out=stacked[1]),
-                self.v_input_norm(streams[2], out=stacked[2]),
+            if self.is_local:
+                return AttentionSources(*self.attn_norm(mixed).unbind(0))
+            streams = mixed.unbind(0)
+        elif self.is_local:
+            return self.attn_norm(streams[0])
+        norms = (
+            (self.attn_norm,) * 3
+            if self.is_local
+            else (self.q_input_norm, self.k_input_norm, self.v_input_norm)
+        )
+        stacked = streams[0].new_empty(
+            (3, *streams[0].shape),
+            dtype=norms[0].output_dtype or streams[0].dtype,
+        )
+        return AttentionSources(
+            *(
+                norm(stream, out=out)
+                for norm, stream, out in zip(norms, streams, stacked, strict=True)
             )
-        attention = self.attn(attn_input, positions, forward_batch)
+        )
+
+    def forward(self, state, positions, forward_batch, *, pass_idx=0, messages=None):
+        conv_layer_id = self.config.conv_layer_id(self.layer_id, pass_idx)
+        with (
+            self.attn_sconv.state_layer_override(conv_layer_id),
+            self.mlp_sconv.state_layer_override(conv_layer_id),
+        ):
+            self._forward(state, positions, forward_batch, pass_idx, messages)
+
+    def _forward(self, state, positions, forward_batch, pass_idx, messages):
+        attn_input = self._attention_input(
+            state.attention_input(self.layer_id), messages
+        )
+        attention = self.attn(attn_input, positions, forward_batch, pass_idx=pass_idx)
         attention = self.attn_sconv(attention, positions, forward_batch)
         routed = forward_batch.forward_mode.is_decode() or (
             forward_batch.forward_mode.is_target_verify()
             and attention.shape[0] <= VERIFY_ROUTED_EPILOGUE_MAX_TOKENS
         )
         tokens = attention.shape[0]
-        # MTP verify keeps every row.
+        # MTP verify and loop message mixing keep every row.
         rows = (
             None
-            if forward_batch.forward_mode.is_target_verify()
+            if forward_batch.forward_mode.is_target_verify() or messages is not None
             else self.mlp.local_input_rows(tokens, combine=not routed)
         )
-        mlp_input = self.mlp_norm(state.mlp_input(self.layer_id, attention, rows))
+        mlp_input = state.mlp_input(self.layer_id, attention, rows)
+        if messages is not None:
+            mlp_input = messages.mix(
+                self.layer_id - self.config.loop_core_layers.start,
+                (mlp_input,),
+                self.controller_weights,
+                "mlp",
+            )[0]
+        mlp_input = self.mlp_norm(mlp_input)
         mlp = self.mlp(
             mlp_input,
             forward_batch,
@@ -163,9 +224,12 @@ class Inkling2LogitsProcessor(LogitsProcessor):
         super().__init__(config)
         self.vocab_size = config.padded_vocab_size
         self.input_logprob_processor.vocab_size = self.vocab_size
+        # SM120 has no NVLink multicast: gather over NCCL, never rendezvous symm mem.
+        if get_platform().is_sm120:
+            self._logits_gatherer = MultimemAllGatherer(max_tokens=0, enabled=False)
         self.use_fp32_lm_head = output_dtype == torch.float32
         # FP32 logits: softcap each rank's vocab shard before the gather, and
-        # gather them as bfloat16 pairs through the multimem all-gather.
+        # gather them as bfloat16 pairs (multimem, or NCCL when it is disabled).
         self.shard_softcap = None
         if self.use_fp32_lm_head:
             self.shard_softcap = self.final_logit_softcapping
@@ -173,8 +237,7 @@ class Inkling2LogitsProcessor(LogitsProcessor):
             self._logits_gatherer = _Fp32AsBf16Gather(self._logits_gatherer)
 
     def warm_logits_gather(self, shard_width, device):
-        """Build the multimem logits all-gather before CUDA graph capture
-        (collective)."""
+        """Prime the logits all-gather (collective) before CUDA graph capture."""
         if self.use_fp32_lm_head and self.do_tensor_parallel_all_gather:
             self._logits_gatherer(
                 torch.zeros((1, shard_width), dtype=torch.float32, device=device)
@@ -213,7 +276,7 @@ class Inkling2CausalLLM(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.start_layer, self.end_layer = 0, config.num_hidden_layers
+        self.start_layer, self.end_layer = 0, config.num_attention_layers
         self.layers_to_capture: list[int] = []
         self.embed_tokens = VocabParallelEmbedding(
             config.padded_vocab_size,
@@ -236,6 +299,15 @@ class Inkling2CausalLLM(nn.Module):
             config.local_layer_ids,
             config.attn_res_normalize_values,
         )
+        if config.loop_config is not None:
+            shape = (2 * len(config.loop_core_layers), config.hidden_size)
+            self.middle_cycle_cross_pass_queries = nn.Parameter(
+                torch.zeros(shape, dtype=torch.float32)
+            )
+            self.middle_cycle_cross_pass_kv_queries = nn.Parameter(
+                torch.zeros(shape, dtype=torch.float32)
+            )
+        self.loop_scaled_queries = None
         self.norm = RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -280,15 +352,74 @@ class Inkling2CausalLLM(nn.Module):
                 return hidden, captures.finalize()
             return hidden
         state = Inkling2AttnResState(self.attn_res, hidden)
-        for i, layer in enumerate(self.layers):
-            if captures is not None and i in self.layers_to_capture:
-                captures.append(state.partial.to(self.lm_head.weight.dtype))
-            layer(state, positions, forward_batch)
+        if self.config.loop_config is None:
+            for i, layer in enumerate(self.layers):
+                self._capture(captures, i, state)
+                layer(state, positions, forward_batch)
+        else:
+            state = self._run_loop(state, positions, forward_batch, captures)
         hidden = self.norm(state.compute_output())
         if captures is not None:
             captures.append(hidden.to(self.lm_head.weight.dtype))
             return hidden, captures.finalize()
         return hidden
+
+    def prepare_loop(self) -> None:
+        """Stack the message controllers and scale their queries after loading,
+        updating in place on reload so captured graphs keep their pointers."""
+        if self.config.loop_config is None:
+            return
+        scaled = scaled_loop_queries(
+            self.middle_cycle_cross_pass_queries.data,
+            self.middle_cycle_cross_pass_kv_queries.data,
+        )
+        if self.loop_scaled_queries is None:
+            self.loop_scaled_queries = scaled
+        else:
+            self.loop_scaled_queries.copy_(scaled)
+        for layer in self.layers:
+            if layer.controllers is not None and layer.controller_weights is None:
+                layer.controller_weights = stack_controller_weights(layer.controllers)
+
+    def _capture(self, captures, visit, state):
+        if captures is not None and visit in self.layers_to_capture:
+            captures.append(state.partial.to(self.lm_head.weight.dtype))
+
+    def _run_loop(self, state, positions, forward_batch, captures):
+        """Prelude once, the core num_passes times, then the coda once.
+
+        Every pass starts from the prelude's residual stream; later passes see the
+        previous pass only through messages read from the blocks it wrote.
+        """
+        core = self.config.loop_core_layers
+        num_passes = self.config.loop_config["num_passes"]
+        for i, layer in enumerate(self.layers[: core.start]):
+            self._capture(captures, i, state)
+            layer(state, positions, forward_batch)
+        prelude_partial, prelude_blocks = state.partial, list(state.blocks)
+        messages = None
+        for pass_idx in range(num_passes):
+            if pass_idx:
+                bank = (*state.blocks[len(prelude_blocks) + 1 :], state.partial)
+                messages = LoopMessageBank(bank, self.loop_scaled_queries)
+                state = Inkling2AttnResState(
+                    self.attn_res, prelude_partial, list(prelude_blocks)
+                )
+            first_visit = core.start + pass_idx * len(core)
+            for offset, layer in enumerate(self.layers[core.start : core.stop]):
+                self._capture(captures, first_visit + offset, state)
+                layer(
+                    state,
+                    positions,
+                    forward_batch,
+                    pass_idx=pass_idx,
+                    messages=messages,
+                )
+        coda_first_visit = core.start + num_passes * len(core)
+        for offset, layer in enumerate(self.layers[core.stop :]):
+            self._capture(captures, coda_first_visit + offset, state)
+            layer(state, positions, forward_batch)
+        return state
 
 
 class Inkling2ForConditionalGeneration(nn.Module):
@@ -318,6 +449,9 @@ class Inkling2ForConditionalGeneration(nn.Module):
             config.text_config,
             quant_config,
         )
+        # Conv states are kept per layer visit, so the runner's layer range spans
+        # every visit even when looped passes share their KV cache layers.
+        self.start_layer, self.end_layer = 0, config.text_config.num_layer_visits
         self.llm = (
             None
             if self.encoder_only
@@ -390,16 +524,16 @@ class Inkling2ForConditionalGeneration(nn.Module):
         return self.llm is not None and bool(self.llm.layers_to_capture)
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        num_layers = len(self.llm.layers)
+        num_visits = self.llm.config.num_layer_visits
         if (
             not layer_ids
             or layer_ids != sorted(set(layer_ids))
             or layer_ids[0] < 0
-            or layer_ids[-1] != num_layers
+            or layer_ids[-1] != num_visits
         ):
             raise ValueError(
-                "Inkling2 draft feature layers must be sorted, unique, and end "
-                f"with {num_layers}, the post-final-norm hidden state"
+                "Inkling2 draft feature layer visits must be sorted, unique, and end "
+                f"with {num_visits}, the post-final-norm hidden state, got {layer_ids}"
             )
         self.llm.layers_to_capture = list(layer_ids)
 
@@ -521,6 +655,10 @@ class Inkling2ForConditionalGeneration(nn.Module):
                 missing.add(f"{name} shards {sorted(expected - shards)}")
         if missing:
             raise ValueError(f"Missing checkpoint tensors: {sorted(missing)}")
+        self.post_load_weights()
+        return loaded
+
+    def post_load_weights(self) -> None:
         for module in self.modules():
             if isinstance(module, Inkling2Experts):
                 module.swizzle_nvfp4_scales()
@@ -533,7 +671,12 @@ class Inkling2ForConditionalGeneration(nn.Module):
                 )
             elif isinstance(module, Inkling2AttnRes):
                 module.scale_queries()
-        return loaded
+            elif isinstance(module, Inkling2CausalLLM):
+                module.prepare_loop()
 
 
-EntryClass = Inkling2ForConditionalGeneration
+class Inkling2LoopForConditionalGeneration(Inkling2ForConditionalGeneration):
+    """Name that looped checkpoints declare in config.json architectures."""
+
+
+EntryClass = [Inkling2ForConditionalGeneration, Inkling2LoopForConditionalGeneration]
