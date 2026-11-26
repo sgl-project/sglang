@@ -86,12 +86,12 @@ export const popularModels = [
     href: "/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next",
     logo: "/cards/logos/qwen.png",
     badge: "New",
-    tags: ["6 platforms", "GDN + QSA hybrid", "BF16 / FP8 / NVFP4"],
+    tags: ["6 platforms", "GDN + QSA hybrid", "BF16 / FP8 / NVFP4 / MXFP4"],
     hero: {
       eyebrow: "Featured model \u00b7 New",
       headline: "Meet Qwen3.8-Flash-Next on SGLang",
       blurb:
-        "Qwen's early preview of the Qwen4 architecture \u2014 176B total parameters with 6B active, three of every four layers Gated DeltaNet and the fourth global attention running Qwen Sparse Attention, over an ultra-sparse MoE with an in-checkpoint MTP head. The cookbook covers single-node TP4 serving on H200 / B200 / B300 / GB300 and TP8 on MI350X / MI355X.",
+        "Qwen's early preview of the Qwen4 architecture \u2014 176B total parameters with 6B active, three of every four layers Gated DeltaNet and the fourth global attention running Qwen Sparse Attention, over an ultra-sparse MoE with an in-checkpoint MTP head. The cookbook covers single-node TP4 serving on H200 / B200 / B300 / GB300 TP8 on MI350X / MI355X, and the MXFP4 checkpoint on a single MI355X.",
       tags: ["176B / 6B active", "262K context", "Single-node"],
       cta: "Open the Qwen3.8-Flash-Next cookbook",
       caption: "Qwen3.8-Flash-Next deployment guide",

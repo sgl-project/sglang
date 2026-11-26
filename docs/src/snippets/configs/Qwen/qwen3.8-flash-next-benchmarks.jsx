@@ -250,4 +250,6 @@ export const benchmarks = [
   { match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
   { match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
   { match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "balanced", nodes: "single" } },
 ];
