@@ -399,7 +399,9 @@ class TestZmqReplayBackpressure(CustomTestCase):
         state = self.publisher._pending_replays[b"stalled"]
         with patch(
             "sglang.srt.disaggregation.kv_events.time.monotonic",
-            return_value=state.last_progress + self.publisher.REPLAY_IDLE_TIMEOUT,
+            # Advance past the deadline: subtracting floats at the exact boundary
+            # can round the elapsed time below REPLAY_IDLE_TIMEOUT.
+            return_value=state.last_progress + self.publisher.REPLAY_IDLE_TIMEOUT + 1,
         ):
             self.publisher._service_replay()
         self.assertNotIn(b"stalled", self.publisher._pending_replays)

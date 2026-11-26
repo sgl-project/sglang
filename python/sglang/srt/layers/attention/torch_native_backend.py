@@ -81,7 +81,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
             k_cache: [max_total_num_tokens, num_heads, head_size]
             v_cache: [max_total_num_tokens, num_heads, head_size]
-            req_to_token: [max_num_reqs, max_context_len]
+            req_to_token: [max_num_reqs, req_to_token_row_width]
             req_pool_indices: [num_seqs]
             encoder_lens: [num_seqs] or None
             seq_lens: [num_seqs]
@@ -194,7 +194,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
             k_cache: [max_total_num_tokens, num_heads, head_size]
             v_cache: [max_total_num_tokens, num_heads, head_size]
-            req_to_token: [max_num_reqs, max_context_len]
+            req_to_token: [max_num_reqs, req_to_token_row_width]
             req_pool_indices: [num_seqs]
             seq_lens: [num_seqs]
             encoder_lens: [num_seqs] or None
