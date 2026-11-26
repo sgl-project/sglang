@@ -143,6 +143,7 @@ class TestViewsOverTheArena(CustomTestCase):
                 state_slots=4,
                 max_running_requests=2,
                 context_len=64,
+                req_to_token_row_width=64,
                 alignment=1,
             ),
         )
@@ -156,7 +157,6 @@ class TestViewsOverTheArena(CustomTestCase):
                 enable_memory_saver=False,
                 need_sort=False,
                 max_num_reqs=2,
-                model_context_len=64,
                 state_cache_params=SimpleNamespace(layers=(1, 3)),
             ),
         )

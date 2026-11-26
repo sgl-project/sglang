@@ -67,7 +67,7 @@
         "wan2_1_t2v_1.3b": {
             "expected_load_ms": 46026.44,
             "stages_ms": {
-                "DecodingStage": 495.01,
+                "DecodingStage": 846.85,
                 "DenoisingStage": 21452.59,
                 "InputValidationStage": 0.09,
                 "LatentPreparationStage": 0.23,
@@ -82,13 +82,13 @@
                 "39": 428.04,
                 "49": 422.31
             },
-            "expected_e2e_ms": 23418.73,
+            "expected_e2e_ms": 22100.0,
             "expected_avg_denoise_ms": 426.59,
             "expected_median_denoise_ms": 427.94,
-            "load_peak_vram_mb": 4934.0,
-            "runtime_peak_vram_mb": 18246.0,
-            "load_peak_allocated_mb": 903.0,
-            "runtime_peak_allocated_mb": 6934.0,
+            "load_peak_vram_mb": 14636.0,
+            "runtime_peak_vram_mb": 23226.0,
+            "load_peak_allocated_mb": 14157.24,
+            "runtime_peak_allocated_mb": 20484.39,
             "estimated_full_test_time_s": 160.9
         },
         "turbo_wan2_1_t2v_1.3b": {
@@ -108,13 +108,13 @@
                 "2": 161.71,
                 "3": 161.1
             },
-            "expected_e2e_ms": 2155.59,
+            "expected_e2e_ms": 1510.0,
             "expected_avg_denoise_ms": 143.62,
             "expected_median_denoise_ms": 160.64,
-            "load_peak_vram_mb": 928.0,
-            "runtime_peak_vram_mb": 14216.0,
-            "load_peak_allocated_mb": 903.0,
-            "runtime_peak_allocated_mb": 6925.0,
+            "load_peak_vram_mb": 14638.0,
+            "runtime_peak_vram_mb": 23234.0,
+            "load_peak_allocated_mb": 14159.13,
+            "runtime_peak_allocated_mb": 20483.54,
             "load_peak_host_anon_mb": 7071.05,
             "runtime_peak_host_anon_mb": 7071.05,
             "estimated_full_test_time_s": 200.3

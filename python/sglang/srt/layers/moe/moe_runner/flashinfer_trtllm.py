@@ -71,7 +71,7 @@ def trtllm_moe_enable_pdl(num_tokens: int) -> bool:
     from sglang.kernels.jit.utils import is_arch_support_pdl
 
     return (
-        not getattr(get_forward(), "sp_active", False)
+        not get_forward().sp_active
         and is_arch_support_pdl()
         and num_tokens <= _TRTLLM_MOE_PDL_MAX_TOKENS
     )
@@ -104,8 +104,6 @@ def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
-
     return moe_finalize_fuse_shared(
         deferred_output.gemm2_out,
         deferred_output.expanded_idx_to_permuted_idx,
@@ -151,8 +149,6 @@ def _make_deferred_finalize_output(
 def _finalize_in_order(result, *, top_k: int, out: torch.Tensor) -> torch.Tensor:
     """Sum FlashInfer's ``do_finalize=False`` outputs into ``out``, adding the
     top-k terms in the same order whatever the batch size."""
-    from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
-
     deferred = _make_deferred_finalize_output(result, top_k=top_k)
     num_tokens = out.shape[0]
     return moe_finalize_fuse_shared(
@@ -2250,6 +2246,7 @@ class FlashInferTrtllmBf16MoeQuantInfo(MoeQuantInfo):
     # Expert-parallel metadata
     global_num_experts: int
     local_expert_offset: int
+    gemm1_clamp_limit: Optional[torch.Tensor] = None
 
 
 def fused_experts_none_to_flashinfer_trtllm_bf16(
@@ -2337,6 +2334,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 hidden_states=hidden_states,
                 gemm1_weights=quant_info.gemm1_weights,
                 gemm2_weights=quant_info.gemm2_weights,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 num_experts=quant_info.global_num_experts,
                 top_k=runner_config.top_k,
                 n_group=None,
@@ -2371,6 +2369,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 hidden_states=hidden_states,
                 gemm1_weights=quant_info.gemm1_weights,
                 gemm2_weights=quant_info.gemm2_weights,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 num_experts=quant_info.global_num_experts,
                 top_k=topk_config.top_k,
                 n_group=topk_config.num_expert_group,
