@@ -119,12 +119,16 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
                     key=lambda item: item[0],
                     reverse=True,
                 )
-                # Establish a complete, unambiguous top-k cutoff in the prefix.
-                self.assertGreater(len(ranked), k)
-                self.assertGreater(ranked[k - 1][0] - ranked[k][0], 1e-4)
+                if k == -1:
+                    # The observed prefix must contain the whole nucleus.
+                    self.assertGreater(sum(math.exp(lp) for lp, _, _ in ranked), p)
+                else:
+                    self.assertGreater(len(ranked), k)
+                    self.assertGreater(ranked[k - 1][0] - ranked[k][0], 1e-4)
+                    ranked = ranked[:k]
                 expected = {}
                 mass = 0.0
-                for logprob, token_id, _ in ranked[:k]:
+                for logprob, token_id, _ in ranked:
                     if p < 1.0 and mass > p:
                         break
                     weight = math.exp(logprob)
@@ -160,6 +164,7 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
             ("greedy", 1, 1.0),
             ("topk", 10, 1.0),
             ("topp", 10, 0.8),
+            ("top_p_only", -1, 0.8),
             ("fallback", 1025, 1.0),
             ("fallback_topp", 1025, 0.8),
         ]

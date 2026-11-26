@@ -51,9 +51,7 @@ _SERVER_ARGS = (
     "--sampling-mask-max-tokens",
     "64",
 )
-_INVALID_SAMPLING_MASK_ERROR = (
-    "return_sampling_mask requires top_k=1 for greedy sampling"
-)
+_INVALID_SAMPLING_MASK_ERROR = "return_sampling_mask requires 1 <= top_k"
 
 
 class TestSamplingMaskCapture(CustomTestCase):
@@ -610,8 +608,42 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
 
         self.assertEqual(len(output_ids), _MAX_NEW_TOKENS)
 
+    def test_top_p_only_returns_the_exact_nucleus(self):
+        # Scale the model logits down and separate the first three ranks.
+        # Their weights are approximately proportional to 1, exp(-1), exp(-2).
+        response = self._post_generate(
+            {
+                "temperature": 100,
+                "logit_bias": {"0": 30000, "1": 29900, "2": 29800},
+                "top_p": 0.8,
+                "max_new_tokens": 1,
+            },
+            return_logprob=True,
+            top_logprobs_num=3,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        output = response.json()
+        meta = output["meta_info"]
+        mask = self._assert_sampling_masks(output["output_ids"], meta)[0]
+        self.assertEqual(set(mask), {0, 1})
+        probs = {tid: math.exp(lp) for lp, tid, _ in meta["output_top_logprobs"][0]}
+        mass = probs[0] + probs[1]
+        self.assertLess(probs[0], 0.8)
+        self.assertGreater(mass, 0.8)
+        for token, actual in zip(mask, meta["output_token_sampling_logprobs"][0]):
+            self.assertAlmostEqual(actual, math.log(probs[token] / mass), delta=1e-3)
+
+    def test_top_p_only_rejects_realized_support_over_capacity(self):
+        response = self._post_generate(
+            {"top_k": -1, "top_p": 0.99, "temperature": 100, "max_new_tokens": 1}
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn(
+            "Sampling support exceeds --sampling-mask-max-tokens=64", response.text
+        )
+
     def test_generate_rejects_unbounded_sampling_mask(self):
-        for params in ({"top_p": _TOP_P}, {"top_k": 65}, {"top_p": 1.0}):
+        for params in ({"top_p": _TOP_P, "min_p": 0.1}, {"top_k": 65}, {"top_p": 1.0}):
             with self.subTest(sampling_params=params):
                 response = self._post_generate(params)
                 self.assertEqual(response.status_code, 400, response.text)
