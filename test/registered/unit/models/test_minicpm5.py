@@ -43,32 +43,46 @@ def test_router_computes_logits_in_fp32_with_bf16_weights():
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
 
 
-def test_dspark_maps_to_the_next_attention_boundary():
+@pytest.fixture
+def dspark_target():
     model = MiniCPM5Model.__new__(MiniCPM5Model)
     nn.Module.__init__(model)
     model.layers_to_capture = []
     target = MiniCPM5ForCausalLM.__new__(MiniCPM5ForCausalLM)
     nn.Module.__init__(target)
-    target.pp_group = SimpleNamespace(is_last_rank=True)
+    target.pp_group = SimpleNamespace(world_size=1, is_last_rank=True)
     target.model = model
     target.capture_aux_hidden_states = False
+    return target
 
-    def configure(layer_ids):
-        configure_aux_hidden_state_capture(
-            model=target,
-            eagle_use_aux_hidden_state=False,
-            eagle_aux_hidden_state_layer_ids=None,
-            dflash_use_aux_hidden_state=True,
-            dflash_target_layer_ids=layer_ids,
-            is_dspark=True,
-        )
 
-    assert not target.capture_aux_hidden_states
+def configure_dspark_capture(target, layer_ids):
+    configure_aux_hidden_state_capture(
+        model=target,
+        eagle_use_aux_hidden_state=False,
+        eagle_aux_hidden_state_layer_ids=None,
+        dflash_use_aux_hidden_state=True,
+        dflash_target_layer_ids=layer_ids,
+        is_dspark=True,
+    )
+
+
+def test_dspark_maps_to_the_next_attention_boundary(dspark_target):
     with pytest.raises(ValueError, match="explicit layer_ids"):
-        configure(None)
-    configure([1, 7, 13, 19, 25])
-    assert target.capture_aux_hidden_states
-    assert model.layers_to_capture == [2, 8, 14, 20, 26]
+        configure_dspark_capture(dspark_target, None)
+    configure_dspark_capture(dspark_target, [1, 7, 13, 19, 25])
+    assert dspark_target.capture_aux_hidden_states
+    assert dspark_target.model.layers_to_capture == [2, 8, 14, 20, 26]
+
+
+@pytest.mark.parametrize("is_last_rank", [False, True], ids=["first", "last"])
+def test_dspark_rejects_pipeline_parallel_capture(dspark_target, is_last_rank):
+    """Earlier pipeline stages cannot forward their captured layers to the draft."""
+    dspark_target.pp_group = SimpleNamespace(world_size=2, is_last_rank=is_last_rank)
+    with pytest.raises(ValueError, match="DSpark.*pp_size=1"):
+        configure_dspark_capture(dspark_target, [1, 7, 13, 19, 25])
+    assert not dspark_target.capture_aux_hidden_states
+    assert dspark_target.model.layers_to_capture == []
 
 
 @pytest.mark.parametrize("layer_ids", [[27], [26, 27]])

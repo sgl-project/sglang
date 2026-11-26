@@ -701,6 +701,11 @@ class MiniCPM5ForCausalLM(nn.Module):
             layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
         self.set_dflash_layers_to_capture(layer_ids)
 
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if self.pp_group.world_size > 1:
+            raise ValueError("MiniCPM5 DSpark layer capture requires pp_size=1.")
+        self.set_dflash_layers_to_capture(layer_ids)
+
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:
             return
