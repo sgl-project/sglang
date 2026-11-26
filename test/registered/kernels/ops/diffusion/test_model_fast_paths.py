@@ -59,6 +59,11 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
+from sglang.multimodal_gen.configs.models.dits.ltx_2 import (
+    LTX2ArchConfig,
+    LTX2Config,
+    LTX2RopeType,
+)
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
     QwenImage21VAEArchConfig,
     QwenImage21VAEConfig,
@@ -168,10 +173,12 @@ from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=140, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=140, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # backend-specific: preserve ROCm eager fallback coverage for CUDA-only fusions.
 register_amd_ci(est_time=8, suite="nightly-kernel-test-1-gpu-amd", nightly=True)
 
@@ -1010,6 +1017,259 @@ def test_ltx2_qknorm_split_rope_hopper_site_is_quality_gated():
     assert LTX2_QKNORM_SPLIT_ROPE.is_enabled(attention)
     LTX2_QKNORM_SPLIT_ROPE.unmount(attention)
     assert not LTX2_QKNORM_SPLIT_ROPE.is_enabled(attention)
+
+
+@contextmanager
+def _ltx2_attention_env():
+    if not model_parallel_is_initialized():
+        ensure_distributed_env_defaults()
+        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+    with ExitStack() as stack:
+        for name, value in (
+            ("get_attn_backend", sdpa_backend.SDPABackend),
+            ("get_compute_dtype", torch.bfloat16),
+            ("get_sequence_parallel_world_size", 1),
+            ("get_ring_parallel_world_size", 1),
+            ("_resolve_sp_attention_mode", ("ulysses", False)),
+            ("_maybe_install_backend_autotune", None),
+        ):
+            stack.enter_context(patch.object(attn_layer, name, return_value=value))
+        stack.enter_context(set_forward_context(0, None))
+        yield
+
+
+def _ltx2_split_rope_reference(x, cos, sin):
+    x_dtype = x.dtype
+    batch = x.shape[0]
+    _, num_heads, seq_len, _ = cos.shape
+    last = 2 * cos.shape[-1]
+    x = x.reshape(batch, seq_len, num_heads, last).swapaxes(1, 2)
+    half = last // 2
+
+    split_x = x.reshape(*x.shape[:-1], 2, half)
+    first_x = split_x[..., :1, :]
+    second_x = split_x[..., 1:, :]
+    cos_u = cos.unsqueeze(-2)
+    sin_u = sin.unsqueeze(-2)
+
+    out = split_x * cos_u
+    out[..., :1, :].addcmul_(-sin_u, second_x)
+    out[..., 1:, :].addcmul_(sin_u, first_x)
+    out = out.reshape(*out.shape[:-2], last)
+    return (
+        out.swapaxes(1, 2).reshape(batch, seq_len, num_heads * last).to(dtype=x_dtype)
+    )
+
+
+def _ltx2_qknorm_rope_reference(
+    q,
+    k,
+    q_norm,
+    k_norm,
+    q_cos,
+    q_sin,
+    k_cos,
+    k_sin,
+    *,
+    eps,
+    **_kwargs,
+):
+    q_normalized = F.rms_norm(q.float(), (q.shape[-1],), q_norm.weight.float(), eps)
+    k_normalized = F.rms_norm(k.float(), (k.shape[-1],), k_norm.weight.float(), eps)
+    q_ref = _ltx2_split_rope_reference(q_normalized, q_cos, q_sin)
+    k_ref = _ltx2_split_rope_reference(k_normalized, k_cos, k_sin)
+    return q_ref.to(dtype=q.dtype), k_ref.to(dtype=k.dtype)
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_ltx2_model_qknorm_vibecuda_switch_executes_integrated_path(monkeypatch):
+    """The complete opt-in forward must match the upstream FP32 Q/K oracle."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("vibecuda LTX2 path requires SM100 or SM103")
+    torch.cuda.manual_seed(20261125)
+    batch, q_seq, k_seq, heads, head_dim = 1, 7, 5, 32, 64
+    hidden = heads * head_dim
+    with _ltx2_attention_env():
+        attention = ltx2_module.LTX2Attention(
+            query_dim=hidden,
+            context_dim=hidden,
+            heads=heads,
+            dim_head=head_dim,
+        ).to(device="cuda", dtype=torch.bfloat16)
+        attention.eval()
+        for linear in (
+            attention.to_q,
+            attention.to_k,
+            attention.to_v,
+            attention.to_out[0],
+        ):
+            linear.weight.normal_(0, hidden**-0.5)
+            linear.bias.zero_()
+        attention.q_norm.weight.normal_(1, 0.1)
+        attention.k_norm.weight.normal_(1, 0.1)
+
+        x = torch.randn(batch, q_seq, hidden, device="cuda", dtype=torch.bfloat16)
+        context = torch.randn(batch, k_seq, hidden, device="cuda", dtype=torch.bfloat16)
+        q_cos = torch.randn(
+            batch, q_seq, heads, head_dim // 2, device="cuda", dtype=torch.bfloat16
+        ).transpose(1, 2)
+        q_sin = torch.randn_like(q_cos)
+        k_cos = torch.randn(
+            batch, k_seq, heads, head_dim // 2, device="cuda", dtype=torch.bfloat16
+        ).transpose(1, 2)
+        k_sin = torch.randn_like(k_cos)
+        forward_kwargs = dict(
+            x=x, context=context, pe=(q_cos, q_sin), k_pe=(k_cos, k_sin)
+        )
+
+        reference_qk = []
+
+        def reference_dispatch(*args, **kwargs):
+            result = _ltx2_qknorm_rope_reference(*args, **kwargs)
+            reference_qk.append(result)
+            return result
+
+        with patch.object(
+            ltx2_module,
+            "_ltx2_try_fused_qknorm_split_rope",
+            side_effect=reference_dispatch,
+        ):
+            expected = attention(**forward_kwargs)
+
+        monkeypatch.setattr(ltx2_module, "_LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED", False)
+        actual_qk = []
+        real_dispatch = ltx2_module.ltx2_qknorm_split_rope_cuda
+
+        def capturing_dispatch(*args, **kwargs):
+            result = real_dispatch(*args, **kwargs)
+            actual_qk.append(result)
+            return result
+
+        with (
+            envs.SGLANG_USE_LTX2_QKNORM_SPLIT_ROPE_VIBECUDA.override(True),
+            patch.object(
+                ltx2_module,
+                "ltx2_qknorm_split_rope_cuda",
+                side_effect=capturing_dispatch,
+            ) as fused,
+        ):
+            actual = attention(**forward_kwargs)
+
+    assert fused.call_count == 1
+    assert fused.call_args.kwargs["backend"] == "vibecuda"
+    assert len(reference_qk) == len(actual_qk) == 1
+    for actual_side, expected_side in zip(actual_qk[0], reference_qk[0]):
+        assert torch.equal(actual_side, expected_side)
+    assert torch.equal(actual, expected)
+
+
+def _ltx2_tiny_split_rope_transformer():
+    arch = LTX2ArchConfig(
+        num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=32,
+        in_channels=16,
+        out_channels=16,
+        cross_attention_dim=64,
+        caption_channels=64,
+        audio_num_attention_heads=2,
+        audio_attention_head_dim=16,
+        audio_in_channels=16,
+        audio_out_channels=16,
+        audio_cross_attention_dim=32,
+        rope_type=LTX2RopeType.SPLIT,
+    )
+    model = ltx2_module.LTX2VideoTransformer3DModel(
+        LTX2Config(arch_config=arch), hf_config={}
+    ).to(device="cuda", dtype=torch.bfloat16)
+    model.eval()
+    for parameter in model.parameters():
+        parameter.normal_(0, 0.05)
+    return model
+
+
+def _ltx2_observe_model_dispatch(model, forward_kwargs):
+    real_dispatch = ltx2_module.ltx2_qknorm_split_rope_cuda
+    calls = []
+
+    def capturing_dispatch(*args, **kwargs):
+        result = real_dispatch(*args, **kwargs)
+        calls.append((kwargs["backend"], result))
+        return result
+
+    with patch.object(
+        ltx2_module,
+        "ltx2_qknorm_split_rope_cuda",
+        side_effect=capturing_dispatch,
+    ):
+        outputs = model(**forward_kwargs)
+    return outputs, calls
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_ltx2_model_qknorm_vibecuda_switch_executes_complete_transformer(monkeypatch):
+    """Every fused site in a complete transformer forward matches the FP32 oracle."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("vibecuda LTX2 path requires SM100 or SM103")
+    torch.cuda.manual_seed(20261126)
+    with _ltx2_attention_env():
+        model = _ltx2_tiny_split_rope_transformer()
+        encoder_mask = torch.ones(1, 6, device="cuda", dtype=torch.int64)
+        encoder_mask[:, 4:] = 0
+        forward_kwargs = dict(
+            hidden_states=torch.randn(1, 32, 16, device="cuda", dtype=torch.bfloat16),
+            audio_hidden_states=torch.randn(
+                1, 5, 16, device="cuda", dtype=torch.bfloat16
+            ),
+            encoder_hidden_states=torch.randn(
+                1, 6, 64, device="cuda", dtype=torch.bfloat16
+            ),
+            audio_encoder_hidden_states=torch.randn(
+                1, 6, 64, device="cuda", dtype=torch.bfloat16
+            ),
+            timestep=torch.tensor([500.0], device="cuda"),
+            encoder_attention_mask=encoder_mask,
+            audio_encoder_attention_mask=encoder_mask,
+            num_frames=2,
+            height=4,
+            width=4,
+            audio_num_frames=5,
+        )
+
+        reference_qk = []
+
+        def reference_dispatch(*args, **kwargs):
+            result = _ltx2_qknorm_rope_reference(*args, **kwargs)
+            reference_qk.append(result)
+            return result
+
+        with patch.object(
+            ltx2_module,
+            "_ltx2_try_fused_qknorm_split_rope",
+            side_effect=reference_dispatch,
+        ):
+            expected = model(**forward_kwargs)
+
+        monkeypatch.setattr(ltx2_module, "_LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED", False)
+        default, default_calls = _ltx2_observe_model_dispatch(model, forward_kwargs)
+        with envs.SGLANG_USE_LTX2_QKNORM_SPLIT_ROPE_VIBECUDA.override(True):
+            actual, actual_calls = _ltx2_observe_model_dispatch(model, forward_kwargs)
+        restored, restored_calls = _ltx2_observe_model_dispatch(model, forward_kwargs)
+
+    expected_calls = 4 * len(model.transformer_blocks)
+    assert len(reference_qk) == len(actual_calls) == expected_calls
+    assert [backend for backend, _ in actual_calls] == ["vibecuda"] * expected_calls
+    assert [backend for backend, _ in default_calls] == ["kda"] * expected_calls
+    assert [backend for backend, _ in restored_calls] == ["kda"] * expected_calls
+    for (_, actual_qk), expected_qk in zip(actual_calls, reference_qk, strict=True):
+        for actual_side, expected_side in zip(actual_qk, expected_qk, strict=True):
+            assert torch.equal(actual_side, expected_side)
+    for actual_output, expected_output in zip(actual, expected, strict=True):
+        assert torch.equal(actual_output, expected_output)
+    for restored_output, default_output in zip(restored, default, strict=True):
+        assert torch.equal(restored_output, default_output)
 
 
 def _ltx2_eager(rms, x, scale, shift, eps):

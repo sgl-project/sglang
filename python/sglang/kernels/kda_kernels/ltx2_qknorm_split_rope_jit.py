@@ -30,8 +30,10 @@ def _jit_ltx2_qknorm_split_rope_module(round_intermediates: bool = False) -> Mod
         cuda_wrappers=[
             (
                 "ltx2_qknorm_split_rope_pair",
-                f"{namespace}::LTX2QKNormSplitRopeKernel::run"
-                f"<{str(round_intermediates).lower()}>",
+                (
+                    f"{namespace}::LTX2QKNormSplitRopeKernel::run"
+                    f"<{str(round_intermediates).lower()}>"
+                ),
             )
         ],
     )
@@ -56,6 +58,39 @@ def _fake_impl(
     )
 
 
+def _ltx2_qknorm_split_rope_into(
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    q: torch.Tensor,
+    q_cos: torch.Tensor,
+    q_sin: torch.Tensor,
+    q_weight: torch.Tensor,
+    k: torch.Tensor,
+    k_cos: torch.Tensor,
+    k_sin: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    num_heads: int,
+    head_dim: int,
+    round_intermediates: bool,
+) -> None:
+    _jit_ltx2_qknorm_split_rope_module(round_intermediates).ltx2_qknorm_split_rope_pair(
+        q_out,
+        k_out,
+        q,
+        q_cos,
+        q_sin,
+        q_weight,
+        k,
+        k_cos,
+        k_sin,
+        k_weight,
+        float(eps),
+        int(num_heads),
+        int(head_dim),
+    )
+
+
 @register_custom_op(
     op_name="diffusion_ltx2_qknorm_split_rope",
     mutates_args=[],
@@ -77,8 +112,7 @@ def _ltx2_qknorm_split_rope_custom_op(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q_out = torch.empty_like(q, dtype=torch.bfloat16)
     k_out = torch.empty_like(k, dtype=torch.bfloat16)
-    module = _jit_ltx2_qknorm_split_rope_module(round_intermediates)
-    module.ltx2_qknorm_split_rope_pair(
+    _ltx2_qknorm_split_rope_into(
         q_out,
         k_out,
         q,
@@ -92,6 +126,7 @@ def _ltx2_qknorm_split_rope_custom_op(
         float(eps),
         int(num_heads),
         int(head_dim),
+        round_intermediates,
     )
     return q_out, k_out
 
@@ -127,6 +162,7 @@ def _supported_side(
         and x.shape[2] == num_heads * head_dim
         and x.shape[2] == weight.shape[0]
         and weight.ndim == 1
+        and weight.is_contiguous()
         and head_dim % 2 == 0
         and x.shape[2] % 4 == 0
         and cos.stride(-1) == 1
@@ -147,6 +183,27 @@ def _is_sm90(x: torch.Tensor) -> bool:
     return x.is_cuda and current_arch().is_sm(9, 0)
 
 
+def _validate_output_aliases(
+    out: tuple[torch.Tensor, torch.Tensor], inputs: tuple[torch.Tensor, ...]
+) -> None:
+    for output in out:
+        if not output.is_contiguous():
+            raise RuntimeError("LTX2 QKNorm split-RoPE outputs must be contiguous")
+    input_storages = {
+        value.untyped_storage().data_ptr() for value in inputs if value.numel() != 0
+    }
+    output_storages = set()
+    for output in out:
+        if output.numel() == 0:
+            continue
+        storage = output.untyped_storage().data_ptr()
+        if storage in input_storages or storage in output_storages:
+            raise RuntimeError(
+                "LTX2 QKNorm split-RoPE outputs must not alias inputs or each other"
+            )
+        output_storages.add(storage)
+
+
 def can_use_ltx2_qknorm_split_rope_cuda(
     q: torch.Tensor,
     q_cos: torch.Tensor,
@@ -160,7 +217,27 @@ def can_use_ltx2_qknorm_split_rope_cuda(
     num_heads: int,
     head_dim: int,
     allow_sm90: bool = False,
+    backend: str = "kda",
 ) -> bool:
+    if backend == "vibecuda":
+        from sglang.kernels.ops.diffusion.rope.ltx2_qknorm_split_rope_vibecuda_jit import (
+            can_use_ltx2_qknorm_split_rope_vibecuda,
+        )
+
+        return can_use_ltx2_qknorm_split_rope_vibecuda(
+            q,
+            q_cos,
+            q_sin,
+            q_weight,
+            k,
+            k_cos,
+            k_sin,
+            k_weight,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+    if backend != "kda":
+        raise ValueError(f"unknown LTX2 QKNorm split-RoPE backend: {backend!r}")
     return (
         (_is_sm100_or_newer(q) or (allow_sm90 and _is_sm90(q)))
         and _supported_side(
@@ -196,7 +273,32 @@ def ltx2_qknorm_split_rope_cuda(
     num_heads: int,
     head_dim: int,
     allow_sm90: bool = False,
+    backend: str = "kda",
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if backend == "vibecuda":
+        from sglang.kernels.ops.diffusion.rope.ltx2_qknorm_split_rope_vibecuda_jit import (
+            ltx2_qknorm_split_rope_vibecuda,
+        )
+
+        return ltx2_qknorm_split_rope_vibecuda(
+            q,
+            q_cos,
+            q_sin,
+            q_weight,
+            k,
+            k_cos,
+            k_sin,
+            k_weight,
+            eps=eps,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            out=out,
+        )
+    if out is not None:
+        _validate_output_aliases(
+            out, (q, q_cos, q_sin, q_weight, k, k_cos, k_sin, k_weight)
+        )
     if not can_use_ltx2_qknorm_split_rope_cuda(
         q,
         q_cos,
@@ -209,8 +311,29 @@ def ltx2_qknorm_split_rope_cuda(
         num_heads=num_heads,
         head_dim=head_dim,
         allow_sm90=allow_sm90,
+        backend=backend,
     ):
         raise RuntimeError("unsupported input for LTX2 QKNorm split-RoPE CUDA")
+    round_intermediates = allow_sm90 and _is_sm90(q)
+    if out is not None:
+        if torch.compiler.is_compiling():
+            raise RuntimeError("out= is supported for eager and CUDA Graph calls only")
+        _ltx2_qknorm_split_rope_into(
+            *out,
+            q,
+            q_cos,
+            q_sin,
+            q_weight,
+            k,
+            k_cos,
+            k_sin,
+            k_weight,
+            float(eps),
+            int(num_heads),
+            int(head_dim),
+            round_intermediates,
+        )
+        return out
     return _ltx2_qknorm_split_rope_custom_op(
         q,
         q_cos,

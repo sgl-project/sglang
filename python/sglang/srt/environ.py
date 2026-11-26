@@ -1746,6 +1746,8 @@ class Envs:
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    # Opt in to the SM100/SM103 VibeCUDA LTX2 QKNorm + split-RoPE kernel.
+    SGLANG_USE_LTX2_QKNORM_SPLIT_ROPE_VIBECUDA = EnvBool(False)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
 

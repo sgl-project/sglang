@@ -111,6 +111,7 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.FLYDSL: "forward_flydsl",
     KernelBackend.HELION: "forward_helion",
     KernelBackend.KDA: "forward_kda",
+    KernelBackend.VIBECUDA: "forward_vibecuda",
     KernelBackend.CAKE: "forward_cake",
     KernelBackend.PLUGIN: "forward_plugin",
     KernelBackend.FLASHINFER: "forward_flashinfer",
@@ -128,6 +129,7 @@ _METHOD_BACKEND_LABELS: Dict[str, str] = {
 # explicitly when wanted. Per-op priority overrides this (see BaseFusedOp).
 DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
     KernelBackend.KDA,
+    KernelBackend.VIBECUDA,
     KernelBackend.CAKE,
     KernelBackend.PLUGIN,
     KernelBackend.AOT,
