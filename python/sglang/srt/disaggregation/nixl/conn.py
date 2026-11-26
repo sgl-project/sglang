@@ -181,7 +181,9 @@ class _StateLayoutMismatch(ValueError):
 # A post NIXL rejected. NIXL may already have writes of the request on the wire
 # and does not wait for them, so the room must never be acked.
 class _NixlPostError(RuntimeError):
-    pass
+    def __init__(self, message, xfer_handle=None):
+        super().__init__(message)
+        self.xfer_handle = xfer_handle
 
 
 # Once one handle of a batch reports ERR, its siblings settle only when NIXL
@@ -720,7 +722,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             # buffer (no cross-worker contention on the staging ring).
             if self.enable_staging:
                 self._init_staging_prefill_ctx()
-                self._init_staging_buffers(len(self.transfer_queues))
+                self._staging_ctx.buffers = self._allocate_staging_buffers(
+                    len(self.transfer_queues)
+                )
             for i, queue in enumerate(self.transfer_queues):
                 staging_buffer = (
                     self._staging_ctx.buffers[i]
@@ -1011,12 +1015,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx = DecodeStagingContext()
         self._init_staging_allocator()
 
-    def _init_staging_buffers(self, count: int):
+    def _allocate_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
             init_staging_buffers,
         )
 
-        self._staging_ctx.buffers = init_staging_buffers(
+        return init_staging_buffers(
             self._register_staging_memory,
             self.kv_args,
             count,
@@ -1148,12 +1152,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         try:
             state = self.agent.transfer(xfer_handle)
         except Exception as e:
-            raise _NixlPostError(f"{error_msg}: {e}") from e
+            raise _NixlPostError(f"{error_msg}: {e}", xfer_handle) from e
         if state == "ERR":
-            raise _NixlPostError(error_msg)
+            raise _NixlPostError(error_msg, xfer_handle)
 
     def _await_handles(
-        self, handles: List[Any], *, failure_seen: bool
+        self, handles: List[Any], *, failure_seen: bool, ready_notifications=None
     ) -> Tuple[bool, bool]:
         """Poll until every handle settled. Returns ``(settled, any_failed)``.
 
@@ -1167,16 +1171,20 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         while True:
             all_settled = True
             any_failed = failure_seen
-            try:
-                for handle in handles:
+            for handle in handles:
+                try:
                     state = self.agent.check_xfer_state(handle)
-                    if state == "ERR":
-                        any_failed = True
-                    elif state != "DONE":
-                        all_settled = False
-            except Exception as e:
-                logger.warning(f"Failed to read NIXL transfer state: {e}")
-                return False, True
+                except Exception as e:
+                    logger.warning(f"Failed to read NIXL transfer state: {e}")
+                    return False, True
+                if state == "ERR":
+                    any_failed = True
+                elif state != "DONE":
+                    all_settled = False
+                elif ready_notifications:
+                    ready = ready_notifications.pop(id(handle), None)
+                    if ready is not None:
+                        self.send_chunk_ready(**ready)
             if all_settled:
                 return True, any_failed
             if not any_failed:
@@ -1715,6 +1723,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # The early-send wait is this thread's first device call; with no device
         # bound it opens a context on device 0 on every rank not on GPU 0.
         device_bound = False
+        # Retain source handles after failed batches. A subsequent staged chunk
+        # can reuse this worker's registered allocation once the WRITEs settle.
+        unsettled_staging = []
+        ambiguous_staging = []
+        alternate_staging = None
 
         while True:
             kv_chunk: TransferKVChunk = queue.get()
@@ -1722,6 +1735,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             handles: List[Any] = []
             settle_timed_out = False
             room_transfer_infos = None
+            staged_handles = []
+            rejected_staged_post = False
             try:
                 if room not in self.request_status:
                     logger.debug(
@@ -1804,48 +1819,47 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self._kv_packers[worker_index] if self.enable_kv_packing else None
                 )
 
-                reqs_to_be_processed = list(room_transfer_infos.values())
+                reqs_to_be_processed = [
+                    req
+                    for req in room_transfer_infos.values()
+                    if not req.is_dummy
+                    and (
+                        kv_chunk.pending_staging_peers is None
+                        or req.agent_name in kv_chunk.pending_staging_peers
+                    )
+                ]
                 # Note(kpham-sgl): Pack each DCP rank once into its fixed region.
                 # NIXL reads regions asynchronously; the chunk barrier prevents
                 # reuse until every transfer completes.
                 packed_source_by_dcp_rank = {}
 
-                # Set when staging allocation/watermark is not yet ready and
-                # the chunk has been re-enqueued. We then break out of the
-                # per-req loop and `continue` the worker main loop without
-                # touching room status -- the next pop will retry.
-                staging_deferred = False
-
                 for req in reqs_to_be_processed:
                     assert room == req.room
-                    if req.is_dummy:
-                        continue
-
-                    assert req.agent_name in self.decode_kv_args_table
-                    dst_info = self.decode_kv_args_table[req.agent_name]
-                    self.validate_aux_buffers(
-                        dst_info.dst_aux_ptrs, dst_info.dst_aux_item_lens
-                    )
-                    if dst_info.unified_layout_error:
-                        raise ValueError(dst_info.unified_layout_error)
-                    decode_tp_size = dst_info.decode_tp_size
+                    dst = self.decode_kv_args_table[req.agent_name]
+                    self.validate_aux_buffers(dst.dst_aux_ptrs, dst.dst_aux_item_lens)
+                    if dst.unified_layout_error:
+                        raise ValueError(dst.unified_layout_error)
                     if self.kv_shard_state_peer_only:
-                        # Every prefill rank checks, not only the state peer:
-                        # a decode that cannot pair would otherwise finish
-                        # without its state or with only some KV pages.
-                        kv_shard_mismatch = self._kv_shard_peer_mismatch(
-                            decode_tp_size
+                        mismatch = self._kv_shard_peer_mismatch(
+                            dst.decode_tp_size
                         ) or self._kv_shard_fan_in_mismatch(req.required_dst_info_num)
-                        if kv_shard_mismatch is not None:
-                            raise RuntimeError(kv_shard_mismatch)
+                        if mismatch is not None:
+                            raise RuntimeError(mismatch)
 
+                sources = {}
+                deferred_peers = set()
+                ready_on_done = {}
+                for i, req in enumerate(reqs_to_be_processed):
+                    dst_info = self.decode_kv_args_table[req.agent_name]
+                    decode_tp_size = dst_info.decode_tp_size
+                    src_prefill_kv_indices = kv_chunk.prefill_kv_indices
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
                     # Aux data is still sent below when is_last_chunk=True.
-                    if (
-                        len(kv_chunk.prefill_kv_indices) > 0
-                        and self.kv_args.kv_data_ptrs
-                    ):
+                    num_pages = (
+                        len(src_prefill_kv_indices) if self.kv_args.kv_data_ptrs else 0
+                    )
+                    if num_pages:
                         is_dcp_transfer = dst_info.requires_dcp_relayout
                         if is_dcp_transfer:
                             chunked_dst_kv_indice = req.dst_kv_indices
@@ -1856,56 +1870,57 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                             # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
                             # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                            if len(chunked_dst_kv_indice) < len(
-                                kv_chunk.prefill_kv_indices
-                            ):
+                            if len(chunked_dst_kv_indice) < num_pages:
                                 logger.warning(
                                     f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
                                 )
-                                kv_chunk.prefill_kv_indices = (
-                                    kv_chunk.prefill_kv_indices[
-                                        : len(chunked_dst_kv_indice)
-                                    ]
-                                )
+                                num_pages = len(chunked_dst_kv_indice)
+                                src_prefill_kv_indices = src_prefill_kv_indices[
+                                    :num_pages
+                                ]
 
-                        src_prefill_kv_indices = kv_chunk.prefill_kv_indices
-
+                    if num_pages:
                         # Decide which kv send path to use:
                         #   1. Staging (heterogeneous TP, both sides have
                         #      registered staging, watermark/alloc ready)
                         #   2. send_kvcache (MLA or homogeneous TP)
                         #   3. send_kvcache_slice (heterogeneous TP fallback,
                         #      or staging hard-failed for this chunk)
-                        use_staging = (
-                            self.enable_staging
-                            and staging_strategy is not None
-                            and not self.is_mla_backend
-                            and not self.is_hybrid_mla_backend
-                            and decode_tp_size != self.attn_tp_size
-                            and (
-                                dst_info.staging_base_ptr != 0
-                                or dst_info.staging_total_size != 0
-                            )
+                        use_staging = staging_strategy is not None and self._can_stage(
+                            dst_info
                         )
 
                         kv_xfer_handle = None
                         if use_staging:
-                            kv_xfer_handle, deferred, staging_chunk_idx = (
-                                self._do_staging_transfer(
-                                    staging_strategy,
-                                    kv_chunk,
-                                    src_prefill_kv_indices,
-                                    req,
-                                    dst_info,
-                                    queue,
+                            if unsettled_staging or ambiguous_staging:
+                                staging_buffer, alternate_staging = (
+                                    self._recover_staging_source(
+                                        staging_buffer,
+                                        unsettled_staging,
+                                        ambiguous_staging,
+                                        alternate_staging,
+                                    )
                                 )
-                            )
+                                staging_strategy.staging_buffer = staging_buffer
+                                unsettled_staging, ambiguous_staging = [], []
+                            try:
+                                kv_xfer_handle, deferred, staging_chunk_idx = (
+                                    self._do_staging_transfer(
+                                        staging_strategy,
+                                        kv_chunk,
+                                        src_prefill_kv_indices,
+                                        req,
+                                        dst_info,
+                                        sources.get(req.agent_name, staging_buffer),
+                                    )
+                                )
+                            except _NixlPostError:
+                                rejected_staged_post = True
+                                raise
                             if deferred:
-                                # Chunk re-enqueued; stop processing remaining
-                                # reqs for this chunk and let the worker loop
-                                # pick it up again on the next pop.
-                                staging_deferred = True
-                                break
+                                deferred_peers.add(req.agent_name)
+                                continue
+                            staged_handles.append(kv_xfer_handle)
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
@@ -1992,26 +2007,44 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         if kv_xfer_handle is not None:
                             handles.append(kv_xfer_handle)
                             if use_staging:
-                                # The next peer may gather into the same source
-                                # staging buffer. Wait before reusing it and
-                                # before allowing decode to scatter this write.
-                                settled, failed = self._await_handles(
-                                    [kv_xfer_handle], failure_seen=False
-                                )
-                                if not settled:
-                                    settle_timed_out = True
-                                if not settled or failed:
-                                    raise RuntimeError(
-                                        f"NIXL staging transfer failed room={room}"
-                                    )
-                                self.send_chunk_ready(
+                                ready = dict(
                                     room=room,
                                     chunk_idx=staging_chunk_idx,
                                     page_start=kv_chunk.index_slice.start,
-                                    num_pages=len(kv_chunk.prefill_kv_indices),
+                                    num_pages=len(src_prefill_kv_indices),
                                     writer_id=req.agent_name,
                                     targets=[(req.endpoint, req.dst_port)],
                                 )
+                                state = self.agent.check_xfer_state(kv_xfer_handle)
+                                if state == "ERR":
+                                    raise RuntimeError(
+                                        f"NIXL staging transfer failed room={room}"
+                                    )
+                                if state != "DONE" and not sources:
+                                    # A fast WRITE leaves the full source available.
+                                    # Plan disjoint views only while the NIC is still
+                                    # reading this peer's slice at offset zero.
+                                    sources = self._staging_views(
+                                        staging_buffer,
+                                        kv_chunk,
+                                        reqs_to_be_processed[i:],
+                                    )
+                                if state != "DONE" and req.agent_name in sources:
+                                    ready_on_done[id(kv_xfer_handle)] = ready
+                                else:
+                                    if state != "DONE":
+                                        settled, failed = self._await_handles(
+                                            [kv_xfer_handle], failure_seen=False
+                                        )
+                                        if not settled:
+                                            settle_timed_out = True
+                                        if not settled or failed:
+                                            raise RuntimeError(
+                                                f"NIXL staging transfer failed room={room}"
+                                            )
+                                    # Start decode scatter before the next gather.
+                                    handles.pop()
+                                    self.send_chunk_ready(**ready)
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
@@ -2053,7 +2086,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
-                settled, any_failed = self._await_handles(handles, failure_seen=False)
+                settled, any_failed = self._await_handles(
+                    handles, failure_seen=False, ready_notifications=ready_on_done
+                )
                 if not settled:
                     settle_timed_out = True
                     raise RuntimeError(
@@ -2063,9 +2098,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if any_failed:
                     raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
 
-                if staging_deferred:
-                    # Drain posted writes before the retry reuses this worker's
-                    # packing buffers; the re-enqueued chunk stays counted.
+                if deferred_peers:
+                    # Each remote ring has its own watermark. Done peers have
+                    # received both KV and any last-chunk aux. Retry the rest.
+                    kv_chunk.pending_staging_peers = deferred_peers
+                    with self._staging_ctx.watermark_cv:
+                        self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
+                    queue.put(kv_chunk)
                     continue
                 # Clear with the decrement: the failure path below reads this
                 # flag, so a raise after this point must not uncount twice.
@@ -2116,6 +2155,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 notify = False
                 if not settle_timed_out:
                     notify, _ = self._await_handles(handles, failure_seen=True)
+                if not notify:
+                    unsettled_staging.extend(staged_handles)
+                if rejected_staged_post and not self._staging_sources_settled(
+                    (), (e.xfer_handle,)
+                ):
+                    # The rejected handle is absent from the sibling drain above.
+                    # Preserve its source AND withhold Failed/ACK: either message
+                    # can allow decode to reclaim a destination still being written.
+                    ambiguous_staging.append(e.xfer_handle)
+                    notify = False
                 if notify:
                     if (
                         isinstance(e, _NixlPostError)
@@ -2141,7 +2190,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self.update_status(room, KVPoll.Failed)
                     # This chunk stays counted in _staging_outstanding, so no
                     # drain ACK can follow; discard the target and fall back to
-                    # the timeout.
+                    # the timeout. Decode's own deadline cannot fence a late WRITE.
                     self.poison_deferred_ack_room(room)
                 # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
                 # room_transfer_infos survives the sender's clear() of this room.
@@ -2776,6 +2825,100 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             handles=handles,
         )
 
+    def _can_stage(self, dst_info):
+        return (
+            self.enable_staging
+            and not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and dst_info.decode_tp_size != self.attn_tp_size
+            and (dst_info.staging_base_ptr != 0 or dst_info.staging_total_size != 0)
+        )
+
+    def _staging_sources_settled(self, handles, ambiguous):
+        try:
+            return all(
+                self.agent.check_xfer_state(h) in ("DONE", "ERR") for h in handles
+            ) and all(
+                h is not None and self.agent.check_xfer_state(h) == "DONE"
+                for h in ambiguous
+            )
+        except Exception:
+            return False
+
+    def _recover_staging_source(self, current, posted, rejected, alternate):
+        # Accepted transfers settle on DONE or ERR. A rejected POST may have
+        # partially issued; only DONE proves that its source can be overwritten.
+        if self._staging_sources_settled(posted, rejected):
+            return current, alternate
+        if alternate is None:
+            (replacement,) = self._allocate_staging_buffers(1)
+            # Pin both registered allocations for the lifetime of the manager,
+            # just like the original per-worker sources.
+            self._staging_ctx.buffers.append(replacement)
+        else:
+            replacement, old_posted, old_rejected = alternate
+            if not self._staging_sources_settled(old_posted, old_rejected):
+                raise RuntimeError(
+                    "Both NIXL worker staging buffers have unsettled WRITEs"
+                )
+        # Keep the old handles with their source. Only this worker can rotate it
+        # back in, and only after all its WRITEs have settled.
+        return replacement, (current, posted, rejected)
+
+    def _staging_views(self, buffer, chunk, peers):
+        """Partition the registered source when every destination fits."""
+        if (
+            len(peers) < 2
+            or not len(chunk.prefill_kv_indices)
+            or not self.kv_args.kv_data_ptrs
+        ):
+            return {}
+        regions = {}
+        offset = 0
+        for req in peers:
+            dst = self.decode_kv_args_table[req.agent_name]
+            if not self._can_stage(dst):
+                continue
+            pages = len(chunk.prefill_kv_indices)
+            if not dst.requires_dcp_relayout:
+                pages = min(pages, len(req.dst_kv_indices[chunk.index_slice]))
+            if not pages:
+                continue
+            _, _, size = self._staging_source_slice(
+                dst.decode_tp_rank, dst.decode_tp_size, pages
+            )
+            if not size or offset + size > buffer.get_size():
+                return {}
+            regions[req.agent_name] = (offset, size)
+            offset = (offset + size + 255) // 256 * 256
+        if len(regions) < 2:
+            return {}
+        return {peer: buffer.view(off, size) for peer, (off, size) in regions.items()}
+
+    def _staging_source_slice(self, dst_rank, dst_tp, pages):
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+            resolve_total_kv_heads,
+        )
+
+        kv = self.kv_buffer_tensors
+        k = kv["k_buffers"]
+        total_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
+        local_rank = self.kv_args.engine_rank % self.attn_tp_size
+        head_start, num_heads, _, _ = compute_head_slice_params(
+            self.attn_tp_size, dst_tp, local_rank, dst_rank, total_heads
+        )
+        size = (
+            pages
+            * kv["page_size"]
+            * num_heads
+            * k[0].shape[-1]
+            * k[0].element_size()
+            * len(k)
+            * 2
+        )
+        return head_start, num_heads, size
+
     def send_kvcache_staged(
         self,
         peer_name: str,
@@ -2790,7 +2933,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     ):
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
-            compute_head_slice_params,
             compute_staging_layout,
             gather_all_layers_to_staging,
             resolve_total_kv_heads,
@@ -2809,18 +2951,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         total_kv_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
 
         local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
-        src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
-            self.attn_tp_size,
-            dst_attn_tp_size,
-            local_tp_rank,
-            dst_tp_rank,
-            total_kv_heads,
+        src_head_start, num_heads_to_send, per_rank_bytes = self._staging_source_slice(
+            dst_tp_rank, dst_attn_tp_size, len(prefill_kv_indices)
         )
-
         num_tokens = len(prefill_kv_indices) * page_size
-        per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
-        per_rank_bytes = per_layer_bytes * num_layers * 2
-
         num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
             dst_attn_tp_size,
@@ -2907,28 +3041,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         src_prefill_kv_indices: npt.NDArray[np.int32],
         req: TransferInfo,
         dst_info: KVArgsRegisterInfo,
-        queue: FastQueue,
+        staging_buffer,
     ):
-        """Attempt staging transfer. Returns (xfer_handle, deferred, chunk_idx).
-
-        Mirrors mooncake._do_staging_transfer semantics:
-          - staging not ready (watermark/alloc pending) -> ``queue.put(kv_chunk)``
-            re-enqueue the chunk and return ``(None, True, chunk_idx)``. Caller should
-            ``break`` out of the per-req loop and ``continue`` the worker
-            main loop without updating room status -- the chunk will be
-            retried on the next pop.
-          - oversized chunk (will never fit) -> raise RuntimeError.
-          - staging successfully posted -> return ``(handle, False, chunk_idx)``.
-            The caller waits for DONE before reusing its staging buffer and
-            sending ZMQ CHUNK_READY.
-          - send_kvcache_staged returned None (chunk cannot fit; decode buffer
-            too small, kv_buffer_tensors missing, etc.) -> raise RuntimeError
-            instead of falling back to the slice path.
-        """
+        num_pages = len(src_prefill_kv_indices)
         page_start = kv_chunk.index_slice.start
-        num_pages = len(kv_chunk.prefill_kv_indices)
-
-        ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
+        ready, chunk_idx, c_offset, _, c_end = staging_strategy.check_ready(
             req, page_start, num_pages, session_id=req.agent_name
         )
         if not ready:
@@ -2943,24 +3060,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     f"(room={kv_chunk.room}). Increase "
                     f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
-            # Not ready yet: wait (bounded) for a watermark advance, then
-            # re-enqueue to retry. A plain block-until-ready would head-of-line
-            # block other rooms on this single worker thread.
-            with self._staging_ctx.watermark_cv:
-                self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
-            queue.put(kv_chunk)
-            return (None, True, chunk_idx)
+            return None, True, chunk_idx
 
+        if not 0 <= c_offset < c_end <= dst_info.staging_total_size:
+            raise ValueError(
+                f"Invalid decode staging reservation [{c_offset}, {c_end}) "
+                f"for room {kv_chunk.room}, chunk {chunk_idx}, "
+                f"pool size {dst_info.staging_total_size}"
+            )
         handle = self.send_kvcache_staged(
             req.agent_name,
             src_prefill_kv_indices,
             dst_info.staging_base_ptr + c_offset,
-            dst_info.staging_total_size - c_offset,
+            c_end - c_offset,
             dst_info.gpu_id,
             dst_info.decode_tp_rank,
             dst_info.decode_tp_size,
             dst_info.dst_kv_item_len,
-            staging_buffer=staging_strategy.staging_buffer,
+            staging_buffer=staging_buffer,
         )
         if handle is None:
             # A silent slice fallback would leak this chunk's decode-side
@@ -2973,7 +3090,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB or reduce "
                 f"chunked_prefill_size."
             )
-        return (handle, False, chunk_idx)
+        return handle, False, chunk_idx
 
     def send_aux(
         self,

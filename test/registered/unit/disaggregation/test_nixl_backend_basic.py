@@ -7,6 +7,7 @@ import threading
 import types
 import unittest
 from collections import defaultdict
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -894,7 +895,7 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.send_chunk_ready = MagicMock()
         return mgr
 
-    def _run_staging_worker(self, mgr, chunks):
+    def _run_staging_worker(self, mgr, chunks, staging_buffer=None):
         pending = list(chunks)
 
         def get():
@@ -904,7 +905,554 @@ class TestNixlTransferWorker(CustomTestCase):
 
         queue = SimpleNamespace(get=get, put=pending.append)
         with self.assertRaises(SystemExit):
-            mgr.transfer_worker(queue, staging_buffer=object())
+            mgr.transfer_worker(
+                queue,
+                staging_buffer=(
+                    staging_buffer if staging_buffer is not None else object()
+                ),
+            )
+
+    def _two_staged_peers(self, room):
+        mgr = self._make_staging_manager(room)
+        requests = mgr.transfer_infos[room]
+        requests["other"] = TransferInfo(
+            **{**vars(requests["agent"]), "agent_name": "other", "dst_port": 5556}
+        )
+        peer = mgr.decode_kv_args_table["agent"]
+        peer.decode_tp_rank = 0
+        peer.staging_total_size = 4096
+        peer.dst_kv_item_len = 4
+        mgr.decode_kv_args_table["other"] = SimpleNamespace(
+            **{**vars(peer), "decode_tp_rank": 1, "staging_base_ptr": 0xA000}
+        )
+        return mgr
+
+    def test_staged_fanout_reads_each_head_from_its_own_source_until_done(self):
+        import torch
+
+        from sglang.srt.disaggregation.common import staging_buffer as staging
+
+        # Two pages of two tokens each. Distinct layer, token, head, K/V
+        # values expose an incorrect source offset or a premature slot reuse.
+        keys = [
+            torch.arange(24, dtype=torch.uint8).reshape(6, 2, 2) + i * 32
+            for i in range(2)
+        ]
+        values = [k + 96 for k in keys]
+        pages = [2, 0]
+        payload_size = 32
+        for buf_size in (4096, payload_size):
+            overlap = buf_size > payload_size
+            with self.subTest(buf_size=buf_size):
+                mgr = self._two_staged_peers(27)
+                mgr.kv_args.total_kv_head_num = 2
+                mgr.kv_args.page_size = 2
+                mgr.kv_buffer_tensors = dict(
+                    k_buffers=keys, v_buffers=values, page_size=2
+                )
+                # Only device allocation and stream operations are mocked. Use
+                # the torch gather, byte views and NIXL descriptors from production.
+                buf = object.__new__(staging.StagingBuffer)
+                buf.buffer = torch.empty(buf_size, dtype=torch.uint8)
+                buf.device, buf.device_module = buf.buffer.device, torch.cpu
+                buf.gpu_id, buf.data_ptr, buf.size_bytes = (
+                    0,
+                    buf.buffer.data_ptr(),
+                    buf_size,
+                )
+                buf._gather_stream = MagicMock()
+                strategy = MagicMock(staging_buffer=buf)
+
+                strategy.check_ready.return_value = (
+                    True,
+                    0,
+                    128,
+                    0,
+                    128 + payload_size,
+                )
+                mgr._try_create_staging_strategy.return_value = strategy
+                writes, completed, posted, received = {}, [], [], {}
+                notifications = []
+                pending_polls = []
+
+                def init_xfer(op, src, dst, peer):
+                    self.assertEqual(op, "WRITE")
+                    writes[peer] = (src, dst)
+                    return peer
+
+                def finish(peer):
+                    if peer in received:
+                        return
+                    src, _ = writes[peer]
+                    offset = int(src[0, 0]) - buf.get_ptr()
+                    count = int(src[0, 1])
+                    received[peer] = bytes(buf.buffer[offset : offset + count].tolist())
+                    completed.append(peer)
+
+                def state(peer):
+                    if peer not in writes:  # auxiliary last-chunk metadata
+                        return "DONE"
+                    if peer == "agent" and "other" not in completed:
+                        # Force the first poll to observe an active WRITE. In the
+                        # one-slot case it completes on the next poll. Bound the
+                        # delay to make a serial regression fail without hanging.
+                        pending_polls.append(peer)
+                        if len(pending_polls) <= (3 if overlap else 1):
+                            return "PROC"
+                    finish(peer)
+                    return "DONE"
+
+                mgr.agent = SimpleNamespace(
+                    get_xfer_descs=lambda desc, kind: desc,
+                    initialize_xfer=init_xfer,
+                    transfer=lambda peer: posted.append(peer) or "PROC",
+                    check_xfer_state=state,
+                )
+                mgr.send_chunk_ready.side_effect = lambda **kw: notifications.append(
+                    (kw["writer_id"], kw["writer_id"] in received, kw["targets"])
+                )
+                chunk = self._make_chunk(27, pages, is_last_chunk=True)
+                with (
+                    patch.object(staging, "_USE_TRITON_STAGING", False),
+                    patch.object(
+                        staging, "device_stream_context", return_value=nullcontext()
+                    ),
+                ):
+                    self._run_staging_worker(mgr, [chunk], staging_buffer=buf)
+
+                self.assertEqual(posted, ["agent", "other"])
+                self.assertEqual(completed, ["other", "agent"] if overlap else posted)
+                for rank, peer in enumerate(posted):
+                    expected = torch.cat(
+                        [t[[4, 5, 0, 1], rank].flatten() for t in keys + values]
+                    )
+                    self.assertEqual(received[peer], bytes(expected.tolist()))
+                    self.assertEqual(
+                        int(writes[peer][1][0, 0]),
+                        mgr.decode_kv_args_table[peer].staging_base_ptr + 128,
+                    )
+                self.assertEqual([n[0] for n in notifications], completed)
+                self.assertCountEqual(
+                    notifications,
+                    [
+                        ("agent", True, [("127.0.0.1", 5555)]),
+                        ("other", True, [("127.0.0.1", 5556)]),
+                    ],
+                )
+                self.assertEqual(
+                    [c.args[0] for c in mgr.send_aux.call_args_list], posted
+                )
+                self.assertEqual(mgr.request_status[27], KVPoll.Success)
+
+    def test_staged_writers_stay_within_the_decode_reservation(self):
+        import torch
+
+        from sglang.srt.disaggregation.common import staging_buffer as staging
+
+        mgr = self._two_staged_peers(38)
+        mgr.agent = StagingFakeAgent()
+        mgr.attn_tp_size = mgr.kv_args.total_kv_head_num = 2
+        kv = torch.empty((2, 1, 4), dtype=torch.uint8)
+        mgr.kv_buffer_tensors = dict(k_buffers=[kv], v_buffers=[kv], page_size=2)
+        req = mgr.transfer_infos[38]["agent"]
+        dst = mgr.decode_kv_args_table["agent"]
+        dst.decode_tp_size = 1
+        chunk = self._make_chunk(38, [0], False)
+        source = MagicMock()
+        source.fits.return_value = True
+        source.get_ptr.return_value = 0x2000
+        strategy = MagicMock()
+
+        def transfer(offset, end):
+            strategy.check_ready.return_value = (True, 0, offset, 1, end)
+            return mgr._do_staging_transfer(
+                strategy, chunk, chunk.prefill_kv_indices, req, dst, source
+            )
+
+        with patch.object(staging, "gather_all_layers_to_staging") as gather:
+            # The pool has 4096 bytes. Even writer 0 must reject a slot
+            # containing just its own 16 bytes when the two writers need 32.
+            with self.assertRaisesRegex(RuntimeError, "cannot fit chunk"):
+                transfer(128, 144)
+            for offset, end in ((128, 128), (144, 128), (128, 4097), (-1, 31)):
+                with (
+                    self.subTest(offset=offset, end=end),
+                    self.assertRaises(ValueError),
+                ):
+                    transfer(offset, end)
+            gather.assert_not_called()
+            self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+            for rank in range(2):
+                mgr.kv_args.engine_rank = rank
+                handle, deferred, chunk_idx = transfer(128, 160)
+                self.assertEqual((handle, deferred, chunk_idx), ("handle", False, 0))
+                dst_desc, _ = mgr.agent.get_xfer_descs_calls[-1]
+                self.assertEqual(
+                    dst_desc.tolist(),
+                    [[dst.staging_base_ptr + 128 + rank * 16, 16, dst.gpu_id]],
+                )
+
+    def _two_room_fanout(self, room):
+        mgr = self._two_staged_peers(room)
+        next_room = room + 1
+        mgr.transfer_infos[next_room] = {
+            name: TransferInfo(**{**vars(req), "room": next_room})
+            for name, req in mgr.transfer_infos[room].items()
+        }
+        mgr.request_status[next_room] = KVPoll.WaitingForInput
+        mgr.req_to_decode_prefix_len[next_room] = 0
+        mgr._reload_invalidated_peers = MagicMock()
+        mgr._staging_source_slice = MagicMock(return_value=(0, 1, 32))
+        buffer = MagicMock()
+        buffer.get_size.return_value = 4096
+        strategy = MagicMock(staging_buffer=buffer)
+        strategy.check_ready.return_value = (True, 0, 0, 0, 32)
+        mgr._try_create_staging_strategy.return_value = strategy
+        return mgr, buffer, strategy
+
+    def test_staged_fanout_notifies_fast_peer_before_gathering_the_next(self):
+        room = 37
+        mgr, buffer, _ = self._two_room_fanout(room)
+        events = []
+
+        def send(peer, *_args, staging_buffer):
+            self.assertIs(staging_buffer, buffer)
+            events.append(("gather", peer))
+            return peer
+
+        mgr.send_kvcache_staged = send
+        mgr.send_chunk_ready.side_effect = lambda **kw: events.append(
+            ("ready", kw["writer_id"])
+        )
+        self._run_staging_worker(
+            mgr, [self._make_chunk(room, [0], True)], staging_buffer=buffer
+        )
+        self.assertEqual(
+            events,
+            [
+                ("gather", "agent"),
+                ("ready", "agent"),
+                ("gather", "other"),
+                ("ready", "other"),
+            ],
+        )
+        buffer.view.assert_not_called()
+        self.assertEqual(mgr.request_status[room], KVPoll.Success)
+
+    def test_staged_fanout_progresses_across_opposite_per_peer_watermarks(self):
+        # Each decode rank has one slot. The second reservation becomes
+        # writable only after that rank scatters the first from CHUNK_READY.
+        rooms = (30, 31)
+        mgr, buffer, strategy = self._two_room_fanout(rooms[0])
+        order = {"agent": list(rooms), "other": list(reversed(rooms))}
+        delivered = []
+        writes = []
+        completed_aux = []
+
+        def ready(req, _start, _count, *, session_id):
+            if strategy.check_ready.call_count > 16:
+                raise AssertionError("staging worker made no progress")
+            active = order[session_id]
+            return bool(active and active[0] == req.room), 0, 0, 0, 32
+
+        def chunk_ready(*, room, writer_id, **kwargs):
+            self.assertEqual(order[writer_id].pop(0), room)
+            delivered.append((room, writer_id))
+
+        def send(peer, indices, *args, **kwargs):
+            transfer = int(indices[0]), peer
+            writes.append(transfer)
+            return ("kv", *transfer)
+
+        def state(handle):
+            kind, room, peer = handle
+            if kind == "aux":
+                completed_aux.append((room, peer))
+            return "DONE"
+
+        def status(*, bootstrap_room, status, **kwargs):
+            self.assertEqual(status, KVPoll.Success)
+            for peer in order:
+                self.assertIn((bootstrap_room, peer), delivered)
+                self.assertIn((bootstrap_room, peer), completed_aux)
+
+        strategy.check_ready.side_effect = ready
+        mgr.send_kvcache_staged = send
+        mgr.send_chunk_ready.side_effect = chunk_ready
+        mgr.send_aux.side_effect = lambda peer, room, *_: ("aux", room, peer)
+        mgr.send_kv_status_message.side_effect = status
+        mgr.agent.check_xfer_state.side_effect = state
+        chunks = [self._make_chunk(room, [room], True) for room in rooms]
+        for chunk in chunks:
+            chunk.prefill_aux_index = chunk.room
+        self._run_staging_worker(mgr, chunks, staging_buffer=buffer)
+        expected = [(room, peer) for room in rooms for peer in order]
+        self.assertCountEqual(writes, expected)
+        self.assertCountEqual(delivered, expected)
+        self.assertCountEqual(
+            [(c.args[1], c.args[0]) for c in mgr.send_aux.call_args_list], expected
+        )
+        self.assertEqual(mgr.send_kv_status_message.call_count, len(rooms))
+        self.assertTrue(all(mgr.request_status[r] == KVPoll.Success for r in rooms))
+        self.assertFalse(mgr._staging_outstanding)
+
+    def test_staged_fanout_sends_last_chunk_aux_when_one_peer_has_no_pages(self):
+        room = 33
+        mgr, buffer, strategy = self._two_room_fanout(room)
+        mgr.transfer_infos[room]["agent"].dst_kv_indices = np.array([], dtype=np.int32)
+        mgr.send_kvcache_staged = MagicMock(return_value="kv-other")
+        self._run_staging_worker(
+            mgr, [self._make_chunk(room, [0], True)], staging_buffer=buffer
+        )
+        self.assertEqual(
+            [c.kwargs["session_id"] for c in strategy.check_ready.call_args_list],
+            ["other"],
+        )
+        mgr.send_kvcache_staged.assert_called_once()
+        self.assertEqual(mgr.send_kvcache_staged.call_args.args[0], "other")
+        self.assertEqual(mgr.send_chunk_ready.call_args.kwargs["writer_id"], "other")
+        self.assertCountEqual(
+            [c.args[0] for c in mgr.send_aux.call_args_list], ["agent", "other"]
+        )
+        self.assertEqual(mgr.request_status[room], KVPoll.Success)
+
+    def test_staged_fanout_rejects_invalid_peer_with_pending_reservation(self):
+        mgr, buffer, strategy = self._two_room_fanout(32)
+        mgr.decode_kv_args_table["agent"].unified_layout_error = "rejected peer layout"
+
+        def ready(req, *args, **kwargs):
+            if strategy.check_ready.call_count > 4:
+                raise AssertionError("worker kept waiting for incompatible peer")
+            return req.agent_name != "agent", 0, -1, 0, 32
+
+        strategy.check_ready.side_effect = ready
+        mgr.send_kvcache_staged = MagicMock()
+        self._run_staging_worker(
+            mgr, [self._make_chunk(32, [0], True)], staging_buffer=buffer
+        )
+        self.assertEqual(mgr.failure_records[32], "rejected peer layout")
+        mgr.send_kvcache_staged.assert_not_called()
+        mgr.send_aux.assert_not_called()
+
+    @staticmethod
+    def _cpu_staging_source():
+        # Backing memory is shared by views of this source, independent across
+        # allocations. The POST fake may inspect these bytes much later.
+        raw = memoryview(bytearray(512))
+        return SimpleNamespace(
+            raw=raw,
+            get_size=lambda: len(raw),
+            view=lambda offset, size: SimpleNamespace(raw=raw[offset : offset + size]),
+        )
+
+    def test_staged_fanout_keeps_source_after_ambiguous_post(self):
+        from sglang.srt.disaggregation.nixl.conn import _NixlPostError
+
+        room, next_room = 34, 35
+        for deferred_release in (False, True):
+            with self.subTest(deferred_release=deferred_release):
+                mgr, _, _ = self._two_room_fanout(room)
+                mgr.enable_deferred_decode_kv_release = deferred_release
+                mgr.poison_deferred_ack_room = MagicMock()
+                mgr._maybe_ack_drained_abort = MagicMock()
+                source = self._cpu_staging_source()
+                spare = self._cpu_staging_source()
+                mgr._staging_ctx.buffers = [source]
+                mgr._allocate_staging_buffers = MagicMock(return_value=[spare])
+                posted = {}
+                completed = []
+
+                def send(peer, indices, *_args, staging_buffer):
+                    r = int(indices[0])
+                    payload = bytes([r, int(peer == "other")]) * 16
+                    window = staging_buffer.raw[: len(payload)]
+                    window[:] = payload
+                    posted[r, peer] = (window, payload)
+                    if r == room and peer == "other":
+                        raise _NixlPostError("partially posted", (r, peer))
+                    return r, peer
+
+                def state(handle):
+                    if handle == (room, "other"):
+                        return "ERR"
+                    if handle == (room, "agent") and (room, "other") not in posted:
+                        return "PROC"
+                    if handle in posted:
+                        completed.append(handle)
+                    return "DONE"
+
+                mgr.send_kvcache_staged = send
+                mgr.agent.check_xfer_state.side_effect = state
+                chunks = [self._make_chunk(r, [r], True) for r in (room, next_room)]
+                self._run_staging_worker(mgr, chunks, staging_buffer=source)
+                self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+                self.assertEqual(mgr.request_status[next_room], KVPoll.Success)
+                self.assertIn((room, "agent"), completed)
+                self.assertEqual(mgr._staging_outstanding[room], 1)
+                mgr._allocate_staging_buffers.assert_called_once_with(1)
+                self.assertEqual(len(mgr._staging_ctx.buffers), 2)
+                self.assertIs(mgr._staging_ctx.buffers[0], source)
+                self.assertIs(mgr._staging_ctx.buffers[1], spare)
+                mgr.poison_deferred_ack_room.assert_called_once_with(room)
+                self.assertNotIn(
+                    (room,),
+                    [c.args for c in mgr._maybe_ack_drained_abort.call_args_list],
+                )
+                self.assertCountEqual(
+                    [
+                        (c.kwargs["room"], c.kwargs["writer_id"])
+                        for c in mgr.send_chunk_ready.call_args_list
+                    ],
+                    [(next_room, "agent"), (next_room, "other")],
+                )
+                # Re-read the ambiguous WRITE's source after a complete healthy
+                # room. A GPU/NIC could still be reading it at this time.
+                ambiguous_window, expected = posted[room, "other"]
+                self.assertIs(ambiguous_window.obj, source.raw.obj)
+                self.assertEqual(bytes(ambiguous_window), expected)
+                for peer in ("agent", "other"):
+                    self.assertIs(posted[next_room, peer][0].obj, spare.raw.obj)
+                mgr.send_kv_status_message.assert_called_once()
+                self.assertEqual(
+                    mgr.send_kv_status_message.call_args.kwargs["bootstrap_room"],
+                    next_room,
+                )
+                self.assertEqual(
+                    mgr.send_kv_status_message.call_args.kwargs["status"],
+                    KVPoll.Success,
+                )
+
+    def test_fanout_retains_unsettled_staging_across_rooms(self):
+        from sglang.srt.disaggregation.nixl.conn import _NixlPostError
+
+        first, second, blocked, recovered = 28, 29, 30, 31
+        mgr, _, _ = self._two_room_fanout(first)
+        for room in (blocked, recovered):
+            mgr.transfer_infos[room] = {
+                name: TransferInfo(**{**vars(req), "room": room})
+                for name, req in mgr.transfer_infos[first].items()
+            }
+            mgr.request_status[room] = KVPoll.WaitingForInput
+            mgr.req_to_decode_prefix_len[room] = 0
+        mgr.poison_deferred_ack_room = MagicMock()
+        source, spare = self._cpu_staging_source(), self._cpu_staging_source()
+        mgr._allocate_staging_buffers = MagicMock(return_value=[spare])
+        posted = {}
+
+        def send(peer, indices, *_args, staging_buffer):
+            room = int(indices[0])
+            window = staging_buffer.raw[:8]
+            window[:] = bytes([room]) * 8
+            posted[room, peer] = window
+            if room == second:
+                raise _NixlPostError("rejected by backend", (room, peer))
+            return room, peer
+
+        def state(handle):
+            if (
+                handle == (first, "agent")
+                and mgr.request_status[blocked] != KVPoll.Failed
+            ):
+                raise RuntimeError("NIXL_ERR_NOT_FOUND for old registration")
+            if handle == (second, "agent"):
+                # A terminal/error or stale handle on the rejected POST never
+                # permits reuse. It can remain unrecoverable after reconnect.
+                raise RuntimeError("NIXL_ERR_BACKEND for rejected POST")
+            return "DONE"
+
+        mgr.send_kvcache_staged = send
+        mgr.agent.check_xfer_state.side_effect = state
+        rooms = (first, second, blocked, recovered)
+        chunks = [self._make_chunk(r, [r], True) for r in rooms]
+        self._run_staging_worker(mgr, chunks, staging_buffer=source)
+        self.assertEqual(
+            [mgr.request_status[r] for r in rooms],
+            [KVPoll.Failed] * 3 + [KVPoll.Success],
+        )
+        mgr._allocate_staging_buffers.assert_called_once_with(1)
+        self.assertEqual(
+            list(posted),
+            [
+                (first, "agent"),
+                (second, "agent"),
+                (recovered, "agent"),
+                (recovered, "other"),
+            ],
+        )
+        self.assertIs(posted[first, "agent"].obj, source.raw.obj)
+        self.assertIs(posted[second, "agent"].obj, spare.raw.obj)
+        self.assertEqual(bytes(posted[second, "agent"]), bytes([second]) * 8)
+        self.assertIs(posted[recovered, "agent"].obj, source.raw.obj)
+        self.assertCountEqual(
+            [c.args for c in mgr.poison_deferred_ack_room.call_args_list],
+            [(first,), (second,)],
+        )
+        self.assertEqual(
+            [
+                (c.kwargs["bootstrap_room"], c.kwargs["status"])
+                for c in mgr.send_kv_status_message.call_args_list
+            ],
+            [(blocked, KVPoll.Failed), (recovered, KVPoll.Success)],
+        )
+
+    def test_fanout_drains_old_source_after_spare_allocation_fails(self):
+        room, next_room, recovered = 28, 29, 30
+        mgr, buffer, _ = self._two_room_fanout(room)
+        mgr.transfer_infos[recovered] = {
+            name: TransferInfo(**{**vars(req), "room": recovered})
+            for name, req in mgr.transfer_infos[room].items()
+        }
+        mgr.request_status[recovered] = KVPoll.WaitingForInput
+        mgr.req_to_decode_prefix_len[recovered] = 0
+        mgr._allocate_staging_buffers = MagicMock(
+            side_effect=RuntimeError("out of memory")
+        )
+        mgr.poison_deferred_ack_room = MagicMock()
+        mgr.send_kvcache_staged = MagicMock(
+            side_effect=lambda peer, indices, *a, **kw: (int(indices[0]), peer)
+        )
+
+        def state(handle):
+            if handle == (room, "agent"):
+                # The old WRITE finishes only after a later room tries the
+                # same worker while its source is still owned by the NIC.
+                return (
+                    "DONE" if mgr.request_status[next_room] == KVPoll.Failed else "PROC"
+                )
+            return "ERR" if handle == (room, "other") else "DONE"
+
+        mgr.agent.check_xfer_state.side_effect = state
+        chunks = [self._make_chunk(r, [r], True) for r in (room, next_room, recovered)]
+        with (
+            patch("sglang.srt.disaggregation.nixl.conn.NIXL_ERR_SETTLE_TIMEOUT_S", 0),
+            patch("sglang.srt.disaggregation.nixl.conn.NIXL_ERR_SETTLE_POLL_S", 0),
+        ):
+            self._run_staging_worker(mgr, chunks, staging_buffer=buffer)
+        posted = [
+            (int(c.args[1][0]), c.args[0])
+            for c in mgr.send_kvcache_staged.call_args_list
+        ]
+        self.assertEqual(
+            posted, [(r, p) for r in (room, recovered) for p in ("agent", "other")]
+        )
+        mgr.poison_deferred_ack_room.assert_called_once_with(room)
+        self.assertEqual(mgr._staging_outstanding[room], 1)
+        self.assertCountEqual(
+            [
+                (c.kwargs["room"], c.kwargs["writer_id"])
+                for c in mgr.send_chunk_ready.call_args_list
+            ],
+            [(recovered, "agent"), (recovered, "other")],
+        )
+        statuses = [
+            (c.kwargs["bootstrap_room"], c.kwargs["status"])
+            for c in mgr.send_kv_status_message.call_args_list
+        ]
+        self.assertEqual(
+            statuses, [(next_room, KVPoll.Failed), (recovered, KVPoll.Success)]
+        )
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        mgr._allocate_staging_buffers.assert_called_once_with(1)
 
     def test_deferred_staging_chunk_still_transfers_after_last_chunk_success(self):
         room = 27
@@ -915,11 +1463,10 @@ class TestNixlTransferWorker(CustomTestCase):
         events = []
         attempts = []
 
-        def stage(_strategy, chunk, _indices, _req, _info, queue):
+        def stage(_strategy, chunk, _indices, _req, _info, _buffer):
             page_start = chunk.index_slice.start
             attempts.append(page_start)
             if len(attempts) == 1:
-                queue.put(chunk)
                 return None, True, 0
             return f"kv-{page_start}", False, page_start
 
@@ -1284,7 +1831,7 @@ class TestNixlStaging(CustomTestCase):
 
         self.assertEqual(agent.get_xfer_descs_calls, [])
 
-    def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
+    def test_do_staging_transfer_defers_when_allocation_not_ready(self):
         mgr = self._make_manager()
         mgr._staging_ctx = PrefillStagingContext()
         strategy = MagicMock()
@@ -1298,7 +1845,6 @@ class TestNixlStaging(CustomTestCase):
             state_indices=None,
         )
         req = SimpleNamespace(room=3, agent_name="decode_agent")
-        queue = FakeQueue()
 
         with patch.dict(
             sys.modules,
@@ -1314,12 +1860,12 @@ class TestNixlStaging(CustomTestCase):
                 kv_chunk.prefill_kv_indices,
                 req,
                 SimpleNamespace(),
-                queue,
+                staging_buffer=None,
             )
 
         self.assertIsNone(handle)
         self.assertTrue(deferred)
-        self.assertEqual(queue.items, [kv_chunk])
+        self.assertEqual(chunk_idx, 0)
 
     def test_do_staging_transfer_raises_for_oversized_allocation(self):
         mgr = self._make_manager()
@@ -1355,7 +1901,7 @@ class TestNixlStaging(CustomTestCase):
                     kv_chunk.prefill_kv_indices,
                     SimpleNamespace(room=3, agent_name="decode_agent"),
                     SimpleNamespace(),
-                    FakeQueue(),
+                    staging_buffer=None,
                 )
 
 
