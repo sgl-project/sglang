@@ -19,6 +19,8 @@ import torch
 from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
 
 from sglang.kernels.ops.gemm.fused_a_gemm import fused_a_gemm_weight_eligible
+from sglang.kernels.ops.quantization import awq_dequantize as awq_dequantize_jit
+from sglang.kernels.ops.quantization.awq_triton import awq_dequantize_decomposition
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
     CompressedTensorsLinearMethod,
@@ -35,6 +37,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     _unsupported_derived_weight_cache_error,
 )
+from sglang.srt.models.deepseek_common import utils as deepseek_common_utils
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -377,6 +380,64 @@ class TestPostLoadPackedKvBProj(CustomTestCase):
         error = _unsupported_derived_weight_cache_error(model)
         self.assertIsNotNone(error)
         self.assertIn("compressed-tensors WNA16", error)
+
+
+class TestPostLoadAwqKvBProj(CustomTestCase):
+    def test_cuda_builds_absorbed_weights_from_an_awq_kv_b_proj(self):
+        """An AWQ MLA checkpoint on CUDA must finish post_load_weights with
+        w_kc/w_vc built from the dequantized kv_b_proj."""
+        heads, nope, v, kv_lora_rank, group_size = 2, 4, 4, 64, 32
+        out_features = heads * (nope + v)
+        gen = torch.Generator().manual_seed(0)
+        int32_max = torch.iinfo(torch.int32).max
+        kv_b_proj = SimpleNamespace(
+            qweight=torch.randint(
+                int32_max,
+                (kv_lora_rank, out_features // 8),
+                generator=gen,
+                dtype=torch.int32,
+            ),
+            qzeros=torch.randint(
+                int32_max,
+                (kv_lora_rank // group_size, out_features // 8),
+                generator=gen,
+                dtype=torch.int32,
+            ),
+            scales=torch.rand(kv_lora_rank // group_size, out_features, generator=gen),
+        )
+        self_attn = SimpleNamespace(
+            kv_b_proj=kv_b_proj,
+            qk_nope_head_dim=nope,
+            v_head_dim=v,
+            w_kc=None,
+            w_vc=None,
+            w_scale=1.0,
+        )
+        loader = DeepseekV2WeightLoaderMixin.__new__(DeepseekV2WeightLoaderMixin)
+        loader.config = SimpleNamespace(num_hidden_layers=1, architectures=["X"])
+        loader.quant_config = None
+        loader.model = SimpleNamespace(
+            start_layer=0,
+            end_layer=1,
+            layers=[SimpleNamespace(self_attn=self_attn)],
+        )
+
+        # The JIT kernel needs a GPU; the torch decomposition computes the same
+        # dequantization on CPU tensors.
+        with (
+            mock.patch.object(deepseek_common_utils, "_is_cuda", True),
+            mock.patch.object(
+                awq_dequantize_jit, "awq_dequantize", awq_dequantize_decomposition
+            ),
+        ):
+            loader.post_load_weights()
+
+        w = awq_dequantize_decomposition(
+            kv_b_proj.qweight, kv_b_proj.scales, kv_b_proj.qzeros
+        ).T
+        w_kc, w_vc = w.unflatten(0, (-1, nope + v)).split([nope, v], dim=1)
+        torch.testing.assert_close(self_attn.w_kc, w_kc, rtol=0, atol=0)
+        torch.testing.assert_close(self_attn.w_vc, w_vc.transpose(1, 2), rtol=0, atol=0)
 
 
 class TestGlm47FlashW4A16Config(CustomTestCase):

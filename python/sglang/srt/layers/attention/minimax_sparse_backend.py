@@ -125,7 +125,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
         self.req_to_token_pool = runner.req_to_token_pool  # pool obj for TboAttnBackend
         self.req_to_token = runner.req_to_token_pool.req_to_token
-        self.max_context_len = int(runner.model_config.context_len)
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
         self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(
@@ -258,7 +257,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
             self.num_kv_heads = self.kv_pool.main_pool.head_num
             self._msa_nb_max = (
-                self.max_context_len + self.block_size_k - 1
+                self.req_to_token_pool.row_width + self.block_size_k - 1
             ) // self.block_size_k
             self._msa_cg: dict[int, tuple] = {}
 
@@ -467,7 +466,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
-            self._max_seqlen_k = self.max_context_len
+            self._max_seqlen_k = self.req_to_token_pool.row_width
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
             if self._linear_verify and forward_batch.forward_mode.is_target_verify():
