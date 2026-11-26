@@ -47,6 +47,24 @@ monokernel providers import `sglang.kernels.plugin_kernels.amd.spec`. The
 runtime integrations live in `sglang.srt.kernel_plugins.<hardware>`. Unit tests are in
 `test/registered/unit/kernel_plugins/<hardware>/`.
 
+### Out-of-tree platform selection
+
+An out-of-tree platform can opt in with `PlatformCapabilities.supports_megakernel`
+and return its device target from `get_megakernel_target()`. The method must
+return the same target in the launcher, tokenizer, and workers without
+initializing the device runtime. A general plugin registers an exact entry
+with `register(architecture=..., target=..., path=...)`. Platform defaults
+can use `find_target_registration()` to consult registration metadata before
+loading a provider.
+
+Exact matches are selected automatically and checked against the resolved
+launch settings. A platform can implement `requires_megakernel()` for
+checkpoints or launch modes that need a provider even when no entry registered.
+A platform that sets `accepts_legacy_megakernel_flag` accepts the existing
+NVIDIA flag as a deprecated explicit request. The launcher records the selection
+for the tokenizer and model workers to verify. Installation in an out-of-tree
+model worker requires the platform execution lifecycle.
+
 ## Operators
 
 An external kernel exposed as an operator registers into its logical group

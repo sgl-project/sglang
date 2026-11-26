@@ -835,6 +835,15 @@ def megakernel_disable_reasons(
         )
     if spec is None:
         return None, [why]
+    return spec, megakernel_config_disable_reasons(
+        spec=spec, cfg=cfg, hf_config=hf_config
+    )
+
+
+def megakernel_config_disable_reasons(
+    *, spec: MegakernelSpec, cfg: Any, hf_config: Any, model_config: Any = None
+) -> list[str]:
+    """Validate a resolved provider configuration without querying the device."""
     req = spec.requires
     reasons = [
         f"{f.value} is in use and {spec.name} does not accept it"
@@ -871,7 +880,9 @@ def megakernel_disable_reasons(
         )
     if spec.config_disable_reasons is not None:
         reasons += spec.config_disable_reasons(cfg, hf_config)
-    return spec, reasons
+    if model_config is not None:
+        reasons += _dtype_reasons(spec, model_config)
+    return reasons
 
 
 def _dtype_reasons(spec: Optional[MegakernelSpec], model_config: Any) -> list[str]:

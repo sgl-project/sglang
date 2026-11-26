@@ -622,6 +622,17 @@ def spec_registered(
     return any((arch, target) in _REGISTRY for arch in architectures or ())
 
 
+def find_target_registration(
+    architectures: Optional[Sequence[str]], *, target: str
+) -> tuple[str, str] | None:
+    """Return the first exact (architecture, provider path) without importing it."""
+    for arch in architectures or ():
+        path = _REGISTRY.get((arch, target))
+        if path is not None:
+            return arch, path
+    return None
+
+
 def find_spec(
     *,
     architectures: Optional[Sequence[str]],
