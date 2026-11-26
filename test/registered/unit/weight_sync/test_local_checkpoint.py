@@ -195,6 +195,11 @@ class TestLocalCheckpointPull(CustomTestCase):
         for version in (1, 2):
             directory = Path(self._vdir(version))
             directory.mkdir()
+            (directory / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {"weight_map": {name: f"{name}.safetensors" for name in ("a", "b")}}
+                )
+            )
             for name in ("a", "b"):
                 save_file(
                     {name: np.array([version], dtype=np.uint8)},
@@ -220,6 +225,7 @@ class TestLocalCheckpointPull(CustomTestCase):
             reader = executor.submit(read_across_pull)
             try:
                 self.assertTrue(opened.wait(10))
+                self._pull(2)
                 second = snapshot(2)
             finally:
                 resume.set()
@@ -231,6 +237,47 @@ class TestLocalCheckpointPull(CustomTestCase):
     def test_relative_snapshot_path_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "absolute local_checkpoint_dir"):
             local_checkpoint.snapshot_path("relative", 1)
+
+    def test_incomplete_full_publication_can_be_completed_and_retried(self):
+        directory = Path(self._vdir(1))
+        directory.mkdir()
+        final = Path(local_checkpoint.snapshot_path(self.local, 1))
+
+        def snapshot():
+            local_checkpoint.pull(self.local, self.base, self.source, 1, snapshot=True)
+
+        with self.assertRaisesRegex(
+            ValueError, "checkpoint index or model.safetensors"
+        ):
+            snapshot()
+        self.assertFalse(final.exists())
+
+        (directory / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"a": "a.safetensors", "b": "b.safetensors"}})
+        )
+        save_file({"a": np.array([1], dtype=np.uint8)}, directory / "a.safetensors")
+        # A legacy in-place pull may already have marked this incomplete version applied.
+        self._pull(1)
+        with self.assertRaisesRegex(ValueError, "Incomplete snapshot seed"):
+            snapshot()
+        self.assertFalse(final.exists())
+        save_file({"b": np.array([2], dtype=np.uint8)}, directory / "b.safetensors")
+        snapshot()
+        self.assertEqual(_read_tensors(final), {"a": b"\x01", "b": b"\x02"})
+
+    def test_missing_delta_payload_does_not_publish_a_snapshot(self):
+        directory = Path(self._vdir(1))
+        _write_delta_version(directory, 1, self.V0, self.V1, "xor")
+        shard = directory / "model.safetensors"
+        payload = shard.read_bytes()
+        shard.unlink()
+        final = Path(local_checkpoint.snapshot_path(self.local, 1))
+        with self.assertRaisesRegex(ValueError, "Incomplete snapshot delta"):
+            local_checkpoint.pull(self.local, self.base, self.source, 1, snapshot=True)
+        self.assertFalse(final.exists())
+        shard.write_bytes(payload)
+        local_checkpoint.pull(self.local, self.base, self.source, 1, snapshot=True)
+        self.assertEqual(_read_tensors(final), self.V1)
 
     def test_failed_snapshot_copy_is_not_published_and_can_retry(self):
         self._pull(0)
