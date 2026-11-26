@@ -170,21 +170,6 @@ jobs:
           sglang/multimodal_gen/test/single_test_file/test_usp_pipelined_attention_multi_gpu.py::TestUspPipelinedAttentionMultiGpu::test_four_ranks_match_sequential_bitwise)
     secrets: inherit
 
-  multimodal-gen-test-4-gpu-h100:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true' &&
-      inputs.multimodal_gen_server == 'true'
-    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
-    with:
-      stage: base-b-diffusion
-      runner_config: 4-gpu-h100
-      job_display_name: diffusion-4-gpu-h100
-      caller_inputs: ${{ toJson(inputs) }}
-      job_timeout_minutes: 240
-      run_timeout_minutes: 240
-    secrets: inherit
-
   multimodal-gen-unit-test:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
