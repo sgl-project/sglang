@@ -56,6 +56,19 @@ To reduce DiT memory, stream its blocks from host memory:
 sglang serve --model-path tencent/Hy-Nomas --num-gpus 1 --dit-layerwise-offload true --port 30000
 ```
 
+### Offline single-event CUDA graphs
+
+On one NVIDIA GPU, you can capture the resident BF16 DiT for a lossless offline event that uses FlexAttention. For a 640×352, 61-frame event, start the server with an explicit single-event warmup.
+
+```bash
+sglang serve --model-path tencent/Hy-Nomas --num-gpus 1 \
+  --enable-breakable-cuda-graph true --component-residency all=resident \
+  --warmup-mode server --warmup-resolutions 640x352 --warmup-num-frames 61 \
+  --warmup-steps 8 --warmup-sampling-params '{"segments":[{"frames":61,"caption":"A fox in a forest."}],"prompt_format":"plain","guidance_scale":1.0}'
+```
+
+Use the same event geometry in the request. The graph reuses the padded text shape and reads the current event’s attention mask on each replay. Realtime sessions, camera-conditioned and multi-event requests, and shapes omitted from warmup run eagerly. Use the unquantized DiT and keep Cache-DiT, LoRA and compilation disabled for this configuration.
+
 ### Weights
 
 `tencent/Hy-Nomas` is resolved through a pinned [model overlay](https://huggingface.co/Niehen6174/Hy-Nomas-overlay). It downloads the official distilled, non-quantized DiT, the PixelUMM decoder and the Qwen2.5-VL text encoder. It then caches a Diffusers-style pipeline under `SGLANG_DIFFUSION_CACHE_ROOT`. Weights keep their original values and dtypes. Later starts reuse the cache, and a local directory with the same layout can be passed to `--model-path` instead. The first load needs extra disk space for the decoder export.
