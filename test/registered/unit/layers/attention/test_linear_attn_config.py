@@ -26,7 +26,7 @@ from sglang.srt.layers.attention.linear.utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _Runner:
@@ -181,6 +181,7 @@ class TestFlashInferKDAPrefillPolicy(CustomTestCase):
         cases = [(config, (10, 3), {}, "flashinfer") for config in safe_configs]
         cases += [
             (k3, (10, 0), {}, "flashinfer"),
+            (k3, (10, 7), {}, "flashinfer"),
             (k3, (9, 0), {}, "triton"),
             (k3, (12, 0), {}, "triton"),
             (k3, None, {}, "triton"),

@@ -13,7 +13,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 DEVICE = "cuda"
@@ -24,7 +24,7 @@ EPS = 1e-6
 
 @marker.parametrize("rows", [128, 1024, 4096], [128])
 @marker.parametrize("residual_path", [False, True], [False, True])
-@marker.benchmark("impl", ["split", "fused"], unit="us")
+@marker.benchmark("impl", ["split", "fused"], unit="us", gate=["fused"])
 def benchmark(rows: int, residual_path: bool, impl: str):
     if impl == "fused" and torch.cuda.get_device_capability()[0] < 10:
         marker.skip("Fused Qwen-Image norm+FP8 quant requires NVIDIA Blackwell")

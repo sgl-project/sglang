@@ -18,8 +18,8 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_align_single_token_module() -> Module:
-    args = make_cpp_args(is_arch_support_pdl())
+def _jit_align_single_token_module(write_inactive_prefix_count: bool = False) -> Module:
+    args = make_cpp_args(is_arch_support_pdl(), write_inactive_prefix_count)
     return load_jit(
         "moe_align_single_token",
         *args,
@@ -30,20 +30,26 @@ def _jit_align_single_token_module() -> Module:
 
 
 def moe_align_single_token(
-    topk_ids: torch.Tensor, block_size: int
+    topk_ids: torch.Tensor,
+    block_size: int,
+    *,
+    return_inactive_prefix_count: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """moe_align_block_size for a single token (distinct expert ids).
 
     Returns (sorted_token_ids, expert_ids, num_tokens_post_padded) with the
     same layout as moe_align_block_size: experts ascending, one block per
-    expert, padding value = numel.
+    expert, padding value = numel. With ``return_inactive_prefix_count``,
+    the count is int32 ``[padded_tokens, inactive_blocks]``.
     """
     topk = topk_ids.shape[1]
     device = topk_ids.device
     sorted_ids = torch.empty((topk * block_size,), dtype=torch.int32, device=device)
     expert_ids = torch.empty((topk,), dtype=torch.int32, device=device)
-    num_post = torch.empty((1,), dtype=torch.int32, device=device)
-    _jit_align_single_token_module().run(
+    num_post = torch.empty(
+        (2 if return_inactive_prefix_count else 1,), dtype=torch.int32, device=device
+    )
+    _jit_align_single_token_module(return_inactive_prefix_count).run(
         topk_ids, sorted_ids, expert_ids, num_post, block_size
     )
     return sorted_ids, expert_ids, num_post

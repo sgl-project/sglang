@@ -22,7 +22,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -53,7 +53,7 @@ os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
 # Refer to https://github.com/deepseek-ai/DeepGEMM/commit/d75b218b7b8f4a5dd5406ac87905039ead3ae42f
 # NVRTC may have performance loss with some cases.
 # And NVCC JIT speed is also 9x faster in the ref commit
-os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
+os.environ["DG_JIT_USE_NVRTC"] = "1" if envs.SGLANG_DG_USE_NVRTC.get() else "0"
 
 
 def update_deep_gemm_config(gpu_id: int):
@@ -550,7 +550,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-    from sglang.srt.utils.common import require_mlp_sync
+    from sglang.srt.layers.dp_attention import require_mlp_sync
 
     n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
     block_m = 64

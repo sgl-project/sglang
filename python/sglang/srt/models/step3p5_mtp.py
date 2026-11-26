@@ -11,6 +11,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -18,7 +19,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.step3p5 import Step3p5DecoderLayer, Step3p5ForCausalLM
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,6 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
-            # if forward_batch.return_hidden_states_before_norm:
             hidden_states_before_norm = residual_batch.snapshot(
                 hidden_states, forward_batch
             )

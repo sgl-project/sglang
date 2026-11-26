@@ -76,7 +76,8 @@ using Ws = CoopMbWorkspace<kHistBits, kTieCap>;
 int row_split(int batch, int64_t row_len_hint) {
   // Escape hatch for benchmarking the two paths against each other; 0 forces the
   // one-block kernel. An empty value means unset, not zero.
-  if (const char* e = std::getenv("SGL_DSA_TOPK_ROW_SPLIT"); e != nullptr && *e != '\0') {
+  const char* e = std::getenv("SGLANG_DSA_TOPK_ROW_SPLIT");
+  if (e != nullptr && *e != '\0') {
     const int v = std::atoi(e);
     if (v >= 0) {
       return v;

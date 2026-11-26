@@ -19,6 +19,7 @@ of slots (see ``_PipelinePool``).
 import dataclasses
 import functools
 import logging
+import math
 import socket
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.kernels.ops.communication.ipc_a2a import load_ipc_a2a_sync
+from sglang.kernels.ops.diffusion import copy_head_groups
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     _Unsupported,
@@ -41,8 +43,75 @@ logger = logging.getLogger(__name__)
 _AUTO_PIPELINE_GROUPS = (7, 5, 4, 3, 2)
 # Each group's attention call must fill this many waves of 128-row tiles: below
 # it the call's tail costs more than the overlap saves (cuDNN SDPA on B300 runs
-# Wan 1.3B at Ulysses 4 in three one-head groups 44% slower than sequentially).
-_MIN_GROUP_WAVES = 4
+# Wan 1.3B at Ulysses 4 in three one-head groups, 1.7 waves, 44% slower than
+# sequentially). The groups attend on their own streams, so one call's tail
+# overlaps the next: MiniMax-H3 at Ulysses 4 runs 7 two-head groups (3.5 waves
+# at 1280x704, 3.9 at 1344x768) faster than 2, under FA4 and cuDNN alike.
+_MIN_GROUP_WAVES = 3
+# plain exchange, bytes per rank from which the copy engine is no slower than
+# NCCL on B300 (0.77x of its time at 3 ranks; even at 4, 0.85x by twice that):
+# below, 30 us per peer loses to NCCL's one kernel. Pairs have ipc_a2a; larger
+# groups are not measured
+_AUTO_PLAIN_MIN_BYTES = {3: 48 << 20, 4: 128 << 20}
+# A pool that grows takes this much more than the call needs: every regrowth
+# re-shares the buffers over IPC (0.38 s of cudaIpcOpenMemHandle on 8 x B300),
+# and requests differ by a few percent.
+_POOL_HEADROOM = 1.25
+
+# What an expired in-kernel peer wait leaves in the transport's timeout word:
+# the code of its site, plus the peer it waited for where the wait knows it,
+# the first expiry winning. The plain exchange's spin_wait stores
+# TIMEOUT_EXCHANGE without the peer (kSpinWaitTimeout in ipc_a2a.cuh).
+TIMEOUT_EXCHANGE = 400
+TIMEOUT_PIPELINE_INPUT = 500
+TIMEOUT_PIPELINE_OUTPUT = 600
+_TIMEOUT_SITES = (
+    # (code of peer 0, the path, its switch)
+    (TIMEOUT_EXCHANGE, "copy-engine all-to-all", "SGLANG_DIFFUSION_IPC_A2A_MULTI=0"),
+    (
+        TIMEOUT_PIPELINE_INPUT,
+        "head-group pipeline (input rows)",
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0",
+    ),
+    (
+        TIMEOUT_PIPELINE_OUTPUT,
+        "head-group pipeline (output rows)",
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0",
+    ),
+)
+
+
+class IpcPeerTimeoutError(RuntimeError):
+    """An in-kernel peer wait of the copy-engine transport expired: the request
+    computed on incomplete data, and what the peers hold is unknown, so the
+    server must be restarted (the HTTP server turns unhealthy with this)."""
+
+
+def describe_peer_timeouts(codes: list[int], ranks: list[int], budget_s: float) -> str:
+    """The error for timeout words ``codes`` of the group members with global
+    ranks ``ranks`` (0: that member's waits all completed)."""
+    waits: dict[tuple[str, str], list[int]] = {}
+    switches = []
+    for rank, code in zip(ranks, codes):
+        if code == 0:
+            continue
+        base, path, switch = max(site for site in _TIMEOUT_SITES if site[0] <= code)
+        peer = "a peer" if base == TIMEOUT_EXCHANGE else f"rank {ranks[code - base]}"
+        waits.setdefault((path, peer), []).append(rank)
+        if switch not in switches:
+            switches.append(switch)
+    listed = "; ".join(
+        f"rank{'s' if len(who) > 1 else ''} {', '.join(map(str, who))} waited for "
+        f"{peer} in the {path}"
+        for (path, peer), who in waits.items()
+    )
+    return (
+        f"Ulysses IPC peer wait timed out after {budget_s:g} s: {listed}. The request "
+        "ran on incomplete data and was failed; the transport state is unknown, so "
+        "restart the server's process group. Raise SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS "
+        "if a rank can legitimately stall that long, or turn the path off with "
+        f"{' '.join(switches)}."
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -384,20 +453,42 @@ class IpcA2AMultiState:
             torch.cuda.synchronize()
         self.staging.clear()
         self.pools.clear()
+        if torch.cuda.is_available():
+            torch.cuda.ipc_collect()
+
+    def _release_shared(self) -> None:
+        """Free the buffers just dropped on every rank; a group collective.
+
+        A shared block outlives its last local reference until each peer has
+        closed its mapping, and then only when the IPC limbo is collected.
+        """
+        torch.cuda.synchronize()
+        dist.barrier(group=self.group)
+        torch.cuda.ipc_collect()
 
     def _share(self, t: torch.Tensor, group) -> list[torch.Tensor]:
         """Every member's `t`, peers' re-opened in the LOCAL device context
-        (a mapping is only dereferenceable from the context that opened it)."""
+        (a mapping is only dereferenceable from the context that opened it).
+
+        Each peer gets its own handle: torch counts one reference per handle and
+        frees `t` only once that count is back to zero, so one handle opened by
+        world - 1 peers never frees it (every dropped pool or staging buffer
+        stayed allocated)."""
         from torch.multiprocessing.reductions import reduce_tensor
 
+        mine = [
+            None if member == self.rank else reduce_tensor(t)
+            for member in range(self.world)
+        ]
         handles: list = [None] * self.world
-        dist.all_gather_object(handles, reduce_tensor(t), group=group)
+        dist.all_gather_object(handles, mine, group=group)
         dev = torch.cuda.current_device()
         out = []
-        for member, (fn, args) in enumerate(handles):
+        for member, theirs in enumerate(handles):
             if member == self.rank:
                 out.append(t)
                 continue
+            fn, args = theirs[self.rank]
             args = list(args)
             for i, v in enumerate(args):
                 if isinstance(v, torch.device):
@@ -444,13 +535,18 @@ class IpcA2AMultiState:
         self.ops = load_ipc_a2a_sync()
         self.memops = memops
         # flags[p] is written by peer p; seq[p] counts the calls sent to p
-        self.flags = torch.zeros(self.world, dtype=torch.int32, device="cuda")
+        self.flags = ipc_shareable_zeros(self.world, dtype=torch.int32)
         self.seq = torch.zeros(self.world, dtype=torch.int32, device="cuda")
-        self.timed_out = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self.timed_out = ipc_shareable_zeros(1, dtype=torch.int32)
         self.budget_ns = int(envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS * 1e6)
         self.max_buffers = envs.SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS
-        self.peer_flags = self._share(self.flags, group)
-        self.peer_timed_out = self._share(self.timed_out, group)
+        try:
+            self.peer_flags = self._share(self.flags, group)
+            self.peer_timed_out = self._share(self.timed_out, group)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"sharing the signal flags over CUDA IPC failed: {e}"
+            ) from e
         self.inited = True
 
     def get_staging(self, chunk: int, dtype: torch.dtype) -> list[torch.Tensor] | None:
@@ -462,7 +558,7 @@ class IpcA2AMultiState:
         if buffers is None:
             if torch.cuda.is_current_stream_capturing():
                 return None
-            local = torch.zeros(2, self.world, chunk, dtype=dtype, device="cuda")
+            local = ipc_shareable_zeros(2, self.world, chunk, dtype=dtype)
             buffers = self._share(local, self.group)
             self._insert(key, buffers)
         return buffers
@@ -472,6 +568,7 @@ class IpcA2AMultiState:
             # queued copies may still target the evicted peer mappings
             torch.cuda.synchronize()
             self.staging.popitem(last=False)
+            self._release_shared()
         self.staging[key] = value
 
     def pipelined_attention(
@@ -486,6 +583,8 @@ class IpcA2AMultiState:
         signature=None,
         replicated=(None, None, None),
         replicated_first: bool = True,
+        attend_into=None,
+        fill_all=None,
     ):
         """Ulysses attention with the head exchange pipelined against it.
 
@@ -501,11 +600,12 @@ class IpcA2AMultiState:
         ``attend(q, k, v)`` runs attention on one head group, ``[batch, rows,
         heads / (world * groups), head_dim]`` per part in the sequence order
         above, and must treat heads independently, which keeps the result
-        bit-identical to the sequential exchange. Group g's copies run on the
-        copy engine while group g-1 attends, and each group attends on its own
-        stream and sends its output from there, so no stream waits on a kernel
-        still running on another. Every copy, the merge into the output
-        included, is a pitched copy-engine copy, so the exchange takes no SMs.
+        bit-identical to the sequential exchange. Group g's peer copies run on
+        the copy engine while group g-1 attends, and each group attends on its
+        own stream and sends its output from there, so no stream waits on a
+        kernel still running on another. A same-device copy runs on the SMs and
+        would wait out a running attention, so this rank's own rows of every
+        group go into its slots in one pass before the first group attends.
         Returns the output rows of this rank, or None when this call cannot
         pipeline. ``groups < 0`` picks the count and steps aside, on every
         rank, when the buffers would not fit.
@@ -517,15 +617,29 @@ class IpcA2AMultiState:
         go straight into its own receive slot, and v always moves straight
         from ``v``. It is only called once the call is known to pipeline.
 
+        ``fill_all(blocks, part)`` is ``fill`` given every block at once, as a list of
+        ``(head_start, head_count, q_dst, k_dst)`` (for a norm over all heads of a row,
+        which one pass then writes everywhere), for q (``part`` 0) and then k (1), so q
+        is on its way while k is filled.
+
+        ``attend_into(q, k, v, out)``, when given, writes what ``attend``
+        returns into ``out`` (any token stride); with ``out=None`` it only says
+        whether it serves those inputs. Each group then attends straight into a
+        token-major buffer of every row and head whose rows of this rank are the
+        output, so only the peers' rows move: out on the copy engine, back in
+        one pass.
+
         ``sequential()``, when given, returns what the sequential exchange
         gives for this call. The first call per plan and ``signature`` (the
         caller's attention setup) runs both and keeps the pipeline for them
         only if every rank sees the same bytes, so a backend that does not
         treat a head group as it treats those heads in the full call never
         changes a result. It runs the sequential exchange first, with the
-        pool released, so that call never holds both at once.
+        pool released so that call never holds both at once, unless the pool
+        already covers this call and every rank has room for both.
         """
         world, r = self.world, self.rank
+        filled = fill is not None or fill_all is not None
         squeeze = q.dim() == 3
         if squeeze:
             q, k, v = q[None], k[None], v[None]
@@ -540,11 +654,11 @@ class IpcA2AMultiState:
             tuple(None if t is None else t.shape for t in replicated),
             replicated_first,
             groups,
-            fill is not None,
+            filled,
         )
         if shapes not in self.plans:
             self.plans[shapes] = self._plan(
-                q, k, v, replicated, replicated_first, groups, fill is not None
+                q, k, v, replicated, replicated_first, groups, filled
             )
         plan = self.plans[shapes]
         if plan is None:
@@ -553,7 +667,7 @@ class IpcA2AMultiState:
 
         # each token's heads of one group must be one contiguous run to move
         # with a pitched copy
-        copied = [v] if fill is not None else [q, k, v]
+        copied = [v] if filled else [q, k, v]
         copied += [t for t in replicated if t is not None]
         if not all(t.stride(-1) == 1 and t.stride(-2) == head_dim for t in copied):
             return None
@@ -571,30 +685,45 @@ class IpcA2AMultiState:
         if pool is not None:
             sizes = tuple(map(max, sizes, pool.sizes))
         reference = None
-        if pool is None or pool.sizes != sizes or check is not None:
+        grow = pool is None or pool.sizes != sizes
+        if grow:
+            sizes = (
+                math.ceil(sizes[0] * _POOL_HEADROOM),
+                math.ceil(sizes[1] * _POOL_HEADROOM),
+                sizes[2],
+            )
+        if grow or check is not None:
             if torch.cuda.is_current_stream_capturing() or key in self.declined:
                 return None
             esz = q.element_size()
-            held = 0 if pool is None else pool.nbytes(esz)
             need = (sizes[0] + sizes[1]) * esz
-            if fill is not None:
+            if filled:
                 need += plan.world * groups * slots.send_numel * esz
-            if auto and not self._fits_on_every_rank(need, reclaimable=held):
-                logger.info(
-                    "Ulysses pipeline buffers (%.1f GiB) do not fit; using the "
-                    "sequential exchange for this shape",
-                    need / 2**30,
-                )
-                self.declined.add(key)
-                return None
-            if pool is not None:
-                # queued copies may still target the old mappings
-                torch.cuda.synchronize()
-                del self.pools[q.dtype]
-                pool = None
+            # A first sight the pool already covers keeps the pool through the
+            # sequential reference when every rank has room for both: dropping
+            # it re-shares every buffer over IPC, 0.17-0.23 s per new shape on
+            # 4 x B300.
+            keep = not grow and self._fits_on_every_rank(need)
+            if not keep:
+                held = 0 if pool is None else pool.nbytes(esz)
+                if auto and not self._fits_on_every_rank(need, reclaimable=held):
+                    logger.info(
+                        "Ulysses pipeline buffers (%.1f GiB) do not fit; using the "
+                        "sequential exchange for this shape",
+                        need / 2**30,
+                    )
+                    self.declined.add(key)
+                    return None
+                if pool is not None:
+                    # queued copies may still target the old mappings
+                    torch.cuda.synchronize()
+                    del self.pools[q.dtype]
+                    pool = None
+                    self._release_shared()
             if check is not None:
                 reference = sequential()
-            pool = self.pools[q.dtype] = _PipelinePool(self, q.dtype, *sizes)
+            if pool is None:
+                pool = self.pools[q.dtype] = _PipelinePool(self, q.dtype, *sizes)
         if self.pipe_in is None:
             self.pipe_in = torch.cuda.Stream()
         while len(self.pipe_group_streams) < groups:
@@ -653,9 +782,53 @@ class IpcA2AMultiState:
                     n,
                 )
 
+        def own_rows_views(part):
+            # my shard of one part as [batch, s_local, group, group heads * head_dim],
+            # and my own slots of it as [group, batch, s_local, ...]
+            gh = plan.group_heads(part)
+            width = gh * head_dim
+            head0 = start(r, 0, part)
+            shard = parts[part][:, :, head0 : head0 + groups * gh]
+            inb = pool.inb[r]
+            dst = inb.as_strided(
+                (groups, batch, s_local, width),
+                (slots.group_numel, slots.rows[part] * width, width, 1),
+                inb.storage_offset()
+                + slots.part_offset[part]
+                + my_shard_row[part] * width,
+            )
+            return shard.unflatten(2, (groups, gh)).flatten(3).permute(2, 0, 1, 3), dst
+
         ready = main.record_event()
+        # my own rows of every group, here and in one pass per part: a same-device
+        # copy runs on the SMs, so on the copy stream it would wait out the
+        # previous group's attention and hold up the peer sends queued behind it
+        if fill_all is None:
+            for part in (2,) if filled else range(3):
+                copy_head_groups(*own_rows_views(part))
+        for g in range(groups):
+            for part in range(3):
+                place_replicated(main, part, g)
+        placed = main.record_event()
         own, sent = [], []
-        if fill is not None:
+        if fill_all is not None:
+            own_rows = lambda part, g: slots.slot(pool, r, g, part)[
+                0, my_shard_row[part] : my_shard_row[part] + s_local
+            ]
+            hg = plan.group_heads(0)
+            blocks = []
+            for g in range(groups):
+                for p in peers:
+                    qk = slots.send_block(pool, p, g)
+                    blocks.append((start(p, g, 0), hg, qk[0], qk[1]))
+                blocks.append((start(r, g, 0), hg, own_rows(0, g), own_rows(1, g)))
+            for part in range(2):
+                fill_all(blocks, part)
+                sent.append(main.record_event())
+            # v's own rows after the fill, on the SMs while the copy engine sends it
+            copy_head_groups(*own_rows_views(2))
+            own = [main.record_event()] * groups
+        elif fill is not None:
             # group by group: the peers' blocks first, so their copies start
             # while this rank fills its own block straight into its slot
             own_rows = lambda part, g: slots.slot(pool, r, g, part)[
@@ -669,22 +842,31 @@ class IpcA2AMultiState:
                 sent.append(main.record_event())
                 fill(start(r, g, 0), hg, own_rows(0, g), own_rows(1, g))
                 own.append(main.record_event())
-        own_cin = []
         cin.wait_event(ready)
         with torch.cuda.stream(cin):
             for g in range(groups):
-                for p in (r, *peers):
+                for p in peers:
                     send_rows(cin, 2, p, g)
-                    if fill is None:
+                    if not filled:
                         send_rows(cin, 0, p, g)
                         send_rows(cin, 1, p, g)
-                    if p == r:
-                        for part in range(3):
-                            place_replicated(cin, part, g)
-                        own_cin.append(cin.record_event())
-                if fill is not None:
+                chunk = s_local * row_bytes[0]
+                if fill_all is not None:
+                    # q, then k as soon as its pass is done
+                    for part in range(2):
+                        cin.wait_event(sent[part])
+                        for p in peers:
+                            mem.copy2d(
+                                cin,
+                                slots.slot_ptr(pool, p, g, part, 0, my_shard_row[part]),
+                                chunk,
+                                slots.send_block(pool, p, g).data_ptr() + part * chunk,
+                                chunk,
+                                chunk,
+                                1,
+                            )
+                elif filled:
                     cin.wait_event(sent[g])
-                    chunk = s_local * row_bytes[0]
                     for p in peers:
                         q_slot = slots.slot_ptr(pool, p, g, 0, 0, my_shard_row[0])
                         k_slot = slots.slot_ptr(pool, p, g, 1, 0, my_shard_row[1])
@@ -704,14 +886,32 @@ class IpcA2AMultiState:
         # heads. Each group stream writes its blocks as soon as they exist, so
         # the merge overlaps the groups still attending instead of trailing them.
         hq = plan.group_heads(0)
-        merged = torch.empty(
-            batch,
-            plan.out_rows,
-            plan.heads[0],
-            head_dim,
-            dtype=q.dtype,
-            device=q.device,
+        # zero-copy output: every row of every head, this rank's rows returned
+        into = (
+            attend_into is not None
+            and not squeeze
+            and not any(plan.replicated)
+            and attend_into(*(slots.slot(pool, r, 0, part) for part in range(3)), None)
         )
+        if into:
+            full = torch.empty(
+                batch,
+                world * s_local,
+                plan.heads[0],
+                head_dim,
+                dtype=q.dtype,
+                device=q.device,
+            )
+            merged = full[:, my_shard_row[0] : my_shard_row[0] + s_local]
+        else:
+            merged = torch.empty(
+                batch,
+                plan.out_rows,
+                plan.heads[0],
+                head_dim,
+                dtype=q.dtype,
+                device=q.device,
+            )
         merged_ptr = merged.data_ptr()
         merged_row = plan.heads[0] * head_bytes
         out_row = row_bytes[0]
@@ -721,13 +921,40 @@ class IpcA2AMultiState:
         done = []
         for g in range(groups):
             stream = self.pipe_group_streams[g]
-            if fill is not None:
-                stream.wait_event(own[g])
-            stream.wait_event(own_cin[g])
+            stream.wait_event(own[g] if filled else placed)
             with torch.cuda.stream(stream):
-                for p in peers:
-                    mem.wait(stream, pool.fin_ptr[r] + 4 * p, base + g + 1)
+                if g == 0:
+                    # bounded: a peer that sends nothing this call expires here
+                    self.wait_peers(pool.fin_ptr[r], base + 1, TIMEOUT_PIPELINE_INPUT)
+                else:
+                    # front-end waits hold no SM while earlier groups attend (a
+                    # wait kernel per group slowed the q/k-filled call 1.2% at
+                    # 11648 rows per rank on B300); a peer that stops after its
+                    # first group expires in the output wait
+                    for p in peers:
+                        mem.wait(stream, pool.fin_ptr[r] + 4 * p, base + g + 1)
                 views = [slots.slot(pool, r, g, part) for part in range(3)]
+                if into:
+                    out = full[:, :, start(r, g, 0) : start(r, g, 0) + hq]
+                    attend_into(*views, out)
+                    attended = stream.record_event()
+                    for p in peers:
+                        # the peer's rows of this group, out of the token-major buffer
+                        src_rows = out[:, plan.shard_row(0, p) :]
+                        for b in range(batch):
+                            mem.copy2d(
+                                stream,
+                                slots.out_block_ptr(pool, p, r, g) + b * block_batch,
+                                out_row,
+                                src_rows[b].data_ptr(),
+                                merged_row,
+                                out_row,
+                                s_local,
+                            )
+                    for p in peers:
+                        mem.write(stream, pool.fout_ptr[p] + 4 * (g * world + r), call)
+                    done.append(stream.record_event())
+                    continue
                 if squeeze:
                     out = attend(*(t[0] for t in views)).contiguous()[None]
                 else:
@@ -768,8 +995,10 @@ class IpcA2AMultiState:
                             out_row,
                             n,
                         )
+                self.wait_peers(
+                    pool.fout_ptr[r] + 4 * g * world, call, TIMEOUT_PIPELINE_OUTPUT
+                )
                 for p in peers:
-                    mem.wait(stream, pool.fout_ptr[r] + 4 * (g * world + p), call)
                     # the block and the merged output both have one row pitch
                     # across the batch, so a single copy covers every batch row
                     mem.copy2d(
@@ -782,8 +1011,37 @@ class IpcA2AMultiState:
                         batch * plan.out_rows,
                     )
                 done.append(stream.record_event())
+
+        def gather(first: int, stop: int) -> None:
+            # the peers' blocks of this rank's rows for groups [first, stop), one pass each
+            for g in range(first, stop):
+                self.wait_peers(
+                    pool.fout_ptr[r] + 4 * g * world, call, TIMEOUT_PIPELINE_OUTPUT
+                )
+            outb = pool.outb[r]
+            for p in peers:
+                blocks = outb.as_strided(
+                    (stop - first, batch, s_local, out_row // esz),
+                    (slots.out_numel, s_local * out_row // esz, out_row // esz, 1),
+                    outb.storage_offset() + (p * groups + first) * slots.out_numel,
+                )
+                heads = merged[:, :, start(p, first, 0) : start(p, stop, 0)]
+                copy_head_groups(
+                    blocks,
+                    heads.unflatten(2, (stop - first, hq))
+                    .flatten(3)
+                    .permute(2, 0, 1, 3),
+                )
+
+        if into and groups > 1:
+            # once the last group has attended, the SMs gather the earlier groups
+            # while the last group's blocks are still on the copy engines
+            main.wait_event(attended)
+            gather(0, groups - 1)
         for event in done:
             main.wait_event(event)
+        if into:
+            gather(groups - 1 if groups > 1 else 0, groups)
         # the next call's fill rewrites `send` and the caller may free `v`, both
         # read by the copy stream
         main.wait_stream(cin)
@@ -895,40 +1153,50 @@ class IpcA2AMultiState:
             )
         return buffers[r][slot]
 
-    def check_timeout(self) -> None:
-        """Retire the transport on every rank if any rank's spin expired.
+    def wait_peers(self, flags: int, target: int, code: int) -> None:
+        """Hold the current stream until every peer's entry of this rank's int32
+        [world] flag array at address ``flags`` reaches ``target``: one launch.
+        A wait that outlasts the budget stores ``code`` + the peer in the timeout
+        word, and every wait gives up at once while that word is set."""
+        self.ops.wait_peers(
+            self.timed_out, flags, self.world, self.rank, target, code, self.budget_ns
+        )
 
-        A spin only flags the peer it waited on, so agree across the whole group
-        at the request boundary: a rank that retired alone would post an NCCL
-        all-to-all that its IPC peers never join. Expiry means a peer went
-        silent for the whole budget and that exchange returned incomplete data,
-        so this raises instead of serving the result.
+    def check_timeout(self) -> None:
+        """Fail the request on every rank if any rank's in-kernel peer wait
+        expired; a group collective, run after each denoising stage (before
+        anything decodes or saves its output).
+
+        A rank that retired alone would post an NCCL all-to-all that its IPC
+        peers never join, so agree across the whole group. Expiry means a peer
+        went silent for the whole budget, so the stage computed on incomplete
+        data. The transport is retired and IpcPeerTimeoutError marks the server
+        unusable.
         """
         if self.failed or not self.inited:
             return
-        expired = self.timed_out.clone()
-        dist.all_reduce(expired, op=dist.ReduceOp.MAX, group=self.group)
-        if expired.item() == 0:
+        codes = torch.empty(self.world, dtype=torch.int32, device="cuda")
+        dist.all_gather_into_tensor(codes, self.timed_out, group=self.group)
+        codes = codes.tolist()
+        if not any(codes):
             return
         self.failed = True
-        raise RuntimeError(
-            "IPC all-to-all gave up waiting for a peer after "
-            f"{envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS:g} ms, so that exchange "
-            "returned incomplete data. The transport is now disabled on every "
-            "rank; retry the request over NCCL, or set "
-            "SGLANG_DIFFUSION_IPC_A2A_MULTI=0."
+        raise IpcPeerTimeoutError(
+            describe_peer_timeouts(
+                codes, dist.get_process_group_ranks(self.group), self.budget_ns / 1e9
+            )
         )
 
 
 IPC_A2A_MULTI = IpcA2AMultiState()
 
 
-def ipc_a2a_multi_ready(group, enabled: bool | None = None) -> bool:
+def ipc_a2a_multi_ready(group, enabled: bool) -> bool:
     """True when the N-rank transport is enabled and initialized on every
     member of `group` (initializes lazily on the first eager call)."""
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    if not (envs.SGLANG_DIFFUSION_IPC_A2A_MULTI if enabled is None else enabled):
+    if not enabled:
         return False
     if IPC_A2A_MULTI.group is not None and IPC_A2A_MULTI.group is not group:
         IPC_A2A_MULTI.reset()
@@ -958,6 +1226,24 @@ def ipc_a2a_multi_ready(group, enabled: bool | None = None) -> bool:
     return True
 
 
+def plain_exchange_ready(group, nbytes: int) -> bool:
+    """True when a plain all-to-all of `nbytes` per rank should take the copy
+    engine: SGLANG_DIFFUSION_IPC_A2A_MULTI when it is set, else where it
+    measured faster than NCCL. Every rank sends the same bytes, so every rank
+    decides the same."""
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    enabled = envs.SGLANG_DIFFUSION_IPC_A2A_MULTI
+    if enabled is None:
+        threshold = _AUTO_PLAIN_MIN_BYTES.get(dist.get_world_size(group))
+        enabled = (
+            threshold is not None
+            and nbytes >= threshold
+            and current_platform.is_blackwell()
+        )
+    return ipc_a2a_multi_ready(group, enabled)
+
+
 def ulysses_pipelined_attention(
     q,
     k,
@@ -969,6 +1255,8 @@ def ulysses_pipelined_attention(
     signature=None,
     replicated=(None, None, None),
     replicated_first: bool = True,
+    attend_into=None,
+    fill_all=None,
 ):
     """Pipelined Ulysses attention over the copy-engine transport, or None
     when the Ulysses group cannot use it (the caller keeps its NCCL path).
@@ -989,4 +1277,6 @@ def ulysses_pipelined_attention(
         signature=signature,
         replicated=replicated,
         replicated_first=replicated_first,
+        attend_into=attend_into,
+        fill_all=fill_all,
     )

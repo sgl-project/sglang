@@ -6,10 +6,10 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_parallel_rank,
@@ -63,8 +63,9 @@ def prepare_wan_ti2v_latents(
     latent_model_input = latents.to(target_dtype)
     assert latent_model_input.ndim == 5
 
-    latent_for_mask = latent_model_input.squeeze(0)
-    reserved_frames_masks = [torch.ones_like(latent_for_mask)]
+    # One per-sample mask over [C, T, H, W]; it broadcasts across the outputs of
+    # an n > 1 request, which share the conditioning image.
+    reserved_frames_masks = [torch.ones_like(latent_model_input[0])]
     reserved_frames_masks[0][:, 0] = 0
     reserved_frames_mask = reserved_frames_masks[0].unsqueeze(0)
 
@@ -155,7 +156,8 @@ def expand_wan_ti2v_timestep(
 
     local_seq_len = _get_wan_ti2v_local_seq_len(batch, seq_len, patch_size)
 
-    if get_sp_parallel_rank() == 0 and reserved_frames_mask is not None:
+    # every rank expands its own mask shard so all ranks see the same rounded t
+    if reserved_frames_mask is not None:
         temp_ts = (reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded).flatten()
         temp_ts = torch.cat(
             [

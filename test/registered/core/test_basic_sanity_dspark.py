@@ -8,6 +8,7 @@ from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixi
 from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
+from sglang.test.kits.sampling_penalty_kit import PenalizedEOSMixin
 from sglang.test.kits.spec_server_kits import (
     SpecGrammarKit,
     SpecLogprobKit,
@@ -20,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=102, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=93, stage="base-b", runner_config="1-gpu-large")
 
 TARGET_MODEL = "Qwen/Qwen3-14B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
@@ -41,6 +42,7 @@ class _DSparkSanityMixin(
     FwdOccupancyMixin,
     MMLUSanityMixin,
     JSONConstrainedMixin,
+    PenalizedEOSMixin,
     SpecGrammarKit,
     SpecLogprobKit,
     SpecSamplingMaskKit,

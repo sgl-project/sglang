@@ -158,7 +158,7 @@ struct HcCombineKernel {
     using namespace host;
     auto M = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, kHiddenSize})  // block_output
         .with_dtype<DType>()
@@ -349,7 +349,7 @@ struct HcCombineSplitKernel {
     using namespace hc_combine_split_detail;
     auto M = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(block_output);
     TensorMatcher({M, kHcCount * kHiddenSize})

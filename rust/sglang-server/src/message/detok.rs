@@ -20,6 +20,11 @@ pub enum DetokMsg {
         decode_logprob_text: bool,
         /// `SamplingParams.no_stop_trim`: keep the matched stop; default trims it.
         no_stop_trim: bool,
+        /// `SamplingParams.skip_special_tokens` for the output text.
+        skip_special_tokens: bool,
+        /// The request has stop strings or regexes: the byte-table decoder holds
+        /// a chunk that ends inside a character (see `ByteDecoder`).
+        has_stop_strs: bool,
     },
     /// One decode step's chunks for *this shard*. Batched because `from-scheduler` blocks
     /// per send.

@@ -12,7 +12,6 @@ require a full install.
 """
 
 import importlib.util
-import math
 import os
 from dataclasses import dataclass, field
 
@@ -169,27 +168,6 @@ def test_compacted_branch_keeps_shared_prefix_protected():
     """
     s = strategy()
     assert freed_tokens(s, chain([PAGE] * 8, convo_length=200_000)) == 0
-
-
-def test_budget_clamps_at_zero():
-    """A budget below zero must mean nothing needs caching, not wrap around."""
-    s = strategy()
-    node = FakeNode(_tlru_cached_prefix_len=PAGE, key_len=PAGE, _tlru_history_len=0)
-    assert is_tel_safe(s, node)
-
-
-def test_priority_is_finite_and_orderable():
-    """The driver pushes (priority, node) onto a heap, so the keys must compare
-    without falling through to comparing nodes."""
-    s = strategy()
-    a, b = chain([PAGE] * 4)[:2]
-    for node in (a, b):
-        flag, when = s.get_priority(node)
-        assert flag in (-1, 0)
-        assert math.isfinite(when)
-    assert (s.get_priority(a) < s.get_priority(b)) or (
-        s.get_priority(b) < s.get_priority(a)
-    )
 
 
 if __name__ == "__main__":

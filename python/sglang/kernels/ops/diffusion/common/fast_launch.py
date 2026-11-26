@@ -33,10 +33,15 @@ from typing import Any, Callable
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
-from triton import knobs
-from triton.knobs import HookChain
 from triton.runtime import driver
 from triton.runtime.jit import JITFunction
+
+try:
+    from triton import knobs
+    from triton.knobs import HookChain
+except ImportError:
+    # Vendor Triton builds may not expose the upstream launch-hook API.
+    knobs = None
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +167,9 @@ class _Plan:
 
 def _launch_hooked() -> bool:
     """A profiler such as proton hooks Triton launches; those go through the runner."""
+    if knobs is None:
+        # Keep the regular runner when its hooks cannot be inspected safely.
+        return True
     return any(
         hook is not None and not (isinstance(hook, HookChain) and not hook.calls)
         for hook in (knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook)

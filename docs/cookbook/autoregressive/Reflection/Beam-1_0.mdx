@@ -14,11 +14,11 @@ tag: NEW
 docker pull lmsysorg/sglang:beam
 ```
 
-For host setup, see [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker).
+For host setup, see [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker). The command panel below has a **Python / Docker** toggle, with Python selected by default. The Python output is the bare `sglang serve` command: run it inside a container started from this image. The Docker output wraps the same command in `docker run`.
 
 </Accordion>
 
-Select your hardware, strategy, and quantization to generate the Docker command.
+Select your hardware, strategy, and quantization to generate the launch command.
 
 - **Low-Latency** uses TP with the [DFlash2 drafter](https://huggingface.co/reflection/Beam-1.0-501B-A23B-DFlash2) at block size 8.
 - **High-Throughput** disables DFlash2. H200 BF16 uses TP8 with an automatic static memory fraction; the other recipes use TP + DPA. Blackwell NVFP4 also enables EP and FlashInfer MegaMoE.

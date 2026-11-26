@@ -32,7 +32,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 
 logger = logging.getLogger(__name__)
 
-register_xpu_ci(est_time=3600, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
+register_xpu_ci(est_time=3600, suite="nightly-kernel-main-test-4-gpu-xpu", nightly=True)
 
 XPU_FLUX2_CASES = [
     DiffusionTestCase(
@@ -52,7 +52,12 @@ XPU_FLUX2_CASES = [
                 "bf16",
             ],
             # The xpu_b60.json baseline for this case records device time.
-            env_vars={"SGLANG_DIFFUSION_SYNC_STAGE_PROFILING": "1"},
+            # Layerwise offload overlaps per-step H2D weight copies on the copy
+            # engine; re-enable copy offload that the CI container disables.
+            env_vars={
+                "SGLANG_DIFFUSION_SYNC_STAGE_PROFILING": "1",
+                "UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD": "0",
+            },
         ),
         DiffusionSamplingParams(
             prompt="A curious raccoon in a top hat, oil painting",

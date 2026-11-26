@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.models.dits.flux3_image import (
 from sglang.multimodal_gen.runtime.pipelines.flux3_image_weights import (
     resolve_flux3_image_dit_quant_config,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _TINY = dict(
     hidden_size=256,
@@ -245,6 +246,20 @@ def test_packed_cfg_forward_matches_flux3_transformer_per_sample(
         torch.testing.assert_close(reused, uncached, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="needs the CUDA kernels")
+def test_native_swiglu_is_within_one_bf16_step_of_the_eager_pair():
+    torch.manual_seed(0)
+    packed = (torch.randn(1, 37, 2 * 96, device="cuda") * 3).bfloat16()
+    gate, value = packed.chunk(2, dim=-1)
+    eager = torch.nn.functional.silu(gate) * value
+    torch.testing.assert_close(
+        flux3_fused_ops._SILU_AND_MUL(packed).float(),
+        eager.float(),
+        rtol=2**-7,
+        atol=1e-6,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA kernels")
 def test_packed_forward_skips_absent_streams(request):
     """t2i has no image_cond tokens: its mode blocks must not run, and only the
@@ -400,12 +415,16 @@ class TestFlux3ImageDiTContract(unittest.TestCase):
         )
         with mock.patch(metadata, return_value=object()):
             with self.assertRaisesRegex(ValueError, "do not also set --quantization"):
-                resolve_flux3_image_dit_quant_config("dit.safetensors", "kitchen_int8")
+                resolve_flux3_image_dit_quant_config("dit.safetensors", "convrot_int8")
 
         with mock.patch(metadata, return_value=None):
+            with self.assertRaisesRegex(
+                ValueError, "Invalid quantization method: kitchen_int8"
+            ):
+                resolve_flux3_image_dit_quant_config("dit.safetensors", "kitchen_int8")
             config = resolve_flux3_image_dit_quant_config(
                 "dit.safetensors",
-                "kitchen_int8",
+                "convrot_int8",
                 ignored_layers=["adaln.linear"],
             )
         self.assertIsInstance(config, ConvRotInt8Config)

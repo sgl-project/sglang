@@ -21,12 +21,17 @@ profiler stepping) is pure-Python and runs on CPU.
 
 import contextlib
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend import (
+    full_cuda_graph_backend as full_backend_module,
+)
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
@@ -56,6 +61,7 @@ def _make_backend(runner):
     backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
     backend._graphs = {}
     backend._outputs = {}
+    backend._capture_inputs = {}
     backend._pool = None
     backend._capture_stream = None
     backend._precarve = SimpleNamespace(
@@ -87,6 +93,23 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
 
 
 class TestCaptureOneNoProfiling(CustomTestCase):
+    def test_capture_inputs_stay_alive_until_graph_reset(self):
+        backend = _make_backend(_make_runner(enable_profile=False, profiler=None))
+        counts = torch.tensor([64, 64])
+        reference = weakref.ref(counts)
+        graph = mock.Mock()
+        with mock.patch("torch.cuda.CUDAGraph", return_value=graph):
+            backend.capture_one(
+                ShapeKey(size=64),
+                lambda: None,
+                capture_inputs=SimpleNamespace(global_num_tokens_gpu=counts),
+            )
+        del counts
+        self.assertIsNotNone(reference())
+        graph.reset.side_effect = lambda: self.assertIsNotNone(reference())
+        backend.cleanup()
+        self.assertIsNone(reference())
+
     def test_runs_two_warmups_and_capture_without_stepping(self):
         runner = _make_runner(enable_profile=False, profiler=None)
         backend = _make_backend(runner)
@@ -228,6 +251,30 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         # Schedule wait=2 + active=1 => one step per warmup (x2) + one post-capture.
         self.assertEqual(profiler.step.call_count, 3)
         self.assertEqual(forward_fn.call_count, 3)
+
+
+class TestMemorySaverEnv(CustomTestCase):
+    def test_every_declared_true_spelling_enables_the_adapter(self):
+        """``SGLANG_MEMORY_SAVER_CUDA_GRAPH=yes`` puts the communicators on the
+        memory-saver graph path; the graph backend must capture on it too."""
+        runner = SimpleNamespace(device_module=object())
+        with (
+            envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.override("yes"),
+            mock.patch.object(
+                full_backend_module,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_group=None),
+            ),
+            # torch-memory-saver is an optional dependency.
+            mock.patch.object(
+                full_backend_module.TorchMemorySaverAdapter,
+                "create",
+                side_effect=lambda enable: SimpleNamespace(enabled=enable),
+            ),
+        ):
+            backend = FullCudaGraphBackend(runner, enable_memory_saver=True)
+
+        self.assertTrue(backend._memory_saver_adapter.enabled)
 
 
 class TestCleanup(CustomTestCase):
