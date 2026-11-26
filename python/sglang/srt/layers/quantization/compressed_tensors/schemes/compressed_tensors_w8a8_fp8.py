@@ -9,6 +9,7 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationStrate
 from torch.nn import Parameter
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -29,13 +30,14 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip, is_xpu
+from sglang.srt.utils import is_cpu, is_hip, is_xpu
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_cpu = is_cpu()
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
@@ -148,6 +150,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             layer.register_parameter("input_scale", input_scale)
 
     def process_weights_after_loading(self, layer) -> None:
+        if _is_cpu:
+            raise NotImplementedError(
+                "CPU compressed-tensors W8A8 FP8 linear is not supported; CPU FP8 kernels are W8A16."
+            )
+
         if self.strategy == QuantizationStrategy.TENSOR:
             max_w_scale, weight = requantize_with_max_scale(
                 weight=layer.weight,
@@ -276,6 +283,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         bias: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _is_cpu:
+            raise NotImplementedError(
+                "CPU compressed-tensors W8A8 FP8 linear is not supported; CPU FP8 kernels are W8A16."
+            )
+
         if self.weight_block_size is None and output is not None:
             return output.copy_(self._apply_weights(layer, x, bias))
         if isinstance(x, tuple) and self.weight_block_size is not None:

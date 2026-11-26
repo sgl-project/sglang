@@ -5,9 +5,11 @@
 </picture>
 </div>
 
-**SGLang diffusion is an inference framework for accelerated image/video generation.**
+**SGLang Diffusion is an inference framework for accelerated image, video, audio, and action generation.**
 
-SGLang diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
+SGLang Diffusion features an end-to-end unified pipeline for accelerating diffusion models and action policies. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
+
+For robot action generation, see the [VLA cookbook](https://docs.sglang.io/cookbook/vla/intro) and [action API](https://docs.sglang.io/docs/sglang-diffusion/api/openai_api#action-generation-sglang-extension). Model-specific recipes define the supported observations, action layouts, and serving interfaces.
 
 ## Key Features
 

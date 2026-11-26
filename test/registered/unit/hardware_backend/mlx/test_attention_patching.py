@@ -11,7 +11,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.test.ci.ci_register import register_mlx_ci
 
-register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=1, suite="extra-unit-test-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
@@ -435,7 +435,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.req_to_token_pool = ReqToTokenPool(
             size=4,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
         )
@@ -703,7 +703,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         runner._req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -763,7 +763,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         runner._req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=128,
+            row_width=128,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -820,7 +820,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         runner._req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=512,
+            row_width=512,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -916,7 +916,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_req_pool_maps_request_indices(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -944,7 +944,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_req_pool_can_keep_tracked_auxiliary_slot(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -963,7 +963,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_component_inserts_tracked_slot_and_frees_live_slot(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -1005,7 +1005,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_component_unfinished_frees_tracked_source_slot(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -1048,7 +1048,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     ):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -1089,7 +1089,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_component_frees_duplicate_live_slot(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -1180,6 +1180,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             takes_deferred_relay=lambda batch: False, flush_deferred_relay=lambda: None
         )
         scheduler.cur_batch_for_debug = None
+        scheduler.is_generation = True
         scheduler.last_batch = None
         scheduler.running_batch = None
         scheduler.tp_worker = SimpleNamespace(
@@ -1193,6 +1194,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             enable_overlap=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
+            reqs=[],
+            sampling_info=SimpleNamespace(set_plugin_state=lambda reqs: None),
         )
         scheduler.get_next_batch_to_run = lambda running_batch, last_batch: (
             SimpleNamespace(batch_to_run=batch, running_batch=running_batch)

@@ -20,6 +20,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.flashinfer_comm_fusion import (
     is_flashinfer_allreduce_unavailable,
@@ -42,7 +43,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -54,7 +54,7 @@ _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and get_platform().is_sm90
 _is_sm100_supported = _is_cuda and get_platform().is_sm100
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 

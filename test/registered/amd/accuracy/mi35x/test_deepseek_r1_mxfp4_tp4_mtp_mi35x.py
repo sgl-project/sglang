@@ -4,7 +4,7 @@ This mirrors the production-style TP=4 launch recipe with EAGLE speculative
 decoding, overlap plan stream, FP8 KV cache, long context, and full GSM8K
 client pressure enabled.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-tp4 suite
 """
 
 import ast
@@ -28,14 +28,16 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-tp4",
     nightly=True,
 )
 
 INVALID = -9999999
 
 SERVER_LAUNCH_TIMEOUT = 3600
-GSM8K_MTP_ACCURACY_THRESHOLD = 0.944
+# Same gate as the non-MTP TP4 test: greedy EAGLE should not change accuracy,
+# and full GSM8K runs here have ranged 0.940-0.951 night to night.
+GSM8K_MTP_ACCURACY_THRESHOLD = 0.93
 
 
 def get_one_example(lines, i, include_answer):

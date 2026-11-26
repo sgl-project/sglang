@@ -365,7 +365,9 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         model_config=model_config,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
-        req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(2, 512)),
+        req_to_token_pool=SimpleNamespace(
+            row_width=512, req_to_token=torch.zeros(2, 512)
+        ),
         token_to_kv_pool=object(),
         use_mla_backend=not is_draft,
         spec_algorithm=spec,
@@ -617,6 +619,7 @@ def test_pool_configurator_only_merges_dspark_target_cache(
     config = config_mod.KVCacheConfigurator.__new__(config_mod.KVCacheConfigurator)
     config.is_draft_worker = is_draft
     config.modelslim_cache_layout = None
+    config.kv_shard_rank = None
     config.server_args = SimpleNamespace(indexer_kv_cache_dtype=None)
     config.spec_algorithm = SimpleNamespace(is_dspark=lambda: dspark)
     config.model_config = SimpleNamespace(
@@ -681,7 +684,7 @@ def test_pool_configurator_only_merges_dspark_target_cache(
             )
         else:
             config._build_ascend_mla_kv_pool(
-                max_total_num_tokens=256, is_dsa_model=False
+                max_total_num_tokens=256, max_running_requests=4, is_dsa_model=False
             )
     constructor.assert_called_once()
     requested = flash_mla_env == "1" and dspark and not is_draft

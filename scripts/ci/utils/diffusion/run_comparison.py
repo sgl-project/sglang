@@ -22,7 +22,7 @@ Usage:
     python3 scripts/ci/utils/diffusion/run_comparison.py --dry-run
 
     # Run only specific case(s)
-    python3 scripts/ci/utils/diffusion/run_comparison.py --case-ids flux1_dev_t2i_1024
+    python3 scripts/ci/utils/diffusion/run_comparison.py --case-ids flux3_base_t2i_1024
 
     # Run only specific framework(s)
     python3 scripts/ci/utils/diffusion/run_comparison.py --frameworks sglang
@@ -71,7 +71,6 @@ INSTALLABLE_FRAMEWORKS = {"vllm-omni", "lightx2v"}
 
 # Cached reference image (downloaded once)
 _cached_ref_image: bytes | None = None
-_cached_ref_image_path: str | None = None
 _ref_image_variants: dict[int, bytes] = {}
 
 
@@ -369,19 +368,6 @@ def _get_ref_image_variant(config: dict, variant: int | None) -> bytes:
 def _get_ref_image_b64(config: dict, variant: int | None = None) -> str:
     """Get reference image as base64 string."""
     return base64.b64encode(_get_ref_image_variant(config, variant)).decode("utf-8")
-
-
-def _get_ref_image_path(config: dict) -> str:
-    """Save reference image to a temp file and return path."""
-    global _cached_ref_image_path
-    if _cached_ref_image_path and os.path.exists(_cached_ref_image_path):
-        return _cached_ref_image_path
-    data = _get_ref_image_bytes(config)
-    fd, path = tempfile.mkstemp(suffix=".png")
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-    _cached_ref_image_path = path
-    return path
 
 
 # ---------------------------------------------------------------------------
