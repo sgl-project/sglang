@@ -96,6 +96,17 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     defer_block_expansion: bool = False
     # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
+    # Batch-level prefill tensors shared across all QSA layers (computed once per forward).
+    prefill_row_starts: Optional[torch.Tensor] = None
+    prefill_row_ends: Optional[torch.Tensor] = None
+    prefill_compressed_cu_seqlens: Optional[torch.Tensor] = None
+    prefill_row_sequence_lengths: Optional[torch.Tensor] = None
+    prefill_row_lengths: Optional[torch.Tensor] = None
+    prefill_compress_group_locs: Optional[torch.Tensor] = None
+    write_locs_int32: Optional[torch.Tensor] = None
+    # Boundary-crossing groups for unaligned prefixes (e.g. ForwardMode.MIXED decode rows).
+    mixed_ring_write_locs: Optional[torch.Tensor] = None
+    mixed_ring_group_locs: Optional[torch.Tensor] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -162,21 +173,31 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         if sequence_lengths_list is None:
             sequence_lengths_list = sequence_lengths.tolist()
         complete_blocks = [int(length) // ratio for length in sequence_lengths_list]
-        if query_sequence_ids is None:
-            query_sequence_ids = self.token_to_batch_idx
-        num_valid_tokens = query_sequence_ids.numel()
-        if positions.numel() < num_valid_tokens:
-            raise ValueError(
-                "QSA prefill positions are shorter than the request mapping: "
-                f"positions={positions.numel()}, mapping={num_valid_tokens}"
+        if (
+            query_sequence_ids is None
+            and self.prefill_row_starts is not None
+            and self.prefill_row_ends is not None
+            and self.prefill_compressed_cu_seqlens is not None
+        ):
+            row_starts = self.prefill_row_starts
+            row_ends = self.prefill_row_ends
+            compressed_cu_seqlens = self.prefill_compressed_cu_seqlens
+        else:
+            if query_sequence_ids is None:
+                query_sequence_ids = self.token_to_batch_idx
+            num_valid_tokens = query_sequence_ids.numel()
+            if positions.numel() < num_valid_tokens:
+                raise ValueError(
+                    "QSA prefill positions are shorter than the request mapping: "
+                    f"positions={positions.numel()}, mapping={num_valid_tokens}"
+                )
+            positions = positions[:num_valid_tokens]
+            row_starts, row_ends, compressed_cu_seqlens = build_qsa_row_ranges(
+                sequence_lengths,
+                positions.to(sequence_lengths.device),
+                query_sequence_ids.to(sequence_lengths.device),
+                self.compress_ratio,
             )
-        positions = positions[:num_valid_tokens]
-        row_starts, row_ends, compressed_cu_seqlens = build_qsa_row_ranges(
-            sequence_lengths,
-            positions.to(sequence_lengths.device),
-            query_sequence_ids.to(sequence_lengths.device),
-            self.compress_ratio,
-        )
         compressed_keys = gather_qsa_compressed_keys(
             compressed_buffer,
             self.token_slot_table,
@@ -248,18 +269,29 @@ def build_pending_ring_slots(
     logical_positions: torch.Tensor,
     compress_ratio: int,
     is_extend: bool,
+    prefix_lengths: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pending-ring slot ``req_pool_idx * ratio + position % ratio`` per token.
     On extend, tokens before the pending tail dump into rows [0, ratio),
-    which no request owns (request slot 0 is never allocated); CUDA-graph safe."""
+    which no request owns (request slot 0 is never allocated); CUDA-graph safe.
+    When ``prefix_lengths`` is provided (unaligned prefixes such as mixed-chunk
+    decode rows), tokens belonging to the leading partial group also write to
+    their request's pending ring so boundary-crossing groups can be compressed
+    from the ring."""
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
     slots = requests * compress_ratio + positions % compress_ratio
     if is_extend:
         lengths = sequence_lengths.long()[rows]
-        pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % compress_ratio)
+        keep = positions >= (lengths // compress_ratio) * compress_ratio
+        if prefix_lengths is not None:
+            prefixes = prefix_lengths.long()[rows]
+            leading_boundary = (
+                (prefixes + compress_ratio - 1) // compress_ratio
+            ) * compress_ratio
+            keep = keep | (positions < leading_boundary)
+        slots = torch.where(keep, slots, positions % compress_ratio)
     return slots
 
 

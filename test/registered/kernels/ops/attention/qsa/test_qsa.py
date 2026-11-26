@@ -2310,5 +2310,234 @@ def test_qsa_large_fp8_prefill_float_reference(head_dim, heads):
         torch.testing.assert_close(actual[row].double(), expected, rtol=2e-2, atol=2e-2)
 
 
+def test_qsa_paged_fp8_prefill_matches_gathered_without_sync():
+    """Direct paged FP8 prefill with explicit max_q must match gathered chunked
+    prefill across multi-sequence prefix batches without any host-device sync."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    prefix_lens = [128, 0, 64]
+    extend_lens = [513, 1025, 257]
+    seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+    total_q = sum(extend_lens)
+    max_seq = max(seq_lens)
+    max_q = max(extend_lens)
+    num_q_heads, num_kv_heads, head_dim, topk = 6, 1, 128, 64
+    scale = head_dim**-0.5
+
+    # Scatter each sequence's tokens into shuffled pool slots.
+    total_slots = sum(seq_lens) + 64
+    perm = torch.randperm(total_slots, device=device, dtype=torch.int32)
+    slot_table = torch.zeros(len(seq_lens), max_seq, device=device, dtype=torch.int32)
+    offset = 0
+    for i, sl in enumerate(seq_lens):
+        slot_table[i, :sl] = perm[offset : offset + sl]
+        offset += sl
+
+    k_pool = torch.randn(
+        total_slots, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    v_pool = torch.randn(
+        total_slots, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    q = torch.randn(total_q, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+
+    # Build valid causal token indices per row.
+    idx_rows = []
+    for p, e in zip(prefix_lens, extend_lens):
+        vis = torch.arange(e, device=device) + p + 1
+        row_idx = (
+            torch.arange(topk, device=device)[None, :]
+            + torch.arange(e, device=device)[:, None] * 5
+        ) % vis[:, None]
+        idx_rows.append(row_idx.to(torch.int32))
+    topk_indices = torch.cat(idx_rows, dim=0)
+    cu_q = torch.tensor(
+        [0, *accumulate(extend_lens)], device=device, dtype=torch.int32
+    )
+    seq_lens_t = torch.tensor(seq_lens, device=device, dtype=torch.int32)
+
+    # Warm up Triton compilation before enforcing zero host-device syncs.
+    sparse_gqa_paged_prefill_triton(
+        q, k_pool, v_pool, slot_table, topk_indices, cu_q, seq_lens_t, scale, max_q=max_q
+    )
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        paged_out = sparse_gqa_paged_prefill_triton(
+            q,
+            k_pool,
+            v_pool,
+            slot_table,
+            topk_indices,
+            cu_q,
+            seq_lens_t,
+            scale,
+            max_q=max_q,
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    gathered_k = torch.cat(
+        [k_pool.index_select(0, slot_table[i, :sl].long()) for i, sl in enumerate(seq_lens)],
+        dim=0,
+    )
+    gathered_v = torch.cat(
+        [v_pool.index_select(0, slot_table[i, :sl].long()) for i, sl in enumerate(seq_lens)],
+        dim=0,
+    )
+    cu_k = torch.tensor([0, *accumulate(seq_lens)], device=device, dtype=torch.int32)
+    ref_fp8_out = sparse_gqa_fwd_interface_triton_ck(
+        q, gathered_k, gathered_v, topk_indices, cu_q, cu_k, seq_lens_t, scale, max_q=max_q
+    )
+    torch.testing.assert_close(paged_out, ref_fp8_out, rtol=1e-2, atol=1e-2)
+
+    # Also compare against the legacy production pack path, which casts FP8 K/V
+    # to q.dtype (BF16) during pack_qsa_prefill_kv before running chunked prefill.
+    packed_k_bf16, packed_v_bf16 = pack_qsa_prefill_kv(
+        k=k_pool,
+        v=v_pool,
+        req_to_token=slot_table,
+        req_indices=torch.arange(len(seq_lens), device=device, dtype=torch.int32),
+        cu_k=cu_k,
+        total_k=sum(seq_lens),
+        max_k=max_seq,
+        output_dtype=q.dtype,
+    )
+    ref_bf16_out = sparse_gqa_fwd_interface_triton_ck(
+        q,
+        packed_k_bf16,
+        packed_v_bf16,
+        topk_indices,
+        cu_q,
+        cu_k,
+        seq_lens_t,
+        scale,
+        max_q=max_q,
+    )
+    torch.testing.assert_close(paged_out, ref_bf16_out, rtol=2e-2, atol=2e-2)
+
+
+def test_qsa_prefill_config_preserves_h200_bf16_and_uses_sm100_fp8_stages(monkeypatch):
+    from sglang.srt.layers.attention.qsa import sparse_attn as sa_mod
+
+    sa_mod._prefill_config_table.cache_clear()
+    try:
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.version, "hip", None)
+
+        # H200 BF16 & FP8 stay on _H20_CONFIGS (e.g. total_q=96 -> (32, 4, 2)).
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda _: "NVIDIA H200")
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+        sa_mod._prefill_config_table.cache_clear()
+        assert sa_mod._get_best_config(96, is_fp8=False) == (32, 4, 2)
+        assert sa_mod._get_best_config(96, is_fp8=True) == (32, 4, 2)
+        assert sa_mod._get_best_config(2048, is_fp8=True) == (16, 1, 2)
+
+        # Blackwell (SM100+) upgrades only FP8 prefill >512 to 3 stages; BF16 unchanged.
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda _: "NVIDIA B300")
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 3))
+        sa_mod._prefill_config_table.cache_clear()
+        assert sa_mod._get_best_config(96, is_fp8=False) == (64, 4, 2)
+        assert sa_mod._get_best_config(96, is_fp8=True) == (64, 4, 2)
+        assert sa_mod._get_best_config(2048, is_fp8=False) == (16, 1, 2)
+        assert sa_mod._get_best_config(2048, is_fp8=True) == (16, 1, 3)
+    finally:
+        sa_mod._prefill_config_table.cache_clear()
+
+
+def test_qsa_mixed_chunk_unaligned_prefix_ring_slots():
+    """ForwardMode.MIXED decode rows with prefix_len % compress_ratio != 0 must
+    build fixed-size mixed_ring_write_locs/mixed_ring_group_locs with the real
+    write slot and ring members without colliding with aligned chunk writes."""
+    runner, pool, req_pool = _make_qsa_runner_and_pool()
+    backend = QwenSparseAttnBackend(runner)
+    # Use non-zero request slots (slot 0 is the reserved dummy sink).
+    # Request 0 (slot 1): decode row completing block 1 (prefix=7, extend=1 -> seq=8).
+    # Request 1 (slot 2): aligned extend chunk (prefix=4, extend=8 -> seq=12).
+    forward_batch = SimpleNamespace(
+        token_to_kv_pool=routed(pool),
+        req_to_token_pool=req_pool,
+        req_pool_indices=torch.tensor([1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([8, 12], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([8, 12], dtype=torch.int32),
+        forward_mode=ForwardMode.MIXED,
+        extend_seq_lens=torch.tensor([1, 8], dtype=torch.int32),
+        extend_seq_lens_cpu=[1, 8],
+        extend_prefix_lens=torch.tensor([7, 4], dtype=torch.int32),
+        extend_prefix_lens_cpu=[7, 4],
+        positions=torch.tensor([7, 4, 5, 6, 7, 8, 9, 10, 11], dtype=torch.int64),
+        mrope_positions=None,
+        input_ids=torch.zeros(9, dtype=torch.int32),
+        out_cache_loc=torch.arange(9, dtype=torch.int32),
+        _original_forward_mode=None,
+    )
+    backend.init_forward_metadata(forward_batch)
+    idx_meta = backend.forward_metadata.indexer_metadata
+    assert idx_meta.mixed_ring_write_locs is not None
+    assert idx_meta.mixed_ring_group_locs is not None
+    # Fixed-size capacity == num_requests: one active write, one reserved 0 slot.
+    assert idx_meta.mixed_ring_write_locs.shape == (2,)
+    assert idx_meta.mixed_ring_group_locs.shape == (2, COMPRESS_RATIO)
+    valid_mask = idx_meta.mixed_ring_write_locs > 0
+    assert valid_mask.tolist() == [True, False]
+    expected_write_slot = int(req_pool.req_to_token[1, 7].item()) // COMPRESS_RATIO
+    assert idx_meta.mixed_ring_write_locs.tolist() == [expected_write_slot, 0]
+    # Request slot 1's 4 ring members for positions [4, 5, 6, 7], oldest first.
+    assert idx_meta.mixed_ring_group_locs[valid_mask].tolist() == [[4, 5, 6, 7]]
+    # Decode token at pos=7 stays in request slot 1's ring (slot 7), not the [0, 4) sink.
+    assert idx_meta.pending_ring_slots is not None
+    assert int(idx_meta.pending_ring_slots[0].item()) == 1 * COMPRESS_RATIO + (
+        7 % COMPRESS_RATIO
+    )
+    # Batch-level cached prefill metadata tensors must also be populated once.
+    assert idx_meta.prefill_row_starts is not None
+    assert idx_meta.prefill_row_ends is not None
+    assert idx_meta.prefill_row_sequence_lengths is not None
+    assert idx_meta.prefill_row_lengths is not None
+
+
+def test_qsa_expand_block_indices_out_zero_copy():
+    """triton_expand_qsa_block_indices(out=...) writes in place into the caller's
+    bridge tensor and matches the CPU reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(31)
+    device = torch.device("cuda")
+    rows, block_topk, token_topk = 16, 8, 32
+    final_topk = token_topk + COMPRESS_RATIO - 1
+    query_positions = torch.randint(4, 128, (rows,), dtype=torch.int32, device=device)
+    sequence_lengths = query_positions + 4
+    block_indices = torch.full(
+        (rows, block_topk), -1, dtype=torch.int32, device=device
+    )
+    for r in range(rows):
+        limit = int(sequence_lengths[r]) // COMPRESS_RATIO
+        k = min(block_topk, limit)
+        block_indices[r, :k] = torch.arange(k, dtype=torch.int32, device=device)
+
+    bridge = torch.full((rows + 4, final_topk), 99, dtype=torch.int32, device=device)
+    out = triton_expand_qsa_block_indices(
+        block_indices,
+        query_positions,
+        sequence_lengths,
+        COMPRESS_RATIO,
+        token_topk,
+        out=bridge[:rows],
+    )
+    assert out.data_ptr() == bridge.data_ptr()
+    ref = torch_expand_qsa_block_indices(
+        block_indices.cpu(),
+        query_positions.cpu(),
+        sequence_lengths.cpu(),
+        COMPRESS_RATIO,
+        token_topk,
+    )
+    assert torch.equal(out.cpu(), ref)
+    # Untouched tail rows in the bridge must remain intact until caller zeroes them.
+    assert torch.all(bridge[rows:] == 99)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

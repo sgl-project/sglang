@@ -1,5 +1,6 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
+import functools
 from typing import Optional
 
 import torch
@@ -21,12 +22,40 @@ _L20_CONFIGS = [
     (512, (32, 4, 2)),
     (float("inf"), (16, 1, 2)),
 ]
+# SM100+ (Blackwell): for 1-byte FP8 K/V caches on large prefill batches,
+# 3 pipeline stages fit in shared memory at high occupancy and hide HBM gather
+# latency (-12.7% on B300). Smaller buckets keep _L20_CONFIGS verbatim; 2-byte
+# BF16/FP16 K/V, pre-Blackwell GPUs, and packed decode keep their original tables.
+_SM100_FP8_PREFILL_CONFIGS = [
+    (32, (32, 8, 2)),
+    (64, (64, 8, 2)),
+    (128, (64, 4, 2)),
+    (512, (32, 4, 2)),
+    (float("inf"), (16, 1, 3)),
+]
 
 
-def _get_best_config(total_q: int):
+@functools.lru_cache(maxsize=2)
+def _prefill_config_table(is_fp8: bool = False):
+    if not torch.cuda.is_available():
+        return _L20_CONFIGS
+    if (
+        is_fp8
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(0) >= (10, 0)
+    ):
+        return _SM100_FP8_PREFILL_CONFIGS
+    return (
+        _H20_CONFIGS
+        if "H20" in torch.cuda.get_device_name(0)
+        else _L20_CONFIGS
+    )
+
+
+def _get_best_config(total_q: int, *, is_fp8: bool = False):
     if is_batch_invariant_mode_enabled():
         return (32, 4, 2)
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
+    table = _prefill_config_table(is_fp8=is_fp8)
     return next(cfg for limit, cfg in table if total_q <= limit)
 
 
@@ -131,7 +160,7 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    block_n, warps, stages = _get_best_config(total_q, is_fp8=k.element_size() == 1)
     out = torch.empty_like(q)
     _sparse_gqa_prefill[(max_seqlen_k, (cu_seqlens.shape[0] - 1) * num_kv_heads)](
         q,
@@ -394,7 +423,7 @@ def sparse_gqa_fwd_interface_triton_ck(
         # Host sync; callers that know the longest entry pass it instead.
         max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    block_n, warps, stages = _get_best_config(total_q, is_fp8=k.element_size() == 1)
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
@@ -487,7 +516,7 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["slot_rows", "st_m"])
 def _resolve_prefill_slots(
     indices,
     slots,
@@ -560,7 +589,9 @@ def sparse_gqa_paged_prefill_triton(
         num_warps=4,
     )
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    block_n, warps, stages = _get_best_config(
+        total_q, is_fp8=k_cache.element_size() == 1
+    )
     _sparse_gqa_chunk_prefill[(max_q, num_entries * num_kv_heads)](
         q,
         k_cache,

@@ -150,6 +150,7 @@ def _breakable_qsa_indexer(layer, hidden_states, positions, output):
         hidden_states=hidden_states,
         positions=positions,
         forward_batch=forward_batch,
+        out=output,
     )
     if output is None:
         # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA
@@ -157,8 +158,11 @@ def _breakable_qsa_indexer(layer, hidden_states, positions, output):
         # shared. Graphs captured on a smaller bridge keep writing and reading it.
         output = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
         layer._qsa_prefill_topk_bridges.insert(0, output)
-    output.fill_(0)
-    output[: topk.shape[0]].copy_(topk)
+        output[: topk.shape[0]].copy_(topk)
+    elif topk.data_ptr() != output.data_ptr():
+        output[: topk.shape[0]].copy_(topk)
+    if topk.shape[0] < output.shape[0]:
+        output[topk.shape[0] :].zero_()
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -2118,6 +2122,7 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -2146,6 +2151,8 @@ class Qwen4ExpAttentionDecoderLayer(
                 if positions.ndim == 2
                 else forward_batch.positions
             )
+        elif out is not None and _is_cuda:
+            indexer_kwargs["out"] = out
         topk_indices = self.indexer(
             hidden_states,
             positions,
