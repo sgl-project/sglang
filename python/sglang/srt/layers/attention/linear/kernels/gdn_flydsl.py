@@ -92,6 +92,7 @@ class FlyDSLGDNKernel(TritonGDNKernel):
     _indices_batch = None
 
     def __init__(self):
+        super().__init__()
         (
             self._prefill_fn,
             self._prepare_supported,
