@@ -233,7 +233,7 @@ def build_sparse_kv_budget_options(
         top_k=get_sparsity_driven_kv_offload_sparse_context_len(
             model_config=model_config
         ),
-        kv_bytes_per_token=model_config.mla_kv_head_num
+        kv_bytes_per_token=model_config.get_total_num_kv_heads(compressed_mla=True)
         * (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
         * torch._utils._element_size(kv_dtype),
         num_layers=num_layers,

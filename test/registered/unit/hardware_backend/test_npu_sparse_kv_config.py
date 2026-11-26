@@ -13,7 +13,7 @@ register_cpu_ci(est_time=1, stage="base-a", runner_config="cpu")
 
 MODEL_CONFIG = SimpleNamespace(
     num_attention_heads=128,
-    mla_kv_head_num=1,
+    get_total_num_kv_heads=lambda *, compressed_mla: 1,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
     index_head_dim=128,

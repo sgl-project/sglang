@@ -272,7 +272,7 @@ def resolve_sparse_kv_budget(
     resident_rows: int | None = None,
 ) -> BudgetPlan:
     """Resolve and validate native persistent allocations before pool sizing."""
-    kv_head_num = model_config.mla_kv_head_num
+    kv_head_num = model_config.get_total_num_kv_heads(compressed_mla=True)
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     index_head_dim = model_config.index_head_dim
