@@ -12,6 +12,7 @@ import torch
 from fastapi import HTTPException
 
 from sglang.multimodal_gen import registry
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.post_training.rl_rollout import (
     AUDIO_STREAM,
     RLRolloutArgs,
@@ -937,3 +938,21 @@ def test_extra_stream_needs_a_flow_match_euler_scheduler(batch):
             shard_for_sp=_identity_for_sp,
             gather_for_sp=_identity_for_sp,
         )
+
+
+def test_ltx2_cond_kwargs_carry_the_audio_text_context():
+    """The LTX-2 step hands the DiT the audio text context from the batch, so only the
+    config's cond kwargs carry it into the denoising env, where the LTX-2 training reads it."""
+    batch = SimpleNamespace(
+        audio_prompt_embeds=[torch.ones(2)],
+        negative_audio_prompt_embeds=[torch.zeros(2)],
+        prompt_attention_mask=torch.ones(2),
+        negative_attention_mask=torch.zeros(2),
+    )
+    config = LTX2PipelineConfig()
+    pos = config.prepare_pos_cond_kwargs(batch, "cpu", None, torch.float32)
+    neg = config.prepare_neg_cond_kwargs(batch, "cpu", None, torch.float32)
+    assert pos["audio_encoder_hidden_states"] is batch.audio_prompt_embeds[0]
+    assert pos["audio_encoder_attention_mask"] is batch.prompt_attention_mask
+    assert neg["audio_encoder_hidden_states"] is batch.negative_audio_prompt_embeds[0]
+    assert neg["audio_encoder_attention_mask"] is batch.negative_attention_mask

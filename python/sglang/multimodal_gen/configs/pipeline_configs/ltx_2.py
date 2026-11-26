@@ -567,6 +567,29 @@ class LTX2PipelineConfig(PipelineConfig):
             else batch.negative_prompt_embeds
         )
 
+    # The LTX-2 step passes the audio text context to the DiT from the batch, not from
+    # these kwargs; they carry it into the rollout denoising env.
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return {
+            "audio_encoder_hidden_states": (
+                batch.audio_prompt_embeds[0]
+                if isinstance(batch.audio_prompt_embeds, list)
+                else batch.audio_prompt_embeds
+            ),
+            # The step gives the audio stream the video text mask.
+            "audio_encoder_attention_mask": batch.prompt_attention_mask,
+        }
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return {
+            "audio_encoder_hidden_states": (
+                batch.negative_audio_prompt_embeds[0]
+                if isinstance(batch.negative_audio_prompt_embeds, list)
+                else batch.negative_audio_prompt_embeds
+            ),
+            "audio_encoder_attention_mask": batch.negative_attention_mask,
+        }
+
     def get_decode_scale_and_shift(self, device, dtype, vae):
         return get_ltx_video_decode_scale_and_shift(
             device, dtype, vae, self.vae_config.arch_config
