@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind  # noqa:
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds  # noqa: E402
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter  # noqa: E402
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -191,6 +192,27 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
             self.assertEqual(q.dtype, q_dtype, (ver, is_prefill))
             self.assertTrue(torch.equal(k_descale, torch.full((2, 1), 2.0)))
             self.assertTrue(torch.equal(v_descale, torch.full((2, 1), 4.0)))
+
+    def test_fp8_query_dtype_is_decode_only(self):
+        # A prefill graph captured on text is replayed for image batches, which
+        # run FA4 on an unquantized q, so only decode takes fp8 q from RoPE.
+        backend = _backend()
+        backend.kv_cache_dtype = torch.float8_e4m3fn
+        backend.use_mla = False
+        swa = SimpleNamespace(head_dim=256, v_head_dim=256, is_cross_attention=False)
+        full = SimpleNamespace(head_dim=512, v_head_dim=512, is_cross_attention=False)
+        decode = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        extend = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        spec = SimpleNamespace(speculative_algorithm=None)
+        with patch.object(flashattention_backend, "get_spec", return_value=spec):
+            self.assertEqual(backend.fp8_query_dtype(swa, decode), torch.float8_e4m3fn)
+            self.assertIsNone(backend.fp8_query_dtype(swa, extend))
+            self.assertIsNone(backend.fp8_query_dtype(full, decode))
+            backend.kv_cache_dtype = torch.float8_e5m2
+            self.assertIsNone(backend.fp8_query_dtype(swa, decode))
+            backend.kv_cache_dtype = torch.float8_e4m3fn
+            spec.speculative_algorithm = "EAGLE"
+            self.assertIsNone(backend.fp8_query_dtype(swa, decode))
 
     def test_an_auto_draft_over_an_fp8_target_passes_no_descales(self):
         """BUG REGRESSION. A draft whose own `auto` KV cache dtype resolves to

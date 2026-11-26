@@ -39,6 +39,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
@@ -3059,7 +3060,7 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             return
 
         if cache_k.dtype != self.dtype:
-            if self._can_cast_store(cache_k, cache_v, dcp_kv_mask):
+            if self._can_cast_store(cache_k, cache_v, dcp_kv_mask, k_scale, v_scale):
                 # one kernel: divide by the scale, cast to fp8 and scatter the rows
                 self._cast_store_kv(
                     layer_id - self.start_layer, loc, cache_k, cache_v, k_scale, v_scale
@@ -3126,13 +3127,22 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
 
     def _can_cast_store(
-        self, cache_k: torch.Tensor, cache_v: torch.Tensor, dcp_kv_mask
+        self,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        dcp_kv_mask,
+        k_scale,
+        v_scale,
     ) -> bool:
         """fp8 pool fed bf16/fp16 K/V on the plain NHD slot layout: the cast can
         run inside the scatter (cast_store_kv_kernel) instead of two aten casts."""
         return (
             _is_cuda
-            and self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            # Triton has no fp8 conversions below SM89
+            and current_arch().is_sm_at_least(8, 9)
+            # e4m3 only: Triton's cast saturates as the eager one does there, but
+            # for e5m2 the eager cast overflows to inf
+            and self.dtype == torch.float8_e4m3fn
             and cache_k.dtype in (torch.bfloat16, torch.float16)
             and cache_v.dtype == cache_k.dtype
             and dcp_kv_mask is None
@@ -3144,6 +3154,8 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             and cache_v.stride(-1) == 1
             and (self.head_dim & (self.head_dim - 1)) == 0
             and (self.v_head_dim & (self.v_head_dim - 1)) == 0
+            and _cast_store_scale_mode(k_scale) is not None
+            and _cast_store_scale_mode(v_scale) is not None
         )
 
     def _cast_store_kv(
@@ -3160,11 +3172,9 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             return
         k_buf = self.k_buffer[layer_idx].view(self.dtype)
         v_buf = self.v_buffer[layer_idx].view(self.dtype)
-        has_scale = k_scale is not None or v_scale is not None
-        one = (
-            torch.ones(1, dtype=torch.float32, device=cache_k.device)
-            if has_scale
-            else None
+        k_mode, v_mode = (
+            _cast_store_scale_mode(k_scale),
+            _cast_store_scale_mode(v_scale),
         )
         cast_store_kv_kernel[(n, h)](
             cache_k,
@@ -3172,8 +3182,8 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             k_buf,
             v_buf,
             loc,
-            _scale_as_tensor(k_scale, cache_k) if k_scale is not None else one,
-            _scale_as_tensor(v_scale, cache_v) if v_scale is not None else one,
+            _cast_store_scale_arg(k_scale, k_mode),
+            _cast_store_scale_arg(v_scale, v_mode),
             cache_k.stride(0),
             cache_k.stride(1),
             cache_v.stride(0),
@@ -3186,7 +3196,8 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             H=h,
             DK=self.head_dim,
             DV=self.v_head_dim,
-            HAS_SCALE=has_scale,
+            K_SCALE_MODE=k_mode,
+            V_SCALE_MODE=v_mode,
             num_warps=4,
         )
 
@@ -6049,10 +6060,45 @@ def move_kv_cache_native(
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
 
-def _scale_as_tensor(scale, like: torch.Tensor) -> torch.Tensor:
-    if torch.is_tensor(scale):
-        return scale.reshape(-1)[:1].to(torch.float32)
-    return torch.full((1,), float(scale), dtype=torch.float32, device=like.device)
+# How cast_store_kv_kernel divides by a k/v scale, matching what eager
+# ``x.div_(scale)`` does for that kind of scale.
+_SCALE_NONE = 0
+# 0-dim CUDA tensor: no type promotion, so the divisor is rounded to x's dtype
+# and the division is correctly rounded.
+_SCALE_TENSOR = 1
+# Python number or 0-dim CPU tensor: x * (1 / scale), reciprocal rounded in fp32.
+_SCALE_HOST = 2
+
+
+def _cast_store_scale_mode(scale) -> Optional[int]:
+    """The kernel's mode for ``scale``, or None when the eager path must run
+    (e.g. a 1-D tensor, which promotes the division to fp32)."""
+    if scale is None:
+        return _SCALE_NONE
+    if isinstance(scale, (float, int)):
+        return _SCALE_HOST
+    if isinstance(scale, torch.Tensor) and scale.ndim == 0:
+        if scale.device.type == "cpu":
+            return _SCALE_HOST
+        if scale.is_cuda and scale.is_floating_point():
+            return _SCALE_TENSOR
+    return None
+
+
+def _cast_store_scale_arg(scale, mode: int):
+    if mode == _SCALE_TENSOR:
+        return scale
+    return float(scale) if mode == _SCALE_HOST else 1.0
+
+
+@triton.jit
+def _cast_store_scaled(x, scale, MODE: tl.constexpr):
+    if MODE == 1:
+        divisor = tl.load(scale).to(x.dtype).to(tl.float32)
+        x = tl.div_rn(x.to(tl.float32), divisor).to(x.dtype)
+    elif MODE == 2:
+        x = (x.to(tl.float32) * tl.div_rn(1.0, scale)).to(x.dtype)
+    return x
 
 
 @triton.jit
@@ -6062,8 +6108,8 @@ def cast_store_kv_kernel(
     k_cache_ptr,
     v_cache_ptr,
     loc_ptr,
-    k_scale_ptr,
-    v_scale_ptr,
+    k_scale,
+    v_scale,
     k_stride_t,
     k_stride_h,
     v_stride_t,
@@ -6074,11 +6120,13 @@ def cast_store_kv_kernel(
     H: tl.constexpr,
     DK: tl.constexpr,
     DV: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
+    K_SCALE_MODE: tl.constexpr,
+    V_SCALE_MODE: tl.constexpr,
 ):
     """One (token, head) per program: K/V rows divided by their per-tensor scale
-    (rounded in the source dtype, as the pool's div_ did), cast to the cache
-    dtype and scattered to slot ``loc``. Slot 0 is the reserved padding slot."""
+    as eager ``div_`` would (see _cast_store_scale_mode; ``k_scale``/``v_scale``
+    are a 0-dim tensor in mode 1 and a float otherwise), cast to the cache dtype
+    and scattered to slot ``loc``. Slot 0 is the reserved padding slot."""
     t = tl.program_id(0)
     h = tl.program_id(1)
     loc = tl.load(loc_ptr + t).to(tl.int64)
@@ -6087,16 +6135,14 @@ def cast_store_kv_kernel(
         return
     dk = tl.arange(0, DK)
     k = tl.load(k_ptr + t * k_stride_t + h * k_stride_h + dk)
-    if HAS_SCALE:
-        k = (k.to(tl.float32) / tl.load(k_scale_ptr)).to(k.dtype)
+    k = _cast_store_scaled(k, k_scale, K_SCALE_MODE)
     tl.store(
         k_cache_ptr + loc * k_cache_stride + h * DK + dk,
         k.to(k_cache_ptr.dtype.element_ty),
     )
     dv = tl.arange(0, DV)
     v = tl.load(v_ptr + t * v_stride_t + h * v_stride_h + dv)
-    if HAS_SCALE:
-        v = (v.to(tl.float32) / tl.load(v_scale_ptr)).to(v.dtype)
+    v = _cast_store_scaled(v, v_scale, V_SCALE_MODE)
     tl.store(
         v_cache_ptr + loc * v_cache_stride + h * DV + dv,
         v.to(v_cache_ptr.dtype.element_ty),

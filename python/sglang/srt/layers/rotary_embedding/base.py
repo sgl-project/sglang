@@ -336,7 +336,6 @@ class RotaryEmbedding(BaseFusedOp):
         assert fused_set_kv_buffer_arg is None, (
             "fused_set_kv_buffer_arg is not supported for native implementation"
         )
-        assert q_out is None, "q_out is not supported for native implementation"
 
         if offsets is not None:
             positions = positions + offsets
@@ -365,6 +364,8 @@ class RotaryEmbedding(BaseFusedOp):
         key_pass = key[..., self.rotary_dim :]
         key_rot = self._apply_rotary_emb_wrapped(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        if q_out is not None:
+            q_out.copy_(query)
         return query, key
 
     def forward_npu(
@@ -466,18 +467,22 @@ class RotaryEmbedding(BaseFusedOp):
         fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """``q_out``: a buffer shaped like ``query`` in another dtype (e.g. fp8).
-        The rotated query is written there and ``query`` is left untouched; the
-        caller uses ``q_out`` as the query. Full-head rotary on the JIT kernel
-        only."""
+        """``q_out``: a buffer shaped like ``query`` in another dtype (e.g. fp8)
+        that receives the rotated query, cast to its dtype; the caller uses it
+        as the query. The JIT kernel writes it directly for full-head rotary
+        and leaves ``query`` untouched; every other path rotates ``query`` and
+        casts it into ``q_out``."""
+        # q_out the JIT kernel writes itself
+        jit_q_out = None
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
             q_rope = query.view(batch_size, -1, self.head_size)
             k_rope = key.view(batch_size, -1, self.head_size)
             if self.head_size != self.rotary_dim:
-                assert q_out is None, "q_out needs rotary_dim == head_size"
                 q_rope = q_rope[..., : self.rotary_dim]
                 k_rope = k_rope[..., : self.rotary_dim]
+            elif q_out is not None and fused_set_kv_buffer_arg is None:
+                jit_q_out = q_out.view(batch_size, -1, self.head_size)
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 q=q_rope,
@@ -485,14 +490,9 @@ class RotaryEmbedding(BaseFusedOp):
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
                 fused_args=fused_set_kv_buffer_arg,
-                q_out=(
-                    q_out.view(batch_size, -1, self.head_size)
-                    if q_out is not None
-                    else None
-                ),
+                q_out=jit_q_out,
             )
         else:
-            assert q_out is None, "q_out is not supported by the fallback rotary kernel"
             if fused_set_kv_buffer_arg is not None and _is_hip:
                 extra_args = fused_set_kv_buffer_arg
                 k_cache = fused_set_kv_buffer_arg["key_cache"]
@@ -547,6 +547,8 @@ class RotaryEmbedding(BaseFusedOp):
                     cos_sin_cache,
                     self.is_neox_style,
                 )
+        if q_out is not None and jit_q_out is None:
+            q_out.copy_(query)
         return query, key
 
     def extra_repr(self) -> str:

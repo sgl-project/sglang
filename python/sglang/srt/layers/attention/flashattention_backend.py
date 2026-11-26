@@ -479,20 +479,20 @@ class FlashAttentionBackend(AttentionBackend):
             return 4
         return self.fa_impl_ver
 
-    def fp8_query_dtype(self, layer: RadixAttention) -> Optional[torch.dtype]:
-        # Mirrors prepare_paged_mha_query's quantize_q for the FA3 kernels, where
-        # q is cast in prefill and decode alike (FA4 casts only in decode). The
-        # layer must also run FA3 in this batch: image masks (image_token_ranges,
-        # set before the layers run) send every layer of an extend batch to FA4,
-        # which takes no fp8 q on SM90.
-        metadata = self.forward_metadata
-        needs_fa4 = metadata is not None and metadata.image_token_ranges is not None
+    def fp8_query_dtype(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> Optional[torch.dtype]:
+        # Mirrors prepare_paged_mha_query's quantize_q for an FA3 layer. Decode
+        # only: a prefill CUDA graph captured on text is also replayed for image
+        # batches, which send every layer to FA4, and FA4 takes an unquantized
+        # 16-bit q there.
         if (
-            self.kv_cache_dtype_str == "auto"
+            not forward_batch.forward_mode.is_decode()
+            or self.kv_cache_dtype_str == "auto"
             or self.kv_cache_is_mxfp8
             # the RoPE q_out path writes e4m3 only; e5m2 keeps the cast here
             or self.kv_cache_dtype != torch.float8_e4m3fn
-            or self._ver_for(layer, needs_fa4=needs_fa4) != 3
+            or self._ver_for(layer) != 3
             or layer.head_dim > 256
             or layer.is_cross_attention
             or get_spec().speculative_algorithm is not None
@@ -1575,12 +1575,6 @@ class FlashAttentionBackend(AttentionBackend):
         k_descale = v_descale = None
         if self.kv_cache_dtype_str == "auto" or self.kv_cache_is_mxfp8:
             return q, q_rope, k_rope, k_descale, v_descale
-        if ver == 4 and q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            # fp8 q comes from the RoPE kernel for layers that run FA3
-            # (fp8_query_dtype). A prefill CUDA graph fixes that choice at
-            # capture, so an image batch that sends the layer to FA4 can still
-            # hand it fp8 q; FA4 on SM90 takes 16-bit q only.
-            q = q.to(torch.bfloat16)
         fa4_casts_kv = ver == 4 and self.fa4_casts_fp8_kv
         quantize_q = (
             not fa4_casts_kv and layer.head_dim <= 256 and (not is_prefill or ver != 4)

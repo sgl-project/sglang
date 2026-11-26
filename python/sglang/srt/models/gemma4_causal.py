@@ -546,9 +546,9 @@ class Gemma4Attention(nn.Module):
 
         # Apply rotary embedding. Layers whose attention kernel takes fp8 q get
         # it straight from the RoPE kernel (no separate cast).
-        q_dtype = get_attn_backend().fp8_query_dtype(self.attn)
+        q_dtype = get_attn_backend().fp8_query_dtype(self.attn, forward_batch)
         q_out = torch.empty_like(q, dtype=q_dtype) if q_dtype is not None else None
-        # Only the CUDA rotary path takes q_out; other platforms see the old call.
+        # Passed only when set, so other callers and platforms see the old call.
         rope_kwargs = {} if q_out is None else {"q_out": q_out}
         use_fused_kv = False
         if k is not None:
