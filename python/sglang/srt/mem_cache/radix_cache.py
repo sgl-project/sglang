@@ -515,6 +515,10 @@ class RadixCache(BasePrefixCache):
     def checkpoint(self, req: Req, *, up_to: int):
         if self.disable:
             return
+        if req.bidir_prefix_len >= 0:
+            up_to = min(up_to, req.bidir_prefix_len)
+            if up_to <= req.kv.cache_protected_len:
+                return
         token_ids = req.full_untruncated_fill_ids[:up_to]
         # Pure-SWA trees never cache what the window already evicted.
         window_evict_floor = req.kv.window_evict_floor
