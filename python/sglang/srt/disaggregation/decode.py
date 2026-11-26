@@ -243,7 +243,7 @@ class DecodeReqToTokenPool:
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         pre_alloc_size: int,
@@ -255,12 +255,11 @@ class DecodeReqToTokenPool:
         self.size = size
         # +1 padding row at index 0; see ReqToTokenPool for rationale.
         self._alloc_size = size + pre_alloc_size + 1
-        self.max_context_len = max_context_len
         self.device = device
         self.pre_alloc_size = pre_alloc_size
         with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._alloc_size, max_context_len),
+                (self._alloc_size, row_width),
                 dtype=torch.int32,
                 device=device,
             )
@@ -271,6 +270,11 @@ class DecodeReqToTokenPool:
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
+
+    @property
+    def row_width(self) -> int:
+        """See ReqToTokenPool.row_width."""
+        return self.req_to_token.shape[1]
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -333,7 +337,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         cache_params: Mamba2CacheParams,
@@ -358,7 +362,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         DecodeReqToTokenPool.__init__(
             self,
             size=size,
-            max_context_len=max_context_len,
+            row_width=row_width,
             device=device,
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,

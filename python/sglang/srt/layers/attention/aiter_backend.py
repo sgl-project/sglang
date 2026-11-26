@@ -868,7 +868,6 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         # Parse constants
-        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.skip_prefill = skip_prefill
 
         max_bs = model_runner.req_to_token_pool.size
@@ -966,7 +965,9 @@ class AiterAttnBackend(AttentionBackend):
             )
             chunk = get_schedule().chunked_prefill_size
             self.deterministic_prefill_max_q = (
-                chunk if chunk is not None and chunk > 0 else self.max_context_len
+                chunk
+                if chunk is not None and chunk > 0
+                else self.req_to_token_pool.row_width
             )
 
         # Decode metadata format. unified_attention and pa_decode_gluon (the
@@ -1012,7 +1013,7 @@ class AiterAttnBackend(AttentionBackend):
         # Read once by Scheduler.init_overlap (decide_needs_cpu_seq_lens). Under
         # DFLASH a decode step reaches this backend only as TARGET_VERIFY, whose
         # unified-verify metadata is built from device seq_lens and sized by
-        # max_context_len, so the FutureMap's per-step seq_lens D2H (on HIP a host
+        # row_width, so the FutureMap's per-step seq_lens D2H (on HIP a host
         # Event.synchronize behind the previous step's accept) buys nothing; the
         # DFLASH worker plans from its host reservation bound (nxt_kv_lens_cpu).
         # Extend batches keep their scheduler-built host lengths either way.
@@ -1108,7 +1109,7 @@ class AiterAttnBackend(AttentionBackend):
 
         # aiter kernel related initialization
         self.max_num_partitions = (
-            self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
+            self.req_to_token_pool.row_width + _AITER_PARTITION_SIZE_ROCM - 1
         ) // _AITER_PARTITION_SIZE_ROCM
         self._decode_partition_buckets = self._build_decode_partition_buckets()
         if len(self._decode_partition_buckets) > 1:
@@ -1664,7 +1665,7 @@ class AiterAttnBackend(AttentionBackend):
         """Convert ragged token-level KV indices to a dense block page table."""
         page_size = self.page_size
         if max_blocks is None:
-            max_blocks = (self.max_context_len + page_size - 1) // page_size
+            max_blocks = (self.req_to_token_pool.row_width + page_size - 1) // page_size
 
         swa_slot_mapping = None
         swa_page_table = None
@@ -1747,7 +1748,7 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         page_size = self.page_size
-        max_blocks = (self.max_context_len + page_size - 1) // page_size
+        max_blocks = (self.req_to_token_pool.row_width + page_size - 1) // page_size
 
         swa_slot_mapping = None
         swa_page_table = None
@@ -2365,7 +2366,7 @@ class AiterAttnBackend(AttentionBackend):
     def _resolve_mla_gluon_min_kv_seq_len(self, forward_batch: ForwardBatch) -> int:
         try:
             if torch.cuda.is_current_stream_capturing():
-                return int(self.max_context_len)
+                return int(self.req_to_token_pool.row_width)
         except Exception:
             pass
         if forward_batch.seq_lens_cpu is not None:
@@ -2490,7 +2491,7 @@ class AiterAttnBackend(AttentionBackend):
 
     def _dcp_graph_max_local_kv_len(self) -> int:
         """Static upper bound on this rank's shard under a cuda graph."""
-        max_global_kv_len = self.max_context_len
+        max_global_kv_len = self.req_to_token_pool.row_width
         if self._asm_cprr_supports_verify_shape(self.num_draft_tokens):
             max_global_kv_len += self.num_draft_tokens
         return self._dcp_max_local_kv_len(max_global_kv_len)
@@ -2837,10 +2838,9 @@ class AiterAttnBackend(AttentionBackend):
 
     def _kv_index_blocks(self, bs: int) -> int:
         return spec_kv_index_token_blocks(
-            self.req_to_token.shape[1],
+            self.req_to_token_pool.row_width,
             kv_lens_sum=None,
             batch_size=bs,
-            context_len=self.max_context_len,
         )
 
     def _uses_paged_ragged_decode(self) -> bool:
@@ -2856,7 +2856,7 @@ class AiterAttnBackend(AttentionBackend):
         """(label, max_seq_len, num_partitions), ascending; the last serves any length."""
         fallback = (
             _DECODE_PARTITION_FALLBACK,
-            self.max_context_len,
+            self.req_to_token_pool.row_width,
             self.max_num_partitions,
         )
         # Below 128 partitions buckets save little: at batch 256 and 1.5K tokens,
@@ -3769,7 +3769,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
-                self.max_context_len + self.page_size - 1
+                self.req_to_token_pool.row_width + self.page_size - 1
             ) // self.page_size
             # Non-unified AITER CUDA graph paths fill this buffer with flat
             # token-level kv_indices via create_flashinfer_kv_indices_triton
@@ -3803,7 +3803,7 @@ class AiterAttnBackend(AttentionBackend):
             # cuda_graph_kv_indices with flat per-token indices makes
             # page-table width ambiguous after the token buffer is expanded.
             max_num_blocks_per_seq = (
-                self.max_context_len + self.page_size - 1
+                self.req_to_token_pool.row_width + self.page_size - 1
             ) // self.page_size
             self.cuda_graph_page_table = torch.zeros(
                 (max_bs, max_num_blocks_per_seq),
@@ -3829,7 +3829,7 @@ class AiterAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (max_num_tokens * self.req_to_token_pool.row_width),
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -3901,7 +3901,7 @@ class AiterAttnBackend(AttentionBackend):
 
         if self.use_sliding_window_kv_pool:
             max_num_blocks_per_seq = (
-                self.max_context_len + self.page_size - 1
+                self.req_to_token_pool.row_width + self.page_size - 1
             ) // self.page_size
             self.cuda_graph_swa_page_table = torch.zeros(
                 (max_bs, max_num_blocks_per_seq),
@@ -3957,7 +3957,7 @@ class AiterAttnBackend(AttentionBackend):
         swa_page_table = None
         triton_mla_tables = triton_mla_seqused_k = None
         # Unified verify never reads this host max (replay sizes from
-        # max_context_len); torch.max(seq_lens).item() would sync every replay.
+        # row_width); torch.max(seq_lens).item() would sync every replay.
         max_kv_len = (
             seq_lens_cpu.max().item()
             if seq_lens_cpu is not None
@@ -3973,7 +3973,7 @@ class AiterAttnBackend(AttentionBackend):
 
             if spec_info is None or (self.decode_uses_page_table and not self.use_mla):
                 max_num_blocks_per_seq = (
-                    self.max_context_len + self.page_size - 1
+                    self.req_to_token_pool.row_width + self.page_size - 1
                 ) // self.page_size
 
                 if not self.decode_uses_page_table:
@@ -4320,7 +4320,7 @@ class AiterAttnBackend(AttentionBackend):
                 max_q_len = verify_tokens_per_req
                 if self._use_unified_verify:
                     max_num_blocks_per_seq = (
-                        self.max_context_len + self.page_size - 1
+                        self.req_to_token_pool.row_width + self.page_size - 1
                     ) // self.page_size
                     page_table = self.cuda_graph_page_table[:bs]
 
@@ -6264,14 +6264,12 @@ class AiterMultiStepDraftBackend:
                     topk=topk,
                 )
             )
-        self.max_context_len = self.attn_backends[0].max_context_len
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = get_schedule().page_size
         self.runner_ids = model_runner.runner_ids
 
@@ -6283,11 +6281,10 @@ class AiterMultiStepDraftBackend:
         seq_lens_sum = forward_batch.seq_lens_sum
 
         num_token_blocks = spec_kv_index_token_blocks(
-            self.pool_len,
+            self.req_to_token_pool.row_width,
             kv_lens_sum=None,
             batch_size=num_seqs,
             base_programs=self.speculative_num_steps * num_seqs * self.topk,
-            context_len=self.max_context_len,
         )
         src = self.runner_ids.read_source(
             forward_batch.iteration_ids,
@@ -6327,7 +6324,7 @@ class AiterMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
-            forward_batch.batch_size, self.topk, self.max_context_len
+            forward_batch.batch_size, self.topk, self.req_to_token_pool.row_width
         )
         kv_indices = torch.empty(
             (self.speculative_num_steps, kv_indices_width),
@@ -6348,7 +6345,7 @@ class AiterMultiStepDraftBackend:
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         kv_indices_width = draft_kv_indices_buffer_width(
-            max_bs, self.topk, self.max_context_len
+            max_bs, self.topk, self.req_to_token_pool.row_width
         )
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),

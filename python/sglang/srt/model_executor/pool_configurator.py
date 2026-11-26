@@ -38,7 +38,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
-from sglang.srt.mem_cache.allocation_sizing import get_decode_reach
+from sglang.srt.mem_cache.allocation_sizing import get_spec_decode_reach
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -1082,7 +1082,7 @@ def compute_swa_request_cap(
     if get_spec().speculative_algorithm is None:
         decode_alloc = page_size
     else:
-        decode_alloc = get_decode_reach(page_size)
+        decode_alloc = get_spec_decode_reach(page_size)
     per_request = trailing_tokens + decode_alloc
 
     if max_running_requests is None:

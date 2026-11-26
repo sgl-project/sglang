@@ -36,7 +36,7 @@ class TestXPUGraphMetadata(CustomTestCase):
         backend.attention_chunk_size = None
         backend.use_sliding_window_kv_pool = True
         backend.page_size = page_size
-        backend.max_context_len = max_context_len
+        backend.req_to_token_pool = SimpleNamespace(row_width=max_context_len)
 
         # Pool setup: 2 requests, stride indices at 0, 16, 32, 48.
         # Req 0 has length 32 (needs 2 pages: pos 0 and 16).

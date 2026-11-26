@@ -404,7 +404,7 @@ class ReqToTokenPool:
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
     ):
@@ -416,18 +416,22 @@ class ReqToTokenPool:
         # +1 padding row at index 0: cuda-graph padded batches default
         # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
         self._alloc_size = size + 1
-        # The row width: the model context plus room for over-allocation and
-        # drafts. A speculative step can read past the model context, so
-        # attention tables indexed by KV position are sized to this width.
-        self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._alloc_size, max_context_len), dtype=torch.int32, device=device
+                (self._alloc_size, row_width), dtype=torch.int32, device=device
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
+
+    @property
+    def row_width(self) -> int:
+        """The KV positions a row holds; the builders size it to the model
+        context plus room for over-allocation and drafts. A speculative step
+        can read past the model context, so attention tables indexed by KV
+        position are sized to this width."""
+        return self.req_to_token.shape[1]
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -1434,7 +1438,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         size: int,
         mamba_size: int,
         mamba_spec_state_size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         cache_params: BaseLinearStateParams,
@@ -1458,7 +1462,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ):
         super().__init__(
             size=size,
-            max_context_len=max_context_len,
+            row_width=row_width,
             device=device,
             enable_memory_saver=enable_memory_saver,
         )

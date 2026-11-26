@@ -56,7 +56,7 @@ def _fake_runner(*, row_width):
         dtype=torch.bfloat16,
         page_size=16,
         req_to_token_pool=SimpleNamespace(
-            max_context_len=row_width, req_to_token=torch.zeros((2, row_width))
+            row_width=row_width, req_to_token=torch.zeros((2, row_width))
         ),
         device="cpu",
         is_draft_worker=False,
@@ -70,7 +70,8 @@ def _construct_backend(runner, *, configured=0, xqa=False):
     ``_init_full_attn_kv_splits``."""
     access = SimpleNamespace(kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN)
 
-    def parent_init(backend, *args, **kwargs):
+    def parent_init(backend, model_runner, *args, **kwargs):
+        backend.req_to_token_pool = model_runner.req_to_token_pool
         backend.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: access
         )
@@ -280,7 +281,7 @@ class TestTRTLLMHAFullAttnKVSplit(CustomTestCase):
         backend = self._backend()
         backend.decode_seq_len_splits = 1
         backend.q_data_type = torch.bfloat16
-        backend.max_context_len = 1024
+        backend.req_to_token_pool = SimpleNamespace(row_width=1024)
         backend.workspace_buffer = backend._multi_ctas_kv_counter_buffer = None
         seen = []
         decode = SimpleNamespace(get_device_sm_count=lambda device: self.SMS)
