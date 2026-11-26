@@ -16,6 +16,10 @@ DATA_ALIGNMENT = 256
 DEFAULT_MAX_INFLIGHT_SLICES = 4096
 
 
+class InactivePoolLeaseError(RuntimeError):
+    """The requested pool generation is no longer active."""
+
+
 def get_mm_feature_consumer_count() -> int:
     """Number of scheduler ranks receiving one routed multimodal request."""
     parallel = get_parallel()
@@ -392,7 +396,7 @@ class StreamOrderedMmFeaturePool:
                 or lease.ready_byte_offset != ready_byte_offset
                 or lease.ack_byte_offset != ack_byte_offset
             ):
-                raise RuntimeError(
+                raise InactivePoolLeaseError(
                     f"Cannot cancel inactive {self.transport_name} pool lease "
                     f"(slot={slot}, generation={generation})"
                 )

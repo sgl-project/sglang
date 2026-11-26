@@ -404,7 +404,7 @@ class ReqToTokenPool:
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
     ):
@@ -416,18 +416,22 @@ class ReqToTokenPool:
         # +1 padding row at index 0: cuda-graph padded batches default
         # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
         self._alloc_size = size + 1
-        # The row width: the model context plus room for over-allocation and
-        # drafts. A speculative step can read past the model context, so
-        # attention tables indexed by KV position are sized to this width.
-        self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._alloc_size, max_context_len), dtype=torch.int32, device=device
+                (self._alloc_size, row_width), dtype=torch.int32, device=device
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
+
+    @property
+    def row_width(self) -> int:
+        """The KV positions a row holds; the builders size it to the model
+        context plus room for over-allocation and drafts. A speculative step
+        can read past the model context, so attention tables indexed by KV
+        position are sized to this width."""
+        return self.req_to_token.shape[1]
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -1434,7 +1438,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         size: int,
         mamba_size: int,
         mamba_spec_state_size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         cache_params: BaseLinearStateParams,
@@ -1458,7 +1462,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ):
         super().__init__(
             size=size,
-            max_context_len=max_context_len,
+            row_width=row_width,
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
@@ -3979,6 +3983,14 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                     )
                     for _ in range(self.layer_num)
                 ]
+                self.dq_k_buffer = self.dq_v_buffer = None
+                if self.layer_num and get_platform().is_sm120:
+                    self.dq_k_buffer = torch.zeros(
+                        (m, n, k), dtype=torch.bfloat16, device=self.device
+                    )
+                    self.dq_v_buffer = torch.zeros(
+                        (m, n, v), dtype=torch.bfloat16, device=self.device
+                    )
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -4004,6 +4016,8 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         del self.v_buffer
         del self.k_scale_buffer
         del self.v_scale_buffer
+        del self.dq_k_buffer
+        del self.dq_v_buffer
 
     def _get_key_buffer(self, layer_id: int):
         return self.k_buffer[layer_id - self.start_layer]
@@ -4252,6 +4266,9 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             v_size_bytes += get_tensor_size_bytes(v_cache)
         for v_scale in self.v_scale_buffer:
             v_size_bytes += get_tensor_size_bytes(v_scale)
+        if self.dq_k_buffer is not None:
+            k_size_bytes += get_tensor_size_bytes(self.dq_k_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.dq_v_buffer)
         return k_size_bytes, v_size_bytes
 
 
@@ -6637,9 +6654,17 @@ class MiniMaxSparseKVPool(KVCache):
             layer_ids=sorted(self.sparse_layer_id_mapping)
         )
 
+    def get_kv_layer_ids(self) -> list[int]:
+        """Global layer id of each get_sparse_kv_buf_infos() entry (K, then V)."""
+        return sorted(self.sparse_layer_id_mapping) * 2
+
     def get_dense_kv_state_buf_infos(self):
         # Dense KV uses logical device slots, independently of sparse host slots.
         return self._get_layer_kv_buf_infos(layer_ids=sorted(self._dense_layer_ids))
+
+    def get_dense_kv_state_layer_ids(self) -> list[int]:
+        """Global layer id of each get_dense_kv_state_buf_infos() entry (K, then V)."""
+        return sorted(self._dense_layer_ids) * 2
 
     def _get_layer_kv_buf_infos(self, *, layer_ids):
         buffers = [self.get_key_buffer(layer_id) for layer_id in layer_ids] + [
@@ -6649,6 +6674,12 @@ class MiniMaxSparseKVPool(KVCache):
             [buffer.data_ptr() for buffer in buffers],
             [buffer.nbytes for buffer in buffers],
             [buffer[0].nbytes * self.page_size for buffer in buffers],
+        )
+
+    def get_index_k_state_layer_ids(self) -> list[int]:
+        """Global layer id of each get_index_k_state_buf_infos() entry."""
+        return sorted(
+            self.index_k_layer_id_mapping, key=self.index_k_layer_id_mapping.get
         )
 
     def get_index_k_state_buf_infos(self):
