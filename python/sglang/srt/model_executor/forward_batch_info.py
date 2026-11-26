@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+    from sglang.srt.steering.spec import SteeringVectorSpec
 
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
 # ForwardBatch.apply_deprecated_skip_attn_backend_init.
@@ -592,6 +593,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_is_final_cpu: Optional[List[bool]] = None
     # For LoRA
     lora_ids: Optional[List[str]] = None
+    # For per-request activation steering vectors (None when unused -> zero overhead)
+    steering_vectors: Optional[List[Optional[SteeringVectorSpec]]] = None
+    steering_is_decode: Optional[List[bool]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
     # A one-request batch's committed KV length, which can lag one verify: a host-side
@@ -792,6 +796,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # wrapper plans and view-context plans must keep this False — a
     # forward-path re-plan would clobber their metadata.
     forward_metadata_replan_equivalent: bool = False
+
+    def has_steering(self) -> bool:
+        """Return True when at least one request in this batch carries a steering spec."""
+        return self.steering_vectors is not None
 
     def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
         """Record that attention metadata was pre-planned for this batch.
@@ -1087,6 +1095,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
+            steering_vectors=(
+                [req.steering_vector for req in batch.reqs]
+                if any(req.steering_vector is not None for req in batch.reqs)
+                else None
+            ),
+            steering_is_decode=(
+                [len(req.output_ids) > 0 for req in batch.reqs]
+                if any(req.steering_vector is not None for req in batch.reqs)
+                else None
+            ),
             rids=[req.rid for req in batch.reqs],
             attention_kv_len_lower_bound=(
                 batch.reqs[0].kv.kv_committed_len if len(batch.reqs) == 1 else None
@@ -2050,6 +2068,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
         if self.lora_ids is not None:
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
+        if self.steering_vectors is not None:
+            self.steering_vectors.extend((bs - len(self.steering_vectors)) * [None])
+        if self.steering_is_decode is not None:
+            self.steering_is_decode.extend(
+                (bs - len(self.steering_is_decode)) * [False]
+            )
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()

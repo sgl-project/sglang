@@ -1336,6 +1336,7 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
+            steering_vector=request.steering_vector,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
