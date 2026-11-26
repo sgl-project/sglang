@@ -5,7 +5,7 @@ import threading
 import time
 import unittest
 from collections import defaultdict
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -316,8 +316,8 @@ class TestWaiterEndsWithTheProtocol(CustomTestCase):
         self.assertEqual(reduced, [[0, 1]])
 
     def test_a_failed_transfer_worker_ends_the_wait(self):
-        """REGRESSION: a Mooncake transfer worker that raises fails its room,
-        so a page move waiting for its unfinished send returns."""
+        """REGRESSION: a Mooncake transfer worker whose send raises fails its
+        room, so a page move waiting for its unfinished send returns."""
         from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 
         manager = _Manager()
@@ -329,8 +329,11 @@ class TestWaiterEndsWithTheProtocol(CustomTestCase):
         self.assertFalse(prefill._send_done(peer))
 
         class _OneChunk:
+            def __init__(self):
+                self.items = [SimpleNamespace(room=9), None]
+
             def get(self):
-                return SimpleNamespace(room=9)
+                return self.items.pop(0)
 
         # A worker whose send raises (here: whatever it reads first is
         # missing, as a timed-out aux send raises out of the same body).
@@ -339,10 +342,16 @@ class TestWaiterEndsWithTheProtocol(CustomTestCase):
             poison_deferred_ack_room=lambda room: None,
             record_failure=lambda room, reason: None,
             update_status=manager.update_status,
+            request_status=manager.request_status,
+            conclude_failure=lambda **kw: None,
             bootstrap_port=0,
+            transfer_worker_health=None,
         )
-        with self.assertRaisesRegex(RuntimeError, "Transfer thread failed"):
-            MooncakeKVManager.transfer_worker(worker, _OneChunk(), None)
+        worker._fail_room_on_worker_error = MethodType(
+            MooncakeKVManager._fail_room_on_worker_error, worker
+        )
+        # The worker fails the room and runs on to the stop sentinel.
+        MooncakeKVManager.transfer_worker(worker, _OneChunk(), None)
         self.assertEqual(manager.request_status[9], KVPoll.Failed)
         self.assertTrue(prefill._send_done(peer))
         NetworkTransferWaiter(prefill._send_done, (), interval=0.0)(
