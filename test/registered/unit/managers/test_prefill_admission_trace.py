@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -22,7 +22,7 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 TRACE_LOG = "sglang.srt.managers.scheduler_components.prefill_admission_trace"
 
 
-class TestPrefillAdmissionTrace(unittest.TestCase):
+class TestPrefillAdmissionTrace(CustomTestCase):
     def scheduler(self, *requests):
         s = Scheduler.__new__(Scheduler)
         s.dp_round_trace = True
