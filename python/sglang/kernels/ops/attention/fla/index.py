@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import collections
 import contextlib
 
 import torch
@@ -19,9 +18,6 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 # (cu_seqlens tensor, per-sequence lengths on the host) for the extend call in
 # flight: lets the chunk index builders skip a GPU->host .tolist() sync.
 _CPU_LENS_HINT = None
-# pinned sources of in-flight non_blocking H2D copies: freeing one early lets the
-# host allocator hand the buffer out again before the DMA has read it
-_PINNED_KEEPALIVE = collections.deque(maxlen=64)
 
 
 @contextlib.contextmanager
@@ -60,9 +56,13 @@ def prepare_chunk_indices(
             or [torch.zeros(0, dtype=torch.long)]
         )
         out = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
-        pinned = out.to(cu_seqlens.dtype).pin_memory()
-        _PINNED_KEEPALIVE.append(pinned)
-        return pinned.to(cu_seqlens.device, non_blocking=True)
+        # The caching host allocator records an event on the copy stream, so the
+        # pinned block is not reused before this copy has read it.
+        return (
+            out.to(cu_seqlens.dtype)
+            .pin_memory()
+            .to(cu_seqlens.device, non_blocking=True)
+        )
     indices = torch.cat(
         [
             torch.arange(n)

@@ -1203,7 +1203,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         hint = contextlib.nullcontext()
         lens_cpu = forward_batch.extend_seq_lens_cpu
         if (
-            envs.SGLANG_ROCM_NO_EXTEND_SYNC.get()
+            envs.SGLANG_KDA_NO_EXTEND_SYNC.get()
             and lens_cpu is not None
             and query_start_loc is not None
             and query_start_loc.numel() == len(lens_cpu) + 1

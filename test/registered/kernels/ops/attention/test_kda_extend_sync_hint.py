@@ -1,4 +1,4 @@
-"""SGLANG_ROCM_NO_EXTEND_SYNC: host-side chunk indices must match the
+"""SGLANG_KDA_NO_EXTEND_SYNC: host-side chunk indices must match the
 device-derived ones, and chunk KDA must give bit-identical outputs and states
 with the hint on or off."""
 
