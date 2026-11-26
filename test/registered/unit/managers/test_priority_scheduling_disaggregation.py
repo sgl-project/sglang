@@ -873,7 +873,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
                 self.assertEqual(req.output_ids, output_ids)
 
 
-class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
+class TestCommonKVManagerPrefillRecompute(CustomTestCase):
     """The kv manager owns the shared executor + HTTP session and routes any
     rebootstrap ``/generate`` failure through ``kv_receiver.abort()`` ->
     ``KVPoll.Failed`` so the scheduler's normal transfer-failure streaming runs.
