@@ -78,6 +78,7 @@ BUILT_IN_KV_CACHE_DTYPES = (
     "mxfp8",
     "bf16",
     "bfloat16",
+    "int8",
     "nvfp4",
     "fp4_mx_block16",
 )
@@ -112,6 +113,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "mlu",
 ]
 
 _REMOVED_ATTENTION_BACKENDS = {
@@ -324,6 +326,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "flashmla",
     "cutedsl_mla",
     "trtllm_mla",
+    "mlu",
 ]
 add_chunked_prefix_cache_attention_backend = (
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append

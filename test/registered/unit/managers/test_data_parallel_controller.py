@@ -587,10 +587,14 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
             ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=room))
             ctl.workers[expected_rank].send_pyobj.assert_called()
 
-    def test_requires_bootstrap_room(self):
+    def test_room_less_request_is_placed_round_robin(self):
+        """A room-less request (Rust frontend, sent straight to a PD server) is
+        placed for the scheduler to answer or reject, not asserted on."""
         ctl = _make_controller(num_dp_ranks=4)
-        with self.assertRaises(AssertionError):
+        for _ in range(4):
             ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=None))
+        for worker in ctl.workers:
+            worker.send_pyobj.assert_called_once()
 
     def test_routed_dp_rank_bypasses_bootstrap_room(self):
         ctl = _make_controller(num_dp_ranks=4)
