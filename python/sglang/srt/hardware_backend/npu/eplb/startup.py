@@ -18,10 +18,11 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.hardware_backend.npu.eplb.coordinator import AsyncEplbCoordinator
 from sglang.srt.hardware_backend.npu.eplb.placement import PlanningSpec
-from sglang.srt.hardware_backend.npu.eplb.runtime import EplbControl, NpuEplbRuntime
-from sglang.srt.hardware_backend.npu.eplb.weights import (
+from sglang.srt.hardware_backend.npu.eplb.runtime import NpuEplbRuntime
+from sglang.srt.hardware_backend.npu.eplb.transport import (
     _allocate_migration_warmup_buffers,
     _validate_migration_topology,
+    EplbControl,
 )
 
 logger = logging.getLogger(__name__)

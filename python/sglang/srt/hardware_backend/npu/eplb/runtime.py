@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import NamedTuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from sglang.srt.environ import envs
@@ -30,186 +28,18 @@ from sglang.srt.hardware_backend.npu.eplb.plan_exchange import (
     broadcast_placement,
     populated_replica_width,
 )
-from sglang.srt.hardware_backend.npu.eplb.weights import (
-    _ExpertWeightAdapter,
+from sglang.srt.hardware_backend.npu.eplb.transport import (
+    _hccl_expert_order,
+    _make_comm_rank_lookup,
+    _submit_hccl_batches,
     _warm_migration_group,
 )
+from sglang.srt.hardware_backend.npu.eplb.weights import (
+    _ExpertWeightAdapter,
+    _make_weight_writeback,
+    _PackedExpertFields,
+)
 from sglang.srt.utils import get_bool_env_var
-
-_MAX_PACKED_FIELD_BYTES = 16 * 1024
-
-
-class EplbControl:
-    def __init__(self, group: dist.ProcessGroup):
-        self.group = group
-        self.wait_seconds = 0.0
-        # The forward thread owns votes and waits for each reduction to finish.
-        self._vote_values = np.empty(8, dtype=np.int64)
-        self._vote_flags = torch.from_numpy(self._vote_values)
-
-    def vote(
-        self, epoch: int, phase: int, layer: int, ready: bool, error: bool
-    ) -> tuple[bool, bool]:
-        # MAX(x), MAX(-x) detects mismatched protocol positions on every rank.
-        self._vote_values[:] = (
-            epoch,
-            -epoch,
-            phase,
-            -phase,
-            layer,
-            -layer,
-            int(not ready),
-            int(error),
-        )
-        start = time.perf_counter()
-        dist.all_reduce(self._vote_flags, op=dist.ReduceOp.MAX, group=self.group)
-        self.wait_seconds += time.perf_counter() - start
-        (
-            max_epoch,
-            neg_min_epoch,
-            max_phase,
-            neg_min_phase,
-            max_layer,
-            neg_min_layer,
-            any_unready,
-            any_error,
-        ) = self._vote_flags.tolist()
-        if (
-            max_epoch != -neg_min_epoch
-            or max_phase != -neg_min_phase
-            or max_layer != -neg_min_layer
-        ):
-            raise RuntimeError("EPLB ranks reached different protocol boundaries")
-        return any_unready == 0, bool(any_error)
-
-    def close(self) -> None:
-        dist.destroy_process_group(self.group)
-
-
-def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
-    # The NPU adapter exposes dense byte rows. Merge adjacent copies only
-    # when they are contiguous in both the staging and live storage.
-    ranges = []
-    for source, destination in rows:
-        if ranges:
-            prev_source, prev_dest, length = ranges[-1]
-            if source == prev_source + length and destination == prev_dest + length:
-                ranges[-1] = (prev_source, prev_dest, length + 1)
-                continue
-        ranges.append((source, destination, 1))
-
-    # Slice on the staging worker. The forward thread only submits the copies.
-    copies = [
-        (
-            weight[destination : destination + length],
-            buffer[source : source + length],
-        )
-        for source, destination, length in ranges
-        for weight, buffer in zip(weights, buffers, strict=True)
-    ]
-
-    # Batched copy helps fragmented writeback. Reused staging rows can be
-    # faster as separate copies, especially when each row is large.
-    if (
-        len(ranges) >= 8
-        and weights[0].device.type == "npu"
-        and hasattr(torch, "_foreach_copy_")
-        and len({source for source, _ in rows}) == len(rows)
-    ):
-        destinations, sources = zip(*copies, strict=True)
-
-        def batch_writeback():
-            torch._foreach_copy_(destinations, sources, non_blocking=True)
-
-        return batch_writeback
-
-    def writeback():
-        for destination, source in copies:
-            destination.copy_(source)
-
-    return writeback
-
-
-def _make_comm_rank_lookup(old_layout, new_layout, local_experts):
-    def index_ranks(layout):
-        by_expert = defaultdict(list)
-        for slot, expert in enumerate(layout):
-            rank = slot // local_experts
-            ranks = by_expert[expert]
-            # Preserve rank order for the shared source assignment.
-            if not ranks or ranks[-1] != rank:
-                ranks.append(rank)
-        return by_expert
-
-    old_ranks = index_ranks(old_layout)
-    new_ranks = index_ranks(new_layout)
-
-    def lookup(expert):
-        sources = old_ranks[expert]
-        source_ranks = set(sources)
-        return sources, [rank for rank in new_ranks[expert] if rank not in source_ranks]
-
-    return lookup
-
-
-def _submit_hccl_batches(p2p_op_infos, expert_order, batch_size, work_handles):
-    ops_by_expert = dict(p2p_op_infos)
-    if not any(ops_by_expert.values()):
-        return
-    for start in range(0, len(expert_order), batch_size):
-        batch_ops = [
-            op
-            for expert in expert_order[start : start + batch_size]
-            for op in ops_by_expert.get(expert, ())
-        ]
-        if batch_ops:
-            work = dist.batch_isend_irecv(batch_ops)
-            work_handles.extend(work)
-            for request in work:
-                request.wait()
-
-
-def _hccl_expert_order(old_layout, new_layout, num_logical, world_size, batch_size):
-    """Spread busy rank pairs across HCCL batches without changing the transfers."""
-    block_size = 4
-    if batch_size % block_size or num_logical <= batch_size:
-        return None
-
-    num_batches = (num_logical + batch_size - 1) // batch_size
-    padded = num_batches * batch_size
-    ranks = np.arange(world_size)[:, None]
-    owners = np.zeros((world_size, padded), dtype=bool)
-    receivers = np.zeros_like(owners)
-    owners[ranks, np.asarray(old_layout).reshape(world_size, -1)] = True
-    receivers[ranks, np.asarray(new_layout).reshape(world_size, -1)] = True
-    receivers &= ~owners
-
-    # The updater splits each expert's destinations evenly among its old
-    # owners, giving the remainder to the lowest owner ranks.
-    quotient, remainder = np.divmod(
-        receivers.sum(axis=0), owners.sum(axis=0).clip(min=1)
-    )
-    sends = owners * (quotient + (owners.cumsum(axis=0) <= remainder))
-    endpoint_rows = np.concatenate((sends, receivers), axis=0)
-    contiguous = endpoint_rows.reshape(-1, num_batches, batch_size).sum(axis=2)
-    contiguous_cost = contiguous.max(axis=0).sum()
-    if contiguous_cost == 0:
-        return None
-    interleaved = endpoint_rows.reshape(
-        -1, batch_size // block_size, num_batches, block_size
-    ).sum(axis=(1, 3))
-
-    # Require a substantial drop in busiest-endpoint rows to offset extra
-    # submissions on lightly loaded ranks.
-    if interleaved.max(axis=0).sum() * 3 > contiguous_cost * 2:
-        return None
-    return (
-        np.arange(padded)
-        .reshape(-1, num_batches, block_size)
-        .transpose(1, 0, 2)
-        .flatten()
-        .tolist()
-    )
 
 
 class _RoutingTensors(NamedTuple):
@@ -278,63 +108,6 @@ def _install_routing_layer(
         else:
             physical[layer, :, :width].copy_(replica_slots)
             count[layer].copy_(replica_counts)
-
-
-@dataclass(frozen=True)
-class _PackedExpertFields:
-    """Send narrow fields together and expose their original views for writeback."""
-
-    packed_indices: tuple[int, ...]
-    direct_indices: tuple[int, ...]
-    send_buffer: torch.Tensor
-    receive_buffers: list[torch.Tensor]
-
-    @classmethod
-    def create(cls, staging: list[torch.Tensor]) -> _PackedExpertFields | None:
-        # The weight adapter exposes contiguous [expert, bytes] tensors.
-        packed_indices = tuple(
-            i
-            for i, field in enumerate(staging)
-            if 0 < field.size(1) <= _MAX_PACKED_FIELD_BYTES
-        )
-        if len(packed_indices) < 2:
-            return None
-        direct_indices = tuple(
-            i for i in range(len(staging)) if i not in packed_indices
-        )
-        widths = [staging[i].size(1) for i in packed_indices]
-        receive_buffer = staging[0].new_empty((staging[0].size(0), sum(widths)))
-        for i, view in zip(
-            packed_indices, receive_buffer.split(widths, dim=1), strict=True
-        ):
-            staging[i] = view
-        return cls(
-            packed_indices=packed_indices,
-            direct_indices=direct_indices,
-            send_buffer=torch.empty_like(receive_buffer),
-            receive_buffers=[staging[i] for i in direct_indices] + [receive_buffer],
-        )
-
-    def pack(self, weights: list[torch.Tensor]) -> None:
-        torch.cat(
-            [weights[i] for i in self.packed_indices], dim=1, out=self.send_buffer
-        )
-
-    def pack_for_local_copies(
-        self,
-        weights: list[torch.Tensor],
-        old_local_layout: list[int],
-        new_local_layout: list[int],
-    ) -> bool:
-        """Pack early if the updater will copy a resident expert before P2P."""
-        resident_experts = set(old_local_layout)
-        if any(
-            old != new and new in resident_experts
-            for old, new in zip(old_local_layout, new_local_layout, strict=True)
-        ):
-            self.pack(weights)
-            return True
-        return False
 
 
 @dataclass(frozen=True)

@@ -21,13 +21,16 @@ Import torch_npu only when an NPU operation actually needs it.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import torch
 import torch.distributed as dist
+from sglang.srt.hardware_backend.npu.eplb.transport import _validate_migration_topology
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+    from sglang.srt.hardware_backend.npu.eplb.coordinator import WeightWriteback
 
 # ACL format IDs, kept here so importing this module does not load torch_npu.
 _FORMAT_NCHW = 0
@@ -49,8 +52,7 @@ _SUPPORTED_NZ_FORMATS = (
 )
 # NZ expert weights retain the logical axes [experts, M, N].
 _NZ_EXPERT_WEIGHT_NDIM = 3
-# Per-peer warmup payload in bytes, independent of HCCL buffer capacity.
-_EPLB_WARMUP_BYTES_PER_PEER = 4 << 20
+_MAX_PACKED_FIELD_BYTES = 16 * 1024
 
 
 def migrate_expert_weights(
@@ -104,22 +106,6 @@ def migrate_expert_weights(
         if missing_experts:
             missing_experts_by_layer[layer] = missing_experts
     return missing_experts_by_layer
-
-
-def _validate_migration_topology(group_size: int) -> None:
-    from sglang.srt.runtime_context import get_parallel
-
-    parallel = get_parallel()
-    world_size = dist.get_world_size()
-    # TP and WORLD must have the same members and rank numbering.
-    if parallel.pp_size != 1 or not (
-        parallel.tp_size == parallel.moe_ep_size == group_size == world_size
-    ):
-        raise ValueError(
-            "NPU EPLB requires PP=1 and TP size = EP size = EPLB group size = "
-            f"WORLD size; got PP={parallel.pp_size}, TP={parallel.tp_size}, "
-            f"EP={parallel.moe_ep_size}, EPLB group={group_size}, WORLD={world_size}."
-        )
 
 
 def _select_expert_weight_updates(
@@ -435,48 +421,102 @@ class _ExpertWeightAdapter:
         ]
 
 
-def prewarm_eplb_communication() -> None:
-    """Warm the migration communicator before KV sizing."""
-    from sglang.srt.runtime_context import get_exec, get_parallel
+@dataclass(frozen=True)
+class _PackedExpertFields:
+    """Send narrow fields together and expose their original views for writeback."""
 
-    # The async runtime warms its dedicated group after weight loading.
-    if get_exec().moe.eplb_async_rebalance:
-        return
-    group = get_parallel().tp_group.device_group
-    world_size = dist.get_world_size(group)
-    _validate_migration_topology(world_size)
-    if world_size == 1:
-        return
-    buffers = _allocate_migration_warmup_buffers(world_size)
-    _warm_migration_group(group, *buffers)
-    del buffers
-    torch.npu.empty_cache()
+    packed_indices: tuple[int, ...]
+    direct_indices: tuple[int, ...]
+    send_buffer: torch.Tensor
+    receive_buffers: list[torch.Tensor]
 
-
-def _allocate_migration_warmup_buffers(
-    world_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    send = torch.empty(_EPLB_WARMUP_BYTES_PER_PEER, dtype=torch.uint8, device="npu")
-    recv = torch.empty(
-        (world_size - 1, send.numel()), dtype=send.dtype, device=send.device
-    )
-    return send, recv
-
-
-def _warm_migration_group(
-    group: dist.ProcessGroup, send: torch.Tensor, recv: torch.Tensor
-) -> None:
-    ops = []
-    rank = dist.get_rank()
-    world_size = dist.get_world_size(group)
-    for slot, peer in enumerate(p for p in range(world_size) if p != rank):
-        ops.extend(
-            [
-                dist.P2POp(dist.isend, send, peer, group=group),
-                dist.P2POp(dist.irecv, recv[slot], peer, group=group),
-            ]
+    @classmethod
+    def create(cls, staging: list[torch.Tensor]) -> _PackedExpertFields | None:
+        # The weight adapter exposes contiguous [expert, bytes] tensors.
+        packed_indices = tuple(
+            i
+            for i, field in enumerate(staging)
+            if 0 < field.size(1) <= _MAX_PACKED_FIELD_BYTES
         )
-    for work in dist.batch_isend_irecv(ops):
-        work.wait()
-    dist.all_reduce(send.view(torch.int32), group=group)
-    torch.npu.synchronize()
+        if len(packed_indices) < 2:
+            return None
+        direct_indices = tuple(
+            i for i in range(len(staging)) if i not in packed_indices
+        )
+        widths = [staging[i].size(1) for i in packed_indices]
+        receive_buffer = staging[0].new_empty((staging[0].size(0), sum(widths)))
+        for i, view in zip(
+            packed_indices, receive_buffer.split(widths, dim=1), strict=True
+        ):
+            staging[i] = view
+        return cls(
+            packed_indices=packed_indices,
+            direct_indices=direct_indices,
+            send_buffer=torch.empty_like(receive_buffer),
+            receive_buffers=[staging[i] for i in direct_indices] + [receive_buffer],
+        )
+
+    def pack(self, weights: list[torch.Tensor]) -> None:
+        torch.cat(
+            [weights[i] for i in self.packed_indices], dim=1, out=self.send_buffer
+        )
+
+    def pack_for_local_copies(
+        self,
+        weights: list[torch.Tensor],
+        old_local_layout: list[int],
+        new_local_layout: list[int],
+    ) -> bool:
+        """Pack early if the updater will copy a resident expert before P2P."""
+        resident_experts = set(old_local_layout)
+        if any(
+            old != new and new in resident_experts
+            for old, new in zip(old_local_layout, new_local_layout, strict=True)
+        ):
+            self.pack(weights)
+            return True
+        return False
+
+
+def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
+    # The NPU adapter exposes dense byte rows. Merge adjacent copies only
+    # when they are contiguous in both the staging and live storage.
+    ranges = []
+    for source, destination in rows:
+        if ranges:
+            prev_source, prev_dest, length = ranges[-1]
+            if source == prev_source + length and destination == prev_dest + length:
+                ranges[-1] = (prev_source, prev_dest, length + 1)
+                continue
+        ranges.append((source, destination, 1))
+
+    # Slice on the staging worker. The forward thread only submits the copies.
+    copies = [
+        (
+            weight[destination : destination + length],
+            buffer[source : source + length],
+        )
+        for source, destination, length in ranges
+        for weight, buffer in zip(weights, buffers, strict=True)
+    ]
+
+    # Batched copy helps fragmented writeback. Reused staging rows can be
+    # faster as separate copies, especially when each row is large.
+    if (
+        len(ranges) >= 8
+        and weights[0].device.type == "npu"
+        and hasattr(torch, "_foreach_copy_")
+        and len({source for source, _ in rows}) == len(rows)
+    ):
+        destinations, sources = zip(*copies, strict=True)
+
+        def batch_writeback():
+            torch._foreach_copy_(destinations, sources, non_blocking=True)
+
+        return batch_writeback
+
+    def writeback():
+        for destination, source in copies:
+            destination.copy_(source)
+
+    return writeback
