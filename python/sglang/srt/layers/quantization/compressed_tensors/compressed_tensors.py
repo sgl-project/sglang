@@ -12,7 +12,6 @@ from typing import (
     Dict,
     List,
     Literal,
-    NamedTuple,
     Optional,
     Tuple,
     cast,
@@ -79,6 +78,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.platforms.device_mixin import DeviceCapability
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 
@@ -101,23 +101,6 @@ __all__ = ["CompressedTensorsLinearMethod"]
 
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
-
-
-class DeviceCapability(NamedTuple):
-    major: int
-    minor: int
-
-    def as_version_str(self) -> str:
-        return f"{self.major}.{self.minor}"
-
-    def to_int(self) -> int:
-        """
-        Express device capability as an integer ``<major><minor>``.
-
-        It is assumed that the minor version is always a single digit.
-        """
-        assert 0 <= self.minor < 10
-        return self.major * 10 + self.minor
 
 
 # The MLP prefix of a plain `ignore` entry that names its layer.
@@ -168,9 +151,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         ):
             return "FP8"
         return None
-
-    def get_linear_method(self) -> CompressedTensorsLinearMethod:
-        return CompressedTensorsLinearMethod(self)
 
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.float16, torch.bfloat16]
@@ -485,20 +465,15 @@ class CompressedTensorsConfig(QuantizationConfig):
         else:
             device_capability = torch.cuda.get_device_capability()
 
-        capability_tuple = DeviceCapability(*device_capability)
-
-        if capability_tuple is not None:
-            capability = capability_tuple.to_int()
-            supported = capability >= min_capability
-            if error and not supported:
-                raise RuntimeError(
-                    "Quantization scheme is not supported for ",
-                    f"the current GPU. Min capability: {min_capability}. ",
-                    f"Current capability: {capability}.",
-                )
-            return supported
-        else:
-            return False
+        capability = DeviceCapability(*device_capability).to_int()
+        supported = capability >= min_capability
+        if error and not supported:
+            raise RuntimeError(
+                "Quantization scheme is not supported for "
+                f"the current GPU. Min capability: {min_capability}. "
+                f"Current capability: {capability}."
+            )
+        return supported
 
     def _is_dynamic_token_w4a8(
         self, weight_quant: BaseModel, input_quant: BaseModel

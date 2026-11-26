@@ -6,7 +6,6 @@ import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import patch
 
 import torch
 from transformers import ApertusConfig, Glm4Config, LlamaConfig, OPTConfig, Qwen2Config
@@ -18,7 +17,6 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.dp_attention import initialize_dp_attention
-from sglang.srt.models import hunyuan
 from sglang.srt.models.apertus import ApertusModel
 from sglang.srt.models.arcee import ArceeModel
 from sglang.srt.models.glm4 import Glm4Model
@@ -148,29 +146,6 @@ def load_scales(model, directory, *, tp_rank, tp_size, version=0, changed=False)
     data = calibration_data(model, tp_size, version)
     path = Path(directory) / "calibration.json"
     path.write_text(json.dumps(data))
-    if isinstance(model, HunYuanMoEV1ForCausalLM):
-        # This legacy native endpoint parses the file, then rejects the missing
-        # kv_scale attribute. Verify its real selection and preserve that guard.
-        selected = []
-        original = hunyuan.kv_cache_scales_loader
-
-        def record(*args, **kwargs):
-            rows = list(original(*args, **kwargs))
-            selected.extend(rows)
-            return rows
-
-        with (
-            patch.object(hunyuan, "kv_cache_scales_loader", record),
-            loading_scope(changed),
-        ):
-            try:
-                model.load_kv_cache_scales(str(path))
-            except RuntimeError as error:
-                assert "KV cache scaling factor attribute" in str(error)
-            else:
-                raise AssertionError("Expected the existing HunYuan kv_scale guard")
-        assert selected == list(data["kv_cache"]["scaling_factor"][tp_rank].items())
-        return [(layer.k_scale, layer.v_scale) for layer in attention_layers(model)]
     with loading_scope(changed):
         model.load_kv_cache_scales(str(path))
     result = [(layer.k_scale, layer.v_scale) for layer in attention_layers(model)]

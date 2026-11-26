@@ -50,7 +50,7 @@ class Qwen25Detector(BaseFormatDetector):
 
         :param text: The complete text to parse.
         :param tools: List of available tools.
-        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        :return: StreamingParseResult with normal text and parsed tool calls.
         """
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
@@ -111,6 +111,11 @@ class Qwen25Detector(BaseFormatDetector):
                     self._normal_text_buffer = ""
 
         return result
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        # The stream is over, so a held-back prefix of the end token is plain text.
+        normal_text, self._normal_text_buffer = self._normal_text_buffer, ""
+        return StreamingParseResult(normal_text=normal_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
