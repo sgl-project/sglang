@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 __all__ = ["GPTQIntelAMXLinearScheme", "GPTQIntelAMXMoEScheme"]
 
 
-def _check_cpu_amx_support(quant_config: GPTQConfig) -> None:
+def _check_cpu_amx_support(quant_config: GPTQConfig, *, is_moe: bool = False) -> None:
     if quant_config.desc_act and not (
         quant_config.true_sequential and quant_config.static_groups
     ):
@@ -35,8 +35,12 @@ def _check_cpu_amx_support(quant_config: GPTQConfig) -> None:
             "Currently, desc_act (True) is only supported with sequential "
             "and static group on CPU with AMX."
         )
-    if quant_config.weight_bits != 4:
-        raise ValueError("Currently, only 4bits is supported on CPU with AMX.")
+    if quant_config.weight_bits not in (4, 8):
+        raise ValueError(
+            "Currently, only 4-bit and 8-bit weights are supported on CPU with AMX."
+        )
+    if is_moe and quant_config.weight_bits != 4:
+        raise ValueError("Currently, only 4-bit MoE is supported on CPU with AMX.")
     if quant_config.checkpoint_format == "gptq_v2":
         raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
 
@@ -155,7 +159,7 @@ class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        _check_cpu_amx_support(self.quant_config)
+        _check_cpu_amx_support(self.quant_config, is_moe=True)
         pack_factor = self.quant_config.pack_factor
 
         if self.quant_config.group_size != -1:

@@ -53,6 +53,61 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestGetProcessor(CustomTestCase):
+    def test_phi4mm_missing_audio_args_uses_manual_processor(self):
+        config = SimpleNamespace(model_type="phi4mm", auto_map={})
+        loaded_processor = SimpleNamespace(tokenizer=MagicMock(chat_template="x"))
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.side_effect = TypeError(
+            "Phi4MMAudioFeatureExtractor.__init__() missing 3 required "
+            "positional arguments: 'audio_compression_rate', "
+            "'audio_downsample_rate', and 'audio_feat_stride'"
+        )
+        manual_processor = MagicMock(return_value=loaded_processor)
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+            _build_phi4mm_processor=manual_processor,
+            get_tokenizer_from_processor=lambda processor: processor.tokenizer,
+            _install_tokenizer_warnings_filter=MagicMock(),
+            patch_mistral_common_tokenizer=MagicMock(),
+            _fix_special_tokens_pattern=MagicMock(),
+            _fix_added_tokens_encoding=MagicMock(),
+            attach_additional_stop_token_ids=MagicMock(),
+        ):
+            processor = processor_utils.get_processor(
+                "test-phi4mm", trust_remote_code=True
+            )
+
+        self.assertIs(processor, loaded_processor)
+        manual_processor.assert_called_once_with("test-phi4mm", True, None)
+
+    def test_phi4mm_unrelated_type_error_is_not_masked(self):
+        config = SimpleNamespace(model_type="phi4mm", auto_map={})
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.side_effect = TypeError("unrelated failure")
+        manual_processor = MagicMock()
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+            _build_phi4mm_processor=manual_processor,
+        ):
+            with self.assertRaisesRegex(TypeError, "unrelated failure"):
+                processor_utils.get_processor("test-phi4mm")
+
+        manual_processor.assert_not_called()
+
+    def test_phi4mm_manual_processor_requires_trust_remote_code(self):
+        with self.assertRaisesRegex(ValueError, "trust-remote-code"):
+            processor_utils._build_phi4mm_processor("test-phi4mm", False, None)
+
     def test_applies_v5_bos_eos_fix_to_processor_tokenizer(self):
         class ProcessorTokenizer:
             chat_template = "template"

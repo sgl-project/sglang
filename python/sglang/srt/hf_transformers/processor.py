@@ -201,6 +201,54 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _build_phi4mm_processor(model_path, trust_remote_code, revision):
+    """Work around transformers v5 processor_config.json for Phi-4-MM."""
+    from transformers import AutoTokenizer
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    if not trust_remote_code:
+        raise ValueError(
+            "The Phi-4-MM processor requires loading the model's processor code; "
+            "pass --trust-remote-code to enable it."
+        )
+
+    pp_file = _resolve_local_or_cached_file(
+        model_path, "preprocessor_config.json", revision
+    )
+    with open(pp_file) as f:
+        raw = json.load(f)
+    auto_map = raw["auto_map"]
+
+    def load_cls(key):
+        return get_class_from_dynamic_module(
+            auto_map[key], model_path, code_revision=revision
+        )
+
+    image_processor = load_cls("AutoImageProcessor")(dynamic_hd=raw["dynamic_hd"])
+    audio_processor = load_cls("AutoFeatureExtractor")(
+        audio_compression_rate=raw["audio_compression_rate"],
+        audio_downsample_rate=raw["audio_downsample_rate"],
+        audio_feat_stride=raw["audio_feat_stride"],
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code, revision=revision
+    )
+    return load_cls("AutoProcessor")(
+        image_processor=image_processor,
+        audio_processor=audio_processor,
+        tokenizer=tokenizer,
+    )
+
+
+def _is_phi4mm_audio_processor_type_error(error: TypeError) -> bool:
+    message = str(error)
+    return (
+        "Phi4MMAudioFeatureExtractor" in message
+        and "missing" in message
+        and "audio_compression_rate" in message
+    )
+
+
 def _get_minimax_m31_processor(model_path, config, revision):
     from transformers import MiniMaxM3VLProcessor
 
@@ -384,6 +432,13 @@ def _get_processor(
                     **kwargs,
                 )
 
+    except TypeError as e:
+        if config.model_type != "phi4mm" or not _is_phi4mm_audio_processor_type_error(
+            e
+        ):
+            raise
+        logger.info("Building Phi4MM processor manually for %s", tokenizer_name)
+        processor = _build_phi4mm_processor(tokenizer_name, trust_remote_code, revision)
     except ValueError as e:
         error_message = str(e)
         if "Unrecognized feature extractor" in error_message:
