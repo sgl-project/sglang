@@ -65,7 +65,7 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         return self._event_loop_vpp_rank_local()
 
     def _pp_vpp_max_inflight(self):
-        return 2
+        return 8
 
     def _pp_vpp_available_prefill_tokens(self):
         stats = self.pool_stats_observer.get_pool_stats()
@@ -110,13 +110,14 @@ class SchedulerVPPMixin(SchedulingVPPCore):
 
     def _init_scheduling_native_loop_state(self):
         SchedulerPPMixin.init_pp_loop_state(self)
-        self.pp_loop_size = 2
-        self.mbs = [None] * 2
-        self.last_mbs = [None] * 2
+        self.pp_loop_size = self._pp_vpp_max_inflight()
+        self.mbs = [None] * self.pp_loop_size
+        self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
-            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(2)
+            ScheduleBatch(reqs=[], batch_is_full=False)
+            for _ in range(self.pp_loop_size)
         ]
-        self.mb_metadata = [None] * 2
+        self.mb_metadata = [None] * self.pp_loop_size
         self._vpp_forward_batches = {}
         # Initialize both directed activation communicators before entering the
         # asynchronous control loop; first-use NCCL initialization is collective.

@@ -33,6 +33,8 @@ if TYPE_CHECKING:
 
 _VPP_PROTOCOL_VERSION = 1
 _VPP_ACTIVATION_TAG = 1
+_VPP_WAVE_SIZE = 2
+_VPP_SEND_CREDITS = 2
 logger = logging.getLogger(__name__)
 
 
@@ -219,14 +221,14 @@ class SchedulingVPPCore:
         if (
             self.pp_group.world_size != 2
             or self._vpp_layout.virtual_stages != 2
-            or max_inflight != 2
+            or max_inflight < _VPP_WAVE_SIZE
         ):
-            raise ValueError("VPP scheduling requires PP2/VPP2/max-inflight=2")
+            raise ValueError("VPP scheduling requires PP2/VPP2 and at least two slots")
         logger.info(
             "VPP fixed batch scheduling enabled: two-batch waves, activation manifests"
         )
-        self._pp_vpp_fixed_wave = []
-        self._pp_vpp_fixed_second_pass = False
+        self._pp_vpp_fixed_waves = deque()
+        self._pp_vpp_fixed_wave_fill = 0
         self._pp_vpp_fixed_received = deque()
         self._pp_vpp_highest_admitted_batch_seq = -1
         self._pp_vpp_pending_batch_controls = deque()
@@ -245,31 +247,63 @@ class SchedulingVPPCore:
             first_pass = sorted(
                 seq for seq, stage in rank_schedule.ready_tasks if stage == 0
             )
-            if not self._pp_vpp_fixed_second_pass:
+            waves = self._pp_vpp_fixed_waves
+            # Fill the initial wave before considering its second pass.
+            if first_pass and (
+                not waves
+                or (len(waves) == 1 and self._pp_vpp_fixed_wave_fill < _VPP_WAVE_SIZE)
+            ):
+                return (first_pass[0], 0)
+            if waves:
+                key = (waves[0][0], self.pp_group.world_size)
+                proxy = self._pp_vpp_ready_proxies.get(key)
+                ready = proxy is not None
                 if first_pass:
-                    return (first_pass[0], 0)
-                if self._pp_vpp_fixed_wave:
-                    key = (
-                        self._pp_vpp_fixed_wave[0],
-                        self.pp_group.world_size,
+                    # Metadata can precede GPU receive/TP reconstruction.
+                    # Vote before choosing a different model collective.
+                    event = (
+                        proxy.tensors.get("_vpp_local_recv_event") if ready else None
                     )
-                    # Admission was attempted before task selection. Drain a
-                    # partial wave once its second pass is ready, even if more
-                    # requests are waiting for bootstrap or local capacity.
-                    if key in self._pp_vpp_ready_proxies:
-                        self._pp_vpp_fixed_second_pass = True
-
-            if self._pp_vpp_fixed_second_pass:
-                if self._pp_vpp_fixed_wave:
-                    key = (
-                        self._pp_vpp_fixed_wave[0],
-                        self.pp_group.world_size,
-                    )
-                    if key in self._pp_vpp_ready_proxies:
-                        return key
+                    ready = ready and (event is None or event.query())
+                    states = self._pp_vpp_all_gather_cpu_state((int(ready),))
+                    ready = bool(states[:, 0].min())
+                if ready:
+                    # With no first pass to fill, drain a partial wave too.
+                    if len(waves) == 1:
+                        self._pp_vpp_fixed_wave_fill = _VPP_WAVE_SIZE
+                    return key
+            if first_pass:
+                return (first_pass[0], 0)
         elif self._pp_vpp_fixed_received:
             return self._pp_vpp_fixed_received[0]
         return None
+
+    def _pp_vpp_fixed_ready_admitted_task(
+        self: Scheduler,
+    ) -> Optional[Tuple[int, int]]:
+        """Drain admitted work when the receive FIFO's next admission is blocked."""
+        target = next(
+            (
+                key
+                for key in self._pp_vpp_fixed_received
+                if self._pp_vpp_slot_batch_seqs[
+                    key[0] % len(self._pp_vpp_slot_batch_seqs)
+                ]
+                == key[0]
+                and key in self._pp_vpp_ready_proxies
+            ),
+            None,
+        )
+        # Readiness is lane-local; agree on the task identity before entering
+        # the model's TP collectives, including when a lane has no candidate.
+        states = self._pp_vpp_all_gather_cpu_state(
+            target if target is not None else (-1, -1)
+        )
+        if target is None or not bool(
+            (states.min(dim=0).values == states.max(dim=0).values).all()
+        ):
+            return None
+        return target
 
     def _pp_vpp_fixed_record_dispatch(
         self: Scheduler,
@@ -279,40 +313,21 @@ class SchedulingVPPCore:
         batch_seq = action.batch_seq
         stage_id = action.stage_id
         if self.pp_group.is_first_rank:
+            waves = self._pp_vpp_fixed_waves
             if stage_id == 0:
-                self._pp_vpp_fixed_wave.append(batch_seq)
-                if len(self._pp_vpp_fixed_wave) == rank_schedule.max_inflight:
-                    self._pp_vpp_fixed_second_pass = True
+                if not waves or self._pp_vpp_fixed_wave_fill == _VPP_WAVE_SIZE:
+                    waves.append([])
+                    self._pp_vpp_fixed_wave_fill = 0
+                waves[-1].append(batch_seq)
+                self._pp_vpp_fixed_wave_fill += 1
             else:
-                if self._pp_vpp_fixed_wave.pop(0) != batch_seq:
+                if waves[0].pop(0) != batch_seq:
                     raise RuntimeError("fixed VPP second pass is out of order")
-                if not self._pp_vpp_fixed_wave:
-                    self._pp_vpp_fixed_second_pass = False
+                if not waves[0]:
+                    waves.popleft()
 
         if stage_id > 0:
             self._pp_vpp_fixed_received.remove((batch_seq, stage_id))
-
-    def _pp_vpp_fixed_wait_send_credit(
-        self: Scheduler,
-        pending_work: deque,
-        max_pending: int,
-    ) -> None:
-        """Release the oldest send before dispatch, independent of local polling."""
-        while len(pending_work) >= max_pending:
-            group = pending_work.popleft()
-            if not isinstance(group, (list, P2PWorkGroup)):
-                group.wait()
-                continue
-            items = group if isinstance(group, list) else group.items
-            with self.pp_comm_stream_ctx:
-                for item in items:
-                    if item.work is not None:
-                        item.work.wait()
-                    if isinstance(item.payload, torch.Tensor) and item.payload.is_cuda:
-                        # GPU wait inserts a stream dependency. Keep the storage
-                        # alive until that stream has finished reading it.
-                        item.payload.record_stream(self.device_module.current_stream())
-            items.clear()
 
     def _pp_vpp_reap_send_work(self: Scheduler, pending_work: deque) -> None:
         while pending_work:
@@ -733,15 +748,26 @@ class SchedulingVPPCore:
                 )
             if not self.pp_group.is_first_rank:
                 if not self._pp_vpp_fixed_remote_admit(batch_seq, rank_schedule):
-                    return None
+                    # A continuation can wait for an earlier chunk still in
+                    # this FIFO. Let that admitted chunk finish to release the
+                    # dependency instead of repeatedly retrying the FIFO head.
+                    target = self._pp_vpp_fixed_ready_admitted_task()
+                    if target is None:
+                        return None
+                    batch_seq, stage_id = target
 
         while self._pp_vpp_arrivals:
             rank_schedule.mark_ready(*self._pp_vpp_arrivals.popleft())
 
         if pending_send_work is not None and stage_id < rank_schedule.logical_size - 1:
-            self._pp_vpp_fixed_wait_send_credit(
-                pending_send_work, rank_schedule.max_inflight
+            # A full send window must leave the CPU free to post reverse
+            # receives. The work group's helper is the sole CPU waiter.
+            self._pp_vpp_reap_send_work(pending_send_work)
+            states = self._pp_vpp_all_gather_cpu_state(
+                (int(len(pending_send_work) < _VPP_SEND_CREDITS),)
             )
+            if not bool(states[:, 0].min()):
+                return None
         if not is_ready(batch_seq, stage_id):
             return None
 
@@ -794,7 +820,7 @@ class SchedulingVPPCore:
         self._pp_vpp_activation_receiver = VPPSchedulerActivationReceiver(
             self._pp_vpp_activation_group(source_rank),
             self.pp_group.vpp_activation_tp_group,
-            max_inflight,
+            _VPP_SEND_CREDITS,
             batch_p2p=self.pp_group.world_size == 2,
             tag=_VPP_ACTIVATION_TAG,
         )
@@ -803,7 +829,7 @@ class SchedulingVPPCore:
 
         activation_send_work = deque()
         control_send_work = deque()
-        max_control_sends = max_inflight * rank_schedule.logical_size
+        max_control_sends = _VPP_SEND_CREDITS * rank_schedule.logical_size
         max_control_sends = max(64, max_control_sends)
         next_batch_seq = 0
         pending_admits: set[int] = set()
@@ -1431,7 +1457,7 @@ class SchedulingVPPCore:
             def action_ready(batch_seq: int, stage_id: int) -> bool:
                 if (
                     stage_id < rank_schedule.logical_size - 1
-                    and len(activation_send_work) >= max_inflight
+                    and len(activation_send_work) >= _VPP_SEND_CREDITS
                 ):
                     return False
                 if stage_id == 0:

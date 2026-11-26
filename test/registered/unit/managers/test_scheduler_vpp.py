@@ -170,7 +170,8 @@ class _PendingSend:
         self.waits = waits
 
     def poll(self):
-        return False
+        self.wait()
+        return True
 
     def wait(self):
         self.waits.append((self.action.batch_seq, self.action.stage_id))
@@ -307,6 +308,7 @@ class TestSchedulingVPPCore(CustomTestCase):
 
     def _fixed_scheduler(self, *, rank=0):
         scheduler = self._scheduler(rank=rank)
+        scheduler.attn_tp_group = SimpleNamespace(world_size=1)
         scheduler._vpp_layout = SimpleNamespace(virtual_stages=2)
         scheduler._pp_vpp_init_fixed_batch(2)
         return scheduler
@@ -472,10 +474,9 @@ class TestSchedulingVPPCore(CustomTestCase):
             [output["next_token_ids"].item() for _, _, output in scheduler.finalized],
             [4, 5, 6, 7],
         )
-        self.assertEqual(scheduler.send_waits, scheduler.actions[:-2])
+        self.assertEqual(scheduler.send_waits, scheduler.actions)
         self.assertLessEqual(len(context["activation_send_work"]), 2)
-        self.assertFalse(scheduler._pp_vpp_fixed_wave)
-        self.assertFalse(scheduler._pp_vpp_fixed_second_pass)
+        self.assertFalse(scheduler._pp_vpp_fixed_waves)
         materialized = [
             wire
             for wire in scheduler.published
@@ -921,41 +922,29 @@ class TestSchedulingVPPCore(CustomTestCase):
                 self.assertIsNone(scheduler._pp_vpp_prefix_registry.get("request", 1))
                 self.assertIn((0, 1), scheduler._pp_vpp_early_activations)
 
-    def test_fixed_task_selection_waits_for_send_credit_and_local_readiness(self):
+    def test_fixed_task_selection_respects_local_readiness_after_reaping(self):
         scheduler = self._fixed_scheduler()
         scheduler.pp_comm_stream_ctx = nullcontext()
         schedule = PipelineRankSchedule(0, 2, 2, 2)
         schedule.admit(0)
-        completed = []
-        pending = deque(
-            [
-                [
-                    SimpleNamespace(
-                        payload=torch.ones(1),
-                        work=SimpleNamespace(wait=lambda: completed.append("oldest")),
-                    )
-                ],
-                [],
-            ]
-        )
+        pending = deque([SimpleNamespace(poll=lambda: True)])
 
         def blocked(batch_seq, stage_id):
             self.assertEqual((batch_seq, stage_id), (0, 0))
-            self.assertEqual(completed, ["oldest"])
-            self.assertEqual(len(pending), 1)
+            self.assertFalse(pending)
             return False
 
         self.assertIsNone(
             scheduler._pp_vpp_fixed_select_tp_action(schedule, 5, blocked, pending)
         )
         self.assertIsNone(schedule.running)
-        self.assertEqual(scheduler._pp_vpp_fixed_wave, [])
+        self.assertFalse(scheduler._pp_vpp_fixed_waves)
         action = scheduler._pp_vpp_fixed_select_tp_action(
             schedule, 6, lambda batch, stage: True, pending
         )
         self.assertEqual(action, PipelineWavefrontAction(6, 0, 0, 0, 0))
         self.assertIs(schedule.running, action)
-        self.assertEqual(scheduler._pp_vpp_fixed_wave, [0])
+        self.assertEqual(list(scheduler._pp_vpp_fixed_waves), [[0]])
 
     def test_fixed_task_selection_admits_downstream_input_and_preserves_receive_fifo(
         self,
@@ -993,6 +982,60 @@ class TestSchedulingVPPCore(CustomTestCase):
         self.assertEqual(final, PipelineWavefrontAction(5, 0, 0, 3, 1))
         self.assertEqual(len(pending), 2)
         self.assertEqual(list(scheduler._pp_vpp_fixed_received), [])
+
+    def test_blocked_continuation_admission_drains_earlier_chunk(self):
+        scheduler, schedule, wire = self._downstream_admission()
+        scheduler._pp_vpp_accept_received_tensors(wire)
+        first = scheduler._pp_vpp_fixed_select_tp_action(
+            schedule, 0, lambda batch, stage: True
+        )
+        schedule.complete(first)
+        req = scheduler.candidate_batch.reqs[0]
+        scheduler.candidate_batch = SimpleNamespace(
+            reqs=[req], prefix_lens=[9], extend_lens=[5]
+        )
+        continuation = self._wire(batch_seq=1, stage=1)
+        continuation["vpp_batch_manifest"] = scheduler._pp_vpp_batch_manifest(
+            1, 1, scheduler.candidate_batch
+        )
+        scheduler._pp_vpp_accept_received_tensors(continuation)
+        scheduler._pp_vpp_accept_received_tensors(self._wire(stage=3))
+        self.assertEqual(list(scheduler._pp_vpp_fixed_received), [(1, 1), (0, 3)])
+        self.assertFalse(scheduler._pp_vpp_fixed_remote_admit(1, schedule))
+
+        action = scheduler._pp_vpp_fixed_select_tp_action(
+            schedule, 1, lambda batch, stage: True
+        )
+        self.assertEqual((action.batch_seq, action.stage_id), (0, 3))
+        self.assertEqual(list(scheduler._pp_vpp_fixed_received), [(1, 1)])
+        schedule.complete(action)
+        # The completed chunk releases ownership of this request before its
+        # continuation is admitted. Keep the real manifest readiness gate.
+        scheduler.mbs[0] = None
+        scheduler._pp_vpp_slot_batch_seqs[0] = None
+        schedule.retire(0)
+        next_action = scheduler._pp_vpp_fixed_select_tp_action(
+            schedule, 2, lambda batch, stage: True
+        )
+        self.assertEqual((next_action.batch_seq, next_action.stage_id), (1, 1))
+        self.assertEqual(list(scheduler._pp_vpp_fixed_received), [])
+
+    def test_admitted_fallback_requires_matching_task_on_every_tp_lane(self):
+        scheduler = self._scheduler(rank=1)
+        scheduler._pp_vpp_fixed_received = deque([(1, 1), (0, 3)])
+        scheduler._pp_vpp_ready_proxies[(0, 3)] = object()
+        scheduler._pp_vpp_all_gather_cpu_state = lambda state: torch.tensor(
+            [state, (-1, -1)]
+        )
+        self.assertIsNone(scheduler._pp_vpp_fixed_ready_admitted_task())
+        scheduler._pp_vpp_all_gather_cpu_state = lambda state: torch.tensor(
+            [state, (0, 1)]
+        )
+        self.assertIsNone(scheduler._pp_vpp_fixed_ready_admitted_task())
+        scheduler._pp_vpp_all_gather_cpu_state = lambda state: torch.tensor(
+            [state, state]
+        )
+        self.assertEqual(scheduler._pp_vpp_fixed_ready_admitted_task(), (0, 3))
 
     def test_control_queue_has_one_tp_sender_and_rejects_device_payloads(self):
         scheduler = self._scheduler(rank=1)
@@ -1441,8 +1484,7 @@ class TestSchedulingVPPCore(CustomTestCase):
             action = schedule.dispatch(seq + 2, *target)
             scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
             schedule.complete(action)
-        self.assertEqual(scheduler._pp_vpp_fixed_wave, [])
-        self.assertFalse(scheduler._pp_vpp_fixed_second_pass)
+        self.assertFalse(scheduler._pp_vpp_fixed_waves)
         self.assertEqual(list(scheduler._pp_vpp_fixed_received), [])
         self.assertIsNone(scheduler._pp_vpp_fixed_next_task(schedule))
 
@@ -1462,8 +1504,7 @@ class TestSchedulingVPPCore(CustomTestCase):
         action = schedule.dispatch(1, *target)
         scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
         schedule.complete(action)
-        self.assertFalse(scheduler._pp_vpp_fixed_second_pass)
-        self.assertEqual(scheduler._pp_vpp_fixed_wave, [])
+        self.assertFalse(scheduler._pp_vpp_fixed_waves)
 
     def test_downstream_fixed_tasks_follow_receive_fifo(self):
         scheduler = self._fixed_scheduler(rank=1)
@@ -1485,34 +1526,160 @@ class TestSchedulingVPPCore(CustomTestCase):
             schedule.complete(action)
         self.assertIsNone(scheduler._pp_vpp_fixed_next_task(schedule))
 
-    def test_send_credit_waits_for_oldest_payload_before_releasing_capacity(self):
-        scheduler = self._scheduler()
+    def test_full_send_window_returns_without_waiting_and_requires_tp_consensus(self):
+        """Blocking here prevents the CPU from posting the reverse receive."""
+        from threading import Event
+
+        scheduler = self._fixed_scheduler()
+        schedule = PipelineRankSchedule(0, 2, 2, 4)
+        schedule.admit(0)
         scheduler.pp_comm_stream_ctx = nullcontext()
-        completed = []
-        oldest = [
-            SimpleNamespace(
-                payload=torch.ones(1),
-                work=SimpleNamespace(wait=lambda: completed.append("oldest")),
+        entered, release = Event(), Event()
+        waits = []
+
+        def wait():
+            if waits:
+                raise AssertionError("CPU send work was waited twice")
+            waits.append(True)
+            entered.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("CPU send was not released")
+
+        oldest = P2PWorkGroup(
+            [
+                SimpleNamespace(
+                    payload=torch.ones(1), wait=wait, work=SimpleNamespace(wait=wait)
+                )
+            ]
+        )
+        pending = deque([oldest, SimpleNamespace(poll=lambda: True)])
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            self.assertIsNone(
+                scheduler._pp_vpp_fixed_select_tp_action(
+                    schedule, 0, lambda batch, stage: True, pending
+                )
             )
-        ]
-        newest = [
-            SimpleNamespace(
-                payload=torch.ones(1),
-                work=SimpleNamespace(wait=lambda: completed.append("newest")),
+            self.assertEqual(len(pending), 2)
+            self.assertIsNone(schedule.running)
+            release.set()
+            self.assertTrue(oldest._done.wait(timeout=5))
+            # This lane has credits, but another TP lane still has a full window.
+            with patch.object(
+                scheduler,
+                "_pp_vpp_all_gather_cpu_state",
+                return_value=torch.tensor([[1], [0]]),
+            ):
+                self.assertIsNone(
+                    scheduler._pp_vpp_fixed_select_tp_action(
+                        schedule, 1, lambda batch, stage: True, pending
+                    )
+                )
+            self.assertFalse(pending)
+            self.assertEqual(waits, [True])
+            self.assertIsNone(schedule.running)
+            action = scheduler._pp_vpp_fixed_select_tp_action(
+                schedule, 2, lambda batch, stage: True, pending
             )
-        ]
-        pending = deque([oldest, newest])
-        scheduler._pp_vpp_fixed_wait_send_credit(pending, 2)
-        self.assertEqual(completed, ["oldest"])
-        self.assertEqual(oldest, [])
-        self.assertIs(pending[0], newest)
-        self.assertEqual(len(newest), 1)
-        scheduler._pp_vpp_fixed_wait_send_credit(pending, 2)
-        self.assertEqual(completed, ["oldest"])
-        scheduler._pp_vpp_fixed_wait_send_credit(pending, 1)
-        self.assertEqual(completed, ["oldest", "newest"])
-        self.assertEqual(newest, [])
-        self.assertEqual(list(pending), [])
+            self.assertEqual((action.batch_seq, action.stage_id), (0, 0))
+        finally:
+            release.set()
+            oldest._done.wait(timeout=5)
+
+    def test_cross_wave_fill_checks_gpu_readiness_and_keeps_second_pass_fifo(self):
+        """Metadata-ready stage2 must not block ready stage0 on a GPU fence."""
+        scheduler = self._fixed_scheduler()
+        schedule = PipelineRankSchedule(0, 2, 2, 4)
+        for seq in range(4):
+            schedule.admit(seq)
+        for seq in (0, 1):
+            action = scheduler._pp_vpp_fixed_select_tp_action(
+                schedule, seq, lambda batch, stage: True
+            )
+            schedule.complete(action)
+
+        self.assertEqual(scheduler._pp_vpp_fixed_next_task(schedule), (2, 0))
+        gpu_done = False
+        scheduler._pp_vpp_ready_proxies[(0, 2)] = PPProxyTensors(
+            {"_vpp_local_recv_event": SimpleNamespace(query=lambda: gpu_done)}
+        )
+        self.assertEqual(scheduler._pp_vpp_fixed_next_task(schedule), (2, 0))
+        gpu_done = True
+        with patch.object(
+            scheduler,
+            "_pp_vpp_all_gather_cpu_state",
+            return_value=torch.tensor([[1], [0]]),
+        ):
+            self.assertEqual(scheduler._pp_vpp_fixed_next_task(schedule), (2, 0))
+        self.assertEqual(scheduler._pp_vpp_fixed_next_task(schedule), (0, 2))
+        gpu_done = False
+        action = scheduler._pp_vpp_fixed_select_tp_action(
+            schedule, 2, lambda batch, stage: True
+        )
+        self.assertEqual((action.batch_seq, action.stage_id), (2, 0))
+        schedule.complete(action)
+        self.assertEqual(list(scheduler._pp_vpp_fixed_waves), [[0, 1], [2]])
+
+        # Finish the head while the following wave has only one first pass.
+        gpu_done = True
+        for seq in (0, 1):
+            scheduler._pp_vpp_ready_proxies[(seq, 2)] = PPProxyTensors({})
+            scheduler._pp_vpp_fixed_received.append((seq, 2))
+            schedule.mark_ready(seq, 2)
+            action = scheduler._pp_vpp_fixed_select_tp_action(
+                schedule, seq + 3, lambda batch, stage: True
+            )
+            self.assertEqual((action.batch_seq, action.stage_id), (seq, 2))
+            schedule.complete(action)
+        action = scheduler._pp_vpp_fixed_select_tp_action(
+            schedule, 5, lambda batch, stage: True
+        )
+        self.assertEqual((action.batch_seq, action.stage_id), (3, 0))
+        schedule.complete(action)
+        self.assertEqual(list(scheduler._pp_vpp_fixed_waves), [[2, 3]])
+        scheduler._pp_vpp_ready_proxies[(3, 2)] = PPProxyTensors({})
+        self.assertIsNone(scheduler._pp_vpp_fixed_next_task(schedule))
+        # Without a first-pass alternative, preserve the normal GPU dependency.
+        scheduler._pp_vpp_ready_proxies[(2, 2)] = PPProxyTensors(
+            {"_vpp_local_recv_event": SimpleNamespace(query=lambda: False)}
+        )
+        self.assertEqual(scheduler._pp_vpp_fixed_next_task(schedule), (2, 2))
+
+    def test_eight_slots_keep_four_waves_and_reuse_only_retired_slots(self):
+        scheduler = self._fixed_scheduler()
+        capacity = SchedulerVPPMixin._pp_vpp_max_inflight(scheduler)
+        schedule = PipelineRankSchedule(0, 2, 2, capacity)
+        scheduler._pp_vpp_init_fixed_batch(capacity)
+        for seq in range(8):
+            schedule.admit(seq)
+        for seq in range(8):
+            action = scheduler._pp_vpp_fixed_select_tp_action(
+                schedule, seq, lambda batch, stage: True
+            )
+            self.assertEqual((action.batch_seq, action.stage_id), (seq, 0))
+            schedule.complete(action)
+        self.assertEqual(
+            list(scheduler._pp_vpp_fixed_waves), [[0, 1], [2, 3], [4, 5], [6, 7]]
+        )
+        self.assertFalse(schedule.can_admit(8))
+        # Reverse receive order cannot change second-pass dispatch order.
+        for seq in reversed(range(8)):
+            scheduler._pp_vpp_ready_proxies[(seq, 2)] = PPProxyTensors({})
+            scheduler._pp_vpp_fixed_received.append((seq, 2))
+            schedule.mark_ready(seq, 2)
+        for seq in range(8):
+            action = scheduler._pp_vpp_fixed_select_tp_action(
+                schedule, seq + 8, lambda batch, stage: True
+            )
+            self.assertEqual((action.batch_seq, action.stage_id), (seq, 2))
+            schedule.complete(action)
+            schedule.mark_completed(seq)
+            self.assertFalse(schedule.can_admit(seq + 8))
+            schedule.retire(seq)
+            self.assertTrue(schedule.can_admit(seq + 8))
+        self.assertFalse(scheduler._pp_vpp_fixed_waves)
+        self.assertFalse(scheduler._pp_vpp_fixed_received)
+        self.assertEqual(schedule.inflight_count, 0)
 
     def test_send_reaping_stops_at_the_first_unfinished_group(self):
         """A later completion must not release credit ahead of an older send."""
