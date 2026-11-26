@@ -1061,9 +1061,11 @@ class CommonKVManager(BaseKVManager):
                 if not infos:
                     self.transfer_infos.pop(bootstrap_room, None)
                 self.req_to_decode_prefix_len.pop(bootstrap_room, None)
-                if self.request_status.get(bootstrap_room) == KVPoll.WaitingForInput:
-                    # update_status never lowers a status.
-                    self.request_status[bootstrap_room] = KVPoll.Bootstrapping
+                # update_status never lowers a status; same lock as its writes.
+                with self._status_lock:
+                    status = self.request_status.get(bootstrap_room)
+                    if status == KVPoll.WaitingForInput:
+                        self.request_status[bootstrap_room] = KVPoll.Bootstrapping
         self._reject_transfer_infos(bootstrap_room=bootstrap_room, infos=foreign)
         return True
 
