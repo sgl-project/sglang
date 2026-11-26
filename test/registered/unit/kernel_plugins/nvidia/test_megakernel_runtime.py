@@ -10,7 +10,7 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.kernels.plugin_kernels.megakernel import spec as registry
 from sglang.srt.kernel_plugins.nvidia import binding, kimi_k31_dflash_binding
 from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
 from sglang.srt.runtime_context import get_parallel, publish, reset_context

@@ -51,7 +51,7 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 
 
-_provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
+_provider_spec = import_module("sglang.kernels.plugin_kernels.megakernel.spec")
 _PostVerifyIO = getattr(_provider_spec, "PostVerifyIO", None)
 _VerifySamplingView = getattr(_provider_spec, "VerifySamplingView", None)
 _VerifyTreeView = getattr(_provider_spec, "VerifyTreeView", None)

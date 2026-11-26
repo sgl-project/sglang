@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import msgspec
 import torch
 
-from sglang.kernels.plugin_kernels.nvidia.spec import (
+from sglang.kernels.plugin_kernels.megakernel.spec import (
     LocalKeysFn,
     PostVerifyIO,
     PostVerifyOutput,

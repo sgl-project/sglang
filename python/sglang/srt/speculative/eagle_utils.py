@@ -75,7 +75,7 @@ _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 # optional binding contract.
 LOCAL_KEYS_SUPPORTED = True
 LocalKeysFn = Callable[[Any], Optional[torch.Tensor]]
-_provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
+_provider_spec = import_module("sglang.kernels.plugin_kernels.megakernel.spec")
 _ShardedLogitsView = getattr(_provider_spec, "ShardedLogitsView", None)
 _VocabShardView = getattr(_provider_spec, "VocabShardView", None)
 

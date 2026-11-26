@@ -21,7 +21,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func,
 )
-from sglang.kernels.plugin_kernels.nvidia.spec import (
+from sglang.kernels.plugin_kernels.megakernel.spec import (
     RecurrentCommitIO,
     SupportsRecurrentCommit,
 )

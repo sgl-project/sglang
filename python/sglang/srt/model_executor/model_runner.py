@@ -779,12 +779,20 @@ class ModelRunner:
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
         # after every post-load change to the model, before the KV cache is sized
-        install_megakernel(
-            model=self.model,
-            hf_config=self.model_config.hf_config,
-            capture_tail_hooks=self.capture_tail_hooks,
-            is_draft=self.is_draft_worker,
+        from sglang.srt.kernel_plugins.megakernel import (
+            get_oot_megakernel_selection,
+            install_oot_megakernel,
         )
+
+        if get_oot_megakernel_selection(self.server_args) is not None:
+            install_oot_megakernel(self)
+        else:
+            install_megakernel(
+                model=self.model,
+                hf_config=self.model_config.hf_config,
+                capture_tail_hooks=self.capture_tail_hooks,
+                is_draft=self.is_draft_worker,
+            )
         allocate_mega_moe_buffers(self.model)
 
     def init_memory_saver_adapter(self):
@@ -1246,6 +1254,9 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        from sglang.srt.kernel_plugins.megakernel import prepare_oot_megakernel
+
+        prepare_oot_megakernel(self)
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():
