@@ -9,11 +9,12 @@ import torch
 
 from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestAllocExtendJitBounds(unittest.TestCase):
+class TestAllocExtendJitBounds(CustomTestCase):
     def test_one_block_extends_share_a_key_and_larger_extends_keep_their_coverage(self):
         def fill_indices(
             pre_lens,
