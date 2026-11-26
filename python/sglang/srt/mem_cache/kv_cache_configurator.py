@@ -1486,6 +1486,7 @@ class KVCacheConfigurator:
             is_dflash=self.spec_algorithm.is_dflash_family(),
             speculative_draft_attention_backend=draft_backend,
             speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
+            model_config=aux.draft_model_config,
         )
         decision = place_fused_draft(
             profile=profile,
@@ -2376,10 +2377,12 @@ class KVCacheConfigurator:
         max_running_requests: int,
         is_dsa_model: bool,
     ) -> KVCache:
+        from sglang.srt.hardware_backend.npu.kv_capability import (
+            resolve_npu_kv_capability,
+        )
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (
             NPUMLATokenToKVPool,
         )
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
         from sglang.srt.mem_cache.kv_cache_dtype import resolve_indexer_quant_mode
 
         # NPU mirror of the GPU DSA cache layer split: under prefill CP, swap
@@ -2398,7 +2401,6 @@ class KVCacheConfigurator:
             index_size = max_total_num_tokens
         else:
             index_size = max_total_num_tokens * dcp_size
-        is_arch35 = is_npu_arch35()
         # Shared layers never access the indexer; pool sizing uses the same gate
         # so the saved indexer memory can be used for additional KV tokens.
         use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
@@ -2414,8 +2416,10 @@ class KVCacheConfigurator:
                 )
                 if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
-        use_dsa_fp8_kv_cache_storage = (
-            self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
+        # Only the DSA layout has a packed record; dense MLA and ModelSlim KV
+        # pools keep their own layouts.
+        kv_capability = (
+            resolve_npu_kv_capability(self.kv_cache_dtype) if is_dsa_model else None
         )
         dsa_pool_kwargs = {}
         if is_dsa_model and get_dsa_index_kpool(self.model_config.hf_config) > 1:
@@ -2436,6 +2440,47 @@ class KVCacheConfigurator:
                     ]
                 ),
             }
+        if kv_capability is not None and not kv_capability.supported:
+            requested = self.kv_cache_dtype_str or self.server_args.kv_cache_dtype
+            raise ValueError(
+                f"--kv-cache-dtype {requested} is not supported: "
+                f"{kv_capability.unsupported_reason}"
+            )
+        main_kv_packed = kv_capability is not None and kv_capability.main_kv_packed
+        if main_kv_packed and envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+            # The sparse KV offload reads the main KV as separate unquantized
+            # latent and rope buffers; it has no packed-record path.
+            requested = self.kv_cache_dtype_str or self.server_args.kv_cache_dtype
+            raise ValueError(
+                f"--kv-cache-dtype {requested} stores the DSA MLA KV as a packed "
+                "quantized record, which SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD "
+                "cannot read. Disable it or use --kv-cache-dtype bf16."
+            )
+        if (
+            main_kv_packed
+            and self.kv_cache_dtype == torch.int8
+            and dcp_size > 1
+            and not self.is_draft_worker
+        ):
+            # DCP sparse attention reads the packed record through
+            # kv_quant_sparse_flash_attention, which is wired for fp8_e4m3 on
+            # arch35 only; the INT8 record has no DCP read path yet.
+            raise ValueError(
+                "--kv-cache-dtype int8 is not supported with --dcp-size > 1. "
+                "Disable DCP or use --kv-cache-dtype bf16."
+            )
+        if (
+            main_kv_packed
+            and self.kv_cache_dtype == torch.int8
+            and dsa_cp_layer_shard_rank is not None
+        ):
+            # The layer-split pool allocates its indexer cache in the main KV
+            # store dtype; the INT8 record keeps a BF16 indexer.
+            raise ValueError(
+                "--kv-cache-dtype int8 is not supported with "
+                "--enable-dsa-cache-layer-split. Disable the layer split or use "
+                "--kv-cache-dtype bf16."
+            )
         pool_cls = NPUMLATokenToKVPool
         pool_kwargs = {}
         if dsa_cp_layer_shard_rank is not None:
@@ -2459,9 +2504,10 @@ class KVCacheConfigurator:
                 calculate_mla_kv_cache_dim(
                     model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
                 )
-                if use_dsa_fp8_kv_cache_storage
+                if main_kv_packed
                 else None
             ),
+            kv_capability=kv_capability,
             is_draft_worker=self.is_draft_worker,
             indexer_quant_mode=resolve_indexer_quant_mode(
                 self.server_args.indexer_kv_cache_dtype, self.kv_cache_dtype
@@ -3960,7 +4006,9 @@ def calculate_mla_kv_cache_dim(
     quant_block_size = DSATokenToKVPool.quant_block_size
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
     # (excluding TRTLLM and HIP raw-layout kernels).
-    if kv_cache_dtype == torch.float8_e4m3fn:
+    # An int8 KV cache is only accepted for DSA on non-arch35 Ascend NPUs,
+    # where it is always the packed record.
+    if kv_cache_dtype in (torch.float8_e4m3fn, torch.int8):
         assert kv_lora_rank % quant_block_size == 0, (
             f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
         )
