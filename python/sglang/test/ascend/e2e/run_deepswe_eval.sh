@@ -126,4 +126,32 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 docker compose version || echo "WARNING: docker compose plugin is still unavailable"
 
+# The official ubuntu:24.04 image lacks the Ubuntu archive signing key in this
+# environment, so pier's egress-proxy build fails at `apt-get update` with
+# "NO_PUBKEY 871920D1991BC93C". This eval image (Ubuntu 22.04) ships a keyring
+# that has the key, so build a patched local image and retag it as
+# ubuntu:24.04; compose's `FROM ubuntu:24.04` then uses it instead of pulling.
+seed_ubuntu_base() {
+    local keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+    if [ ! -f "${keyring}" ]; then
+        echo "WARNING: ${keyring} not found; skip patching ubuntu:24.04"
+        return 0
+    fi
+    local work
+    work="$(mktemp -d)"
+    cp "${keyring}" "${work}/ubuntu-archive-keyring.gpg"
+    cat > "${work}/Dockerfile" <<'EOF'
+FROM ubuntu:24.04
+COPY ubuntu-archive-keyring.gpg /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+    echo "Patching ubuntu:24.04 with the archive signing key ..."
+    if docker build -t ubuntu:24.04 "${work}"; then
+        echo "Patched ubuntu:24.04 base ready."
+    else
+        echo "WARNING: failed to patch ubuntu:24.04; apt in the build may fail"
+    fi
+    rm -rf "${work}"
+}
+seed_ubuntu_base
+
 python3 /root/sglang/python/sglang/test/ascend/e2e/run_deepswe_eval.py
