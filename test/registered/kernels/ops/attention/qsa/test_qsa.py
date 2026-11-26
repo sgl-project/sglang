@@ -552,6 +552,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
             compress_member_rows=None,
             decode_logical_positions=None,
             pending_ring_slots=None,
+            prefill_tp_layout=None,
             get_token_to_batch_idx=lambda: mapping,
             prefill_max_row_keys=lambda *_: None,
             get_prefill_mqa_inputs=lambda layer_id, logical_positions: (
@@ -563,6 +564,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
         )
         indexer = SimpleNamespace(
             layer_id=0,
+            index_n_heads=1,
             project_qk=lambda hidden, rope_positions, **kwargs: (
                 hidden.reshape(-1, 1, 2),
                 hidden.reshape(-1, 1, 2),
@@ -1013,6 +1015,7 @@ class _DispatchMetadata:
     compress_member_rows = None
     decode_logical_positions = None
     pending_ring_slots = None
+    prefill_tp_layout = None
     # Consumed by the real _pending_ring_slots helper the dispatch indexer
     # borrows: one token row owned by request slot 1.
     token_to_batch_idx = torch.zeros(2, dtype=torch.int32)
