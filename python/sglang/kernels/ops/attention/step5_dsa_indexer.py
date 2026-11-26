@@ -12,7 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.deep_select import topk
+from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.attention.deep_select import is_deep_select_supported, topk
 
 # Index Q/K normalization and RoPE.
 
@@ -248,8 +249,7 @@ def step5_dsa_build_compression_metadata(
     device = req_to_token.device
     rows = request_slots.numel()
     num_slots, token_capacity = req_to_token.shape
-    token_width = 1
-    num_blocks = (7 + token_width) // 8
+    num_blocks = 1
     result = dict(
         request_slots=torch.empty(rows, dtype=torch.int64, device=device),
         input_start_positions=torch.empty(rows, dtype=torch.int64, device=device),
@@ -261,10 +261,10 @@ def step5_dsa_build_compression_metadata(
         compressed_key_write_indices=torch.empty(
             (num_blocks, rows), dtype=torch.int64, device=device
         ),
-        num_input_tokens=rows * token_width,
+        num_input_tokens=rows,
     )
-    query_slots = torch.empty(rows * token_width, dtype=torch.int32, device=device)
-    query_positions = torch.empty(rows * token_width, dtype=torch.int32, device=device)
+    query_slots = torch.empty(rows, dtype=torch.int32, device=device)
+    query_positions = torch.empty(rows, dtype=torch.int32, device=device)
     uses = torch.zeros(num_slots, dtype=torch.int32, device=device)
     _count_request_owners[(triton.cdiv(rows, 128),)](
         request_slots, valid_rows, uses, rows, num_slots, 128
@@ -291,8 +291,8 @@ def step5_dsa_build_compression_metadata(
         *req_to_token.stride(),
         compressed_index_key_pages * 64,
         context_len,
-        token_width,
-        triton.next_power_of_2(token_width),
+        1,
+        1,
         triton.next_power_of_2(num_blocks),
         num_blocks,
         num_warps=4,
@@ -905,12 +905,9 @@ STEP5_HISTORY_BLOCKS = 512
 _SCORE_STRIDE_ALIGNMENT = 256
 
 
-def can_use_step5_dsa_topk_deepselect(device: torch.device) -> bool:
-    return (
-        device.type == "cuda"
-        and torch.version.hip is None
-        and torch.cuda.get_device_capability(device)[0] == 10
-    )
+def can_use_step5_dsa_topk_deepselect() -> bool:
+    cuda = current_arch().cuda
+    return cuda is not None and cuda.is_sm(10) and is_deep_select_supported()
 
 
 def deepselect_score_width(score_width: int) -> int:

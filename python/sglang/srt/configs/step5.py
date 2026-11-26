@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Step5 text and vision-language checkpoint configurations."""
 
-from typing import Any, Optional, Union
+from typing import Any
 
 import msgspec
 from transformers.configuration_utils import PretrainedConfig
@@ -24,20 +24,20 @@ class Step5Config(PretrainedConfig):
         vocab_size: int = 128896,
         rms_norm_eps: float = 1e-5,
         max_position_embeddings: int = 1048576,
-        rope_theta: Optional[list[float]] = None,
-        rope_scaling: Optional[dict[str, Any]] = None,
-        partial_rotary_factors: Optional[list[float]] = None,
-        layer_types: Optional[list[str]] = None,
+        rope_theta: list[float] | None = None,
+        rope_scaling: dict[str, Any] | None = None,
+        partial_rotary_factors: list[float] | None = None,
+        layer_types: list[str] | None = None,
         sliding_window: int = 512,
         moe_intermediate_size: int = 1536,
         share_expert_dim: int = 1536,
         moe_num_experts: int = 352,
         moe_top_k: int = 8,
         moe_router_scaling_factor: float = 1.0,
-        moe_layers_enum: Optional[str] = None,
-        swiglu_limits: Optional[list[float]] = None,
-        swiglu_limits_shared: Optional[list[float]] = None,
-        sparse_config: Optional[dict[str, Any]] = None,
+        moe_layers_enum: str | None = None,
+        swiglu_limits: list[float] | None = None,
+        swiglu_limits_shared: list[float] | None = None,
+        sparse_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         self.hidden_size = hidden_size
@@ -87,8 +87,8 @@ class Step5VLConfig(Step3p7Config):
 
     def __init__(
         self,
-        vision_config: Optional[Union[dict, Step3p7VisionEncoderConfig]] = None,
-        text_config: Optional[Union[dict, PretrainedConfig]] = None,
+        vision_config: dict | Step3p7VisionEncoderConfig | None = None,
+        text_config: dict | PretrainedConfig | None = None,
         **kwargs: Any,
     ) -> None:
         if text_config is None or isinstance(text_config, dict):

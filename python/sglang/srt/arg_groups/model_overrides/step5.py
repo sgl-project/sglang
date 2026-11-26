@@ -21,6 +21,8 @@ def _validate_features(cfg: Any) -> None:
         raise ValueError("Step5 does not support --enable-hierarchical-cache yet")
     if cfg.disaggregation_mode != "null":
         raise ValueError("Step5 does not support PD disaggregation yet")
+    if cfg.pp_size > 1:
+        raise ValueError("Step5 does not support pipeline parallelism yet")
     if cfg.attn_dp_size > 1:
         raise ValueError("Step5 does not support attention data parallelism yet")
     if cfg.moe_a2a_backend != "none":

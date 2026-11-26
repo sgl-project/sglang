@@ -18,20 +18,11 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
-from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    is_in_breakable_cuda_graph,
-)
-from sglang.srt.model_executor.runner_utils.prefill_graph import (
-    is_in_full_prefill_graph,
-    is_in_prefill_graph_scope,
-)
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.device import async_h2d
@@ -41,6 +32,7 @@ STEP5_COMPRESSION_RATIO = 8
 STEP5_INDEX_HEAD_DIM = 256
 STEP5_INDEX_RING_SIZE = 8
 STEP5_MAX_CONTEXT_LEN = 1048576
+STEP5_SELECTED_BLOCKS = STEP5_HISTORY_BLOCKS + 1
 
 # 512 MiB FP32 score budget, independent of packed prefill length.
 STEP5_SCORE_WORKSPACE_ELEMENTS = 128 * 1024 * 1024
@@ -106,7 +98,7 @@ class Step5IndexerMetadata(msgspec.Struct, frozen=True, kw_only=True):
     selection_workspace: Step5SelectionWorkspace
 
 
-def allocate_selection_workspace(
+def _allocate_selection_workspace(
     *,
     rows: int,
     score_width: int,
@@ -116,9 +108,7 @@ def allocate_selection_workspace(
     device: torch.device,
 ) -> Step5SelectionWorkspace:
     use_deepselect = False
-    if score_width > STEP5_HISTORY_BLOCKS and can_use_step5_dsa_topk_deepselect(
-        torch.device(device)
-    ):
+    if score_width > STEP5_HISTORY_BLOCKS and can_use_step5_dsa_topk_deepselect():
         padded = deepselect_score_width(score_width)
         if padded <= deepselect_score_width(max_score_width):
             score_width, use_deepselect = padded, True
@@ -131,13 +121,19 @@ def allocate_selection_workspace(
     topk_lengths = None
     if use_deepselect:
         topk_lengths = torch.empty(rows, dtype=torch.int32, device=device)
-        topk_lengths.copy_(torch.where(row_to_req > 0, positions // 8, 0))
+        topk_lengths.copy_(
+            torch.where(row_to_req > 0, positions // STEP5_COMPRESSION_RATIO, 0)
+        )
     return Step5SelectionWorkspace(
-        packed=torch.empty((rows, 513), dtype=torch.int64, device=device),
+        packed=torch.empty(
+            (rows, STEP5_SELECTED_BLOCKS), dtype=torch.int64, device=device
+        ),
         counts=torch.empty(rows, dtype=torch.int32, device=device),
         lengths=torch.empty(rows, dtype=torch.int32, device=device),
         indexer_logits=indexer_logits,
-        ids=torch.empty((capacity, 513), dtype=torch.int32, device=device),
+        ids=torch.empty(
+            (capacity, STEP5_SELECTED_BLOCKS), dtype=torch.int32, device=device
+        ),
         use_deepselect=use_deepselect,
         topk_lengths=topk_lengths,
         topk_ids=(
@@ -154,7 +150,7 @@ def allocate_selection_workspace(
     )
 
 
-def build_prefill_compression_inputs(
+def _build_prefill_compression_inputs(
     *,
     request_slots: torch.Tensor,
     prefix_lengths: list[int],
@@ -180,20 +176,21 @@ def build_prefill_compression_inputs(
     uses = torch.zeros(req_to_token.shape[0], dtype=torch.int32, device=device)
     uses.scatter_add_(0, slots, active.to(torch.int32))
     admitted = (raw_slots == slots) & (uses[slots] == 1)
-    max_blocks = max(((row[0] % 8 + row[2]) // 8 for row in rows), default=0)
+    ratio = STEP5_COMPRESSION_RATIO
+    max_blocks = max(((row[0] % ratio + row[2]) // ratio for row in rows), default=0)
     block_idx = torch.arange(max_blocks, device=device)[:, None]
-    offsets = torch.arange(8, device=device)
-    logical = (bases // 8 + block_idx) * 8
-    complete = logical + 8 <= bases + lengths
+    offsets = torch.arange(ratio, device=device)
+    logical = (bases // ratio + block_idx) * ratio
+    complete = logical + ratio <= bases + lengths
     mapped = req_to_token[
         slots[None, :, None],
         (logical[:, :, None] + offsets).clamp_max(req_to_token.shape[1] - 1),
     ].long()
     first = mapped[:, :, 0]
     valid = (
-        (first >= 64)
-        & (first < compressed_index_key_pages * 64)
-        & (first.remainder(8) == 0)
+        (first >= STEP5_PAGE_SIZE)
+        & (first < compressed_index_key_pages * STEP5_PAGE_SIZE)
+        & (first.remainder(ratio) == 0)
         & (mapped == first[:, :, None] + offsets).all(2)
     )
     return dict(
@@ -204,9 +201,13 @@ def build_prefill_compression_inputs(
         request_active=active,
         request_mapping_valid=admitted & (~complete | valid).all(0),
         request_count_valid=torch.ones(1, dtype=torch.bool, device=device),
-        compressed_key_write_indices=(first // 8).contiguous(),
+        compressed_key_write_indices=(first // ratio).contiguous(),
         num_input_tokens=source,
     )
+
+
+def _num_blocks(num_tokens: int) -> int:
+    return (num_tokens + STEP5_COMPRESSION_RATIO - 1) // STEP5_COMPRESSION_RATIO
 
 
 def wrap_step5_attention_backend(runner, full_attn_backend: AttentionBackend):
@@ -331,55 +332,9 @@ def _prefill_query_layout(compression_inputs: dict):
     return requests, torch.where(requests != 0, positions, 0)
 
 
-class Step5RadixAttention(RadixAttention):
-    """Keep aligned DSA tail rows when dispatching to the Step5 backend."""
-
-    def forward(
-        self,
-        q,
-        k,
-        v,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-        key_value_num_tokens: int | None = None,
-        **kwargs,
-    ):
-        backend = get_attn_backend()
-        # Graph wrappers still own real-row slicing and output padding.
-        if (
-            isinstance(backend, Step5AttentionBackend)
-            and not (
-                self.use_prefill_attention_wrapper
-                and is_in_prefill_graph_scope()
-                and forward_batch.forward_mode.is_extend()
-                and (is_in_breakable_cuda_graph() or is_in_full_prefill_graph())
-            )
-            and padded_extend_real_tokens(q.shape[0], forward_batch) is not None
-        ):
-            if k is not None:
-                assert v is not None
-                k = k.view(
-                    -1,
-                    self.tp_k_head_num,
-                    self.v_head_dim if "k_rope" in kwargs else self.qk_head_dim,
-                )
-                if "k_rope" not in kwargs:
-                    v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-            return backend.forward(
-                q, k, v, self, forward_batch, save_kv_cache, **kwargs
-            )
-        return super().forward(
-            q,
-            k,
-            v,
-            forward_batch,
-            save_kv_cache,
-            key_value_num_tokens=key_value_num_tokens,
-            **kwargs,
-        )
-
-
 class Step5AttentionBackend(AttentionBackend):
+    plans_padded_extend_rows = True
+
     def __init__(
         self,
         *,
@@ -414,15 +369,15 @@ class Step5AttentionBackend(AttentionBackend):
         return [self.swa_backend]
 
     @property
-    def needs_cpu_seq_lens(self):
+    def needs_cpu_seq_lens(self) -> bool:
         return self.swa_backend.needs_cpu_seq_lens
 
-    def shared_read_ends(self, fm):
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return SharedReadEnds.max_of(
             (SharedReadEnds.POST_REPLAY, self.swa_backend.shared_read_ends(fm))
         )
 
-    def init_forward_metadata(self, forward_batch):
+    def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         self.forward_metadata = None
         mode = forward_batch.forward_mode
         _check_forward_mode(mode)
@@ -451,11 +406,11 @@ class Step5AttentionBackend(AttentionBackend):
             query_request_slots=row_to_req,
             query_positions=positions,
             score_width=score_width,
-            selection_workspace=allocate_selection_workspace(
+            selection_workspace=_allocate_selection_workspace(
                 rows=positions.numel(),
                 score_width=score_width,
                 device=request_slots.device,
-                max_score_width=req_to_token.shape[1] // 8,
+                max_score_width=req_to_token.shape[1] // STEP5_COMPRESSION_RATIO,
                 row_to_req=row_to_req,
                 positions=positions,
             ),
@@ -469,7 +424,7 @@ class Step5AttentionBackend(AttentionBackend):
         slots = fb.req_pool_indices
         if len(lengths) > fb.batch_size:
             slots = torch.cat((slots, slots.new_zeros(1)))
-        compression_inputs = build_prefill_compression_inputs(
+        compression_inputs = _build_prefill_compression_inputs(
             request_slots=slots,
             prefix_lengths=prefixes,
             append_lengths=lengths,
@@ -479,7 +434,7 @@ class Step5AttentionBackend(AttentionBackend):
         requests, positions = _prefill_query_layout(compression_inputs)
         score_width = max(
             1,
-            (max((p + n for p, n in zip(prefixes, lengths)), default=0) + 7) // 8,
+            _num_blocks(max((p + n for p, n in zip(prefixes, lengths)), default=0)),
         )
         return self._build_indexer_metadata(
             compression_inputs=compression_inputs,
@@ -520,10 +475,12 @@ class Step5AttentionBackend(AttentionBackend):
             compression_inputs=compression_inputs,
             row_to_req=row_to_req,
             positions=positions,
-            score_width=(self.context_len + 7) // 8,
+            score_width=_num_blocks(self.context_len),
         )
 
-    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ) -> None:
         bs = forward_batch.batch_size
         if in_capture:
             self._graph_valid_rows.zero_()
@@ -537,16 +494,19 @@ class Step5AttentionBackend(AttentionBackend):
             forward_batch, in_capture=in_capture
         )
 
-    def init_forward_metadata_in_graph(self, forward_batch):
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         self.forward_metadata = self._build_decode_metadata(
             forward_batch, valid_rows=self._graph_valid_rows
         )
         self._cuda_graph_metadata[forward_batch.batch_size] = self.forward_metadata
         self.swa_backend.init_forward_metadata_in_graph(forward_batch)
 
-    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         req_to_token = self.req_to_token_pool.req_to_token
-        if (self.context_len + 7) // 8 * 8 > req_to_token.shape[1]:
+        if (
+            _num_blocks(self.context_len) * STEP5_COMPRESSION_RATIO
+            > req_to_token.shape[1]
+        ):
             raise ValueError("Step5 graph context exceeds native request capacity")
         self._cuda_graph_metadata.clear()
         self.forward_metadata = None
@@ -555,15 +515,24 @@ class Step5AttentionBackend(AttentionBackend):
         )
         self.swa_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def get_cuda_graph_seq_len_fill_value(self):
+    def get_cuda_graph_seq_len_fill_value(self) -> int:
         return self.swa_backend.get_cuda_graph_seq_len_fill_value()
 
-    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+    def get_indexer_metadata(
+        self, layer_id: int, forward_batch: ForwardBatch
+    ) -> Step5IndexerMetadata | None:
         return self.forward_metadata
 
     def forward_decode(
-        self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
-    ):
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
         if layer.layer_id in self.dsa_layer_ids:
             return self._forward_dsa(
                 q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
@@ -573,8 +542,15 @@ class Step5AttentionBackend(AttentionBackend):
         )
 
     def forward_extend(
-        self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
-    ):
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
         if layer.layer_id in self.dsa_layer_ids:
             return self._forward_dsa(
                 q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
@@ -595,15 +571,15 @@ class Step5AttentionBackend(AttentionBackend):
 
     def _forward_dsa(
         self,
-        q,
-        k,
-        v,
-        layer,
-        forward_batch,
-        save_kv_cache=True,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
         *,
-        index_selection,
-    ):
+        index_selection: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
                 layer,

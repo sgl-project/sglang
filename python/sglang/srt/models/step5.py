@@ -4,14 +4,11 @@
 from __future__ import annotations
 
 import copy
-import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from functools import partial
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from safetensors import safe_open
 from torch import nn
 
 from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
@@ -26,12 +23,13 @@ from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
     gemma_rmsnorm as mixed_dtype_gemma_rmsnorm,
 )
 from sglang.kernels.spec import KernelBackend
-from sglang.srt.configs.step5 import Step5Config, parse_step5_attention_profile
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.attention.step5_backend import (
-    Step5IndexerMetadata,
-    Step5RadixAttention,
+from sglang.srt.configs.step5 import (
+    Step5Config,
+    Step5VLConfig,
+    parse_step5_attention_profile,
 )
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.step5_backend import Step5IndexerMetadata
 from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm, LayerNorm
@@ -49,6 +47,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputForma
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.layer_list import make_pp_layers
@@ -64,17 +63,28 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_parallel
 
 
 class Step5RMSNorm(GemmaRMSNorm):
-    def __init__(self, hidden_size, eps=1e-6, *, weight_dtype=None):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        *,
+        weight_dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__(hidden_size, eps=eps)
         if weight_dtype is not None:
             self.weight.data = self.weight.data.to(weight_dtype)
             self.gemma_weight = self.gemma_weight.to(weight_dtype)
 
-    def _forward_impl(self, x, residual=None, post_residual_addition=None):
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        post_residual_addition: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Idle DP ranks must not launch a zero-grid CUDA norm.
         if x.numel() == 0:
             if residual is not None:
@@ -108,7 +118,6 @@ class Step5Indexer(nn.Module):
         index_head_dim: int,
         num_index_heads: int,
         index_tp_size: int,
-        tp_rank: int,
         tp_size: int,
         rotary_dim: int,
         rope_theta: float,
@@ -408,7 +417,7 @@ class Step5Attention(nn.Module):
         self.k_norm = Step5RMSNorm(
             profile.head_dim, eps=self.eps, weight_dtype=torch.float32
         )
-        self.attn = Step5RadixAttention(
+        self.attn = RadixAttention(
             num_heads=self.num_heads,
             head_dim=profile.head_dim,
             scaling=profile.head_dim**-0.5,
@@ -425,7 +434,6 @@ class Step5Attention(nn.Module):
                 index_head_dim=profile.index_head_dim,
                 num_index_heads=profile.index_num_heads,
                 index_tp_size=profile.provider_groups,
-                tp_rank=parallel.attn_tp_rank,
                 tp_size=parallel.attn_tp_size,
                 rotary_dim=profile.index_rope_dim,
                 rope_theta=config.rope_theta[layer_id],
@@ -464,13 +472,26 @@ class Step5Attention(nn.Module):
         v = v.contiguous().view(-1, self.num_kv_heads, self.head_dim)
         if is_in_breakable_cuda_graph():
             output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
-            _breakable_step5_attention_core(
-                q, k, v, hidden_states, positions, output, self
+            _bcg_step5_attention_core(
+                q=q,
+                k=k,
+                v=v,
+                hidden_states=hidden_states,
+                positions=positions,
+                output=output,
+                layer=self,
             )
         elif self.is_dsa:
             output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
             _step5_attention_core(
-                q, k, v, hidden_states, positions, output, self, forward_batch
+                q=q,
+                k=k,
+                v=v,
+                hidden_states=hidden_states,
+                positions=positions,
+                output=output,
+                layer=self,
+                forward_batch=forward_batch,
             )
         else:
             output = self.attn(q, k, v, forward_batch)
@@ -487,7 +508,7 @@ def _step5_attention_core(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
     output: torch.Tensor,
-    owner: Step5Attention,
+    layer: Step5Attention,
     forward_batch: ForwardBatch | None = None,
 ) -> None:
     if forward_batch is None:
@@ -495,13 +516,13 @@ def _step5_attention_core(
     backend = get_attn_backend()
     num_tokens = forward_batch.global_num_token_non_padded_cpu
     kwargs = {}
-    if owner.is_dsa:
-        metadata = backend.get_indexer_metadata(owner.attn.layer_id, forward_batch)
+    if layer.is_dsa:
+        metadata = backend.get_indexer_metadata(layer.attn.layer_id, forward_batch)
         if metadata is None:
             output.zero_()
             return
         num_tokens = metadata.num_input_tokens
-        kwargs["index_selection"] = owner.indexer(
+        kwargs["index_selection"] = layer.indexer(
             hidden_states[:num_tokens], positions[:num_tokens], metadata
         )
     batch_view = copy.copy(forward_batch)
@@ -510,7 +531,7 @@ def _step5_attention_core(
         q[:num_tokens],
         k[:num_tokens],
         v[:num_tokens],
-        owner.attn,
+        layer.attn,
         batch_view,
         save_kv_cache=True,
         **kwargs,
@@ -519,7 +540,17 @@ def _step5_attention_core(
     output[num_tokens:].zero_()
 
 
-_breakable_step5_attention_core = eager_on_graph(_step5_attention_core)
+_bcg_step5_attention_core = eager_on_graph(_step5_attention_core)
+
+
+def _step5_stage_facts(config: Step5Config, layer_id: int) -> tuple:
+    return (
+        declare_attn(),
+        declare_ffn(
+            sparse=layer_id in config.moe_layer_list,
+            next_layer_sparse=layer_id + 1 in config.moe_layer_list,
+        ),
+    )
 
 
 class Step5DecoderLayer(nn.Module):
@@ -564,20 +595,10 @@ class Step5DecoderLayer(nn.Module):
         self.post_attention_layernorm = Step5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, weight_dtype=torch.bfloat16
         )
-        attn, ffn = self.stage_facts(config, layer_id)
+        attn, ffn = _step5_stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
-        )
-
-    @staticmethod
-    def stage_facts(config: Step5Config, layer_id: int):
-        return (
-            declare_attn(),
-            declare_ffn(
-                sparse=layer_id in config.moe_layer_list,
-                next_layer_sparse=layer_id + 1 in config.moe_layer_list,
-            ),
         )
 
     def forward(
@@ -626,7 +647,7 @@ class Step5Model(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
-            stage_facts=partial(Step5DecoderLayer.stage_facts, config),
+            stage_facts=partial(_step5_stage_facts, config),
         )
         self.norm = Step5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, weight_dtype=torch.float32
@@ -648,64 +669,33 @@ class Step5Model(nn.Module):
         residual_batch.start(forward_batch)
         for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states = layer(positions, hidden_states, forward_batch)
-        hidden_states, residual = residual_batch.stream_of(forward_batch).export(
-            hidden_states
+        return residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, backend=KernelBackend.TORCH
         )
-        forward_batch.residual_stream = None
-        return self.norm(hidden_states + residual, backend=KernelBackend.TORCH)
 
 
-def _duplicated_owners(model_path: str | None) -> dict[str, str]:
-    index_path = Path(model_path or "") / "model.safetensors.index.json"
-    if not model_path or not index_path.is_file():
-        return {}
-    owners = json.loads(index_path.read_text())["weight_map"]
-    seen, duplicated = set(), set()
-    for filename in sorted(set(owners.values())):
-        with safe_open(Path(model_path) / filename, framework="pt") as shard:
-            names = set(shard.keys())
-        duplicated |= names & seen
-        seen |= names
-    return {name: owners[name] for name in duplicated}
-
-
-def _deduplicated_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], model_path: str | None
-) -> Iterator[tuple[str, torch.Tensor]]:
-    owners = _duplicated_owners(model_path)
-    emitted = set()
-    for name, weight in weights:
-        if name not in owners:
-            yield name, weight
-            continue
-        if name in emitted:
-            continue
-        emitted.add(name)
-        with safe_open(
-            Path(model_path) / owners[name], framework="pt", device="cpu"
-        ) as shard:
-            yield name, shard.get_tensor(name)
+_STACKED_PARAMS_MAPPING = (
+    ("qkv_proj", "q_proj", "q"),
+    ("qkv_proj", "k_proj", "k"),
+    ("qkv_proj", "v_proj", "v"),
+    ("gate_up_proj", "gate_proj", 0),
+    ("gate_up_proj", "up_proj", 1),
+)
+_EXPERT_PARAMS_MAPPING = (
+    ("w13_weight", "gate_proj.weight", "w1"),
+    ("w13_weight", "up_proj.weight", "w3"),
+    ("w2_weight", "down_proj.weight", "w2"),
+    ("w13_weight_scale_inv", "gate_proj.weight_scale_inv", "w1"),
+    ("w13_weight_scale_inv", "up_proj.weight_scale_inv", "w3"),
+    ("w2_weight_scale_inv", "down_proj.weight_scale_inv", "w2"),
+)
 
 
 class Step5ForCausalLM(nn.Module):
-    _stacked_params = (
-        ("qkv_proj", "q_proj", "q"),
-        ("qkv_proj", "k_proj", "k"),
-        ("qkv_proj", "v_proj", "v"),
-        ("gate_up_proj", "gate_proj", 0),
-        ("gate_up_proj", "up_proj", 1),
-    )
-    _expert_params = (
-        ("w13_weight", "gate_proj.weight", "w1"),
-        ("w13_weight", "up_proj.weight", "w3"),
-        ("w2_weight", "down_proj.weight", "w2"),
-        ("w13_weight_scale_inv", "gate_proj.weight_scale_inv", "w1"),
-        ("w13_weight_scale_inv", "up_proj.weight_scale_inv", "w3"),
-        ("w2_weight_scale_inv", "down_proj.weight_scale_inv", "w2"),
-    )
-
     @classmethod
-    def get_model_config_for_expert_location(cls, config):
+    def get_model_config_for_expert_location(
+        cls, config: Step5Config
+    ) -> ModelConfigForExpertLocation:
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
             num_logical_experts=config.moe_num_experts,
@@ -733,17 +723,17 @@ class Step5ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
 
     @property
-    def start_layer(self):
+    def start_layer(self) -> int:
         return self.model.start_layer
 
     @property
-    def end_layer(self):
+    def end_layer(self) -> int:
         return self.model.end_layer
 
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.model.get_input_embeddings()
 
-    def get_embed_and_head(self):
+    def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     @torch.no_grad()
@@ -759,24 +749,26 @@ class Step5ForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def _target_name(self, name: str) -> tuple[str, object]:
+    def _target_name(self, name: str) -> tuple[str, str | int | None]:
         if ".self_attn.sparse_indexer_" in name:
             return name.replace(".self_attn.", ".self_attn.indexer."), None
         if ".moe." not in name:
-            for param, source, shard in self._stacked_params:
+            for param, source, shard in _STACKED_PARAMS_MAPPING:
                 if f".{source}." in name:
                     return name.replace(f".{source}.", f".{param}."), shard
         return name, None
 
-    def _load_experts(self, params, name: str, weight: torch.Tensor) -> str | None:
+    def _load_experts(
+        self, params_dict: dict[str, nn.Parameter], name: str, weight: torch.Tensor
+    ) -> str | None:
         head, marker, tail = name.rpartition(".moe.")
         if not marker:
             return None
-        for param_name, source, shard in self._expert_params:
+        for param_name, source, shard in _EXPERT_PARAMS_MAPPING:
             if tail != source:
                 continue
             target = f"{head}.moe.experts.{param_name}"
-            param = params[target]
+            param = params_dict[target]
             for expert_id in range(self.config.moe_num_experts):
                 param.weight_loader(
                     param,
@@ -798,46 +790,41 @@ class Step5ForCausalLM(nn.Module):
         return int(name.split(".")[2]) >= self.config.num_hidden_layers
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return self._load_language_weights(
-            _deduplicated_weights(weights, get_model().model_path)
-        )
-
-    def _load_language_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
-        params = dict(self.named_parameters())
-        loaded = set()
+        params_dict = dict(self.named_parameters())
+        loaded_params = set()
         for name, weight in weights:
             if self._is_skipped(name):
                 continue
-            expert_target = self._load_experts(params, name, weight)
+            expert_target = self._load_experts(params_dict, name, weight)
             if expert_target is not None:
-                loaded.add(expert_target)
+                loaded_params.add(expert_target)
                 continue
             target, shard = self._target_name(name)
-            if target not in params:
+            if target not in params_dict:
                 raise ValueError(f"Unknown Step5 weight: {name}")
-            param = params[target]
+            param = params_dict[target]
             if shard is None:
-                loader = getattr(param, "weight_loader", default_weight_loader)
-                loader(param, weight)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight)
             else:
                 param.weight_loader(param, weight, shard)
-            loaded.add(target)
-        missing = params.keys() - loaded
+            loaded_params.add(target)
+        missing = params_dict.keys() - loaded_params
         if missing:
             raise ValueError(f"Step5 weights not loaded: {sorted(missing)[:16]}")
-        return loaded
+        return loaded_params
 
 
 class Step5ForConditionalGeneration(Step5ForCausalLM):
     @classmethod
-    def get_model_config_for_expert_location(cls, config):
+    def get_model_config_for_expert_location(
+        cls, config: Step5VLConfig
+    ) -> ModelConfigForExpertLocation:
         return super().get_model_config_for_expert_location(config.text_config)
 
     def __init__(
         self,
-        config,
+        config: Step5VLConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:

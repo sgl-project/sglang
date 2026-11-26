@@ -5,8 +5,6 @@ DeepSeek DSA runs MLA over selected tokens; Step5 runs GQA (head_dim 192, one KV
 head per rank) over every token of the selected regions in the paged KV cache.
 """
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
@@ -21,8 +19,6 @@ def _sparse_attention_kernel(
     counts_ptr,
     lengths_ptr,
     out_ptr,
-    k_scale_ptr,
-    v_scale_ptr,
     q_stride_row,
     q_stride_head,
     kv_stride,
@@ -33,7 +29,6 @@ def _sparse_attention_kernel(
     HEADS: tl.constexpr,
     D: tl.constexpr,
     REGION: tl.constexpr,
-    FP8_KV: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -52,9 +47,6 @@ def _sparse_attention_kernel(
         mask=head_mask[:, None] & dim_mask[None, :],
         other=0.0,
     )
-    if FP8_KV:
-        k_scale = tl.load(k_scale_ptr)
-        v_scale = tl.load(v_scale_ptr)
 
     m = tl.full((BLOCK_H,), float("-inf"), tl.float32)
     l = tl.zeros((BLOCK_H,), tl.float32)
@@ -74,9 +66,6 @@ def _sparse_attention_kernel(
         kv_off = slot[:, None] * kv_stride + d[None, :]
         k = tl.load(k_ptr + kv_off, mask=kv_mask, other=0.0)
         v = tl.load(v_ptr + kv_off, mask=kv_mask, other=0.0)
-        if FP8_KV:
-            k = (k.to(tl.float32) * k_scale).to(tl.bfloat16)
-            v = (v.to(tl.float32) * v_scale).to(tl.bfloat16)
 
         s = tl.dot(q, tl.trans(k)) * scale
         s = tl.where(valid[None, :], s, float("-inf"))
@@ -106,8 +95,6 @@ def step5_dsa_sparse_attention(
     lengths: torch.Tensor,
     out: torch.Tensor,
     scale: float,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Attention of each query row over its selected 8-token regions.
 
@@ -117,8 +104,6 @@ def step5_dsa_sparse_attention(
     rows, heads, head_dim = q.shape
     assert head_dim == 192 and k_cache.shape[-1] == v_cache.shape[-1] == head_dim
     assert packed.dtype == torch.int64 and packed.shape[0] == rows
-    fp8_kv = k_cache.dtype == torch.float8_e4m3fn
-    assert not fp8_kv or (k_scale is not None and v_scale is not None)
     if rows:
         _sparse_attention_kernel[(rows,)](
             q,
@@ -128,8 +113,6 @@ def step5_dsa_sparse_attention(
             counts,
             lengths,
             out,
-            k_scale,
-            v_scale,
             q.stride(0),
             q.stride(1),
             k_cache.stride(0),
@@ -140,7 +123,6 @@ def step5_dsa_sparse_attention(
             HEADS=heads,
             D=head_dim,
             REGION=8,
-            FP8_KV=fp8_kv,
             BLOCK_H=max(16, triton.next_power_of_2(heads)),
             BLOCK_D=256,
             BLOCK_N=64,
