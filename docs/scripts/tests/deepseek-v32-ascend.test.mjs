@@ -81,7 +81,7 @@ test('the router command matches the CI contract and targets the node-0 servers'
   const router = node('router');
   assert.ok(router.includes('python -m sglang_router.launch_router'));
   assert.deepEqual(flags(router), [
-    '--model-id /path/to/model-weights',
+    '--model-id /path/to/DeepSeek-V3.2-W8A8',
     '--no-tokenizer',
     '--worker-urls http://<prefill-node0-ip>:30000 http://<decode-node0-ip>:30000',
     '--host 127.0.0.1',

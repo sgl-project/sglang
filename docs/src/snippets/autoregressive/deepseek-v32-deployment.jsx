@@ -155,9 +155,9 @@ export const DeepSeekV32Deployment = () => {
       return [
         '# Ascend A3 · 4-node PD disaggregation · router',
         '# Run on any host that can reach prefill node 0 and decode node 0.',
-        '# Replace <prefill-node0-ip> and <decode-node0-ip> before running.',
+        '# Replace <prefill-node0-ip>, <decode-node0-ip>, and the model path before running.',
         'python -m sglang_router.launch_router \\',
-        '  --model-id /path/to/model-weights \\',
+        '  --model-id /path/to/DeepSeek-V3.2-W8A8 \\',
         '  --no-tokenizer \\',
         `  --worker-urls http://<prefill-node0-ip>:${npuServerPort} http://<decode-node0-ip>:${npuServerPort} \\`,
         '  --host 127.0.0.1 \\',
