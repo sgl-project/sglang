@@ -52,5 +52,32 @@ def test_murmur_hash32_cpu_shape_and_dtype(positions_dtype):
     assert actual.shape == (3, 128)
 
 
+def test_watermark_state_folds_wide_multimodal_padding_ids():
+    from sglang.srt.sampling.watermarking.gumbel.algorithm import hash_contexts
+    from sglang.srt.sampling.watermarking.gumbel.state import WatermarkState
+
+    # _compute_pad_values() builds padding ids from a 62-bit mask, which does
+    # not fit the int32 context buffer used by the watermark state.
+    wide_id = (1 << 62) | 0x2A5B
+    state = WatermarkState(
+        max_num_reqs=1,
+        context_window=4,
+        max_contexts_per_req=2,
+        device="cpu",
+    )
+    state.init_from_prompt(torch.tensor([0], dtype=torch.int32), [[wide_id, 123]])
+
+    folded = ((wide_id & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+    assert state.token_ids[0, :2].tolist() == [folded, 123]
+    assert state.lengths[0].item() == 2
+
+    # The watermark hashes the low 32 bits of each id, so folding keeps the
+    # context hash identical to hashing the original wide id.
+    lengths = torch.tensor([2], dtype=torch.int32)
+    original_hash = hash_contexts(torch.tensor([[wide_id, 123]], dtype=torch.int64), lengths)
+    stored_hash = hash_contexts(state.token_ids[0, :2].to(torch.int64).view(1, -1), lengths)
+    assert original_hash.item() == stored_hash.item()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
