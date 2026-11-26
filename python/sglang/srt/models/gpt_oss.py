@@ -1019,6 +1019,9 @@ class GptOssForCausalLM(nn.Module):
                 (moe_tp_rank + 1) * per_rank_intermediate_size,
                 original_intermediate_size,
             )
+            experts.loaded_intermediate_size = max(
+                0, moe_tp_rank_end - moe_tp_rank_start
+            )
 
             moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
             moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts

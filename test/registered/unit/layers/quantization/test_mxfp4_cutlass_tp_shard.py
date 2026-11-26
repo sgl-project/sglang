@@ -32,7 +32,9 @@ class TestMxfp4CutlassTpShard(CustomTestCase):
     intermediate_size / tp.
     """
 
-    def _create_weights(self, fi_kernel, tp_size, tp_rank=0):
+    def _create_weights(
+        self, fi_kernel, tp_size, tp_rank=0, intermediate=GPT_OSS_INTERMEDIATE
+    ):
         method = object.__new__(Mxfp4MoEMethod)
         method.use_marlin = False
         method.use_deep_gemm = False
@@ -50,7 +52,7 @@ class TestMxfp4CutlassTpShard(CustomTestCase):
                 layer,
                 num_experts=2,
                 hidden_size=GPT_OSS_HIDDEN,
-                intermediate_size_per_partition=GPT_OSS_INTERMEDIATE // tp_size,
+                intermediate_size_per_partition=intermediate // tp_size,
                 params_dtype=torch.bfloat16,
                 with_bias=True,
             )
@@ -70,19 +72,30 @@ class TestMxfp4CutlassTpShard(CustomTestCase):
                     self.assertEqual(layer.w13_weight_bias.shape[1], 2 * rows)
 
     def test_humming_range_ignores_short_shard_tail(self):
-        # tp=4 rank 3 loads 672 of its 736 channels; the unwritten rows and
-        # columns keep scale 127 and must not move Humming's per-expert range.
+        # The last rank loads fewer channels than its buffer holds; the rest
+        # keeps scale 127 and must not reach Humming's per-expert range.
+        # (3072, 2880): the config is wider than the checkpoint.
         tp_size, tp_rank = 4, 3
-        loaded = GPT_OSS_INTERMEDIATE - tp_rank * loader_rank_intermediate(
-            GPT_OSS_INTERMEDIATE, tp_size
-        )
-        self.assertEqual(loaded, 672)
+        for config_inter, expect_loaded in (
+            (GPT_OSS_INTERMEDIATE, 672),
+            (3072, 576),
+        ):
+            with self.subTest(config_intermediate=config_inter):
+                # Mirrors the cutoff in _load_mxfp4_experts_weights (gpt_oss.py).
+                per_rank = loader_rank_intermediate(config_inter, tp_size)
+                loaded = (
+                    min((tp_rank + 1) * per_rank, GPT_OSS_INTERMEDIATE)
+                    - tp_rank * per_rank
+                )
+                self.assertEqual(loaded, expect_loaded)
+                self._check_humming_inputs(config_inter, tp_size, tp_rank, loaded)
+
+    def _check_humming_inputs(self, config_inter, tp_size, tp_rank, loaded):
+        captured = []
 
         def fake_humming(weights, scales, **kwargs):
-            exps = scales.flatten(1).to(torch.int32)
-            return weights, scales, torch.stack(
-                [exps.amax(dim=1), exps.amin(dim=1)], dim=1
-            ).float()
+            captured.append(scales.clone())
+            return weights, scales, torch.zeros(scales.shape[0], 2)
 
         fake_fused_moe = types.ModuleType("flashinfer.fused_moe")
         fake_fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming = (
@@ -91,39 +104,51 @@ class TestMxfp4CutlassTpShard(CustomTestCase):
         fake_flashinfer = types.ModuleType("flashinfer")
         fake_flashinfer.fused_moe = fake_fused_moe
 
-        residuals = []
-        for tail_fill in (127, 105):
-            layer = self._create_weights("cutlass_sm90", tp_size, tp_rank)
-            layer.moe_runner_config = types.SimpleNamespace(gate_up_interleaved=True)
-            gen = torch.Generator().manual_seed(0)
-            for name, rows, cols in (
-                ("w13_weight_scale", 2 * loaded, None),
-                ("w2_weight_scale", None, loaded // MXFP4_BLOCK),
-            ):
-                scale = getattr(layer, name).data
-                scale.fill_(tail_fill)
-                region = scale[:, :rows, :cols]
-                region.copy_(
-                    torch.randint(100, 111, region.shape, generator=gen).to(
-                        torch.uint8
-                    )
-                )
-            method = self.method
-            method._use_sm90_humming = True
-            with mock.patch.dict(
-                sys.modules,
-                {"flashinfer": fake_flashinfer, "flashinfer.fused_moe": fake_fused_moe},
-            ):
-                method._process_weights_for_sm90_cutlass(layer)
-            residuals.append(
-                (
-                    layer.w13_humming_residual_scale.clone(),
-                    layer.w2_humming_residual_scale.clone(),
-                )
-            )
+        layer = self._create_weights("cutlass_sm90", tp_size, tp_rank, config_inter)
+        layer.moe_runner_config = types.SimpleNamespace(gate_up_interleaved=True)
+        layer.loaded_intermediate_size = loaded
+        gen = torch.Generator().manual_seed(0)
+        n_groups = -(-loaded // MXFP4_BLOCK)
+        w13_real = layer.w13_weight_scale.data
+        w2_real = layer.w2_weight_scale.data
+        w13_real.fill_(127)
+        w2_real.fill_(127)
+        w13_real[:, : 2 * loaded, :] = torch.randint(
+            100, 111, w13_real[:, : 2 * loaded, :].shape, generator=gen
+        ).to(torch.uint8)
+        w2_real[:, :, :n_groups] = torch.randint(
+            100, 111, w2_real[:, :, :n_groups].shape, generator=gen
+        ).to(torch.uint8)
+        w13_src = w13_real.clone()
+        w2_src = w2_real.clone()
 
-        self.assertTrue(torch.equal(residuals[0][0], residuals[1][0]))
-        self.assertTrue(torch.equal(residuals[0][1], residuals[1][1]))
+        method = self.method
+        method._use_sm90_humming = True
+        with mock.patch.dict(
+            sys.modules,
+            {"flashinfer": fake_flashinfer, "flashinfer.fused_moe": fake_fused_moe},
+        ):
+            method._process_weights_for_sm90_cutlass(layer)
+
+        w13_in, w2_in = captured
+        n_pad = method._padded_intermediate
+        k_groups = GPT_OSS_HIDDEN // MXFP4_BLOCK
+        for name, got, src, expected_fill in (
+            ("w13", w13_in, w13_src, w13_src[:, 0, 0]),
+            ("w2", w2_in, w2_src, w2_src[:, 0, 0]),
+        ):
+            expected = expected_fill.view(-1, 1, 1).expand_as(got).clone()
+            if name == "w13":
+                expected[:, :loaded, :k_groups] = src[:, 1 : 2 * loaded : 2, :k_groups]
+                expected[:, n_pad : n_pad + loaded, :k_groups] = src[
+                    :, 0 : 2 * loaded : 2, :k_groups
+                ]
+            else:
+                expected[:, :GPT_OSS_HIDDEN, :n_groups] = src[
+                    :, :GPT_OSS_HIDDEN, :n_groups
+                ]
+            self.assertTrue(torch.equal(got, expected), name)
+            self.assertFalse((got == 127).any(), name)
 
 
 if __name__ == "__main__":

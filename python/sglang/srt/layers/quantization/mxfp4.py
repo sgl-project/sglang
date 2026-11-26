@@ -506,9 +506,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # processor can exclude the never-written tail from Humming's
             # per-expert scale range.
             self._unpadded_hidden = getattr(layer, "hidden_size_unpadded", hidden_size)
-            self._checkpoint_intermediate = intermediate_size_per_partition * getattr(
-                layer, "moe_tp_size", 1
-            )
             # create_weights below aligns only to the mxfp4 block: gpt_oss.py
             # shards by whole blocks, so a rank's slice can exceed
             # intermediate_size / tp (736 vs 720 at tp=4). The extra rows have zero
@@ -1193,15 +1190,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         K_real = min(getattr(self, "_unpadded_hidden", None) or K_un, K_un)
         # ceil: a partial trailing group is still real and must be kept.
         w13_scale_real = -(-K_real // sf_block_size)
-        # The last ranks of a whole-block shard load fewer than N_un channels
-        # (672 of 736 at tp=4 on rank 3); the rest of the buffer keeps the
+        # The loader (gpt_oss.py) records how many channels this rank got: the
+        # last ranks of a whole-block shard load fewer than N_un (672 of 736 at
+        # tp=4 on rank 3, 576 of 768 when the config is wider than the
+        # checkpoint). The rest of the buffer keeps the
         # _UE8M0_ONE fill and must stay out of Humming's range as well.
-        _ckpt_inter = getattr(self, "_checkpoint_intermediate", None)
-        if _ckpt_inter is None:
-            N_real = N_un
-        else:
-            _tp_rank = getattr(layer, "moe_tp_rank", 0)
-            N_real = max(0, min(N_un, _ckpt_inter - _tp_rank * N_un))
+        N_real = min(N_un, getattr(layer, "loaded_intermediate_size", N_un))
 
         def _stack_up_gate_w13(
             unpadded_w13,
