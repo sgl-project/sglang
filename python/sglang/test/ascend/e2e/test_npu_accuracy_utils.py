@@ -81,6 +81,13 @@ DEEPSWE_EVAL_IMAGE = (
     "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050"
 )
 DEEPSWE_DIND_IMAGE = "docker:dind"
+# The dind daemon cannot reach Docker Hub directly, so give it docker.io
+# registry mirrors (tried in order).
+DEEPSWE_DIND_REGISTRY_MIRRORS = (
+    "https://swr.cn-southwest-2.myhuaweicloud.com",
+    "https://docker.mirrors.ustc.edu.cn",
+    "https://mirror.ccs.tencentyun.com",
+)
 DEEPSWE_EVAL_NODE_ARCH = os.environ.get("DEEPSWE_EVAL_NODE_ARCH") or "amd64"
 # Time to get the pod scheduled and the eval container up (image pulls, node
 # availability) versus the wall-clock budget of the evaluation itself.
@@ -488,6 +495,10 @@ def _build_deepswe_eval_env(
 def _build_deepswe_eval_pod(pod_name, namespace, env_vars, share_volume, share_sub_path):
     from kubernetes import client as k8s
 
+    dind_args = ["--storage-driver=overlay2"]
+    for mirror in DEEPSWE_DIND_REGISTRY_MIRRORS:
+        dind_args.extend(["--registry-mirror", mirror])
+
     dind_container = k8s.V1Container(
         name="dind",
         image=DEEPSWE_DIND_IMAGE,
@@ -498,7 +509,7 @@ def _build_deepswe_eval_pod(pod_name, namespace, env_vars, share_volume, share_s
         # Empty TLS cert dir: serve plain HTTP on 2375 so the eval container can
         # talk to it over the pod's shared network namespace.
         env=[k8s.V1EnvVar(name="DOCKER_TLS_CERTDIR", value="")],
-        args=["--storage-driver=overlay2"],
+        args=dind_args,
         volume_mounts=[
             k8s.V1VolumeMount(name="dind-storage", mount_path="/var/lib/docker")
         ],
