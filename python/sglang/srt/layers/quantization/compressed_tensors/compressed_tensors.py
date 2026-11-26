@@ -1053,9 +1053,20 @@ class CompressedTensorsConfig(QuantizationConfig):
                 else:
                     moe_backend = get_moe_runner_backend()
                     triton_supported = self._is_wna16_triton_moe_supported(weight_quant)
+                    device_sm = get_platform().device_sm
                     use_blackwell_triton = (
                         moe_backend.is_auto()
                         and get_platform().is_sm100
+                        and triton_supported
+                    )
+                    use_pre_ampere_triton = (
+                        moe_backend.is_auto()
+                        and not get_platform().is_sm100
+                        and (
+                            CompressedTensorsWNA16TritonMoE.get_min_capability()
+                            <= device_sm
+                            < CompressedTensorsWNA16MoE.get_min_capability()
+                        )
                         and triton_supported
                     )
                     if moe_backend.is_triton() and not triton_supported:
@@ -1064,12 +1075,20 @@ class CompressedTensorsConfig(QuantizationConfig):
                             "INT4 group quantization with group_size=32 or 128 and no "
                             "actorder."
                         )
-                    if moe_backend.is_triton() or use_blackwell_triton:
-                        reason = (
-                            "SM100/SM103 auto default"
-                            if use_blackwell_triton
-                            else "moe_runner_backend=triton"
-                        )
+                    if (
+                        moe_backend.is_triton()
+                        or use_blackwell_triton
+                        or use_pre_ampere_triton
+                    ):
+                        if use_blackwell_triton:
+                            reason = "SM100/SM103 auto default"
+                        elif use_pre_ampere_triton:
+                            reason = (
+                                f"sm_{device_sm} auto default "
+                                "(pre-Ampere, Marlin requires sm_80+)"
+                            )
+                        else:
+                            reason = "moe_runner_backend=triton"
                         logger.info_once(
                             f"Using CompressedTensorsWNA16TritonMoE ({reason})"
                         )

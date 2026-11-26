@@ -6,6 +6,7 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -162,7 +163,15 @@ def moe_align_block_size(
         return sorted_ids, expert_ids, num_tokens_post_pad
 
     # ===== TO BE REFACTORED ====
-    use_jit_align = return_inactive_prefix_count or pad_expert_ids
+    # sgl_kernel AOT moe_align_block_size lacks pre-Ampere (sm_70/sm_75) cubins,
+    # leaving outputs uninitialized; route < sm_80 CUDA GPUs to the JIT kernel.
+    use_jit_align = (
+        return_inactive_prefix_count
+        or pad_expert_ids
+        or (
+            _is_cuda and not ignore_invalid_expert and 0 < get_platform().device_sm < 80
+        )
+    )
     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
