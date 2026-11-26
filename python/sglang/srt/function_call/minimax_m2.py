@@ -31,12 +31,7 @@ class MinimaxM2Detector(BaseFormatDetector):
         super().__init__()
         self.tool_call_start_token: str = "<minimax:tool_call>"
         self.tool_call_end_token: str = "</minimax:tool_call>"
-        self.tool_call_prefix: str = '<invoke name="'
         self.tool_call_function_end_token: str = "</invoke>"
-        self.tool_call_regex = re.compile(
-            r"<minimax:tool_call>(.*?)</minimax:tool_call>|<minimax:tool_call>(.*?)$",
-            re.DOTALL,
-        )
         self.tool_call_function_regex = re.compile(
             r"<invoke name=\"(.*?)</invoke>|<invoke name=\"(.*)$", re.DOTALL
         )
@@ -48,9 +43,6 @@ class MinimaxM2Detector(BaseFormatDetector):
         # Streaming state variables
         self._current_function_name: str = ""
         self._current_parameters: Dict[str, Any] = {}
-        self._streamed_parameters: Dict[
-            str, str
-        ] = {}  # Track what parameter content we've streamed
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
 
@@ -60,10 +52,6 @@ class MinimaxM2Detector(BaseFormatDetector):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools)
         return StreamingParseResult(normal_text=normal, calls=calls)
-
-    def _convert_param_value(self, value: str, param_type: str) -> Any:
-        """Convert parameter value to the correct type (legacy single-type version)."""
-        return self._convert_param_value_with_types(value, [param_type])
 
     def _extract_types_from_schema(self, schema: Any) -> list[str]:
         """
@@ -257,7 +245,6 @@ class MinimaxM2Detector(BaseFormatDetector):
                 self._function_name_sent = False
                 self._current_function_name = ""
                 self._current_parameters = {}
-                self._streamed_parameters = {}
 
                 # Remove the start token
                 self._buf = self._buf[len(self.tool_call_start_token) :]
@@ -466,7 +453,6 @@ class MinimaxM2Detector(BaseFormatDetector):
         self._function_name_sent = False
         self._current_function_name = ""
         self._current_parameters = {}
-        self._streamed_parameters = {}
         self.current_tool_name_sent = False
 
     def _extract(self, text: str, tools: List[Tool]) -> Tuple[str, List[ToolCallItem]]:
