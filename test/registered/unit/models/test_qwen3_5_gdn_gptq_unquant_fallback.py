@@ -1216,9 +1216,15 @@ class TestQwen35GptqMoeUnquantFallback(CustomTestCase):
         override = get_context().override_server_args(device="cpu")
         override.install()
         self.addCleanup(override.restore)
-        parallel = get_parallel().override(tp_group=None, attn_tp_group=None)
-        parallel.__enter__()
-        self.addCleanup(parallel.__exit__, None, None, None)
+        self.enterContext(
+            get_parallel().override(
+                tp_group=None,
+                attn_tp_group=None,
+                tp_rank=0,
+                moe_ep_rank=0,
+                moe_tp_rank=0,
+            )
+        )
 
     @staticmethod
     def _moe(quant_config, prefix):
