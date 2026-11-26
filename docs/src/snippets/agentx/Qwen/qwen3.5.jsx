@@ -9,9 +9,9 @@ export const agentx = {
   "main": "ad39ddd246b7feb092e05a0236545609cff37915",
   "prs": {
    "5236": {
-    "run": null,
-    "sha": "4d5230ad975779820c5b22954d55466209a554ea",
-    "status": "in-progress"
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/45715126870",
+    "sha": "d7862e6d04fbee1d07e7ca2a85aead6f504b20e0",
+    "status": "verified-pr"
    },
    "5235": {
     "run": null,
@@ -13512,9 +13512,11 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "4d5230ad975779820c5b22954d55466209a554ea",
+    "sha": "d7862e6d04fbee1d07e7ca2a85aead6f504b20e0",
+    "run": "45715126870",
     "pr": "5236",
-    "status": "in-progress"
+    "comment": "7183494277",
+    "status": "verified-pr"
    },
    "points": [
     {
@@ -13776,10 +13778,12 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "4d5230ad975779820c5b22954d55466209a554ea",
+    "sha": "d7862e6d04fbee1d07e7ca2a85aead6f504b20e0",
     "recipe": "inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/qwen3.5/sglang/h200-fp8-mtp/agentic.yaml",
+    "run": "45715126870",
     "pr": "5236",
-    "status": "in-progress"
+    "comment": "7183494277",
+    "status": "verified-pr"
    },
    "points": [
     {
@@ -13892,9 +13896,11 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "4d5230ad975779820c5b22954d55466209a554ea",
+    "sha": "d7862e6d04fbee1d07e7ca2a85aead6f504b20e0",
+    "run": "45715126870",
     "pr": "5236",
-    "status": "in-progress"
+    "comment": "7183494277",
+    "status": "verified-pr"
    },
    "points": [
     {
@@ -14154,10 +14160,12 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "4d5230ad975779820c5b22954d55466209a554ea",
+    "sha": "d7862e6d04fbee1d07e7ca2a85aead6f504b20e0",
     "recipe": "inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/qwen3.5/sglang/h200-fp8-mtp/agentic.yaml",
+    "run": "45715126870",
     "pr": "5236",
-    "status": "in-progress"
+    "comment": "7183494277",
+    "status": "verified-pr"
    },
    "points": [
     {
@@ -14281,10 +14289,12 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "4d5230ad975779820c5b22954d55466209a554ea",
+    "sha": "d7862e6d04fbee1d07e7ca2a85aead6f504b20e0",
     "recipe": "inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/qwen3.5/sglang/h200-fp8-mtp/agentic.yaml",
+    "run": "45715126870",
     "pr": "5236",
-    "status": "in-progress"
+    "comment": "7183494277",
+    "status": "verified-pr"
    },
    "points": [
     {
@@ -14411,43 +14421,20 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "4d5230ad975779820c5b22954d55466209a554ea",
+    "sha": "d7862e6d04fbee1d07e7ca2a85aead6f504b20e0",
     "recipe": "inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/qwen3.5/sglang/h200-fp8-mtp/agentic.yaml",
+    "run": "45715126870",
     "pr": "5236",
-    "status": "in-progress"
+    "comment": "7183494277",
+    "status": "verified-pr"
    },
    "points": [
     {
-     "concs": [8],
-     "item": 13,
-     "override": "override_hicache_tp4_c8",
-     "goldenAL": "3.39",
-     "kv": "hicache"
-    },
-    {
      "concs": [12],
-     "item": 14,
+     "item": 13,
      "override": "override_hicache_tp4_c12",
      "goldenAL": "3.39",
-     "kv": "hicache",
-     "patch": {
-      "sglang": [
-       {
-        "args": {
-         "--mem-fraction-static": ["0.86"]
-        }
-       }
-      ],
-      "dynamo": [
-       null,
-       null,
-       {
-        "args": {
-         "--mem-fraction-static": ["0.86"]
-        }
-       }
-      ]
-     }
+     "kv": "hicache"
     }
    ],
    "routers": {
@@ -14459,7 +14446,7 @@ export const agentx = {
        "diff": {
         "args": {
          "--expert-parallel-size": ["4"],
-         "--mem-fraction-static": ["0.92"],
+         "--mem-fraction-static": ["0.86"],
          "--tensor-parallel-size": ["4"]
         }
        },
@@ -14542,10 +14529,12 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "4d5230ad975779820c5b22954d55466209a554ea",
+    "sha": "d7862e6d04fbee1d07e7ca2a85aead6f504b20e0",
     "recipe": "inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/qwen3.5/sglang/h200-fp8-mtp/agentic.yaml",
+    "run": "45715126870",
     "pr": "5236",
-    "status": "in-progress"
+    "comment": "7183494277",
+    "status": "verified-pr"
    },
    "points": [
     {
