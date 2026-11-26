@@ -431,22 +431,6 @@ class LoRAMemoryPool:
             f"Expected dict or 3D torch.Tensor, got {type(weights).__name__}."
         )
 
-    def _get_standard_shape(
-        self,
-        module_name: str,
-        base_model: torch.nn.Module,
-        max_lora_dim: int,
-        layer_idx: int,
-    ) -> Tuple[int]:
-        """Get 3D shape for standard (non-MoE) modules."""
-        input_dim, _ = get_hidden_dim(
-            module_name, self.base_hf_config, base_model, layer_idx
-        )
-        c = get_stacked_multiply(module_name, base_model)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, self.tp_size)
-        return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
-
     def get_lora_A_shape(
         self,
         module_name: str,
@@ -1491,7 +1475,6 @@ class LoRAMemoryPool:
                     and ("lora_embedding_A" in name or "lora_A" in name)
                 ):
                     buffer_view = self.lm_head_A_buffer[target_module][
-                        # buffer_id, :, :lora_rank
                         buffer_id,
                         :lora_rank,
                         :,
@@ -1608,9 +1591,6 @@ class LoRAMemoryPool:
     ) -> torch.Tensor:
         """
         Get LoRA tensor buffer (automatically handles both 3D and 4D tensors).
-
-        if lora_type == LoRAType.LORA_A:
-            return self.A_buffer[target_module][layer_id]
 
         Args:
             target_module: Target module name (e.g., 'gate_up_proj' or 'gate_up_proj_moe' for MoE)

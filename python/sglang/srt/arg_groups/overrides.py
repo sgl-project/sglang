@@ -935,6 +935,8 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "Dots3NoteForCausalLM",
         "Xing4_0ForCausalLM",
         "KimiK31ForConditionalGeneration",
+        "GigaChat4ForCausalLM",
+        "GigaChat4ForCausalLMNextN",
     }
 )
 

@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.runtime_context import SpawnRanks, get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -38,6 +39,7 @@ ATTENTION_CASES = (
     ("mtp", "moe"),
     ("sdar", False),
     ("sdar", True),
+    ("sdar_moe", None),
     ("step3", False),
     ("step3", True),
     ("xllm", "gated"),
@@ -184,12 +186,25 @@ def build_attention(
             )
         names = ("eh_proj",) if start else ()
     elif model == "sdar":
-        from sglang.srt.models.sdar_moe import SDARMoeAttention
+        from sglang.srt.models.sdar import SDARAttention
 
-        module = SDARMoeAttention(
+        module = SDARAttention(
             config, 0, quant_config=quant_config, reduce_results=variant
         )
-        names = ("o_proj",)
+        names = ("qkv_proj", "o_proj")
+    elif model == "sdar_moe":
+        from sglang.srt.models import sdar_moe
+
+        # Exercise the block's attention, leaving the MoE mixer outside this fixture.
+        with (
+            layer_stack(),
+            patch.object(
+                sdar_moe, "SDARMoeSparseMoeBlock", lambda **kwargs: torch.nn.Identity()
+            ),
+        ):
+            module = sdar_moe.SDARMoeBlock(config, 0, quant_config=quant_config)
+        module = module.self_attn
+        names = ("qkv_proj", "o_proj")
     elif model == "step3":
         from sglang.srt.models.step3_vl import Step3TextAttention
 
