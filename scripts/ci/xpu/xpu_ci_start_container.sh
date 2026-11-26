@@ -153,6 +153,10 @@ HF_MOUNT_SRC="${HF_CACHE_HOST}"
 if [[ "${UNTRUSTED}" == "1" ]]; then
   OVERLAY_ROOT="${HOME}/.cache/sglang-xpu-ci-pr-overlay"
   mkdir -p "${OVERLAY_ROOT}"
+  # Held until this job's container exists, so a concurrent start never sees our
+  # overlay without its container and removes it. Released on exit if we fail.
+  exec {OVERLAY_LOCK_FD}>"${OVERLAY_ROOT}/.lock"
+  flock "${OVERLAY_LOCK_FD}"
   # Drop overlays left by earlier PR runs whose container is gone.
   shopt -s nullglob
   for dir in "${OVERLAY_ROOT}"/*/; do
@@ -265,6 +269,11 @@ docker run -dt \
   "${GPU_AFFINITY_ARGS[@]}" \
   --name "${CONTAINER_NAME}" \
   "${IMAGE}"
+
+# The container now marks our overlay as in use; let other starts clean up.
+if [[ -n "${OVERLAY_LOCK_FD:-}" ]]; then
+  exec {OVERLAY_LOCK_FD}>&-
+fi
 
 if [[ "${UNTRUSTED}" == "1" ]]; then
   # docker cp copies symlinks as links and does not follow them out of the checkout.
