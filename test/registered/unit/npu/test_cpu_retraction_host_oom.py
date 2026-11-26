@@ -10,6 +10,7 @@ from sglang.srt.hardware_backend.npu.memory_pool_npu import (
     NPUMLATokenToKVPool,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -24,7 +25,7 @@ def copy_chunks(pool, buffers, indices):
     return pool._chunk_copy_npu_to_cpu(buffers, indices)
 
 
-class TestNpuCpuRetractionHostOom(unittest.TestCase):
+class TestNpuCpuRetractionHostOom(CustomTestCase):
     def _copy(self, pool_type, failure):
         pool = object.__new__(pool_type)
         pool.cpu_offloading_chunk_size = 3
