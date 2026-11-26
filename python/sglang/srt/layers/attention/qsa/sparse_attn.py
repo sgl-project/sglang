@@ -45,11 +45,7 @@ def _prefill_config_table(is_fp8: bool = False):
         and torch.cuda.get_device_capability(0) >= (10, 0)
     ):
         return _SM100_FP8_PREFILL_CONFIGS
-    return (
-        _H20_CONFIGS
-        if "H20" in torch.cuda.get_device_name(0)
-        else _L20_CONFIGS
-    )
+    return _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
 
 
 def _get_best_config(total_q: int, *, is_fp8: bool = False):

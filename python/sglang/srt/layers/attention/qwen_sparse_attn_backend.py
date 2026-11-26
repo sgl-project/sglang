@@ -379,11 +379,20 @@ class QwenSparseAttnBackend(AttentionBackend):
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
+    _token_to_kv_pool: Optional[object] = None
+
+    @property
+    def token_to_kv_pool(self):
+        return self._token_to_kv_pool
+
+    @token_to_kv_pool.setter
+    def token_to_kv_pool(self, pool) -> None:
+        _require_supported_kv_pool_layout(pool)
+        self._token_to_kv_pool = pool
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
-        _require_supported_kv_pool_layout(self.token_to_kv_pool)
         self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
             self.token_to_kv_pool
         )
@@ -742,8 +751,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
         if not has_unaligned_prefix and extend_prefix_lens_cpu is not None:
             has_unaligned_prefix = any(
-                int(p) % ratio != 0
-                for p in extend_prefix_lens_cpu[: lengths.numel()]
+                int(p) % ratio != 0 for p in extend_prefix_lens_cpu[: lengths.numel()]
             )
         if not _is_npu:
             if has_unaligned_prefix:
@@ -983,13 +991,17 @@ class QwenSparseAttnBackend(AttentionBackend):
                     if num_valid_tokens > 0:
                         member_rows = group_member_rows.long()
                         prefill_compress_group_locs = (
-                            member_rows[:, None]
-                            + torch.arange(
-                                self.compress_ratio,
-                                device=member_rows.device,
-                                dtype=torch.long,
+                            (
+                                member_rows[:, None]
+                                + torch.arange(
+                                    self.compress_ratio,
+                                    device=member_rows.device,
+                                    dtype=torch.long,
+                                )
                             )
-                        ).clamp_max(num_valid_tokens - 1).to(torch.int32)
+                            .clamp_max(num_valid_tokens - 1)
+                            .to(torch.int32)
+                        )
                 else:
                     compress_group_ring_locs = build_group_ring_slots(
                         req_pool_indices=row_req_pool_indices,
@@ -1057,10 +1069,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch):
-        _require_supported_kv_pool_layout(
-            getattr(self, "token_to_kv_pool", None)
-            or getattr(forward_batch, "token_to_kv_pool", None)
-        )
         if self._cp_kv_pending is not None:
             # Left by a forward that failed before its attention: join it
             # before this stream issues further collectives on the CP group.
@@ -1212,7 +1220,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
                 self.token_to_kv_pool
             )
-        _require_supported_kv_pool_layout(self.token_to_kv_pool)
         if self.req_to_token is None:
             req_pool = getattr(self.runner, "req_to_token_pool", None)
             self.req_to_token = getattr(req_pool, "req_to_token", None)
@@ -1804,10 +1811,6 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
-        _require_supported_kv_pool_layout(
-            getattr(self, "token_to_kv_pool", None)
-            or getattr(forward_batch, "token_to_kv_pool", None)
-        )
         if getattr(
             forward_batch, "attn_cp_metadata", None
         ) is not None and is_cp_active(forward_batch):
@@ -2383,10 +2386,6 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
-        _require_supported_kv_pool_layout(
-            getattr(self, "token_to_kv_pool", None)
-            or getattr(forward_batch, "token_to_kv_pool", None)
-        )
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(
                 q, k, v, layer, forward_batch, topk_indices
