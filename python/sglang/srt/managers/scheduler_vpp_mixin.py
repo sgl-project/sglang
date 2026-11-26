@@ -65,7 +65,7 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         return self._event_loop_vpp_rank_local()
 
     def _pp_vpp_max_inflight(self):
-        return 8
+        return get_parallel().pp_vpp_max_inflight
 
     def _pp_vpp_available_prefill_tokens(self):
         stats = self.pool_stats_observer.get_pool_stats()

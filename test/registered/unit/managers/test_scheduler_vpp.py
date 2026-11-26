@@ -1645,41 +1645,50 @@ class TestSchedulingVPPCore(CustomTestCase):
         )
         self.assertEqual(scheduler._pp_vpp_fixed_next_task(schedule), (2, 2))
 
-    def test_eight_slots_keep_four_waves_and_reuse_only_retired_slots(self):
-        scheduler = self._fixed_scheduler()
-        capacity = SchedulerVPPMixin._pp_vpp_max_inflight(scheduler)
-        schedule = PipelineRankSchedule(0, 2, 2, capacity)
-        scheduler._pp_vpp_init_fixed_batch(capacity)
-        for seq in range(8):
-            schedule.admit(seq)
-        for seq in range(8):
-            action = scheduler._pp_vpp_fixed_select_tp_action(
-                schedule, seq, lambda batch, stage: True
-            )
-            self.assertEqual((action.batch_seq, action.stage_id), (seq, 0))
-            schedule.complete(action)
-        self.assertEqual(
-            list(scheduler._pp_vpp_fixed_waves), [[0, 1], [2, 3], [4, 5], [6, 7]]
-        )
-        self.assertFalse(schedule.can_admit(8))
-        # Reverse receive order cannot change second-pass dispatch order.
-        for seq in reversed(range(8)):
-            scheduler._pp_vpp_ready_proxies[(seq, 2)] = PPProxyTensors({})
-            scheduler._pp_vpp_fixed_received.append((seq, 2))
-            schedule.mark_ready(seq, 2)
-        for seq in range(8):
-            action = scheduler._pp_vpp_fixed_select_tp_action(
-                schedule, seq + 8, lambda batch, stage: True
-            )
-            self.assertEqual((action.batch_seq, action.stage_id), (seq, 2))
-            schedule.complete(action)
-            schedule.mark_completed(seq)
-            self.assertFalse(schedule.can_admit(seq + 8))
-            schedule.retire(seq)
-            self.assertTrue(schedule.can_admit(seq + 8))
-        self.assertFalse(scheduler._pp_vpp_fixed_waves)
-        self.assertFalse(scheduler._pp_vpp_fixed_received)
-        self.assertEqual(schedule.inflight_count, 0)
+    def test_configured_slots_keep_two_batch_waves_and_reuse_retired_slots(self):
+        for slots in (2, 3, 4, 8, 16):
+            with (
+                self.subTest(slots=slots),
+                get_context().parallel.override(pp_vpp_max_inflight=slots),
+            ):
+                scheduler = self._fixed_scheduler()
+                capacity = SchedulerVPPMixin._pp_vpp_max_inflight(scheduler)
+                schedule = PipelineRankSchedule(0, 2, 2, capacity)
+                scheduler._pp_vpp_init_fixed_batch(capacity)
+                for seq in range(slots):
+                    schedule.admit(seq)
+                for seq in range(slots):
+                    action = scheduler._pp_vpp_fixed_select_tp_action(
+                        schedule, seq, lambda batch, stage: True
+                    )
+                    self.assertEqual((action.batch_seq, action.stage_id), (seq, 0))
+                    schedule.complete(action)
+                self.assertEqual(
+                    list(scheduler._pp_vpp_fixed_waves),
+                    [
+                        list(range(start, min(start + 2, slots)))
+                        for start in range(0, slots, 2)
+                    ],
+                )
+                self.assertFalse(schedule.can_admit(slots))
+                # Reverse receive order cannot change second-pass dispatch order.
+                for seq in reversed(range(slots)):
+                    scheduler._pp_vpp_ready_proxies[(seq, 2)] = PPProxyTensors({})
+                    scheduler._pp_vpp_fixed_received.append((seq, 2))
+                    schedule.mark_ready(seq, 2)
+                for seq in range(slots):
+                    action = scheduler._pp_vpp_fixed_select_tp_action(
+                        schedule, seq + slots, lambda batch, stage: True
+                    )
+                    self.assertEqual((action.batch_seq, action.stage_id), (seq, 2))
+                    schedule.complete(action)
+                    schedule.mark_completed(seq)
+                    self.assertFalse(schedule.can_admit(seq + slots))
+                    schedule.retire(seq)
+                    self.assertTrue(schedule.can_admit(seq + slots))
+                self.assertFalse(scheduler._pp_vpp_fixed_waves)
+                self.assertFalse(scheduler._pp_vpp_fixed_received)
+                self.assertEqual(schedule.inflight_count, 0)
 
     def test_send_reaping_stops_at_the_first_unfinished_group(self):
         """A later completion must not release credit ahead of an older send."""

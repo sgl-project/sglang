@@ -888,8 +888,9 @@ class TestVPPResolution(CustomTestCase):
 
         parser = argparse.ArgumentParser()
         add_cli_args_from_dataclass(parser, Parallel)
+        self.assertEqual(parser.parse_args([]).pp_vpp_max_inflight, 8)
         parsed = parser.parse_args(
-            "--pp-size 2 --pp-virtual-stages 3 "
+            "--pp-size 2 --pp-virtual-stages 3 --pp-vpp-max-inflight 4 "
             "--pp-vpp-layer-partition 1 2 3 1 2 3".split()
         )
         args = ServerArgs(
@@ -899,6 +900,7 @@ class TestVPPResolution(CustomTestCase):
             pp_size=parsed.pp_size,
             pp_virtual_stages=parsed.pp_virtual_stages,
             pp_vpp_layer_partition=parsed.pp_vpp_layer_partition,
+            pp_vpp_max_inflight=parsed.pp_vpp_max_inflight,
             disaggregation_mode="prefill",
         )
         model_config = self.model_config()
@@ -913,6 +915,7 @@ class TestVPPResolution(CustomTestCase):
         child = pickle.loads(pickle.dumps(args))
         self.addCleanup(reset_context)
         publish(child, role="scheduler")
+        self.assertEqual(get_parallel().pp_vpp_max_inflight, 4)
         layout = resolve_vpp_layout(model_config, get_parallel())
         self.assertEqual(layout.layer_ids_for_rank(0), (0, 3, 4, 5, 7, 8))
         self.assertEqual(layout.layer_ids_for_rank(1), (1, 2, 6, 9, 10, 11))
@@ -957,6 +960,9 @@ class TestVPPResolution(CustomTestCase):
 
         for changes, error in (
             ({"pp_virtual_stages": 0}, "positive integer"),
+            ({"pp_vpp_max_inflight": 0}, "--pp-vpp-max-inflight"),
+            ({"pp_vpp_max_inflight": 1}, "--pp-vpp-max-inflight"),
+            ({"pp_vpp_max_inflight": -1}, "--pp-vpp-max-inflight"),
             ({"pp_size": 1}, "--pp-size"),
             ({"pp_async_batch_depth": -1}, "async batch"),
             ({"disaggregation_mode": "decode"}, "--disaggregation-mode prefill"),

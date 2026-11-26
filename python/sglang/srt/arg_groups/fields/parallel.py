@@ -89,6 +89,11 @@ class Parallel(msgspec.Struct):
             nargs="+",
         ),
     ] = None
+    pp_vpp_max_inflight: A[
+        int,
+        "Maximum number of inflight VPP microbatches (at least 2). "
+        "Controls admission slots; wave size and activation send credits stay at 2.",
+    ] = 8
     dp_size: A[
         int,
         Arg(

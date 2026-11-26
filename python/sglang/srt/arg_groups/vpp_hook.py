@@ -18,6 +18,8 @@ def validate_vpp_options(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if type(cfg.pp_virtual_stages) is not int or cfg.pp_virtual_stages < 1:
         raise ValueError("--pp-virtual-stages must be a positive integer")
+    if type(cfg.pp_vpp_max_inflight) is not int or cfg.pp_vpp_max_inflight < 2:
+        raise ValueError("--pp-vpp-max-inflight must be an integer of at least 2")
     if cfg.pp_virtual_stages == 1:
         if cfg.pp_vpp_layer_partition is not None:
             raise ValueError(

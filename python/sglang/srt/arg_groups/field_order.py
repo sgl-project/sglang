@@ -588,5 +588,8 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_boundary_decay_start_chunks",
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
+    "pp_virtual_stages",
+    "pp_vpp_layer_partition",
+    "pp_vpp_max_inflight",
 )
 # fmt: on
