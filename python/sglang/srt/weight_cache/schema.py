@@ -36,6 +36,9 @@ class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
     # Quantization config. Equal on every rank.
     quant_method: str  # "" for unquantized
     quant_config_hash: str
+    # The quantization config files in a local checkpoint directory, such as
+    # ModelOpt's hf_quant_config.json with its per-layer recipe; "" if there is none.
+    quant_files_hash: str
 
     # Parallel config: the layout. Equal on every rank.
     tp_size: int

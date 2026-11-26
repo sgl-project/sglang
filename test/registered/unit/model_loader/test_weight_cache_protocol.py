@@ -206,7 +206,7 @@ class TestLoadSpec(CustomTestCase):
                 *("checkpoint_id", "model_arch", "hf_config_hash", "dtype"),
                 *("role", "draft_model_idx"),
                 # Quantization config.
-                *("quant_method", "quant_config_hash"),
+                *("quant_method", "quant_config_hash", "quant_files_hash"),
                 # Parallel config: the layout.
                 *("tp_size", "pp_size", "dp_size", "ep_size", "moe_dp_size"),
                 *("attn_dp_size", "attn_cp_size", "moe_cp_size", "moe_dense_tp_size"),
@@ -236,8 +236,13 @@ class TestLoadSpec(CustomTestCase):
     def test_every_model_and_quantization_field_changes_both_digests(self):
         base = _make_load_spec()
         quant_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+        checkpoint = tempfile.TemporaryDirectory()
+        self.addCleanup(checkpoint.cleanup)
+        with open(os.path.join(checkpoint.name, "hf_quant_config.json"), "w") as f:
+            f.write("{}")
         other = _make_load_spec(
             _model_config(
+                model_path=checkpoint.name,
                 hf_config=PretrainedConfig(
                     architectures=["OtherModel"], quantization_config=quant_config
                 ),
@@ -267,6 +272,79 @@ class TestLoadSpec(CustomTestCase):
                         base.digest(include_rank=include_rank),
                         changed.digest(include_rank=include_rank),
                     )
+
+    def test_quantization_config_files_of_a_local_checkpoint_are_hashed(self):
+        def spec(recipe, name="hf_quant_config.json", quantization="modelopt_fp8"):
+            with tempfile.TemporaryDirectory() as checkpoint:
+                if recipe is not None:
+                    with open(os.path.join(checkpoint, name), "w") as f:
+                        f.write(recipe)
+                return _make_load_spec(
+                    _model_config(model_path=checkpoint, quantization=quantization)
+                )
+
+        head = spec('{"quantization": {"exclude_modules": ["lm_head"]}}')
+        mlp = spec('{"quantization": {"exclude_modules": ["model.layers.0.mlp"]}}')
+        # The method name and the HF config are equal: only the file differs.
+        self.assertEqual(
+            load_spec_mismatches(msgspec.to_builtins(head), msgspec.to_builtins(mlp)),
+            {"quant_files_hash": (head.quant_files_hash, mlp.quant_files_hash)},
+        )
+        for include_rank in (True, False):
+            self.assertNotEqual(
+                head.digest(include_rank=include_rank),
+                mlp.digest(include_rank=include_rank),
+            )
+        # The same bytes in another directory are the same recipe.
+        self.assertEqual(
+            head, spec('{"quantization": {"exclude_modules": ["lm_head"]}}')
+        )
+        # The sidecar is read for an unquantized request too; other files are not.
+        self.assertEqual(
+            spec("{}", quantization=None).quant_files_hash,
+            spec("{}").quant_files_hash,
+        )
+        for none in (spec(None), spec("{}", name="config.json"), _make_load_spec()):
+            self.assertEqual(none.quant_files_hash, "")
+
+    def test_quantization_config_files_are_chosen_as_the_loader_chooses_them(self):
+        def file_hash(files, directory="ckpt", method_files=()):
+            with tempfile.TemporaryDirectory() as tmp:
+                checkpoint = os.path.join(tmp, directory)
+                os.mkdir(checkpoint)
+                for name, content in files.items():
+                    if content is None:  # a link whose target is gone
+                        os.symlink(os.path.join(tmp, "absent"), f"{checkpoint}/{name}")
+                    else:
+                        with open(os.path.join(checkpoint, name), "w") as f:
+                            f.write(content)
+                method = SimpleNamespace(get_config_filenames=lambda: method_files)
+                with mock.patch(
+                    "sglang.srt.weight_cache.config.get_quantization_config",
+                    return_value=method,
+                ):
+                    return _make_load_spec(
+                        _model_config(model_path=checkpoint, quantization="fp8")
+                    ).quant_files_hash
+
+        sidecar = file_hash({"hf_quant_config.json": "a"})
+        self.assertNotEqual(sidecar, "")
+        # The directory name is taken literally, not as a glob pattern.
+        self.assertEqual(
+            file_hash({"hf_quant_config.json": "a"}, directory="ckpt[1]"), sidecar
+        )
+        # A file the loader does not look for is never opened or counted.
+        self.assertEqual(
+            file_hash({"hf_quant_config.json": "a", "old_hf_quant_config.json": None}),
+            sidecar,
+        )
+        self.assertEqual(file_hash({"old_hf_quant_config.json": "b"}), "")
+        # The method's own config files count, by the suffix the loader matches.
+        own = ["quantize_config.json"]
+        a = file_hash({"quantize_config.json": "a"}, method_files=own)
+        b = file_hash({"quantize_config.json": "b"}, method_files=own)
+        self.assertEqual(len({"", a, b}), 3)
+        self.assertEqual(file_hash({"quantize_config.json": "a"}), "")
 
     def test_staged_checkpoint_keeps_the_spec(self):
         base = _make_load_spec()

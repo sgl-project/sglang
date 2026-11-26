@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.distributed.utils import get_pp_layer_partition
 from sglang.srt.layers import dp_attention
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import use_cutedsl_moe_swap_ab
 from sglang.srt.layers.moe.utils import MoeA2ABackend, resolve_moe_runner_backend
+from sglang.srt.layers.quantization import get_quantization_config
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
 from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
@@ -48,6 +50,40 @@ def path_checkpoint_id() -> str:
     """
     path, revision = get_model().model_path, get_model().revision
     return f"{path}@{revision}" if revision else path
+
+
+def _quant_files_hash(model_config: ModelConfig, quant_method: str) -> str:
+    """Hash the quantization config files next to a local checkpoint.
+
+    A ModelOpt checkpoint keeps its per-layer recipe in hf_quant_config.json, which
+    hf_config.quantization_config does not hold. The names are the ones the loader
+    looks for (ModelConfig and get_quant_config): that file, and files ending in one
+    of the method's own config filenames. A file the loader then does not read still
+    counts, which can refuse a pair and never matches one. A checkpoint that is not
+    a local directory has none here.
+    """
+    folder = model_config.model_path
+    if not os.path.isdir(folder):
+        return ""
+    suffixes = ()
+    if quant_method:
+        try:
+            suffixes = tuple(
+                get_quantization_config(quant_method).get_config_filenames()
+            )
+        except ValueError:  # not a registered method: the loader refuses it
+            pass
+    digests = {}
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        if not name.endswith(".json") or not os.path.isfile(path):
+            continue
+        if name == "hf_quant_config.json" or (suffixes and name.endswith(suffixes)):
+            with open(path, "rb") as f:
+                digests[name] = hashlib.sha256(f.read()).hexdigest()
+    if not digests:
+        return ""
+    return hashlib.sha256(json.dumps(digests, sort_keys=True).encode()).hexdigest()
 
 
 def build_load_spec(
@@ -88,6 +124,7 @@ def build_load_spec(
         # Quantization config.
         quant_method=quant_method,
         quant_config_hash=hash_quant_config(quant_config),
+        quant_files_hash=_quant_files_hash(model_config, quant_method),
         # Parallel config: the layout.
         tp_size=parallel.tp_size,
         pp_size=parallel.pp_size,
