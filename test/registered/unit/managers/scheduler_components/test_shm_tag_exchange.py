@@ -1,9 +1,11 @@
 """Unit tests for srt/managers/scheduler_components/shm_tag_exchange.py."""
 
+import random
 import sys
 import time
 import unittest
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
+from datetime import timedelta
 from pathlib import Path
 from queue import Queue
 from tempfile import TemporaryDirectory
@@ -12,21 +14,27 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
+import torch.distributed as dist
 import torch.multiprocessing
 
+from sglang.srt.disaggregation import shm_flag_reduce, utils
+from sglang.srt.distributed import parallel_state
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components import shm_tag_exchange
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
     _broadcast_via_exchange,
 )
-from sglang.srt.managers.scheduler_components.shm_tag_exchange import ShmTagExchange
+from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
+    HierTagExchange,
+    ShmTagExchange,
+)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.utils import stale_shm_cleanup
+from sglang.srt.utils import network, stale_shm_cleanup
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 # Arbitrary, with both 32-bit halves non-zero: the shm row carries the digest folded.
 _DIGEST = (7 << 32) | 5
@@ -146,6 +154,147 @@ def _exchange_rounds(rank: int, init_file: str) -> None:
         torch.distributed.destroy_process_group()
 
 
+class _Hosts:
+    """Spoofed hostname per global rank, so 4 local gloo ranks span 1 to 3 hosts;
+    `names` may change between groups."""
+
+    def __init__(self, names):
+        self.names = names
+
+    def hostname(self) -> str:
+        return self.names[dist.get_rank()]
+
+    def same_node(self, group, source_rank=0):
+        ranks = dist.get_process_group_ranks(group)
+        src = self.names[ranks[source_rank]]
+        return [self.names[r] == src for r in ranks]
+
+
+def _pd_decode_rank(stack: ExitStack, hosts: _Hosts) -> None:
+    """A PD decode scheduler rank with the multi-host exchange on, on `hosts`."""
+    for switch in (
+        envs.SGLANG_OPT_SCHEDULER_SHM_SYNC,
+        envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST,
+        envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP,
+    ):
+        stack.enter_context(switch.override(True))
+    for module in (shm_flag_reduce,):
+        stack.enter_context(
+            patch.object(
+                module,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="decode"),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                module, "get_parallel", return_value=SimpleNamespace(pp_size=1)
+            )
+        )
+    stack.enter_context(_sleep_on_idle(False))
+    stack.enter_context(
+        patch.object(shm_tag_exchange.socket, "gethostname", hosts.hostname)
+    )
+    stack.enter_context(
+        patch.object(parallel_state, "in_the_same_node_as", hosts.same_node)
+    )
+    stack.enter_context(
+        patch.object(network, "get_local_ip_auto", return_value="127.0.0.1")
+    )
+    stack.enter_context(_shm_names())
+
+
+def _init_four_ranks(rank: int, init_file: str) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=Path(init_file).as_uri(),
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=120),
+    )
+
+
+def _spawn_four_ranks(fn) -> None:
+    with TemporaryDirectory() as directory:
+        torch.multiprocessing.spawn(
+            fn, args=(str(Path(directory) / "gloo-init"),), nprocs=4, join=True
+        )
+
+
+def _close_exchanges() -> None:
+    for exchange in shm_tag_exchange._EXCHANGES.values():
+        if isinstance(exchange, HierTagExchange):
+            exchange.local.close()
+            exchange.full.close()
+        elif exchange is not None:
+            exchange.close()
+
+
+def _check_flag_reductions(group, seed: int) -> None:
+    rank = dist.get_rank(group)
+    rng = random.Random(seed * 1009 + rank)
+    for n in (1, 5, 6, 314, 315, 316, 700):
+        for op in (dist.ReduceOp.MIN, dist.ReduceOp.MAX):
+            flags = [rng.randrange(256) for _ in range(n)]
+            if n == 316 and rank == 1:
+                # Outside a byte on one rank: every rank takes gloo for the list.
+                flags[-1] = 300
+            want = torch.tensor(flags, dtype=torch.int32)
+            dist.all_reduce(want, op=op, group=group)
+            with patch.object(
+                utils.dist, "all_reduce", wraps=utils.dist.all_reduce
+            ) as gloo:
+                got = utils.all_reduce_flags(flags=flags, group=group, op=op)
+            assert got == want.tolist(), (n, op, got, want)
+            assert gloo.called == (n == 316), (n, gloo.called)
+    # Lengths differ across ranks (one data word each): every rank raises.
+    reducer = shm_flag_reduce.get_flag_reducer(group)
+    try:
+        reducer.reduce([0] * (1 + rank), op=dist.ReduceOp.MIN)
+    except RuntimeError as e:
+        assert "different lengths" in str(e)
+    else:
+        raise AssertionError("mismatched lengths did not raise")
+
+
+def _pd_decode_flag_reductions(rank: int, init_file: str) -> None:
+    _init_four_ranks(rank, init_file)
+    hosts = _Hosts(("h0", "h0", "h1", "h1"))
+    try:
+        with ExitStack() as stack:
+            _pd_decode_rank(stack, hosts)
+            world = dist.group.WORLD
+            # One host per group of two ranks: the plain shared-memory table.
+            pair = [dist.new_group([0, 1]), dist.new_group([2, 3])][rank // 2]
+            for group in (world, pair):
+                shm_flag_reduce.init_decode_flag_reducer(group, enable_overlap=True)
+            reducer = shm_flag_reduce.get_flag_reducer(world)
+            assert isinstance(reducer.exchange, HierTagExchange), reducer
+            assert (reducer.exchange.link is not None) == reducer.exchange.is_leader
+            assert isinstance(
+                shm_flag_reduce.get_flag_reducer(pair).exchange, ShmTagExchange
+            )
+            _check_flag_reductions(world, seed=1)
+            _check_flag_reductions(pair, seed=2)
+            # Three hosts: this kind stays on gloo on every rank.
+            hosts.names = ("h0", "h1", "h2", "h2")
+            assert (
+                shm_tag_exchange.get_shm_exchange(
+                    world,
+                    "pdflags3",
+                    multihost=True,
+                    width=shm_flag_reduce._WIDTH,
+                    max_hosts=shm_tag_exchange.PD_DECODE_MAX_HOSTS,
+                )
+                is None
+            )
+            shm_flag_reduce.release_decode_flag_reducers()
+            assert shm_flag_reduce.get_flag_reducer(world) is None
+    finally:
+        _close_exchanges()
+        dist.destroy_process_group()
+
+
 class TestShmTagExchange(CustomTestCase):
     def test_request_receiver_opts_into_multihost_exchange_with_runtime_switch(self):
         cpu_group = object()
@@ -193,6 +342,53 @@ class TestHiCacheReadyCountsThroughShm(CustomTestCase):
                 nprocs=2,
                 join=True,
             )
+
+
+class TestPdDecodeFlagsThroughShm(CustomTestCase):
+    def test_flag_reductions_through_the_exchange_equal_gloo(self):
+        """On one and on two hosts, the decode queues' MIN / MAX flag reductions go
+        through the shared-memory exchange, not a gloo all_reduce, and return the
+        gloo result, including lists split over several calls; a flag outside a
+        byte sends that reduction through gloo on every rank, a group across
+        three hosts keeps gloo, and lists of different lengths raise."""
+        _spawn_four_ranks(_pd_decode_flag_reductions)
+
+    def test_reducer_needs_a_pd_decode_overlap_scheduler_without_pp(self):
+        """Only a PD decode scheduler with the overlap loop, no pipeline parallelism
+        and more than one rank gets a reducer; every other one builds no exchange."""
+        cases = {
+            "switch off": (False, "decode", 1, True, 8),
+            "prefill": (True, "prefill", 1, True, 8),
+            "pp": (True, "decode", 2, True, 8),
+            "no overlap": (True, "decode", 1, False, 8),
+            "one rank": (True, "decode", 1, True, 1),
+            "decode": (True, "decode", 1, True, 8),
+        }
+        for name, (switch, mode, pp_size, overlap, size) in cases.items():
+            group = object()
+            with (
+                self.subTest(name),
+                envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.override(switch),
+                patch.object(
+                    shm_flag_reduce,
+                    "get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode=mode),
+                ),
+                patch.object(
+                    shm_flag_reduce,
+                    "get_parallel",
+                    return_value=SimpleNamespace(pp_size=pp_size),
+                ),
+                patch.object(
+                    shm_flag_reduce, "get_shm_exchange", return_value=object()
+                ) as build,
+                patch.object(shm_flag_reduce.dist, "get_world_size", return_value=size),
+            ):
+                shm_flag_reduce.init_decode_flag_reducer(group, enable_overlap=overlap)
+                reducer = shm_flag_reduce.get_flag_reducer(group)
+            self.assertEqual(reducer is not None, name == "decode")
+            self.assertEqual(build.called, name == "decode")
+        shm_flag_reduce.release_decode_flag_reducers()
 
 
 if __name__ == "__main__":

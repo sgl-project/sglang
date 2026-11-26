@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.shm_flag_reduce import release_decode_flag_reducers
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
 from sglang.srt.managers.scheduler_components.request_list import (
     PD_KINDS,
@@ -270,6 +271,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
                 km.teardown()
             scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
+        release_decode_flag_reducers()
         # clear socket ctx in CommonKVReceiver
         CommonKVReceiver.close_all_sockets()
     scheduler.disagg_metadata_buffers = None

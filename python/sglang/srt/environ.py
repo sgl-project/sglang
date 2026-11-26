@@ -869,6 +869,11 @@ class Envs:
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
+    # PD decode (pp 1): landed requests take freed seats in decode-side arrival
+    # order instead of landing order (decode_seat_age.py).
+    SGLANG_OPT_PD_DECODE_SEAT_AGE_ORDER = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -1856,8 +1861,8 @@ class Envs:
     SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # The scheduler's per-pass TP syncs (request broadcast size, HiCache ready counts)
-    # through a shared-memory table when the group shares a host (shm_tag_exchange.py).
+    # The scheduler's per-pass TP syncs (request broadcast size, HiCache ready counts,
+    # PD decode queue flags) through a shared-memory table (shm_tag_exchange.py).
     SGLANG_OPT_SCHEDULER_SHM_SYNC = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )

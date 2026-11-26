@@ -31,6 +31,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.shm_flag_reduce import get_flag_reducer
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
@@ -536,6 +537,11 @@ def all_reduce_flags(
     if not flags or dist.get_world_size(group) == 1:
         return flags
 
+    reducer = get_flag_reducer(group)
+    if reducer is not None:
+        reduced = reducer.reduce(flags, op)
+        if reduced is not None:
+            return reduced
     tensor_to_reduce = torch.tensor(flags, dtype=torch.int32, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=op, group=group)
     return tensor_to_reduce.tolist()
@@ -615,6 +621,25 @@ def poll_and_all_reduce_with_staging(
 #########################
 # Metadata Buffers
 #########################
+
+
+def decode_metadata_buffer_size(
+    *, max_running_requests: int, prealloc_slots: int, rows_per_request: int
+) -> int:
+    """Rows of a PD decode's metadata buffers. A request holds one from its
+    preallocation until its KV has landed, so the rows cap the transfers in flight;
+    every preallocation slot (--disaggregation-decode-extra-slots) gets one."""
+    stock_rows = max_running_requests * rows_per_request
+    if prealloc_slots <= stock_rows:
+        return stock_rows
+    logger.info(
+        "PD decode metadata rows %d: one per preallocation slot "
+        "(--disaggregation-decode-extra-slots), above %d per running request x %d",
+        prealloc_slots,
+        rows_per_request,
+        max_running_requests,
+    )
+    return prealloc_slots
 
 
 class ReqToMetadataIdxAllocator:
