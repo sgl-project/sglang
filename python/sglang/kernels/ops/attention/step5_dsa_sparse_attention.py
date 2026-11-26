@@ -95,14 +95,16 @@ def step5_dsa_sparse_attention(
     lengths: torch.Tensor,
     out: torch.Tensor,
     scale: float,
+    region_size: int,
 ) -> torch.Tensor:
-    """Attention of each query row over its selected 8-token regions.
+    """Attention of each query row over its selected regions of region_size tokens.
 
-    q/out: [T, heads, 192]; k/v cache: [slots, 1, 192]. packed: int64 [T, >=513]
-    with (physical slot // 8) << 32 | first logical position, one entry per region.
+    q/out: [T, heads, D]; k/v cache: [slots, 1, D]. packed: int64 [T, >=topk + 1]
+    with (physical slot // region_size) << 32 | first logical position, one entry
+    per region.
     """
     rows, heads, head_dim = q.shape
-    assert head_dim == 192 and k_cache.shape[-1] == v_cache.shape[-1] == head_dim
+    assert k_cache.shape[-1] == v_cache.shape[-1] == head_dim
     assert packed.dtype == torch.int64 and packed.shape[0] == rows
     if rows:
         _sparse_attention_kernel[(rows,)](
@@ -122,9 +124,9 @@ def step5_dsa_sparse_attention(
             scale,
             HEADS=heads,
             D=head_dim,
-            REGION=8,
+            REGION=region_size,
             BLOCK_H=max(16, triton.next_power_of_2(heads)),
-            BLOCK_D=256,
+            BLOCK_D=triton.next_power_of_2(head_dim),
             BLOCK_N=64,
             num_warps=8,
         )

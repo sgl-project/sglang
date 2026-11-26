@@ -125,10 +125,14 @@ class Step5Indexer(nn.Module):
         rope_scaling: dict[str, Any] | None,
         max_position_embeddings: int,
         eps: float,
+        region_size: int,
+        topk: int,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        self.region_size = region_size
+        self.topk = topk
         self.index_head_dim = index_head_dim
         self.num_heads = num_index_heads // index_tp_size
         self.weight_scale = self.num_heads**-0.5
@@ -247,6 +251,8 @@ class Step5Indexer(nn.Module):
             use_deepselect=workspace.use_deepselect,
             topk_lengths=workspace.topk_lengths,
             topk_ids=workspace.topk_ids,
+            topk_size=self.topk,
+            region_size=self.region_size,
         )
         return workspace.packed, workspace.counts, workspace.lengths
 
@@ -457,6 +463,8 @@ class Step5Attention(nn.Module):
                 rope_scaling=config.rope_scaling,
                 max_position_embeddings=config.max_position_embeddings,
                 eps=self.eps,
+                region_size=profile.region_size,
+                topk=profile.topk,
                 prefix=prefix,
             )
 

@@ -97,6 +97,17 @@ class Step5VLConfig(Step3p7Config):
         super().__init__(vision_config=vision_config, text_config=text_config, **kwargs)
 
 
+_KERNEL_SUPPORTED_VALUES = {
+    "head_dim": frozenset({192}),
+    "index_head_dim": frozenset({256}),
+    "index_rope_dim": frozenset({32}),
+    "index_k_heads": frozenset({1}),
+    "region_size": frozenset({8}),
+    "topk": frozenset({512}),
+    "sliding_window": frozenset({512}),
+}
+
+
 class Step5AttentionProfile(msgspec.Struct, frozen=True, kw_only=True):
     hidden_size: int
     head_dim: int
@@ -105,15 +116,14 @@ class Step5AttentionProfile(msgspec.Struct, frozen=True, kw_only=True):
     index_head_dim: int
     index_num_heads: int
     index_rope_dim: int
+    index_k_heads: int
     provider_groups: int
+    region_size: int
+    topk: int
+    sliding_window: int
 
 
 def parse_step5_attention_profile(config: Step5Config) -> Step5AttentionProfile:
-    from sglang.kernels.ops.attention.step5_dsa_indexer import (
-        STEP5_INDEX_HEAD_DIM,
-        STEP5_REGION_SIZE,
-    )
-
     sparse = config.sparse_config
     profile = Step5AttentionProfile(
         hidden_size=config.hidden_size,
@@ -123,17 +133,18 @@ def parse_step5_attention_profile(config: Step5Config) -> Step5AttentionProfile:
         index_head_dim=sparse["proxy_dim"],
         index_num_heads=sparse["sparse_indexer_num_heads"],
         index_rope_dim=sparse["sparse_indexer_rope_dim"],
+        index_k_heads=sparse["sparse_indexer_num_k_heads"],
         provider_groups=sparse["num_provider_groups"],
+        region_size=sparse["region_block_size"],
+        topk=sparse["topk"],
+        sliding_window=config.sliding_window,
     )
-    if (
-        profile.head_dim != 192
-        or profile.index_head_dim != STEP5_INDEX_HEAD_DIM
-        or sparse["region_block_size"] != STEP5_REGION_SIZE
-        or sparse["sparse_indexer_num_k_heads"] != 1
-        or config.sliding_window != 512
-    ):
-        raise ValueError(
-            "Step5 kernels support head_dim 192, index_head_dim 256, "
-            "8-token regions and a 512-token sliding window"
-        )
+    values = msgspec.structs.asdict(profile)
+    unsupported = {
+        name: values[name]
+        for name, supported in _KERNEL_SUPPORTED_VALUES.items()
+        if values[name] not in supported
+    }
+    if unsupported:
+        raise ValueError(f"Step5 kernels do not support {unsupported}")
     return profile

@@ -6,10 +6,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.step5_dsa_indexer import (
-    STEP5_HISTORY_BLOCKS,
-    STEP5_INDEX_HEAD_DIM,
     STEP5_PAGE_SIZE,
-    STEP5_REGION_SIZE,
     Step5CompressionPlan,
     can_use_step5_dsa_topk_deepselect,
     deepselect_score_width,
@@ -17,6 +14,10 @@ from sglang.kernels.ops.attention.step5_dsa_indexer import (
 )
 from sglang.kernels.ops.attention.step5_dsa_sparse_attention import (
     step5_dsa_sparse_attention,
+)
+from sglang.srt.configs.step5 import (
+    Step5AttentionProfile,
+    parse_step5_attention_profile,
 )
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -30,8 +31,6 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.device import async_h2d
-
-STEP5_SELECTED_BLOCKS = STEP5_HISTORY_BLOCKS + 1
 
 # 512 MiB FP32 score budget, independent of packed prefill length.
 STEP5_SCORE_WORKSPACE_ELEMENTS = 128 * 1024 * 1024
@@ -89,9 +88,11 @@ def _allocate_selection_workspace(
     row_to_req: torch.Tensor,
     positions: torch.Tensor,
     device: torch.device,
+    topk: int,
+    region_size: int,
 ) -> Step5SelectionWorkspace:
     use_deepselect = False
-    if score_width > STEP5_HISTORY_BLOCKS and can_use_step5_dsa_topk_deepselect():
+    if score_width > topk and can_use_step5_dsa_topk_deepselect():
         padded = deepselect_score_width(score_width)
         if padded <= deepselect_score_width(max_score_width):
             score_width, use_deepselect = padded, True
@@ -104,25 +105,17 @@ def _allocate_selection_workspace(
     topk_lengths = None
     if use_deepselect:
         topk_lengths = torch.empty(rows, dtype=torch.int32, device=device)
-        topk_lengths.copy_(
-            torch.where(row_to_req > 0, positions // STEP5_REGION_SIZE, 0)
-        )
+        topk_lengths.copy_(torch.where(row_to_req > 0, positions // region_size, 0))
     return Step5SelectionWorkspace(
-        packed=torch.empty(
-            (rows, STEP5_SELECTED_BLOCKS), dtype=torch.int64, device=device
-        ),
+        packed=torch.empty((rows, topk + 1), dtype=torch.int64, device=device),
         counts=torch.empty(rows, dtype=torch.int32, device=device),
         lengths=torch.empty(rows, dtype=torch.int32, device=device),
         indexer_logits=indexer_logits,
-        ids=torch.empty(
-            (capacity, STEP5_SELECTED_BLOCKS), dtype=torch.int32, device=device
-        ),
+        ids=torch.empty((capacity, topk + 1), dtype=torch.int32, device=device),
         use_deepselect=use_deepselect,
         topk_lengths=topk_lengths,
         topk_ids=(
-            torch.empty(
-                (capacity, STEP5_HISTORY_BLOCKS), dtype=torch.int32, device=device
-            )
+            torch.empty((capacity, topk), dtype=torch.int32, device=device)
             if use_deepselect
             else None
         ),
@@ -142,14 +135,13 @@ def _slice_selection_workspace(
     rows: int,
     row_to_req: torch.Tensor,
     positions: torch.Tensor,
+    region_size: int,
 ) -> Step5SelectionWorkspace:
     capacity = min(rows, workspace.indexer_logits.shape[0])
     topk_lengths = None
     if workspace.use_deepselect:
         topk_lengths = workspace.topk_lengths[:rows]
-        topk_lengths.copy_(
-            torch.where(row_to_req > 0, positions // STEP5_REGION_SIZE, 0)
-        )
+        topk_lengths.copy_(torch.where(row_to_req > 0, positions // region_size, 0))
     return Step5SelectionWorkspace(
         packed=workspace.packed[:rows],
         counts=workspace.counts[:rows],
@@ -170,6 +162,7 @@ def _build_prefill_compression_plan(
     append_lengths: list[int],
     req_to_token: torch.Tensor,
     compressed_index_key_pages: int,
+    region_size: int,
 ) -> Step5CompressionPlan:
     """Build the prefill compression plan shared by every DSA layer.
 
@@ -189,7 +182,7 @@ def _build_prefill_compression_plan(
     uses = torch.zeros(req_to_token.shape[0], dtype=torch.int32, device=device)
     uses.scatter_add_(0, slots, active.to(torch.int32))
     admitted = (raw_slots == slots) & (uses[slots] == 1)
-    ratio = STEP5_REGION_SIZE
+    ratio = region_size
     max_blocks = max(((row[0] % ratio + row[2]) // ratio for row in rows), default=0)
     block_idx = torch.arange(max_blocks, device=device)[:, None]
     offsets = torch.arange(ratio, device=device)
@@ -219,8 +212,8 @@ def _build_prefill_compression_plan(
     )
 
 
-def _num_blocks(num_tokens: int) -> int:
-    return (num_tokens + STEP5_REGION_SIZE - 1) // STEP5_REGION_SIZE
+def _num_blocks(num_tokens: int, region_size: int) -> int:
+    return (num_tokens + region_size - 1) // region_size
 
 
 def wrap_step5_attention_backend(runner, full_attn_backend: AttentionBackend):
@@ -233,6 +226,7 @@ def wrap_step5_attention_backend(runner, full_attn_backend: AttentionBackend):
         req_to_token_pool=runner.req_to_token_pool,
         context_len=runner.model_config.context_len,
         max_context_len=runner.model_config.hf_text_config.max_position_embeddings,
+        profile=parse_step5_attention_profile(runner.model_config.hf_text_config),
     )
 
 
@@ -252,7 +246,7 @@ def _validate_config(*, kv_pool, context_len: int, max_context_len: int) -> None
 
 
 def _allocate_indexer_states(
-    *, kv_pool: SWAKVPool, num_req_slots: int
+    *, kv_pool: SWAKVPool, num_req_slots: int, region_size: int, index_head_dim: int
 ) -> dict[int, Step5LayerIndexerState]:
     full_pool = kv_pool.full_kv_pool
     device = full_pool.device
@@ -261,17 +255,17 @@ def _allocate_indexer_states(
     ring_shape = (
         num_layers,
         num_req_slots,
-        STEP5_REGION_SIZE,
+        region_size,
         1,
-        STEP5_INDEX_HEAD_DIM,
+        index_head_dim,
     )
     compressed_index_keys = torch.empty(
         (
             num_layers,
             num_pages,
-            kv_pool.page_size // STEP5_REGION_SIZE,
+            kv_pool.page_size // region_size,
             1,
-            STEP5_INDEX_HEAD_DIM,
+            index_head_dim,
         ),
         dtype=torch.uint8,
         device=device,
@@ -284,7 +278,7 @@ def _allocate_indexer_states(
         ring_shape, dtype=torch.bfloat16, device=device
     )
     index_positions = torch.full(
-        (num_layers, num_req_slots, STEP5_REGION_SIZE),
+        (num_layers, num_req_slots, region_size),
         -1,
         dtype=torch.int64,
         device=device,
@@ -357,6 +351,7 @@ class Step5AttnBackend(AttentionBackend):
         req_to_token_pool,
         context_len: int,
         max_context_len: int,
+        profile: Step5AttentionProfile,
     ):
         _validate_config(
             kv_pool=kv_pool, context_len=context_len, max_context_len=max_context_len
@@ -371,10 +366,14 @@ class Step5AttnBackend(AttentionBackend):
         self.token_to_kv_pool = kv_pool
         self.req_to_token_pool = req_to_token_pool
         self.context_len = context_len
+        self.region_size = profile.region_size
+        self.topk = profile.topk
         self.full_num_pages = kv_pool.full_kv_pool.size // kv_pool.page_size + 1
         self.indexer_states = _allocate_indexer_states(
             kv_pool=kv_pool,
             num_req_slots=req_to_token_pool.req_to_token.shape[0],
+            region_size=profile.region_size,
+            index_head_dim=profile.index_head_dim,
         )
         self.dsa_layer_ids = frozenset(self.indexer_states)
         # Metadata storage only. CUDA graph objects belong to the public runner.
@@ -422,9 +421,11 @@ class Step5AttnBackend(AttentionBackend):
                 rows=positions.numel(),
                 score_width=score_width,
                 device=plan.request_slots.device,
-                max_score_width=req_to_token.shape[1] // STEP5_REGION_SIZE,
+                max_score_width=req_to_token.shape[1] // self.region_size,
                 row_to_req=row_to_req,
                 positions=positions,
+                topk=self.topk,
+                region_size=self.region_size,
             )
         return Step5IndexerMetadata(
             layer_states=self.indexer_states,
@@ -450,11 +451,15 @@ class Step5AttnBackend(AttentionBackend):
             append_lengths=lengths,
             req_to_token=req_to_token,
             compressed_index_key_pages=self.full_num_pages,
+            region_size=self.region_size,
         )
         requests, positions = _prefill_query_layout(plan)
         score_width = max(
             1,
-            _num_blocks(max((p + n for p, n in zip(prefixes, lengths)), default=0)),
+            _num_blocks(
+                max((p + n for p, n in zip(prefixes, lengths)), default=0),
+                self.region_size,
+            ),
         )
         return self._build_indexer_metadata(
             plan=plan,
@@ -492,12 +497,13 @@ class Step5AttnBackend(AttentionBackend):
             req_to_token=self.req_to_token_pool.req_to_token,
             compressed_index_key_pages=self.full_num_pages,
             context_len=self.context_len,
+            region_size=self.region_size,
         )
         return self._build_indexer_metadata(
             plan=plan,
             row_to_req=row_to_req,
             positions=positions,
-            score_width=_num_blocks(self.context_len),
+            score_width=_num_blocks(self.context_len, self.region_size),
             selection_workspace=(
                 None
                 if graph_workspace is None
@@ -506,6 +512,7 @@ class Step5AttnBackend(AttentionBackend):
                     rows=positions.numel(),
                     row_to_req=row_to_req,
                     positions=positions,
+                    region_size=self.region_size,
                 )
             ),
         )
@@ -537,7 +544,10 @@ class Step5AttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         req_to_token = self.req_to_token_pool.req_to_token
-        if _num_blocks(self.context_len) * STEP5_REGION_SIZE > req_to_token.shape[1]:
+        if (
+            _num_blocks(self.context_len, self.region_size) * self.region_size
+            > req_to_token.shape[1]
+        ):
             raise ValueError("Step5 graph context exceeds native request capacity")
         self._cuda_graph_metadata.clear()
         self.forward_metadata = None
@@ -546,8 +556,8 @@ class Step5AttnBackend(AttentionBackend):
         )
         self._graph_workspace = _allocate_selection_workspace(
             rows=max_bs,
-            score_width=_num_blocks(self.context_len),
-            max_score_width=req_to_token.shape[1] // STEP5_REGION_SIZE,
+            score_width=_num_blocks(self.context_len, self.region_size),
+            max_score_width=req_to_token.shape[1] // self.region_size,
             row_to_req=torch.zeros(
                 max_bs, dtype=torch.int32, device=req_to_token.device
             ),
@@ -555,6 +565,8 @@ class Step5AttnBackend(AttentionBackend):
                 max_bs, dtype=torch.int32, device=req_to_token.device
             ),
             device=req_to_token.device,
+            topk=self.topk,
+            region_size=self.region_size,
         )
         self.swa_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
@@ -643,4 +655,5 @@ class Step5AttnBackend(AttentionBackend):
             lengths=lengths,
             out=torch.empty_like(q),
             scale=layer.scaling,
+            region_size=self.region_size,
         )
