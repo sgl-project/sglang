@@ -31,9 +31,7 @@ from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     NPUDecodeContextParallelMetadata,
     build_dcp_extend_gather_plan,
 )
-from sglang.srt.hardware_backend.npu.kv_capability import (
-    DSA_KV_QUANT_BLOCK_SIZE,
-)
+from sglang.srt.hardware_backend.npu.kv_capability import DSA_KV_QUANT_BLOCK_SIZE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -425,7 +423,6 @@ class AscendAttnBackend(AttentionBackend):
                 self.use_native_sdpa = True
         self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
-        self.max_context_len = model_runner.model_config.context_len
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -1054,12 +1051,12 @@ class AscendAttnBackend(AttentionBackend):
         metadata.fa_metadata.copy_(schedule)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        total_context_len = self.max_context_len + self.page_size - 1
+        total_context_len = self.req_to_token_pool.row_width + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
         graph_num_pages = total_context_len // self.page_size
         if self.dense_mla_dcp_target:
-            max_kv_len = self.max_context_len
+            max_kv_len = self.req_to_token_pool.row_width
             if self.speculative_num_draft_tokens is not None:
                 max_kv_len += self.speculative_num_draft_tokens
             dcp_cycle_size = self.page_size * self.dcp_size
@@ -1361,6 +1358,10 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 # draft-extend (and any other spec mode) sees base + draft block
                 max_len = max_seq_len_host + self.speculative_num_draft_tokens
+            # The hint is already an allocated length, so the offsets can push
+            # max_len past the row; the slice below is cut at the row width, so
+            # clamp max_len to it or the copy shapes diverge.
+            max_len = min(max_len, self.req_to_token_pool.row_width)
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             metadata.block_tables[:bs, :max_seq_pages].copy_(
                 self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
@@ -1597,7 +1598,7 @@ class AscendAttnBackend(AttentionBackend):
             head_dim=layer.qk_head_dim,
             gamma=width,
             softmax_scale=layer.scaling,
-            max_kv_len=self.max_context_len + width,
+            max_kv_len=self.req_to_token_pool.row_width + width,
             causal=layer.attn_type != AttentionType.ENCODER_ONLY,
         ).view(-1, layer.tp_q_head_num * layer.v_head_dim)
         if output.shape[0] < padded_tokens:

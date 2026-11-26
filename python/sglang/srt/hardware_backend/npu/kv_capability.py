@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 # block. It is the tile_size MLAProlog writes with and the sparse-attention
 # read takes; 128 is the only value the NPU operators validate today.
 DSA_KV_QUANT_BLOCK_SIZE = 128
-DSA_INT8_KV_ROPE_HEAD_DIM = 64
 
 _NPU_NON_ARCH35_KV_CACHE_DTYPES = (
     "bf16, bfloat16, int8, or auto with a non-FP8 checkpoint"

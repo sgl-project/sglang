@@ -779,21 +779,23 @@ def _build_mamba_device_pool_group(
                     index_mapper=dcp_mapper,
                 )
             )
+    num_layers = 1 + max(layer for entry in entries for layer in entry.layer_mapping)
+    num_layers = max(
+        [num_layers, *(pool.layer_num for pool in params.sidecar_draft_device_pools)]
+    )
     entries.extend(
         _sidecar_draft_entries(
-            params, page_size, dcp_size=dcp_size, dcp_mapper=dcp_mapper
+            params, page_size, num_layers, dcp_size=dcp_size, dcp_mapper=dcp_mapper
         )
     )
-    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     # Not rank_replicated: the Mamba state is TP-sharded.
-    return DevicePoolGroup(
-        entries, num_layers + 1, page_size, restores_sidecar_drafts=True
-    )
+    return DevicePoolGroup(entries, num_layers, page_size, restores_sidecar_drafts=True)
 
 
 def _sidecar_draft_entries(
     params: Any,
     page_size: int,
+    num_layers: int,
     *,
     dcp_size: int = 1,
     dcp_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
@@ -806,9 +808,11 @@ def _sidecar_draft_entries(
         draft_page_size = page_size // dcp_size if draft_dcp_sharded else page_size
         if draft_pool.page_size != draft_page_size:
             raise ValueError("Draft KV page size must match the tree page size.")
-        # Draft layer i rides transfer layer i; the draft reads it only after
-        # the batch's loads finish.
-        layer_mapping = {layer: layer for layer in range(draft_pool.layer_num)}
+        if draft_pool.layer_num > num_layers:
+            raise ValueError("Draft KV has more layers than the target transfers.")
+        # Draft depth i waits on the tail transfer layer carrying its KV.
+        offset = num_layers - draft_pool.layer_num
+        layer_mapping = {offset + layer: layer for layer in range(draft_pool.layer_num)}
         if type(draft_pool) is MLATokenToKVPool:
             entry = DevicePoolEntry(
                 name=PoolName.DRAFT,
@@ -883,7 +887,7 @@ def _build_minimax_m3_nvfp4_device_pool_group(
             page_size=page_size,
             rows_are_pages=True,
         ),
-        *_sidecar_draft_entries(params, page_size),
+        *_sidecar_draft_entries(params, page_size, main_pool.layer_num),
     ]
     # Not rank_replicated: the KV heads are TP-sharded.
     return DevicePoolGroup(

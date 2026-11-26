@@ -880,7 +880,7 @@ class TreeComponent(ABC):
         *,
         swa_component: Optional[SWAComponent],
         write_backlog_cap: int,
-        max_context_len: int = 0,
+        context_length: int = 0,
         further_window_components: Sequence[SWAComponent] = (),
     ) -> BufferModePipeline:
         """Called on the FULL component to construct the buffer-mode pipeline."""
@@ -891,7 +891,7 @@ class TreeComponent(ABC):
             swa_component=swa_component,
             further_window_components=further_window_components,
             write_backlog_cap=write_backlog_cap,
-            max_context_len=max_context_len,
+            context_length=context_length,
         )
 
     def prepare_buffer_load_back(

@@ -263,7 +263,7 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
 
     full_storage_tensor = _validated_full_storage_tensor(weight)
     storage_elements = torch_npu.get_storage_size(full_storage_tensor)
-    npu_format = torch_npu.get_npu_format(full_storage_tensor)
+    npu_format = torch.ops.npu.get_npu_format(full_storage_tensor)
     # Check the actual storage format: requesting NZ (29) can produce a C0
     # variant, such as 50 for packed FP4. Expert-block checks below still apply.
     if npu_format not in _BASE_FORMATS and npu_format not in _SUPPORTED_NZ_FORMATS:
@@ -318,11 +318,13 @@ def _validate_nz_expert_blocks(
         or weight.ndim != _NZ_EXPERT_WEIGHT_NDIM
     ):
         raise ValueError("NPU EPLB requires 3D batched NZ expert weights.")
+    # ModelSlim exposes INT8 NZ allocations through INT32 views. Expert
+    # boundaries must match in bytes, even when element counts differ.
     if (
-        weight.element_size() != full_storage_tensor.element_size()
-        or weight.stride(0) != full_storage_tensor.stride(0)
-        or full_storage_tensor.numel()
-        != full_storage_tensor.shape[0] * weight.stride(0)
+        weight.stride(0) * weight.element_size()
+        != full_storage_tensor.stride(0) * full_storage_tensor.element_size()
+        or full_storage_tensor.numel() * full_storage_tensor.element_size()
+        != full_storage_tensor.shape[0] * weight.stride(0) * weight.element_size()
     ):
         raise ValueError("NPU EPLB requires the original NZ expert blocks.")
     total_experts = full_storage_tensor.shape[0]

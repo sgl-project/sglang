@@ -298,6 +298,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
+            patch.object(mhc, "is_npu_arch35", return_value=True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
@@ -344,6 +345,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
+            patch.object(mhc, "is_npu_arch35", return_value=True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
@@ -391,6 +393,7 @@ class TestNpuMhcSeam(unittest.TestCase):
 
         with (
             patch.object(mhc, "_is_npu", True),
+            patch.object(mhc, "is_npu_arch35", return_value=True),
             patch.object(
                 torch,
                 "ops",

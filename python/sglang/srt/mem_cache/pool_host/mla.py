@@ -399,6 +399,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 * native.index_k.dtype.itemsize
             )
         if native.index_scales is not None:
+            # Scale mirror in the device scale dtype.
             lengths.append(
                 self.page_num
                 * native.index_scales.shape[2]
@@ -1320,10 +1321,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             scale_buffer_data_ptr = (
                 scale_buffer.data_ptr() if scale_buffer is not None else None
             )
-            scale_item_size = (
-                scale_buffer.element_size() if scale_buffer is not None else 0
-            )
-            # k row width mirrors the device pool (packed dim for FP8 DSA).
+            # k row width mirrors the device pool (packed dim for DSA).
             k_width = self.k_buffer.shape[-1]
             k_item_size = self.k_buffer.element_size()
             # Indexer buffers cover only physical Indexer layers, which can be
@@ -1377,7 +1375,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 if scale_buffer_data_ptr is not None:
                     # Host scale layout is (page_num, num_indexer_layers,
-                    # index_page_size, 1, 1): one scale per pooled row.
+                    # index_page_size, 1, 1): one scale value per entry per
+                    # indexer layer.
                     ptr_list.append(
                         scale_buffer_data_ptr
                         + (indices[index] // self.page_size)

@@ -25,7 +25,8 @@ from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
 
-# RoPE width npu_kv_quant_sparse_flash_attention reads from the packed record.
+# RoPE width the native sparse attention kernel reads from the packed record.
+_INT8_KV_ROPE_HEAD_DIM = 64
 
 _NVFP4_PREFILL_BACKEND = {
     "fp8_e4m3": "flashinfer",
@@ -112,6 +113,12 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
         )
+    # SM120 kernels read the per-layer pools' interleaved scales; the unified
+    # pool stores them token-major.
+    if get_platform().is_sm120 and cfg.enable_unified_memory:
+        raise ValueError(
+            "--kv-cache-dtype mxfp8 on SM120 does not support --enable-unified-memory."
+        )
 
 
 def handle_platform_kv_cache_dtype_compatibility(server_args: Any) -> None:
@@ -179,12 +186,10 @@ def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
             f"{hf_config.architectures[0]} is not a DSA model. Use "
             "--kv-cache-dtype bf16 or auto."
         )
-    from sglang.srt.hardware_backend.npu.kv_capability import DSA_INT8_KV_ROPE_HEAD_DIM
-
-    if model_config.qk_rope_head_dim not in (0, DSA_INT8_KV_ROPE_HEAD_DIM):
+    if model_config.qk_rope_head_dim not in (0, _INT8_KV_ROPE_HEAD_DIM):
         raise ValueError(
             "--kv-cache-dtype int8 needs a DSA model with qk_rope_head_dim "
-            f"0 or {DSA_INT8_KV_ROPE_HEAD_DIM}; this model has "
+            f"0 or {_INT8_KV_ROPE_HEAD_DIM}; this model has "
             f"qk_rope_head_dim={model_config.qk_rope_head_dim}. Use "
             "--kv-cache-dtype bf16 or auto."
         )
