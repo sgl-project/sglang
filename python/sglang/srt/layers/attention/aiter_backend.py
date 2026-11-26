@@ -1064,9 +1064,6 @@ class AiterAttnBackend(AttentionBackend):
             elif self.num_head in _mla_low_head_zero_pad:
                 self.head_pad_mode = "zero"
                 self.head_repeat_factor = 1
-                # The fp8 PS-ASM prefill hangs or faults on gfx950 at
-                # zero-padded head counts; use the flash-attn prefill instead.
-                self.use_fp8_prefill_attn = False
             else:
                 self.head_pad_mode = "none"
                 self.head_repeat_factor = 1

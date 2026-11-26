@@ -152,6 +152,8 @@ def _k3_absorb_v_gate_kernel(
 
 
 MAX_M = 64
+# K chunk of the W_UV kernel; its loads along K are unmasked.
+V_BK = 512
 
 
 def _bm(m: int) -> int:
@@ -257,7 +259,7 @@ def covered_v(attn_output, w_vc, gate) -> bool:
     dv = w_vc.shape[2]
     if not (0 < m <= MAX_M) or w_vc.shape[:2] != (h, dk):
         return False
-    if dk % 128 or dv % 32 or dv & (dv - 1):
+    if dk % V_BK or dv % 32 or dv & (dv - 1):
         return False
     if attn_output.dtype != torch.bfloat16 or w_vc.dtype != torch.bfloat16:
         return False
@@ -273,7 +275,7 @@ def covered_v(attn_output, w_vc, gate) -> bool:
     return True
 
 
-def k3_mla_absorb_v_gate(attn_output, w_vc, gate=None, bn: int = 16, bk: int = 512):
+def k3_mla_absorb_v_gate(attn_output, w_vc, gate=None, bn: int = 16):
     """attn_output [M, H, DK] (strided ok), w_vc [H, DK, DV] (W_UV, any
     strides), gate [M, H * DV] or None. Returns [M, H * DV] bf16 =
     bf16(attn @ W_UV) (* bf16(sigmoid(gate)), double-rounded). Caller checks
@@ -299,7 +301,7 @@ def k3_mla_absorb_v_gate(attn_output, w_vc, gate=None, bn: int = 16, bk: int = 5
         DV=dv,
         BM=_bm(m),
         BN=bn,
-        BK=bk,
+        BK=V_BK,
         HAS_GATE=gate is not None,
         num_warps=4,
     )
