@@ -93,15 +93,7 @@ inline CPUActMethod act_method_from_string(const std::optional<std::string>& act
   TORCH_CHECK(false, "Unsupported activation: ", activation.value(), ". Supported: silu, gelu");
 }
 
-enum class CPUQuantMethod : int64_t {
-  BF16 = 0,
-  INT8_W8A8 = 1,
-  FP8_W8A16 = 2,
-  INT4_W4A8 = 3,
-  MXFP4 = 4,
-  FP8_W8A8 = 5,
-  FP8_W8A8_FULL = 6
-};
+enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4, FP8_W8A8 = 5 };
 
 constexpr bool operator==(CPUQuantMethod a, int64_t b) {
   return static_cast<int64_t>(a) == b;
@@ -212,12 +204,10 @@ void fused_experts_fp8_a8_kernel_impl(
     scalar_t* __restrict__ ic1,
     scalar_t* __restrict__ ic2,
     at::Float8_e4m3fn* __restrict__ A_tmp,
-    scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     float* __restrict__ Ukernel_tmp,
     at::Float8_e4m3fn* __restrict__ Aq_tmp,
     float* __restrict__ As_tmp,
-    bool full_w8a8,
     const at::Float8_e4m3fn* __restrict__ input,
     const at::Float8_e4m3fn* __restrict__ packed_w1,
     const at::Float8_e4m3fn* __restrict__ packed_w2,
