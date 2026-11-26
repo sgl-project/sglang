@@ -150,12 +150,11 @@ def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
     model_runner = SimpleNamespace(
         kv_cache_dtype=None,
         token_to_kv_pool=object(),
-        req_to_token_pool=object(),
+        req_to_token_pool=SimpleNamespace(max_context_len=_MAX_CONTEXT_LEN),
         runner_ids=None,
         server_args=SimpleNamespace(
             speculative_attention_mode=speculative_attention_mode
         ),
-        model_config=SimpleNamespace(context_len=_MAX_CONTEXT_LEN),
     )
     with _published(speculative_attention_mode):
         return HybridAttnBackend(

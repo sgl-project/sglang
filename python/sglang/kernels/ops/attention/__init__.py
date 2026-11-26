@@ -767,6 +767,14 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.indexer_head_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_head_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
 
 for _op, _module in (
     ("finish_prefill_indexer_topk", "fp4_indexer"),

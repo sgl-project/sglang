@@ -522,6 +522,10 @@ fn native_core_error(error: CoreError, stream: bool) -> Response {
     )
 }
 
+/// Sent by the PD decode bootstrap heartbeat (`CommonKVManager` in Python), whose
+/// 3 s timeout a generation probe on a busy prefill exceeds.
+const BOOTSTRAP_HEARTBEAT_HEADER: &str = "x-sglang-bootstrap-heartbeat";
+
 /// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
 /// router build (server startup) — changing them on a live process needs a
 /// restart. The deep-probe handler is built once with
@@ -535,7 +539,15 @@ fn health_routes() -> Router<Arc<AppState>> {
         environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
     );
     let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
-        get(move |state: State<Arc<AppState>>| health_generate(state, timeout, false))
+        get(
+            move |state: State<Arc<AppState>>, headers: HeaderMap| async move {
+                if headers.contains_key(BOOTSTRAP_HEARTBEAT_HEADER) {
+                    health_without_generation(state).await
+                } else {
+                    health_generate(state, timeout, false).await
+                }
+            },
+        )
     } else {
         get(health_without_generation)
     };
@@ -613,41 +625,31 @@ async fn generate(
     headers: HeaderMap,
     request: axum::extract::Request,
 ) -> Response {
-    let (mut body, raw_body) = match json_body(&state, request).await {
-        Ok(body) => body,
-        // A body that fails to parse has no readable `stream` flag, so this one
-        // can only answer unary -- as Python's does (FastAPI rejects before its
-        // handler runs).
+    let raw_body = match json_bytes(&state, request).await {
+        Ok(raw_body) => raw_body,
         Err(rejection) => {
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
-    let overrides = if state.server_args.enable_request_header_overrides {
-        match apply_header_overrides(&mut body, &headers) {
-            Ok(applied) => Some(applied),
-            Err(error) => return native_error(StatusCode::BAD_REQUEST, &error, false),
+    let started_at = start.map(|Extension(crate::RequestStart(at))| at);
+    // Decoding a large body, and freeing its parse, is CPU work that would
+    // stall every other request on this async worker, so they run on the
+    // blocking pool.
+    let (decoded, headers) = off_worker(raw_body.len(), {
+        let state = state.clone();
+        move || {
+            let decoded = decode_body(&state, &headers, raw_body, started_at);
+            (decoded, headers)
         }
-    } else {
-        None
-    };
-    // What the client sent as `sampling_params` (an object, or one per batch
-    // item), for a package's hook, before anything fills in beneath it.
-    let client_sampling_params = state
-        .generate_hook
-        .as_ref()
-        .and_then(|_| body.get("sampling_params").cloned());
-    // The request log and crash dump show the body as the client sent it:
-    // the defaults merged below go into a copy, as Python does.
-    let raw_body = RawBody {
-        bytes: raw_body,
-        overrides,
-    };
-    let received = ReceivedAs::Body {
-        snapshot: state.core.snapshot_body(&body, Some(raw_body), &headers),
-        started_at: start.map(|Extension(crate::RequestStart(at))| at),
-    };
-    let (payloads, is_batch) = match generate_requests(&state, body) {
-        Ok(requests) => requests,
+    })
+    .await;
+    let DecodedBody {
+        payloads,
+        is_batch,
+        client_sampling_params,
+        received,
+    } = match decoded {
+        Ok(decoded) => decoded,
         Err((code, message, stream)) => return native_error(code, &message, stream),
     };
     let stream = payloads.first().is_some_and(|request| request.stream);
@@ -716,21 +718,102 @@ fn item_sampling_params(
     }
 }
 
-/// The body exactly as axum's `Json<Value>` extracts it (the same content-type
-/// check, body limit and rejections), with its raw bytes, which a crash dump
-/// keeps as they came rather than serializing the body again.
-async fn json_body<S: Send + Sync>(
+/// The largest `/generate` body decoded inline on the async worker; a smaller
+/// one is not worth a hop to the blocking pool.
+const INLINE_MAX_BYTES: usize = 64 << 10;
+
+/// `work`'s result, computed on the blocking pool for a body of more than
+/// [`INLINE_MAX_BYTES`].
+async fn off_worker<T: Send + 'static>(
+    bytes: usize,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    if bytes <= INLINE_MAX_BYTES {
+        return work();
+    }
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        // `work` panicked, which carries on here as it would have inline; or
+        // the runtime is shutting down and dropped it unrun, as it is
+        // dropping this request.
+        Err(error) => std::panic::resume_unwind(match error.try_into_panic() {
+            Ok(panic) => panic,
+            Err(error) => Box::new(error.to_string()),
+        }),
+    }
+}
+
+/// A `/generate` body decoded into what the handler submits.
+struct DecodedBody {
+    payloads: Vec<GenerateRequest>,
+    is_batch: bool,
+    /// What the client sent as `sampling_params` (an object, or one per batch
+    /// item), for a package's hook, before anything fills in beneath it.
+    client_sampling_params: Option<serde_json::Value>,
+    received: ReceivedAs,
+}
+
+/// [`generate`]'s synchronous part: parse `raw_body`, apply the header
+/// overrides, snapshot it for the request log and decode it into its
+/// requests. The parse is dropped here. An error carries the body's `stream`
+/// flag once known.
+fn decode_body(
+    state: &AppState,
+    headers: &HeaderMap,
+    raw_body: bytes::Bytes,
+    started_at: Option<Instant>,
+) -> Result<DecodedBody, (StatusCode, String, bool)> {
+    let mut body = match Json::<serde_json::Value>::from_bytes(&raw_body) {
+        Ok(Json(body)) => body,
+        // A body that fails to parse has no readable `stream` flag, so this one
+        // can only answer unary -- as Python's does (FastAPI rejects before its
+        // handler runs).
+        Err(rejection) => return Err((StatusCode::BAD_REQUEST, rejection.body_text(), false)),
+    };
+    let overrides = if state.server_args.enable_request_header_overrides {
+        match apply_header_overrides(&mut body, headers) {
+            Ok(applied) => Some(applied),
+            Err(error) => return Err((StatusCode::BAD_REQUEST, error, false)),
+        }
+    } else {
+        None
+    };
+    let client_sampling_params = state
+        .generate_hook
+        .as_ref()
+        .and_then(|_| body.get("sampling_params").cloned());
+    // The request log and crash dump show the body as the client sent it:
+    // the defaults merged below go into a copy, as Python does.
+    let raw_body = RawBody {
+        bytes: raw_body,
+        overrides,
+    };
+    let received = ReceivedAs::Body {
+        snapshot: state.core.snapshot_body(&body, Some(raw_body), headers),
+        started_at,
+    };
+    let (payloads, is_batch) = generate_requests(state, body)?;
+    Ok(DecodedBody {
+        payloads,
+        is_batch,
+        client_sampling_params,
+        received,
+    })
+}
+
+/// The body's bytes after the checks axum's `Json<Value>` makes before it
+/// parses (the same content-type check, body limit and rejections). A crash
+/// dump keeps them as they came rather than serializing the body again.
+async fn json_bytes<S: Send + Sync>(
     state: &S,
     request: axum::extract::Request,
-) -> Result<(serde_json::Value, bytes::Bytes), JsonRejection> {
+) -> Result<bytes::Bytes, JsonRejection> {
     use axum::extract::FromRequest;
 
     if !json_content_type(request.headers()) {
         return Err(axum::extract::rejection::MissingJsonContentType::default().into());
     }
-    let raw = bytes::Bytes::from_request(request, state).await?;
-    let Json(body) = Json::<serde_json::Value>::from_bytes(&raw)?;
-    Ok((body, raw))
+    Ok(bytes::Bytes::from_request(request, state).await?)
 }
 
 /// axum's `Json` content-type rule: `application/json` or `application/*+json`.
@@ -804,7 +887,7 @@ async fn generate_single(
     req: GenerateRequest,
     held: Option<PendingGeneration>,
     stream: bool,
-    request: RequestState,
+    mut request: RequestState,
     received: ReceivedAs,
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
@@ -815,7 +898,11 @@ async fn generate_single(
     };
     let mut call = match call {
         Ok(call) => call,
-        Err(error) => return native_core_error(error, stream),
+        // Refused before admission: the hook sees the failure the client gets.
+        Err(error) => {
+            request.fail(&error);
+            return native_core_error(error, stream);
+        }
     };
     let rid = call.public_id().to_owned();
     // Cumulative frames (SGLang default) vs per-step deltas.
@@ -910,7 +997,7 @@ async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
     stream: bool,
-    request_states: Vec<RequestState>,
+    mut request_states: Vec<RequestState>,
     received: ReceivedAs,
 ) -> Response {
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
@@ -918,7 +1005,14 @@ async fn generate_batch(
     // every other in-flight request.
     let calls = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
-        Err(error) => return native_core_error(error, stream),
+        // The refusal refuses every item, before any was admitted: each
+        // item's hook sees it.
+        Err(error) => {
+            for request in &mut request_states {
+                request.fail(&error);
+            }
+            return native_core_error(error, stream);
+        }
     };
 
     if stream {
@@ -1339,6 +1433,51 @@ mod tests {
         assert!(response.headers().get("x-custom-header").is_none());
     }
 
+    /// The PD decode heartbeat on `/health` never waits on the scheduler:
+    /// a busy prefill must not miss it and get dropped by decode.
+    #[tokio::test]
+    async fn bootstrap_heartbeat_health_sends_no_probe() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let state = Arc::new(AppState {
+            core: crate::api_server::handlers::CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: true,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
+                },
+            ),
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        let request = Request::get("/health")
+            .header(BOOTSTRAP_HEARTBEAT_HEADER, "1")
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            health_routes().with_state(state).oneshot(request),
+        )
+        .await
+        .expect("the heartbeat must not wait on the scheduler")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(intake_rx.try_recv().is_err());
+    }
+
     /// Also: an HTTP layer's [`crate::RequestStart`] starts the request's
     /// timing, so `e2e_latency` covers the layer's work too.
     async fn assert_native_http_rid_echo(client_rid: &str, stream: bool) {
@@ -1489,11 +1628,104 @@ mod tests {
         }
     }
 
+    /// A unary P/D prefill request the scheduler admitted is aborted when its
+    /// client's connection closes before any response byte: the server drops
+    /// the handler, and the generation's guard tells the scheduler. A router
+    /// whose prefill connection is lost before headers needs no abort of its own.
+    #[tokio::test]
+    async fn closed_connection_aborts_admitted_unary_prefill() {
+        use crate::tokenizer_manager::wiring::AbortSource;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let core = crate::api_server::handlers::CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            crate::api_server::handlers::CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: true,
+                mm_limits: Default::default(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
+                metadata: crate::api_server::handlers::CoreMetadata::default(),
+                metrics: None,
+                request_log: None,
+                generate_validator: None,
+                abort_hook: None,
+            },
+        );
+        let state = Arc::new(AppState {
+            core,
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        // Served like the API listener: axum over hyper's default HTTP/1 settings.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                routes()
+                    .with_state(state)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "rid": "prefill-rid",
+            "input_ids": [1, 2],
+            "sampling_params": {"max_new_tokens": 1},
+            "bootstrap_host": "127.0.0.1",
+            "bootstrap_port": 8998,
+            "bootstrap_room": 7,
+        }))
+        .unwrap();
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST /generate HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("HTTP generation must enter through core intake");
+        };
+        assert!(admission.try_accept());
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), socket.read(&mut byte))
+                .await
+                .is_err(),
+            "no response byte while the request is admitted"
+        );
+        drop(socket);
+
+        let aborted = tokio::time::timeout(Duration::from_secs(5), abort_rx.recv_async())
+            .await
+            .expect("the closed connection must abort the admitted request")
+            .unwrap();
+        assert!(
+            matches!(&aborted, AbortSource::Guard(rid) if *rid == request.rid),
+            "{aborted:?}"
+        );
+        assert!(abort_rx.try_recv().is_err());
+    }
+
     /// Each item `body` submits under `server_args`: its `max_new_tokens`, and
     /// whether that value is marked defaulted.
     async fn submitted_max_new_tokens(
         server_args: crate::message::config::ServerArgs,
-        body: serde_json::Value,
+        body: impl ToString,
         items: usize,
     ) -> Vec<(Option<i64>, bool)> {
         let (intake_tx, intake_rx) = flume::unbounded();
@@ -1548,7 +1780,13 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
-        let response = routes().with_state(state).oneshot(request).await.unwrap();
+        // As the app serves it, with no body limit.
+        let response = routes()
+            .layer(axum::extract::DefaultBodyLimit::disable())
+            .with_state(state)
+            .oneshot(request)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         responder.await.unwrap()
     }
@@ -1804,6 +2042,36 @@ mod tests {
         }
     }
 
+    /// A million `input_ids` are parsed and decoded on the blocking pool, so
+    /// the async worker runs its other tasks on time meanwhile.
+    #[tokio::test]
+    async fn a_large_body_does_not_stall_the_worker() {
+        let ids = vec!["7"; 1 << 20].join(",");
+        let body = format!(r#"{{"input_ids": [{ids}]}}"#);
+        let done = Arc::new(AtomicBool::new(false));
+        let ticker = tokio::spawn({
+            let done = done.clone();
+            async move {
+                let mut worst = Duration::ZERO;
+                while !done.load(Ordering::Relaxed) {
+                    let start = Instant::now();
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    worst = worst.max(start.elapsed());
+                }
+                worst
+            }
+        });
+        tokio::task::yield_now().await;
+        let submitted = submitted_max_new_tokens(Default::default(), body, 1).await;
+        done.store(true, Ordering::Relaxed);
+        let worst = ticker.await.unwrap();
+        assert_eq!(submitted, vec![(Some(128), true)]);
+        assert!(
+            worst < Duration::from_millis(200),
+            "the ticker stalled {worst:?}"
+        );
+    }
+
     /// An omitted `max_new_tokens` takes the launch default, beneath the
     /// request's own value and the preferred sampling params; a `None`
     /// default is no limit. Whichever fill supplies it, it is marked defaulted.
@@ -1959,7 +2227,9 @@ mod tests {
     /// anything is submitted, a batch's valid items included: native
     /// `/generate` with its 400 (a stream's error frame), and the OpenAI
     /// routes with their 400, unary even for a stream, as Python answers the
-    /// tokenizer manager's `ValueError` before the stream starts.
+    /// tokenizer manager's `ValueError` before the stream starts. A generate
+    /// hook sees each native request, every item of a batch, fail once with
+    /// the status and message the client gets.
     #[tokio::test]
     async fn generate_validator_refuses_every_ingress_before_submission() {
         let native = serde_json::json!({"code": 400, "message": "top_logprobs_num 2"});
@@ -1993,7 +2263,9 @@ mod tests {
                 "stream": stream,
             })
         };
-        for (uri, body, status, error) in [
+        // The last field: how many requests a generate hook sees fail, each
+        // with the client's status and message (one per native batch item).
+        for (uri, body, status, error, hook_failures) in [
             (
                 "/generate",
                 generate(
@@ -2003,6 +2275,7 @@ mod tests {
                 ),
                 StatusCode::BAD_REQUEST,
                 &native,
+                2,
             ),
             (
                 "/generate",
@@ -2013,26 +2286,31 @@ mod tests {
                 ),
                 StatusCode::OK,
                 &native_stream,
+                2,
             ),
             (
                 "/generate",
                 generate(serde_json::json!("x"), serde_json::json!(2), false),
                 StatusCode::BAD_REQUEST,
                 &native,
+                1,
             ),
             (
                 "/v1/completions",
                 completion(false),
                 StatusCode::BAD_REQUEST,
                 &openai,
+                0,
             ),
             (
                 "/v1/completions",
                 completion(true),
                 StatusCode::BAD_REQUEST,
                 &openai,
+                0,
             ),
         ] {
+            let hook = TopPHook::default();
             let (intake_tx, intake_rx) = flume::unbounded();
             let core = crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
@@ -2060,7 +2338,7 @@ mod tests {
                 }),
                 generation_policy: GenerationPolicy::default(),
                 chat_formatter: None,
-                generate_hook: None,
+                generate_hook: Some(Arc::new(hook.clone())),
                 openai_chat: None,
             });
             let case = format!("{uri} {body}");
@@ -2091,6 +2369,18 @@ mod tests {
             assert!(
                 intake_rx.is_empty(),
                 "{case}: an item reached the scheduler"
+            );
+            let failed: Vec<_> = hook
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["failed"].clone())
+                .collect();
+            assert_eq!(
+                failed,
+                vec![serde_json::json!([400, "top_logprobs_num 2"]); hook_failures],
+                "{case}"
             );
         }
     }
@@ -2395,6 +2685,159 @@ mod tests {
                 assert_eq!(entry, &expected, "{case}");
                 if !stream {
                     assert_eq!(entry["decode_latency"], 0.25, "{case}");
+                }
+            }
+        }
+    }
+
+    /// Every frame carries the prompt ids intake left, exactly when the
+    /// request asked for them, as Python's `return_prompt_token_ids` does:
+    /// each frame of a stream (cumulative or incremental, a status abort's
+    /// included), a unary response, and each item of a batch with its own
+    /// ids, after the frame's other keys.
+    #[tokio::test]
+    async fn requested_prompt_ids_ride_every_frame() {
+        for (stream, incremental, batch, requested) in [
+            (false, false, false, true),
+            (false, false, true, true),
+            (true, false, false, true),
+            (true, false, true, true),
+            (true, true, true, true),
+            (false, false, true, false),
+            (true, false, true, false),
+        ] {
+            let server_args = crate::message::config::ServerArgs {
+                incremental_streaming_output: incremental,
+                ..Default::default()
+            };
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let core = crate::api_server::handlers::CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::from(&server_args),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
+                },
+            );
+            let state = Arc::new(AppState {
+                core,
+                server_args: Arc::new(server_args),
+                generation_policy: GenerationPolicy::default(),
+                chat_formatter: None,
+                generate_hook: None,
+                openai_chat: None,
+            });
+            let items = if batch { 2 } else { 1 };
+            let responder = tokio::spawn(async move {
+                let mut sinks = Vec::new();
+                for _ in 0..items {
+                    let TmEvent::Intake { request, admission } =
+                        intake_rx.recv_async().await.unwrap()
+                    else {
+                        panic!("expected a generation intake");
+                    };
+                    assert!(admission.try_accept());
+                    let RequestKind::Generate(generate) = &request.kind else {
+                        panic!("/generate must submit a generation request");
+                    };
+                    assert_eq!(generate.prompt_token_ids.is_some(), requested);
+                    // What intake does as it pushes the request.
+                    generate.report_prompt_token_ids();
+                    sinks.push((request.rid.clone(), request.sink.clone()));
+                }
+                for (rid, sink) in &sinks {
+                    let ResponseItem::Frame(mut chunk) = frame(0, "a") else {
+                        unreachable!()
+                    };
+                    chunk.rid = rid.clone();
+                    sink.try_send(ResponseItem::Frame(chunk)).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                for (item, (rid, sink)) in sinks.iter().enumerate() {
+                    let ResponseItem::Done(mut chunk) = done(0, "b") else {
+                        unreachable!()
+                    };
+                    chunk.rid = rid.clone();
+                    // A streamed batch's second item ends on a status abort,
+                    // still a frame.
+                    if stream && item == 1 {
+                        chunk.finish_reason = serde_json::from_value(serde_json::json!({
+                            "type": "abort",
+                            "message": "Aborted",
+                            "status_code": 500,
+                            "err_type": null
+                        }))
+                        .unwrap();
+                    }
+                    sink.try_send(ResponseItem::Done(chunk)).unwrap();
+                }
+            });
+            let prompts = [serde_json::json!([1, 2]), serde_json::json!([3, 4, 5])];
+            let input_ids = if batch {
+                serde_json::json!(prompts)
+            } else {
+                prompts[0].clone()
+            };
+            let body = serde_json::json!({
+                "input_ids": input_ids,
+                "stream": stream,
+                "return_prompt_token_ids": requested,
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = routes().with_state(state).oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            responder.await.unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            let frames: Vec<serde_json::Value> = if stream {
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(parse)
+                    .collect()
+            } else if batch {
+                parse(body).as_array().unwrap().clone()
+            } else {
+                vec![parse(body)]
+            };
+
+            let case = format!(
+                "stream={stream} incremental={incremental} batch={batch} requested={requested}"
+            );
+            assert_eq!(frames.len(), items * if stream { 2 } else { 1 }, "{case}");
+            for (position, frame) in frames.iter().enumerate() {
+                let index = frame["index"]
+                    .as_u64()
+                    .map_or(if batch { position } else { 0 }, |i| i as usize);
+                assert_eq!(
+                    frame.get("prompt_token_ids"),
+                    requested.then_some(&prompts[index]),
+                    "{case}: {frame}"
+                );
+                if requested {
+                    let keys: Vec<&str> = frame
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    assert_eq!(keys.last(), Some(&"prompt_token_ids"), "{case}");
                 }
             }
         }
@@ -2935,7 +3378,7 @@ mod tests {
         assert_eq!(value["meta_info"]["completion_tokens"], 2);
         assert_eq!(
             value["meta_info"]["finish_reason"],
-            serde_json::json!({"type": "length", "length": 2})
+            serde_json::json!({"type": "length", "length": 2, "ignored_stop": null})
         );
         assert!(
             value["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.020,
@@ -3348,10 +3791,11 @@ mod tests {
         }
     }
 
-    /// `json_body` accepts and rejects exactly what `Json<Value>` does, with
-    /// the same rejection text, and hands back the bytes it was sent.
+    /// `json_bytes` and the parse `decode_body` makes of them accept and
+    /// reject exactly what `Json<Value>` does, with the same rejection text,
+    /// and keep the bytes as sent.
     #[tokio::test]
-    async fn json_body_matches_the_json_extractor() {
+    async fn json_bytes_and_their_parse_match_the_json_extractor() {
         use axum::extract::FromRequest;
 
         let request = |content_type: Option<&str>, body: &'static str| {
@@ -3371,7 +3815,11 @@ mod tests {
             (Some("application/json"), "{\"text\": "),
             (Some("application/json"), "[1, 2"),
         ] {
-            let ours = json_body(&(), request(content_type, body)).await;
+            let ours = json_bytes(&(), request(content_type, body))
+                .await
+                .and_then(|raw| {
+                    Json::<serde_json::Value>::from_bytes(&raw).map(|Json(value)| (value, raw))
+                });
             let axums =
                 Json::<serde_json::Value>::from_request(request(content_type, body), &()).await;
             match (ours, axums) {

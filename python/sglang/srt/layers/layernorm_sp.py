@@ -50,12 +50,20 @@ from sglang.srt.utils.device import get_device
 # has been validated. Other models reject --enable-layernorm-sp at construction.
 # The mechanism is generic; extend the allowlist as families are validated.
 MUSE_SP_ARCHITECTURES = frozenset({"MuseSparkForConditionalGeneration"})
-SP_SUPPORTED_ARCHITECTURES = MUSE_SP_ARCHITECTURES | frozenset(
-    {
-        "Qwen3ForCausalLM",
-        "Qwen4ExpForCausalLM",
-        "Qwen4ExpForConditionalGeneration",
-    }
+KIMI_K3_SP_ARCHITECTURES = frozenset(
+    {"KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration"}
+)
+SP_SUPPORTED_ARCHITECTURES = (
+    MUSE_SP_ARCHITECTURES
+    | KIMI_K3_SP_ARCHITECTURES
+    | frozenset(
+        {
+            "Glm5NextForConditionalGeneration",
+            "Qwen3ForCausalLM",
+            "Qwen4ExpForCausalLM",
+            "Qwen4ExpForConditionalGeneration",
+        }
+    )
 )
 
 
@@ -107,6 +115,15 @@ def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
             "at or under the threshold, disagrees with the entry and exit gathers."
         )
     return num_tokens > get_parallel().layernorm_sp_min_tokens
+
+
+def stack_rows(forward_mode, num_tokens: int) -> int:
+    """Rows a rank holds inside the layer stack: its padded shard of an SP pass,
+    else every token."""
+    if not runs_sp(forward_mode, num_tokens):
+        return num_tokens
+    world_size, _ = _group_size_rank(get_parallel().tp_group)
+    return ceil_align(num_tokens, world_size) // world_size
 
 
 class _SPForwardState:

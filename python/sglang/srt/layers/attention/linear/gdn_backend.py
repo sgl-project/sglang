@@ -266,15 +266,8 @@ if is_cuda():
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_npu():
-    from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
-    )
-
-    fused_gdn_gating = fused_gdn_gating_npu
-    causal_conv1d_fn = causal_conv1d_fn_npu
-    causal_conv1d_update = causal_conv1d_update_npu
+    from sgl_kernel_npu.operators.attention.gdn import fused_gdn_gating
+    from sgl_kernel_npu.operators.mamba import causal_conv1d_fn, causal_conv1d_update
 elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
 
@@ -378,8 +371,12 @@ class GDNKernelDispatcher:
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: Optional[LinearAttnKernelBackend] = None,
+        *,
+        round_beta_to_input_dtype: bool = False,
     ):
-        triton_kernel = TritonGDNKernel()
+        triton_kernel = TritonGDNKernel(
+            round_beta_to_input_dtype=round_beta_to_input_dtype
+        )
         self.tree_verify_kernel = triton_kernel
         xpu_kernel = None
         if any(
@@ -675,7 +672,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
 
     def _create_kernel_dispatcher(self, backends):
-        return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+        self._round_beta_to_input_dtype = (
+            not is_cpu()
+            and not is_npu()
+            and backends.decode.is_triton()
+            and getattr(
+                self._model_runner.model_config.hf_config,
+                "gdn_round_beta_to_input_dtype",
+                False,
+            )
+        )
+        return GDNKernelDispatcher(
+            backends.decode,
+            backends.prefill,
+            backends.verify,
+            round_beta_to_input_dtype=self._round_beta_to_input_dtype,
+        )
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
@@ -690,6 +702,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
         backends = model_runner.linear_attn_backends
+        self._replayssm_verify_num_stages = (
+            envs.SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES.get()
+        )
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
@@ -1913,6 +1928,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             is_kda=False,
             disable_state_update=True,
             cache_ring=True,
+            round_beta_to_input_dtype=self._round_beta_to_input_dtype,
             replayssm_rawv=layer_cache.replayssm_rawv,
             replayssm_rawk=layer_cache.replayssm_rawk,
             replayssm_g=layer_cache.replayssm_g,
@@ -2003,6 +2019,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            num_stages=self._replayssm_verify_num_stages,
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
