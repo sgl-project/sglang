@@ -891,10 +891,11 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        assert req.bootstrap_room is not None, (
-            "req.bootstrap_room should not be None. Do not send requests directly to "
-            "prefill or decode instances; send to the router instead."
-        )
+        if req.bootstrap_room is None:
+            # No decode looks it up by room (the Rust frontend assigns none to a
+            # request sent straight to a PD server); the scheduler answers or rejects it.
+            self.round_robin_scheduler(req)
+            return
         target_rank = req.bootstrap_room % len(self.workers)
         sock_send(self.workers[target_rank], req)
 

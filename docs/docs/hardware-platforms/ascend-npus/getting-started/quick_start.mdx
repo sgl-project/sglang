@@ -59,7 +59,7 @@ on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
   <Tab title="A3 Series">
 
 ```shell Command
-export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --env ASCEND_VISIBLE_DEVICES=0-15 \

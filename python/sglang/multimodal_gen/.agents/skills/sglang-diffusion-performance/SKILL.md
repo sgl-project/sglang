@@ -17,6 +17,10 @@ degrees, or offload flags is a recipe for a configuration nobody runs.
 
 List `docs/cookbook/diffusion/` for the families that have a page.
 
+For Cosmos3 Sim-Bimanual, warm up the served reference-image geometry and count
+denoise graph replays on both a prompt change and an action change. Report
+short-tail signature misses separately from hits on full chunks.
+
 `test/` configs are pinned CI setups for correctness and regression checks, not
 deployment advice. Use them when you need an exactly reproducible run, and note
 which cookbook flags you diverged from.
