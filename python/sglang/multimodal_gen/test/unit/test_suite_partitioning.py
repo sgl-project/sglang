@@ -6,6 +6,12 @@ who runs what without talking to each other.
 """
 
 import json
+import os
+import runpy
+import subprocess
+import sys
+import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +24,7 @@ from sglang.multimodal_gen.test.runner.diffusion_suite_runner import (
     build_local_partition_assignment,
 )
 from sglang.multimodal_gen.test.server.gpu_cases import (
+    CUDA_STANDALONE_FILES,
     PARAMETRIZED_CASE_GROUPS,
     STANDALONE_FILES,
     TWO_GPU_CASES,
@@ -26,6 +33,7 @@ from sglang.multimodal_gen.test.server.gpu_cases import (
 _H100_BASELINE_PATH = (
     Path(__file__).resolve().parents[1] / "server/perf_baselines/h100.json"
 )
+_PLANNER_DIR = Path(__file__).resolve().parents[5] / "scripts/ci/utils/diffusion"
 
 
 def _items(*est_times: float) -> list[PartitionItem]:
@@ -42,6 +50,37 @@ def _expected_work(suite: str) -> tuple[list[str], list[str]]:
         for case in case_group
     ]
     return case_ids, list(STANDALONE_FILES.get(suite, []))
+
+
+@pytest.mark.parametrize("suite", ["1-gpu", "2-gpu"])
+def test_ci_plan_preserves_registered_standalone_files(tmp_path, suite):
+    """The CUDA CI planner must schedule every standalone file in its registry."""
+    repo_root = Path(__file__).resolve().parents[5]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(
+                repo_root / "scripts/ci/utils/diffusion/compute_diffusion_partitions.py"
+            ),
+        ],
+        env={**os.environ, "GITHUB_OUTPUT": str(tmp_path / "outputs")},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    output_name = {"1-gpu": "1gpu", "2-gpu": "2gpu"}[suite]
+    prefix = f"plan-{output_name}="
+    plan = next(
+        json.loads(line.removeprefix(prefix))
+        for line in result.stdout.splitlines()
+        if line.startswith(prefix)
+    )
+    scheduled = [
+        filename
+        for partition in plan["partitions"]
+        for filename in partition["standalone_files"]
+    ]
+    assert sorted(scheduled) == sorted(CUDA_STANDALONE_FILES[suite])
 
 
 def test_assign_partition_covers_every_item_once():
@@ -109,12 +148,42 @@ def test_file_suite_runs_each_file_once(monkeypatch, tmp_path, total_partitions)
     assert sorted(executed) == sorted(str(tmp_path / filename) for filename in files)
 
 
+@pytest.mark.parametrize("num_gpus", [1, 2])
+def test_sharded_component_accuracy_launches_all_ranks(monkeypatch, num_gpus):
+    suite = f"{num_gpus}-gpu"
+    (rel,) = run_suite.FILE_SUITES[f"component-accuracy-{suite}"]
+    target_dir = Path(run_suite.__file__).resolve().parents[1] / "server"
+    calls = []
+
+    def fail_component(cmd):
+        calls.append(cmd)
+        return 1
+
+    monkeypatch.setattr(run_suite.subprocess, "call", fail_component)
+    code, executed, results, _ = run_suite._run_standalone_file(suite, rel, target_dir)
+    key = f"standalone:{rel}"
+    assert (code, executed, results) == (1, [key], {key: "fail"})
+    (cmd,) = calls
+    launcher = ["torch.distributed.run", "--standalone", "--nproc_per_node=2", "-m"]
+    assert cmd == [
+        sys.executable,
+        "-m",
+        *(launcher if num_gpus == 2 else []),
+        "pytest",
+        "-s",
+        "-v",
+        str(target_dir / rel),
+    ]
+
+
 def test_failing_cases_do_not_skip_the_shards_standalone_files(monkeypatch, tmp_path):
     """Standalone files used to own a shard, so cases could not block them."""
     standalone_rel = "../single_test_file/test_disagg_server.py"
     executed_standalone = []
 
-    def fake_run_standalone_file(suite, rel, target_dir, extra_filter=None):
+    def fake_run_standalone_file(
+        suite, rel, target_dir, extra_filter=None, failure_summary=None
+    ):
         executed_standalone.append(rel)
         key = f"standalone:{rel}"
         return 0, [key], {key: "pass"}, {"used_fallback_estimate": False}
@@ -143,6 +212,178 @@ def test_failing_cases_do_not_skip_the_shards_standalone_files(monkeypatch, tmp_
 
     assert executed_standalone == [standalone_rel]
     assert exit_code == 1
+
+
+@pytest.fixture
+def log_partition(monkeypatch, tmp_path):
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.setenv("SGLANG_DIFFUSION_RETRY_DEADLINE", str(time.time() - 1))
+    monkeypatch.setattr(run_suite, "get_case_est_time", lambda case: 1)
+    monkeypatch.setattr(
+        run_suite, "get_standalone_file_est_time", lambda suite, file: (1, False)
+    )
+    monkeypatch.setattr(
+        run_suite,
+        "_get_parametrized_files_for_case_ids",
+        lambda *args: [str(tmp_path / "test_generation.py")],
+    )
+    monkeypatch.setattr(
+        run_suite, "__file__", str(tmp_path / "runner" / "diffusion_suite_runner.py")
+    )
+
+    def run(case_source, standalone_source):
+        (tmp_path / "test_generation.py").write_text(textwrap.dedent(case_source))
+        (tmp_path / "test_standalone.py").write_text(textwrap.dedent(standalone_source))
+        args = SimpleNamespace(
+            suite="2-gpu",
+            partition_id=0,
+            total_partitions=1,
+            filter=None,
+            continue_on_error=False,
+        )
+        return run_suite._run_partition_assignment(
+            args,
+            tmp_path,
+            PartitionAssignment(
+                case_ids=["case0"], standalone_files=["test_standalone.py"]
+            ),
+        )
+
+    return run
+
+
+def test_failure_reasons_follow_successful_standalone_output(log_partition, capfd):
+    """A passing standalone run must not bury the earlier case's failure reasons."""
+    code = log_partition(
+        """
+        import pytest
+        @pytest.mark.parametrize('case', ['case0'])
+        def test_generation(case):
+            assert False, ('[performance] Validation failed for memory.\\n'
+                           'Actual: 102 MiB\\nExpected: 100 MiB\\nLimit: 101 MiB')
+        """,
+        """
+        def test_standalone():
+            print('STANDALONE_FINISHED')
+        """,
+    )
+    output = capfd.readouterr().out
+    assert code == 1
+    assert output.index("STANDALONE_FINISHED") < output.index(
+        "Failed cases and reasons"
+    )
+    tail = output.split("Failed cases and reasons", 1)[1]
+    assert "test_generation[case0]" in tail
+    assert "Actual: 102 MiB" in tail
+    assert "Expected: 100 MiB" in tail
+    assert "Limit: 101 MiB" in tail
+    assert output.count("Retry budget exhausted") == 1
+
+
+def test_final_reasons_exclude_recovered_cases(log_partition, monkeypatch, capfd):
+    """Recovered retries must not reappear as failures beside a later failing file."""
+    monkeypatch.setenv("SGLANG_DIFFUSION_RETRY_DEADLINE", str(time.time() + 600))
+    code = log_partition(
+        """
+        from pathlib import Path
+        import pytest
+        @pytest.mark.parametrize('case', ['case0'])
+        def test_generation(case):
+            marker = Path(__file__).with_suffix('.attempt')
+            if not marker.exists():
+                marker.touch()
+                assert False, '[performance] transient failure'
+        """,
+        """
+        def test_standalone():
+            assert False, 'standalone failure reason'
+        """,
+    )
+    output = capfd.readouterr().out
+    assert code == 1
+    assert "Recovered retryable failures on attempt 2" in output
+    tail = output.split("Failed cases and reasons", 1)[1]
+    assert "test_generation" not in tail
+    assert "test_standalone" in tail
+    assert "standalone failure reason" in tail
+
+
+def test_parent_progress_precedes_child_output():
+    """Buffered parent progress must appear before the child's direct byte output."""
+    runner_path = run_suite.run_pytest.__code__.co_filename
+    script = textwrap.dedent(
+        f"""
+        import importlib.util
+        import sys
+        spec = importlib.util.spec_from_file_location('pytest_runner', {runner_path!r})
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        print('PARENT_PROGRESS')
+        runner._run_pytest_attempt([sys.executable, '-c', "print('CHILD_OUTPUT')"])
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-E", "-c", script], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.index("PARENT_PROGRESS") < result.stdout.index("CHILD_OUTPUT")
+
+
+def test_observed_suite_prefers_thirty_minutes_over_extra_short_shard(monkeypatch):
+    """The 154-minute CI suite should use five shards, rather than six at 26m."""
+    monkeypatch.syspath_prepend(str(_PLANNER_DIR))
+    namespace = runpy.run_path(str(_PLANNER_DIR / "compute_diffusion_partitions.py"))
+    assert namespace["compute_partition_count"](9255.4, 1200, 1800, 2400, 10) == 5
+
+
+@pytest.mark.parametrize("attempt_order", [(2, 10), (10, 2)])
+@pytest.mark.parametrize("old_status,new_status", [("error", "pass"), ("pass", "fail")])
+def test_coverage_uses_latest_partition_report(
+    tmp_path, monkeypatch, attempt_order, old_status, new_status
+):
+    monkeypatch.syspath_prepend(str(_PLANNER_DIR))
+    namespace = runpy.run_path(str(_PLANNER_DIR / "verify_diffusion_coverage.py"))
+    partitions = [
+        (
+            "1-gpu",
+            0,
+            2,
+            attempt,
+            {"lora": old_status, "old-only": "pass"}
+            if attempt == 2
+            else {"lora": new_status},
+        )
+        for attempt in attempt_order
+    ]
+    partitions.extend(
+        [("1-gpu", 1, 2, 1, {"carried": "pass"}), ("2-gpu", 0, 1, 1, {"tp2": "pass"})]
+    )
+    for suite, partition, total_partitions, attempt, results in partitions:
+        artifact = f"diffusion-report-diffusion-{suite}-h100-{partition}-{attempt}"
+        report_dir = tmp_path / artifact / "sglang/multimodal_gen/test"
+        report_dir.mkdir(parents=True)
+        monkeypatch.setattr(
+            run_suite, "__file__", str(report_dir / "runner/diffusion_suite_runner.py")
+        )
+        run_suite.write_execution_report(
+            suite,
+            partition,
+            total_partitions,
+            executed_cases=list(results),
+            case_results=results,
+        )
+
+    reports = namespace["load_execution_reports"](tmp_path)
+    assert len(reports) == 3
+    assert namespace["collect_case_results"](reports) == {
+        "1-gpu": {"lora": new_status, "carried": "pass"},
+        "2-gpu": {"tp2": "pass"},
+    }
+    executed = namespace["collect_executed_cases"](reports)
+    complete, missing = namespace["verify_coverage"](
+        {"1-gpu": {"lora", "carried", "old-only"}, "2-gpu": {"tp2"}}, executed
+    )
+    assert not complete
+    assert missing == {"1-gpu": {"old-only"}}
 
 
 def test_two_gpu_cases_have_h100_full_test_time_estimates():

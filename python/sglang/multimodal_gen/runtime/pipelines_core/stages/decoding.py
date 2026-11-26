@@ -31,6 +31,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+    streamed_video_output_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
@@ -49,6 +53,21 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 )
 
 logger = init_logger(__name__)
+
+
+def decode_parallelism_type(vae) -> StageParallelismType:
+    """Every rank decodes unless CFG parallel duplicates the latents on ranks
+    whose output is dropped: then only the main CFG rank does, or all of them
+    when the VAE shards the decode over the ranks."""
+    if not get_global_server_args().enable_cfg_parallel:
+        return StageParallelismType.REPLICATED
+    if (
+        model_parallel_is_initialized()
+        and get_decode_parallel_world_size() > 1
+        and vae.use_parallel_decode
+    ):
+        return StageParallelismType.REPLICATED
+    return StageParallelismType.MAIN_RANK_ONLY
 
 
 def scale_and_shift_latents(latents: torch.Tensor, server_args, vae) -> torch.Tensor:
@@ -98,6 +117,12 @@ def _ensure_tensor_decode_output(decode_output):
     return decode_output
 
 
+def _to_unit_range(image: torch.Tensor, *, in_place: bool = False) -> torch.Tensor:
+    if in_place:
+        return image.div_(2).add_(0.5).clamp_(0, 1)
+    return (image / 2 + 0.5).clamp(0, 1)
+
+
 class DecodingStage(PipelineStage):
     """
     Stage for decoding latent representations into pixel space.
@@ -135,19 +160,7 @@ class DecodingStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        server_args = get_global_server_args()
-        if server_args.enable_cfg_parallel:
-            if self._can_use_parallel_decode():
-                return StageParallelismType.REPLICATED
-            return StageParallelismType.MAIN_RANK_ONLY
-        return StageParallelismType.REPLICATED
-
-    def _can_use_parallel_decode(self) -> bool:
-        return (
-            model_parallel_is_initialized()
-            and get_decode_parallel_world_size() > 1
-            and self.vae.use_parallel_decode
-        )
+        return decode_parallelism_type(self.vae)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify decoding stage inputs."""
@@ -208,6 +221,7 @@ class DecodingStage(PipelineStage):
         server_args: ServerArgs,
         *,
         vae_dtype: torch.dtype,
+        on_frames=None,
     ) -> torch.Tensor:
         """
         Decode latent representations into pixel space using VAE.
@@ -220,11 +234,48 @@ class DecodingStage(PipelineStage):
                   VAE precision ("fp32", "fp16", "bf16")
                 - pipeline_config.vae_precision: fallback VAE precision
                 - pipeline_config.vae_tiling: Whether to enable VAE tiling for memory efficiency
+            on_frames: Receives finished video frames in order. VAEs without a
+                frame callback hand over the complete decoded clip once.
 
         Returns:
             Decoded video tensor with shape (batch, channels, frames, height, width),
-            normalized to [0, 1] range and moved to CPU as float32
+            normalized to [0, 1] on the decode device.
         """
+        normalized_on_frames = (
+            (lambda frames: on_frames(_to_unit_range(frames)))
+            if on_frames is not None
+            and isinstance(self.vae, ParallelTiledVAE)
+            and self.vae.supports_decode_on_frames
+            else None
+        )
+        image = self.decode_raw(
+            latents,
+            server_args,
+            vae_dtype=vae_dtype,
+            on_frames=normalized_on_frames,
+        )
+        # Safe in place: image is decode_raw's fresh output, with no other
+        # live reference to its pre-normalization values.
+        image = _to_unit_range(image, in_place=True)
+        if (
+            on_frames is not None
+            and normalized_on_frames is None
+            and image.ndim == 5
+            and image.shape[:2] == (1, 3)
+        ):
+            on_frames(image)
+        return image
+
+    @torch.no_grad()
+    def decode_raw(
+        self,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+        *,
+        vae_dtype: torch.dtype,
+        on_frames=None,
+    ) -> torch.Tensor:
+        """Decode without pixel normalization, including for inter-clip conditioning."""
         latents = latents.to(get_local_torch_device())
         # The caller resolves the decode-only override before component use so
         # residency and execution agree on the target dtype.
@@ -257,11 +308,20 @@ class DecodingStage(PipelineStage):
             should_cast_vae = not vae_autocast_enabled
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
+            decode_kwargs = {}
+            streams_frames = (
+                isinstance(self.vae, ParallelTiledVAE)
+                and self.vae.supports_decode_on_frames
+            )
+            if on_frames is not None and streams_frames:
+                decode_kwargs["on_frames"] = on_frames
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
                 try:
-                    decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
+                    decode_output = self._get_vae_decode_fn(vae, server_args)(
+                        latents, **decode_kwargs
+                    )
                 except Exception as error:
                     if "out of memory" in str(error).lower():
                         # decode runs after denoising, so the DiT and encoders
@@ -286,8 +346,14 @@ class DecodingStage(PipelineStage):
                     raise
                 image = _ensure_tensor_decode_output(decode_output)
 
-        # De-normalize image to [0, 1] range
-        image = (image / 2 + 0.5).clamp(0, 1)
+        if (
+            on_frames is not None
+            and not streams_frames
+            and image.ndim == 5
+            and image.shape[:2] == (1, 3)
+        ):
+            on_frames(image)
+
         return image
 
     def load_model(self):
@@ -304,6 +370,26 @@ class DecodingStage(PipelineStage):
             if pipeline:
                 pipeline.add_module(self.component_name, self.vae)
             self.server_args.model_loaded[self.component_name] = True
+
+    def _encode_while_decoding(
+        self, batch: Req, server_args: ServerArgs
+    ) -> EncodeWhileDecoding | None:
+        """An encoder to feed during the decode, if the frames go to the file as decoded."""
+        if (
+            type(self).forward is not DecodingStage.forward
+            or type(self).decode is not DecodingStage.decode
+            or not isinstance(self.vae, ParallelTiledVAE)
+            or not self.vae.supports_decode_on_frames
+            or batch.return_trajectory_decoded
+            or not isinstance(batch.latents, torch.Tensor)
+        ):
+            return None
+        save_file_path = streamed_video_output_path(
+            batch, server_args, int(batch.latents.shape[0])
+        )
+        if save_file_path is None:
+            return None
+        return EncodeWhileDecoding(save_file_path, batch)
 
     @torch.no_grad()
     def forward(
@@ -327,6 +413,8 @@ class DecodingStage(PipelineStage):
             self.component_name,
             quality=batch.sampling_params.quality,
         )
+        stream = self._encode_while_decoding(batch, server_args)
+        output_file_paths = None
         with self.use_declared_component(
             component_name=self.component_name,
             module=self.vae,
@@ -340,7 +428,27 @@ class DecodingStage(PipelineStage):
                 vae,
                 quality_allows(batch.sampling_params.quality, "lossless"),
             ):
-                frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
+                decode_latents = server_args.pipeline_config.prepare_decoding_latents(
+                    batch, server_args=server_args, vae=vae
+                )
+                try:
+                    if stream is None:
+                        # Model-specific decode overrides need not support streaming.
+                        frames = self.decode(
+                            decode_latents, server_args, vae_dtype=vae_dtype
+                        )
+                    else:
+                        frames = self.decode(
+                            decode_latents,
+                            server_args,
+                            vae_dtype=vae_dtype,
+                            on_frames=stream,
+                        )
+                        output_file_paths = stream.finish()
+                except BaseException:
+                    if stream is not None:
+                        stream.abort()
+                    raise
 
                 # decode trajectory latents if needed
                 if batch.return_trajectory_decoded:
@@ -369,11 +477,20 @@ class DecodingStage(PipelineStage):
                 else:
                     trajectory_decoded = None
 
-        frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        if output_file_paths is None:
+            frames = server_args.pipeline_config.post_decoding(frames, server_args)
+            frames = server_args.pipeline_config.postprocess_decoded_batch(
+                frames, batch, server_args
+            )
+        else:
+            frames = None
 
         # Update batch with decoded image
         output_batch = OutputBatch(
             output=frames,
+            output_file_paths=output_file_paths,
+            audio=batch.audio,
+            audio_sample_rate=batch.audio_sample_rate,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             rollout_trajectory_data=batch.rollout_trajectory_data,

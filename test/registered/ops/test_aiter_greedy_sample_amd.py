@@ -15,10 +15,10 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.device import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd")
 
 
 def _mock_global_server_args(backend="pytorch"):

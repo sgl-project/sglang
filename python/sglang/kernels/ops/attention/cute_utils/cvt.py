@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/4868b542c9dfd166662eecc4bb8be3a36a3feaa2/vllm/cute_utils/cvt.py
-from cutlass import Constexpr, Float32, Uint32, cute
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, vector
+from cutlass import Float32, Uint32, cute
+from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
@@ -48,99 +47,3 @@ def bf16x2_to_fp32x2(data, *, loc=None, ip=None) -> tuple[Float32, Float32]:
 
     else:
         raise ValueError(f"Unsupported type {type(data)}")
-
-
-@dsl_user_op
-def fp8x4_to_bf16x4(x: Uint32, *, loc=None, ip=None) -> cute.TensorSSA:
-    # there is only fp8->fp16 conversion, hence we need to go
-    # round trip through fp16.
-    out = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32()] * 2),
-        [x.ir_value(loc=loc, ip=ip)],
-        "{\n\t"
-        ".reg .b16 x0, x1;\n\t"
-        ".reg .b16 t00, t01, t10, t11;\n\t"
-        "mov.b32 {x0, x1}, $2;\n\t"
-        "cvt.rn.f16x2.e4m3x2 $0, x0;\n\t"
-        "cvt.rn.f16x2.e4m3x2 $1, x1;\n\t"
-        "mov.b32 {t00, t01}, $0;\n\t"
-        "mov.b32 {t10, t11}, $1;\n\t"
-        "cvt.rn.bf16.f16 t00, t00;\n\t"
-        "cvt.rn.bf16.f16 t01, t01;\n\t"
-        "cvt.rn.bf16.f16 t10, t10;\n\t"
-        "cvt.rn.bf16.f16 t11, t11;\n\t"
-        "mov.b32 $0, {t00, t01};\n\t"
-        "mov.b32 $1, {t10, t11};\n\t"
-        "}\n",
-        "=r,=r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
-    vec = vector.from_elements(
-        ir.VectorType.get([2], T.i32(), loc=loc),
-        [llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip) for i in range(2)],
-        loc=loc,
-        ip=ip,
-    )
-    return cute.TensorSSA(vec, 2, Uint32)
-
-
-@dsl_user_op
-def fp32x4_to_fp8x4(
-    a0: Float32,
-    a1: Float32,
-    a2: Float32,
-    a3: Float32,
-    *,
-    loc=None,
-    ip=None,
-) -> Uint32:
-    # Pack four FP32 values into one b32 of four e4m3 bytes, byte order
-    # {a0, a1, a2, a3} from low to high address.
-    out = llvm.inline_asm(
-        T.i32(),
-        [
-            a0.ir_value(loc=loc, ip=ip),
-            a1.ir_value(loc=loc, ip=ip),
-            a2.ir_value(loc=loc, ip=ip),
-            a3.ir_value(loc=loc, ip=ip),
-        ],
-        "{\n\t"
-        ".reg .b16 t0, t1;\n\t"
-        "cvt.rn.satfinite.e4m3x2.f32 t0, $2, $1;\n\t"
-        "cvt.rn.satfinite.e4m3x2.f32 t1, $4, $3;\n\t"
-        "mov.b32 $0, {t0, t1};\n\t"
-        "}\n",
-        "=r,f,f,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
-    return Uint32(out)
-
-
-@dsl_user_op
-def fp32x8_to_fp4x8(
-    vals: cute.Tensor,
-    offset: Constexpr[int],
-    *,
-    loc=None,
-    ip=None,
-) -> Uint32:
-    # Pack eight scaled FP32 values into four E2M1x2 bytes, returned as one b32.
-    assert vals.element_type is Float32
-    out = llvm.inline_asm(
-        T.i32(),
-        [vals[offset + i].ir_value(loc=loc, ip=ip) for i in range(8)],
-        "{\n\t"
-        ".reg .b8 x0, x1, x2, x3;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 x0, $2, $1;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 x1, $4, $3;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 x2, $6, $5;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 x3, $8, $7;\n\t"
-        "mov.b32 $0, {x0, x1, x2, x3};\n\t"
-        "}\n",
-        "=r,f,f,f,f,f,f,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
-    return Uint32(out)

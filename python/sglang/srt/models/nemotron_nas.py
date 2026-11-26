@@ -17,6 +17,7 @@
 
 """Inference-only deci model compatible with HuggingFace weights."""
 
+import logging
 from typing import Iterable, Optional, Tuple, Type, Union
 
 import torch
@@ -34,6 +35,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -46,8 +49,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.llama import LlamaAttention, LlamaMLP
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:
@@ -134,17 +137,12 @@ class DeciLMDecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
-        # A layer whose attention and FFN are both no-ops has no stages.
-        stages = []
+        norms = []
         if not self._is_no_op_attention:
-            stages.append((declare_attn(), self.input_layernorm))
+            norms.append(self.input_layernorm)
         if not self._is_no_op_ffn:
-            stages.append(
-                (
-                    declare_ffn(sparse=False, next_layer_sparse=False),
-                    self.post_attention_layernorm,
-                )
-            )
+            norms.append(self.post_attention_layernorm)
+        stages = list(zip(self.stage_facts(config, layer_idx), norms, strict=True))
         self.entry_boundary = None
         if stages:
             boundaries = append_stages(
@@ -155,6 +153,20 @@ class DeciLMDecoderLayer(nn.Module):
                 self.attn_boundary = boundaries[0]
             if not self._is_no_op_ffn:
                 self.ffn_boundary = boundaries[-1]
+
+    @staticmethod
+    def stage_facts(config: LlamaConfig, layer_idx: int):
+        """The stages a DeciLM layer declares, from its block config alone:
+        the model's shared declaration function, which the layer declares
+        with too (see make_layers)."""
+        block_config = config.block_configs[layer_idx]
+        # A layer whose attention and FFN are both no-ops has no stages.
+        stages = []
+        if not block_config.attention.no_op:
+            stages.append(declare_attn())
+        if not block_config.ffn.no_op:
+            stages.append(declare_ffn(sparse=False, next_layer_sparse=False))
+        return tuple(stages)
 
     def forward(
         self,
@@ -223,6 +235,7 @@ class DeciModel(nn.Module):
             config.num_hidden_layers,
             get_layer,
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: layer_type.stage_facts(config, idx),
         )
         if get_parallel().pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

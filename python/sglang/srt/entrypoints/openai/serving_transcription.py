@@ -97,7 +97,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         else:
             sampling_params = self._adapter.build_sampling_params(request)
         adapted_request = GenerateReqInput(
-            text="",  # Empty text — the multimodal processor sets proper decoder/prompt tokens
+            text=self._adapter.build_prompt(request, self.tokenizer_manager.tokenizer),
             audio_data=request.audio_data,
             sampling_params=sampling_params,
             stream=request.stream,
@@ -119,7 +119,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             # soundfile can't parse some containers (e.g. mp3 on older
             # libsndfile builds); fall back to a full decode.
             try:
-                from sglang.srt.utils import load_audio
+                from sglang.srt.multimodal.media_io import load_audio
 
                 audio = load_audio(audio_data, sr=16000, mono=True)
                 return audio.shape[-1] / 16000.0
@@ -336,7 +336,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         sampling_params = adapted_request.sampling_params
         assert isinstance(sampling_params, dict)
         chunk_request = GenerateReqInput(
-            text="",
+            text=adapted_request.text,
             audio_data=chunk_audio,
             sampling_params=dict(sampling_params),
             stream=stream,
@@ -755,6 +755,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     is_last=is_last,
                     raw_request=raw_request,
                     routing_key=self.extract_routing_key(raw_request),
+                    rendered_text=adapted_request.text,
                 )
 
                 if delta:
@@ -804,6 +805,5 @@ class OpenAIServingTranscription(OpenAIServingBase):
             websocket,
             tokenizer_manager=self.tokenizer_manager,
             adapter=self._adapter,
-            server_args=self.tokenizer_manager.server_args,
             session_semaphore=self._session_semaphore,
         )

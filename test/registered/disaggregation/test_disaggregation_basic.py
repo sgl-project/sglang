@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -22,12 +23,14 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
+    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=1007, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=584, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
@@ -37,6 +40,8 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.pause_generate_url = cls.lb_url
         cls.pause_target_urls = [cls.prefill_url, cls.decode_url]
+        cls.extra_prefill_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
+        cls.extra_decode_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
         cls.launch_all()
 
     def test_gsm8k(self):
@@ -132,6 +137,56 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         # ensure the output is a valid JSON
         json.loads(output)
 
+    def test_prefill_answers_one_token_request_alone(self):
+        def generate(url, prompt, max_new_tokens, n=1):
+            return requests.post(
+                url + "/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": max_new_tokens,
+                        "n": n,
+                    },
+                },
+                timeout=60,
+            )
+
+        # A request for one token that names no decode gets from the prefill
+        # server the answer the prefill and decode give through the router.
+        prompt = "The capital of France is"
+        routed = generate(self.lb_url, prompt, 1).json()
+        alone = generate(self.prefill_url, prompt, 1)
+        self.assertEqual(alone.status_code, 200, alone.text)
+        alone = alone.json()
+        self.assertEqual(alone["output_ids"], routed["output_ids"])
+        self.assertEqual(
+            alone["meta_info"]["finish_reason"], routed["meta_info"]["finish_reason"]
+        )
+
+        # Its prompt is cached like any other, unlike a fake-bootstrap probe's.
+        unseen = " ".join(["An unseen prompt about cached prefixes."] * 40)
+        first = generate(self.prefill_url, unseen, 1).json()["meta_info"]
+        again = generate(self.prefill_url, unseen, 1).json()["meta_info"]
+        self.assertGreater(again["cached_tokens"], first["cached_tokens"])
+
+        # A request for no token is answered too, with none.
+        empty = generate(self.prefill_url, prompt, 0)
+        self.assertEqual(empty.status_code, 200, empty.text)
+        self.assertEqual(empty.json()["output_ids"], [])
+
+        # Parallel samples first warm the prompt up with such a request.
+        samples = generate(self.prefill_url, prompt, 1, n=2)
+        self.assertEqual(samples.status_code, 200, samples.text)
+        self.assertEqual(
+            [sample["output_ids"] for sample in samples.json()],
+            [routed["output_ids"]] * 2,
+        )
+
+        # Nothing would continue a longer request.
+        longer = generate(self.prefill_url, prompt, 2)
+        self.assertEqual(longer.status_code, 400, longer.text)
+
     def test_first_token_finish(self):
         client = openai.Client(api_key="empty", base_url=f"{self.lb_url}/v1")
         tokenizer = AutoTokenizer.from_pretrained(self.model)
@@ -195,30 +250,30 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
         cls._disagg_failure_ctx.__exit__(None, None, None)
         super().tearDownClass()
 
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=f"http://{self.base_host}:{self.lb_port}",
-            eval_name="gsm8k",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
+    def test_servers_survive_transfer_failures(self):
+        # Failures are injected on every poll, so nearly every request fails.
+        # Send them directly: an eval client retries each failure with backoff
+        # and spends minutes waiting without checking anything more.
+        def generate(i):
+            return requests.post(
+                self.lb_url + "/generate",
+                json={
+                    "text": f"Request {i}: The capital of France is",
+                    "sampling_params": {"max_new_tokens": 32},
+                },
+                timeout=120,
+            )
 
-        # Expect lots of failure but the server cannot crash
-        try:
-            metrics = run_sgl_eval(args)
-            print(f"Evaluation metrics: {metrics}")
-        except Exception as e:
-            print(f"Test encountered expected errors: {e}")
-            # Check if servers are still healthy
-            try:
-                response = requests.get(self.prefill_url + "/health_generate")
-                assert response.status_code == 200
-                response = requests.get(self.decode_url + "/health_generate")
-                assert response.status_code == 200
-            except Exception as health_check_error:
-                # If health check fails, re-raise the original exception
-                raise e from health_check_error
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            statuses = [r.status_code for r in pool.map(generate, range(64))]
+        print(f"Response status counts: {Counter(statuses)}")
+
+        # Requests may fail, but neither server may crash or stop serving.
+        for name, process, url in [
+            ("prefill", self.process_prefill, self.prefill_url),
+            ("decode", self.process_decode, self.decode_url),
+        ]:
+            assert_process_healthy(self, name, process, url, "/health_generate")
 
 
 class TestDisaggregationMooncakeSpec(
@@ -436,6 +491,7 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.extra_decode_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
         cls.launch_all()
 
     def test_retract_pause_decode_running_batch(self):
@@ -468,6 +524,7 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
             async with session.post(
                 url,
                 json=json_data,
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 resp.raise_for_status()
@@ -612,6 +669,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             "--max-running-requests",
             str(cls.MAX_RUNNING),
             "--enable-metrics",
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
         cls.launch_all()
 
@@ -634,12 +692,14 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             async with session.post(
                 self.prefill_url + "/pause_generation",
                 json={"mode": mode},
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
             async with session.post(
                 self.prefill_url + "/continue_generation",
                 json={},
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
@@ -707,6 +767,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             async with session.post(
                 url,
                 json=json_data,
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp.raise_for_status()

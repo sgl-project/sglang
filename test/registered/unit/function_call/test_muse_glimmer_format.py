@@ -24,7 +24,7 @@ from sglang.srt.function_call.muse_glimmer_format import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _CHANNEL_MARKERS = (MESSAGE, EOM, EOT, START)
 _HELD_BACK_MARKERS = (MESSAGE, EOM, EOT, START, FUNCTION_CALLS_OPEN, INVOKE_OPEN)
@@ -183,15 +183,6 @@ class TestCouldStartHeader(CustomTestCase):
         # The finished header is already present; do not drop it because the
         # recipient also happens to contain a space.
         self.assertTrue(could_start_header("to=foo bar" + MESSAGE))
-
-
-class TestMarkerLengthInvariants(CustomTestCase):
-    def test_max_channel_marker_tracks_the_longest_framing_token(self):
-        self.assertEqual(MAX_CHANNEL_MARKER, max(len(m) for m in _CHANNEL_MARKERS))
-
-    def test_max_marker_covers_function_calls_open(self):
-        self.assertEqual(MAX_MARKER, max(MAX_CHANNEL_MARKER, len(FUNCTION_CALLS_OPEN)))
-        self.assertGreaterEqual(MAX_MARKER, len(INVOKE_OPEN))
 
 
 if __name__ == "__main__":

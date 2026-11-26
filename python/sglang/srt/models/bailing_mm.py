@@ -24,21 +24,18 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe import BailingMoeV2ForCausalLM
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -118,13 +115,12 @@ class BailingMMNativeForConditionalGeneration(nn.Module):
                 self.linear_proj = PPMissingLayer()
 
         self.is_mrope_enabled = "mrope_section" in config.llm_config.rope_parameters
-        self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        return self.pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def _get_vision_feature(
         self, items: List[MultimodalDataItem], grid_thw: torch.Tensor

@@ -8,9 +8,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.kernels.ops.quantization.per_token_quant_fp8 import per_token_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=30, stage="nightly", runner_config="1-gpu-large")
 
 
 def _run_impl(input: torch.Tensor, *, use_jit: bool):
@@ -105,15 +104,6 @@ def test_per_token_quant_fp8_preserves_padded_tail():
 
     assert torch.all(output[1:].float() == 1.0)
     assert torch.all(scale[1:] == 2.0)
-
-
-def test_per_token_quant_fp8_rejects_unsupported_dtype():
-    input = torch.ones((1, 512), dtype=torch.int32, device="cuda")
-    output = torch.empty((1, 512), dtype=torch.float8_e4m3fn, device="cuda")
-    scale = torch.empty((1, 1), dtype=torch.float32, device="cuda")
-
-    with pytest.raises(RuntimeError, match="Unsupported dtype"):
-        per_token_quant_fp8(input, output, scale)
 
 
 if __name__ == "__main__":

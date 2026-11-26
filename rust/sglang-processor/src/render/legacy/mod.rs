@@ -1166,12 +1166,14 @@ mod tests {
                 ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                     content: ChatCompletionRequestSystemMessageContent::Text("sys".into()),
                     name: None,
+                    tools: None,
                 }),
                 ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                     content: ChatCompletionRequestUserMessageContent::Array(vec![
                         ChatCompletionRequestUserMessageContentPart::Text(
                             ChatCompletionRequestMessageContentPartText {
                                 text: "Hello".into(),
+                                prompt_cache_breakpoint: None,
                             },
                         ),
                     ]),

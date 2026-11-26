@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     Qwen2_5VLVisionTransformer,
 )
+from sglang.multimodal_gen.runtime.models.encoders.qwen_vl import QwenVLModelBase
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
     apply_qwen_vl_text_rope,
     build_qwen_vl_text_rope,
@@ -465,7 +466,6 @@ class Qwen2_5_VLTextModel(nn.Module):
         )
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
-        self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         # self.post_init()
 
@@ -623,7 +623,7 @@ class Qwen2_5_VLTextModel(nn.Module):
         )
 
 
-class Qwen2_5_VLModel(nn.Module):
+class Qwen2_5_VLModel(QwenVLModelBase):
     base_model_prefix = ""
     _checkpoint_conversion_mapping = {"^model": "language_model"}
     # Reference: fix gemma3 grad acc #37208
@@ -640,18 +640,6 @@ class Qwen2_5_VLModel(nn.Module):
         self.config = config
         # Initialize weights and apply final processing
         # self.post_init()
-
-    def get_input_embeddings(self):
-        return self.language_model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.language_model.embed_tokens = value
-
-    def set_decoder(self, decoder):
-        self.language_model = decoder
-
-    def get_decoder(self):
-        return self.language_model
 
     def get_rope_index(
         self,
@@ -855,31 +843,7 @@ class Qwen2_5_VLModel(nn.Module):
             ).unsqueeze(1)
             return position_ids, mrope_position_deltas
         else:
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = (
-                    position_ids.unsqueeze(0)
-                    .expand(3, -1, -1)
-                    .to(attention_mask.device)
-                )
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-                    -1, keepdim=True
-                )[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-            else:
-                position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
-                )
-                mrope_position_deltas = torch.zeros(
-                    [input_ids.shape[0], 1],
-                    device=input_ids.device,
-                    dtype=input_ids.dtype,
-                )
-
-            return position_ids, mrope_position_deltas
+            return self._get_text_rope_index(input_ids, attention_mask)
 
     def get_video_features(
         self,
@@ -925,68 +889,6 @@ class Qwen2_5_VLModel(nn.Module):
         ).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
         return image_embeds
-
-    def get_placeholder_mask(
-        self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
-        image_features: torch.FloatTensor = None,
-        video_features: torch.FloatTensor = None,
-    ):
-        """
-        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
-        equal to the length of multimodal features. If the lengths are different, an error is raised.
-        """
-        if input_ids is None:
-            special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(
-                    self.config.image_token_id,
-                    dtype=torch.long,
-                    device=inputs_embeds.device,
-                )
-            )
-            special_image_mask = special_image_mask.all(-1)
-            special_video_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(
-                    self.config.video_token_id,
-                    dtype=torch.long,
-                    device=inputs_embeds.device,
-                )
-            )
-            special_video_mask = special_video_mask.all(-1)
-        else:
-            special_image_mask = input_ids == self.config.image_token_id
-            special_video_mask = input_ids == self.config.video_token_id
-
-        n_image_tokens = special_image_mask.sum()
-        special_image_mask = (
-            special_image_mask.unsqueeze(-1)
-            .expand_as(inputs_embeds)
-            .to(inputs_embeds.device)
-        )
-        if (
-            image_features is not None
-            and inputs_embeds[special_image_mask].numel() != image_features.numel()
-        ):
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
-            )
-
-        n_video_tokens = special_video_mask.sum()
-        special_video_mask = (
-            special_video_mask.unsqueeze(-1)
-            .expand_as(inputs_embeds)
-            .to(inputs_embeds.device)
-        )
-        if (
-            video_features is not None
-            and inputs_embeds[special_video_mask].numel() != video_features.numel()
-        ):
-            raise ValueError(
-                f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
-            )
-
-        return special_image_mask, special_video_mask
 
     def forward(
         self,
@@ -1122,24 +1024,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
     layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
     _fsdp_forward_methods = ("generate",)
 
-    # BitandBytes specific attributes
-    default_bitsandbytes_target_modules = [
-        ".gate_up_proj.",
-        ".down_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
-
     def __init__(
         self,
         config: Qwen2_5VLConfig,
@@ -1166,9 +1050,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         self.generation_config = generation_config
 
         self.config = config
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
 
     @torch.no_grad()
     def forward(
@@ -1429,22 +1310,16 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
                     break
                 if loaded_stacked_param:
                     continue
-            try:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-            except KeyError:
-                raise
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            param = params_dict[name]
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             loaded_weight = loaded_weight.to(param.dtype)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
 
 
 EntryClass = Qwen2_5_VLForConditionalGeneration

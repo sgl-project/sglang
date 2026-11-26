@@ -158,9 +158,8 @@ class TestKimiAttentionParallelGroups(CustomTestCase):
                                 self.assertEqual(
                                     module.all_reduce_fusion, active_fusion
                                 )
-                                self.assertEqual(
-                                    module.o_proj.reduce_results, not active_fusion
-                                )
+                                # The stage boundary completes the attention-TP sum.
+                                self.assertFalse(module.o_proj.reduce_results)
                                 self.assertEqual(
                                     module.o_proj.use_dp_attention_reduce,
                                     not active_fusion,

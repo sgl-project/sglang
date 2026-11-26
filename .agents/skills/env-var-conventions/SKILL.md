@@ -23,7 +23,7 @@ Group the new entry under an existing section comment (e.g. `# Logging Options`,
 | `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`, `HOME`, `PATH` | Distributed launcher / OS | **No.** `os.getenv` only. |
 | Test runner internals (`PYTEST_CURRENT_TEST`, etc.) | Test framework | **No.** `os.getenv` only. |
 
-`SGL_*` is **not** a parallel valid prefix — it's a deprecated legacy alias. `_convert_SGL_to_SGLANG` rewrites `SGL_*` to `SGLANG_*` at import time with a `DeprecationWarning`. Never define a new `SGL_*` descriptor or `os.getenv("SGL_...")` call site; if you see one in code, it's tech debt to migrate.
+`SGL_*` is **not** a valid prefix — the legacy alias was removed in SGLang 1.0, and server startup stops when an `SGL_<X>` is set for a registered `SGLANG_<X>` (`validate_removed_options`). Never define a new `SGL_*` descriptor or `os.getenv("SGL_...")` call site; if you see one in code, it's tech debt to migrate.
 
 The rule of thumb: if the value's lifecycle is owned by sglang code (we read it, we may want to override it in tests, we may want to rename it), put it in `Envs`. If the value is set by something outside sglang and we only consume it as-is, use `os.getenv`.
 
@@ -31,7 +31,7 @@ The rule of thumb: if the value's lifecycle is owned by sglang code (we read it,
 
 | Type | Use for |
 |---|---|
-| `EnvBool(default)` | boolean flag |
+| `EnvBool(default)` | boolean flag; accepts `true`/`1`/`yes`/`y`/`on` and `false`/`0`/`no`/`n`/`off`, case-insensitive |
 | `EnvInt(default)` | integer |
 | `EnvFloat(default)` | float |
 | `EnvStr(default)` | string |
@@ -75,10 +75,10 @@ if envs.SGLANG_FOO.get():
 
 | Method | Use |
 |---|---|
-| `.get()` | Read value (parsed). Returns `default` if unset, or `None` if explicitly set to None. |
+| `.get()` | Read value (parsed). Returns `default` if unset, or `None` if explicitly set to None. An empty value reads as unset, except for `EnvStr` and `EnvTuple`. Raises `ValueError` naming the variable when the value does not parse; server startup parses every set variable first (`validate_env_values`). |
 | `.set(value)` | Set value. `set(None)` flips the internal `_set_to_none` flag so the next `.get()` returns `None`, not `default`. |
 | `.clear()` | Unset entirely. Next `.get()` returns `default`. |
-| `.is_set()` | True iff the key is present in `os.environ` (regardless of value, including the explicit-None case). |
+| `.is_set()` | True iff the key is present in `os.environ` (including the explicit-None case) and, for a type other than `EnvStr` and `EnvTuple`, its value is not empty. |
 | `.override(value)` | Context manager — set on enter, restore exactly what was there on exit. Use this in tests. |
 
 The `_set_to_none` distinction matters: `clear()` → `is_set()=False, get()=default`; `set(None)` → `is_set()=True, get()=None`. A few descriptors (e.g. `SGLANG_TEST_MAX_RETRY = EnvInt(None)`, `SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)`) rely on this to distinguish "user opted out" from "default applies".
@@ -131,14 +131,14 @@ The `allow_sglang=True` escape hatch exists for the rare case where you must byp
 
 ## Rule 4 — Naming: `SGLANG_` prefix + verb category
 
-Prefix is always `SGLANG_` for new entries. `SGL_*` is auto-translated to `SGLANG_*` with a `DeprecationWarning` in `_convert_SGL_to_SGLANG`; never add a new `SGL_*` key.
+Prefix is always `SGLANG_` for new entries; never add a new `SGL_*` key.
 
 The second token signals intent. Pick the right verb up front — renames require an alias entry (Rule 5).
 
 | Verb | Meaning | Example |
 |---|---|---|
 | `ENABLE_FOO` | Knob that turns feature foo on/off. Default in the `EnvBool` encodes prod behavior. | `SGLANG_ENABLE_TORCH_COMPILE`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM` |
-| `DISABLE_FOO` | Kill-switch. `DISABLE_FOO=True` turns foo off. | `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP` |
+| `DISABLE_FOO` | Kill-switch. `DISABLE_FOO=True` turns foo off. | `SGLANG_DISABLE_OVERLAP_AFTER_PREFILL` |
 | `USE_FOO` | Selects which implementation / backend | `SGLANG_USE_AITER`, `SGLANG_USE_DEEPGEMM_BMM` |
 | `FORCE_FOO` | Overrides autodetection | `SGLANG_FORCE_FP8_MARLIN`, `SGLANG_FORCE_STREAM_INTERVAL` |
 | `LOG_FOO` | Logging-only knob | `SGLANG_LOG_GC`, `SGLANG_LOG_MS` |
@@ -157,7 +157,7 @@ Picking between `ENABLE_FOO` and `DISABLE_FOO`: both verbs are valid. The only f
 
 `SGLANG_*` is the canonical sglang prefix. Vendor-integration keys (`MOONCAKE_*`, `ASCEND_*`, `DEEP_NORMAL_*`, `IS_H200`) keep their upstream prefix and live in the same `Envs` class — these are integration aliases, not sglang-owned feature flags.
 
-## Rule 5 — Renames go through `*WithAlias` or `_print_deprecated_env`
+## Rule 5 — Renames go through `*WithAlias`; removals go through `_DEPRECATED_ENVS`
 
 For a rename where the old key must keep working with a warning:
 
@@ -165,23 +165,20 @@ For a rename where the old key must keep working with a warning:
 SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
 ```
 
-Use `EnvBoolWithAlias` / `EnvIntWithAlias`. The fallback emits a `DeprecationWarning` and copies the old value over.
+Use `EnvBoolWithAlias` / `EnvIntWithAlias` / `EnvStrWithAlias`. The fallback warns and copies the old value over.
 
-For a full removal where the env var is going away, add to `_convert_SGL_to_SGLANG`:
-
-```python
-_print_deprecated_env("SGLANG_OLD_NAME", "SGLANG_NEW_NAME")  # mapped to a replacement
-_print_deprecated_env("SGLANG_OLD_NAME")                     # no replacement, gone
-```
-
-For env-var to CLI-flag migration, add at module top-level:
+For a removal, or a var replaced by a CLI flag or another var, add an entry to `_DEPRECATED_ENVS` in `environ.py` and delete the descriptor:
 
 ```python
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_FOO",
-    "Please use '--foo' instead.",
-)
+_DEPRECATED_ENVS = {
+    "SGLANG_OLD_NAME": _DeprecatedEnv(replacement="SGLANG_NEW_NAME"),       # value forwarded
+    "SGLANG_GONE": _DeprecatedEnv(note="Pass --foo instead."),              # warns only
+}
 ```
+
+When the deprecation period ends, delete the alias or the `_DEPRECATED_ENVS` entry and add the old name to `REMOVED_ENVS` in `environ.py` with what to use instead; server startup stops while it is still set (`validate_removed_options`).
+
+A var that only restated the hardware, or only killed an architecture-gated default, is deleted outright with its whole footprint; see the code-cleanup skill's catalog.
 
 Don't silently flip a default during a rename. If the new default disagrees with the old one, that's a behavior change — call it out in the PR body separately from the rename.
 
@@ -192,9 +189,11 @@ Don't silently flip a default during a rename. If the new default disagrees with
 | User-facing (documented, expected to flip per deployment) | `server_args.py` CLI flag |
 | Expert toggle, A-B kill-switch, vendor integration | `environ.py` env var |
 | Test / debug hook | `environ.py` env var with `TEST_` / `DEBUG_` prefix |
-| Temporary env var rolling out to a CLI flag | env var first, then migrate via `_warn_deprecated_env_to_cli_flag` |
+| Temporary env var rolling out to a CLI flag | env var first, then a `_DEPRECATED_ENVS` entry whose `note` names the flag |
 
 Don't add a CLI flag that just forwards to an env var, and don't add an env var that duplicates an existing CLI flag. Pick one surface.
+
+The exception is a secret, such as an API key: it may have both a flag and an env var (`--admin-api-key` and `SGLANG_ADMIN_API_KEY`, the flag wins), because a flag value is visible to anyone who can read the process's argv (`ps`, `/proc/<pid>/cmdline`), and the bundled clients read the same env var so the key is set once. Define it with `secret=True`.
 
 ## Out of scope
 

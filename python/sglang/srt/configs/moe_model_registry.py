@@ -22,6 +22,7 @@ _DEEPEP_V2_MODELS: dict[str, _DeepEPv2ModelPolicy] = {
     "DeepseekV4ForCausalLM": _DeepEPv2ModelPolicy(),
     "Qwen3MoeForCausalLM": _DeepEPv2ModelPolicy(),
     "Glm5NextForConditionalGeneration": _DeepEPv2ModelPolicy(),
+    "GlmMoeDsaForCausalLM": _DeepEPv2ModelPolicy(),
     "MiMoV2ForCausalLM": _DeepEPv2ModelPolicy(),
     "MiMoV2FlashForCausalLM": _DeepEPv2ModelPolicy(),
 }

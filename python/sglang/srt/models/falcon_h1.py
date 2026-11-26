@@ -31,6 +31,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -38,11 +40,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
 
 
 class FalconH1MLP(nn.Module):
@@ -108,7 +108,6 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -234,7 +233,6 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             ),
         )
 
-        self.alt_stream = alt_stream
         self.key_multiplier = config.key_multiplier
 
         self.ssm_out_multiplier = config.ssm_out_multiplier
@@ -349,6 +347,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 forward_batch=forward_batch,
                 mup_vector=self.mup_vector,
+                use_triton_causal_conv=forward_batch.forward_mode.is_target_verify(),
             )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 
@@ -376,7 +375,6 @@ class FalconH1Model(nn.Module):
         super().__init__()
         self.config = config
 
-        alt_stream = get_stream("alt") if _is_cuda else None
         self.embedding_multiplier = config.embedding_multiplier
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -393,7 +391,6 @@ class FalconH1Model(nn.Module):
                 idx,
                 quant_config=quant_config,
                 prefix=prefix,
-                alt_stream=alt_stream,
             )
 
         self.layers = make_layers(
@@ -401,14 +398,12 @@ class FalconH1Model(nn.Module):
         )
 
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.infer_count = 0
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        # mamba_cache_params: MambaCacheParams,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
@@ -532,9 +527,6 @@ class FalconH1ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip layers on other devices.
-                # if is_pp_missing_parameter(name, self):
-                #     continue
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -545,8 +537,6 @@ class FalconH1ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # if is_pp_missing_parameter(name, self):
-                #     continue
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

@@ -4,6 +4,7 @@ SGLang SDARModelLM (block diffusion / dLLM-style forward).
 """
 
 import logging
+from functools import partial
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -31,6 +32,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -46,7 +49,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_cuda, make_pp_layers
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -169,33 +172,6 @@ class SDARAttention(nn.Module):
         )
         self.alt_stream = alt_stream
 
-    def forward_prepare_native(self, positions, hidden_states, forward_batch):
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch)
-                else None
-            ),
-        )
-        return q, k, v
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -291,14 +267,22 @@ class SDARBlock(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=False,
-                    next_layer_sparse=False,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=False,
+                next_layer_sparse=False,
             ),
         )
 
@@ -361,6 +345,7 @@ class SDARModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(SDARBlock.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             norm_kwargs = (
@@ -421,7 +406,7 @@ class SDARForCausalLM(nn.Module):
         super().__init__()
         self.pp_group = get_parallel().pp_group
         assert self.pp_group.world_size == 1, (
-            f"SDARMoeForCausalLM does not support pipeline parallel (pp_size={self.pp_group.world_size}). "
+            f"SDARForCausalLM does not support pipeline parallel (pp_size={self.pp_group.world_size}). "
             "Please set pp_size=1."
         )
 
