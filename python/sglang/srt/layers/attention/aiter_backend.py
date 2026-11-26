@@ -868,7 +868,7 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         # Parse constants
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.skip_prefill = skip_prefill
 
         max_bs = model_runner.req_to_token_pool.size

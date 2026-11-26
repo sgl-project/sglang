@@ -14,16 +14,13 @@ How `suite -> files` is resolved
     legacy single-string `suite=` when `stage=`/`runner_config=` are unset).
 
 How `file -> models` is resolved (best effort, recall-favoring)
-    - A constant table built from `python/sglang/test/**/*.py` module-level
-      assignments (`DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/..."`, including
-      tuple/list values) plus each test file's own module-level constants.
-    - Inline HuggingFace-id string literals in the file (f-string fragments are
-      skipped: they are partial/dynamic and would yield truncated ids).
-    - `ast.Name` references that resolve to a known model constant.
-    Anything we cannot resolve is reported per suite as `unresolved_files`, and
-    any file we cannot parse is reported in `parse_failures`, so recall gaps are
-    visible rather than silent. A `--overrides` JSON file supplies models for
-    dynamic cases and trims false positives.
+    hf_repo_scan.py, the scanner the PR stages' prefetch uses too, reads each
+    file's literals and the names it defines or imports from test-support
+    modules. A file it finds no model in is reported per suite as
+    `unresolved_files`, and any file it cannot parse is reported in
+    `parse_failures`, so recall gaps are visible rather than silent. A test
+    file's `declare_models(skip_models=...)` call drops models it names but
+    does not load; the `--overrides` JSON file adds models per suite.
 
 How `runner label -> models` is aggregated
     Registration/prewarm decisions are made per GH runner *label* (a runner's
@@ -40,9 +37,6 @@ Usage:
 """
 
 import argparse
-import ast
-import glob
-import importlib.util
 import json
 import os
 import re
@@ -50,199 +44,7 @@ import subprocess
 import sys
 from typing import Dict, List, Optional, Set, Tuple
 
-# A HuggingFace repo id is `namespace/name`: exactly one slash, each side
-# starting alphanumeric and made of alnum plus `.`, `_`, `-`. Note `.` is kept
-# because real ids carry it (e.g. `RedHatAI/Llama-3.2-3B-quantized.w8a8`).
-MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
-
-# `namespace/...` values that look like model ids but are MIME types or similar.
-_MIME_NAMESPACES = frozenset(
-    {
-        "application",
-        "audio",
-        "example",
-        "font",
-        "image",
-        "message",
-        "model",
-        "multipart",
-        "text",
-        "video",
-    }
-)
-
-# Trailing extensions that mark a file path or weight file, not a model name.
-# (Real ids use suffixes like `-GGUF`/`.w8a8`, not these dotted extensions.)
-_FILE_EXTENSIONS = (
-    ".py",
-    ".json",
-    ".txt",
-    ".md",
-    ".rst",
-    ".yaml",
-    ".yml",
-    ".sh",
-    ".cu",
-    ".cuh",
-    ".cpp",
-    ".cc",
-    ".h",
-    ".hpp",
-    ".so",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".csv",
-    ".log",
-    ".safetensors",
-    ".bin",
-    ".h5",
-    ".gguf",
-    ".pt",
-    ".pth",
-    ".onnx",
-)
-
-
-def looks_like_model_id(value: str, deny: Optional[Set[str]] = None) -> bool:
-    """Heuristic: does ``value`` look like a HuggingFace repo id?
-
-    Recall-favoring (a few false positives are cheap for cache-warming) but
-    drops the obvious non-models: MIME types, file paths, numeric ratios.
-    """
-    if deny and value in deny:
-        return False
-    if not MODEL_ID_RE.match(value):
-        return False
-    if not any(c.isalpha() for c in value):  # e.g. "2/3"
-        return False
-    namespace, name = value.split("/", 1)
-    if len(namespace) < 2 or len(name) < 2:  # e.g. "N/A"; real ids have longer parts
-        return False
-    if namespace.lower() in _MIME_NAMESPACES:
-        return False
-    if name.lower().endswith(_FILE_EXTENSIONS):
-        return False
-    return True
-
-
-def _string_values(node: ast.AST) -> List[str]:
-    """String constants directly held by ``node`` (a Constant, Tuple, or List)."""
-    if isinstance(node, ast.Constant):
-        return [node.value] if isinstance(node.value, str) else []
-    if isinstance(node, (ast.Tuple, ast.List)):
-        out: List[str] = []
-        for elt in node.elts:
-            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                out.append(elt.value)
-        return out
-    return []
-
-
-def extract_constants_from_source(
-    source: str, deny: Optional[Set[str]] = None
-) -> Dict[str, Set[str]]:
-    """Module-level ``NAME = "<model id>"`` (and tuple/list) assignments.
-
-    Handles both bare ``Assign`` and annotated ``AnnAssign`` (``NAME: str =
-    ...``). Returns ``{constant_name: {model_id, ...}}``; only model-shaped
-    values are kept, so referencing a non-model constant later contributes
-    nothing.
-    """
-    table: Dict[str, Set[str]] = {}
-    tree = ast.parse(source)
-    for stmt in tree.body:
-        if isinstance(stmt, ast.Assign):
-            targets, value = stmt.targets, stmt.value
-        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
-            targets, value = [stmt.target], stmt.value
-        else:
-            continue
-        models = {v for v in _string_values(value) if looks_like_model_id(v, deny)}
-        if not models:
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name):
-                table.setdefault(target.id, set()).update(models)
-    return table
-
-
-def extract_models_from_source(
-    source: str,
-    const_table: Dict[str, Set[str]],
-    deny: Optional[Set[str]] = None,
-) -> Set[str]:
-    """All model ids reachable from ``source``: inline literals + name refs.
-
-    ``const_table`` is the merged (global + local) constant lookup. Name
-    references resolve against it, so an imported ``DEFAULT_*`` constant is
-    picked up even though its value is defined elsewhere. String fragments
-    inside f-strings are skipped -- they are partial/dynamic and would yield
-    truncated, non-existent ids (e.g. ``f"org/model-{ver}"``).
-    """
-    tree = ast.parse(source)
-    fstring_fragments = {
-        id(part)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.JoinedStr)
-        for part in node.values
-        if isinstance(part, ast.Constant)
-    }
-    found: Set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if id(node) in fstring_fragments:
-                continue
-            if looks_like_model_id(node.value, deny):
-                found.add(node.value)
-        elif isinstance(node, ast.Name) and node.id in const_table:
-            found.update(m for m in const_table[node.id] if not (deny and m in deny))
-    return found
-
-
-def build_global_constant_table(
-    repo_root: str, deny: Optional[Set[str]] = None
-) -> Tuple[Dict[str, Set[str]], Dict[str, str]]:
-    """Constant table from every module under ``python/sglang/test/``.
-
-    These shared helpers (e.g. test_utils, lora_utils) define the ``DEFAULT_*``
-    model constants test files reference by name. Returns ``(table, errors)``
-    where ``errors`` maps any unparsable helper to its exception string -- a
-    broken shared helper drops constants across many suites, so the gap must be
-    surfaced rather than swallowed.
-    """
-    table: Dict[str, Set[str]] = {}
-    errors: Dict[str, str] = {}
-    pattern = os.path.join(repo_root, "python", "sglang", "test", "**", "*.py")
-    for path in glob.glob(pattern, recursive=True):
-        try:
-            with open(path, encoding="utf-8") as f:
-                source = f.read()
-            local = extract_constants_from_source(source, deny)
-        except (OSError, SyntaxError) as exc:
-            rel = os.path.relpath(path, repo_root)
-            errors[rel] = f"{type(exc).__name__}: {exc}"
-            print(
-                f"WARNING: could not parse constant source {rel}; its model "
-                f"constants are EXCLUDED: {errors[rel]}",
-                file=sys.stderr,
-            )
-            continue
-        for name, models in local.items():
-            table.setdefault(name, set()).update(models)
-    return table, errors
-
-
-def _load_ci_register(repo_root: str):
-    """Import ci_register.py by path, sidestepping the heavy `sglang` package."""
-    spec = importlib.util.spec_from_file_location(
-        "ci_register",
-        os.path.join(repo_root, "python", "sglang", "test", "ci", "ci_register.py"),
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from hf_repo_scan import RepoIdScanner, load_ci_register
 
 
 def collect_suite_files(
@@ -264,17 +66,10 @@ def collect_suite_files(
     dropped), and ``{suite: runner_config}`` (None for legacy single-string
     ``suite=`` registrations, which carry no runner_config).
     """
-    ci_register = _load_ci_register(repo_root)
+    ci_register = load_ci_register(repo_root)
     backend = getattr(ci_register.HWBackend, backend_name.upper())
 
-    # Same exclusion as run_suite.py: pytest+package structure files.
-    files = sorted(
-        f
-        for f in glob.glob(
-            os.path.join(repo_root, "test", "registered", "**", "*.py"), recursive=True
-        )
-        if os.path.basename(f) not in ("conftest.py", "__init__.py")
-    )
+    files = sorted(ci_register.registered_test_files(repo_root))
 
     suite_files: Dict[str, List[str]] = {}
     suite_nightly: Dict[str, bool] = {}
@@ -318,28 +113,22 @@ def collect_suite_files(
 
 
 def load_overrides(path: Optional[str]) -> Dict[str, object]:
-    """Read the overrides JSON: ``by_file``, ``by_suite``, ``deny``,
-    ``suite_labels`` (all optional).
+    """Read the overrides JSON: ``by_suite`` and ``suite_labels`` (both
+    optional).
 
     ``suite_labels`` maps a legacy ``suite=`` registration (which carries no
     runner_config) to the GH runner label(s) its dispatching workflow
     hardcodes in ``runs-on`` -- a LIST, since one suite can run on several
-    labels. A present-but-null key is treated as its default, so a hand-edit
-    like ``"deny": null`` does not blow up downstream iteration.
+    labels. A present-but-null key is treated as its default.
     """
-    overrides: Dict[str, object] = {
-        "by_file": {},
-        "by_suite": {},
-        "deny": [],
-        "suite_labels": {},
-    }
+    overrides: Dict[str, object] = {"by_suite": {}, "suite_labels": {}}
     if not path:
         return overrides
     if not os.path.exists(path):
         raise FileNotFoundError(f"overrides file not found: {path}")
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    for key in ("by_file", "by_suite", "deny", "suite_labels"):
+    for key in overrides:
         if data.get(key) is not None:
             overrides[key] = data[key]
     return overrides
@@ -405,12 +194,9 @@ def build_inventory(
     include_disabled: bool = False,
     b200_runner: Optional[str] = None,
 ) -> Dict[str, object]:
-    deny: Set[str] = set(overrides.get("deny", []))  # type: ignore[arg-type]
-    by_file: Dict[str, List[str]] = overrides.get("by_file", {})  # type: ignore[assignment]
-    by_suite: Dict[str, List[str]] = overrides.get("by_suite", {})  # type: ignore[assignment]
     suite_labels_override: Dict[str, List[str]] = overrides.get("suite_labels", {})  # type: ignore[assignment]
 
-    global_table, table_errors = build_global_constant_table(repo_root, deny)
+    scanner = RepoIdScanner(repo_root)
     suite_files, suite_nightly, registry_errors, suite_runner_config = (
         collect_suite_files(repo_root, backend_name, include_disabled)
     )
@@ -428,35 +214,15 @@ def build_inventory(
 
     # Resolve models once per file (a file can belong to several suites).
     file_models: Dict[str, Set[str]] = {}
-    extract_errors: Dict[str, str] = {}
     for files in suite_files.values():
         for rel in files:
-            if rel in file_models:
-                continue
-            abs_path = os.path.join(repo_root, rel)
-            try:
-                with open(abs_path, encoding="utf-8") as f:
-                    source = f.read()
-                local_table = extract_constants_from_source(source, deny)
-                merged = dict(global_table)
-                for name, models in local_table.items():
-                    merged.setdefault(name, set()).update(models)
-                resolved = extract_models_from_source(source, merged, deny)
-            except (OSError, SyntaxError) as exc:
-                extract_errors[rel] = f"{type(exc).__name__}: {exc}"
-                print(
-                    f"WARNING: could not extract models from {rel}; treating it "
-                    f"as unresolved: {extract_errors[rel]}",
-                    file=sys.stderr,
-                )
-                resolved = set()
-            resolved.update(by_file.get(rel, []))
-            file_models[rel] = resolved
+            if rel not in file_models:
+                file_models[rel] = scanner.file_repo_ids(rel)
 
     suites: Dict[str, object] = {}
     all_models: Set[str] = set()
     for suite in sorted(suite_files):
-        models: Set[str] = set(by_suite.get(suite, []))
+        models: Set[str] = set(overrides["by_suite"].get(suite, []))
         unresolved: List[str] = []
         for rel in suite_files[suite]:
             resolved = file_models.get(rel, set())
@@ -508,9 +274,8 @@ def build_inventory(
     }
 
     parse_failures = {}
-    parse_failures.update(table_errors)
     parse_failures.update(registry_errors)
-    parse_failures.update(extract_errors)
+    parse_failures.update(scanner.errors)
 
     return {
         "generated_at_commit": commit,
@@ -540,9 +305,7 @@ def render_markdown(inventory: Dict[str, object]) -> str:
         f"runner labels: **{inventory.get('runner_label_count', 0)}**",
     ]
     if failures:
-        lines.append(
-            f"- ⚠️ Unparsable files: **{len(failures)}** (see `parse_failures`)"
-        )
+        lines.append(f"- ⚠️ Scan errors: **{len(failures)}** (see `parse_failures`)")
     if unmapped:
         lines.append(
             f"- ⚠️ Suites with no runner label: **{len(unmapped)}** "

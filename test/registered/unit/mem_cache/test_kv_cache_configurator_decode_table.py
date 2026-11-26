@@ -59,7 +59,7 @@ class TestDecodeTableInitPools(CustomTestCase):
                     features=SimpleNamespace(enable_memory_saver=False)
                 ),
             ),
-            patch.object(kcc, "get_req_to_token_extra_context_len", return_value=0),
+            patch.object(kcc, "get_req_to_token_headroom", return_value=0),
             patch.object(kcc, "is_deepseek_dsa", return_value=False),
             patch.object(kcc, "is_deepseek_v4", return_value=False),
             patch.object(
