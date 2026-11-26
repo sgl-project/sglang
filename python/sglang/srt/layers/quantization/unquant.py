@@ -882,12 +882,19 @@ def sm12x_fp32_lm_head(
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
-def sm12x_bf16_lm_head_applies(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    return _sm12x_bf16_gemv_eligible(x, weight)
+def sm12x_bf16_lm_head_applies(
+    x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> bool:
+    return _sm12x_bf16_gemv_eligible(x, weight) and (
+        out is None or _sm12x_bf16_gemv_writes(out, x, weight, x.dtype)
+    )
 
 
-def sm12x_bf16_lm_head(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return _sm12x_bf16_gemv(x, weight)
+def sm12x_bf16_lm_head(
+    x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """BF16 logits of a BF16 LM head for sm12x_bf16_lm_head_applies operands."""
+    return _sm12x_bf16_gemv(x, weight, out=out)
 
 
 def bf16_gemm_needs_autotune() -> bool:
