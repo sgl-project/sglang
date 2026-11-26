@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import msgspec
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -18,7 +19,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.weight_cache import load_diff, schema, snapshot_loader, validator
 from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.coordinator import Ballot
-from sglang.srt.weight_cache.schema import SnapshotManifest, SnapshotRank, StorageMeta
+from sglang.srt.weight_cache.schema import SnapshotManifest, StorageMeta
 from sglang.srt.weight_cache.transport import WeightTransport
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -147,9 +148,18 @@ def _load_tiny_model(loader, *, model_config, device_config):
     return model
 
 
+def _spec_digest(tp_rank=0, tp_size=2):
+    """The digest of the LoadSpec that _pre_load builds on rank ``tp_rank``."""
+    with _topology(tp_rank, tp_size):
+        spec = build_load_spec(
+            _model_config(), checkpoint_id="rev1", device=_CPU.device
+        )
+    return spec.digest()
+
+
 def _manifest(*, tp_rank=0, version="v1", storages=None):
     return SnapshotManifest(
-        rank=SnapshotRank(tp_rank=tp_rank, pp_rank=0, moe_dp_rank=0, moe_ep_rank=0),
+        spec_digest=_spec_digest(tp_rank),
         version=version,
         storages={} if storages is None else storages,
         load_diff=b"tables",
@@ -369,7 +379,7 @@ class TestSnapshotLoader(CustomTestCase):
                 vote=lambda *, group, ballot: ballots,
             ):
                 _, manifest = self._publish(source, _MemoryTransport(), group=group)
-            self.assertEqual(manifest.rank.tp_rank, rank)
+            self.assertEqual(manifest.spec_digest, _spec_digest(rank))
             self.assertEqual(bool(source.commits), rank == 0)
             versions.append(manifest.version)
         self.assertEqual(versions[0], versions[1])
@@ -593,10 +603,10 @@ class TestSnapshotLoader(CustomTestCase):
         with (
             _topology(tp_rank=0),
             mock.patch.object(snapshot_loader, "vote", vote),
-            self.assertRaisesRegex(RuntimeError, "rank"),
+            self.assertRaisesRegex(RuntimeError, "published for LoadSpec"),
         ):
             _pre_load(source, _model_config())
-        self.assertIn("rank", vote.calls[0].error)
+        self.assertIn("published for LoadSpec", vote.calls[0].error)
         self.assertEqual(transport.fetches, 0)
         self.assertTrue(transport.closed)
 
@@ -623,9 +633,14 @@ class TestSnapshotLoader(CustomTestCase):
             for loader, rank, size in cases:
                 with _topology(rank, size):
                     _pre_load(loader, _model_config())
+        for i in (0, 1, 3, 4):
+            self.assertIsNone(ballots[i].error)
         self.assertEqual(ballots[0].agree, ballots[1].agree)
         self.assertIn("daemon socket refused", ballots[2].error)
-        self.assertNotEqual(ballots[3].agree, ballots[0].agree)
+        # Rank 1 accepted its own manifest: the same load as rank 0, at version v1.
+        group, version = msgspec.msgpack.decode(ballots[3].agree)
+        self.assertEqual(group, msgspec.msgpack.decode(ballots[0].agree)[0])
+        self.assertEqual(version, "v1")
         self.assertNotEqual(ballots[4].agree, ballots[0].agree)
 
         # When the ranks reject the load, a rank that found a snapshot releases it.
@@ -635,10 +650,11 @@ class TestSnapshotLoader(CustomTestCase):
             _topology(tp_rank=1),
             mock.patch.object(load_diff, "preflight"),
             mock.patch.object(validator, "record_construction"),
-            mock.patch.object(snapshot_loader, "vote", _vote_failing_at(1)),
+            mock.patch.object(snapshot_loader, "vote", vote := _vote_failing_at(1)),
         ):
             with self.assertRaises(RuntimeError):
                 _pre_load(rejected, _model_config())
+        self.assertIsNone(vote.calls[0].error)  # rejected by a peer, not locally
         self.assertTrue(transport.closed)
 
     def test_pre_load_check_votes_on_build_failure_before_lookup(self):

@@ -32,15 +32,9 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.model_loader.utils import on_model_constructed, set_default_torch_dtype
 from sglang.srt.weight_cache import load_diff, validator
-from sglang.srt.weight_cache.config import build_load_spec, build_weight_cache_config
+from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.coordinator import Ballot, vote
-from sglang.srt.weight_cache.schema import (
-    LoadSpec,
-    SnapshotManifest,
-    StorageMeta,
-    WeightCacheConfig,
-    snapshot_tag,
-)
+from sglang.srt.weight_cache.schema import LoadSpec, SnapshotManifest, StorageMeta
 from sglang.srt.weight_cache.transport import WeightTransport
 
 if TYPE_CHECKING:
@@ -109,30 +103,27 @@ def pre_load_check(
     manifest, error = None, None
     agree = b""
     try:
-        weight_config = build_weight_cache_config(
+        spec = build_load_spec(
             model_config,
             checkpoint_id=checkpoint_id,
+            device=device_config.device,
             draft_model_idx=loader.load_config.draft_model_idx,
         )
-        spec = build_load_spec(device=device_config.device)
-        manifest = loader.lookup(
-            weight_config=weight_config, spec=spec, device_config=device_config
-        )
+        manifest = loader.lookup(spec=spec, device_config=device_config)
         if manifest is not None:
-            if manifest.rank != spec.rank:
+            if manifest.spec_digest != spec.digest():
                 raise ValueError(
-                    f"Snapshot is for rank {manifest.rank!r}, expected {spec.rank!r}"
+                    f"Snapshot was published for LoadSpec {manifest.spec_digest}, "
+                    f"expected {spec.digest()}"
                 )
             if isinstance(loader, SnapshotLoader):
                 loader._preflight(model_config=model_config, manifest=manifest)
-        group_tag = snapshot_tag(weight_config, spec, include_rank=False)
         version = manifest.version if manifest is not None else None
-        agree = msgspec.msgpack.encode((group_tag, version))
+        agree = msgspec.msgpack.encode((spec.digest(include_rank=False), version))
     except Exception as e:  # every rank must learn it before any rank moves on
         error = repr(e)
     _vote_or_close(loader=loader, group=group, ballot=Ballot(error=error, agree=agree))
     if error is None and isinstance(loader, SnapshotLoader):
-        loader._prepared_weight_config = weight_config
         loader._prepared_spec = spec
         loader._prepared_group = group
         loader._ready_for_load = True
@@ -161,7 +152,6 @@ class SnapshotLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig, *, owner: bool = False):
         super().__init__(load_config)
         self._owner = owner
-        self._prepared_weight_config: Optional[WeightCacheConfig] = None
         self._prepared_spec: Optional[LoadSpec] = None
         self._prepared_group: Optional[GroupCoordinator] = None
         self._ready_for_load = False
@@ -204,16 +194,12 @@ class SnapshotLoader(BaseModelLoader):
         """Owner: discard this rank's private staging. Idempotent."""
 
     def lookup(
-        self,
-        *,
-        weight_config: WeightCacheConfig,
-        spec: LoadSpec,
-        device_config: DeviceConfig,
+        self, *, spec: LoadSpec, device_config: DeviceConfig
     ) -> Optional[SnapshotManifest]:
         self.close()
         found = self._find(
-            tag=snapshot_tag(weight_config, spec),
-            group_tag=snapshot_tag(weight_config, spec, include_rank=False),
+            tag=spec.digest(),
+            group_tag=spec.digest(include_rank=False),
             device_config=device_config,
         )
         if found is not None:
@@ -243,7 +229,6 @@ class SnapshotLoader(BaseModelLoader):
         return model
 
     def close(self) -> None:
-        self._prepared_weight_config = None
         self._prepared_spec = None
         self._prepared_group = None
         self._prepared_snapshot = None
@@ -295,8 +280,7 @@ class SnapshotLoader(BaseModelLoader):
         group: Optional[GroupCoordinator],
     ) -> SnapshotManifest:
         """Stage the shards and commit one shared version after all ranks are ready."""
-        spec, weight_config = self._prepared_spec, self._prepared_weight_config
-        self._prepared_spec = self._prepared_weight_config = None
+        spec, self._prepared_spec = self._prepared_spec, None
         group_matches = group is self._prepared_group
         if spec is not None:
             group = self._prepared_group
@@ -309,7 +293,7 @@ class SnapshotLoader(BaseModelLoader):
         error, source = exported.error, {}
         if error is None:
             try:
-                if spec is None or weight_config is None:
+                if spec is None:
                     raise RuntimeError("Run pre_load_check before the owner's raw load")
                 if not group_matches:
                     raise RuntimeError("Snapshot publication must use the load group")
@@ -317,8 +301,8 @@ class SnapshotLoader(BaseModelLoader):
                     raise RuntimeError(
                         "The export belongs to a different prepared load"
                     )
-                group_tag = snapshot_tag(weight_config, spec, include_rank=False)
-                tag = snapshot_tag(weight_config, spec)
+                group_tag = spec.digest(include_rank=False)
+                tag = spec.digest()
                 agree = group_tag.encode()
                 payload = hashlib.sha256(exported.attestation).digest()
                 if leader:
@@ -345,7 +329,7 @@ class SnapshotLoader(BaseModelLoader):
                     version=hashlib.sha256(
                         b"".join(peer.payload for peer in ballots)
                     ).hexdigest(),
-                    rank=spec.rank,
+                    spec_digest=tag,
                     storages=storages_meta,
                     load_diff=exported.load_diff,
                     attestation=exported.attestation,

@@ -138,9 +138,8 @@ class WeightTransport(ABC):
 
     @abstractmethod
     def publish(self, *, storages: Dict[str, torch.Tensor]) -> Dict[str, Any]:
-        """Stage the owner's storages and return their locator for the manifest.
+        """Owner: make ``storages`` readable; returns the manifest's ``source``.
 
-        Readers discover the locator only through a published manifest.
         It may consume ``storages`` (vmm_fd repacks them), so nothing reads them after.
         """
 
@@ -148,10 +147,10 @@ class WeightTransport(ABC):
     def fetch(
         self, *, manifest: SnapshotManifest, device: torch.device
     ) -> Dict[str, torch.Tensor]:
-        """Fetch every storage of ``manifest`` as uint8 bytes, all or nothing.
+        """Reader: every storage of ``manifest`` as uint8 bytes, all or nothing.
 
-        Returns once the bytes are visible on the current stream. A failed fetch
-        leaves no mapped tensors exposed and the transport safe to close.
+        Returns once the bytes are visible on the current stream; raises otherwise,
+        leaving no mapped tensors exposed and the transport safe to close.
         """
 
     @abstractmethod

@@ -147,11 +147,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
-    from sglang.srt.weight_cache.schema import (
-        LoadSpec,
-        SnapshotManifest,
-        WeightCacheConfig,
-    )
+    from sglang.srt.weight_cache.schema import LoadSpec, SnapshotManifest
 
 _is_npu = is_npu()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
@@ -363,11 +359,7 @@ class BaseModelLoader(ABC):
         self.load_config = load_config
 
     def lookup(
-        self,
-        *,
-        weight_config: WeightCacheConfig,
-        spec: LoadSpec,
-        device_config: DeviceConfig,
+        self, *, spec: LoadSpec, device_config: DeviceConfig
     ) -> Optional[SnapshotManifest]:
         """Look up the exact snapshot before loading. A miss selects a raw load."""
         return None

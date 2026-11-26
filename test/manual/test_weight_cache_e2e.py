@@ -21,7 +21,7 @@ import sys
 import time
 
 from sglang.srt.weight_cache.protocol import (
-    cache_config_mismatches,
+    load_spec_mismatches,
     recv_msg,
     send_msg,
 )
@@ -121,9 +121,7 @@ def run_single_daemon(
                     if req.get("type") == "query_config":
                         send_msg(conn, {"status": "ok", "config": daemon.config})
                     elif req.get("type") == "fetch_state":
-                        if not cache_config_mismatches(
-                            daemon.config, req.get("config")
-                        ):
+                        if not load_spec_mismatches(daemon.config, req.get("config")):
                             send_msg(
                                 conn,
                                 {
@@ -295,12 +293,11 @@ def main():
     result = recv_msg(s)
     s.close()
     daemon_config = result.get("config", {})
-    model, spec = daemon_config["model"], daemon_config["spec"]
     print(
-        f"\nDaemon (0,0) config: model={model['checkpoint_id']}, "
-        f"arch={model['model_arch']}, "
-        f"tp_size={spec['tp_size']}, "
-        f"dtype={model['dtype']}"
+        f"\nDaemon (0,0) config: model={daemon_config.get('checkpoint_id')}, "
+        f"arch={daemon_config.get('model_arch')}, "
+        f"tp_size={daemon_config.get('tp_size')}, "
+        f"dtype={daemon_config.get('dtype')}"
     )
 
     # Fetch state from daemon (pp_rank=0, tp_rank=0)
@@ -345,10 +342,8 @@ def main():
         sys.exit(1)
 
     # Test config mismatch
-    mismatch_config = {
-        **daemon_config,
-        "spec": {**spec, "tp_size": spec["tp_size"] + 1},
-    }
+    mismatch_config = dict(daemon_config)
+    mismatch_config["tp_size"] = daemon_config.get("tp_size", 1) + 1
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(10)
     s.connect(socket_path_0)

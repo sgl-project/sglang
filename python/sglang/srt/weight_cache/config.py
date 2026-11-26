@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build WeightCacheConfig from the model config and LoadSpec from the runtime context."""
+"""Build a LoadSpec from the model config and the runtime context."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from sglang.srt.model_loader.loader import PreshardedModelLoader
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 
 from .protocol import compute_env_stamp, hash_quant_config, resolve_cache_quantization
-from .schema import LoadSpec, WeightCacheConfig
+from .schema import LoadSpec
 
 if TYPE_CHECKING:
     import torch
@@ -49,34 +49,21 @@ def path_checkpoint_id() -> str:
     return f"{path}@{revision}" if revision else path
 
 
-def build_weight_cache_config(
+def build_load_spec(
     model_config: ModelConfig,
     *,
     checkpoint_id: str,
+    device: torch.device,
     draft_model_idx: Optional[int] = None,
-) -> WeightCacheConfig:
-    """Describe the model; call it before the model is built.
+) -> LoadSpec:
+    """Describe the weights this rank is about to load.
 
-    Construction and loading can rewrite the HF and quantization configs.
+    Call it after the parallel groups and the GEMM backends are initialized, and
+    before the model is built: construction and loading rewrite the HF and
+    quantization configs.
     """
     quant_method, quant_config = resolve_cache_quantization(model_config)
     architectures = model_config.hf_config.architectures
-    return WeightCacheConfig(
-        checkpoint_id=checkpoint_id,
-        model_arch=architectures[0] if architectures else "",
-        hf_config_hash=_hf_config_hash(model_config.hf_config),
-        dtype=str(model_config.dtype),
-        quant_method=quant_method,
-        quant_config_hash=hash_quant_config(quant_config),
-        draft_model_idx=draft_model_idx,
-    )
-
-
-def build_load_spec(*, device: torch.device) -> LoadSpec:
-    """Describe how this rank loads the model.
-
-    Call it after the parallel groups and the GEMM backends are initialized.
-    """
     parallel = get_parallel()
     execution = get_exec()
     # From the published config: a dense model's process never sets the MoE flags.
@@ -89,6 +76,16 @@ def build_load_spec(*, device: torch.device) -> LoadSpec:
         swap_ab = use_cutedsl_moe_swap_ab(device)
 
     return LoadSpec(
+        # Model config.
+        checkpoint_id=checkpoint_id,
+        model_arch=architectures[0] if architectures else "",
+        hf_config_hash=_hf_config_hash(model_config.hf_config),
+        dtype=str(model_config.dtype),
+        draft_model_idx=draft_model_idx,
+        # Quantization config.
+        quant_method=quant_method,
+        quant_config_hash=hash_quant_config(quant_config),
+        # Parallel config: the layout.
         tp_size=parallel.tp_size,
         pp_size=parallel.pp_size,
         dp_size=parallel.dp_size,
@@ -100,15 +97,18 @@ def build_load_spec(*, device: torch.device) -> LoadSpec:
         moe_cp_size=dp_attention.get_moe_cp_size(),
         moe_dense_tp_size=parallel.moe_dense_tp_size,
         enable_dp_lm_head=parallel.enable_dp_lm_head,
+        # Parallel config: this rank's shard.
         tp_rank=parallel.tp_rank,
         pp_rank=parallel.pp_rank,
         moe_dp_rank=parallel.moe_dp_rank,
         moe_ep_rank=parallel.moe_ep_rank,
+        # Expert placement config.
         ep_num_redundant_experts=execution.moe.ep_num_redundant_experts,
         enable_eplb=execution.moe.enable_eplb,
         init_expert_location=PreshardedModelLoader._normalize_init_expert_location(
             execution.moe.init_expert_location
         ),
+        # Kernel config.
         moe_a2a_backend=execution.moe.moe_a2a_backend,
         moe_runner_backend=moe_runner.value,
         fp4_gemm_runner_backend=get_fp4_gemm_runner_backend().value,
@@ -116,5 +116,6 @@ def build_load_spec(*, device: torch.device) -> LoadSpec:
         bf16_gemm_backend=get_bf16_gemm_backend().value,
         flashinfer_cutedsl_swap_ab=swap_ab,
         enable_fp32_lm_head=execution.features.enable_fp32_lm_head,
+        # Environment.
         **compute_env_stamp(),
     )

@@ -313,7 +313,7 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
     """
 
     # A flag that ModelConfig writes into hf_config: the daemon and the engine
-    # must derive the same model (WeightCacheConfig) from it.
+    # must derive the same HF config hash (LoadSpec) from it.
     daemon_args = ["--context-length", "4096"]
     server_args = daemon_args[:]
     tp_size = 1
