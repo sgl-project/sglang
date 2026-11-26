@@ -1070,6 +1070,8 @@ class DFlashDecoderLayer(nn.Module):
             prefix=attention_prefix,
         )
         self.post_attention_layernorm = norm_cls(hidden_size, eps=rms_norm_eps)
+        self.post_self_attn_layernorm: Optional[nn.Module] = None
+        self.post_feedforward_layernorm: Optional[nn.Module] = None
         mlp_prefix = f"{prefix}.mlp" if prefix else ""
         self.mlp = DFlashMLP(
             config=config, quant_config=quant_config, prefix=mlp_prefix
@@ -1124,17 +1126,25 @@ class DFlashDecoderLayer(nn.Module):
             forward_batch=forward_batch,
             **attn_kwargs,
         )
-        if attention_kernel is not None:
+        if attention_kernel is not None and self.post_self_attn_layernorm is None:
             hidden_states, residual = self.attention_conv.finish_add_norm(
                 attn_out, attention_kernel, residual, self.post_attention_layernorm
             )
         else:
+            if attention_kernel is not None:
+                attn_out = self.attention_conv.finish(attn_out, attention_kernel)
+            if self.post_self_attn_layernorm is not None:
+                attn_out = self.post_self_attn_layernorm(attn_out)
             hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
 
         mlp_kernel = None
         if self.mlp_conv is not None:
             hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self.post_feedforward_layernorm is not None:
+            if mlp_kernel is not None:
+                hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
+            return self.post_feedforward_layernorm(hidden_states), residual, None
         if mlp_kernel is None:
             return hidden_states, residual, None
         if self.mlp_conv.fused:
@@ -1182,11 +1192,12 @@ class DFlashDraftModel(nn.Module):
         )
         attention_cls = self.decoder_layer_cls.attention_cls
         if draft_config.is_mla:
-            if attention_cls is not DFlashAttention:
+            if attention_cls is DFlashAttention:
+                attention_cls = DFlashMLAAttention
+            elif not issubclass(attention_cls, DFlashMLAAttention):
                 raise ValueError(
                     f"{type(self).__name__} does not support mla draft attention."
                 )
-            attention_cls = DFlashMLAAttention
             # No fused qkv_proj to slice.
             self.supports_fused_context_kv = False
         self.block_size = draft_config.resolve_block_size(default=16)
