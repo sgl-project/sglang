@@ -1,12 +1,10 @@
 import logging
-from functools import lru_cache
 from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -27,8 +25,6 @@ _is_cuda = is_cuda()
 _device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
@@ -108,20 +104,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         )
         return hf_config.n_shared_experts
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        if is_nextn:
-            if hasattr(self.config, "num_nextn_predict_layers"):
-                num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                # compatible with old design
-                nextn_layer_id = (
-                    0
-                    if self.config.num_hidden_layers == 1
-                    else self.config.num_hidden_layers
-                )
-            else:
-                raise ValueError("num_nextn_predict_layers is not in the config")
-
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -138,17 +121,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
-        if is_nextn:
-            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
-            nextn_spec_weight_names = [
-                "shared_head.norm",
-                "eh_proj",
-                "enorm",
-                "hnorm",
-            ]
-
         params_dict = dict(self.named_parameters())
-        weight_names = []
         for name, loaded_weight in weights:
             if "language_model." in name:
                 name = name.replace("language_model.", "")
@@ -157,8 +130,6 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            weight_names.append(name)
-
             if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
                 # Shared expert becomes expert ID = n_routed_experts
                 name = name.replace(
@@ -166,34 +137,15 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     f"mlp.experts.{self.config.n_routed_experts}",
                 )
 
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-            else:
-                if not name.startswith(nextn_layer_prefix):
-                    continue
-
-                # Use shared head and embed weights from target model
-                if "shared_head.head" in name or "embed_tokens" in name:
-                    continue
-
-                is_decoder = True
-                # For nextn specific weights
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
-                        is_decoder = False
-                        break
-                # For decoder layer weights
-                if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
+            if hasattr(self.config, "num_nextn_predict_layers"):
+                num_nextn_layers = self.config.num_nextn_predict_layers
+                if num_nextn_layers > 0 and name.startswith("model.layers"):
+                    name_list = name.split(".")
+                    if (
+                        len(name_list) >= 3
+                        and int(name_list[2]) >= self.config.num_hidden_layers
+                    ):
+                        continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -260,18 +212,15 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     if name not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    if "visual" in name:
+                        loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                            self.config, name, loaded_weight
                         )
-                        if "visual" in name:
-                            loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
-                                self.config, name, loaded_weight
-                            )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                    weight_loader(param, loaded_weight)
 
 
 EntryClass = [Glm4vMoeForConditionalGeneration]

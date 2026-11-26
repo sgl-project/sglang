@@ -13,9 +13,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
-
-logger = logging.get_logger(__name__)
 
 
 def _first_not_none(*candidates: Any) -> Any:

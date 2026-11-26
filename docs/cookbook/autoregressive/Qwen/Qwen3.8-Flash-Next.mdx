@@ -302,6 +302,7 @@ sglang serve \
 
 The official `Qwen/Qwen3.8-Flash-Next-FP8` checkpoint with NEXTN MTP on two H200 (TP2, EP2), for long agentic sessions at 16 to 24 concurrent agents. Below concurrency 16 use the GPU-KV commands in the panel above. At 16 agents and more, the BF16 KV pool fills (99% in our runs at concurrency 16) and the server evicts and recomputes long prefixes. These commands add an FP8 KV cache and HiCache host-memory offload to the InferenceX H200 recipe ([InferenceX #2753](https://github.com/SemiAnalysisAI/InferenceX/pull/2753), [#4888](https://github.com/SemiAnalysisAI/InferenceX/pull/4888), [#5194](https://github.com/SemiAnalysisAI/InferenceX/pull/5194)). Nothing else changes.
 
+- **AgentX table.** This recipe is the `qwen3.8next-fp8-h200-sglang-agentic-mtp` configuration in the AgentX table above ([SemiAnalysis InferenceX #5194](https://github.com/SemiAnalysisAI/InferenceX/pull/5194)). This section explains its flags and the measured effect.
 - **Container image.** `lmsysorg/sglang:v0.5.23-cu130` (`sha256:f832b5c39559c9caa900b22ad37c76fcce66470676855c42052102c537812f1f`, the image InferenceX uses for this cell), run without patches.
 - **FP8 KV.** `--kv-cache-dtype fp8_e4m3` stores the KV cache in FP8 E4M3. On two H200 the KV pool grows from about 2.1 million to about 4.0 million tokens (1.9x). The MTP draft KV follows the target dtype; no draft-specific dtype is set.
 - **HiCache.** `--enable-hierarchical-cache` with `--hicache-io-backend kernel`, `--hicache-mem-layout page_first` and `--hicache-write-policy write_back` keeps evicted KV in host memory instead of dropping it. `--hicache-size` is in gigabytes per rank: 50 GB per rank (100 GB for the two ranks), inside the 308 GB host-memory share InferenceX gives each point.
@@ -341,6 +342,23 @@ sglang serve \
   --host 0.0.0.0 \
   --port 30000
 ```
+
+### ReplaySSM verify pipeline tuning
+
+The measured Rubin TP1 recipe uses BF16 SSM checkpoints, NEXTN with three steps
+and four draft tokens, and `--enable-linear-replayssm-spec`. Add this environment
+setting to that worker's launch recipe:
+
+```bash
+export SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES=3
+```
+
+The default is `2`. Three stages reduced verify latency on this Rubin recipe,
+but GB300 microbenchmarks showed regressions with FP32 checkpoints and some
+other head/batch shapes. Keep the default for unmeasured configurations, or
+compare both values on the deployment GPU before opting in. This setting affects
+only GDN ReplaySSM target verification; KDA, ordinary decode and prefill retain
+their existing launches.
 
 ## 1. Model Introduction
 

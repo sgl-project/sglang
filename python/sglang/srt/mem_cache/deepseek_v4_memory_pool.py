@@ -17,6 +17,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dsv4 import (
     fused_k_norm_rope_flashmla,
     fused_store_cache,
@@ -61,8 +62,12 @@ _is_hip = is_hip()
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
-def get_dsv4_indexer_bytes_per_token(index_head_dim: int, use_fp4_indexer: bool) -> int:
-    """Return payload and quant-scale bytes for one compressed indexer token."""
+def get_dsv4_indexer_bytes_per_token(
+    index_head_dim: int, use_fp4_indexer: bool, *, use_bf16_indexer: bool = False
+) -> int:
+    """Return payload and any quant-scale bytes for one compressed indexer token."""
+    if use_bf16_indexer:
+        return index_head_dim * torch.bfloat16.itemsize
     if use_fp4_indexer:
         return index_head_dim // 2 + index_head_dim // 32
     return index_head_dim + index_head_dim // 128 * 4
@@ -222,11 +227,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
     assert mode in ("v41", "v41_new", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
-    is_sm100 = (
-        torch.cuda.is_available()
-        and torch.version.cuda is not None
-        and torch.cuda.get_device_capability()[0] == 10
-    )
+    is_sm100 = current_arch().is_sm(10)
     if _is_hip:
         supported = (
             is_gfx95_supported() and resolve_hip_flashmla_backend() == "aiter_sparse"
@@ -2470,17 +2471,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
         return compress_kv_pool.set_key_buffer_fused(
             compress_layer_id, loc, cache_k, freqs_cis
-        )
-
-    def set_index_k_fused(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-    ) -> None:
-        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
-        return self._indexer_pool(compress_ratio).set_index_fused(
-            compress_layer_id, loc, cache_k
         )
 
     def set_index_k_fp4(

@@ -315,7 +315,7 @@ def test_rounded_silu_table_matches_the_computed_kernel(dtype):
     from sglang.kernels.ops.activation import activation as act
 
     if act._silu_rounding_table(torch.empty(1, dtype=dtype, device="cuda")) is None:
-        pytest.skip("the SiLU table runs on sm_10x only")
+        pytest.skip("the SiLU table runs on sm_90 and sm_10x only")
     gate = (
         torch.arange(65536, device="cuda", dtype=torch.int32)
         .to(torch.int16)
