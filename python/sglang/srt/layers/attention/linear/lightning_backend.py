@@ -100,18 +100,11 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
-        # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
-        self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
-        self.decode_cuda_graph_metadata = {}
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
-        self.BLOCK = (
-            model_runner.model_config.block
-            if hasattr(model_runner.model_config, "block")
-            else 256
-        )
+        self.BLOCK = 256
         config = model_runner.model_config.hf_config
         total_num_heads = getattr(
             config, "num_linear_key_value_heads", config.num_attention_heads
@@ -398,7 +391,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         save_kv_cache=True,
         **kwargs,
     ):
-        layer_id = layer.layer_id if layer else kwargs["layer_id"]
+        layer_id = layer.layer_id
 
         metadata = self.forward_metadata
 
@@ -488,7 +481,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         save_kv_cache=True,
         **kwargs,
     ) -> torch.Tensor:
-        layer_id = layer.layer_id if layer else kwargs["layer_id"]
+        layer_id = layer.layer_id
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata

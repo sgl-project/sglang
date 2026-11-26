@@ -14,7 +14,9 @@ reinforcement learning-based training.
 This document demonstrates the deployment of DeepSeek-R1 on Ascend NPUs using SGLang, including single-node PD mixed
 mode, multi-node PD disaggregation mode, feature configuration, and performance optimization.
 
-The commands in this document use the daily build image `quay.io/ascend/sglang:main-cann9.1.0-a3`.
+This document is validated and written based on **SGLang v0.5.18**. The current model (DeepSeek-R1) is fully supported
+in this version. It is recommended to use exactly v0.5.18 (the `v0.5.18-cann9.0.0-a3` image); later versions are not
+covered by this document and may introduce breaking changes.
 
 ## Supported features
 
@@ -88,45 +90,43 @@ The Docker image requires at least **30GB** of free space. Ensure sufficient dis
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-The following command uses the daily build tag `main-cann9.1.0-a3`.
+The following command is based on the stable release tag `v0.5.18-cann9.0.0-a3`.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-```bash Command
-docker pull quay.io/ascend/sglang:main-cann9.1.0-a3
+The command requires
+[Ascend Docker Runtime](/docs/hardware-platforms/ascend-npus/getting-started/installation#install-ascend-docker-runtime)
+on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 
-docker run -itd --shm-size=16g --name ${NAME} \
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
+```bash Command
+# ============================================================
+# Before running, update the following variables or use default values:
+#   NAME: container name
+# ============================================================
+
+NAME=sglang-deepseek-r1
+
+# pull image
+docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
+
+# create container
+docker run -itd --shm-size=16g --name "$NAME" \
 --privileged=true --net=host \
--v /var/queue_schedule:/var/queue_schedule \
+-e ASCEND_VISIBLE_DEVICES=0-15 \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
 -v /usr/local/sbin:/usr/local/sbin \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
---device=/dev/davinci0:/dev/davinci0  \
---device=/dev/davinci1:/dev/davinci1  \
---device=/dev/davinci2:/dev/davinci2  \
---device=/dev/davinci3:/dev/davinci3  \
---device=/dev/davinci4:/dev/davinci4  \
---device=/dev/davinci5:/dev/davinci5  \
---device=/dev/davinci6:/dev/davinci6  \
---device=/dev/davinci7:/dev/davinci7  \
---device=/dev/davinci8:/dev/davinci8  \
---device=/dev/davinci9:/dev/davinci9  \
---device=/dev/davinci10:/dev/davinci10  \
---device=/dev/davinci11:/dev/davinci11  \
---device=/dev/davinci12:/dev/davinci12  \
---device=/dev/davinci13:/dev/davinci13  \
---device=/dev/davinci14:/dev/davinci14  \
---device=/dev/davinci15:/dev/davinci15  \
---device=/dev/davinci_manager:/dev/davinci_manager \
---device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:main-cann9.1.0-a3
+quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
+
+# enter container
+docker exec -it "$NAME" bash
 ```
 
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
   container, for example: `-v /path/to/models:/models`.
-- Replace `${NAME}` with your own container name or remove `--name` to use default name.
 </Tip>
 
 ## Online service deployment
