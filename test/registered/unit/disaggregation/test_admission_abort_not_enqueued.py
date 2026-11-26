@@ -97,6 +97,7 @@ def _prefill_queue(sched):
         queue=IndexedReqList(ListKind.PD_BOOTSTRAP),
         create_sender=MagicMock(),
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),
+        kv_manager=SimpleNamespace(deferred_bootstrap=None),
     )
     return q
 

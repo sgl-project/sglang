@@ -57,10 +57,12 @@ class Disagg(msgspec.Struct):
         'Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
     ] = "null"
     disaggregation_decode_allocation_policy: A[
-        Literal["early", "prefill_complete"],
+        Literal["early", "prefill_complete", "just_in_time"],
         "When to reserve per-request decode KV in disaggregated serving. "
         "prefill_complete retains KV on prefill until prefill finishes, then "
-        "admits it on decode. Set the same policy on both roles. Default: early.",
+        "admits it on decode. just_in_time signals decode earlier, timed so its "
+        "reservation handshake completes as prefill finishes. Set the same "
+        "policy on both roles. Default: early.",
     ] = "early"
     disaggregation_transfer_backend: A[
         str,

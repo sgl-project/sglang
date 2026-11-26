@@ -41,8 +41,36 @@ requests for destination KV capacity. It also retains KV on prefill longer and
 removes overlap between chunked prefill and KV transfer. Compare both policies
 for your workload; this option is not a general throughput improvement.
 
-This initial implementation requires Mooncake (RDMA or `mooncake_tcp`), the Python
-bootstrap registry, and attention TP/CP and pipeline sizes of one. Attention DP
+With `prefill_complete`, the readiness signal, decode's reservation, and the
+destination indices it sends back all sit between the end of prefill and the
+start of the KV transfer. The `just_in_time` policy keeps the same deferred
+handshake but starts it while the request still prefills:
+
+```bash
+--disaggregation-decode-allocation-policy just_in_time
+```
+
+Prefill signals readiness at the last scheduling round whose predicted
+remaining prefill time still covers the handshake latency. The prediction counts
+the request's unscheduled chunks at the measured scheduling-round interval, plus
+the measured lead from scheduling a chunk to processing its result, which spans
+the pipeline under pipeline parallelism. Prefill measures the handshake from
+sending readiness, which waits until decode has registered the request, to the
+arrival of decode's destination indices, and uses the 90th percentile of recent
+handshakes, excluding the first with each decode rank and, under pipeline
+parallelism, those whose decode registration reached stage 0 after its final
+prefill result. A
+request whose whole prefill is shorter than the handshake, or that arrives
+before any measurement, signals before its first forward. Under pipeline
+parallelism, stage 0 paces readiness and every stage still signals once its
+prefill finishes. Destination indices that arrive mid-prefill start the KV
+transfer of finished chunks as under the `early` policy, except under pipeline
+parallelism, where the transfer starts once prefill finishes. Decode behaves as
+under `prefill_complete`; the two policies have the same requirements.
+
+These policies require Mooncake (RDMA or `mooncake_tcp`), the Python bootstrap
+registry, attention TP/CP sizes of one, and a decode pipeline size of one;
+prefill may use pipeline parallelism. Attention DP
 is allowed when each DP rank has attention TP size one. Prefill automatically
 resolves `--optimistic-prefill-attempts` from zero to one; configurations that
 disable optimistic prefill after model validation are rejected.
@@ -50,20 +78,23 @@ Chunked prefill does not yield just because decode has not admitted the request.
 Completed requests retain their KV in the existing optimistic-prefill inflight
 queue until decode supplies destination indices; readiness alone never starts
 a KV write.
-After a successful transfer, prefill clears the room's readiness and transfer
-state before notifying decode of success. Retraction recovery can then reuse
-the same bootstrap room. This notification waits for worker and scheduler
-cleanup; failure and cancellation records remain until their timeout expires.
+Prefill's transfer worker notifies decode of success as soon as the transfer
+ends, as under `early`. A retraction-recovery recompute that reuses the
+bootstrap room waits on prefill until the previous request's readiness and
+transfer state are cleared; failure and cancellation records remain until their
+timeout expires.
 Retries remain eligible for prefill after the optimistic attempt budget is
 exhausted and remain subject to the existing cancellation and timeout handling.
+With a pipeline-parallel prefill, a chunked request whose bootstrap fails
+computes its remaining chunks before prefill drops it.
 
-On prefill, `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` starts after the final
-prefill result, giving decode admission its own budget. On decode,
-`SGLANG_DISAGGREGATION_WAITING_TIMEOUT` bounds the wait for prefill completion,
+On prefill, `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` starts when prefill
+signals readiness, giving decode admission its own budget. On decode,
+`SGLANG_DISAGGREGATION_WAITING_TIMEOUT` bounds the wait for readiness,
 then starts afresh for admission and again when destination indices are sent
 for transfer.
 
-The option does not support staging buffers, runtime PD role switching,
+Neither policy supports staging buffers, runtime PD role switching,
 encoder disaggregation, decoupled speculation, HiSparse, decode radix cache, decode
 HiCache, or non-DSA auxiliary state pools. Prefill HiCache is limited to L2 with
 `write_back` and no storage backend. Unsupported configurations fail validation.
