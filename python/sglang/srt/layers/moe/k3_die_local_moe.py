@@ -145,7 +145,6 @@ def _ineligible(layer: torch.nn.Module) -> Optional[str]:
 
 
 def wanted(layer: torch.nn.Module, with_bias: bool, precision: str) -> bool:
-    """Whether this layer keeps die-local weights shared by both kernels."""
     if not enabled():
         return False
     from sglang.srt.layers.moe import k3_deepgemm_routed
@@ -236,8 +235,6 @@ def _placement_unavailable(shape, itemsize: int, device) -> Optional[str]:
 
 
 class _PlacedPages:
-    """Owns the reservation behind an `_empty_die_local` tensor."""
-
     def __init__(self, reservation, num_bytes: int):
         self.reservation = reservation
         self.__cuda_array_interface__ = {
@@ -253,7 +250,6 @@ class _PlacedPages:
 
 
 def _domain_of(address: int) -> Optional[int]:
-    """Locality domain the page at `address` is homed on, or None."""
     from cuda.bindings import driver as cu
 
     attr = getattr(

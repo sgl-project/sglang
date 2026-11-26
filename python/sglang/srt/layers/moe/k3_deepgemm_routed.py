@@ -7,7 +7,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-
 logger = logging.getLogger(__name__)
 
 MegaWeights = Tuple[torch.Tensor, torch.Tensor]
@@ -42,7 +41,6 @@ def _deep_gemm():
 
 @functools.lru_cache(maxsize=1)
 def missing_capability() -> Optional[str]:
-    """What the installed DeepGEMM lacks for this path, or None."""
     deep_gemm = _deep_gemm()
     if deep_gemm is None:
         return "deep_gemm cannot be imported"
@@ -97,7 +95,6 @@ def mismatch(layer: torch.nn.Module, with_bias: bool, precision: str) -> Optiona
 
 
 def handles(layer: torch.nn.Module, num_tokens: int) -> bool:
-    """Whether a routed call of `num_tokens` rows on this layer runs on MegaMoE."""
     if getattr(layer, "mega_l1_weights", None) is None:
         return False
     from sglang.srt.layers.moe.k3_die_local_moe import takes
@@ -106,8 +103,6 @@ def handles(layer: torch.nn.Module, num_tokens: int) -> bool:
 
 
 class _Group:
-    """One-rank MegaMoE group of this process: buffer and counters."""
-
     buf = None
     stats = None
     shape = None
@@ -296,7 +291,6 @@ def _get_pack_kernel():
 
 
 def _call_keywords(num_call_tokens: int) -> dict:
-    """Keywords of every MegaMoE call of this path."""
     limit = _TRTLLM_SPLIT4_COMBINE_MAX_TOKENS
     return dict(
         cumulative_local_expert_recv_stats=_group.stats,
