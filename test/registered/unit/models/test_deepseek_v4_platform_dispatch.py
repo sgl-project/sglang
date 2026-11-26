@@ -430,10 +430,15 @@ class TestNpuMhcSeam(unittest.TestCase):
             cann.reset_mock()
             fallback.assert_not_called()
 
-            invalid_dtype = (x, residual, post_mix.half(), comb)
+            invalid_dtype = (x.float(), residual.float(), post_mix, comb)
+            mismatched_dtype = (x.half(), residual, post_mix, comb)
             unaligned = (x[:, :8], residual[:, :, :8], post_mix, comb)
-            for args in (invalid_dtype, unaligned):
-                with self.subTest(shape=args[0].shape, dtype=args[2].dtype):
+            for args in (invalid_dtype, mismatched_dtype, unaligned):
+                with self.subTest(
+                    shape=args[0].shape,
+                    dtype=args[0].dtype,
+                    residual_dtype=args[1].dtype,
+                ):
                     mhc.post(cfg, *args)
                     fallback.assert_called_once_with(*args)
                     fallback.reset_mock()

@@ -49,7 +49,6 @@ def post(
         and hidden % 128 == 0
         and x.dtype == residual.dtype
         and x.dtype in (torch.float16, torch.bfloat16)
-        and post_mix.dtype == comb.dtype == torch.float32
     ):
         from sgl_kernel_npu.operators.hyper_conn import mhc_post_dpskv4
 
