@@ -257,6 +257,8 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
         self.assertEqual(req1.disagg_kv_sender.local_polls, 1)
 
     def test_failure_on_one_stage_carries_its_classification_everywhere(self):
+        """A stage that succeeded locally must not report a 500 for a request
+        another stage saw aborted; it concludes with the agreed classification."""
         for room, reason, expected in (
             (20, ABORT_REASON_DECODE, "abort"),
             (21, ABORT_REASON_REQUEST, "abort"),
@@ -280,6 +282,7 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
                 self.assertEqual(list(self.pp1.disagg_prefill_transfer_queue), [])
 
     def test_real_error_on_any_stage_outranks_an_abort_on_another(self):
+        """One stage's transfer error must not be hidden by an abort on another."""
         self._both("x", 13)
         self.pp0.fail(13, ABORT_REASON_REQUEST)
         self.pp1.fail(13, "Failed to send kv chunk")
@@ -292,6 +295,7 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
         self.pp0.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
 
     def test_requested_abort_is_not_counted_as_transfer_failure(self):
+        """A requested abort must not inflate the transfer-failure metric."""
         self._both("x", 14)
         self.pp0.store[14] = KVPoll.Success
         self.pp1.fail(14, ABORT_REASON_DECODE)
@@ -421,8 +425,8 @@ class TestTransferOutcomeClassification(CustomTestCase):
         )
 
     def test_tp_peer_error_outranks_local_abort(self):
-        # A TP peer failed with a real error: MIN over the group clears this
-        # rank's abort-only flag.
+        """A TP peer's transfer error must win over this rank's own abort."""
+
         def peer_reduce(flags, group):
             half = len(flags) // 2
             return flags[:half] + [0] * half

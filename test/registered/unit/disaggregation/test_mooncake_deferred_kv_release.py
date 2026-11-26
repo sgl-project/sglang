@@ -91,6 +91,7 @@ class TestMooncakeAbortNotification(
         return _manager(status=status)
 
     def test_decode_abort_records_requested_abort_reason(self):
+        """A decode-side abort must conclude on prefill as an abort, not a 500."""
         for enabled in (True, False):
             with self.subTest(deferred_release=enabled):
                 manager = _manager(enabled=enabled, status=KVPoll.Transferring)

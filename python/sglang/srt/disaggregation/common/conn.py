@@ -816,11 +816,9 @@ class CommonKVManager(BaseKVManager):
         )
 
     def is_failure_requested_abort_pp_consensus(self, bootstrap_room: int) -> bool:
-        """PP0 only: whether every PP rank that failed the room recorded an abort.
-
-        A rank replicates its abort flag before its Failed status through the
-        same ordered channel, so a Failed rank without a flag failed otherwise.
-        """
+        """PP0 only: whether every PP rank that failed the room recorded an abort."""
+        # The flag precedes the Failed status on the same ordered channel,
+        # so a Failed rank without a flag failed for another reason.
         statuses = self.request_status.collect(bootstrap_room)
         aborts = self.request_status.collect(_pp_abort_key(bootstrap_room))
         return all(
@@ -1001,9 +999,8 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
-        # PP0 classifies the failure for every stage, so it needs each stage's
-        # reason. Only live rooms: a concluded room must not leak a key, and the
-        # status lock keeps clear() from popping the room between check and set.
+        # Only live rooms, so a concluded room cannot leak a key; the status
+        # lock keeps clear() from popping the room between check and set.
         if isinstance(self.request_status, PPConsensusStore):
             with self._status_lock:
                 if bootstrap_room in self.request_status:

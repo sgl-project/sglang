@@ -173,9 +173,8 @@ def poll_transfer_outcomes_prefill_pp(
     pp_poll_send_window: PPSyncSendWindow,
     p2p_tag: P2PTag,
 ) -> Tuple[List[int], List[Optional[TransferOutcome]]]:
-    """PP0 decides polls and terminal outcomes from every stage's status and
-    forwards them, so all stages conclude each transfer the same way. A
-    transfer concludes only once every stage has."""
+    """PP0 decides polls and outcomes for every stage; a transfer concludes
+    only once every stage has."""
     decision = None
     if pp_rank == 0:
         polls = _poll_with_failure_injection_pp(pollers, release=True)
@@ -187,7 +186,10 @@ def poll_transfer_outcomes_prefill_pp(
             for poll, poller in zip(polls, pollers)
         ]
         decision = _all_reduce_transfer_outcomes(
-            polls, abort_only, attn_cp_cpu_group, attn_tp_cpu_group
+            polls=polls,
+            abort_only=abort_only,
+            attn_cp_cpu_group=attn_cp_cpu_group,
+            attn_tp_cpu_group=attn_tp_cpu_group,
         )
     return pp_sync_polls(
         decision, pp_group, pp_rank, pp_size, pp_poll_send_window, p2p_tag
@@ -631,18 +633,18 @@ def poll_transfer_outcomes_attn_cp_tp_group(
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
 ) -> Tuple[List[int], List[Optional[TransferOutcome]]]:
-    """Poll senders and agree on polls and terminal outcomes across attn TP/CP.
-
-    A failure is a requested abort only if every failed rank recorded one; a
-    rank that succeeded locally has no failure reason and stays neutral.
-    """
+    """Poll senders and agree on polls and terminal outcomes across attn TP/CP."""
     polls = _poll_with_failure_injection(pollers)
+    # A rank that succeeded locally has no failure reason and stays neutral.
     abort_only = [
         int(poll != KVPoll.Failed or poller.is_failure_requested_abort())
         for poll, poller in zip(polls, pollers)
     ]
     return _all_reduce_transfer_outcomes(
-        polls, abort_only, attn_cp_cpu_group, attn_tp_cpu_group
+        polls=polls,
+        abort_only=abort_only,
+        attn_cp_cpu_group=attn_cp_cpu_group,
+        attn_tp_cpu_group=attn_tp_cpu_group,
     )
 
 
@@ -652,6 +654,7 @@ def _all_reduce_transfer_outcomes(
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
 ) -> Tuple[List[int], List[Optional[TransferOutcome]]]:
+    # MIN over both groups: an error on any rank outranks an abort on another.
     reduced = _all_reduce_polls(polls + abort_only, attn_tp_cpu_group)
     reduced = _all_reduce_polls(reduced, attn_cp_cpu_group)
     polls, abort_only = reduced[: len(polls)], reduced[len(polls) :]

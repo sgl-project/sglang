@@ -38,7 +38,7 @@ from sglang.srt.disaggregation.checksum import (
     page_indices_for_request,
     state_indices_for_request,
 )
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
@@ -1570,27 +1570,27 @@ class SchedulerDisaggregationPrefillMixin:
     def handle_inflight_transfer_failure(
         self: Scheduler, req: Req, aborted_by_request: bool = False
     ) -> None:
-        """Conclude an inflight request whose KV transfer failed.
-
-        aborted_by_request is the classification agreed across ranks. This
-        rank's own exception is only logged: a rank that succeeded locally has
-        no failure reason and would otherwise report a 500 for a requested abort.
-        """
+        """Conclude an inflight request whose KV transfer failed."""
         error_message = (
             f"Prefill transfer failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
-        exc: Optional[Exception] = None
+        # aborted_by_request is the classification agreed across ranks; this
+        # rank's own exception is only logged, since a rank that succeeded has none.
         is_aborted_by_request = (
             isinstance(req.finished_reason, FINISH_ABORT) or aborted_by_request
         )
+        exc: Optional[KVTransferError] = None
         try:
             req.disagg_kv_sender.failure_exception()
-        except Exception as e:
+        except KVTransferError as e:
             exc = e
             error_message += f" with exception {e}"
+        except Exception as e:
+            error_message += f" with exception {e}"
+        is_propagated = exc is not None and exc.is_from_another_rank
         # Mute propagated exceptions and requested aborts to avoid noisy logging
-        if getattr(exc, "is_from_another_rank", False) or is_aborted_by_request:
+        if is_propagated or is_aborted_by_request:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
@@ -1599,7 +1599,7 @@ class SchedulerDisaggregationPrefillMixin:
             if is_aborted_by_request:
                 # This rank's own reason when it recorded one; a rank that
                 # succeeded locally only knows a peer recorded an abort.
-                reason = getattr(exc, "failure_reason", None)
+                reason = exc.failure_reason if exc is not None else None
                 prepare_abort(
                     req,
                     reason if is_abort_failure_reason(reason) else ABORT_REASON_PEER,
