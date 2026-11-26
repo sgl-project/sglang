@@ -40,7 +40,7 @@ class TestUnifiedCacheLinkerRuntimeAttach(CustomTestCase):
                     "--tp-size",
                     "4",
                     "--attention-backend",
-                    "compressed",
+                    "dsv4",
                     "--page-size",
                     str(PAGE_SIZE),
                     "--mem-fraction-static",
