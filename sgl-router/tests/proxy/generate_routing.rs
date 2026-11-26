@@ -7,6 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use serde_json::{json, Value};
 use sgl_router::discovery::WorkerMode;
 use sgl_router::state::kv_events::{compute_block_hashes, HashTree, KvWorkerId};
@@ -129,6 +130,78 @@ async fn pd_generate_merges_prefill_input_logprobs() {
         assert_eq!(
             response["meta_info"]["input_token_logprobs"], expected,
             "return_logprob={return_logprob}"
+        );
+    }
+}
+
+fn routes(ids: &[i32]) -> String {
+    BASE64_STANDARD.encode(
+        ids.iter()
+            .flat_map(|id| id.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[tokio::test]
+async fn pd_generate_merges_only_the_decode_suffix_per_prompt() {
+    // Skip the first input token. Rows contain two expert IDs each.
+    let p = json!([
+        {"meta_info": {"routed_experts": routes(&[4, 0])}},
+        {"meta_info": {"routed_experts": routes(&[5, 6, 0, 7])}}
+    ]);
+    let d = json!([
+        {"text": "a", "meta_info": {"prompt_tokens": 2, "completion_tokens": 2,
+                                      "routed_experts": routes(&[99, 0, 9, 1])}},
+        {"text": "b", "meta_info": {"prompt_tokens": 3, "completion_tokens": 2,
+                                      "routed_experts": routes(&[3, 2])}}
+    ]);
+    let prefill = MockWorker::start_returning_error(StatusCode::OK, p).await;
+    let decode = MockWorker::start_returning_error(StatusCode::OK, d.clone()).await;
+    let app = radix_router(
+        &[
+            (&prefill, WorkerMode::Prefill),
+            (&decode, WorkerMode::Decode),
+        ],
+        HashTree::new(),
+    );
+    for enabled in [true, false] {
+        let body = json!({"input_ids": [[10, 11], [20, 21, 22]], "return_routed_experts": enabled,
+                          "routed_experts_start_len": 1});
+        let res = send(&app, "POST", &body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: Value = serde_json::from_slice(&collect_body(res.into_body()).await).unwrap();
+        let mut expected = d.clone();
+        if enabled {
+            expected[0]["meta_info"]["routed_experts"] = routes(&[4, 0, 9, 1]).into();
+            expected[1]["meta_info"]["routed_experts"] = routes(&[5, 6, 0, 7, 3, 2]).into();
+        }
+        assert_eq!(response, expected);
+    }
+}
+
+#[tokio::test]
+async fn pd_generate_returns_prompt_routes_when_decode_has_none() {
+    for (completion_tokens, expected) in [(0, routes(&[2])), (1, routes(&[2, 0]))] {
+        let p = json!({"meta_info": {"routed_experts": routes(&[2, 0]), "input_token_logprobs": [[null, 10, null]]}});
+        let d = json!({"text": "a", "meta_info": {"prompt_tokens": 2, "completion_tokens": completion_tokens, "input_token_logprobs": []}});
+        let prefill = MockWorker::start_returning_error(StatusCode::OK, p).await;
+        let decode = MockWorker::start_returning_error(StatusCode::OK, d).await;
+        let app = radix_router(
+            &[
+                (&prefill, WorkerMode::Prefill),
+                (&decode, WorkerMode::Decode),
+            ],
+            HashTree::new(),
+        );
+        let body = json!({"input_ids": [10, 11], "return_routed_experts": true, "return_logprob": true,
+                          "sampling_params": {"max_new_tokens": completion_tokens}});
+        let res = send(&app, "POST", &body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: Value = serde_json::from_slice(&collect_body(res.into_body()).await).unwrap();
+        assert_eq!(response["meta_info"]["routed_experts"], expected);
+        assert_eq!(
+            response["meta_info"]["input_token_logprobs"],
+            json!([[null, 10, null]])
         );
     }
 }

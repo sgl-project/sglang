@@ -4,6 +4,7 @@
 //! Plain and PD forwarding, including load tracking and streaming metrics.
 
 use super::nonempty_header;
+use super::pd_metadata::PrefillMetadata;
 use super::preparation::{
     append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
@@ -343,8 +344,9 @@ async fn dispatch<T: Transport>(
         stream_abort,
         decode_slot,
     );
-    // A logprob merge needs prefill's body, so it waits for prefill too.
-    let wait_for_prefill = ctx.config.proxy.stream_after_prefill || request.merges_input_logprobs;
+    // Native metadata computed by prefill must arrive before returning decode's response.
+    let wait_for_prefill =
+        ctx.config.proxy.stream_after_prefill || request.prefill_metadata.requested();
     let dispatch = async {
         match prefill_task {
             Some((task, prefill)) => forward_pd(task, prefill, response, wait_for_prefill).await,
@@ -521,8 +523,10 @@ impl Transport for Http {
     ) -> Self::Response {
         if request.responder.is_some() {
             super::openai::respond(&mut request.responder, response, streaming).await
-        } else if let Some(prefill_body) = prefill_body.filter(|_| request.merges_input_logprobs) {
-            merge_input_logprobs(&prefill_body, response).await
+        } else if let Some(prefill_body) =
+            prefill_body.filter(|_| request.prefill_metadata.requested())
+        {
+            merge_prefill_metadata(request.prefill_metadata, &prefill_body, response).await
         } else {
             response
         }
@@ -584,32 +588,28 @@ impl Transport for Http {
     }
 }
 
-/// Decode's response with prefill's `meta_info.input_token_logprobs` before
-/// its own. A failure status, or a body without both lists, passes through;
-/// an unreadable decode body is a 502.
-async fn merge_input_logprobs(prefill_body: &[u8], response: Response<Body>) -> Response<Body> {
+/// Buffer the decode body once when the caller requested prefill metadata.
+async fn merge_prefill_metadata(
+    metadata: PrefillMetadata,
+    prefill_body: &[u8],
+    response: Response<Body>,
+) -> Response<Body> {
     if !response.status().is_success() {
         return response;
     }
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
     let Ok(decode_body) = axum::body::to_bytes(body, usize::MAX).await else {
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::BAD_GATEWAY;
         return response;
     };
-    let body =
-        prepend_prefill_logprobs(prefill_body, &decode_body).map_or(decode_body, Bytes::from);
+    let body = if let Some(merged) = metadata.merge(prefill_body, &decode_body) {
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        Bytes::from(merged)
+    } else {
+        decode_body
+    };
     Response::from_parts(parts, Body::from(body))
-}
-
-fn prepend_prefill_logprobs(prefill_body: &[u8], decode_body: &[u8]) -> Option<Vec<u8>> {
-    const LOGPROBS: &str = "/meta_info/input_token_logprobs";
-    let prefill: serde_json::Value = serde_json::from_slice(prefill_body).ok()?;
-    let mut decode: serde_json::Value = serde_json::from_slice(decode_body).ok()?;
-    let prefill_logprobs = prefill.pointer(LOGPROBS)?.as_array()?;
-    let decode_logprobs = decode.pointer_mut(LOGPROBS)?.as_array_mut()?;
-    decode_logprobs.splice(0..0, prefill_logprobs.iter().cloned());
-    serde_json::to_vec(&decode).ok()
 }
 
 /// Forwards the shared Generate request to the selected engines.

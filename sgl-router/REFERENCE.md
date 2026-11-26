@@ -526,6 +526,12 @@ well, and its response carries prefill's `meta_info.input_token_logprobs` ahead
 of decode's, since only prefill computed the prompt. A streamed, batch, or
 `n > 1` request returns decode's logprobs alone.
 
+For a buffered PD request with `return_routed_experts: true`, the router
+returns the prompt's expert IDs from prefill and the generated-token IDs from
+decode in `meta_info.routed_experts`. Each sample in a batch uses its own
+prompt length. `routed_experts_start_len` skips the same initial prompt
+positions as on a plain worker.
+
 ## OpenAI over /generate
 
 `/v1/completions` and `/v1/chat/completions` behave as the engine's own routes,
