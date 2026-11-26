@@ -293,6 +293,7 @@ class Gemma2Model(nn.Module):
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
+                prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
         )
@@ -373,10 +374,6 @@ class Gemma2ForCausalLM(nn.Module):
         "gate_up_proj",
         "down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer.
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = True
 
     def __init__(
         self,

@@ -355,6 +355,19 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     return int(sliding_window) - 1
 
 
+def dflash_draft_window_pages(draft_hf_config: Any, *, page_size: int) -> int:
+    """Trailing pages of draft KV a sliding-window-only DFLASH/DSPARK draft
+    reads; 0 when any draft layer attends to the whole prompt, so a PD sender
+    must ship every draft page."""
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if not layer_types or any(t != "sliding_attention" for t in layer_types):
+        return 0
+    window = get_dflash_attention_sliding_window_size(draft_hf_config)
+    # Two spare pages cover the partial last page and draft queries placed
+    # at or before the last prompt token.
+    return -(-window // page_size) + 2
+
+
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         return config.get(key, default)
