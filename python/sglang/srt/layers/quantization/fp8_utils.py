@@ -80,9 +80,7 @@ _is_npu = is_npu()
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
 # pure-triton block-fp8 path on gfx1250.
-_use_aiter = (
-    get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_gfx1250_supported
-)
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip and not _is_gfx1250_supported
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_gfx942 = _use_aiter and is_gfx942_supported()
 # Conservative, not a tuned crossover: ptpc beat block-fp8 up to M=512 on
@@ -365,7 +363,7 @@ if _use_aiter:
     )
 
 _use_aiter_mxfp8_gfx1250 = False
-if get_bool_env_var("SGLANG_USE_AITER") and _is_hip and _is_gfx1250_supported:
+if envs.SGLANG_USE_AITER.get() and _is_hip and _is_gfx1250_supported:
     try:
         from aiter import dtypes as aiter_dtypes
         from aiter.ops.gemm_op_a8w8 import (

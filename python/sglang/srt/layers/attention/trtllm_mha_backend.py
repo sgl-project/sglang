@@ -296,7 +296,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         config = model_runner.model_config
 
         # MHA-specific dimensions
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
