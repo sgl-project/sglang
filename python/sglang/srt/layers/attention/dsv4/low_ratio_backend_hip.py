@@ -41,9 +41,13 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4RowgroupPrefillWorkspace,
     aiter_fp4_paged_mqa_logits,
     aiter_has_fp4_rowgroup,
+    aiter_has_opus_mqa_logits,
     index_q_rope_pack_flydsl,
     index_q_rope_pack_weights_flydsl,
     logits_rows_per_chunk,
+    opus_k_scale,
+    opus_prefill_mqa_logits,
+    opus_q_scale,
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_prefill_workspace,
@@ -87,6 +91,58 @@ def _fp4_rowgroup_enabled() -> bool:
         )
         return False
     return True
+
+
+@functools.lru_cache(maxsize=1)
+def _fp4_opus_prefill_enabled() -> bool:
+    """SGLANG_HIP_FP4_INDEXER_OPUS_PREFILL, off when the installed AITER has no OPUS MXFP4
+    MQA logits kernels."""
+    if not envs.SGLANG_HIP_FP4_INDEXER_OPUS_PREFILL.get():
+        return False
+    if not aiter_has_opus_mqa_logits():
+        logger.warning(
+            "SGLANG_HIP_FP4_INDEXER_OPUS_PREFILL is set but the installed AITER has no "
+            "OPUS MXFP4 MQA logits kernels; keeping the FlyDSL prefill kernel."
+        )
+        return False
+    return True
+
+
+def _log_opus_vs_flydsl(
+    opus: torch.Tensor,
+    flydsl: torch.Tensor,
+    row_ends: torch.Tensor,
+    layer_id: int,
+    rows: slice,
+    block_rows: int = 512,
+) -> None:
+    """SGLANG_DEBUG_FP4_INDEXER_OPUS: max |opus - flydsl| over the rows' windows, as a fraction of
+    the largest |flydsl| there, and NaNs in OPUS's windows; reduced in row blocks (the tiles are
+    GB-sized)."""
+    width = min(opus.shape[1], flydsl.shape[1])
+    cols = torch.arange(width, device=opus.device)[None, :]
+    diff = scale = 0.0
+    nans = 0
+    for lo in range(0, opus.shape[0], block_rows):
+        hi = min(lo + block_rows, opus.shape[0])
+        inside = cols < row_ends[lo:hi, None].to(torch.int64)
+        a, b = opus[lo:hi, :width], flydsl[lo:hi, :width]
+        nans += int((torch.isnan(a) & inside).sum())
+        diff = max(
+            diff, float(torch.where(inside, (a - b).abs(), 0.0).nan_to_num(0.0).amax())
+        )
+        scale = max(
+            scale, float(torch.where(inside, b.abs(), 0.0).nan_to_num(0.0).amax())
+        )
+    logger.info(
+        "[opus debug] layer %d rows %d:%d max|d|/max %.3e nan %d (width %d)",
+        layer_id,
+        rows.start,
+        rows.stop,
+        diff / max(scale, 1e-30),
+        nans,
+        width,
+    )
 
 
 def _score_requests_page8(
@@ -238,11 +294,21 @@ def refresh_low_ratio_prefill_workspaces(
 ) -> Dict[int, Union[FP4PrefillWorkspace, FP4RowgroupPrefillWorkspace]]:
     """Must run outside CUDA-graph capture; see prepare_fp4_prefill_workspace. A page8 pool
     scores on the row-group kernel, which takes no schedule, on a table as wide as
-    ``max_context_len`` needs (without extend_lens, the indexer builds its workspace
-    itself)."""
+    ``max_context_len`` needs; with SGLANG_HIP_FP4_INDEXER_OPUS_PREFILL the other pools
+    score on the OPUS kernel, on the request tables alone (without extend_lens, the indexer
+    builds either workspace itself)."""
     previous = previous or {}
     workspaces = {}
+    opus = _fp4_opus_prefill_enabled()
     for ratio, meta in metadata_by_ratio.items():
+        if opus and ratio not in page8_ratios:
+            if extend_lens is not None:
+                workspaces[ratio] = prepare_fp4_rowgroup_prefill_workspace(
+                    meta.page_table,
+                    extend_lens,
+                    page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+                )
+            continue
         if ratio in page8_ratios:
             if extend_lens is not None:
                 workspaces[ratio] = prepare_fp4_rowgroup_prefill_workspace(
@@ -640,7 +706,8 @@ def low_ratio_index_topk_hip_extend(
     k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
     prefill_workspace = metadata.fp4_low_ratio_prefill_workspaces.get(ratio)
     page8 = pool.low_ratio_index_k_page8(layer.layer_id)
-    if page8 and not (
+    opus = not page8 and _fp4_opus_prefill_enabled()
+    if (page8 or opus) and not (
         isinstance(prefill_workspace, FP4RowgroupPrefillWorkspace)
         and prefill_workspace.request_page_table.shape[0] == len(extend_lens_cpu)
     ):
@@ -648,14 +715,70 @@ def low_ratio_index_topk_hip_extend(
             indexer_metadata.page_table,
             extend_lens_cpu,
             page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
-            table_columns=rowgroup_table_columns(
-                backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+            table_columns=(
+                rowgroup_table_columns(
+                    backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+                )
+                if page8
+                else None
+            ),
+        )
+    if opus:
+        q_scale_opus = opus_q_scale(q_scale, q_fp4.shape[-2])
+        k_scale_opus = opus_k_scale(k_scale, prefill_workspace.request_page_table)
+
+    def flydsl_rows(rows: slice) -> torch.Tensor:
+        return aiter_fp4_paged_mqa_logits(
+            q_fp4=q_fp4[rows],
+            q_scale=q_scale[rows],
+            k_payload=k_payload,
+            k_scale=k_scale,
+            weights=weights[rows],
+            page_table=indexer_metadata.page_table[rows],
+            c4_seq_lens=indexer_metadata.compressed_seq_lens[rows],
+            weight_scale=1.0,
+            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            is_decode=False,
+            prefill_workspace=(
+                prefill_workspace if rows.start == 0 and not opus else None
             ),
         )
 
     def score_rows(
         rows: slice, req_lo: int, rows_per_request: List[int]
     ) -> torch.Tensor:
+        if opus:
+            assert sum(rows_per_request) == rows.stop - rows.start, (
+                rows,
+                rows_per_request,
+            )
+            logits = opus_prefill_mqa_logits(
+                q_fp4=q_fp4[rows],
+                q_scale_opus=q_scale_opus[rows],
+                k_payload=k_payload,
+                k_scale_opus=k_scale_opus,
+                weights=weights[rows],
+                weight_scale=1.0,
+                block_tables=prefill_workspace.request_page_table[
+                    req_lo : req_lo + len(rows_per_request)
+                ],
+                query_start_loc=rowgroup_prefill_query_start_loc(
+                    prefill_workspace, rows, rows_per_request
+                ),
+                row_ends=indexer_metadata.compressed_seq_lens[rows],
+                max_query_len=max(rows_per_request),
+                max_seq_len=prefill_workspace.max_seq_len,
+            )
+            if envs.SGLANG_DEBUG_FP4_INDEXER_OPUS.get():
+                logits = logits.clone()
+                _log_opus_vs_flydsl(
+                    logits,
+                    flydsl_rows(rows),
+                    indexer_metadata.compressed_seq_lens[rows],
+                    layer.layer_id,
+                    rows,
+                )
+            return logits
         if page8:
             return _score_requests_page8(
                 q_fp4=q_fp4[rows],
@@ -669,19 +792,7 @@ def low_ratio_index_topk_hip_extend(
                 rows_per_request=rows_per_request,
                 row_ends=indexer_metadata.compressed_seq_lens[rows],
             )
-        return aiter_fp4_paged_mqa_logits(
-            q_fp4=q_fp4[rows],
-            q_scale=q_scale[rows],
-            k_payload=k_payload,
-            k_scale=k_scale,
-            weights=weights[rows],
-            page_table=indexer_metadata.page_table[rows],
-            c4_seq_lens=indexer_metadata.compressed_seq_lens[rows],
-            weight_scale=1.0,
-            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
-            is_decode=False,
-            prefill_workspace=prefill_workspace if rows.start == 0 else None,
-        )
+        return flydsl_rows(rows)
 
     def select_rows_page8_consumer(rows: slice, req_lo, rows_per_request, consume_rows):
         """A consumer on a page8 pool scores only a request's candidate blocks."""
