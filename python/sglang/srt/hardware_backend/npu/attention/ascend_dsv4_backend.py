@@ -320,6 +320,9 @@ class CompressorAscendBackendMixin:
                 req_to_token_pool=self.req_to_token_pool,
                 out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
             )
+            # [Compact] V4 的字典按压缩比返回字段，验证长度可能改变页表列数。
+            # 例 3 个请求的末尾长度为 [103, 204, 305]。若同时启用 C4/C128，
+            # verify 时下方仍遍历两个页表字段，各字段内的 tensor 按需要定列宽。
             for k, v in result.items():
                 setattr(fm, k, v)
             if is_decode:
@@ -340,6 +343,8 @@ class CompressorAscendBackendMixin:
                 self._build_npu_compress_metadata_verify(forward_batch)
 
         else: #dsv4.1的路径
+            # [Compact] V4.1 eager 走 ratio 1/2。ACLGraph 回放走 _refresh_graph_verify_rows。
+            # 例 3 个请求的 start_pos=[100, 200, 300]，seqused=[3, 4, 5]。
             # V4.1: no allocator bundle and no c4/c128 tables; only the shared
             # seq scalars the fused low-ratio compressor consumes.
             if is_decode:
@@ -1866,17 +1871,12 @@ class LowRatioCompressAscendBackendMixin:
 
             # ragged_verify_token_rows： 给 compact 后的一维 verify token 数组中的每个位置，找出它属于 batch 中的第几个请求。
             request_rows = ragged_verify_token_rows(layout, t).to(device=seq_lens.device) #(num_token, )
-            # 每个 token 所属请求，shape: (t,)
-            # eg. raw_num_requests=bs=3: verify_lens=[2,3,1] → [0,0,1,1,1,2]
-            # eg. raw_num_requests=3,bs=4:
-            # request_rows = [0, 0, 1, 1, 1,     2, 3, 3]
-#                                 请求0    请求1   请求2   ↑  ↑ 尾部补齐行
+            # [Compact] 例 verify_lens=[3, 4, 5]，request_rows [12] 为
+            # [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2]。24 行图的尾部 12 行归到越界编号 3。
 
             valid_request = request_rows < raw_num_requests
-            # 屏蔽虚拟请求及未归属的尾部补齐行。
-            # 返回逐 token 的 bool mask，shape: (layout.graph_num_token,)
-            # 无 padding 示例：[T,T,T,T,T,T]
-            # 若另有两个未归属尾部行：[T,T,T,T,T,T,F,F]
+            # 布尔 mask 的形状和 token 行数一致。真实 KV 槽有效时，12 行图全为 True，
+            # 24 行图的前 12 行为 True，尾部 12 行为 False。
 
             out_loc = forward_batch.out_cache_loc.reshape(-1)
             valid_cache_loc = out_loc > 0
@@ -2092,6 +2092,8 @@ class LowRatioCompressAscendBackendMixin:
         # (unused, empty) softmax-lse tensors explicitly.
         attn_out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
         lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+        # [Compact] Target 计算。MQSMLA 用 Q 偏移和 top-k 长度区分有效行与补齐行。
+        # 例 12 行图的 q 和 attn_out 首维均为 12，Q 偏移的尾部重复 12 表示空请求槽。
         _ds41_ops().mixed_quant_sparse_flash_mla_dsl(
             q, out=attn_out, lse=lse, **attn_kwargs
         )
@@ -2239,6 +2241,8 @@ class LowRatioCompressAscendBackendMixin:
         # bs 是图的请求槽位容量；t 是图的 token 容量，两者不能混用。
         t = bs * tokens_per_req if num_tokens is None else int(num_tokens)
 
+        # [Compact] 图与 padding。相同 token 档位下，请求槽更多也可能增大 C2 输出容量。
+        # 例图 token 容量 12、请求槽容量 8 时，C2 缓冲区长度为 min(12, 12 // 2 + 8)=12。
         for ratio in self._dsv41_low_ratios(): # 压缩输出容量：为各请求跨前缀完成的压缩组预留余量
             pad = min(t, t // ratio + bs)
             setattr(
@@ -2503,21 +2507,21 @@ class LowRatioCompressAscendBackendMixin:
         element for element.
         """
 
-        #假设本轮请求数量bs=3, 本轮验证长度是 [2, 3, 1], 前缀长度是[6,7,4]
+        # 例 raw_bs=3，verify_lens=[3, 4, 5]，前缀长度=[100, 200, 300]。
         fm = ctx.fm
         layout = ctx.ragged_layout
         w = int(ctx.tokens_per_bs)
-        # n = int(ctx.bs) * w
-        live = ctx.live_seq_lens[: ctx.bs].to(torch.int64) # 各请求已提交的前缀长度，统一为 int64 eg.[6, 7, 4] (bs=3,)
+        live = ctx.live_seq_lens[: ctx.bs].to(torch.int64) # 8 槽图的前缀长度为 [100, 200, 300, 0, 0, 0, 0, 0]。
 
-        # positions:本轮验证 token 的绝对位置，从 0 开始编号，shape: (n,)
-        # static:
-        #   [6,7,8,9,10,11, 7,8,9,10,11,12, 4,5,6,7,8,9]，shape: (18,)
-        # compact:
-        #   [6,7, 7,8,9, 4]，shape: (6,)
-        #   └A─┘ └─B──┘  C
+        # positions 是本轮 token 的绝对位置。Static 每请求 6 行，真实位置共 18 行。
+        # Compact 位置为 [100, 101, 102, 200, 201, 202, 203, 300, 301, 302, 303, 304]，
+        # 命中 12 行图时 positions 形状为 [12]。
         positions = ctx.forward_batch.positions.reshape(-1).to(torch.int64) # 展平本轮 token 的绝对位置
 
+        # [Compact] Target 计算。按图 token 容量规划压缩行，只保留有效组的写入槽。
+        # 例 12 个有效 position 中，C2 组在 101、201、203、301、303 结束。
+        # positions_cmp_padding_c2 [12] 含组起点 [100, 200, 202, 300, 302] 和 7 个 0，
+        # c2_loc [12] 含 5 个压缩 KV 写入槽和 7 个 -1。
         # Static uses a request-major rectangle; ragged uses a token-tier capacity.
         n = (int(layout.graph_num_tokens)if layout is not None else int(ctx.bs) * w)  #图容量
 
@@ -2534,26 +2538,21 @@ class LowRatioCompressAscendBackendMixin:
                 return
 
             # Ragged: use Q indptr to map each packed token to its request.
-            request_rows = ragged_verify_token_rows(layout, n) #返回每个 token 所属的是第几个请求 eg.  [0, 0, 1, 1, 1, 2]
+            request_rows = ragged_verify_token_rows(layout, n) # 例 [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2]。
             valid_request = request_rows < int(ctx.raw_bs) # ctx.raw_bs:原始请求数量/ ctx.bs:补齐后，图执行使用的请求槽位数量 /仅保留实际请求，屏蔽图补齐产生的虚拟请求
             safe_request_rows = request_rows.clamp(max=int(ctx.bs) - 1)  #将越界编号限制到合法范围，保证读取安全
-            row_live = live[safe_request_rows] # 展开所属请求的前缀长度，eg. [6,6,7,7,7,4]，shape: (n,)，int64
+            row_live = live[safe_request_rows] # 展开为 3 个 100、4 个 200 和 5 个 300。
             row_live = torch.where(valid_request, row_live, torch.zeros_like(row_live),) # 真实请求保留前缀长度，虚拟请求或未归属行置 0，shape: (n,)
 
         else: # static 分支：每个请求都有相同数量的验证行
             # Static: every request owns the same number of token rows.
-            # 每个请求的前缀长度重复 w 次，shape: (bs*w,) = (18,)
-            # eg. [6,6,6,6,6,6, 7,7,7,7,7,7, 4,4,4,4,4,4]
+            # 每个请求槽的前缀长度重复 6 次。若回放 4 槽图，形状为 [24]。
             # 这里保留整数长度；辅助函数内部通过 row_live > 0 判断有效性
             row_live = live.repeat_interleave(w)
 
-        # The replay view's out_cache_loc is UNPADDED: scatter it into the
-        # padded window; padding rows keep 0 and the slot filter drops them.
-        # raw_out_loc:v 本轮输入 token 的完整 KV 物理槽位，shape: (m_raw,)  注意：这是物理槽位，不是上面的逻辑 positions  m_raw 通常等于图容量。
-        # compact 示例，假设 page_size=128：
-        # 如果没 有padding [134,135, 263,264,265, 388]，shape: (6,)
-        # 如果有 有 token 图容量 padding [134, 135, 263, 264, 265, 388, 0, 0] (8, )
-        #                                               ↑   ↑  padding
+        # Compact 的 out_cache_loc 已补到图容量，存的是 KV 物理槽。
+        # 例 12 行图可用 [1124, 1125, 1126, 2248, 2249, 2250, 2251,
+        # 3372, 3373, 3374, 3375, 3376]，24 行图还会在尾部补 12 个 0。
         raw_out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
         if layout is not None and raw_out_loc.numel() != n:  #    # compact 正常输入应已经补齐到 token 图容量
             raise RuntimeError(
@@ -2564,7 +2563,7 @@ class LowRatioCompressAscendBackendMixin:
         if raw_out_loc.numel() == n:
             out_loc = raw_out_loc  # 已补齐，直接复用        # out_loc = torch.zeros(n, dtype=torch.int64, device=ctx.device)
         else:
-            # static 模式下目前没有补齐
+            # Static 输入若短于图容量，用 0 填满剩余位置。
             out_loc = torch.zeros(n, dtype=torch.int64, device=ctx.device)
             if raw_out_loc.numel() > 0:
                 m = min(int(raw_out_loc.numel()), n)
@@ -2574,12 +2573,8 @@ class LowRatioCompressAscendBackendMixin:
             # 为每个 token 判断是否需要产生一个压缩 KV，并计算对应的组起始位置和压缩缓存槽位，
             # 和_fill_ragged_verify_positions_cmp_padding_one的作用是类似的
 
-            # compact 本例，ratio=1： keep   = [T,T,T,T,T,T] / pos_values  = [6,7,7,8,9,4] / slot_values = [134,135,263,264,265,388]
-            # compact 本例，ratio=2：
-            # keep   = [F,T,T,F,T,F]  # 奇数位置完成两 token 一组
-            # pos_values  = [6,6,6,8,8,4]  # 每行所属压缩组的起点位置
-            # slot_values = [67,67,131,132,132,194]  # out_loc // 2
-            # 其中只有 keep=True 的值会被写入有效压缩结果
+            # 12 行图的 ratio 1 保留 12 行。ratio 2 只保留 5 个组结束行，
+            # 用物理槽整除 2 得到压缩写入槽 [562, 1124, 1125, 1686, 1687]。
             keep, pos_values, slot_values = self._dsv41_ratio_row_values(
                 positions, out_loc, ratio, int(self.page_size), row_live=row_live
             )
@@ -2598,14 +2593,7 @@ class LowRatioCompressAscendBackendMixin:
                     ).to(slot_dst.dtype)
                 )
             else:
-                # _stable_compact_1d() 的作用是：按照 keep 筛选有效元素，保持原顺序，写进固定长度的缓冲区，并填充剩余尾部。
-                # pos_values = [6, 6, 6, 8, 8, 4, 0, 0]  # shape: (8,)
-                # keep = [F, T, T, F, T, F, F, F]
-                # 保留的元素，顺序不变：
-                #              [6, 6, 8]
-                #输出：
-                # # pos_dst = [6, 6, 8, 0, 0, 0, 0]
-                # #             有效值    未使用的尾部
+                # 按原顺序写入 5 个有效组，剩下 7 行的位置填 0，槽位填 -1。
                 self._stable_compact_1d(pos_dst, pos_values, keep, fill=0)
                 self._stable_compact_1d(slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP)
 
@@ -3479,6 +3467,8 @@ class DeepseekV4AscendAttnBackend(
             # The graph-owned Q indptr remains device-side and is refreshed
             # without reallocating. This mirror can later be replaced by an
             # NPU metadata kernel without changing the captured interface.
+            # [Compact] 同步开销。保留 CPU 镜像时，回放前另有一次设备到 host 的读回。
+            # 例 8 槽布局将设备上的 [3, 4, 5, 0, 0, 0, 0, 0] 读为 CPU 张量 [8]。
             verify_lens_cpu = verify_lens if mirrorless else verify_lens.cpu()
 
         is_idle_replay = runtime_mode.is_idle()
@@ -3648,6 +3638,8 @@ class DeepseekV4AscendAttnBackend(
     def _refresh_graph_seq_metadata(self, ctx) -> None:
         fm = ctx.fm
         if ctx.ragged_layout is not None:
+            # [Compact] Target 计算。实际 Q 边界由逐请求 verify_lens 的累加偏移给出。
+            # 例 12 行图的实际 Q 偏移为 [0, 3, 7, 12, 12, 12, 12, 12, 12]，形状 [9]。
             fm.actual_seq_lengths_q_pa.copy_(
                 ctx.ragged_layout.qo_indptr_device.to(
                     device=ctx.device, dtype=torch.int32
@@ -3696,8 +3688,7 @@ class DeepseekV4AscendAttnBackend(
                         mask = torch.zeros_like(mask_buf)  # 无请求槽位时全部无效
                     else:
                         request_rows = ragged_verify_token_rows(layout, n)
-                        # 每个 token 所属的请求，shape: (n,)
-                        # eg. [0,0,1,1,1,2]
+                        # 例 12 行图对应 [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2]。
 
                         valid_request = request_rows < int(ctx.raw_bs)
                         # 排除虚拟请求和未归属的尾部补齐行，shape: (n,)
@@ -3706,15 +3697,11 @@ class DeepseekV4AscendAttnBackend(
                         # 保证下面索引前缀长度时不会越界
 
                         per_req = ctx.live_seq_lens[: ctx.bs] > 0
-                        # 各请求是否活跃，shape: (bs,)
-                        # eg. [6,7,4] → [T,T,T]
-                        # mask = valid_request & per_req[safe_request_rows]
+                        # 8 个请求槽中前 3 个活跃，后 5 个是虚拟请求槽。
 
                         out_loc = ctx.forward_batch.out_cache_loc.reshape(-1) #DP dummy：所有槽位都是 0  → 全 False
                         mask = (valid_request& per_req[safe_request_rows]& (out_loc > 0))
-                        # 展开为逐 token 的有效性，shape: (n,)
-                        # 无 padding 示例：[T,T,T,T,T,T]
-                        # 若另有两个未归属尾部行：[T,T,T,T,T,T,F,F]
+                        # 12 行图的 mask 为 [True] * 12。24 行图还会在尾部补 12 个 False。
 
                 else: #ctx.final_seq_lens_cpu=前缀长度+本轮验证长度
                     per_req = ctx.final_seq_lens_cpu.reshape(-1)[: ctx.bs].to(
@@ -3774,6 +3761,8 @@ class DeepseekV4AscendAttnBackend(
         fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
         valid = ctx.live_seq_lens[: ctx.bs] > 0
         if ctx.ragged_layout is not None:
+            # [Compact] 例 8 槽的 start_pos=[100, 200, 300, 0, 0, 0, 0, 0]，
+            # seqused=[3, 4, 5, 0, 0, 0, 0, 0]，压缩算子按这两个 [8] 张量分段。
             fm.seqused.copy_(
                 torch.where(valid, ctx.verify_lens, torch.zeros_like(ctx.verify_lens))
             )

@@ -96,6 +96,12 @@ def build_ragged_verify_window(
     model_runner,
 ) -> RaggedVerifyWindow:
     prefix_lens = batch.seq_lens
+    # [Compact] 减少送验。verify_lens 指定有效行，padded_total 是图输入容量。
+    # 例 anchor=[10, 20, 30]，保留 [3, 4, 5] 行且图容量为 12。
+    # verify_ids=[10, 11, 12, 20, 21, 22, 23, 30, 31, 32, 33, 34]。
+    # positions=[100, 101, 102, 200, 201, 202, 203, 300, 301, 302, 303, 304]。
+    # window_index=[0, 1, 2, 6, 7, 8, 9, 12, 13, 14, 15, 16]，
+    # 指向原 [3, 6] 窗口展平后的行。verify_cache_loc [12] 对应同一批选中的 KV 槽。
     verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
     padded_total = layout.graph_num_tokens
 

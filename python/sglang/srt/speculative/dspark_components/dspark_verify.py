@@ -368,6 +368,8 @@ class TargetVerifyExecutor:
             verify_input.candidate_max_seq_len_upper_bound = (
                 candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
             )
+        # [Compact] 例 verify_input.draft_token、positions 和 batch.out_cache_loc
+        # 均为 [12]。prepare_for_verify 生成 batch_size=3 的 target ForwardBatch。
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -380,6 +382,7 @@ class TargetVerifyExecutor:
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )
+        # [Compact] 命中 12 行图时，这里的 logits [12, V]、hidden [12, H] 仍是打包顺序。
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
@@ -399,6 +402,8 @@ class TargetVerifyExecutor:
     ) -> None:
         assert self.kv_injector is not None, "commit_hidden needs a kv_injector"
         if run_compact:
+            # [Compact] 从固定步幅 hidden [18, H] 中提交前缀 [2, 3, 5]，
+            # 对应原窗口展平索引 [0, 1, 6, 7, 8, 12, 13, 14, 15, 16]。
             self.kv_injector.inject_ragged(
                 batch=batch,
                 layout=layout,
@@ -442,6 +447,9 @@ class TargetVerifyExecutor:
         sampling_info,
         iteration_ids,
     ) -> TargetVerifyResult:
+        # [Compact] 输入 RaggedVerifyWindow 的 4 个 [12] 张量。
+        # 将其中的 token ID、position 和 window_index 连同 layout 交给 target，
+        # KV 槽则放入 batch.out_cache_loc。
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
             positions=ragged_window.positions,
@@ -458,6 +466,8 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
+            # [Compact] 同步开销。布局缺少 CPU 版 verify_lens 时从设备读回。
+            # 例设备长度 [3, 4, 5] 转成 CPU 列表，与前缀相加得到 [103, 204, 305]。
             verify_lens_cpu = (
                 layout.verify_lens_cpu
                 if layout.verify_lens_cpu is not None
@@ -501,6 +511,9 @@ class TargetVerifyExecutor:
                 window_index=None,
             )
         else:
+            # [Compact] 减少送验。只保留各请求窗口的前缀，尾部补到 graph_num_tokens。
+            # 例 [3, 4, 5] 且图容量为 12。verify_ids、positions、verify_cache_loc
+            # 和 window_index 都是 [12]。window_index 可回查原 [3, 6] 窗口。
             ragged_window = BuildRaggedVerifyWindow.execute(
                 batch=batch,
                 layout=layout,
@@ -522,6 +535,8 @@ class TargetVerifyExecutor:
         )
         logits_output = target_verify.logits_output
 
+        # [Compact] 接受与 TPOT。Logits 和 hidden 要恢复到每请求固定步幅。
+        # 例 logits [12, vocab_size] scatter 为 [18, vocab_size]，hidden 同样补回 18 行。
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden
@@ -1336,6 +1351,8 @@ def accept_draft_tokens(
     rejection_noise: Optional[RejectionNoise] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
+    # [Compact] 接受与 TPOT。verify_lens 含 anchor，因此最多接受 verify_lens - 1 个草稿。
+    # 例 [3, 4, 5] 对应草稿接受上限 [2, 3, 4]，再加 1 个目标模型生成的 bonus。
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
     if all_greedy:

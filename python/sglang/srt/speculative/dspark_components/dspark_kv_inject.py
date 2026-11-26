@@ -383,6 +383,9 @@ class TargetHiddenKvInjector:
     ) -> None:
         stride = self.verify_num_draft_tokens
         prefix_lens = batch.seq_lens
+        # [Compact] 例 hidden_strided [18, H] 还原为 [3, 6, H]。
+        # commit_lens=[2, 3, 5] 只允许写入位置 [100, 101]、[200, 201, 202]、
+        # [300, 301, 302, 303, 304] 对应的 10 个有效 draft KV 槽。
         hidden = hidden_strided.view(bs, stride, -1)
 
         pool = self.draft_model_runner.token_to_kv_pool

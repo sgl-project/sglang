@@ -890,6 +890,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return not draft_uses_compressed_kv_attention()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
+        # [Compact] 图与 padding。请求槽容量独立于每轮真实请求数和有效 token 数。
+        # 例 num_tokens=12、max_bs=8 时返回 8 个槽，raw_bs=3 时有 5 个虚拟槽。
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return num_tokens // self.captured_req_width
         return min(num_tokens, self.max_bs)
@@ -921,6 +923,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return layout
 
     def _stage_ragged_verify_layout(self, ragged_layout, graph_size_key: int) -> None:
+        # [Compact] 图与 padding。每次回放把真实请求边界写入图捕获时绑定的缓冲区。
+        # 例图容量 12、8 个槽。verify_lens=[3, 4, 5] 补为 [3, 4, 5, 0, 0, 0, 0, 0]，
+        # qo_indptr 从 [0, 3, 7, 12] 补为 [0, 3, 7, 12, 12, 12, 12, 12, 12]。
         # Without this refresh every replay reuses the capture-time synthetic
         # verify_lens / qo_indptr and mis-slices the packed q rows.
         cap_layout = self._captured_ragged_layouts.get(graph_size_key)
@@ -1684,6 +1689,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # capture_num_tokens (same source), and verify_layout_grid's
             # [total] escape branches only fire with ragged_verify_mode off,
             # where this branch is unreachable.
+            # [Compact] 图与 padding。更小的 graph_num_tokens 才会缩小定长 forward。
+            # ACLGraph 是昇腾 NPU 的图捕获和回放机制。每轮装载新数据后复用已捕获的算子任务。
+            # 例 raw_bs=3、verify_lens=[3, 4, 5]。选 12 行图时 input_ids [12]；
+            # 若选 24 行图则 input_ids [24]，其中 12 行是真实输入。
             raw_num_token = graph_size_key = ragged_layout.graph_num_tokens
             bs = self._ragged_capture_slots(graph_size_key)
             assert bs >= raw_bs, (

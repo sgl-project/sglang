@@ -1816,6 +1816,7 @@ class Scheduler(
             needs_confidence_relay=needs_confidence_relay,
         )
 
+        #Static 这里是None
         self._confidence_budget_prepare = None
         if (
             needs_confidence_relay
@@ -5367,6 +5368,9 @@ class Scheduler(
                 if not gpu_only_lens:
                     self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
+                    # compact额外计算, static这里是None, 会跳过
+                    # 这里会走到-》dspark_planner.py(DSparkVerifyPlanner).get_confidence_budget_prepare
+                    #-》DSparkVerifyPlanner.prepare_verify_budget
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:

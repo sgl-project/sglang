@@ -908,6 +908,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._verify_planner.is_compact_mode
         ):
             return None
+        # [Compact] 例 all-gather 后的 DP8 计划行数为 [12, 11, 10, 9, 12, 10, 11, 8]。
+        # 输出整数 12，供 schedule_layout 统一选档。缺少有效的聚合结果时返回 None。
         return dp_global_verify_tier_num_tokens(
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
         )
@@ -962,6 +964,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         coordination_plan=None,
     ) -> GenerationBatchResult:
+        # [Decode] 入口接收当前请求批次、已提交前缀和上一轮的 bonus token。
+        # 统一示例用 draft_num_token=6（即 verify_num_draft_tokens）、raw_bs=3，
+        # Compact verify_lens=[3, 4, 5]。6 行由 1 个 anchor 和 5 个 draft token 组成。
+        # batch.seq_lens=[100, 200, 300] 和上一轮 bonus=[10, 20, 30]，形状均为 [3]。
+        # 请求槽 req_pool_indices=[1, 2, 3]，形状为 [3]。
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
         draft_input = batch.spec_info
@@ -1021,6 +1028,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             if batch.seq_lens_cpu is not None
             else draft_input.nxt_kv_lens_cpu
         )
+        # [Decode] 先按固定宽度规划 position 和 KV 写入槽，再运行 draft。
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -1032,6 +1040,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus=draft_input.bonus_tokens.view(-1) if anchor_ids is not None else None,
             anchor_ids=anchor_ids,
         )
+        # 返回 VerifyWindow，有四个字段。
+        # positions_2d [3, 6] = [[100, ..., 105], [200, ..., 205], [300, ..., 305]]。
+        # verify_cache_loc [18] 是 18 个虚拟 KV 写入槽，verify_cache_loc_2d [3, 6]
+        # 是相同数据的二维视图。iteration_ids 是 IterationIds 对象，持有本轮读写计划。
         if self._verify_inputs_ready is not None:
             # The verify's inputs are final here; the early metadata waits for this.
             self._verify_inputs_ready.record()
@@ -1061,6 +1073,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
             )
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+            # [Decode] 给 draft 传 anchor [3] 和完整窗口 positions_2d [3, 6]。
+            # 返回 DraftProposal，三个请求各产出 5 个草稿，draft_tokens 形状为 [3, 5]。
             proposal = self._proposer.propose(
                 batch=batch,
                 draft_input=draft_input,
@@ -1079,19 +1093,33 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
+        # 例三个 draft_tokens 行分别为 [11, 12, 13, 14, 15]、
+        # [21, 22, 23, 24, 25] 和 [31, 32, 33, 34, 35]。
         draft_tokens = draft_block.draft_tokens
         if coordination_plan is not None:
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
+        # [Compact] 本轮 confidence 的形状为 [3, 5]。用于分配长度的示例矩阵如下。
+        # [[.9, .9, .1, .9, .9], [.9, .9, .9, .1, .9], [.9, .9, .9, .9, .1]]。
         confidence = proposal.confidence
 
-        verify_token_budget = self._verify_planner.resolve_verify_token_budget(
+        # [Compact] 输入 draft_input、confidence [3, 5]、前缀和请求槽 [3]。
+        # 假设重叠调度已用历史置信度和 SPS 表算出预算 9，本次调用读回整数 9。
+        # 预算只数额外草稿行，加上 3 个 anchor 共计划验证 12 行。Static 返回 None。
+        # 当前 rank 取出本轮允许验证的额外草稿行数，`例如， raw_bs=3`、每请求窗口 6 行。如果这个函数返回 9，意思是三个请求一共可以额外验证 9 行草稿。
+        verify_token_budget = self._verify_planner.resolve_verify_token_budget( #static 这里会返回None compact返回 int整数（eg. 9）
             draft_input=draft_input,
             confidence=confidence,
             prefix_lens=prefix_lens,
             req_pool_indices=batch.req_pool_indices,
         )
 
+        # 按配置走 Static 或 Compact
+        # [Compact] 输入本轮 confidence [3, 5]、额外预算 9 和 DP 最大计划行数 12。
+        # Top-K 把 9 个额外行分给三个请求 [2, 3, 4]，每个再加 1 个 anchor->[3,4,5]。
+        # static 这里会返回None
+        # compact 会返回RaggedVerifyLayout结构体，包含:
+        #verify_lens=[3,4,5]`、`extend_start_loc=[0,3,7]`、`qo_indptr_device=[0,3,7,12]` 和图档位 `12`
         layout = self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,
@@ -1101,8 +1129,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+        # 输出 RaggedVerifyLayout。verify_lens [3]=[3, 4, 5]，
+        # extend_start_loc [3]=[0, 3, 7]，qo_indptr_device [4]=[0, 3, 7, 12]。
+        # graph_num_tokens=12 是标量图档位。此时 layout.bs=3，只描述真实请求。
+        # 模式为 Compact 且 layout 有效时，should_run_compact 输出 True。
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
+        # [Decode] 完整的待验 token 矩阵 [3, 6]。第一个请求是 [10, 11, 12, 13, 14, 15]，
+        # 首列是 anchor。矩阵保留完整步幅，后续接受阶段按请求和列定位。
         verify_ids_2d = proposal.verify_ids
         if verify_ids_2d is None:
             verify_ids_2d = torch.cat(
@@ -1149,6 +1183,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
+                # [Compact] 减少送验。Target 使用打包后的输入和逐请求验证长度。
+                # 输入为 [3, 6] 的位置窗口、[3, 5] 的草稿和 layout。
+                # 内部先以 12 行输入跑 target，再恢复固定步幅。返回 target_verify
+                # 里的 logits [18, V]、回放标志，以及单独返回的 hidden_strided [18, H]。
                 target_verify, hidden_strided = self._verify_executor.run_compact(
                     batch=batch,
                     layout=layout,
@@ -1166,6 +1204,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                     and self._verify_planner.mode_value == "static"
                 ):
                     self._verify_epilogue.begin_static_step(bs, fold_eligible)
+                # [Decode] Static 用完整 verify_ids_2d [3, 6]，送验前展平为 [18]。
+                # 回放时可按静态图请求档位继续补齐，例如 4 个请求槽对应 24 行。
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
                     draft_input=draft_input,
@@ -1227,6 +1267,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         if region_accept is not None:
             accept = region_accept
         else:
+            # [Compact] 用 verify_ids_2d [3, 6]、target_logits [18, V] 和 layout 做接受判定。
+            # 例返回 AcceptOuts。correct_len=[1, 2, 4]、bonus=[101, 102, 103]，
+            # commit_lens=[2, 3, 5]、new_seq_lens=[102, 203, 305]，这些向量的形状均为 [3]。
             accept = self._verify_executor.accept_and_finalize(
                 folded_accept=folded_accept,
                 bs=bs,
@@ -1295,6 +1338,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if relay is not None:
             relay.published_seq_lens = accept.new_seq_lens
         if on_publish is not None:
+            # [Compact] 向重叠调度发布新前缀长度 [3] 和可用的 confidence [3, 5]。
+            # 调度器可用置信度为后续 step 准备预算。
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
             else:
@@ -1312,6 +1357,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         if not folded_commit:
             with self._draft_context():
+                # [Compact] 输入 hidden_strided [18, H]、原窗口计划和 commit_lens=[2, 3, 5]。
+                # 将 10 个有效位置写入 draft KV，函数通过缓存更新产生结果。
                 self._verify_executor.commit_hidden(
                     batch=batch,
                     layout=layout,
@@ -1324,6 +1371,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         logits_output.hidden_states = None
 
+        # [Compact] 启用逐步记录时，可对照 verify_lens=[3, 4, 5]、图容量 12
+        # 和 commit_lens=[2, 3, 5]。逐请求长度求和是 12 个有效验证行和 10 个提交 token。
         self._observers.observe_verify_step(
             forward_ct=int(batch.forward_iter),
             reqs=batch.reqs,
@@ -1348,12 +1397,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
 
+        # [Decode] 已接受 token 返回 scheduler，bonus 和新长度供下一轮 draft 使用。
+        # 例如接受草稿数 [1, 2, 4]，新 bonus=[101, 102, 103]，
+        # 则 accept_lens=[2, 3, 5]，new_seq_lens=[102, 203, 305]，形状均为 [3]。
+        # make_next_draft_input 用两组 [3] 张量生成下轮的 DFlashDraftInputV2。
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
         )
         if relay is not None:
             relay.published_bonus = next_draft_input.bonus_tokens
+        # [Decode] out_tokens [3, 6] 每行先放接受的草稿，再放 bonus，剩余位置补 0。
+        # 例第一个请求是 [11, 101, 0, 0, 0, 0]。next_token_ids 展平为 [18]，
+        # scheduler 按 accept_lens=[2, 3, 5] 分别读出有效输出。
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
