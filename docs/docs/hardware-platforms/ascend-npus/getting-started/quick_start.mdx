@@ -21,7 +21,7 @@ For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/as
 
 <Tip>
 If `npu-smi` is reported as `command not found`, the NPU driver is not installed on the host. Start from
-[installing the NPU HDK](https://www.hiascend.com/hardware/firmware-drivers?ids=d803%2C89dda9ba9de741349efa03687a487678%2C28%2CAArch64%2Coffline_run_file).
+[installing the NPU HDK](https://www.hiascend.com/hardware/firmware-drivers?ids=d803%2Cbcc87fc38cd74df28cf5c415cf2aea75%2C31%2CAArch64%2Coffline_run_file).
 </Tip>
 
 ### Docker
@@ -45,7 +45,8 @@ at least **30GB** of free space. If you need to download model weights, check th
 
 <Tip>
 We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version,
-or a daily build tag (e.g., `main-cann9.1.0-a3`) if you need the latest development changes.
+or a daily build tag if you need the latest development changes. CANN 9.2.0 has no daily builds published yet, so
+daily-build tags are currently available only for CANN 9.1.0 (e.g., `main-cann9.1.0-a3`).
 </Tip>
 
 If you have already downloaded model weights to a local path (e.g., `/path/to/model`), mount the path into the container by
@@ -58,7 +59,7 @@ on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
   <Tab title="A3 Series">
 
 ```shell Command
-export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
+export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --env ASCEND_VISIBLE_DEVICES=0-15 \
