@@ -75,6 +75,12 @@ def current_model() -> ModelContext:
     return _MODEL
 
 
+def max_slots(rows: int) -> int:
+    """The most GPU slots a tiered layer with ``rows`` host rows can have: a wave reads
+    each of up to K experts into a host row of its own, and the plan kernel bounds K."""
+    return min(rows, _MAX_TIER_SLOTS)
+
+
 def host_memory_budget_bytes(need_bytes: int) -> Optional[int]:
     """Pinned host memory for all expert stores, which need ``need_bytes`` to hold every
     expert: ``--paged-experts-host-memory-gb``; unset, None (every expert pinned, as without
@@ -201,7 +207,7 @@ def host_rows(
             )
             + " or set --paged-experts-num-resident to fewer slots"
         )
-    if num_slots > _MAX_TIER_SLOTS:
+    if num_slots > max_slots(rows):
         raise RuntimeError(
             f"Paged experts: the disk tier plans at most {_MAX_TIER_SLOTS} GPU slots per "
             f"layer, --paged-experts-num-resident gives {num_slots}; set it to at most "
