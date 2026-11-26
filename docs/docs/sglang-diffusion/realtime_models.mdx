@@ -30,12 +30,16 @@ also register a realtime adapter and implement the WebSocket session lifecycle.
 
 | Model family | Pipeline | Live controls | QVG KV-cache quantization |
 | --- | --- | --- | --- |
+| Cosmos-Dreams (Bimanual) | `CosmosDreamsRealtimePipeline` | Camera or robot action blocks | Not supported |
+| HY-Nomas | `NomasPipeline` | Event captions, frame counts, and optional camera poses | Not supported |
 | LingBot World | `LingBotWorldCausalDMDPipeline` | Camera actions and prompt updates | Supported |
 | SANA-WM | `SanaWMRealtimePipeline` | Camera actions | Not supported |
 
 Use the model cookbooks for launch commands, request schemas, and control-token
 details:
 
+- [Cosmos-Dreams](/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints)
+- [HY-Nomas](/cookbook/diffusion/HY-Nomas/HY-Nomas)
 - [LingBot World](/cookbook/diffusion/LingBot-World/LingBot-World)
 - [LingBot World 2.0](/cookbook/diffusion/LingBot-World/LingBot-World-2.0)
 - [SANA-WM](/cookbook/diffusion/SANA-WM/SANA-WM)
@@ -45,7 +49,8 @@ For the complete model list, see
 
 ## Causal Cache Controls
 
-Realtime requests can override two model defaults:
+Realtime requests expose two causal-cache overrides where supported by the
+model's adapter:
 
 - `realtime_causal_sink_size`: amount of stable prefix history retained as an attention sink
 - `realtime_causal_kv_cache_num_frames`: recent causal history retained in the rolling KV-cache window
@@ -53,6 +58,10 @@ Realtime requests can override two model defaults:
 Larger windows preserve more history but increase resident memory and attention
 work. These fields are request/session controls; supported ranges and defaults
 remain model-specific.
+
+These controls are not universal across realtime models. HY-Nomas uses an
+event-segment cache; follow its [cache settings](/cookbook/diffusion/HY-Nomas/HY-Nomas#kv-cache-budget)
+instead of applying sliding-window controls.
 
 For supported LingBot World deployments, the server-level
 `--kv-cache-quant {off,int4,int2}` option compresses completed cache chunks.
@@ -66,7 +75,8 @@ current limitations.
 
 <Warning>
 QVG KV-cache quantization currently supports only the LingBot realtime
-sliding-window-and-sink path. It does not apply to SANA-WM realtime, LongLive 2.0
+sliding-window-and-sink path. It does not apply to Cosmos-Dreams, HY-Nomas,
+SANA-WM realtime, LongLive 2.0
 pinned sinks, global sinks, or dynamically growing caches.
 </Warning>
 
@@ -76,3 +86,4 @@ pinned sinks, global sinks, or dynamically growing caches.
 - Benchmark a representative session length. Short clips may not exercise cold-cache packing and can hide both its memory benefit and packing overhead.
 - Treat sequence parallelism as model-specific. Follow the model cookbook and the [Sequence Parallelism](./ring_sp_performance) guide instead of assuming one mesh is best for every realtime pipeline.
 - Realtime WebSocket clients must send an initialization message before control events. The exact MessagePack schema and output encoding are documented in each model cookbook.
+- Each server process admits one active realtime generation session. Idle connections and invalid initialization messages do not reserve that slot. If an initialized session cannot obtain the slot within one second, the server sends an error and closes its WebSocket with code `1008`.

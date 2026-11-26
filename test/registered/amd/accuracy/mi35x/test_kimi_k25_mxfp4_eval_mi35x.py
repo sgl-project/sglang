@@ -7,7 +7,7 @@ The FP8 KV cache variant validates the fix for assertion failure
 `q_scale.has_value() && kv_scale.has_value()` in aiter ASM MLA decode
 when layer.k_scale is None (the RadixAttention default).
 
-Registry: nightly-amd-8-gpu-mi35x-kimi-k25-mxfp4-aiter-mla suite
+Registry: nightly-test-8-gpu-amd-mi35x-kimi-k25-mxfp4-aiter-mla suite
 """
 
 import os
@@ -27,8 +27,9 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=7200,
-    suite="nightly-amd-8-gpu-mi35x-kimi-k25-mxfp4-aiter-mla",
+    suite="nightly-test-8-gpu-amd-mi35x-kimi-k25-mxfp4-aiter-mla",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 
@@ -153,7 +154,7 @@ class TestKimiK25MXFP4AiterMlaEvalMI35x(unittest.TestCase):
                             num_questions=self.num_questions,
                             parallel=self.num_questions,
                             max_new_tokens=512,
-                            host="http://127.0.0.1",
+                            host="127.0.0.1",
                             port=int(self.base_url.split(":")[-1]),
                         )
                         metrics = run_eval_few_shot_gsm8k(args)

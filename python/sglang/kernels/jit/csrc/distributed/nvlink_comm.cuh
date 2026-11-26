@@ -2,6 +2,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/math.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -21,31 +22,7 @@ namespace sglang {
 
 using device::distributed::PushWorkSpace;
 using device::distributed::Semaphore;
-
-// Runtime uint32 division as a multiply-high and a shift (round-up magic,
-// exact below 2^31); cuda::fast_mod_div needs a newer CCCL than CUDA 13 bundles.
-struct fast_mod_div_u32_t {
-  uint32_t divisor;
-  uint32_t magic;
-  uint32_t shift;
-
-  __host__ explicit fast_mod_div_u32_t(uint32_t d) : divisor(d), magic(0), shift(0) {
-    if (d > 1) {
-      const uint32_t log2_ceil = 32 - std::countl_zero(d - 1);
-      const uint32_t p = 31 + log2_ceil;
-      magic = static_cast<uint32_t>(((uint64_t{1} << p) + d - 1) / d);
-      shift = p - 32;
-    }
-  }
-
-  __device__ friend uint32_t operator/(uint32_t n, const fast_mod_div_u32_t& fd) {
-    return fd.divisor == 1 ? n : __umulhi(n, fd.magic) >> fd.shift;
-  }
-
-  __device__ friend uint32_t operator%(uint32_t n, const fast_mod_div_u32_t& fd) {
-    return n - (n / fd) * fd.divisor;
-  }
-};
+using device::math::fast_mod_div_u32_t;
 
 template <uint32_t kWorldSize>
 struct NVLinkCommPushParams {
@@ -168,8 +145,7 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
         ptx::st_multimem_16B(vec, dst_ptr_mc, vid);
       }
     } else /* reduce-scatter only */ {
-      const auto token_id = vid / params.vecs_per_token_div;
-      const auto offset = vid % params.vecs_per_token_div;
+      const auto [token_id, offset] = math::div(vid, params.vecs_per_token_div);
       // Both by a compile-time constant, so this is a mask and a shift.
       const auto dst_rank = token_id % kWorldSize;
       const auto dst_token_id = token_id / kWorldSize;
@@ -291,7 +267,7 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
   }
 
   __syncthreads();
-  epoch.flip();
+  epoch.commit();
 }
 
 template <typename T, bool kHasResidual, Primitive kPrim, bool kUsePDL, uint32_t kPullUnroll>
@@ -309,8 +285,8 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
   const auto num_warps = gridDim.x * (kPullCTASize / kWarpThreads);
 
   PDLWaitPrimary<kUsePDL>();
-  const auto barrier = distributed::McBarrier{params.sem_local, params.sem_mc, params.world_size, 2};
-  barrier.arrive_relaxed(/*n=*/0);
+  const auto barrier = distributed::McBarrier{params.sem_local, params.sem_mc, params.world_size};
+  barrier.arrive_relaxed();
   __syncthreads();
 
   const auto num_whole_chunks = params.num_vecs / kNumWarpVecs;
@@ -376,9 +352,9 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
   if constexpr (kPrim & Primitive::AG) {
-    barrier.arrive_rel_acq(/*n=*/1);
+    barrier.arrive_rel_acq();
   } else {  // no store multimem, only local store
-    barrier.arrive_relaxed(/*n=*/1);
+    barrier.arrive_relaxed();
   }
 }
 
@@ -453,7 +429,7 @@ struct NVLinkComm {
     auto device_ = SymbolicDevice{};
     auto dtype_ = SymbolicDType{};
     if constexpr (!std::is_same_v<T, void>) dtype_.set_options<T>();
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({-1, D})  //
         .with_dtype(dtype_)
         .with_device(device_)
@@ -535,7 +511,7 @@ struct NVLinkComm {
     };
     const auto kernel = residual.has_value() ? nvlink_push_kernel<T, true, kPrim, kWorldSize, kUsePDL>
                                              : nvlink_push_kernel<T, false, kPrim, kWorldSize, kUsePDL>;
-    host::LaunchKernel(push.num_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
+    host::LaunchKernel(push.default_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
   }
 
   template <Primitive kPrim, uint32_t kPullUnroll>
@@ -568,15 +544,15 @@ struct NVLinkComm {
     } else if constexpr (kPrim == Primitive::RS) {
       CHECK_HOST(out_tokens == routing.num_rank_tokens && in_mc_ptr != 0);
       in_mc_ptr += prefix_bytes;
-      if (num_blocks_hint == 0) num_blocks_hint = pull.num_blocks;  // use all the blocks for RS
+      if (num_blocks_hint == 0) num_blocks_hint = pull.default_blocks;  // use all the blocks for RS
     } else {
       static_assert(kPrim == Primitive::AG);
       CHECK_HOST(num_tokens == routing.num_rank_tokens && out_mc_ptr != 0);
       out_mc_ptr += prefix_bytes;
       if (num_blocks_hint == 0) num_blocks_hint = host::div_ceil(128u, kPullUnroll * world_size);
     }
-    /// NOTE: hard limit upper bound is `pull.num_blocks`
-    num_blocks_hint = std::min(num_blocks_hint, pull.num_blocks);
+    /// NOTE: hard limit upper bound is `pull.capacity`
+    num_blocks_hint = std::min(num_blocks_hint, pull.capacity);
 
     // Every pull primitive works on this rank's shard, so a full-length
     // residual is sliced onto it.
@@ -607,33 +583,11 @@ struct NVLinkComm {
   // specialized for each world size
   template <uint32_t kWorldSize>
   static void
-  all_reduce_push(CommunicatorRef comm, TensorView in, TensorView out, tvm::ffi::Optional<TensorView> residual) {
-    return run_push<Primitive::AR, kWorldSize>(comm->get_push_obj(), in, out, residual);
-  }
-  template <uint32_t kWorldSize>
-  static void
   all_gather_push(CommunicatorRef comm, TensorView in, TensorView out, tvm::ffi::Optional<TensorView> residual) {
     return run_push<Primitive::AG, kWorldSize>(comm->get_push_obj(), in, out, residual);
   }
-  template <uint32_t kWorldSize>
-  static void
-  reduce_scatter_push(CommunicatorRef comm, TensorView in, TensorView out, tvm::ffi::Optional<TensorView> residual) {
-    return run_push<Primitive::RS, kWorldSize>(comm->get_push_obj(), in, out, residual);
-  }
 
   // only compile once for each world size
-  template <uint32_t kPullUnroll>
-  static void all_reduce_pull(
-      CommunicatorRef comm,  // only pull is needed
-      TensorView in,
-      TensorView out,
-      tvm::ffi::Optional<TensorView> residual,
-      int64_t in_mc_ptr,
-      int64_t out_mc_ptr,
-      uint32_t num_blocks_hint) {
-    return run_pull<Primitive::AR, kPullUnroll>(
-        comm->get_pull_obj(), in, out, residual, in_mc_ptr, out_mc_ptr, num_blocks_hint);
-  }
   template <uint32_t kPullUnroll>
   static void all_gather_pull(
       CommunicatorRef comm,  // only pull is needed
@@ -644,16 +598,6 @@ struct NVLinkComm {
       uint32_t num_blocks_hint) {
     return run_pull<Primitive::AG, kPullUnroll>(
         comm->get_pull_obj(), in, out, residual, 0, out_mc_ptr, num_blocks_hint);
-  }
-  template <uint32_t kPullUnroll>
-  static void reduce_scatter_pull(
-      CommunicatorRef comm,  // only pull is needed
-      TensorView in,
-      TensorView out,
-      tvm::ffi::Optional<TensorView> residual,
-      int64_t in_mc_ptr,
-      uint32_t num_blocks_hint) {
-    return run_pull<Primitive::RS, kPullUnroll>(comm->get_pull_obj(), in, out, residual, in_mc_ptr, 0, num_blocks_hint);
   }
 };
 

@@ -102,7 +102,7 @@ An initial implementation of dynamic batching for T2I and T2V models can be foun
 Qwen Image 2.1 supports merging compatible text-to-image requests. Image edits
 are not merged across requests; `n > 1` still produces multiple outputs within
 one edit request. See its [cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#batching)
-for platform measurements and when batching is useful.
+for deployment settings and batching tradeoffs.
 
 ### Video
 
@@ -150,7 +150,7 @@ for platform measurements and when batching is useful.
 - Use `--enable-batching-metrics` to inspect realized batches:
 
 ```text
-Dynamic batch dispatch: size=2/8, user_max=8, queue_wait=5.12ms, stop_reason=delay
-Dynamic batch dispatch: size=1/8, user_max=8, queue_wait=0.04ms, stop_reason=config_cap:1
-Dynamic batch stats (last 5 dispatches): avg_size=2.80, merged_rate=60.0%, full_rate=20.0%, utilization=35.0%, wait_avg=3.21ms, wait_p95=5.12ms, top_rejects=none
+Dynamic batch dispatch: requests=2, outputs=2/8, user_max_outputs=8, queue_wait=5.12ms, stop_reason=delay
+Dynamic batch dispatch: requests=1, outputs=1/1, user_max_outputs=8, queue_wait=0.04ms, stop_reason=config_cap:1
+Dynamic batch stats (last 5 dispatches): avg_requests=2.80, avg_outputs=2.80, merged_rate=60.0%, full_rate=20.0%, utilization=35.0%, wait_avg=3.21ms, wait_p95=5.12ms, top_rejects=none
 ```

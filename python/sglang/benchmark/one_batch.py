@@ -64,24 +64,24 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    resolution_result,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.hf_transformers import get_tokenizer
+from sglang.srt.layers.dp_attention import require_mlp_sync, require_mlp_tp_gather
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -94,12 +94,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     SpawnRanks,
+    get_device,
     get_model,
-    get_parallel,
     get_schedule,
     publish,
     spawn_world_rank,
 )
+from sglang.srt.sampling.sampler_params import SamplerParamsPool
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -108,12 +109,21 @@ from sglang.srt.utils import (
     get_bool_env_var,
     kill_process_tree,
     maybe_reindex_device_id,
-    require_mlp_sync,
-    require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+
+def _init_process_global_configs() -> None:
+    """Process-global config both benchmark modes need before the model loads.
+
+    The Mamba SSU backend is not here: `load_model` installs it for the models
+    that have one.
+    """
+    initialize_moe_config()
+    initialize_fp8_gemm_config()
+    initialize_bf16_gemm_config()
+    initialize_fp4_gemm_config()
 
 
 def start_profile(
@@ -278,7 +288,6 @@ class BenchArgs:
         )
         parser.add_argument(
             "--profile-prefix",
-            "--profile-filename-prefix",  # deprecated alias, kept for back-compat
             dest="profile_prefix",
             type=str,
             default=BenchArgs.profile_prefix,
@@ -317,47 +326,22 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     cfg = resolving_view(server_args)
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-    moe_ep_rank = tp_rank // (cfg.tp_size // cfg.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
-    attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
-        compute_dp_attention_world_info(
-            cfg.enable_dp_attention,
-            tp_rank,
-            cfg.tp_size,
-            cfg.dp_size,
-            cfg.attn_cp_size,
-        )
-    )
-    ps = ParallelState(
-        tp_rank=tp_rank,
-        tp_size=cfg.tp_size,
-        pp_rank=0,
-        pp_size=1,
-        dp_rank=None,
-        dp_size=cfg.dp_size,
-        attn_tp_rank=attn_tp_rank,
-        attn_tp_size=attn_tp_size,
-        attn_cp_rank=0,
-        attn_cp_size=cfg.attn_cp_size,
-        attn_dcp_rank=tp_rank % cfg.dcp_size,
-        attn_dcp_size=cfg.dcp_size,
-        attn_dp_rank=attn_dp_rank,
-        attn_dp_size=attn_dp_size,
-        moe_ep_rank=moe_ep_rank,
-        moe_ep_size=cfg.ep_size,
-        moe_dp_rank=None,
-        moe_dp_size=cfg.moe_dp_size,
-        gpu_id=gpu_id,
-    )
     runner_kwargs = dict(
         model_config=model_config,
         mem_fraction_static=cfg.mem_fraction_static,
         gpu_id=gpu_id,
-        ps=ps,
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
+
+    bootstrap.init_parallel_runtime(
+        server_args=server_args,
+        device=get_device().device,
+        dist_port=port_args.nccl_port,
+    )
+    bootstrap.init_layer_runtime(model_config=model_config)
 
     _use_mlx = use_mlx()
     if _use_mlx:
@@ -424,7 +408,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len,
+        max_new_tokens=bench_args.output_len[0],
     )
 
     reqs = []
@@ -440,7 +424,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
+        req.extend_end = len(req.origin_input_ids)
         reqs.append(req)
 
     return input_ids, reqs
@@ -453,19 +437,15 @@ def prepare_extend_inputs_for_correctness_test(
         req: Req = reqs[i]
         req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
-            # Use req.kv.req_pool_idx instead of i to handle slot 0 padding correctly
-            req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, : bench_args.cut_len
-            ].to(req.prefix_indices.dtype)
+            # The cut prefix is already in the request's row from the first extend.
+            req.prefix_len = bench_args.cut_len
             req.logprob_start_len = -1
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.extend_end = len(req.full_untruncated_fill_ids)
     return reqs
 
 
 def prepare_synthetic_inputs_for_latency_test(
-    batch_size, input_len, custom_inputs=None
+    batch_size, input_len, custom_inputs=None, output_len=BenchArgs.output_len[0]
 ):
     input_ids = (
         custom_inputs
@@ -474,7 +454,7 @@ def prepare_synthetic_inputs_for_latency_test(
     )
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len,
+        max_new_tokens=output_len,
     )
 
     reqs = []
@@ -487,7 +467,7 @@ def prepare_synthetic_inputs_for_latency_test(
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
+        req.extend_end = len(req.origin_input_ids)
         reqs.append(req)
 
     return reqs
@@ -500,13 +480,13 @@ class TreeCacheNamespace(SimpleNamespace):
     def supports_mamba(self) -> bool:
         return False
 
-    def is_chunk_cache(self) -> bool:
-        return False
-
-    def is_tree_cache(self) -> bool:
-        return not self.is_chunk_cache()
+    def supports_prefix_sharing(self) -> bool:
+        return True
 
     def evict(self, params: EvictParams):
+        pass
+
+    def maybe_hand_to_session(self, req):
         pass
 
 
@@ -516,6 +496,7 @@ def extend(reqs, model_runner):
     dummy_tree_cache = TreeCacheNamespace(
         page_size=get_schedule().page_size,
         device=model_runner.device,
+        req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
     )
 
@@ -529,11 +510,18 @@ def extend(reqs, model_runner):
         spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     batch.prepare_for_extend()
+    sampler_params_pool = SamplerParamsPool(
+        num_rows=model_runner.req_to_token_pool.req_to_token.shape[0],
+        device=model_runner.req_to_token_pool.device,
+    )
+    sampler_params_pool.write(reqs)
+    batch.sampling_info.set_sampler_params(
+        sampler_params_pool.gather(batch.req_pool_indices, batch.req_pool_indices_cpu)
+    )
+    batch.sampling_info.set_plugin_state(reqs)
+    batch.sampling_info.set_seeds_and_mask_rows(reqs)
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    if (
-        batch.input_ids is None
-        and getattr(batch, "prefill_input_ids_cpu", None) is not None
-    ):
+    if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
         batch.input_ids = batch.prefill_input_ids_cpu.to(
             batch.device, non_blocking=True
         )
@@ -569,10 +557,6 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             model_runner=model_runner,
-            dp_size=get_parallel().dp_size,
-            attn_tp_size=get_parallel().attn_tp_size,
-            attn_cp_size=model_runner.ps.attn_cp_size,
-            tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(),
@@ -678,7 +662,7 @@ def _read_prompts_from_file(prompt_file, rank_print):
 
 
 def _get_torch_profiler_output_dir():
-    return os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+    return envs.SGLANG_TORCH_PROFILER_DIR.get()
 
 
 def _create_torch_profiler_filename(
@@ -709,15 +693,15 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
-    # With the placement this process was spawned with, so a rank read here
-    # does not need a process group -- the same bundle the runner is handed.
     publish(
         server_args,
         role="scheduler",
         ranks=SpawnRanks(
-            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0)
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0),
+            gpu_id=gpu_id,
         ),
     )
+    _init_process_global_configs()
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
@@ -739,7 +723,11 @@ def correctness_test(
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
         # Prepare extend inputs
-        torch_runner = getattr(model_runner, "torch_runner", None)
+        torch_runner = (
+            model_runner.torch_runner
+            if isinstance(model_runner, _TorchBenchRunner)
+            else None
+        )
         reqs = prepare_extend_inputs_for_correctness_test(
             bench_args, input_ids, reqs, torch_runner
         )
@@ -926,21 +914,14 @@ def latency_test(
         server_args,
         role="scheduler",
         ranks=SpawnRanks(
-            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0)
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0),
+            gpu_id=gpu_id,
         ),
     )
-    initialize_moe_config()
-    initialize_fp8_gemm_config()
-    initialize_fp4_gemm_config()
+    _init_process_global_configs()
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        parallel = get_parallel()
-        set_gpu_proc_affinity(
-            parallel.pp_size,
-            parallel.tp_size,
-            parallel.nnodes,
-            tp_rank,
-        )
+        set_gpu_proc_affinity(tp_rank)
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
@@ -950,8 +931,12 @@ def latency_test(
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs for warm up
+    # Shorter decoding to speed up the warmup.
+    warmup_output_len = min(32, bench_args.output_len[0])
     reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
+        bench_args.batch_size[0],
+        bench_args.input_len[0],
+        output_len=warmup_output_len,
     )
 
     # Warm up
@@ -963,7 +948,7 @@ def latency_test(
         reqs,
         bench_args.batch_size[0],
         bench_args.input_len[0],
-        min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
+        warmup_output_len,
         log_decode_step=0,
         profile=False,
         profile_record_shapes=False,
@@ -1006,7 +991,9 @@ def latency_test(
                     [bs_aligned_inputs[-1]] * (bs - custom_input_len)
                 )
 
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+        reqs = prepare_synthetic_inputs_for_latency_test(
+            bs, il, bs_aligned_inputs, output_len=ol
+        )
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
@@ -1111,8 +1098,6 @@ def main(server_args, bench_args):
 
         for proc in workers:
             proc.join()
-
-        proc.terminate()
 
 
 def cli_main():

@@ -10,7 +10,7 @@
 /// - PDL (Programmatic Dependent Launch) helpers for Hopper (sm_90+).
 /// - Typed `load_as` / `store_as` for void-pointer access.
 /// - `pointer::offset` for safe void-pointer arithmetic.
-/// - `host::LaunchKernel` - kernel launcher with optional PDL.
+/// - `host::LaunchKernel` - kernel launcher with optional PDL, cluster and cooperative launch.
 /// - `host::RuntimeDeviceCheck` - CUDA error checking.
 
 #pragma once
@@ -27,6 +27,7 @@
 #include <optional>
 #include <type_traits>
 #ifndef USE_ROCM
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -53,6 +54,8 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
 #define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
+#define cudaFuncSetAttribute hipFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #endif
 
 namespace sglang {
@@ -224,9 +227,9 @@ template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
 #if SGL_ARCH_HOPPER_OR_GREATER
   if constexpr (kUsePDL) {
-    // The "memory" clobber is load-bearing: without it the compiler may sink
-    // this kernel's stores past the trigger, and the dependent grid's
-    // griddepcontrol.wait only covers writes issued BEFORE launch_dependents.
+    // Not a visibility point: the dependent's griddepcontrol.wait waits for this
+    // whole grid, stores after the trigger included. The "memory" clobber only
+    // keeps the compiler from moving memory operations across the trigger.
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   }
 #endif
@@ -260,6 +263,35 @@ SGL_DEVICE T load_as(const void* ptr, int64_t offset = 0) {
 template <typename T>
 SGL_DEVICE void store_as(void* ptr, std::type_identity_t<T> val, int64_t offset = 0) {
   static_cast<T*>(ptr)[offset] = val;
+}
+
+/**
+ * \brief Assert that `ptr` points to global memory and return it.
+ * \note After inline asm with a memory clobber (e.g. the PDL wait), nvcc 13.x loses
+ * the global address space of `__grid_constant__` pointer fields and lowers their loads
+ * to generic `LD.E` (a 32-byte load splits into two `LD.E.128`). Call this on the
+ * pointer right before the access, after the asm. nvcc 13.4 honors the hint on sm_100+
+ * and ignores it on sm_90a.
+ */
+template <typename T>
+SGL_DEVICE T* assume_global(T* ptr) {
+#ifndef USE_ROCM
+  __builtin_assume(__isGlobal(ptr));
+#endif
+  return ptr;
+}
+
+/**
+ * \brief Assert that `ptr` points to shared memory and return it.
+ * \note The shared-memory counterpart of `assume_global`, e.g. for a shared pointer
+ * routed through a shuffle; same arch support (nvcc 13.4: sm_100+ only).
+ */
+template <typename T>
+SGL_DEVICE T* assume_shared(T* ptr) {
+#ifndef USE_ROCM
+  __builtin_assume(__isShared(ptr));
+#endif
+  return ptr;
 }
 
 /// \brief Safe void-pointer arithmetic (byte-level by default).
@@ -325,13 +357,42 @@ SGL_DEVICE_HOST constexpr uint32_t get_tmem_cols(uint32_t num_cols) {
 
 namespace host {
 
+namespace runtime {
+
+inline bool is_cuda_error(::cudaError_t error) {
+  return error != ::cudaSuccess;
+}
+
+inline const char* get_cuda_error_string(::cudaError_t error) {
+  return ::cudaGetErrorString(error);
+}
+
+#ifndef USE_ROCM
+
+inline bool is_cuda_error(::CUresult error) {
+  return error != ::CUDA_SUCCESS;
+}
+
+inline const char* get_cuda_error_string(::CUresult error) {
+  const char* error_string = "";
+  // cuGetErrorString only fails with CUDA_ERROR_INVALID_VALUE, leaving the string null.
+  const auto new_error = ::cuGetErrorString(error, &error_string);
+  return new_error == ::CUDA_SUCCESS ? error_string : "Unknown error";
+}
+
+#endif
+
+}  // namespace runtime
+
 /**
- * \brief Check the CUDA error code and panic with location info on failure.
+ * \brief Check a CUDA runtime (`cudaError_t`) or driver (`CUresult`) error code
+ *        and panic with location info on failure.
  */
-inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
-  if (error != ::cudaSuccess) {
+template <typename T>
+inline void RuntimeDeviceCheck(T error, DebugInfo location = {}) {
+  if (runtime::is_cuda_error(error)) {
     [[unlikely]];
-    host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
+    panic(location, "CUDA error: ", runtime::get_cuda_error_string(error));
   }
 }
 
@@ -359,6 +420,7 @@ struct LaunchKernel {
   struct KernelConfig {
     bool use_pdl = false;
     std::optional<dim3> cluster_dim = std::nullopt;
+    bool cooperative = false;
   };
 
  public:
@@ -414,6 +476,26 @@ struct LaunchKernel {
   }
 
   /**
+   * \brief Launch as a cooperative grid: every CTA is co-resident, or the launch fails.
+   *
+   * For kernels whose CTAs wait on each other (grid-wide barriers, cross-CTA exchanges): without it a grid larger
+   * than what fits on the device at once hangs instead of returning an error.
+   */
+  auto enable_cooperative(bool enabled = true) -> LaunchKernel& {
+#ifdef USE_ROCM
+    RuntimeCheck(!enabled, "LaunchKernel: cooperative launch is not supported on ROCm");
+#else
+    if (enabled) {
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = cudaLaunchAttributeCooperative;
+      attr.val.cooperative = 1;
+      m_config.attrs = m_attrs;
+    }
+#endif
+    return *this;
+  }
+
+  /**
    * \brief Configure the kernel launch with the given options.
    * \param config The kernel configuration options.
    * \return A reference to this `LaunchKernel` for chaining.
@@ -424,6 +506,7 @@ struct LaunchKernel {
   auto config(const KernelConfig& config) -> LaunchKernel& {
     if (config.use_pdl) this->enable_pdl(true);
     if (config.cluster_dim) this->enable_cluster(*config.cluster_dim);
+    if (config.cooperative) this->enable_cooperative(true);
     return *this;
   }
 
@@ -465,15 +548,13 @@ struct LaunchKernel {
 
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[2];
+  cudaLaunchAttribute m_attrs[3];  // one slot per attribute kind: PDL, cluster, cooperative
 };
 
-// The empty-true-branch if/else form keeps a trailing `else` in user code
-// bound to the user's `if`, not to the macro's.
-#define CHECK_CUDA(COND)                                              \
-  if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
-  } else                                                              \
-    host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
+#define CHECK_CUDA(COND)                                                                    \
+  if (const auto _err = (COND); !::sglang::host::runtime::is_cuda_error(_err)) [[likely]] { \
+  } else                                                                                    \
+    SGL_PANIC << "CUDA error: " << ::sglang::host::runtime::get_cuda_error_string(_err) << ". "
 
 }  // namespace host
 

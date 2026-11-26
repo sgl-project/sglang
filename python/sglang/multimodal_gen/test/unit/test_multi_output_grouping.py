@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
     normalize_output_seeds,
 )
@@ -144,6 +144,7 @@ class TestMultiOutputGrouping(unittest.TestCase):
                     output_file_name="image.png",
                     num_outputs_per_prompt=2,
                     seed=[100, 101],
+                    generator_device="cpu",
                 )
             )
             return req
@@ -181,6 +182,14 @@ class TestMultiOutputGrouping(unittest.TestCase):
                 req.trace_ctx is sequential_parent.trace_ctx
                 for req in sequential_outputs
             )
+        )
+        self.assertEqual(
+            [req.generator[0].initial_seed() for req in sequential_outputs],
+            [100, 101],
+        )
+        self.assertEqual([req.seeds for req in sequential_outputs], [[100], [101]])
+        self.assertIsNot(
+            sequential_outputs[0].generator[0], sequential_outputs[1].generator[0]
         )
 
     def test_split_batched_latents_uses_original_batched_tensor(self):
@@ -228,6 +237,21 @@ class TestMultiOutputGrouping(unittest.TestCase):
             reqs[1].extra["shared"]["tensor"],
         )
         self.assertIsNot(reqs[0].extra["mu"], reqs[1].extra["mu"])
+
+    def test_freeze_for_dedup_separates_large_tensors_with_different_content(self):
+        """Two same-shape tensors above the inline-content limit must not share a
+        fingerprint, or the second request receives the first one's stage output."""
+        first = torch.zeros(300)
+        second = torch.ones(300)
+
+        self.assertNotEqual(
+            PipelineStage.freeze_for_dedup(first),
+            PipelineStage.freeze_for_dedup(second),
+        )
+        self.assertEqual(
+            PipelineStage.freeze_for_dedup(first),
+            PipelineStage.freeze_for_dedup(first),
+        )
 
     def test_declarative_stage_dedup_runs_distinct_fingerprints_separately(self):
         stage = CountingDedupStage()

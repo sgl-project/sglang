@@ -10,11 +10,8 @@ import triton.language as tl
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
-    RunnerInput,
-    RunnerOutput,
     register_fused_func,
 )
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -43,7 +40,7 @@ def _fused_unpack_packed_topk(packed: torch.Tensor):
 
     Returns (topk_ids int32, topk_weights float32). Collapses the ~5 elementwise
     ops (shift / mask / int16 / bitcast / cast) the torch reference emits per call
-    into one Triton launch. Mirrors _pack_topk_kernel (trtllm_lora_temp/topk_pack).
+    into one Triton launch. Mirrors _pack_topk_kernel (ops/lora/moe/trtllm_lora_temp/topk_pack).
     """
     packed = packed.contiguous()
     ids = torch.empty_like(packed, dtype=torch.int32)
@@ -55,31 +52,6 @@ def _fused_unpack_packed_topk(packed: torch.Tensor):
             packed, ids, w, numel, BLOCK=BLOCK
         )
     return ids, w
-
-
-@dataclass
-class MarlinRunnerInput(RunnerInput):
-    """Input bundle passed to the Marlin runner core."""
-
-    hidden_states: torch.Tensor
-    topk_weights: torch.Tensor
-    topk_ids: torch.Tensor
-    router_logits: torch.Tensor
-
-    @property
-    def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.MARLIN
-
-
-@dataclass
-class MarlinRunnerOutput(RunnerOutput):
-    """Output bundle returned from the Marlin runner core."""
-
-    hidden_states: torch.Tensor
-
-    @property
-    def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.MARLIN
 
 
 @dataclass
@@ -158,16 +130,15 @@ def fused_experts_none_to_marlin(
     # fully validated across shared-expert and overlap paths.
     marlin_inplace = False
     if (
-        quant_info.weight_bits == 4
+        quant_info.weight_bits in (4, 8)
         and quant_info.w13_qzeros is None
         and quant_info.w2_qzeros is None
         and quant_info.w13_scales.dtype == torch.float8_e8m0fnu
         and quant_info.w2_scales.dtype == torch.float8_e8m0fnu
         and hidden_states.dtype == torch.float16
     ):
-        # MXFP4(E8M0) Marlin kernels are only numerically valid on the bf16
-        # activation path. The fp16 + E8M0 path is intentionally not generated
-        # in sgl-kernel, so upcast activations here and cast the result back.
+        # MXFP4/MXFP8 (E8M0) Marlin kernels use BF16 activations.
+        # Upcast FP16 inputs here and cast the result back.
         marlin_hidden_states = hidden_states.to(torch.bfloat16)
         marlin_inplace = False
 
@@ -205,6 +176,8 @@ def fused_experts_none_to_marlin(
         gemm1_alpha=runner_config.gemm1_alpha,
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
+        no_combine=runner_config.no_combine,
+        no_combine_keep_router_weight=runner_config.no_combine_keep_router_weight,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(

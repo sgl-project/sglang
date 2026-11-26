@@ -110,7 +110,7 @@ void fixup_zero_kv_rows(
   auto v_head_dim = SymbolicSize{"v_head_dim"};
   auto batch_size_plus_1 = SymbolicSize{"batch_size_plus_1"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   TensorMatcher({total_tokens, num_heads, v_head_dim}).with_dtype<OutT>().with_device(device).verify(out);
   TensorMatcher({total_tokens, num_heads}).with_dtype<float>().with_device(device).verify(lse);

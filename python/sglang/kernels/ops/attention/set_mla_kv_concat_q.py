@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -48,7 +49,7 @@ def can_use_set_mla_kv_concat_q(nope_bytes: int, rope_bytes: int) -> bool:
     filling whole int4 warp rounds and rope dim exactly one int warp round
     for the concat side — 1024/128 bytes i.e. 512/64 bf16 satisfies both).
     """
-    if torch.cuda.get_device_capability()[0] < 9:
+    if not current_arch().is_sm_at_least(9):
         return False
     if nope_bytes % 4 != 0 or rope_bytes % 4 != 0:
         return False
@@ -81,12 +82,11 @@ def covered(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
 ) -> bool:
-    """Per-call gate mirroring the launcher's alignment/layout tripwires, so
-    uncovered layouts fall back to the two-kernel path instead of faulting.
+    """Select the fused path for supported dtypes, widths and alignment.
 
     Expects the already-flattened views the wrapper launches with:
     kv_buffer [pages, D], k_nope/k_rope [B, d], q_nope/q_rope [B, H, d],
-    loc [B].
+    loc [B]. The C++ launcher validates matching tensor shapes.
     """
     if not (
         kv_buffer.dtype == torch.bfloat16
@@ -98,22 +98,10 @@ def covered(
         return False
     if loc.dtype not in (torch.int32, torch.int64):
         return False
-    if loc.dim() != 1 or not loc.is_contiguous():
-        return False
-    if not (
-        k_nope.shape[0]
-        == k_rope.shape[0]
-        == loc.shape[0]
-        == q_nope.shape[0]
-        == q_rope.shape[0]
-    ):
-        return False
-    if q_nope.shape[1] != q_rope.shape[1]:
+    if not loc.is_contiguous():
         return False
     nope_bytes = k_nope.shape[-1] * 2
     rope_bytes = k_rope.shape[-1] * 2
-    if q_nope.shape[-1] * 2 != nope_bytes or q_rope.shape[-1] * 2 != rope_bytes:
-        return False
     if not can_use_set_mla_kv_concat_q(nope_bytes, rope_bytes):
         return False
     # Last dims must be dense for the vectorised row accesses.
@@ -195,7 +183,7 @@ def set_mla_kv_concat_q_fp8_module(use_pdl: bool) -> Module:
 def can_use_set_mla_kv_concat_q_fp8() -> bool:
     """SM90+ (TMA bulk store) and the module compiles. Row widths are fixed
     at 512/64 (the MLA absorb layout) inside the kernel."""
-    if torch.cuda.get_device_capability()[0] < 9:
+    if not current_arch().is_sm_at_least(9):
         return False
     try:
         set_mla_kv_concat_q_fp8_module(is_arch_support_pdl())
@@ -212,10 +200,12 @@ def covered_fp8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
 ) -> bool:
-    """Per-call gate for the fused fp8 quantize+scatter+concat kernel,
-    mirroring the launcher tripwires. Expects flattened views: kv_buffer
+    """Select the fused FP8 path for supported dtypes, widths and alignment.
+
+    Expects flattened views: kv_buffer
     [pages, 576] fp8/uint8, k halves [B, 512/64] bf16, q halves
-    [B, H, 512/64] bf16, loc [B]."""
+    [B, H, 512/64] bf16, loc [B]. The C++ launcher validates matching shapes.
+    """
     if not (
         kv_buffer.dtype in (torch.float8_e4m3fn, torch.uint8)
         and k_nope.dtype == torch.bfloat16
@@ -226,25 +216,9 @@ def covered_fp8(
         return False
     if loc.dtype not in (torch.int32, torch.int64):
         return False
-    if loc.dim() != 1 or not loc.is_contiguous():
+    if not loc.is_contiguous():
         return False
-    if not (
-        k_nope.shape[0]
-        == k_rope.shape[0]
-        == loc.shape[0]
-        == q_nope.shape[0]
-        == q_rope.shape[0]
-    ):
-        return False
-    if q_nope.shape[1] != q_rope.shape[1]:
-        return False
-    if (
-        k_nope.shape[-1] != 512
-        or k_rope.shape[-1] != 64
-        or q_nope.shape[-1] != 512
-        or q_rope.shape[-1] != 64
-        or kv_buffer.shape[-1] < 576
-    ):
+    if k_nope.shape[-1] != 512 or k_rope.shape[-1] != 64:
         return False
     if not can_use_set_mla_kv_concat_q_fp8():
         return False

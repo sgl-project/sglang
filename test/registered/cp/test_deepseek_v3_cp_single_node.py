@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=275, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=383, stage="weekly", runner_config="8-gpu-h200")
 
 DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
@@ -25,7 +25,7 @@ GSM8K_ACCURACY_THRESHOLD = 0.935
 
 
 class TestDeepseekV3CPInSeqSplit(CustomTestCase):
-    """tp=8, dp=2, attn-cp=4 — DP attention + DeepEP MoE + MLA CP."""
+    """tp=8, attn-dp=2, attn-cp=4 — DP attention + DeepEP MoE + MLA CP."""
 
     @classmethod
     def setUpClass(cls):
@@ -35,7 +35,7 @@ class TestDeepseekV3CPInSeqSplit(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "2",
             "--enable-prefill-cp",
             "--cp-strategy",
@@ -70,13 +70,11 @@ class TestDeepseekV3CPInSeqSplit(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=500,
             num_threads=32,
-            num_shots=20,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():

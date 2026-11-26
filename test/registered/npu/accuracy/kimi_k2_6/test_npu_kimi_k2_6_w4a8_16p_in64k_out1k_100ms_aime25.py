@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=1800,
-    suite="full-8-npu-a3",
+    suite="full-test-8-npu-a3",
     nightly=True,
     disabled="accuracy testcase",
 )
@@ -57,8 +57,7 @@ OTHER_ARGS = [
     "ascend_attn",
     "--sampling-backend",
     "ascend",
-    "--enable-dp-attention",
-    "--dp-size",
+    "--attn-dp-size",
     32,
     "--moe-a2a-backend",
     "deepep",

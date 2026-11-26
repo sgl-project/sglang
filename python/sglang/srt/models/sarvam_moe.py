@@ -3,63 +3,62 @@
 - SarvamMoEForCausalLM (30B)
 """
 
-import math
 from contextlib import nullcontext
 from enum import IntEnum, auto
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from functools import partial
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.aux_hidden_states import (
-    AuxHiddenStateAccumulator,
-    AuxHiddenStatePacker,
-)
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    enable_moe_dense_fully_dp,
-)
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+)
+from sglang.srt.layers.layer_boundary.residual import access as residual_access
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe import (
-    get_moe_runner_backend,
-    should_skip_post_experts_all_reduce,
-)
+from sglang.srt.layers.moe import post_experts_output_is_complete
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK
+from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.yarn import yarn_get_mscale
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -75,10 +74,10 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
     DeepseekMHAForwardMixin,
 )
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.runtime_context import (
     attention_backends,
     get_exec,
-    get_forward,
     get_memory,
     get_model,
     get_parallel,
@@ -87,11 +86,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    add_prefix,
-    bind_or_assign,
     is_cuda,
     is_nvidia_cublas_version_ge_12_9,
-    make_layers,
     next_power_of_2,
 )
 
@@ -103,8 +99,8 @@ if _is_cuda:
         from sgl_kernel import merge_state_v2
 
         from sglang.kernels.ops.attention.concat_mla import concat_mla_k
-        from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
         from sglang.kernels.ops.gemm import bmm_fp8
+        from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
         from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
         from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
@@ -115,15 +111,19 @@ if _is_cuda:
         _has_concat_mla_k = False
         bmm_fp8 = None
         concat_mla_k = None
+        linear_bf16_fp32 = None
         merge_state_v2 = None
         per_tensor_quant_mla_fp8 = None
+        tiny_gemm_bf16 = None
 else:
     _has_fp8_support = False
     _has_concat_mla_k = False
     bmm_fp8 = None
     concat_mla_k = None
+    linear_bf16_fp32 = None
     merge_state_v2 = None
     per_tensor_quant_mla_fp8 = None
+    tiny_gemm_bf16 = None
 
 
 class AttnForwardMethod(IntEnum):
@@ -132,10 +132,7 @@ class AttnForwardMethod(IntEnum):
     MHA_PREFILL = auto()
 
 
-SEPARATE_ROPE_BACKENDS = frozenset(
-    ["fa3", "flashinfer", "dsa", "nsa", "trtllm_mla"]
-    # "nsa" is a deprecated alias for "dsa"
-)
+SEPARATE_ROPE_BACKENDS = frozenset(["fa3", "flashinfer", "dsa", "trtllm_mla"])
 CONCAT_ROPE_BACKENDS = frozenset(["flashmla", "triton"])
 
 
@@ -228,8 +225,8 @@ class SarvamMoEMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         reduce_results: bool = True,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -238,8 +235,7 @@ class SarvamMoEMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -248,8 +244,7 @@ class SarvamMoEMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -329,12 +324,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
             layer_id=layer_id,
         )
 
-        moe_runner_backend = get_moe_runner_backend()
-        self.use_flashinfer_trtllm_bypass = moe_runner_backend.is_flashinfer_trtllm()
-        self.fuse_routed_scaling_in_moe = (
-            self.use_flashinfer_trtllm_bypass
-            or moe_runner_backend.is_flashinfer_trtllm_routed()
-        )
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
@@ -343,16 +332,34 @@ class SarvamMoESparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            routed_scaling_factor=(
-                self.routed_scaling_factor if self.fuse_routed_scaling_in_moe else None
-            ),
+            routed_scaling_factor=None,
             # Sarvam uses the DeepSeek-V3 noaux_tc contract: sigmoid scores,
             # correction bias for expert selection, then normalized top-k
             # weights. FlashInfer TRT-LLM consumes this tag when TopK routing
             # is bypassed and performed inside the fused MoE kernel.
             routing_method_type=RoutingMethodType.DeepSeekV3,
         )
-        if self.use_flashinfer_trtllm_bypass:
+        runner_backend = getattr(self.experts, "runner_backend", None)
+        routing_method_type = getattr(
+            self.experts, "routing_method_type", RoutingMethodType.DeepSeekV3
+        )
+        if hasattr(self.topk, "bind_runner_backend"):
+            self.topk.bind_runner_backend(
+                runner_backend,
+                routing_method_type=routing_method_type,
+            )
+        topk_config = getattr(self.topk, "topk_config", None)
+        self.use_flashinfer_trtllm_bypass = (
+            runner_backend is not None
+            and runner_backend.is_flashinfer_trtllm()
+            and getattr(topk_config, "output_format", None)
+            == TopKOutputFormat.BYPASSED
+        )
+        self.fuse_routed_scaling_in_moe = self.use_flashinfer_trtllm_bypass
+        if self.fuse_routed_scaling_in_moe:
+            moe_runner_config = getattr(self.experts, "moe_runner_config", None)
+            if moe_runner_config is not None:
+                moe_runner_config.routed_scaling_factor = self.routed_scaling_factor
             # The bypass routing feeds the experts BypassedTopKOutput, so the
             # fused-op compile protocol's bs=1 swap to fused_moe_forward_native
             # (which only unpacks a standard dispatch output) must stay disabled
@@ -377,10 +384,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
             and config.num_shared_experts > 0
         ):
             intermediate_size = config.moe_intermediate_size * config.num_shared_experts
-            if enable_moe_dense_fully_dp():
-                shared_tp_rank, shared_tp_size = 0, 1
-            else:
-                shared_tp_rank, shared_tp_size = None, None
             self.shared_experts = SarvamMoEMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -388,8 +391,11 @@ class SarvamMoESparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
                 reduce_results=False,
-                tp_rank=shared_tp_rank,
-                tp_size=shared_tp_size,
+                # The shared output joins the routed output's TP sum; where that
+                # output is already complete on each rank, it is not TP-sharded.
+                parallel_group="replicated"
+                if post_experts_output_is_complete(is_tp_path=True)
+                else "tp",
             )
         else:
             self.shared_experts = None
@@ -430,15 +436,18 @@ class SarvamMoESparseMoeBlock(nn.Module):
             else hidden_states
         )
         if self.router_logits_fp32:
-            if _is_cuda:
-                if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
+            if _is_cuda and hidden_states.is_cuda:
+                if (
+                    tiny_gemm_bf16 is not None
+                    and hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens
+                ):
                     return tiny_gemm_bf16(
                         hidden_states,
                         self.gate.weight,
                         out_dtype=torch.float32,
-                        max_m=self.tiny_router_gemm_max_tokens,
                     )
-                return linear_bf16_fp32(hidden_states, self.gate.weight)
+                if linear_bf16_fp32 is not None:
+                    return linear_bf16_fp32(hidden_states, self.gate.weight)
             return F.linear(hidden_states.float(), self.gate.weight.float())
         return F.linear(hidden_states, self.gate.weight)
 
@@ -461,6 +470,12 @@ class SarvamMoESparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
+        moe_runner_config = getattr(self.experts, "moe_runner_config", None)
+        shared_input = (
+            hidden_states.clone()
+            if getattr(moe_runner_config, "inplace", True)
+            else hidden_states
+        )
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
 
@@ -469,7 +484,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         # auxiliary stream. This is the same issue order as DeepSeek-V3.
         final_hidden_states = self._forward_router_experts(hidden_states)
         with torch.cuda.stream(self.alt_stream):
-            shared_out = self._forward_shared_experts(hidden_states)
+            shared_out = self._forward_shared_experts(shared_input)
         current_stream.wait_stream(self.alt_stream)
         if self.fuse_routed_scaling_in_moe:
             final_hidden_states.add_(shared_out)
@@ -477,10 +492,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
             final_hidden_states.mul_(self.routed_scaling_factor).add_(shared_out)
         else:
             final_hidden_states.add_(shared_out)
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_normal(
@@ -491,8 +502,12 @@ class SarvamMoESparseMoeBlock(nn.Module):
             return hidden_states
 
         num_tokens, hidden_dim = hidden_states.shape
+        moe_runner_config = getattr(self.experts, "moe_runner_config", None)
         identity = (
-            hidden_states.clone() if self.shared_experts is not None else hidden_states
+            hidden_states.clone()
+            if self.shared_experts is not None
+            and getattr(moe_runner_config, "inplace", True)
+            else hidden_states
         )
 
         final_hidden_states = self._forward_router_experts(hidden_states)
@@ -508,11 +523,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
             final_hidden_states = shared_out
         elif not self.fuse_routed_scaling_in_moe and self.routed_scaling_factor != 1.0:
             final_hidden_states = final_hidden_states * self.routed_scaling_factor
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -538,7 +548,6 @@ class SarvamMoEMLAAttention(nn.Module):
         self.alt_stream = alt_stream
         self.quant_config = quant_config
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.qk_nope_head_dim = config.qk_nope_head_dim
@@ -566,8 +575,7 @@ class SarvamMoEMLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -591,8 +599,7 @@ class SarvamMoEMLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -609,8 +616,7 @@ class SarvamMoEMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -619,8 +625,7 @@ class SarvamMoEMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
         )
 
@@ -635,7 +640,7 @@ class SarvamMoEMLAAttention(nn.Module):
         if rope_scaling and rope_scaling["type"] == "deepseek_yarn":
             mscale_all_dim = rope_scaling.get("mscale_all_dim", 1.0)
             scaling_factor = rope_scaling.get("factor", 1.0)
-            mscale = self.yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
         self.attn_mqa = RadixAttention(
@@ -663,11 +668,6 @@ class SarvamMoEMLAAttention(nn.Module):
         self.w_kc = None
         self.w_vc = None
         self.w_scale = None
-
-    def yarn_get_mscale(self, scale: float = 1, mscale: float = 1) -> float:
-        if scale <= 1:
-            return 1.0
-        return 0.1 * mscale * math.log(scale) + 1.0
 
     def _concat_and_cast_mha_k(
         self,
@@ -788,9 +788,9 @@ class SarvamMoEMLAAttention(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        get_token_to_kv_pool().set_mla_kv_buffer(
+        get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
             self.attn_mha,
-            forward_batch.out_cache_loc,
+            KVWriteLoc.for_batch(forward_batch),
             k_nope,
             k_pe,
         )
@@ -953,129 +953,6 @@ class SarvamMoEMLAAttention(nn.Module):
         output, _ = self.o_proj(attn_bmm_output)
         return output
 
-    def forward_prepare(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: Optional[BumpAllocator] = None,
-        llama_4_scaling: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], ForwardBatch, Optional[Tuple]]:
-        del llama_4_scaling
-        if hidden_states.shape[0] == 0:
-            return hidden_states, forward_batch, None
-
-        if self.q_lora_rank is None:
-            # Dual-stream parallel Q and KV projections
-            if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-                q, _ = self.q_proj(hidden_states)
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                q, _ = self.q_proj(hidden_states)
-                latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
-        else:
-            q_a, _ = self.q_a_proj(hidden_states)
-            latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-            q_a = self.q_a_layernorm(q_a)
-            q, _ = self.q_b_proj(q_a)
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
-
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
-
-        self._set_current_attention_backend(forward_batch)
-        forward_method = get_attn_forward_method(forward_batch)
-
-        if forward_method == AttnForwardMethod.MHA_PREFILL:
-            output = self._run_mha_prefill(
-                positions=positions,
-                q=q,
-                q_pe=q_pe,
-                k_nope=k_nope,
-                k_pe=k_pe,
-                forward_batch=forward_batch,
-            )
-            return output, forward_batch, None
-
-        # Parallel Absorption + RoPE on separate streams
-        # - Stream 1 (main): Absorption (q_nope @ w_kc)
-        # - Stream 2 (alt): RoPE (q_pe, k_pe)
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-
-            # RoPE on alt stream
-            with torch.cuda.stream(self.alt_stream):
-                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-            # Absorption on main stream (runs in parallel with RoPE)
-            q_nope_out = self._maybe_fp8_bmm(
-                q_nope.transpose(0, 1), self.w_kc, zero_allocator
-            )
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_nope_out = self._maybe_fp8_bmm(
-                q_nope.transpose(0, 1), self.w_kc, zero_allocator
-            )
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-        inner_state = (q_nope_out, k_nope, q_pe, k_pe, forward_batch, zero_allocator)
-        return None, forward_batch, inner_state
-
-    def forward_core(
-        self,
-        intermediate_state: Tuple[
-            Optional[torch.Tensor], ForwardBatch, Optional[Tuple]
-        ],
-    ) -> torch.Tensor:
-        hidden_states, forward_batch, inner_state = intermediate_state
-
-        if inner_state is None:
-            return hidden_states
-
-        q_nope_out, k_nope, q_pe, k_pe, forward_batch, zero_allocator = inner_state
-
-        self._set_current_attention_backend(forward_batch)
-
-        forward_method = get_attn_forward_method(forward_batch)
-
-        if forward_method == AttnForwardMethod.MLA_SEPARATE_ROPE:
-            attn_output = self.attn_mqa(
-                q_nope_out,
-                k_nope,
-                k_nope,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
-            )
-        else:
-            q = torch.cat([q_nope_out, q_pe], dim=-1)
-            k = torch.cat([k_nope, k_pe], dim=-1)
-            attn_output = self.attn_mqa(
-                q,
-                k,
-                k_nope,
-                forward_batch,
-            )
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-
-        attn_bmm_output = self._project_attention_output(attn_output, zero_allocator)
-
-        output, _ = self.o_proj(attn_bmm_output)
-        return output
-
     def prepare_qkv_latent(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -1124,26 +1001,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             alt_stream=None,
         )
 
-        first_k_dense = getattr(config, "first_k_dense_replace", 1)
-        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
-        has_moe = getattr(config, "num_experts", None) is not None
-        self.is_layer_sparse = (
-            has_moe
-            and layer_id >= first_k_dense
-            and (layer_id - first_k_dense) % moe_layer_freq == 0
-        )
-        is_previous_layer_sparse = (
-            has_moe
-            and layer_id > 0
-            and (layer_id - 1) >= first_k_dense
-            and (layer_id - 1 - first_k_dense) % moe_layer_freq == 0
-        )
-        is_next_layer_sparse = (
-            has_moe
-            and layer_id < config.num_hidden_layers - 1
-            and (layer_id + 1) >= first_k_dense
-            and (layer_id + 1 - first_k_dense) % moe_layer_freq == 0
-        )
+        self.is_layer_sparse = self._is_layer_sparse(config, layer_id)
 
         if self.is_layer_sparse:
             self.mlp = SarvamMoESparseMoeBlock(
@@ -1154,19 +1012,15 @@ class SarvamMoEMLADecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
-            if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = SarvamMoEMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                parallel_group=mlp_parallel_group,
                 reduce_results=False,
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1174,21 +1028,50 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (
+                attn,
+                self.input_layernorm,
+                {"qkv_latent_func": self.self_attn.prepare_qkv_latent},
+            ),
+            (ffn, self.post_attention_layernorm),
         )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            qkv_latent_func=self.self_attn.prepare_qkv_latent,
-            allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+
+    @classmethod
+    def stage_facts(cls, config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id),
+                next_layer_sparse=cls._is_next_layer_sparse(config, layer_id),
+            ),
+        )
+
+    @staticmethod
+    def _is_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        first_k_dense = getattr(config, "first_k_dense_replace", 1)
+        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
+        has_moe = getattr(config, "num_experts", None) is not None
+        return (
+            has_moe
+            and layer_id >= first_k_dense
+            and (layer_id - first_k_dense) % moe_layer_freq == 0
+        )
+
+    @staticmethod
+    def _is_next_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        first_k_dense = getattr(config, "first_k_dense_replace", 1)
+        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
+        has_moe = getattr(config, "num_experts", None) is not None
+        return (
+            has_moe
+            and layer_id < config.num_hidden_layers - 1
+            and (layer_id + 1) >= first_k_dense
+            and (layer_id + 1 - first_k_dense) % moe_layer_freq == 0
         )
 
     def forward(
@@ -1196,17 +1079,11 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states_orig = hidden_states
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        capture_output=None,
+    ) -> torch.Tensor:
+        hidden_states_orig = residual_access.buffer(hidden_states)
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -1214,45 +1091,24 @@ class SarvamMoEMLADecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
-            if (
-                self.is_layer_sparse
-                and not self.mlp.experts.moe_runner_config.inplace
-                and not torch.compiler.is_compiling()
-            ):
-                mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
-            else:
-                mlp_ctx = nullcontext()
-            with mlp_ctx:
-                hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if (
-            not self.is_layer_sparse
-            and self.attn_tp_size > 1
-            and not mlp_reduce_scatter
-            and not fuse_mlp_allreduce
+            self.is_layer_sparse
+            and self.layer_id > 0
+            and not self.mlp.experts.moe_runner_config.inplace
+            and not torch.compiler.is_compiling()
+            and isinstance(hidden_states_orig, torch.Tensor)
+            and hidden_states_orig.shape == hidden_states.shape
+            and hidden_states_orig.dtype == hidden_states.dtype
         ):
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
+            mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
         else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-        return hidden_states, residual
+            mlp_ctx = nullcontext()
+        with mlp_ctx:
+            hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states
 
 
 class SarvamMLAModel(nn.Module):
@@ -1266,7 +1122,7 @@ class SarvamMLAModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[List[int]] = None
         # Keep target shared-expert overlap independent from the process-level
         # side stream used by the DSpark draft and other runtime components.
@@ -1285,7 +1141,7 @@ class SarvamMLAModel(nn.Module):
         else:
             self.embed_tokens = nn.Identity()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: SarvamMoEMLADecoderLayer(
                 config=config,
@@ -1294,9 +1150,8 @@ class SarvamMLAModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix="model.layers",
+            stage_facts=partial(SarvamMoEMLADecoderLayer.stage_facts, config),
         )
 
         if self.pp_group.is_last_rank:
@@ -1311,59 +1166,57 @@ class SarvamMLAModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = AuxHiddenStatePacker(
-            len(self.dspark_layers_to_capture or ())
+        aux_hidden_states = (
+            AuxHiddenStatePacker.for_batch(
+                forward_batch, len(self.dspark_layers_to_capture)
+            )
+            if self.dspark_layers_to_capture
+            else None
         )
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 positions,
                 hidden_states,
                 forward_batch,
-                residual,
-                captured_last_layer_outputs=(
-                    aux_hidden_states
-                    if self.dspark_layers_to_capture is not None
+                capture_output=(
+                    aux_hidden_states.capture
+                    if aux_hidden_states is not None
                     and i - 1 in self.dspark_layers_to_capture
                     else None
                 ),
             )
 
-        # prepare_attn materializes the completed residual stream from the
-        # previous decoder layer. The final layer has no successor, so capture
-        # its pre-norm output explicitly.
-        if (
-            self.dspark_layers_to_capture is not None
-            and self.end_layer - 1 in self.dspark_layers_to_capture
-        ):
-            aux_hidden_states.append(
-                hidden_states if residual is None else hidden_states + residual
-            )
-
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        final_capture = (
+            aux_hidden_states.capture
+            if aux_hidden_states is not None
+            and self.end_layer - 1 in self.dspark_layers_to_capture
+            else None
+        )
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self.norm,
+            capture=final_capture,
+            skip_empty=True,
+        )
 
-        if hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
-
-        if self.dspark_layers_to_capture is not None:
+        if aux_hidden_states is not None:
             return hidden_states, aux_hidden_states.finalize()
         return hidden_states
 
@@ -1438,18 +1291,24 @@ class SarvamMLAForCausalLM(nn.Module):
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
 
-        layer_ids = [int(layer_id) for layer_id in layer_ids]
-        if not layer_ids:
+        parsed: List[int] = []
+        for layer_id in layer_ids:
+            if isinstance(layer_id, bool) or not isinstance(layer_id, int):
+                raise ValueError(
+                    f"DSPARK target layer_ids must be integers, got {layer_id!r}."
+                )
+            parsed.append(layer_id)
+        if not parsed:
             raise ValueError(
                 "DSPARK requires at least one target layer for aux hidden capture."
             )
-        if layer_ids != sorted(set(layer_ids)):
+        if parsed != sorted(set(parsed)):
             raise ValueError(
                 "DSPARK target layer_ids must be unique and strictly increasing."
             )
 
         num_layers = int(self.config.num_hidden_layers)
-        invalid = [layer_id for layer_id in layer_ids if not 0 <= layer_id < num_layers]
+        invalid = [layer_id for layer_id in parsed if not 0 <= layer_id < num_layers]
         if invalid:
             raise ValueError(
                 "DSPARK target layer_ids are outside the Sarvam decoder range: "
@@ -1457,7 +1316,7 @@ class SarvamMLAForCausalLM(nn.Module):
             )
 
         self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = layer_ids
+        self.model.dspark_layers_to_capture = parsed
 
     @torch.no_grad()
     def forward(
@@ -1484,76 +1343,6 @@ class SarvamMLAForCausalLM(nn.Module):
             )
         return hidden_states
 
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],
-        input_embeds: torch.Tensor = None,
-    ) -> Optional[LogitsProcessorOutput]:
-        start, end = split_interval
-        if start == 0:
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-            forward_batch.residual = None
-            if self.capture_aux_hidden_states:
-                forward_batch.dspark_aux_hidden_states = AuxHiddenStatePacker(
-                    len(self.model.dspark_layers_to_capture)
-                )
-
-        for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.model.layers[i]
-                capture_previous_layer = (
-                    self.capture_aux_hidden_states
-                    and i - 1 in self.model.dspark_layers_to_capture
-                )
-                forward_batch.hidden_states, forward_batch.residual = layer(
-                    positions,
-                    forward_batch.hidden_states,
-                    forward_batch,
-                    forward_batch.residual,
-                    captured_last_layer_outputs=(
-                        forward_batch.dspark_aux_hidden_states
-                        if capture_previous_layer
-                        else None
-                    ),
-                )
-
-        if end == self.model.config.num_hidden_layers:
-            if (
-                self.capture_aux_hidden_states
-                and end - 1 in self.model.dspark_layers_to_capture
-            ):
-                forward_batch.dspark_aux_hidden_states.append(
-                    forward_batch.hidden_states
-                    if forward_batch.residual is None
-                    else forward_batch.hidden_states + forward_batch.residual
-                )
-            if forward_batch.residual is None:
-                hidden_states = self.model.norm(forward_batch.hidden_states)
-            else:
-                hidden_states, _ = self.model.norm(
-                    forward_batch.hidden_states, forward_batch.residual
-                )
-            forward_batch.hidden_states = hidden_states
-            return self.logits_processor(
-                input_ids,
-                forward_batch.hidden_states,
-                self.lm_head,
-                forward_batch,
-                (
-                    forward_batch.dspark_aux_hidden_states.finalize()
-                    if self.capture_aux_hidden_states
-                    else None
-                ),
-            )
-        return None
-
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(
@@ -1579,6 +1368,7 @@ class SarvamMLAForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
         params_dict = dict(self.named_parameters())
+
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if layer_id is not None and (
@@ -1695,48 +1485,7 @@ class SarvamMLAForCausalLM(nn.Module):
 
 
 class SarvamMoEForCausalLM(BailingMoEForCausalLM):
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],
-        input_embeds: torch.Tensor = None,
-    ) -> Optional[LogitsProcessorOutput]:
-        start, end = split_interval
-
-        if start == 0:
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.word_embeddings(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-            forward_batch.residual = None
-
-        for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.model.layers[i]
-                forward_batch.hidden_states, forward_batch.residual = layer(
-                    positions,
-                    forward_batch.hidden_states,
-                    forward_batch,
-                    forward_batch.residual,
-                )
-
-        if end == self.model.config.num_hidden_layers:
-            if forward_batch.residual is None:
-                hidden_states = self.model.norm(forward_batch.hidden_states)
-            else:
-                hidden_states, _ = self.model.norm(
-                    forward_batch.hidden_states, forward_batch.residual
-                )
-            forward_batch.hidden_states = hidden_states
-
-            return self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-
-        return None
+    pass
 
 
 EntryClass = [SarvamMLAForCausalLM, SarvamMoEForCausalLM]

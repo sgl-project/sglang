@@ -2,13 +2,10 @@ from typing import List, Union
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.minicpmo import MiniCPMO
 from sglang.srt.models.minicpmv import MiniCPMV
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,

@@ -10,15 +10,23 @@ tile masking, the untile permutation, and the softmax scale.
 from __future__ import annotations
 
 import math
+from collections import defaultdict
+from unittest import mock
 
 import pytest
 import torch
+import triton
 
+from sglang.multimodal_gen.runtime.layers.attention.backends import vsa_h3_kernels
 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
     VSA_H3_TILE_ELEMS,
     VideoSparseAttentionH3Impl,
     VideoSparseAttentionH3MetadataBuilder,
     _topk_tile_lists,
+    vsa_h3_fold_gate,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels import (
+    vsa_h3_topk_lists,
 )
 
 requires_cuda = pytest.mark.skipif(
@@ -163,6 +171,155 @@ def test_topk_tile_list_semantics() -> None:
     assert (_lists_to_mask(compete, n_tiles).sum(dim=-1) == keep + num_prefix).all()
 
 
+@requires_cuda
+@pytest.mark.parametrize(
+    "num_prefix, num_video, sparsity",
+    [(29, 528, 0.8), (0, 64, 0.9), (30, 1541, 0.05)],
+)
+def test_topk_list_kernel_matches_sorted_topk(num_prefix, num_video, sparsity) -> None:
+    """The unsorted-top-k list kernel must emit the sorted lists and leave its
+    scratch mask zeroed for the next layer."""
+    n_tiles = num_prefix + num_video
+    scores = torch.randn(HEADS, n_tiles, n_tiles, device="cuda")
+    reference = _topk_tile_lists(scores, num_prefix, num_video, sparsity, True)
+    keep = reference.shape[-1] - num_prefix
+    out = torch.full((HEADS, num_video, n_tiles), -1, dtype=torch.int32, device="cuda")
+    out[..., :num_prefix] = torch.arange(num_prefix, dtype=torch.int32, device="cuda")
+    mask = torch.zeros(HEADS, num_video, num_video, dtype=torch.int8, device="cuda")
+    for _ in range(2):  # the scratch mask must come back zeroed
+        picked = scores[:, num_prefix:, num_prefix:].topk(keep, sorted=False).indices
+        vsa_h3_topk_lists(picked, mask, out, num_prefix)
+        assert torch.equal(out[..., : num_prefix + keep], reference)
+        assert not mask.any()
+    assert (out[..., num_prefix + keep :] == -1).all()
+
+
+def _fresh_compile_cache(monkeypatch, kernel) -> dict:
+    """An empty compile cache for ``kernel``: the test counts its own variants."""
+    monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
+    return kernel.device_caches[torch.cuda.current_device()][0]
+
+
+@requires_cuda
+def test_topk_list_kernel_compiles_once_per_bucket(monkeypatch) -> None:
+    """The prompt length moves the tile counts, the list strides and the
+    alignment of the video rows; within one VIDEO_POW2 bucket every
+    divisibility class must reuse one variant."""
+    cache = _fresh_compile_cache(monkeypatch, vsa_h3_kernels._topk_lists_kernel)
+    for num_prefix, num_video in ((16, 528), (17, 529), (29, 600), (32, 544)):
+        n_tiles = num_prefix + num_video
+        scores = torch.randn(HEADS, n_tiles, n_tiles, device="cuda")
+        reference = _topk_tile_lists(scores, num_prefix, num_video, 0.8, True)
+        keep = reference.shape[-1] - num_prefix
+        # as served: the video rows of [H, n_tiles + 1, n_tiles] lists
+        lists = torch.zeros(
+            HEADS, n_tiles + 1, n_tiles, dtype=torch.int32, device="cuda"
+        )
+        lists[..., :num_prefix] = torch.arange(
+            num_prefix, dtype=torch.int32, device="cuda"
+        )
+        mask = torch.zeros(HEADS, num_video, num_video, dtype=torch.int8, device="cuda")
+        picked = scores[:, num_prefix:, num_prefix:].topk(keep, sorted=False).indices
+        vsa_h3_kernels.vsa_h3_topk_lists(
+            picked, mask, lists[:, num_prefix:n_tiles], num_prefix
+        )
+        assert torch.equal(lists[:, num_prefix:n_tiles, : num_prefix + keep], reference)
+    assert len(cache) == 1
+
+
+def _same_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return a.dtype == b.dtype and torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+@requires_cuda
+def test_untile_kernel_compiles_once_per_mode(monkeypatch) -> None:
+    """The used rows and the tile count follow the prompt length; each
+    divisibility class must reuse one variant per mode and give the bytes of
+    the length-specialized kernel."""
+    kernel = vsa_h3_kernels._untile_kernel
+    cache = _fresh_compile_cache(monkeypatch, kernel)
+    specialized = triton.jit(kernel.fn)
+    block = vsa_h3_kernels.VSA_H3_KERNEL_BLOCK
+    # (tiles, used rows): each divisible by 16 or not
+    for n_tiles, used in ((32, 2048), (32, 2047), (33, 2096), (33, 2100)):
+        total = n_tiles * block
+        out, gate = (
+            torch.randn(7, total, HEAD_DIM, device="cuda").to(torch.bfloat16)
+            for _ in range(2)
+        )
+        compress = torch.randn(7, n_tiles, HEAD_DIM, device="cuda")
+        dst = torch.randperm(total, device="cuda").to(torch.int32)
+        for has_gate in (True, False):
+            results = []
+            for jit in (kernel, specialized):
+                result = torch.empty(
+                    total, 7, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+                )
+                with mock.patch.object(vsa_h3_kernels, "_untile_kernel", jit):
+                    vsa_h3_kernels.vsa_h3_untile(
+                        out,
+                        gate if has_gate else None,
+                        compress if has_gate else None,
+                        dst,
+                        used,
+                        result,
+                    )
+                results.append(result)
+            assert _same_bytes(*results)
+    assert len(cache) == 2
+
+
+@requires_cuda
+def test_pack_tiles_kernel_compiles_once_per_mode(monkeypatch) -> None:
+    """The tile count follows the prompt length; each divisibility class must
+    reuse one variant per mode and give the bytes of the length-specialized
+    kernel."""
+    kernel = vsa_h3_kernels._pack_tiles_kernel
+    cache = _fresh_compile_cache(monkeypatch, kernel)
+    specialized = triton.jit(kernel.fn)
+    block = vsa_h3_kernels.VSA_H3_KERNEL_BLOCK
+    for n_tiles in (32, 33):  # divisible by 16 or not
+        # one empty tile past n_tiles, as the workspace may hold
+        seq_pad, used = (n_tiles + 1) * block, n_tiles * block - 37
+        # q / k / v as slices of one fused [rows, heads, 3 * D] projection
+        q, k, v = (
+            torch.randn(used, 7, 3 * HEAD_DIM, device="cuda")
+            .to(torch.bfloat16)
+            .split(HEAD_DIM, dim=-1)
+        )
+        gate = torch.randn(used, 7, HEAD_DIM, device="cuda").to(torch.bfloat16)
+        src_index = torch.full((seq_pad,), -1, dtype=torch.int32, device="cuda")
+        slots = torch.randperm(n_tiles * block, device="cuda")[:used]
+        src_index[slots] = torch.arange(used, dtype=torch.int32, device="cuda")
+        sizes = (src_index[: n_tiles * block].view(n_tiles, block) >= 0).sum(1).int()
+        for has_gate in (True, False):
+            results = []
+            for jit in (kernel, specialized):
+                tiled = torch.zeros(
+                    3 + has_gate,
+                    7,
+                    seq_pad,
+                    HEAD_DIM,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                pooled = torch.zeros(3, 7, n_tiles, HEAD_DIM, device="cuda")
+                with mock.patch.object(vsa_h3_kernels, "_pack_tiles_kernel", jit):
+                    vsa_h3_kernels.vsa_h3_pack_tiles(
+                        q,
+                        k,
+                        v,
+                        gate if has_gate else None,
+                        src_index,
+                        sizes,
+                        tiled,
+                        pooled,
+                    )
+                results.append((tiled, pooled))
+            assert all(_same_bytes(*pair) for pair in zip(*results))
+    assert len(cache) == 2
+
+
 def _masked_dense_reference(meta, used, q, k, v, gate, sparsity):
     """fp32 reference over the padded tile layout with the top-k tile mask."""
     n_tiles = meta.num_tiles
@@ -215,6 +372,68 @@ def test_sparse_gated_matches_masked_dense_reference() -> None:
         assert torch.all(out[used:] == 0)
 
 
+@requires_cuda
+def test_return_compress_fold_on_row_shards_is_bit_identical() -> None:
+    """The deferred row-shard fold (Ulysses) must reproduce the in-kernel fold
+    bit for bit: same tile index derivation, same fp32 FMA order."""
+    device = torch.device("cuda")
+    meta = _build_metadata(0.5, device)
+    used, total, (q, k, v) = _packed_qkv(device)
+    gate = (torch.randn_like(q) * 0.1).to(torch.bfloat16)
+    impl = _impl()
+
+    folded = _run(impl, meta, used, total, q, k, v, gate=gate)
+    cu = torch.tensor([0, used, total], dtype=torch.int32, device=device)
+    out, out_compress = impl.forward_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens=cu,
+        max_seqlen=used,
+        cu_seqlens_host=(0, used, total),
+        attn_metadata=meta,
+        return_compress=True,
+    )
+    shard = total // 2
+    for row_start in (0, shard):
+        rows = slice(row_start, row_start + shard)
+        vsa_h3_fold_gate(out[rows], gate[rows], out_compress, meta, row_start)
+    assert torch.equal(out, folded)
+
+
+@requires_cuda
+@pytest.mark.parametrize("sparsity", [0.0, 0.8])
+def test_odd_tile_count_matches_reference(sparsity: float) -> None:
+    """An odd tile count (padded to even for the SM100 kernel) must keep the
+    pooled means, the top-k lists and the gate fold on the real tiles."""
+    device = torch.device("cuda")
+    prefix = (70, 0, 40)
+    meta = VideoSparseAttentionH3MetadataBuilder().build(
+        current_timestep=0,
+        raw_latent_shape=VIDEO_SHAPE,
+        patch_size=(1, 1, 1),
+        VSA_sparsity=sparsity,
+        prefix_segments=prefix,
+        device=device,
+    )
+    assert meta.num_tiles % 2 == 1
+    used = sum(prefix) + math.prod(VIDEO_SHAPE)
+    total = (used + 63) // 64 * 64
+    generator = torch.Generator(device="cpu").manual_seed(11)
+    q, k, v, gate = (
+        torch.randn((total, HEADS, HEAD_DIM), generator=generator).to(
+            device=device, dtype=torch.bfloat16
+        )
+        for _ in range(4)
+    )
+    gate = gate * 0.1
+    out = _run(_impl(), meta, used, total, q, k, v, gate=gate)
+    reference = _masked_dense_reference(meta, used, q, k, v, gate, sparsity)
+    diff = (out[:used].float() - reference).abs().max().item()
+    assert diff < 2e-2, f"odd tile count, sparsity {sparsity}: max diff {diff}"
+    assert torch.all(out[used:] == 0)
+
+
 def test_metadata_tile_geometry_accounts_every_row() -> None:
     device = torch.device("cpu")
     meta = _build_metadata(0.9, device)
@@ -239,3 +458,42 @@ def test_metadata_tile_geometry_accounts_every_row() -> None:
     assert meta.num_video_tiles == video_tiles
     assert meta.variable_block_sizes.numel() == meta.num_prefix_tiles + video_tiles
     assert VSA_H3_TILE_ELEMS == 64
+
+
+def test_pointer_load_path_selection() -> None:
+    """sm80 (A100) takes the raw-pointer kernel; Hopper and newer take the TMA
+    descriptor kernel."""
+    from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels import (
+        _use_pointer_loads,
+    )
+
+    assert _use_pointer_loads((8, 0))
+    assert not _use_pointer_loads((9, 0))
+    assert not _use_pointer_loads((10, 0))
+    assert not _use_pointer_loads((10, 3))
+    assert not _use_pointer_loads((12, 0))
+
+
+def test_vsa_h3_module_imports_without_sm100_symbol() -> None:
+    """The module must import without sglang.kernels.ops.diffusion
+    vsa_block_sparse_sm100 (absent on stacks that do not ship the sm100 tcgen05
+    kernel): the dependency is imported lazily inside the sm100 branch only."""
+    import importlib
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        vsa_h3_kernels,
+    )
+
+    importlib.reload(vsa_h3_kernels)
+    assert hasattr(vsa_h3_kernels, "vsa_h3_block_sparse_attn_forward")
+
+
+def test_vsa_h3_backend_resolver_allows_sm80() -> None:
+    """The resolver gate must admit A100, which the pointer kernel serves."""
+    from sglang.multimodal_gen.runtime.platforms.cuda import (
+        _VideoSparseAttentionH3BackendResolver,
+    )
+
+    caps = _VideoSparseAttentionH3BackendResolver.supported_capabilities
+    assert (8, 0) in caps
+    assert {(9, 0), (10, 0), (10, 3)} <= caps

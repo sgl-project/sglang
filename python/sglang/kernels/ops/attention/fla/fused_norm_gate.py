@@ -7,6 +7,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import (
     cdiv,
@@ -46,6 +47,10 @@ def layer_norm_gated_fwd_kernel(
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    G_STRIDED: tl.constexpr = False,
+    G_HEADS: tl.constexpr = 1,
+    stride_g_tok=0,
+    stride_g_head=0,
 ):
     # PDL: x is the producer's output (e.g. the fused KDA verify kernel, which
     # triggers its dependents right after the o store), so every load sits
@@ -53,27 +58,26 @@ def layer_norm_gated_fwd_kernel(
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
 
-    i_t = tl.program_id(0)
+    i_t = tl.program_id(0).to(tl.int64)
 
+    o_t = i_t * BT + tl.arange(0, BT)
     o_d = tl.arange(0, BD)
     m_d = o_d < D
+    m_t = o_t < T
+    m_x = m_t[:, None] & m_d[None, :]
 
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    p_x = x + o_t[:, None] * D + o_d[None, :]
+    b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
     if HAS_RESIDUAL:
-        p_res = tl.make_block_ptr(
-            residual, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
-        )
-        b_x += tl.load(p_res, boundary_check=(0, 1)).to(tl.float32)
+        p_res = residual + o_t[:, None] * D + o_d[None, :]
+        b_x += tl.load(p_res, mask=m_x, other=0.0).to(tl.float32)
     if STORE_RESIDUAL_OUT:
-        p_res_out = tl.make_block_ptr(
-            residual_out, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
-        )
-        tl.store(p_res_out, b_x.to(p_res_out.dtype.element_ty), boundary_check=(0, 1))
+        p_res_out = residual_out + o_t[:, None] * D + o_d[None, :]
+        tl.store(p_res_out, b_x.to(p_res_out.dtype.element_ty), mask=m_x)
     if not IS_RMS_NORM:
         b_mean = tl.sum(b_x, axis=1) / D
-        p_mean = tl.make_block_ptr(mean, (T,), (1,), (i_t * BT,), (BT,), (0,))
-        tl.store(p_mean, b_mean.to(p_mean.dtype.element_ty), boundary_check=(0,))
+        p_mean = mean + o_t
+        tl.store(p_mean, b_mean.to(p_mean.dtype.element_ty), mask=m_t)
         b_xbar = tl.where(m_d[None, :], b_x - b_mean[:, None], 0.0)
         b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
     else:
@@ -81,8 +85,8 @@ def layer_norm_gated_fwd_kernel(
         b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
     b_rstd = 1 / tl.sqrt(b_var + eps)
 
-    p_rstd = tl.make_block_ptr(rstd, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), boundary_check=(0,))
+    p_rstd = rstd + o_t
+    tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), mask=m_t)
 
     if HAS_WEIGHT:
         b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
@@ -98,16 +102,29 @@ def layer_norm_gated_fwd_kernel(
         b_y = b_y + b_b[None, :]
 
     # swish/sigmoid output gate
-    p_g = tl.make_block_ptr(g, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+    if G_STRIDED:
+        # strided [tokens, G_HEADS, D] gate: row = token * G_HEADS + head
+        o_r = i_t * BT + tl.arange(0, BT)
+        m_r = o_r < T
+        g_off = (o_r // G_HEADS).to(tl.int64) * stride_g_tok + (
+            o_r % G_HEADS
+        ) * stride_g_head
+        b_g = tl.load(
+            g + g_off[:, None] + o_d[None, :],
+            mask=m_r[:, None] & m_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        p_g = g + o_t[:, None] * D + o_d[None, :]
+        b_g = tl.load(p_g, mask=m_x, other=0.0).to(tl.float32)
     if ACTIVATION == "swish" or ACTIVATION == "silu":
         b_y = b_y * b_g * tl.sigmoid(b_g)
     elif ACTIVATION == "sigmoid":
         b_y = b_y * tl.sigmoid(b_g)
 
     # Write output
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    p_y = y + o_t[:, None] * D + o_d[None, :]
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -191,6 +208,7 @@ def layer_norm_gated_fwd(
     out_dtype: torch.dtype = None,
     residual_dtype: torch.dtype = None,
     is_rms_norm: bool = False,
+    g_strided: tuple[int, int, int] | None = None,  # (heads, token stride, head stride)
 ):
     if residual is not None:
         residual_dtype = residual.dtype
@@ -223,10 +241,15 @@ def layer_norm_gated_fwd(
     # heuristics for number of warps
 
     if D <= 512:
+        use_pdl = is_arch_support_pdl()
         BT = 32
-        pdl_kwargs = (
-            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-        )
+        use_bt8 = 8 <= T <= 256 if is_rms_norm and activation == "sigmoid" else T == 64
+        if use_pdl and use_bt8 and (D, x.dtype) == (128, torch.bfloat16):
+            if current_arch().is_sm(10, 3):
+                # Small sigmoid-gated RMSNorm batches use eight rows per CTA.
+                # Other norm modes retain their T=64 selection.
+                BT = 8
+        pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
             x=x,
             g=g,
@@ -250,8 +273,20 @@ def layer_norm_gated_fwd(
             HAS_BIAS=bias is not None,
             num_warps=4,
             **pdl_kwargs,
+            **(
+                dict(
+                    G_STRIDED=True,
+                    G_HEADS=g_strided[0],
+                    stride_g_tok=g_strided[1],
+                    stride_g_head=g_strided[2],
+                )
+                if g_strided is not None
+                else {}
+            ),
         )
     else:
+        if g_strided is not None:
+            g = g.reshape(-1, D)
         layer_norm_gated_fwd_kernel1[(T,)](
             x=x,
             g=g,
@@ -296,7 +331,21 @@ class LayerNormGatedFunction(torch.autograd.Function):
         g_shape_og = g.shape
         # reshape input data into 2D tensor
         x = x.reshape(-1, x.shape[-1])
-        g = g.reshape(-1, g.shape[-1])
+        # A column slice of a fused projection can't be viewed as [rows, D];
+        # pass its strides instead of copying.
+        g_strided = None
+        if (
+            not g.is_contiguous()
+            and g.dim() >= 3
+            and g.shape[-1] == x.shape[-1]
+            and g.shape[-1] <= 512
+            and g.stride(-1) == 1
+            and g.stride(-2) == g.shape[-1]
+            and all(n == 1 for n in g.shape[:-3])
+        ):
+            g_strided = (g.shape[-2], g.stride(-3), g.stride(-2))
+        else:
+            g = g.reshape(-1, g.shape[-1]).contiguous()
         if residual is not None:
             assert residual.shape == x_shape_og
             residual = residual.reshape(-1, residual.shape[-1])
@@ -315,6 +364,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
             residual=residual,
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
+            g_strided=g_strided,
         )
         ctx.save_for_backward(residual_out, g, weight, bias, mean, rstd)
         ctx.x_shape_og = x_shape_og

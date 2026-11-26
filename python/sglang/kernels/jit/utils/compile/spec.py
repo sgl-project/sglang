@@ -15,6 +15,7 @@ from typing import List, Optional, Tuple
 
 import msgspec
 
+from sglang.kernels.jit.utils.arch import CompileArch
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 
 _MODULE_NAME_PREFIX = "sgl_kernel_jit_"
@@ -50,6 +51,12 @@ class BuildSpec(msgspec.Struct, frozen=True):
     ldflags: Tuple[str, ...]
     include_paths: Tuple[str, ...]
     header_only: bool
+    # Extra header-only device units: the macros each defines before including
+    # the CUDA sources. They export nothing.
+    cuda_units: Tuple[Tuple[str, ...], ...] = ()
+    # The CUDA compile target (load_jit's cuda_arch_policy resolved); None
+    # means the local GPU's.
+    compile_arch: Optional[CompileArch] = None
 
     @property
     def module_name(self) -> str:
@@ -91,6 +98,14 @@ class BuildSpec(msgspec.Struct, frozen=True):
                     source=_wrapper_source(files, wrappers),
                 )
             )
+        units += [
+            TranslationUnit(
+                filename=f"cuda_unit{index}.cu",
+                is_cuda=True,
+                source=_unit_source(self.cuda_files, defines),
+            )
+            for index, defines in enumerate(self.cuda_units)
+        ]
         return units
 
 
@@ -119,6 +134,15 @@ def _wrapper_source(
         for export_name, kernel_name in wrappers
     ]
     lines.append("}  // namespace sglang")
+    return "\n".join(lines) + "\n"
+
+
+def _unit_source(files: Tuple[str, ...], defines: Tuple[str, ...]) -> str:
+    lines = []
+    for define in defines:
+        name, _, value = define.partition("=")
+        lines.append(f"#define {name} {value}".rstrip())
+    lines += [f'#include "{path}"' for path in files]
     return "\n".join(lines) + "\n"
 
 

@@ -12,7 +12,7 @@ from sglang.test.test_deterministic_utils import (
     TestDeterministicBase,
 )
 
-register_cuda_ci(est_time=119, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=121, stage="extra-b", runner_config="4-gpu-h100")
 
 QWEN35 = "Qwen/Qwen3.5-35B-A3B"
 
@@ -32,7 +32,8 @@ class TestQwen35Fa3Deterministic(TestDeterministicBase):
             "--skip-server-warmup",
             "--mamba-radix-cache-strategy",
             "extra_buffer",
-            "--enable-flashinfer-allreduce-fusion",
+            "--flashinfer-allreduce-fusion-backend",
+            "auto",
             "--tokenizer-worker-num",
             "6",
             "--mem-fraction-static",

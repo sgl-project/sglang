@@ -14,9 +14,9 @@
 """`--enable-unified-memory` and PREFILL cuda-graph capture.
 
 Capture is wired: the captured batch reads `out_cache_loc` out of the registry
-slot, refilled before each replay from the already-rebound kernel-facing loc,
+slot, refilled before each replay from the already-rebound physical loc,
 and the read tables are refilled out-of-graph from the live v2p. So BREAKABLE
-(the CUDA default) and TC_PIECEWISE must be left alone -- an earlier gate
+(the CUDA default)  must be left alone -- an earlier gate
 disabled every prefill backend outright, which cost every unified run its
 prefill graph.
 
@@ -34,25 +34,41 @@ touched.
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
 
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
-def _run_handler(*, prefill_backend, attention_backends):
-    """Run just `handle_unified_memory_pool` over a minimal stand-in."""
+def _run_handler(*, prefill_backend, attention_backends, decode_backend=Backend.FULL):
+    """Run just `handle_unified_memory_pool`; return the resolved graph config."""
+    sa, _ = _run_handler_on_record(
+        prefill_backend=prefill_backend,
+        attention_backends=attention_backends,
+        decode_backend=decode_backend,
+    )
+    return resolution_result(sa, "cuda_graph_config")
+
+
+def _run_handler_on_record(
+    *, prefill_backend, attention_backends, decode_backend=Backend.FULL
+):
+    """The record after the handler, and the graph config it was handed."""
     sa = ServerArgs(model_path="dummy")
-    cg = SimpleNamespace(
-        prefill=SimpleNamespace(backend=prefill_backend),
-        decode=SimpleNamespace(backend=Backend.FULL),
+    cg = CudaGraphConfig(
+        prefill=PhaseConfig(backend=prefill_backend),
+        decode=PhaseConfig(backend=decode_backend),
     )
     for name, value in {
         "enable_unified_memory": True,
@@ -72,14 +88,14 @@ def _run_handler(*, prefill_backend, attention_backends):
         return_value=attention_backends,
     ):
         handle_unified_memory_pool(sa)
-    return cg
+    return sa, cg
 
 
 class TestUnifiedPrefillCudaGraphGate(unittest.TestCase):
     def test_non_full_prefill_backends_are_left_enabled(self):
         """BUG REGRESSION. Unified used to disable prefill capture outright, so
         the default BREAKABLE graph silently never ran."""
-        for backend in (Backend.BREAKABLE, Backend.TC_PIECEWISE):
+        for backend in (Backend.BREAKABLE,):
             for attn in (("fa4", "fa4"), ("triton", "triton")):
                 with self.subTest(prefill=backend, attn=attn):
                     cg = _run_handler(prefill_backend=backend, attention_backends=attn)
@@ -101,11 +117,37 @@ class TestUnifiedPrefillCudaGraphGate(unittest.TestCase):
                 self.assertEqual(cg.prefill.backend, Backend.DISABLED)
                 self.assertEqual(cg.decode.backend, Backend.FULL)
 
+    def test_the_fallback_is_declared_not_written_into_the_config(self):
+        """The config the handler receives is what an earlier step declared, or
+        the operator's own object. The FULL-to-disabled fallback must leave it
+        as it was and record its own declaration."""
+        sa, handed = _run_handler_on_record(
+            prefill_backend=Backend.FULL, attention_backends=("triton", "triton")
+        )
+        self.assertEqual(handed.prefill.backend, Backend.FULL)
+        self.assertEqual(
+            [source for source, _ in sa._resolved_overrides],
+            ["handle_unified_memory_pool"],
+        )
+        resolved = resolution_result(sa, "cuda_graph_config")
+        self.assertEqual(resolved.prefill.backend, Backend.DISABLED)
+
     def test_already_disabled_is_a_no_op(self):
         cg = _run_handler(
             prefill_backend=Backend.DISABLED, attention_backends=("triton", "triton")
         )
         self.assertEqual(cg.prefill.backend, Backend.DISABLED)
+        self.assertEqual(cg.decode.backend, Backend.FULL)
+
+
+class TestUnifiedTrtllmMhaDecodeGraphGate(unittest.TestCase):
+    def test_trtllm_mha_decode_capture_boots(self):
+        """Its replay refills the page table from this batch's lengths, so the
+        gate leaves trtllm_mha decode capture enabled."""
+        cg = _run_handler(
+            prefill_backend=Backend.BREAKABLE,
+            attention_backends=("trtllm_mha", "trtllm_mha"),
+        )
         self.assertEqual(cg.decode.backend, Backend.FULL)
 
 

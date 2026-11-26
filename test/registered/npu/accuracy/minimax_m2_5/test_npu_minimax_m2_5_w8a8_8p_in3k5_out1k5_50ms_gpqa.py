@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=4800,
-    suite="full-acc-16-npu-a3",
+    suite="full-acc-test-16-npu-a3",
     nightly=True,
 )
 
@@ -34,8 +34,7 @@ MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS = {
 MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS = [
     "--tp-size",
     16,
-    "--enable-dp-attention",
-    "--dp-size",
+    "--attn-dp-size",
     16,
     "--mem-fraction-static",
     0.75,

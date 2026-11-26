@@ -28,13 +28,10 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=308, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=226, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
-    # Extra server env; subclasses use it to select a tree_cache implementation.
-    extra_env: dict = {}
-
     @classmethod
     def setUpClass(cls):
         cls.temp_dir = tempfile.mkdtemp()
@@ -64,7 +61,6 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             # Make runs less flaky for CI/dev.
             "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
             "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
-            **cls.extra_env,
         }
 
     @classmethod
@@ -213,15 +209,15 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             code_info, _body_info = self._http_get(
                 f"{self.base_url}/hicache/storage-backend", timeout=10
             )
-            self.assertEqual(code_info, 400)
+            self.assertEqual(code_info, 403)
             code_attach_no_admin, _body_attach_no_admin = self._attach_backend(
                 base_url=self.base_url, backend="file", extra_cfg={}
             )
-            self.assertEqual(code_attach_no_admin, 400)
+            self.assertEqual(code_attach_no_admin, 403)
             code_detach_no_admin, _body_detach_no_admin = self._detach_backend(
                 self.base_url
             )
-            self.assertEqual(code_detach_no_admin, 400)
+            self.assertEqual(code_detach_no_admin, 403)
         finally:
             terminate_and_kill_process_tree(process1)
             time.sleep(2)
@@ -370,19 +366,6 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
         finally:
             terminate_and_kill_process_tree(process2)
             time.sleep(2)
-
-
-class TestUnifiedRadixCacheStorageRuntimeAttachDetach(
-    TestHiCacheStorageRuntimeAttachDetach
-):
-    """Same runtime attach/detach lifecycle, backed by UnifiedRadixCache."""
-
-    extra_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
-
-    def test_runtime_attach_detach(self):
-        # Admin-key gating (phase A of the base test) lives in the HTTP layer and is
-        # independent of the tree cache implementation, so only the lifecycle is run.
-        self._check_attach_detach_lifecycle()
 
 
 if __name__ == "__main__":

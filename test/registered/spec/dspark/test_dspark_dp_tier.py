@@ -1,7 +1,7 @@
 import random
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -13,34 +13,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-
-
-class TestLocalVerifyTierNumTokens(CustomTestCase):
-    def test_no_budget_returns_sentinel(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=None,
-                verify_num_draft_tokens=6,
-                min_verify_len=1,
-            ),
-            -1,
-        )
-
-    def test_budget_adds_to_anchor_floor(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=10,
-                verify_num_draft_tokens=6,
-                min_verify_len=1,
-            ),
-            18,
-        )
-
-    # Clamp/floor variants (verify-all clamp, min_verify_len floor, min=0) are
-    # covered by the TestBusyIdleGraphKeyIdentity sweep bounds.
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
@@ -54,6 +27,67 @@ class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
 
 
 class TestDraftDpSyncMetadata(CustomTestCase):
+    def test_gpu_only_draft_keeps_cpu_lengths_absent(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+        from sglang.test.test_utils import published_topology
+
+        # The proposer resolves its logits layout from the published topology.
+        self.enterContext(published_topology())
+        hidden = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+
+        def forward(batch):
+            self.assertIsNone(batch.seq_lens_cpu)
+            self.assertIsNone(batch.seq_lens_sum)
+            torch.testing.assert_close(batch.seq_lens, torch.tensor([10]))
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(hidden_states=hidden), can_run_graph=True
+            )
+
+        runner = SimpleNamespace(
+            device="cpu",
+            attn_backend=object.__new__(TRTLLMHAAttnBackend),
+            decode_cuda_graph_runner=None,
+            runner_ids=None,
+            forward=forward,
+        )
+        proposer = DraftBlockProposer(
+            draft_model=SimpleNamespace(sample_from_anchor=False),
+            draft_model_runner=runner,
+            gamma=2,
+            mask_token_id=1,
+            draft_block_spec_info=None,
+            tp_sync=None,
+            random_seed=0,
+            greedy_draft=False,
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([10]),
+            seq_lens_cpu=None,
+            seq_lens_sum=None,
+            req_pool_indices=torch.tensor([0]),
+            can_run_decode_cuda_graph=True,
+            is_extend_in_batch=False,
+            dp_spec_prefill_coordination_applied=False,
+        )
+        window = SimpleNamespace(
+            positions_2d=torch.tensor([[10, 11, 12]]),
+            verify_cache_loc_2d=torch.tensor([[10, 11, 12]]),
+            iteration_ids=SimpleNamespace(bind=Mock()),
+        )
+        for reserved_cpu in (None, torch.tensor([100])):
+            result = proposer._run_forward(
+                batch=batch,
+                draft_input=SimpleNamespace(
+                    bonus_tokens=torch.tensor([2]),
+                    nxt_kv_lens_cpu=reserved_cpu,
+                    nxt_kv_lens_sum=100,
+                ),
+                verify_window=window,
+                bs=1,
+                embed_module=torch.nn.Embedding(16, 2),
+            )
+            torch.testing.assert_close(result.raw_hidden, hidden[1:])
+
     def test_preserves_unscaled_request_counts_for_cuda_graph_admission(self):
         proposer = DraftBlockProposer.__new__(DraftBlockProposer)
         proposer._dp_moe_sync = True
@@ -63,12 +97,18 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         )
         proposer.draft_model_runner = SimpleNamespace(device="cpu")
         proposer._num_token_non_padded = torch.empty((1,), dtype=torch.int32)
+        proposer._dp_meta_host = None
+        proposer._dp_meta_device = None
+        proposer._dp_meta_copied = []
+        proposer._dp_meta_slot = 0
 
         forward_batch = SimpleNamespace(input_ids=torch.arange(6))
         batch = SimpleNamespace(
             global_num_tokens=[1, 3, 0, 2],
             global_num_tokens_for_logprob=[1, 3, 0, 2],
             can_run_decode_cuda_graph=True,
+            is_extend_in_batch=False,
+            dp_spec_prefill_coordination_applied=False,
         )
 
         with patch(
@@ -82,6 +122,10 @@ class TestDraftDpSyncMetadata(CustomTestCase):
             [1, 3, 0, 2],
         )
         self.assertEqual(forward_batch.global_num_tokens_cpu, [6, 18, 0, 12])
+        self.assertEqual(forward_batch.global_num_tokens_gpu.tolist(), [6, 18, 0, 12])
+        self.assertEqual(
+            forward_batch.global_num_tokens_for_logprob_gpu.tolist(), [1, 3, 0, 2]
+        )
         # The LOCAL count reuses the proposer's persistent buffer; the GLOBAL
         # count is the invariant every DP rank agrees on.
         self.assertIs(
@@ -93,6 +137,30 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         self.assertEqual(forward_batch.global_num_token_non_padded.dtype, torch.int32)
         self.assertEqual(forward_batch.global_num_token_non_padded_cpu, 6)
         self.assertTrue(forward_batch.can_run_decode_cuda_graph)
+
+    def test_dp_meta_slots_alternate_without_mixing_rows(self):
+        """Each fill must publish its own counts and logprob counts, and a slot
+        may only be rewritten after the fill that used it two steps earlier."""
+        proposer = DraftBlockProposer.__new__(DraftBlockProposer)
+        proposer._dp_meta_host = None
+        proposer._dp_meta_device = None
+        proposer._dp_meta_copied = []
+        proposer._dp_meta_slot = 0
+        steps = [
+            ([6, 18, 0, 12], [1, 3, 0, 2]),
+            ([12, 6, 6, 0], [2, 1, 1, 0]),
+            ([0, 0, 24, 6], [0, 0, 4, 1]),
+        ]
+        staged = []
+        for gnt, gnt_logprob in steps:
+            counts, logprob = proposer._stage_dp_meta(gnt, gnt_logprob, "cpu")
+            self.assertEqual(counts.tolist(), gnt)
+            self.assertEqual(logprob.tolist(), gnt_logprob)
+            staged.append((counts, logprob))
+        self.assertNotEqual(staged[0][0].data_ptr(), staged[1][0].data_ptr())
+        self.assertEqual(staged[0][0].data_ptr(), staged[2][0].data_ptr())
+        self.assertEqual(staged[0][1].data_ptr(), staged[2][1].data_ptr())
+        self.assertEqual(staged[1][0].tolist(), steps[1][0])
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):

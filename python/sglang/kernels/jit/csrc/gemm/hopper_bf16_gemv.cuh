@@ -37,12 +37,14 @@ __device__ __forceinline__ float dot8_f32(const float4 wv, const float4 xv) {
   return acc;
 }
 
-template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
+template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps, bool kUsePDL>
 __global__ void __launch_bounds__(kNumWarps * 32)
     hopper_bf16_gemv_kernel(bf16_t* __restrict__ out, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
   __shared__ bf16_t sx[K];
 
+  PDLTriggerSecondary<kUsePDL>();
   const uint32_t tid = threadIdx.x;
+  PDLWaitPrimary<kUsePDL>();
   for (uint32_t i = tid * kGemvVecSize; i < K; i += kNumWarps * 32 * kGemvVecSize) {
     *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(x + i);
   }
@@ -118,9 +120,11 @@ __global__ void __launch_bounds__(kNumWarps * 32)
   }
 }
 
-template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
+template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps, bool kUsePDL>
 struct HopperBf16GemvKernel {
-  static_assert(K % (32 * kGemvVecSize * kUnroll) == 0, "K must cover full unrolled warp strides");
+  static_assert(
+      kUnroll == 1 ? (K % kGemvVecSize == 0) : (K % (32 * kGemvVecSize * kUnroll) == 0),
+      "K must be 16B-aligned (kUnroll==1) or cover full unrolled warp strides");
   static_assert(K * sizeof(bf16_t) <= 48 * 1024, "activation row must fit static shared memory");
 
   static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView w, const tvm::ffi::TensorView out) {
@@ -134,11 +138,12 @@ struct HopperBf16GemvKernel {
 
     constexpr uint32_t kRowsPerBlock = kRows * kNumWarps;
     constexpr uint32_t kNumBlocks = (N + kRowsPerBlock - 1) / kRowsPerBlock;
-    LaunchKernel(kNumBlocks, kNumWarps * 32, device.unwrap())(
-        hopper_bf16_gemv_kernel<N, K, kRows, kUnroll, kNumWarps>,
-        static_cast<bf16_t*>(out.data_ptr()),
-        static_cast<const bf16_t*>(x.data_ptr()),
-        static_cast<const bf16_t*>(w.data_ptr()));
+    LaunchKernel(kNumBlocks, kNumWarps * 32, device.unwrap())
+        .enable_pdl(kUsePDL)(
+            hopper_bf16_gemv_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>,
+            static_cast<bf16_t*>(out.data_ptr()),
+            static_cast<const bf16_t*>(x.data_ptr()),
+            static_cast<const bf16_t*>(w.data_ptr()));
   }
 };
 

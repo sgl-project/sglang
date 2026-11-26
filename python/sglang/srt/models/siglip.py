@@ -13,9 +13,8 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 
 # Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer
@@ -71,15 +70,12 @@ class SiglipMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
         self.act = act_layer()
         self.fc2 = RowParallelLinear(
@@ -87,8 +83,7 @@ class SiglipMLP(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("fc2", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -154,7 +149,6 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states = self.self_attn(
             hidden_states,
             attention_mask=attn_mask,
-            # causal_attention_mask=causal_attention_mask,
         )
 
         hidden_states = residual + hidden_states
@@ -259,13 +253,6 @@ class SiglipVisionTransformer(nn.Module):
             prefix=add_prefix("encoder", prefix),
         )
 
-        num_hidden_layers = config.num_hidden_layers
-        if len(self.encoder.layers) > config.num_hidden_layers:
-            raise ValueError(
-                f"The original encoder only has {num_hidden_layers} "
-                f"layers, but you requested {len(self.encoder.layers)} layers."
-            )
-
         # VisionAttention in SiglipEncoderLayer is multihead attention
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
@@ -281,12 +268,7 @@ class SiglipVisionTransformer(nn.Module):
             self.post_layernorm.weight.dtype
         )
 
-        return_all_hidden_states = False
-
-        last_hidden_state = self.encoder(
-            inputs_embeds=hidden_states,
-            return_all_hidden_states=return_all_hidden_states,
-        )
+        last_hidden_state = self.encoder(inputs_embeds=hidden_states)
 
         last_hidden_state = self.post_layernorm(last_hidden_state)
 

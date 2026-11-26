@@ -2,9 +2,10 @@
 """Control-request protocol between the HTTP process and scheduler workers.
 
 These types are cross-process IPC contracts, not utilities: the HTTP side
-constructs them (scheduler_client treats them as ``_CONTROL_REQ_TYPES`` and
-fans them out to every replica) and each scheduler dispatches them through
-``Scheduler.request_handlers``. Keep this module import-light -- both
+constructs them and each scheduler dispatches them through
+``Scheduler.request_handlers``. Replica-wide operations in ``_CONTROL_REQ_TYPES``
+fan out to every replica; session releases route to the session's owner.
+Keep this module import-light -- both
 processes import it, and the HTTP process must not drag in torch-heavy
 worker modules through it.
 """
@@ -48,3 +49,15 @@ class GetDisaggStatsReq(msgspec.Struct):
     """Request to get disagg pipeline metrics from the scheduler."""
 
     pass
+
+
+class StartProfileReq(msgspec.Struct):
+    output_dir: str | None = None
+    profile_id: str | None = None
+    activities: list[str] | None = None
+    with_stack: bool | None = None
+    record_shapes: bool | None = None
+
+
+class StopProfileReq(msgspec.Struct):
+    export_trace: bool = True

@@ -19,8 +19,8 @@ FULL side's ids while it used to be sized by its own page count. A model with
 few full-attention layers and many sliding ones gives the id owner more pages,
 and the top of that id space then lands off the end of the swa table. On GPU
 the write is unchecked (`alloc_bind_inplace`'s `tl.store`), so the symptom
-surfaces later and elsewhere: a device-side index assert on the read in
-`_swa_write_loc_unified`, and a dead scheduler.
+surfaces later and elsewhere: a device-side index assert on a later read of
+the swa table, and a dead scheduler.
 
 The reachability of it is a KV-budget property, not just a model property: ids
 come off the front of the owner's free list and freed ids return to the back, so
@@ -39,7 +39,7 @@ import types
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -48,7 +48,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=72, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=77, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=120, stage="extra-a", runner_config="1-gpu-small-amd")
 
 # Healthy 0.865-0.880 (static pool 0.870); a died-mid-run server scores
 # 0.05-0.21. 1 sigma over 200 examples is ~0.024.

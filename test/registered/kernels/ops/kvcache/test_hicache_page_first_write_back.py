@@ -8,30 +8,24 @@ suite so the ROCm/HIP build and execution of those kernels are validated on AMD
 hardware, not just CUDA.
 """
 
+import os
+import shutil
+import subprocess
 import sys
 
 import pytest
 import torch
 
-from sglang.kernels.ops.kvcache.hicache import can_use_write_back_jit_kernel
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.mem_cache.pool_host import common as pool_host_common
-from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
-    HostTensorAllocator,
-    _cuda_host_unregister,
-    _resolve_device_accessible_ptr_fn,
-    alloc_with_host_register,
-    alloc_with_pin_memory,
-    make_kernel_ptr_table,
+from sglang.kernels.ops.kvcache.hicache import (
+    can_use_write_back_jit_kernel,
+    transfer_hicache_all_layer_mla_staged_lf_page_unified,
+    transfer_hicache_all_layer_staged_lf_page_unified,
 )
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import get_hip_version, is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -69,6 +63,22 @@ def _token_indices_for_pages(
 
 
 def _pinned_host_pool(host_pool_cls, **kwargs):
+    if "device_pool" in kwargs:
+        pool = kwargs.pop("device_pool")
+        kwargs.update(
+            buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
+        )
+    from sglang.srt.mem_cache.pool_host.common import (
+        ALLOC_MEMORY_FUNCS,
+        alloc_with_pin_memory,
+    )
+
     original_alloc = ALLOC_MEMORY_FUNCS[DEVICE]
     ALLOC_MEMORY_FUNCS[DEVICE] = alloc_with_pin_memory
     try:
@@ -85,6 +95,17 @@ def _pinned_host_pool(host_pool_cls, **kwargs):
 
 
 def _registered_host_pool(host_pool_cls, **kwargs):
+    if "device_pool" in kwargs:
+        pool = kwargs.pop("device_pool")
+        kwargs.update(
+            buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
+        )
     return host_pool_cls(
         host_to_device_ratio=2.0,
         host_size=0,
@@ -114,6 +135,9 @@ def _assert_pages_equal(host_ref, device_ref, host_pages, device_pages) -> None:
 
 
 def _run_mha(element_dim: int, page_count: int) -> None:
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
     pool_size = PAGE_SIZE * (page_count + 8)
     device_pool = MHATokenToKVPool(
         size=pool_size,
@@ -126,7 +150,15 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         enable_memory_saver=False,
     )
     host_pool = _pinned_host_pool(
-        MHATokenToKVPoolHost, device_pool=device_pool, layout="page_first"
+        MHATokenToKVPoolHost,
+        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+        device_capacity_tokens=device_pool.size
+        if device_pool.host_capacity_tokens is None
+        else device_pool.host_capacity_tokens,
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        write_back_staging=device_pool.hicache_write_back_staging,
+        layout="page_first",
     )
     assert can_use_write_back_jit_kernel(
         element_size=element_dim * host_pool.dtype.itemsize,
@@ -197,6 +229,9 @@ def _run_mha(element_dim: int, page_count: int) -> None:
 
 
 def _run_mla(element_dim: int, page_count: int) -> None:
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
     pool_size = PAGE_SIZE * (page_count + 8)
     device_pool = MLATokenToKVPool(
         size=pool_size,
@@ -273,6 +308,225 @@ def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> 
     _run_mla(element_dim, page_count)
 
 
+@pytest.mark.skipif(not is_hip(), reason="PAGE_SIZE is already 16 on CUDA.")
+def test_page_first_staged_write_back_page_size_16_hip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "PAGE_SIZE", 16)
+    _run_mha(128, 65)
+    _run_mla(576, 65)
+
+
+_HIP_BATCH_SHIM = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#define HIP_ERROR_NOT_SUPPORTED 801
+
+typedef int (*batch_fn)(void**, void**, size_t*, size_t, void*, size_t*, size_t, size_t*, void*);
+
+int hipMemcpyBatchAsync(void** dsts, void** srcs, size_t* sizes, size_t count, void* attrs,
+                        size_t* attrs_idxs, size_t num_attrs, size_t* fail_idx, void* stream) {
+  batch_fn real = (batch_fn)dlsym(RTLD_NEXT, "hipMemcpyBatchAsync");
+  const char* err = getenv("SHIM_BATCH_ERROR");
+  if (err == NULL) {
+    return real(dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, fail_idx, stream);
+  }
+  if (atoi(err) == HIP_ERROR_NOT_SUPPORTED) {
+    /* count 0 sets HIP's last error, as the ROCm 7.1/7.2 rejection does. */
+    real(dsts, srcs, sizes, 0, attrs, attrs_idxs, num_attrs, fail_idx, stream);
+  }
+  const char* idx = getenv("SHIM_BATCH_FAIL_IDX");
+  *fail_idx = idx == NULL ? SIZE_MAX : strtoull(idx, NULL, 10);
+  return atoi(err);
+}
+"""
+
+_HIP_BATCH_SHIM_DRIVER = """
+import os, sys
+import pytest
+sys.path.insert(0, {test_dir!r})
+import test_hicache_page_first_write_back as t
+
+HIP_ERROR_INVALID_VALUE = "1"
+HIP_ERROR_NOT_SUPPORTED = "801"
+
+t.PAGE_SIZE = 16
+os.environ["SHIM_BATCH_ERROR"] = HIP_ERROR_NOT_SUPPORTED
+t._run_mha(128, 65)
+os.environ["SHIM_BATCH_ERROR"] = HIP_ERROR_INVALID_VALUE
+with pytest.raises(Exception, match="hipMemcpyBatchAsync failed"):
+    t._run_mha(128, 65)
+os.environ["SHIM_BATCH_ERROR"] = HIP_ERROR_NOT_SUPPORTED
+os.environ["SHIM_BATCH_FAIL_IDX"] = "3"
+with pytest.raises(Exception, match="failIdx=3 error="):
+    t._run_mha(128, 65)
+"""
+
+
+@pytest.mark.skipif(
+    get_hip_version() < (7, 1) or shutil.which("cc") is None,
+    reason="Injects hipMemcpyBatchAsync results; needs ROCm >= 7.1 and a C compiler.",
+)
+def test_hip_batch_copy_runtime_rejection(tmp_path) -> None:
+    src = tmp_path / "hip_batch_shim.c"
+    shim = tmp_path / "libhip_batch_shim.so"
+    src.write_text(_HIP_BATCH_SHIM)
+    subprocess.run(
+        ["cc", "-shared", "-fPIC", "-o", str(shim), str(src), "-ldl"], check=True
+    )
+    driver = _HIP_BATCH_SHIM_DRIVER.format(test_dir=os.path.dirname(__file__))
+    preload = f"{shim} {os.environ.get('LD_PRELOAD', '')}".strip()
+    result = subprocess.run(
+        [sys.executable, "-c", driver],
+        # With -c, a sglang/ dir in the cwd would be imported as a namespace package.
+        cwd=tmp_path,
+        env={**os.environ, "LD_PRELOAD": preload},
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
+@pytest.mark.parametrize(
+    "groups,layers,page_size,heads_per_group,dim",
+    [(1, 1, 1, 1, 16), (3, 5, 3, 2, 24), (8, 3, 64, 1, 128)],
+)
+# A byte copy: only the element size reaches the kernel, so bf16 repeats fp16.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("page_count", [0, 1, 2, 5])
+def test_page_unified_staged_write_back(
+    groups, layers, page_size, heads_per_group, dim, dtype, index_dtype, page_count
+):
+    # Capacity 2 covers an exact chunk, repeated reuse, and a short final chunk.
+    # Small and >=128 KiB pages exercise the fallback/batch-copy size branches
+    # (the batch API additionally requires a supported CUDA runtime/driver).
+    shape = (groups, layers, 2, page_size, heads_per_group, dim)
+    generator = torch.Generator().manual_seed(1234)
+    source_cpu = [
+        [
+            torch.randint(
+                0,
+                128,
+                (6 * page_size, groups * heads_per_group, dim),
+                generator=generator,
+                dtype=torch.int32,
+            ).to(dtype)
+            for _ in range(layers)
+        ]
+        for _ in range(2)
+    ]
+    src_ids = [4, 0, 3, 4, 1][:page_count]  # Includes a repeated source page.
+    dst_ids = [6, 2, 0, 5, 3][:page_count]
+    dst = torch.full((8, *shape), 255, dtype=dtype, pin_memory=True)
+    expected = dst.clone()
+    for src_page, dst_page in zip(src_ids, dst_ids):
+        for group in range(groups):
+            for layer in range(layers):
+                for kv in range(2):
+                    expected[dst_page, group, layer, kv].copy_(
+                        source_cpu[kv][layer][
+                            src_page * page_size : (src_page + 1) * page_size,
+                            group * heads_per_group : (group + 1) * heads_per_group,
+                        ]
+                    )
+
+    # All GPU work uses a non-default stream; only synchronize after the call.
+    # This also checks ordering when the same staging allocation is reused.
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        source_gpu = [[t.to(DEVICE) for t in component] for component in source_cpu]
+        ptrs = [
+            torch.tensor(
+                [t.data_ptr() for t in component], dtype=torch.uint64, device=DEVICE
+            )
+            for component in source_gpu
+        ]
+        src_pages = torch.tensor(src_ids, dtype=index_dtype, device=DEVICE)
+        dst_pages = torch.tensor(dst_ids, dtype=torch.int64)
+        staging = torch.empty((2, *shape), dtype=dtype, device=DEVICE)
+        transfer_hicache_all_layer_staged_lf_page_unified(
+            *ptrs, src_pages, dst_pages, staging, dst
+        )
+    stream.synchronize()
+    # Compare every element, including pages that should retain the sentinel.
+    assert torch.equal(dst, expected)
+
+
+def test_page_unified_write_back_rejects_dst_page_out_of_range():
+    shape = (2, 3, 2, 4, 1, 16)
+    staging = torch.empty((1, *shape), dtype=torch.float16, device=DEVICE)
+    dst = torch.empty((2, *shape), dtype=torch.float16, pin_memory=True)
+    # Validation must reject the inputs before any pointer is dereferenced.
+    ptrs = torch.zeros(3, dtype=torch.uint64, device=DEVICE)
+    src_pages = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    dst_pages = torch.full((1,), dst.shape[0], dtype=torch.int64)
+    # TVM FFI uses its own exception type for C++ RuntimeCheck failures.
+    with pytest.raises(Exception, match="destination page out of range"):
+        transfer_hicache_all_layer_staged_lf_page_unified(
+            ptrs, ptrs, src_pages, dst_pages, staging, dst
+        )
+
+
+@pytest.mark.parametrize(
+    "layers,page_size,dim", [(1, 1, 16), (5, 3, 512), (3, 64, 576)]
+)
+# A byte copy: only the element size reaches the kernel, so bf16 repeats fp16.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("page_count", [0, 1, 2, 5])
+def test_page_unified_mla_staged_write_back(
+    layers, page_size, dim, dtype, index_dtype, page_count
+):
+    generator = torch.Generator().manual_seed(5678)
+    source_cpu = [
+        torch.randint(0, 128, (6 * page_size, dim), generator=generator).to(dtype)
+        for _ in range(layers)
+    ]
+    src_ids = [4, 0, 3, 4, 1][:page_count]
+    dst_ids = [6, 2, 0, 5, 3][:page_count]
+    shape = (layers, page_size, dim)
+    dst = torch.full((8, *shape), 255, dtype=dtype, pin_memory=True)
+    expected = dst.clone()
+    for src_page, dst_page in zip(src_ids, dst_ids):
+        for layer in range(layers):
+            expected[dst_page, layer].copy_(
+                source_cpu[layer][src_page * page_size : (src_page + 1) * page_size]
+            )
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        source_gpu = [t.to(DEVICE) for t in source_cpu]
+        ptrs = torch.tensor(
+            [t.data_ptr() for t in source_gpu], dtype=torch.uint64, device=DEVICE
+        )
+        src_pages = torch.tensor(src_ids, dtype=index_dtype, device=DEVICE)
+        dst_pages = torch.tensor(dst_ids, dtype=torch.int64)
+        staging = torch.empty((2, *shape), dtype=dtype, device=DEVICE)
+        transfer_hicache_all_layer_mla_staged_lf_page_unified(
+            ptrs, src_pages, dst_pages, staging, dst
+        )
+    stream.synchronize()
+    assert torch.equal(dst, expected)
+
+
+def test_page_unified_mla_write_back_rejects_dst_page_out_of_range():
+    shape = (3, 4, 16)
+    staging = torch.empty((1, *shape), dtype=torch.float16, device=DEVICE)
+    dst = torch.empty((2, *shape), dtype=torch.float16, pin_memory=True)
+    ptrs = torch.zeros(3, dtype=torch.uint64, device=DEVICE)
+    src_pages = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    dst_pages = torch.full((1,), -1, dtype=torch.int64)
+    with pytest.raises(Exception, match="destination page out of range"):
+        transfer_hicache_all_layer_mla_staged_lf_page_unified(
+            ptrs, src_pages, dst_pages, staging, dst
+        )
+
+
 @pytest.mark.skipif(
     is_hip(),
     reason="ROCm maps registered host memory at a distinct device address.",
@@ -282,6 +536,15 @@ def test_registered_mmap_kernel_ptr_table_fallback_matches_device_alias(
 ) -> None:
     """CUDA maps registered host memory at the host address itself;
     ``make_kernel_ptr_table``'s raw-host-address fallback depends on it."""
+    from sglang.srt.mem_cache.pool_host import common as pool_host_common
+    from sglang.srt.mem_cache.pool_host.common import (
+        HostTensorAllocator,
+        _cuda_host_unregister,
+        _resolve_device_accessible_ptr_fn,
+        alloc_with_host_register,
+        make_kernel_ptr_table,
+    )
+
     if _resolve_device_accessible_ptr_fn() is None:
         pytest.skip(
             "installed sglang-kernel has no get_device_accessible_ptr; "
@@ -307,6 +570,10 @@ def test_registered_mmap_kernel_ptr_table_fallback_matches_device_alias(
 
 
 def test_registered_mmap_pointer_domains_and_all_layer_transfer() -> None:
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.common import _resolve_device_accessible_ptr_fn
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
     get_device_accessible_ptr = _resolve_device_accessible_ptr_fn()
     if get_device_accessible_ptr is None:
         pytest.skip(
@@ -366,6 +633,10 @@ def test_registered_mmap_pointer_domains_and_all_layer_transfer() -> None:
 def test_registered_mmap_page_first_kernel_operands_and_graph(
     pool_kind: str,
 ) -> None:
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
     if pool_kind == "mha":
         device_pool = MHATokenToKVPool(
             size=PAGE_SIZE * 4,
@@ -379,7 +650,13 @@ def test_registered_mmap_page_first_kernel_operands_and_graph(
         )
         host_pool = _registered_host_pool(
             MHATokenToKVPoolHost,
-            device_pool=device_pool,
+            buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=device_pool.size
+            if device_pool.host_capacity_tokens is None
+            else device_pool.host_capacity_tokens,
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            write_back_staging=device_pool.hicache_write_back_staging,
             layout="page_first",
         )
         host_refs = [host_pool.k_data_refs[0], host_pool.v_data_refs[0]]

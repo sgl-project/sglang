@@ -13,6 +13,7 @@ from sglang.benchmark.datasets.common import (
     BaseDataset,
     DatasetRow,
     compute_random_lens,
+    first_two_sharegpt_turns,
 )
 from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
 
@@ -94,20 +95,7 @@ def sample_random_requests(
         # Load the dataset.
         with open(dataset_path) as f:
             dataset = json.load(f)
-        # Filter out the conversations with less than 2 turns.
-        dataset = [
-            data
-            for data in dataset
-            if len(data.get("conversations", data.get("conversation", []))) >= 2
-        ]
-        # Only keep the first two turns of each conversation.
-        dataset = [
-            (
-                data.get("conversations", data.get("conversation", []))[0]["value"],
-                data.get("conversations", data.get("conversation", []))[1]["value"],
-            )
-            for data in dataset
-        ]
+        dataset = first_two_sharegpt_turns(dataset)
         # Shuffle the dataset.
         random.shuffle(dataset)
 

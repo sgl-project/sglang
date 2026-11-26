@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import pytest
 from prometheus_client import CollectorRegistry
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.request_state import (
     RequestState,
@@ -65,6 +66,10 @@ def test_scheduler_counts_original_requests_and_cleans_up(
 ):
     collector, registry = metrics
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.server_args = SimpleNamespace(pipeline_config=PipelineConfig())
+    scheduler.worker = SimpleNamespace(release_cache_if_idle=Mock())
+    scheduler._async_output_save = False
+    scheduler._inflight_finalizes = deque()
     scheduler.metrics = collector if enabled else None
     scheduler._disagg_role = RoleType.MONOLITHIC
     scheduler._disagg_metrics = None
@@ -111,6 +116,8 @@ def test_scheduler_counts_original_requests_and_cleans_up(
 
     scheduler._dispatch_items = dispatch
     scheduler.event_loop()
+    assert scheduler.worker.defer_cache_release is True
+    scheduler.worker.release_cache_if_idle.assert_not_called()
     if not enabled:
         assert not collector._requests
         assert (
@@ -269,7 +276,8 @@ assert r.get_sample_value('sglang:diffusion_num_queue_reqs', {'role':'monolithic
 assert r.get_sample_value('sglang:diffusion_num_queue_reqs', {'role':'monolithic','replica':'1'}) == 2
 assert r.get_sample_value('sglang:diffusion_num_queue_reqs', {'role':'decoder','replica':'0'}) == 0
 assert b'sglang:diffusion_requests_total' in generate_latest(r)
-args = SimpleNamespace(enable_metrics=True, pipeline_config=SimpleNamespace(
+args = SimpleNamespace(enable_metrics=True, api_key=None, admin_api_key=None,
+    pipeline_config=SimpleNamespace(
     supports_action_endpoint=lambda: False, supports_openpi_endpoint=lambda: False))
 app = create_app(args)
 app.state.server_warmup_done = asyncio.Event()

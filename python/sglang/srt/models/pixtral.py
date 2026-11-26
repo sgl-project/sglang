@@ -16,6 +16,7 @@
 Using mistral-community/pixtral-12b as reference.
 """
 
+from array import array
 from dataclasses import dataclass, fields
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
@@ -24,13 +25,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PixtralVisionConfig, PretrainedConfig
 from transformers.models.pixtral.modeling_pixtral import (
-    PixtralRotaryEmbedding,
+    PixtralVisionRotaryEmbedding,
 )
 from transformers.models.pixtral.modeling_pixtral import (
     generate_block_attention_mask as _get_pixtral_attention_mask,
-)
-from transformers.models.pixtral.modeling_pixtral import (
-    position_ids_in_meshgrid,
 )
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -40,15 +38,14 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mistral import MistralForCausalLMMistralFormat
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 
-USE_XFORMERS_OPS = False
 PATCH_MERGE = "patch_merge"
 
 
@@ -70,25 +67,30 @@ class VisionEncoderArgs:
     mm_projector_id: str = ""
 
 
-class PixtralForConditionalGeneration(nn.Module):
-    merge_by_field_config = True
+def _fused_moe_text_config(hf_config):
+    """Return the nested fusable MoE config, or None for other branches."""
+    text_config = hf_config.text_config
+    if getattr(text_config, "model_type", "") != "deepseek_v3":
+        return None
+    return text_config
 
+
+class PixtralForConditionalGeneration(nn.Module):
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        text_config = hf_config.text_config
-        if getattr(text_config, "model_type", "") != "deepseek_v3":
-            # The GQA text config builds the dense Mistral backbone.
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
             return None
         return MistralLarge3ForCausalLM.shared_experts_fusion_disable_reason(
             text_config, quant_config
         )
 
-    @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality.startswith("image"):
-            return None
-
-        raise ValueError("Only image modality is supported")
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return 0
+        return MistralLarge3ForCausalLM.num_fusable_shared_experts(text_config)
 
     def __init__(self, *, config, prefix: str = "", **kwargs):
         super().__init__()
@@ -137,9 +139,8 @@ class PixtralForConditionalGeneration(nn.Module):
             self.vision_args, dim=self.config.text_config.hidden_size
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         def is_vision_encoder_weights(weight: tuple[str, torch.Tensor]):
@@ -208,9 +209,6 @@ class PixtralForConditionalGeneration(nn.Module):
         # Now we call the language model load with the generator
         self.language_model.load_weights(llm_weights_generator())
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
-
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         images = [item.feature for item in items]
         # Process images through vision encoder
@@ -239,12 +237,6 @@ class PixtralForConditionalGeneration(nn.Module):
             multimodal_model=self,
             positions=positions,
         )
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        return self.language_model.compute_logits(hidden_states)
 
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
@@ -422,20 +414,9 @@ class VisionTransformer(nn.Module):
         freqs_cis = self.freqs_cis[positions[:, 0], positions[:, 1]]
 
         # pass through Transformer with a block diagonal mask delimiting images
-        if USE_XFORMERS_OPS:
-            from xformers import ops as xops
-
-            mask = xops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(
-                [p.shape[-2] * p.shape[-1] for p in patch_embeds_list],
-            )
-        else:
-            from transformers.models.pixtral.modeling_pixtral import (
-                generate_block_attention_mask,
-            )
-
-            mask = generate_block_attention_mask(
-                [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
-            )
+        mask = _get_pixtral_attention_mask(
+            [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
+        )
         return self.transformer(patch_embeds, mask=mask, freqs_cis=freqs_cis)
 
 
@@ -692,16 +673,11 @@ class Attention(nn.Module):
 
         q, k = apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis)
 
-        if USE_XFORMERS_OPS:
-            from xformers import ops as xops
-
-            out = xops.memory_efficient_attention(q, k, v, attn_bias=mask)
-        else:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            out = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-            out = out.transpose(1, 2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        out = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        out = out.transpose(1, 2)
 
         out = out.reshape(batch, patches, self.n_heads * self.head_dim)
         return self.wo(out)
@@ -812,54 +788,13 @@ class PixtralHFTransformer(nn.Module):
         return hidden_states
 
 
-def resolve_visual_encoder_outputs(
-    outputs: Union[torch.Tensor, List[torch.Tensor]],
-    feature_sample_layers: Optional[List[int]],
-    post_norm: Optional[nn.Module],
-    num_hidden_layers: int,
-) -> torch.Tensor:
-    """Resolve outputs from visual encoder based on feature_sample_layers."""
-    if feature_sample_layers is None:
-        # Just use the last layer's output
-        if isinstance(outputs, list):
-            outputs = outputs[-1]
-        if post_norm is not None:
-            outputs = post_norm(outputs)
-        return outputs
-
-    # Handle the case where we want to use specific layers
-    if not isinstance(outputs, list):
-        raise ValueError(
-            "Expected outputs to be a list when feature_sample_layers is provided"
-        )
-
-    # Validate layer indices
-    for layer_idx in feature_sample_layers:
-        if layer_idx < 0 or layer_idx > num_hidden_layers:
-            raise ValueError(
-                f"Feature sample layer index {layer_idx} is out of range "
-                f"[0, {num_hidden_layers}]"
-            )
-
-    # Collect outputs from specified layers
-    selected_outputs = [outputs[layer_idx] for layer_idx in feature_sample_layers]
-
-    # Combine the outputs
-    combined_outputs = torch.cat(selected_outputs, dim=-1)
-
-    if post_norm is not None:
-        combined_outputs = post_norm(combined_outputs)
-
-    return combined_outputs
-
-
 class PixtralHFVisionModel(nn.Module):
     """Hugging Face Pixtral Vision Model implemented using SGLang components."""
 
     DEFAULT_IMAGE_TOKEN_ID = 10
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        return self.input_padder.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def __init__(
         self,
@@ -903,8 +838,7 @@ class PixtralHFVisionModel(nn.Module):
             )
 
         # Initialize patch position embedding
-        self.patch_positional_embedding = PixtralRotaryEmbedding(config)
-        self.input_padder = MultiModalityDataPaddingPatternMultimodalTokens()
+        self.patch_positional_embedding = PixtralVisionRotaryEmbedding(config)
 
     @property
     def dtype(self):
@@ -919,20 +853,16 @@ class PixtralHFVisionModel(nn.Module):
         pixel_values: torch.Tensor,
         image_sizes: list[tuple[int, int]],
         output_hidden_states: bool = False,
-        feature_sample_layers: Optional[list[int]] = None,
     ) -> Union[torch.Tensor, tuple]:
         """
         Args:
             pixel_values: [batch_size, C, H, W], padded if multiple images
             image_sizes: list of (H, W) for each image in the batch
             output_hidden_states: Whether to return all hidden states.
-            feature_sample_layers: Layer indices whose features should be
-                concatenated and used as the visual encoder output. If none
-                are provided, the last layer is used.
 
         Returns:
             A tuple containing:
-              - hidden_states: Final model outputs (or selected layers if feature_sample_layers given)
+              - hidden_states: Final model outputs
               - hidden_states tuple (optional): All hidden states if output_hidden_states=True
         """
         # batch patch images
@@ -949,14 +879,10 @@ class PixtralHFVisionModel(nn.Module):
         embeds_1d = torch.cat([p.flatten(1).T for p in embeds_2d], dim=0)
         embeds_featurized = self.ln_pre(embeds_1d).unsqueeze(0)
 
-        # positional embeddings
-        position_ids = position_ids_in_meshgrid(
-            embeds_2d,
-            max_width=self.image_size // self.patch_size,
-        ).to(self.device)
+        # Axial rope indexes the (h, w) grid coordinates directly, so the ids are
+        # per-patch pairs rather than the flattened `h * max_width + w` offsets.
+        position_ids = position_meshgrid(embeds_2d).to(self.device)
 
-        # The original PixtralRotaryEmbedding expects 2D input but returns a tuple of tensors (cos, sin)
-        # These tensors are used by apply_rotary_pos_emb in the transformer blocks
         position_embedding = self.patch_positional_embedding(
             embeds_featurized, position_ids
         )
@@ -964,32 +890,18 @@ class PixtralHFVisionModel(nn.Module):
             [p.shape[-2] * p.shape[-1] for p in embeds_2d], embeds_featurized
         )
 
-        return_all_hidden_states = (
-            output_hidden_states or feature_sample_layers is not None
-        )
-
         transformer_outputs = self.transformer(
             embeds_featurized,  # add batch dimension
             attention_mask,
             position_embedding,
-            return_all_hidden_states=return_all_hidden_states,
+            return_all_hidden_states=output_hidden_states,
         )
 
         # Store all hidden states if requested
         all_hidden_states = None
         if isinstance(transformer_outputs, list):
             all_hidden_states = transformer_outputs
-            # Use the last layer by default if feature_sample_layers is not specified
-            if feature_sample_layers is None:
-                out = transformer_outputs[-1]
-            else:
-                # Resolve outputs based on feature sample layers
-                out = resolve_visual_encoder_outputs(
-                    transformer_outputs,
-                    feature_sample_layers,
-                    None,
-                    self.config.num_hidden_layers,
-                )
+            out = transformer_outputs[-1]
         else:
             out = transformer_outputs
 

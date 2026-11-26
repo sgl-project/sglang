@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningEncoderMixin
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
@@ -14,11 +15,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
     PipelineExecutor,
 )
 from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformBase
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class _RecordingExecutor(PipelineExecutor):
     def __init__(self):
-        super().__init__(server_args=SimpleNamespace())
+        super().__init__(server_args=_server_args())
         self.single_inference_mode = None
         self.group_inference_mode = None
         self.single_grad_enabled = None
@@ -47,6 +49,8 @@ class _TestServerArgs(SimpleNamespace):
 def _server_args(**overrides):
     values = {
         "use_fsdp_inference": False,
+        "disable_conditioning_cache": ServerArgs.disable_conditioning_cache,
+        "conditioning_cache_max_size_mb": ServerArgs.conditioning_cache_max_size_mb,
         "component_modes": {},
     }
     values.update(overrides)
@@ -113,6 +117,31 @@ def test_execute_group_with_profiling_uses_platform_inference_mode(monkeypatch):
 
     assert executor.group_inference_mode is False
     assert executor.group_grad_enabled is False
+
+
+@pytest.mark.parametrize("fsdp", [False, True])
+@torch.no_grad()
+def test_warmup_conditioning_is_reused_by_first_serving_request(fsdp):
+    class Encoder(ConditioningEncoderMixin, torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, tokens):
+            self.calls += 1
+            return tokens * 2
+
+    executor = _RecordingExecutor()
+    executor.component_residency_manager = Mock()
+    encoder = Encoder().eval()
+    tokens = torch.arange(8)
+    args = _server_args(use_fsdp_inference=fsdp)
+    for warmup in (True, True, False):
+        batch = _batch()
+        batch.is_warmup = warmup
+        with executor._component_residency_request([], batch, args):
+            torch.testing.assert_close(encoder(tokens), tokens * 2, rtol=0, atol=0)
+    assert encoder.calls == (3 if fsdp else 2)
 
 
 def test_group_payload_is_forwarded_to_component_residency_manager():

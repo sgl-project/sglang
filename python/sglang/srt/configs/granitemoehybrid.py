@@ -15,12 +15,9 @@
 """GraniteMoeHybrid model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.runtime_context import get_parallel
-
-logger = logging.get_logger(__name__)
 
 MAMBA = "mamba"
 ATTENTION = "attention"
@@ -272,8 +269,7 @@ class GraniteMoeHybridConfig(PretrainedConfig):
             **kwargs,
         )
 
-        # HF's `PreTrainedConfig.validate_layer_type` rewrites layer_types to
-        # transformers >= 5.15 schema, so map them back afterwards.
+        # `PreTrainedConfig` rewrites legacy layer_types on init, so map them back.
         self.layer_types = _to_sglang_layer_types(self.layer_types)
 
     @property

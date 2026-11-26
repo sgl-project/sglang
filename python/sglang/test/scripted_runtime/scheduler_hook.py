@@ -10,9 +10,10 @@ from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 
 import zmq
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
 from sglang.test.scripted_runtime.context import ScriptedContext
@@ -97,7 +98,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
-    if scheduler._engine_paused:
+    if scheduler.pause_state.paused:
         ctx.continue_generation()
 
     ctx._release_exhausted_pools()
@@ -125,9 +126,9 @@ class ScriptedSchedulerHook:
     ) -> None:
         self.scheduler = scheduler
         self._is_driver = (
-            scheduler.ps.pp_rank == 0
-            and scheduler.ps.tp_rank == 0
-            and scheduler.ps.attn_cp_rank == 0
+            get_parallel().pp_rank == 0
+            and get_parallel().tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
         )
         self._batch_log: List[ScriptedBatchRecord] = []
 
