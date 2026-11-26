@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import layernorm_modulate_bitexact
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -50,6 +51,7 @@ from sglang.srt.utils import is_device_stream_capturing
 logger = init_logger(__name__)
 
 
+_ANIMA_LN_MOD = BitExactFusionGate("Anima LayerNorm modulation", per_signature=True)
 _ANIMA_ROPE = BitExactFusionGate("Anima FP32 RoPE", per_signature=True)
 
 
@@ -181,24 +183,37 @@ class AnimaAdaLayerNorm(nn.Module):
     def forward(self, x, embedded_timestep, temb, values=None):
         if values is None:
             values = self.project_modulation(embedded_timestep, temb)
+        shift, scale = values[:2]
+        if (
+            is_in_breakable_cuda_graph()
+            and not torch.compiler.is_compiling()
+            and x.is_contiguous()
+        ):
+            out = layernorm_modulate_bitexact(
+                _ANIMA_LN_MOD,
+                self.norm,
+                x,
+                scale.squeeze(1),
+                shift.squeeze(1),
+                lambda: self._modulate(x, scale, shift),
+                sig=(x.device, x.shape, scale.stride(0), self.norm.eps),
+            )
+        else:
+            out = self._modulate(x, scale, shift)
+        return (out, values[2]) if self.gated else out
+
+    def _modulate(self, x, scale, shift):
         norm_x = self.norm(x)
         if (
             norm_x.is_cuda
             and norm_x.dtype in (torch.float16, torch.bfloat16)
             and not torch.compiler.is_compiling()
         ):
-            # Batched chunk views are strided; only copy the small [B, D]
-            # modulation rows, never the [B, S, D] activation.
-            out = modulate_scale_shift(
-                norm_x,
-                values[1].squeeze(1).contiguous(),
-                values[0].squeeze(1).contiguous(),
+            # Batched chunk views are strided; only copy the small [B, D] rows.
+            return modulate_scale_shift(
+                norm_x, scale.squeeze(1).contiguous(), shift.squeeze(1).contiguous()
             )
-        else:
-            # Keep the original graph for torch.compile: the CUDA dispatch
-            # checks pointer alignment, which cannot be traced in a full graph.
-            out = norm_x * (1 + values[1]) + values[0]
-        return (out, values[2]) if self.gated else out
+        return norm_x * (1 + scale) + shift
 
 
 class AnimaAttention(nn.Module):

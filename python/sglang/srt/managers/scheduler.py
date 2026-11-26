@@ -3099,12 +3099,17 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
+        # max_req_len is the largest number of tokens that can be forwarded for
+        # one request. The last generated token is sampled but never forwarded,
+        # so a request may generate max_req_len - input_len + 1 tokens.
+        context_max_new_tokens = self.max_req_len - input_len + 1
+
         # Keep this bound consistent with PrefillAdder's admission budget.
         max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                context_max_new_tokens,
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
@@ -6637,10 +6642,9 @@ class Scheduler(
                 self._pending_chunked_abort_req = chunked_req
 
     def abort_request(self, recv_req: AbortReq):
-        # Abort requests still waiting for encoder embeddings (EPD language-only)
-        if self.mm_receiver is not None:
-            self.mm_receiver.abort_waiting_requests(recv_req)
-
+        # Encoder waiters were already aborted in arrival order by
+        # mm_receiver.process_waiting_requests; scanning them again here would
+        # also hit requests that arrived after this AbortReq.
         for request_list in self.request_lists().values():
             request_list.abort(recv_req)
 
