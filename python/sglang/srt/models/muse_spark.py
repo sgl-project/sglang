@@ -92,6 +92,7 @@ from sglang.srt.layers.muse_spark.muse_spark_layers import (
     MuseSpark1xRMSNorm,
     MuseSpark1xRMSNormWithInputScale,
     QKVOGateParallelLinear,
+    refill_cached,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
@@ -270,8 +271,9 @@ def _replicate_sp_o_proj(layers) -> None:
         shard = o_proj.weight.data
         gathered = shard.new_empty((group.world_size, *shard.shape))
         group.all_gather_into_tensor(gathered, shard.contiguous())
-        o_proj._sp_full_weight = (
-            gathered.permute(1, 0, 2).reshape(shard.shape[0], -1).contiguous()
+        o_proj._sp_full_weight = refill_cached(
+            getattr(o_proj, "_sp_full_weight", None),
+            gathered.permute(1, 0, 2).reshape(shard.shape[0], -1).contiguous(),
         )
         o_proj._sp_full_weight_min_tokens = _SP_O_PROJ_A2A_MIN_TOKENS
         # post_load_weights rebuilds the replica; a direct copy would bypass it
@@ -448,33 +450,31 @@ class MuseSpark1xRouter(nn.Module):
         self.register_buffer(
             "e_score_correction_bias", torch.zeros(num_experts, dtype=torch.float32)
         )
-        self._split2_hi = None
-        self._split2_lo = None
-        self._split2_key = None
+        self._split2_hilo = None
 
     @torch.no_grad()
     def _build_split2(self) -> None:
+        # Rebuilt on every post_load_weights: a loader's in-place write bumps no
+        # version counter this module can see.
         w = self.weight.data
-        key = (w.data_ptr(), w.shape, w._version)
-        if self._split2_key == key:
-            return
         e, k = w.shape
         hi = w.to(torch.bfloat16)
         lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
         # [hidden, 2E]: per 16 columns 8 experts' hi then their lo; one GEMM, logits = hi + lo (fp32)
         g = self._split2_g = 8 if e % 8 == 0 else e
-        self._split2_hilo = (
+        self._split2_hilo = refill_cached(
+            self._split2_hilo,
             torch.stack([hi.view(e // g, g, k), lo.view(e // g, g, k)], 1)
             .reshape(2 * e, k)
             .t()
-            .contiguous()
+            .contiguous(),
         )
-        self._split2_key = key
 
     def forward_split2(
         self, hidden_states: torch.Tensor, sp: bool = False
     ) -> torch.Tensor:
-        self._build_split2()
+        if self._split2_hilo is None:
+            self._build_split2()
         x, w = hidden_states.to(torch.bfloat16), self._split2_hilo
         if _hopper_kernels_enabled():
             from sglang.kernels.ops.gemm.hopper_bf16_small_m_gemv import (
