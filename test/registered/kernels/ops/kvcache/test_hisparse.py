@@ -28,6 +28,7 @@ if is_xpu():
     )
 else:
     from sglang.kernels.ops.kvcache.hisparse import (
+        copy_cache_planned_mla,
         load_blocks_to_device_buffer_mha,
         load_cache_to_device_buffer_dsv4_mla,
         load_cache_to_device_buffer_mla,
@@ -835,6 +836,226 @@ def test_many_misses_copy_byte_exact_through_a_strided_host(
     assert torch.equal(device_buffer[untouched].cpu(), before[untouched].cpu()), (
         "a copy wrote outside its destination row"
     )
+
+
+# copy_cache_planned_kernel loads miss counts one warp-sized window of requests at a time.
+_REPLAY_WINDOW = 64 if is_hip() else 32
+_PLAN_HOT, _PLAN_LAYERS, _PLAN_SEQ_LEN, _PLAN_KV_DIM = 64, 4, 300, 164
+_PLAN_ITEM_BYTES = _PLAN_KV_DIM * torch.empty((), dtype=DTYPE).element_size()
+# Selected tokens by miss count; slot s holds token s, so tokens below 64 hit.
+_PLAN_TOP_K = {
+    40: list(range(10)) + list(range(100, 140)),
+    0: list(range(50)),
+    7: list(range(10)) + list(range(200, 207)) + list(range(10, 43)),
+}
+
+
+def _plan_case(reqs: int) -> dict:
+    gen = torch.Generator().manual_seed(1)
+    host = torch.empty(
+        (_PLAN_SEQ_LEN, _PLAN_LAYERS, _PLAN_KV_DIM),
+        dtype=DTYPE,
+        device="cpu",
+        pin_memory=True,
+    )
+    host.copy_(torch.arange(host.numel(), dtype=DTYPE).view_as(host))
+    slots = reqs + 1
+    host_locs = torch.stack(
+        [torch.randperm(_PLAN_SEQ_LEN, generator=gen) for _ in range(slots)]
+    )
+    device_rows = torch.randperm(slots * (_PLAN_HOT + 1), generator=gen)
+    misses = [(40, 0, 7)[b % 3] for b in range(reqs)]
+    # The last batch row is CUDA-graph padding; it would miss if it were processed.
+    top_k = [_PLAN_TOP_K[m] for m in misses] + [list(range(100, 150))]
+    return {
+        "host": host,
+        "host_locs": host_locs,
+        "misses": misses,
+        "top_k": torch.tensor(top_k, dtype=torch.int32, device=DEVICE),
+        # Request slots are not batch positions.
+        "req_pool_indices": torch.randperm(slots, generator=gen).to(DEVICE),
+        "seq_lens": torch.full(
+            (slots,), _PLAN_SEQ_LEN, dtype=torch.int32, device=DEVICE
+        ),
+        "num_real_reqs": torch.tensor([reqs], dtype=torch.int32, device=DEVICE),
+        "host_cache_locs": host_locs.to(DEVICE),
+        "device_buffer_locs": device_rows.view(slots, -1).to(torch.int32).to(DEVICE),
+        # All -1, so nothing is pool-resident;
+        # the table still selects the kernel variant the HiCache backend runs.
+        "device_locs": torch.full(
+            (slots, _PLAN_SEQ_LEN), -1, dtype=torch.int32, device=DEVICE
+        ),
+        # Layer 1 of a page_first host: an offset base, rows all layers apart.
+        "binding": torch.tensor(
+            [host.data_ptr() + _PLAN_ITEM_BYTES, _PLAN_LAYERS * _PLAN_ITEM_BYTES],
+            dtype=torch.int64,
+            device=DEVICE,
+        ),
+    }
+
+
+def _plan_state(case: dict) -> dict:
+    locs = case["device_buffer_locs"]
+    # One device row no request owns; a replay past a miss count writes it.
+    canary = locs.numel()
+    device_buffer = torch.full(
+        (canary + 1, 1, _PLAN_KV_DIM), -1, dtype=DTYPE, device=DEVICE
+    )
+    resident = case["host"][case["host_locs"][:, :_PLAN_HOT].reshape(-1), 1]
+    device_buffer[locs[:, :_PLAN_HOT].reshape(-1).long(), 0] = resident.to(DEVICE)
+    tokens = torch.cat(
+        [
+            torch.arange(_PLAN_HOT, dtype=torch.int32),
+            torch.tensor([-1], dtype=torch.int32),
+        ]
+    )
+    top_k = case["top_k"]
+    # Twice as wide as top-k, like the coordinator's speculative plan buffers;
+    # stale counts and entries aim a replay that reads them at the canary row.
+    plan_shape = (top_k.shape[0], 2 * top_k.shape[1])
+    return {
+        "device_buffer": device_buffer,
+        "tokens": tokens.repeat(locs.shape[0], 1).to(DEVICE),
+        "lru": torch.arange(_PLAN_HOT, dtype=torch.int16)
+        .repeat(locs.shape[0], 1)
+        .to(DEVICE),
+        "out": torch.full_like(top_k, -1),
+        "miss_src": torch.zeros(plan_shape, dtype=torch.int64, device=DEVICE),
+        "miss_dst": torch.full(plan_shape, canary, dtype=torch.int32, device=DEVICE),
+        "miss_count": torch.full(plan_shape[:1], 5, dtype=torch.int32, device=DEVICE),
+    }
+
+
+def _miss_plan(state: dict) -> dict:
+    return {name: state[name] for name in ("miss_src", "miss_dst", "miss_count")}
+
+
+def _swap_in(*, case: dict, state: dict, **plan_kwargs) -> None:
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=case["top_k"],
+        device_buffer_tokens=state["tokens"],
+        host_cache_locs=case["host_cache_locs"],
+        device_buffer_locs=case["device_buffer_locs"],
+        host_cache=None,
+        device_buffer=state["device_buffer"],
+        top_k_device_locs=state["out"],
+        req_pool_indices=case["req_pool_indices"],
+        seq_lens=case["seq_lens"],
+        lru_slots=state["lru"],
+        item_size_bytes=_PLAN_ITEM_BYTES,
+        num_top_k=case["top_k"].shape[1],
+        hot_buffer_size=_PLAN_HOT,
+        page_size=1,
+        # The (164, 960) many-misses case builds this JIT module too.
+        block_size=960,
+        num_real_reqs=case["num_real_reqs"],
+        device_locs=case["device_locs"],
+        host_binding=case["binding"],
+        **plan_kwargs,
+    )
+
+
+def _replay_plan(*, case: dict, state: dict, num_blocks: int) -> None:
+    copy_cache_planned_mla(
+        **_miss_plan(state),
+        num_real_reqs=case["num_real_reqs"],
+        host_cache=None,
+        device_buffer=state["device_buffer"],
+        item_size_bytes=_PLAN_ITEM_BYTES,
+        num_blocks=num_blocks,
+        block_size=256,
+        host_binding=case["binding"],
+    )
+
+
+@_requires_shared_sources
+@pytest.mark.parametrize(
+    "num_blocks,captured", [(1, False), (3, False), (148, False), (148, True)]
+)
+def test_planned_copy_matches_the_fused_swap_in_through_a_strided_host(
+    num_blocks: int, captured: bool
+) -> None:
+    """Planning with skip_io, then replaying the plan on any grid, must equal the fused swap-in.
+
+    The batch spans two replay windows plus a padded row with a stale plan;
+    a captured replay reads a host binding written after capture.
+    """
+    reqs = _REPLAY_WINDOW + 3
+    case = _plan_case(reqs)
+    fused = _plan_state(case)
+    _swap_in(case=case, state=fused)
+
+    planned = _plan_state(case)
+    initial = {name: t.clone() for name, t in planned.items()}
+
+    def plan_and_replay() -> None:
+        _swap_in(case=case, state=planned, skip_io=True, **_miss_plan(planned))
+        _replay_plan(case=case, state=planned, num_blocks=num_blocks)
+
+    if captured:
+        # Warm up and capture against layer 2; only a binding read at replay sees layer 1.
+        layer_1 = case["binding"].clone()
+        case["binding"][0] += _PLAN_ITEM_BYTES
+        plan_and_replay()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            plan_and_replay()
+        for name, t in planned.items():
+            t.copy_(initial[name])
+        case["binding"].copy_(layer_1)
+        graph.replay()
+    else:
+        _swap_in(case=case, state=planned, skip_io=True, **_miss_plan(planned))
+        get_device_module().synchronize()
+        assert torch.equal(planned["device_buffer"], initial["device_buffer"]), (
+            "the skip_io planning launch moved bytes"
+        )
+        _replay_plan(case=case, state=planned, num_blocks=num_blocks)
+    get_device_module().synchronize()
+
+    assert planned["miss_count"][:reqs].tolist() == case["misses"]
+    for name in ("out", "device_buffer", "tokens", "lru"):
+        assert torch.equal(planned[name], fused[name]), (
+            f"{name} differs from the fused swap-in"
+        )
+    assert (planned["out"][reqs] == -1).all(), "the padded row was swapped in"
+    # Every selected token, hit or miss, holds its own host row at layer 1.
+    rids = case["req_pool_indices"][:reqs].cpu().unsqueeze(1)
+    host_rows = case["host_locs"][rids, case["top_k"][:reqs].long().cpu()]
+    selected = planned["device_buffer"][planned["out"][:reqs].long(), 0]
+    assert torch.equal(selected.cpu(), case["host"][host_rows, 1])
+
+
+@_requires_shared_sources
+@pytest.mark.parametrize("bad", ["table", "int32", "cpu", "strided", "dsv4"])
+def test_planned_copy_rejects_a_binding_it_would_misread(bad: str) -> None:
+    """A binding the replay would read from the wrong base or stride must raise.
+
+    The device reads both elements, so a [layers, 2] table would replay every layer from layer 0.
+    """
+    pair = [0, _PLAN_LAYERS * _PLAN_ITEM_BYTES]
+    binding = {
+        "table": torch.tensor([pair] * _PLAN_LAYERS, dtype=torch.int64, device=DEVICE),
+        "int32": torch.tensor(pair, dtype=torch.int32, device=DEVICE),
+        "cpu": torch.tensor(pair, dtype=torch.int64),
+        "strided": torch.tensor(pair + pair, dtype=torch.int64, device=DEVICE)[::2],
+        "dsv4": torch.tensor(pair, dtype=torch.int64, device=DEVICE),
+    }[bad]
+    plan = torch.zeros((1, 4), dtype=torch.int64, device=DEVICE)
+    with pytest.raises(ValueError):
+        copy_cache_planned_mla(
+            miss_src=plan,
+            miss_dst=plan.to(torch.int32),
+            miss_count=torch.zeros((1,), dtype=torch.int32, device=DEVICE),
+            num_real_reqs=torch.ones((1,), dtype=torch.int32, device=DEVICE),
+            host_cache=None,
+            device_buffer=torch.zeros(
+                (4, _PLAN_ITEM_BYTES), dtype=torch.uint8, device=DEVICE
+            ),
+            item_size_bytes=_PLAN_ITEM_BYTES,
+            is_dsv4_layout=bad == "dsv4",
+            host_binding=binding,
+        )
 
 
 @_requires_shared_sources

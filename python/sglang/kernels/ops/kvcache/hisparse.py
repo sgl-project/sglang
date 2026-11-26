@@ -285,14 +285,18 @@ def _jit_copy_planned_module(
     is_mla: bool,
     is_dsv4_layout: bool,
     skip_io: bool,
+    late_bound_host_base: bool = False,
 ) -> Module:
-    template_args = make_cpp_args(block_size, is_mla, is_dsv4_layout, skip_io)
+    template_args = make_cpp_args(
+        block_size, is_mla, is_dsv4_layout, skip_io, late_bound_host_base
+    )
     return load_jit(
         "sparse_copy_planned",
         block_size,
         is_mla,
         is_dsv4_layout,
         skip_io,
+        late_bound_host_base,
         cuda_files=["kvcacheio/hisparse.cuh"],
         cuda_wrappers=[
             (
@@ -602,31 +606,52 @@ def copy_cache_planned_mla(
     miss_dst: torch.Tensor,
     miss_count: torch.Tensor,
     num_real_reqs: torch.Tensor,
-    host_cache: torch.Tensor,
+    host_cache: torch.Tensor | None,
     device_buffer: torch.Tensor,
     item_size_bytes: int,
     num_blocks: int = 4,
     block_size: int = 1024,
     is_dsv4_layout: bool = False,
     skip_io: bool = False,
+    host_binding: torch.Tensor | None = None,
 ) -> None:
-    """Replay a recorded miss plan (host_cache -> device_buffer) for a skip layer.
+    """Replay a recorded miss plan (host -> device_buffer), IO only, no planning.
 
-    IO-only, no planning; the small fixed grid keeps the SM footprint low while
-    overlapped on a side stream. The anchor's slot table stays valid (lockstep).
-    Only the private-host backing plans, and it owns its host pool from init, so
-    there is no late-bound host source here.
+    A shared-index skip layer replays its anchor's plan on a small grid on a side
+    stream; the anchor's slot table stays valid (lockstep). A swap-in planned by
+    ``load_cache_to_device_buffer_mla(skip_io=True)`` replays its own plan here, with
+    ``skip_io=False``, on a grid that covers the GPU, since the planning kernel runs
+    one CTA per request.
+
+    Optional host_binding replaces ``host_cache`` as the source, as in
+    ``load_cache_to_device_buffer_mla``: [base address, row stride in bytes].
     """
     assert miss_src.dtype == torch.int64 and miss_dst.dtype == torch.int32
     assert miss_count.dtype == torch.int32
-    module = _jit_copy_planned_module(block_size, True, is_dsv4_layout, skip_io)
+    late_bound_host_base = host_binding is not None
+    assert late_bound_host_base or host_cache is not None, "no host source"
+    # Both elements are read on the device, so a [layers, 2] table would silently
+    # replay every layer from layer 0.
+    if late_bound_host_base and (
+        host_binding.dtype != torch.int64
+        or host_binding.shape != (2,)
+        or not host_binding.is_contiguous()
+        or host_binding.device != device_buffer.device
+    ):
+        raise ValueError("host_binding must be a contiguous GPU int64 pair.")
+    if late_bound_host_base and is_dsv4_layout:
+        raise ValueError("DSv4 page-padded host rows have no late-bound stride.")
+    module = _jit_copy_planned_module(
+        block_size, True, is_dsv4_layout, skip_io, late_bound_host_base
+    )
     empty = torch.empty(0)
     module.copy_cache_planned(
         miss_src,
         miss_dst,
         miss_count,
         num_real_reqs,
-        host_cache,
+        host_binding if late_bound_host_base else empty,
+        empty if late_bound_host_base else host_cache,
         empty,
         device_buffer,
         empty,

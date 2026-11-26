@@ -747,7 +747,7 @@ __global__ void load_cache_to_device_buffer_kernel(
 #endif
   }
 
-  // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
+  // Each warp copies one miss; to copy with the whole GPU, plan with SkipIO and run copy_cache_planned_kernel.
   if constexpr (!SkipIO) {
     for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
       const int32_t miss_token = s_top_k_tokens[miss_idx];
@@ -957,27 +957,31 @@ void load_cache_to_device_buffer(
   }
 }
 
-// Copy-only swap-in for shared-index skip layers: replays the anchor's recorded
-// miss plan (no hit detection / LRU; the anchor's slot table stays valid). The
-// small fixed grid (num_blocks) keeps the SM footprint low while overlapping
-// compute on a side stream. SkipIO is the same probe as in the fused kernel.
-template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO>
+// Copy-only swap-in: replays a recorded miss plan, without hit detection or LRU update, on any grid.
+// LateBoundHostBase reads [host base, row stride] from host_binding, as the fused kernel does.
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO, bool LateBoundHostBase>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
     const int64_t* __restrict__ miss_src_locs,
     const int32_t* __restrict__ miss_dst_locs,
     const int32_t* __restrict__ miss_counts,
     const int32_t* __restrict__ num_real_reqs,
+    const int64_t* __restrict__ host_binding,
     const void* __restrict__ host_cache_k,
     const void* __restrict__ host_cache_v,
     void* __restrict__ device_buffer_k,
     void* __restrict__ device_buffer_v,
     int64_t plan_stride,
     int64_t item_size_bytes) {
+  static_assert(
+      !LateBoundHostBase || (IsMLA && !IsDsv4Layout),
+      "LateBoundHostBase supports only the linear MLA host layout: one base address and one row stride.");
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   const int lane_id = threadIdx.x % WARP_SIZE;
   const int warp_global = blockIdx.x * NUM_WARPS + threadIdx.x / WARP_SIZE;
   const int total_warps = gridDim.x * NUM_WARPS;
   const int real = num_real_reqs[0];
+  const void* const host_base = LateBoundHostBase ? reinterpret_cast<const void*>(host_binding[0]) : host_cache_k;
+  const int64_t host_row_bytes = LateBoundHostBase ? host_binding[1] : item_size_bytes;
 
   // Warp-sized windows amortize the miss_counts loads; warps then round-robin
   // the flattened (request, miss) space so a large sparse batch spreads over
@@ -1001,26 +1005,27 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
         if constexpr (SkipIO) continue;
         copy_miss_item<IsMLA, IsDsv4Layout>(
             lane_id,
-            host_cache_k,
+            host_base,
             host_cache_v,
             device_buffer_k,
             device_buffer_v,
             src_row[m],
             static_cast<int64_t>(dst_row[m]),
             item_size_bytes,
-            /*host_row_bytes=*/item_size_bytes);
+            host_row_bytes);
       }
       start += cnt;
     }
   }
 }
 
-template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO>
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO, bool LateBoundHostBase>
 void copy_cache_planned(
     tvm::ffi::TensorView miss_src_locs,
     tvm::ffi::TensorView miss_dst_locs,
     tvm::ffi::TensorView miss_counts,
     tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView host_binding,
     tvm::ffi::TensorView host_cache_k,
     tvm::ffi::TensorView host_cache_v,
     tvm::ffi::TensorView device_buffer_k,
@@ -1034,15 +1039,17 @@ void copy_cache_planned(
   }
   const auto kernel_device = miss_src_locs.device();
   const auto device = LaunchKernel::resolve_device(kernel_device);
-  const void* const host_cache_k_ptr = runtime::get_device_accessible_ptr(host_cache_k);
+  // A late-bound host pool may attach after capture; its pointer is read on device.
+  const void* const host_cache_k_ptr = LateBoundHostBase ? nullptr : runtime::get_device_accessible_ptr(host_cache_k);
   const void* const host_cache_v_ptr =
       (IsMLA || host_cache_v.ndim() == 0) ? nullptr : runtime::get_device_accessible_ptr(host_cache_v);
   LaunchKernel(num_blocks, BLOCK_SIZE, device)(
-      copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout, SkipIO>,
+      copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout, SkipIO, LateBoundHostBase>,
       static_cast<const int64_t*>(miss_src_locs.data_ptr()),
       static_cast<const int32_t*>(miss_dst_locs.data_ptr()),
       static_cast<const int32_t*>(miss_counts.data_ptr()),
       static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      LateBoundHostBase ? static_cast<const int64_t*>(host_binding.data_ptr()) : nullptr,
       host_cache_k_ptr,
       host_cache_v_ptr,
       device_buffer_k.data_ptr(),
