@@ -238,6 +238,35 @@ def rel_bias_partials(
                 else None
             ),
         )
+    if get_platform().is_sm120 and verify:
+        from sglang.kernels.ops.attention.inkling2_rel_verify_mxfp8_sm120 import (
+            can_use_rel_verify_mxfp8_sm120,
+            rel_verify_mxfp8_partials_sm120,
+        )
+
+        if can_use_rel_verify_mxfp8_sm120(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            seqused_k,
+            rel_bias,
+            window_size_left=window_size_left,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        ):
+            return rel_verify_mxfp8_partials_sm120(
+                q,
+                k_cache,
+                v_cache,
+                page_table,
+                seqused_k,
+                rel_bias,
+                softmax_scale,
+                window_size_left=window_size_left,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
     from sglang.kernels.ops.attention.inkling2_decode_attention_sm90 import (
         decode_partials,
     )

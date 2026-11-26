@@ -789,3 +789,13 @@ for _op, _module in (
         )
     )
 del _op, _module
+
+_SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
+register_kernel(
+    KernelSpec(
+        op="attention.inkling2_rel_verify_mxfp8_partials_sm120",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.inkling2_rel_verify_mxfp8_sm120:rel_verify_mxfp8_partials_sm120",
+        capabilities=_SM12X,
+    )
+)
