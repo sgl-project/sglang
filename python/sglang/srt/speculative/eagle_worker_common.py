@@ -642,7 +642,9 @@ def build_eagle_verify_input(
             # Preallocated, or a QLEN_ONLY allocation sized off bs alone.
             seq_lens_sum = 0
         else:
-            seq_lens_sum = bs * target_attn_backend.max_context_len
+            seq_lens_sum = (
+                bs * target_worker.model_runner.req_to_token_pool.req_to_token.shape[1]
+            )
 
     prepared_out_cache_loc = None
     prepared_mrope_positions = None
