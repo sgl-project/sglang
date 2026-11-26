@@ -593,19 +593,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # sees the real free memory. Deferring it left the pools sized against memory
             # that was about to be taken.
             _PAGE_SLACK = 4  # pages of headroom over the derived width
-            max_ctx = getattr(config, "max_position_embeddings", 0) or 0
+            max_positions = getattr(config, "max_position_embeddings", 0) or 0
             from sglang.srt.mem_cache.allocation_sizing import (
-                get_req_to_token_headroom,
+                get_req_to_token_row_width,
             )
 
-            headroom = get_req_to_token_headroom()
-            if max_ctx:
-                pages = -(-(max_ctx + headroom) // 64) + _PAGE_SLACK
-                max_ctx = pages * 64
-            if max_ctx:
+            if max_positions:
+                req_to_token_row_width = get_req_to_token_row_width(max_positions)
                 prealloc_workspace(
                     device=torch.device("cuda", torch.cuda.current_device()),
-                    max_cols=max_ctx,
+                    max_cols=(-(-req_to_token_row_width // 64) + _PAGE_SLACK) * 64,
                     fp8_dtype=fp8_dtype,
                 )
 

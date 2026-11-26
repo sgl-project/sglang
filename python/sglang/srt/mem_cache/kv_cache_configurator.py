@@ -5,7 +5,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import torch
@@ -48,7 +48,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.mem_cache.allocation_sizing import (
     get_mamba_tracking_slots,
-    get_req_to_token_headroom,
+    get_req_to_token_row_width,
 )
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -476,6 +476,7 @@ class KVCacheConfigurator:
                 draft_model_config=aux.draft_model_config,
                 draft_num_layers=aux.dflash_draft_num_layers,
                 attn_tp_size=self.draft_attn_tp_size,
+                algo_label="DFLASH" if self.spec_algorithm.is_dflash() else None,
             )
             self.dflash_draft_loc_space_scale = draft_loc_space_scale(
                 hf_config=aux.draft_model_config.hf_config,
@@ -1261,7 +1262,7 @@ class KVCacheConfigurator:
             raise RuntimeError("unified storage must be sized before construction")
         from sglang.srt.mem_cache.kv.decl import StateLifetime
 
-        req_to_token_headroom, decode_pre_alloc_size = self._unified_request_rows(
+        decode_pre_alloc_size = self._unified_pre_alloc_rows(
             has_state=StateLifetime in self._unified_plan.lifetime_types()
         )
         storage = build_kv_storage(
@@ -1284,8 +1285,6 @@ class KVCacheConfigurator:
                 ),
                 head_dim=self.model_config.head_dim,
                 max_num_reqs=sizes.max_running_requests,
-                model_context_len=self.model_config.context_len,
-                req_to_token_headroom=req_to_token_headroom,
                 state_cache_params=(
                     self.mambaish_config.mamba2_cache_params if has_state else None
                 ),
@@ -1303,10 +1302,10 @@ class KVCacheConfigurator:
         )
         return storage
 
-    def _unified_request_rows(self, *, has_state: bool) -> Tuple[int, int]:
-        """The request table's row headroom beyond the model context, and the
-        rows a decode node hands to PREALLOCATED transfers on top of the
-        running set, by the rules the static request pools follow."""
+    def _unified_pre_alloc_rows(self, *, has_state: bool) -> int:
+        """The request table's rows a decode node hands to PREALLOCATED
+        transfers on top of the running set, by the rules the static request
+        pools follow."""
         disagg = get_disagg()
         if has_state:
             pre_alloc_size = (
@@ -1316,7 +1315,7 @@ class KVCacheConfigurator:
             )
         else:
             pre_alloc_size = self._req_pool_pre_alloc_size()
-        return get_req_to_token_headroom(), pre_alloc_size
+        return pre_alloc_size
 
     def _unified_swa_head_geometry(self) -> _UnifiedSWAHeadGeometry:
         """Head geometry of a hybrid-SWA host's full and SWA sub-pools."""
@@ -1626,7 +1625,9 @@ class KVCacheConfigurator:
         return 0
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
-        req_to_token_headroom = get_req_to_token_headroom()
+        req_to_token_row_width = get_req_to_token_row_width(
+            self.model_config.context_len
+        )
 
         disagg = get_disagg()
         if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
@@ -1634,23 +1635,23 @@ class KVCacheConfigurator:
             if self.mambaish_config:
                 return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
-                    req_to_token_headroom=req_to_token_headroom,
+                    req_to_token_row_width=req_to_token_row_width,
                     pre_alloc_size=pre_alloc_size,
                 )
             return self._build_decode_req_pool(
                 max_num_reqs=max_num_reqs,
-                req_to_token_headroom=req_to_token_headroom,
+                req_to_token_row_width=req_to_token_row_width,
                 pre_alloc_size=pre_alloc_size,
             )
 
         if self.mambaish_config:
             return self._build_hybrid_req_pool(
                 max_num_reqs=max_num_reqs,
-                req_to_token_headroom=req_to_token_headroom,
+                req_to_token_row_width=req_to_token_row_width,
             )
         return self._build_default_req_pool(
             max_num_reqs=max_num_reqs,
-            req_to_token_headroom=req_to_token_headroom,
+            req_to_token_row_width=req_to_token_row_width,
         )
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
@@ -1689,16 +1690,17 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        req_to_token_headroom: int,
+        req_to_token_row_width: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
         from sglang.srt.disaggregation.decode import (
             HybridMambaDecodeReqToTokenPool,
         )
+        from sglang.srt.layers.attention.linear.utils import max_verify_batch_size
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + req_to_token_headroom,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
@@ -1728,6 +1730,7 @@ class KVCacheConfigurator:
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
+            max_verify_batch_size=max_verify_batch_size(max_num_reqs),
         )
         return req_to_token_pool
 
@@ -1735,7 +1738,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        req_to_token_headroom: int,
+        req_to_token_row_width: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
         if _is_npu and is_deepseek_v4(self.model_config.hf_config):
@@ -1747,7 +1750,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = DecodeReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + req_to_token_headroom,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
@@ -1758,13 +1761,13 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        req_to_token_headroom: int,
+        req_to_token_row_width: int,
     ) -> ReqToTokenPool:
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
-            max_context_len=self.model_config.context_len + req_to_token_headroom,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
@@ -1805,7 +1808,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        req_to_token_headroom: int,
+        req_to_token_row_width: int,
     ) -> ReqToTokenPool:
         # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
         # swa/c4/c128/c{4,128}_state tables; others stay on the stock one.
@@ -1819,7 +1822,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = req_to_token_pool_cls(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + req_to_token_headroom,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
         )
@@ -3592,15 +3595,15 @@ class KVCacheConfigurator:
 
         has_state = StateLifetime in self._unified_plan.lifetime_types()
         has_window = WindowLifetime in self._unified_plan.lifetime_types()
-        req_to_token_headroom, pre_alloc = self._unified_request_rows(
-            has_state=has_state
-        )
+        pre_alloc = self._unified_pre_alloc_rows(has_state=has_state)
         ratio = schedule.mamba_full_memory_ratio
         requested = schedule.max_running_requests
         inp = KVSizingInputs(
             budget_bytes=budget_bytes,
             context_len=self.model_config.context_len,
-            req_to_token_headroom=req_to_token_headroom,
+            req_to_token_row_width=get_req_to_token_row_width(
+                self.model_config.context_len
+            ),
             pre_alloc_rows=pre_alloc,
             max_running_requests=None
             if requested is None

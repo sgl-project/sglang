@@ -32,7 +32,7 @@ from sglang.srt.layers.sampling_renorm import (
     top_p_renorm_prob,
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import spec_decode_alloc_lens
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
@@ -1426,7 +1426,7 @@ def _verify_outputs(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    cur_kv_lens, nxt_kv_lens, num_needed_tokens = decode_alloc_lens(
+    cur_kv_lens, nxt_kv_lens, num_needed_tokens = spec_decode_alloc_lens(
         batch.reqs, page_size=batch.token_to_kv_pool_allocator.page_size
     )
     for r in batch.reqs:

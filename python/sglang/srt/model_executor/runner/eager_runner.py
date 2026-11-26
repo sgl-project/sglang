@@ -57,7 +57,7 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_mlu, is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device_timer import device_timer_ctx
 
@@ -202,12 +202,15 @@ class EagerRunner(BaseRunner):
         with self.model_context():
             mode = forward_batch.forward_mode
             mixed_as_extend = (
-                mode.is_mixed() and not is_npu() and get_cp_strategy() is None
+                mode.is_mixed()
+                and not is_mlu()
+                and not is_npu()
+                and get_cp_strategy() is None
             )
             if mixed_as_extend:
                 # A mixed batch is extend-shaped (decode tails are 1-token
-                # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
-                # kernel; CP keeps it to skip the zigzag split.
+                # extends); run it as EXTEND. MLU and NPU keep MIXED for their
+                # dedicated paths; CP keeps it to skip the zigzag split.
                 forward_batch.eager_mixed_as_extend = True
                 forward_batch.forward_mode = ForwardMode.EXTEND
                 mode = ForwardMode.EXTEND

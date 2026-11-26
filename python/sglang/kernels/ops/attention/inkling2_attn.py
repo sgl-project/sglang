@@ -205,13 +205,18 @@ def rel_bias_partials(
     *,
     window_size_left,
     verify,
+    k_scale=None,
+    v_scale=None,
 ):
     """Split-KV partials of paged attention with the compact relative bias, for
-    combine_gate_sink; verify: several queries per sequence (MTP verify)."""
+    combine_gate_sink; verify: several queries per sequence (MTP verify).
+    k/v_scale: the UE8M0 scales of an MXFP8 cache (SM90 and SM120 kernel only)."""
     from sglang.srt.runtime_context import get_platform
     from sglang.srt.utils import get_device_core_count
 
-    if not get_platform().is_sm90:
+    # The SM100 kernel needs tcgen05, which SM90 and SM120 lack.
+    if not (get_platform().is_sm90 or get_platform().is_sm120):
+        assert k_scale is None, "the SM100 bias decode reads a 16-bit cache"
         from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100_bias_decode import (
             paged_rel_bias_decode,
         )
@@ -246,6 +251,8 @@ def rel_bias_partials(
         rel_bias,
         softmax_scale,
         window_size_left=window_size_left,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
 
 
