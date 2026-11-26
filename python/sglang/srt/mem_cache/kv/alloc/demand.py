@@ -270,9 +270,9 @@ def window_retirement(*, shares_prefixes: bool) -> WindowRetirement:
     scheduler retires a prefill's rows a chunk behind its frontier; decode
     retires once SGLANG_SWA_EVICTION_INTERVAL rows fell out of the window,
     behind the processed length, while each step allocates ahead of it (the
-    overlap lag, or the speculative reserve `get_decode_reserve`)."""
+    overlap lag, or the speculative reserve `get_spec_decode_reserve`)."""
     from sglang.srt.environ import envs
-    from sglang.srt.mem_cache.allocation_sizing import get_decode_reserve
+    from sglang.srt.mem_cache.allocation_sizing import get_spec_decode_reserve
     from sglang.srt.runtime_context import get_schedule, get_spec
 
     schedule = get_schedule()
@@ -280,7 +280,7 @@ def window_retirement(*, shares_prefixes: bool) -> WindowRetirement:
     overlap = not schedule.disable_overlap_schedule
     prefill_lag = chunk if overlap and not shares_prefixes and chunk > 0 else 0
     if get_spec().speculative_algorithm:
-        decode_lag = get_decode_reserve()
+        decode_lag = get_spec_decode_reserve()
     else:
         decode_lag = 1 if overlap else 0
     interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())

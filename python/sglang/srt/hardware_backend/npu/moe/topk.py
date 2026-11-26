@@ -8,10 +8,12 @@ from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physica
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _zero_topk_weights_padded_region,
+    apply_routing_simulation,
     capture_routed_experts_if_allowed,
     fused_shared_expert_weight,
     is_routed_scaling_factor_fused_in_topk,
     remap_topk_for_per_rank_shared_slots,
+    routing_simulation_enabled,
     select_experts,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
@@ -145,6 +147,21 @@ def _finalize_topk_npu(
 ):
     # The gates returned routed-only columns; append shared columns here.
     num_shared = topk_config.num_shared_topk_slots
+    if routing_simulation_enabled():
+        # Benchmark-only override: rewrite the router's pick with a balanced
+        # round-robin/uniform assignment before the logical->physical remap.
+        # The gates emit routed-only columns here, so only those ids are
+        # simulated and the shared columns appended below keep the weight this
+        # computes. Keep valid ids on padded rows (NPU dispatch relies on them)
+        # and only zero their weights below, so pass no padding mask here.
+        apply_routing_simulation(
+            topk_ids,
+            topk_weights,
+            router_logits.shape[1],
+            num_routed_topk=topk_ids.shape[1],
+            top_k=topk_ids.shape[1] + num_shared,
+            layer_id=layer_id,
+        )
 
     # 1) Recorder / capturer only see routed experts.
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)

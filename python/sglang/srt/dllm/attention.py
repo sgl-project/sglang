@@ -166,7 +166,7 @@ class DllmFlashAttention:
         key = (bs, tokens)
         if in_capture:
             self.init_graph_state(bs, tokens)
-            capacity = batch.max_seq_len_override or backend.max_context_len
+            capacity = batch.max_seq_len_override or backend.req_to_token_pool.row_width
             self._prefill_graph_metadata[key] = ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
@@ -317,7 +317,7 @@ class DllmFlashAttention:
         prefix_capacity = (
             self.backend.sliding_window_size
             if is_window_layer
-            else self.backend.max_context_len
+            else self.backend.req_to_token_pool.row_width
         )
         prefix_tokens = bs * prefix_capacity if self.graph_mode else ids.numel()
         capacity = prefix_tokens + q.shape[0]

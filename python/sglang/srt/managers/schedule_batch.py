@@ -117,7 +117,7 @@ from sglang.srt.mem_cache.allocation import (
     alloc_tracking_slots,
     retire_window,
 )
-from sglang.srt.mem_cache.allocation_sizing import decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import spec_decode_alloc_lens
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -2988,7 +2988,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             return new_pages * page_size + num_beam_member_rows(requests)
 
-        cur_kv_lens, nxt_kv_lens, _ = decode_alloc_lens(requests, page_size=page_size)
+        cur_kv_lens, nxt_kv_lens, _ = spec_decode_alloc_lens(
+            requests, page_size=page_size
+        )
         return sum(
             ceil_align(nxt, page_size) - ceil_align(cur, page_size)
             for cur, nxt in zip(cur_kv_lens, nxt_kv_lens)
