@@ -859,7 +859,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             speculative_num_steps=3,
             speculative_eagle_topk=2,
             speculative_num_draft_tokens=5,
-            disable_overlap_schedule=True,  # spec-v1: no double allocation
+            disable_overlap_schedule=True,
         )
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
@@ -869,19 +869,15 @@ class TestHybridSWAConfigurator(CustomTestCase):
             cfg = create_memory_pool_configurator(mr)
             config = cfg.calculate_pool_sizes(available, page_size=4)
 
-        # spec-v1 (overlap off): decode_alloc = max(ceil_align(3+4,4)*2,
-        # ceil_align(5,4)) = 16. trailing = 8 + 20 + page(4) = 32; per req =
-        # 32 + 16 = 48. Global prefill = 1*chunk(4) + page(4) = 8.
-        # cap = 48 * 2 + 8 = 104 -> ceil_align(104, 4) = 104.
-        self.assertEqual(config.swa_max_total_num_tokens, 104)
+        # decode_alloc = reach = 2 * max(2 pages * 4 * topk 2, 5) + 3 = 35;
+        # per req = trailing 32 + 35 = 67; cap = 67 * 2 + chunk 4 + page 4 = 142,
+        # page-aligned to 144.
+        self.assertEqual(config.swa_max_total_num_tokens, 144)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_swa_request_cap_doubles_decode_alloc_for_spec_v2_overlap(self):
-        # Overlap on -> spec-v2: decode_alloc = 2 * get_alloc_len_per_decode =
-        # 2 * max(steps*topk, max_draft) = 2 * max(6, 5) = 12 (page=1, since the
-        # v2 allocator does not support page>1 & topk>1). trailing = 8 + 20 +
-        # page(1) = 29; per req = 29 + 12 = 41. Global prefill =
-        # 2*chunk(4) + page(1) = 9; cap = 41 * 2 + 9 = 91.
+    def test_swa_request_cap_with_overlap_counts_two_chunks(self):
+        # decode_alloc = reach = 2 * max(6, 5) = 12 (page 1); per req = trailing
+        # 29 + 12 = 41; cap = 41 * 2 + 2 chunks * 4 + page 1 = 91.
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -899,7 +895,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             speculative_num_steps=3,
             speculative_eagle_topk=2,
             speculative_num_draft_tokens=5,
-            disable_overlap_schedule=False,  # spec-v2: 2 * get_alloc_len_per_decode
+            disable_overlap_schedule=False,
         )
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
@@ -1143,7 +1139,7 @@ class TestEagleConfigurator(CustomTestCase):
             get_sparse_kv_budget,
         )
         from sglang.srt.mem_cache.allocation_sizing import (
-            get_req_to_token_extra_context_len,
+            get_req_to_token_row_width,
         )
         from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 
@@ -1193,7 +1189,7 @@ class TestEagleConfigurator(CustomTestCase):
                 model_config=mr.model_config,
                 available_bytes=1 << 40,
                 index_k_and_draft_bytes_per_token=5 * 128 * 2 + 576 * 2,
-                context_len=8192 + get_req_to_token_extra_context_len(),
+                context_len=get_req_to_token_row_width(mr.model_config.context_len),
                 top_k=2048,
                 kv_bytes_per_token=576 * 2,
             )
@@ -1364,7 +1360,7 @@ class TestEagleConfigurator(CustomTestCase):
             resolve_sparse_kv_budget,
         )
         from sglang.srt.mem_cache.allocation_sizing import (
-            get_req_to_token_extra_context_len,
+            get_req_to_token_row_width,
         )
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
@@ -1439,9 +1435,7 @@ class TestEagleConfigurator(CustomTestCase):
             # Target and draft Indexer K plus the draft's full MLA KV.
             index_k_and_draft_bytes_per_token = 5 * 128 * 2 + 576 * 2
 
-            context_len = (
-                mr.model_config.context_len + get_req_to_token_extra_context_len()
-            )
+            context_len = get_req_to_token_row_width(mr.model_config.context_len)
             aligned_context_len = (context_len + page_size - 1) // page_size * page_size
             slot_map_bytes_per_request = aligned_context_len * 4 * torch.int32.itemsize
             fixed_slot_map_bytes = 2 * slot_map_bytes_per_request
@@ -1706,6 +1700,77 @@ class TestEagleConfigurator(CustomTestCase):
             config.max_total_num_tokens * actual_bytes_per_token,
             available,
         )
+
+    def test_int8_draft_reserves_the_packed_record(self):
+        """An INT8 draft inherits the packed record, as an FP8 draft does on
+        arch35, so both reserve 656-byte rows next to a BF16 indexer."""
+        import torch
+
+        from sglang.srt.model_executor import pool_configurator
+
+        num_layers = 78
+        draft_num_layers = 1
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.kv_cache_dtype = torch.int8
+        mr.model_dtype = torch.bfloat16
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+        mr.spec_aux_config.draft_model_config = None
+
+        with (
+            get_parallel().override(attn_tp_size=1, attn_cp_size=1),
+            patch.object(pool_configurator, "_is_npu", True),
+        ):
+            cfg = pool_configurator.create_memory_pool_configurator(mr)
+
+        bf16_index_k = 128 * 2
+        self.assertEqual(
+            cfg._cell_size,
+            (656 + bf16_index_k) * (num_layers + draft_num_layers),
+        )
+
+    def test_bf16_draft_under_a_packed_target_reserves_bf16_rows(self):
+        """--speculative-draft-kv-cache-dtype bf16 gives the draft unpacked
+        1,152-byte rows and a BF16 indexer; the budget follows the draft's
+        resolved dtype, not the target's 656-byte INT8 or FP8 record."""
+        import torch
+
+        from sglang.srt.model_executor import pool_configurator
+
+        num_layers = 78
+        draft_num_layers = 1
+
+        def cell_size(target_dtype, draft_flag):
+            mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+            _configure_dsa_model(mr)
+            mr.kv_cache_dtype = target_dtype
+            mr.model_dtype = torch.bfloat16
+            mr.spec_algorithm.is_eagle.return_value = True
+            mr.spec_algorithm.is_none.return_value = False
+            mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+            mr.spec_aux_config.draft_model_config = None
+            with (
+                get_parallel().override(attn_tp_size=1, attn_cp_size=1),
+                get_spec().override(speculative_draft_kv_cache_dtype=draft_flag),
+                patch.object(pool_configurator, "_is_npu", True),
+            ):
+                return pool_configurator.create_memory_pool_configurator(mr)._cell_size
+
+        bf16_draft_layer = (512 + 64) * 2 + 128 * 2
+        for target_dtype in (torch.int8, torch.float8_e4m3fn):
+            with self.subTest(target_dtype=target_dtype):
+                inherited = cell_size(target_dtype, None)
+                target_layer, remainder = divmod(
+                    inherited, num_layers + draft_num_layers
+                )
+                self.assertEqual(remainder, 0)
+                self.assertLess(target_layer, bf16_draft_layer)
+                self.assertEqual(
+                    cell_size(target_dtype, "bf16"),
+                    target_layer * num_layers + bf16_draft_layer * draft_num_layers,
+                )
 
     def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
         """SWA draft layers use SWA KV geometry and capacity."""

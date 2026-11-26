@@ -17,7 +17,7 @@ register_cpu_ci(est_time=3, stage="base-a", runner_config="cpu")
 
 def _make_pool():
     pool = NPUMLATokenToKVPool.__new__(NPUMLATokenToKVPool)
-    pool.start_layer = 0
+    pool.start_layer = 4
     pool.layer_num = 2
     pool.device = "cpu"
     pool.page_size = 128
@@ -25,9 +25,10 @@ def _make_pool():
     pool.dcp_size = 1
     pool.is_draft_worker = False
     pool.use_combined_kv_buffer = False
-    pool.dsa_kv_cache_store_fp8 = False
+    pool.dsa_kv_cache_store_c8 = False
     pool.index_head_dim = 2
-    pool.indexer_layer_id_to_slot = {0: 0, 1: 1}
+    pool.indexer_layer_ids = (4, 5)
+    pool.indexer_layer_id_to_slot = {4: 0, 5: 1}
     pool.k_buffer = torch.zeros(2, 2, 128, 1, 512, dtype=torch.bfloat16)
     pool.v_buffer = torch.zeros(2, 2, 128, 1, 64, dtype=torch.bfloat16)
     pool.index_k_buffer = torch.zeros(2, 2, 128, 1, 2, dtype=torch.bfloat16)
@@ -208,6 +209,8 @@ class TestPDSplitKVPool(CustomTestCase):
         )
         self.assertEqual((lens, page_bytes), prefill.get_contiguous_buf_infos()[1:])
         self.assertEqual(page_bytes, [131072] * 2 + [16384] * 2 + [512] * 2)
+        self.assertEqual(prefill.get_kv_layer_ids(), [4, 5] * 3)
+        self.assertEqual(decode.get_kv_layer_ids(), prefill.get_kv_layer_ids())
 
     def test_host_group_partitions_by_shared_memory(self):
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (

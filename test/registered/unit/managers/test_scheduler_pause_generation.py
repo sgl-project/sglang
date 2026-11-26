@@ -396,6 +396,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_unified_cache_external_linker = False
         scheduler.draft_worker = None
         scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+        object.__setattr__(scheduler.request_receiver, "input_blocker", None)
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
@@ -887,6 +888,32 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
 
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
+        self.assertFalse(scheduler.pause_state.paused)
+
+    def test_continue_generation_empties_the_cache_of_the_platform_in_use(self):
+        """torch_empty_cache must release the device cache through the platform;
+        calling CUDA directly frees nothing on NPU, XPU or MPS."""
+
+        class _Platform:
+            empty_cache_calls = 0
+
+            def empty_cache(self):
+                self.empty_cache_calls += 1
+
+        scheduler = self._new_scheduler()
+        scheduler.pause_state.pause()
+        platform = _Platform()
+        with patch("sglang.srt.managers.scheduler.current_platform", platform):
+            scheduler.continue_generation(
+                ContinueGenerationReqInput(torch_empty_cache=True)
+            )
+            self.assertEqual(platform.empty_cache_calls, 1)
+            scheduler.pause_state.pause()
+            scheduler.continue_generation(
+                ContinueGenerationReqInput(torch_empty_cache=False)
+            )
+
+        self.assertEqual(platform.empty_cache_calls, 1)
         self.assertFalse(scheduler.pause_state.paused)
 
     def test_pd_decode_abort_finishes_a_held_rebootstrap(self):

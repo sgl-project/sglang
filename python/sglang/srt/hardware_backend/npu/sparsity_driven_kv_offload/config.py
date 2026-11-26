@@ -23,7 +23,7 @@ from sglang.srt.layers.dp_attention import (
     get_cuda_graph_max_batch_size,
     get_eager_max_batch_size,
 )
-from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_row_width
 from sglang.srt.runtime_context import (
     attention_backends,
     get_disagg,
@@ -221,7 +221,7 @@ def build_sparse_kv_budget_options(
     return dict(
         model_config=model_config,
         attn_dp_size=attn_dp_size,
-        context_len=model_config.context_len + get_req_to_token_extra_context_len(),
+        context_len=get_req_to_token_row_width(model_config.context_len),
         top_k=get_sparsity_driven_kv_offload_sparse_context_len(
             model_config=model_config
         ),

@@ -49,6 +49,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
+    trigger_transferring_weights_request,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -98,9 +99,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.unquant import finalize_gfx115_weight_padding
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    trigger_transferring_weights_request,
-)
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -170,8 +168,6 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         yield module
 
 
-logger = logging.getLogger(__name__)
-
 # The checkpoint files the default loader read, as (folder, files), by the weight source's
 # (model id or path, revision): state derived from the loaded weights (Paged Experts' expert
 # cache) keys on the files this start read, wherever they were found (a hub cache,
@@ -212,12 +208,26 @@ def _get_quantization_config(
         if quant_config is None:
             return None
         if _is_npu and model_config.quantization == "modelslim":
+            from sglang.srt.mem_cache.kv_cache_dtype import draft_reads_packed_dsa_kv
+
             draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
             requested_dtype = (
                 draft_kv_cache_dtype
                 if model_config.is_draft_model and draft_kv_cache_dtype is not None
                 else get_model().kv_cache_dtype
             )
+            if (
+                model_config.is_draft_model
+                and requested_dtype == "int8"
+                and not draft_reads_packed_dsa_kv(
+                    draft_model_config=model_config,
+                    draft_attention_backend=(
+                        get_spec().speculative_draft_attention_backend
+                    ),
+                )
+            ):
+                # The draft keeps its compute dtype (configure_kv_cache_dtype).
+                requested_dtype = "auto"
             quant_config.configure_kv_cache_quantization(requested_dtype)
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
@@ -479,9 +489,6 @@ class DefaultModelLoader(BaseModelLoader):
         hf_folder: str
         weight_files: Tuple[str, ...]
         use_safetensors: bool
-
-    counter_before_loading_weights: float = 0.0
-    counter_after_loading_weights: float = 0.0
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -788,8 +795,6 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator, source.prefix, self.load_config.draft_model_idx
             )
 
-        if self.counter_before_loading_weights == 0.0:
-            self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -960,7 +965,6 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator(),
                 target_device,
             )
-        self.counter_after_loading_weights = time.perf_counter()
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
@@ -1074,7 +1078,6 @@ class DefaultModelLoader(BaseModelLoader):
                 model, self._get_all_weights(model_config, model), target_device
             )
 
-        self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
     @staticmethod
@@ -1254,7 +1257,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         logger.info("[QuantizedRL] Profile-free FP8 quantization enabled")
-        self._initial_load_complete = False
 
     def _prepare_weights(
         self,
@@ -1351,7 +1353,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     quant_method.process_weights_after_loading(module)
 
         model.flash_rl_initial_load_complete = True
-        self._initial_load_complete = True
         logger.info("[QuantizedRL] Initial load complete")
 
     @staticmethod
@@ -2208,7 +2209,6 @@ class PreshardedModelLoader(DefaultModelLoader):
             del extras
             gc.collect()
 
-        self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
     def _dump_state_to_disk(
@@ -2619,7 +2619,6 @@ class PreshardedModelLoader(DefaultModelLoader):
             if self._verify_on_load:
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
 
-        self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
 
@@ -2966,8 +2965,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             self.column_parallel_weights_modules = model.column_parallel_weights_modules
         else:
             self.column_parallel_weights_modules = []
-
-        self.model_type = type(model).__name__
 
         logger.info(
             "Loading weights with BitsAndBytes quantization.  May take a while ..."
@@ -3624,9 +3621,6 @@ class IncModelLoader(DefaultModelLoader):
     Model loader that applies Intel AutoRound quantization
     """
 
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-
     def load_model(
         self,
         *,
@@ -3727,10 +3721,6 @@ class ModelOptModelLoader(DefaultModelLoader):
     """
     Model loader that applies NVIDIA Model Optimizer quantization
     """
-
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-        # Any ModelOpt specific initialization if needed
 
     def _setup_modelopt_quantization(
         self,
