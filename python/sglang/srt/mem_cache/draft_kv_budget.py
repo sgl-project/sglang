@@ -16,6 +16,7 @@ def resolve_dflash_draft_cell_size(
     draft_model_config: ModelConfig,
     draft_num_layers: int,
     attn_tp_size: int,
+    algo_label: str | None = None,
 ) -> int | None:
     """Bytes/token the DFLASH draft KV pool will cost the target's pool budget.
 
@@ -25,6 +26,9 @@ def resolve_dflash_draft_cell_size(
     """
     from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
     from sglang.srt.speculative.dflash_utils import dflash_draft_cell_size_per_token
+    from sglang.srt.speculative.draft_worker_common import (
+        resolve_draft_worker_attention_backend,
+    )
 
     try:
         _, draft_kv_cache_dtype = configure_kv_cache_dtype(
@@ -37,8 +41,9 @@ def resolve_dflash_draft_cell_size(
             is_draft_worker=True,
             is_dflash=True,
             speculative_draft_attention_backend=(
-                get_spec().speculative_draft_attention_backend
+                resolve_draft_worker_attention_backend(algo_label=algo_label)
             ),
+            model_config=draft_model_config,
         )
         return dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,

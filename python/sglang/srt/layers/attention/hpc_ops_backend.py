@@ -192,9 +192,9 @@ class HPCOpsAttnBackend(AttentionBackend):
                 f"num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}."
             )
 
-        self.max_context_len = model_runner.model_config.context_len
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.max_num_pages = (
-            self.max_context_len + self.page_size - 1
+            self.req_to_token_pool.row_width + self.page_size - 1
         ) // self.page_size
         self.device = model_runner.device
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -275,7 +275,7 @@ class HPCOpsAttnBackend(AttentionBackend):
 
             self._decode_task_map = hpc.get_attention_decode_task_workspace(
                 max_bs,
-                self.max_context_len,
+                self.req_to_token_pool.row_width,
                 self.num_kv_heads,
                 min_process_len=_DYNAMIC_SCHED_MIN_PROCESS_LEN,
             )
