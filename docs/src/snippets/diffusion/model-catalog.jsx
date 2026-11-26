@@ -134,10 +134,12 @@ export const DiffusionModelCatalog = ({ category }) => {
         "FireRedTeam/FireRed-Image-Edit-1.0",
         "FireRedTeam/FireRed-Image-Edit-1.1",
       ],
+      cookbook: "/cookbook/diffusion/FireRed/FireRed-Image-Edit",
     },
     {
       name: "JoyAI-Image",
       modelIds: ["jdopensource/JoyAI-Image-Edit-Diffusers"],
+      cookbook: "/cookbook/diffusion/JoyAI-Image/JoyAI-Image-Edit",
     },
     {
       name: "SenseNova-U1.5",
@@ -158,6 +160,7 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "Hunyuan3D 2",
       modelIds: ["tencent/Hunyuan3D-2"],
+      cookbook: "/cookbook/diffusion/Tencent/Hunyuan3D-2",
     },
   ],
   video: [
