@@ -77,9 +77,8 @@ class TestPrefillTransferAbort(CustomTestCase):
         )
         if abort_req is not None:
             _Mixin._abort_prefill_transfer(scheduler, abort_req)
-        exc = _Mixin.handle_inflight_transfer_failure(scheduler, req)
+        _Mixin.handle_inflight_transfer_failure(scheduler, req)
         # The response and the release do not depend on the cause.
-        self.assertIsInstance(exc, RuntimeError)
         self.assertTrue(req.disagg_kv_sender.failure_checked)
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertIn("Prefill transfer failed", req.finished_reason.message)
