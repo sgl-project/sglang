@@ -305,8 +305,8 @@ class Dsv4PrefillGraphMetadata(_Dsv4PrefillGraphMetadataBase):
             self.locs[ratio] = torch.zeros(capacity, dtype=torch.int64, device=device)
 
         page_size = backend.page_size
-        context_len = backend.max_context_len
-        swa_cols = max(1, (context_len + page_size - 1) // page_size)
+        req_to_token_row_width = backend.req_to_token_pool.row_width
+        swa_cols = max(1, (req_to_token_row_width + page_size - 1) // page_size)
         self.swa_page_table = torch.zeros((max_reqs, swa_cols), **int32)
         self.c4_page_table = None
         self.c128_page_table = None
@@ -317,7 +317,9 @@ class Dsv4PrefillGraphMetadata(_Dsv4PrefillGraphMetadataBase):
         if backend._dsv4_has_c128:
             c128_page_size = backend.req_to_token_pool.c128_page_size
             groups = max(
-                1, ((context_len // 128) + c128_page_size - 1) // c128_page_size
+                1,
+                ((req_to_token_row_width // 128) + c128_page_size - 1)
+                // c128_page_size,
             )
             self.c128_page_table = torch.zeros((max_reqs, groups), **int32)
 
