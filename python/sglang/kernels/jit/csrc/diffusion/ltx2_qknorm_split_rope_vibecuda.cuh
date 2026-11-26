@@ -91,7 +91,7 @@ SGL_DEVICE void load8_8B(const bf16_t* p, float* values) {
 }
 
 // The reduction order matches aten's 128-thread vectorized RMSNorm kernel.
-template <bool kVectorX, bool kVectorTable>
+template <bool kVectorX, bool kVectorTable, int32_t kFixedHeadDim = 0>
 __global__ void __launch_bounds__(128, 12) ltx2_qknorm_rope_kernel(
     const bf16_t* __restrict__ q,
     const bf16_t* __restrict__ k,
@@ -112,45 +112,79 @@ __global__ void __launch_bounds__(128, 12) ltx2_qknorm_rope_kernel(
     float eps,
     int32_t pair8,
     int32_t table16) {
-  const int32_t row = blockIdx.x;
   RowContext ctx;
   int64_t batch;
   int64_t seq;
-  if (row < rows_q) {
-    batch = row / seq_q;
-    seq = row % seq_q;
-    ctx.x = q + static_cast<int64_t>(row) * hidden;
-    ctx.weight = q_weight;
-    ctx.out = q_out + static_cast<int64_t>(row) * hidden;
-    ctx.cos = q_cos;
-    ctx.sin = q_sin;
+  if constexpr (kFixedHeadDim == 64 || kFixedHeadDim == 128) {
+    batch = blockIdx.y;
+    const int32_t token = blockIdx.x;
+    if (token < seq_q) {
+      seq = token;
+      const int64_t row = batch * seq_q + seq;
+      ctx.x = q + row * hidden;
+      ctx.weight = q_weight;
+      ctx.out = q_out + row * hidden;
+      ctx.cos = q_cos;
+      ctx.sin = q_sin;
+    } else {
+      seq = token - seq_q;
+      const int64_t row = batch * seq_k + seq;
+      ctx.x = k + row * hidden;
+      ctx.weight = k_weight;
+      ctx.out = k_out + row * hidden;
+      ctx.cos = k_cos;
+      ctx.sin = k_sin;
+    }
   } else {
-    const int64_t row_k = static_cast<int64_t>(row) - rows_q;
-    batch = row_k / seq_k;
-    seq = row_k % seq_k;
-    ctx.x = k + row_k * hidden;
-    ctx.weight = k_weight;
-    ctx.out = k_out + row_k * hidden;
-    ctx.cos = k_cos;
-    ctx.sin = k_sin;
+    const int32_t row = blockIdx.x;
+    if (row < rows_q) {
+      batch = row / seq_q;
+      seq = row % seq_q;
+      ctx.x = q + static_cast<int64_t>(row) * hidden;
+      ctx.weight = q_weight;
+      ctx.out = q_out + static_cast<int64_t>(row) * hidden;
+      ctx.cos = q_cos;
+      ctx.sin = q_sin;
+    } else {
+      const int64_t row_k = static_cast<int64_t>(row) - rows_q;
+      batch = row_k / seq_k;
+      seq = row_k % seq_k;
+      ctx.x = k + row_k * hidden;
+      ctx.weight = k_weight;
+      ctx.out = k_out + row_k * hidden;
+      ctx.cos = k_cos;
+      ctx.sin = k_sin;
+    }
   }
 
   const int32_t thread = threadIdx.x + threadIdx.y * 32;
   constexpr int32_t kThreads = 128;
   constexpr int32_t kStep = kThreads * 4;
   float acc = 0.0f;
-  const bf16_t* x_ptr = ctx.x + static_cast<int64_t>(thread) * 4;
-  for (int32_t i = thread; i < hidden_vec; i += kThreads, x_ptr += kStep) {
-    float4 value;
-    if constexpr (kVectorX) {
-      value = load4(x_ptr);
-    } else {
-      value = make_float4(to_float(x_ptr[0]), to_float(x_ptr[1]), to_float(x_ptr[2]), to_float(x_ptr[3]));
+  if constexpr (kFixedHeadDim == 64) {
+    const bf16_t* x_ptr = ctx.x + thread * 4;
+#pragma unroll 4
+    for (int32_t i = 0; i < 4; ++i, x_ptr += kStep) {
+      const float4 value = load4(x_ptr);
+      acc = fmaf(value.x, value.x, acc);
+      acc = fmaf(value.y, value.y, acc);
+      acc = fmaf(value.z, value.z, acc);
+      acc = fmaf(value.w, value.w, acc);
     }
-    acc = fmaf(value.x, value.x, acc);
-    acc = fmaf(value.y, value.y, acc);
-    acc = fmaf(value.z, value.z, acc);
-    acc = fmaf(value.w, value.w, acc);
+  } else {
+    const bf16_t* x_ptr = ctx.x + static_cast<int64_t>(thread) * 4;
+    for (int32_t i = thread; i < hidden_vec; i += kThreads, x_ptr += kStep) {
+      float4 value;
+      if constexpr (kVectorX) {
+        value = load4(x_ptr);
+      } else {
+        value = make_float4(to_float(x_ptr[0]), to_float(x_ptr[1]), to_float(x_ptr[2]), to_float(x_ptr[3]));
+      }
+      acc = fmaf(value.x, value.x, acc);
+      acc = fmaf(value.y, value.y, acc);
+      acc = fmaf(value.z, value.z, acc);
+      acc = fmaf(value.w, value.w, acc);
+    }
   }
 
 #pragma unroll
@@ -159,19 +193,15 @@ __global__ void __launch_bounds__(128, 12) ltx2_qknorm_rope_kernel(
   }
 
   __shared__ float warp_sums[4];
-  for (int offset = 2; offset > 0; offset >>= 1) {
-    if (threadIdx.x == 0 && threadIdx.y >= offset && threadIdx.y < 2 * offset) {
-      warp_sums[threadIdx.y - offset] = acc;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0 && threadIdx.y < offset) {
-      acc += warp_sums[threadIdx.y];
-    }
-    __syncthreads();
+  if (threadIdx.x == 0) {
+    warp_sums[threadIdx.y] = acc;
   }
+  __syncthreads();
   __shared__ float mean_square;
   if (threadIdx.x == 0 && threadIdx.y == 0) {
-    mean_square = acc / static_cast<float>(hidden);
+    const float sum02 = __fadd_rn(warp_sums[0], warp_sums[2]);
+    const float sum13 = __fadd_rn(warp_sums[1], warp_sums[3]);
+    mean_square = __fadd_rn(sum02, sum13) / static_cast<float>(hidden);
   }
   __syncthreads();
   const float rstd = rsqrtf(mean_square + eps);
@@ -179,6 +209,53 @@ __global__ void __launch_bounds__(128, 12) ltx2_qknorm_rope_kernel(
   const int32_t head_width = 2 * half;
   const int64_t cos_base = batch * ctx.cos.s0 + seq * ctx.cos.s2;
   const int64_t sin_base = batch * ctx.sin.s0 + seq * ctx.sin.s2;
+
+  if constexpr (kFixedHeadDim == 64 || kFixedHeadDim == 128) {
+    constexpr int32_t kHalf = kFixedHeadDim / 2;
+    constexpr int32_t kPairsPerHead = kHalf / 8;
+    constexpr int32_t kIterations = 32 * kFixedHeadDim / (kThreads * 16);
+    const int32_t pair = thread & (kPairsPerHead - 1);
+    const int32_t head = thread / kPairsPerHead;
+    const int64_t offset = static_cast<int64_t>(head) * kFixedHeadDim + pair * 8;
+    const bf16_t* x_first = ctx.x + offset;
+    const bf16_t* x_second = x_first + kHalf;
+    const bf16_t* weight_first = ctx.weight + offset;
+    const bf16_t* weight_second = weight_first + kHalf;
+    const bf16_t* cos_ptr = ctx.cos.ptr + cos_base + static_cast<int64_t>(head) * kHalf + pair * 8;
+    const bf16_t* sin_ptr = ctx.sin.ptr + sin_base + static_cast<int64_t>(head) * kHalf + pair * 8;
+    bf16_t* out_ptr = ctx.out + offset;
+#pragma unroll
+    for (int32_t iteration = 0; iteration < kIterations; ++iteration) {
+      constexpr int32_t kXStep = 2048;
+      constexpr int32_t kTableStep = 1024;
+      const int32_t x_offset = iteration * kXStep;
+      const int32_t table_offset = iteration * kTableStep;
+      float xf[8];
+      float xs[8];
+      float gf[8];
+      float gs[8];
+      float cv[8];
+      float sv[8];
+      load8(x_first + x_offset, xf);
+      load8(x_second + x_offset, xs);
+      load8(weight_first + x_offset, gf);
+      load8(weight_second + x_offset, gs);
+      load8(cos_ptr + table_offset, cv);
+      load8(sin_ptr + table_offset, sv);
+      float out_first[8];
+      float out_second[8];
+#pragma unroll
+      for (int32_t i = 0; i < 8; ++i) {
+        const float norm_first = gf[i] * (rstd * xf[i]);
+        const float norm_second = gs[i] * (rstd * xs[i]);
+        out_first[i] = fmaf(-sv[i], norm_second, norm_first * cv[i]);
+        out_second[i] = fmaf(sv[i], norm_first, norm_second * cv[i]);
+      }
+      store8(out_ptr + x_offset, out_first);
+      store8(out_ptr + kHalf + x_offset, out_second);
+    }
+    return;
+  }
 
   if (pair8) {
     // Each thread owns an eight-element first-half group and its RoPE partner.
@@ -418,47 +495,60 @@ struct VibeCUDALTX2QKNormSplitRopeKernel {
         pair8 && vector_tables && table16(q_cos) && table16(q_sin) && table16(k_cos) && table16(k_sin);
 
     const int32_t hidden_i32 = static_cast<int32_t>(hidden.unwrap());
-    const dim3 grid(static_cast<uint32_t>(total_rows));
+    dim3 grid(static_cast<uint32_t>(total_rows));
     const dim3 block(32, 4);
     const Table4 q_cos_table = make_table(q_cos);
     const Table4 q_sin_table = make_table(q_sin);
     const Table4 k_cos_table = make_table(k_cos);
     const Table4 k_sin_table = make_table(k_sin);
 
-#define LTX2_VIBECUDA_LAUNCH(VECTOR_X, VECTOR_TABLE)   \
-  LaunchKernel(grid, block, device.unwrap())(          \
-      ltx2_qknorm_rope_kernel<VECTOR_X, VECTOR_TABLE>, \
-      static_cast<const bf16_t*>(q.data_ptr()),        \
-      static_cast<const bf16_t*>(k.data_ptr()),        \
-      static_cast<bf16_t*>(q_out.data_ptr()),          \
-      static_cast<bf16_t*>(k_out.data_ptr()),          \
-      static_cast<const bf16_t*>(q_weight.data_ptr()), \
-      static_cast<const bf16_t*>(k_weight.data_ptr()), \
-      q_cos_table,                                     \
-      q_sin_table,                                     \
-      k_cos_table,                                     \
-      k_sin_table,                                     \
-      hidden_i32,                                      \
-      hidden_i32 / 4,                                  \
-      static_cast<int32_t>(rows_q),                    \
-      q_tokens.unwrap(),                               \
-      k_tokens.unwrap(),                               \
-      static_cast<int32_t>(head_dim / 2),              \
-      static_cast<float>(eps),                         \
-      static_cast<int32_t>(pair8),                     \
+    const bool fixed_layout = tables16 && num_heads == 32 && q_cos.stride(1) == head_dim / 2 &&
+                              q_sin.stride(1) == head_dim / 2 && k_cos.stride(1) == head_dim / 2 &&
+                              k_sin.stride(1) == head_dim / 2 && (head_dim == 64 || head_dim == 128);
+    if (fixed_layout) {
+      grid = dim3(static_cast<uint32_t>(q_tokens.unwrap() + k_tokens.unwrap()), static_cast<uint32_t>(batch.unwrap()));
+    }
+
+#define LTX2_VIBECUDA_LAUNCH(VECTOR_X, VECTOR_TABLE, FIXED_HEAD_DIM)   \
+  LaunchKernel(grid, block, device.unwrap())(                          \
+      ltx2_qknorm_rope_kernel<VECTOR_X, VECTOR_TABLE, FIXED_HEAD_DIM>, \
+      static_cast<const bf16_t*>(q.data_ptr()),                        \
+      static_cast<const bf16_t*>(k.data_ptr()),                        \
+      static_cast<bf16_t*>(q_out.data_ptr()),                          \
+      static_cast<bf16_t*>(k_out.data_ptr()),                          \
+      static_cast<const bf16_t*>(q_weight.data_ptr()),                 \
+      static_cast<const bf16_t*>(k_weight.data_ptr()),                 \
+      q_cos_table,                                                     \
+      q_sin_table,                                                     \
+      k_cos_table,                                                     \
+      k_sin_table,                                                     \
+      hidden_i32,                                                      \
+      hidden_i32 / 4,                                                  \
+      static_cast<int32_t>(rows_q),                                    \
+      q_tokens.unwrap(),                                               \
+      k_tokens.unwrap(),                                               \
+      static_cast<int32_t>(head_dim / 2),                              \
+      static_cast<float>(eps),                                         \
+      static_cast<int32_t>(pair8),                                     \
       static_cast<int32_t>(tables16))
 
-    if (vector_x) {
-      if (vector_tables) {
-        LTX2_VIBECUDA_LAUNCH(true, true);
+    if (fixed_layout) {
+      if (head_dim == 64) {
+        LTX2_VIBECUDA_LAUNCH(true, true, 64);
       } else {
-        LTX2_VIBECUDA_LAUNCH(true, false);
+        LTX2_VIBECUDA_LAUNCH(true, true, 128);
+      }
+    } else if (vector_x) {
+      if (vector_tables) {
+        LTX2_VIBECUDA_LAUNCH(true, true, 0);
+      } else {
+        LTX2_VIBECUDA_LAUNCH(true, false, 0);
       }
     } else {
       if (vector_tables) {
-        LTX2_VIBECUDA_LAUNCH(false, true);
+        LTX2_VIBECUDA_LAUNCH(false, true, 0);
       } else {
-        LTX2_VIBECUDA_LAUNCH(false, false);
+        LTX2_VIBECUDA_LAUNCH(false, false, 0);
       }
     }
 #undef LTX2_VIBECUDA_LAUNCH
