@@ -581,6 +581,11 @@ field defaults to the conservative answer.
       <td><code>False</code></td>
       <td>Model-parallel groups create a PyNccl communicator when the caller does not choose. Set it to True only if the device runs NCCL (or an NCCL-compatible library PyNccl loads).</td>
     </tr>
+    <tr>
+      <td><code>prefill_only_noop_kv_pool</code></td>
+      <td><code>False</code></td>
+      <td><code>--prefill-only-disable-kv-cache</code> accepts the platform and swaps in <code>NoOpMHATokenToKVPool</code>. Set it to True only if the platform builds its plain MHA KV pool through core's <code>_build_mha_kv_pool</code> (its pool class comes from <code>get_mha_kv_pool_cls()</code>); otherwise the server refuses to start.</td>
+    </tr>
   </tbody>
 </table>
 
