@@ -60,7 +60,7 @@ The A3 selector provides **one Ascend A3 node with 8 cards / 16 NPU dies**, runn
 This recipe is based on the upstream Ascend best practice. Hardware validation of the generated A3 cookbook command is pending; the reference accuracy and performance values below are not measurements of this recipe. The tested A2 selector is a separate low-concurrency configuration and does not validate the A3 preset.
 </Note>
 
-1. Set up the Ascend runtime using the [MiniMax-M2.5 installation instructions](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5#installation). The reference environment uses CANN 9.1.0 and `quay.io/ascend/sglang:main-cann9.1.0-a3`. Map `/dev/davinci0` through `/dev/davinci15` and mount your model directory into the container, for example `-v /path/to/models:/models`.
+1. Set up the Ascend runtime using the [MiniMax-M2.5 installation instructions](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5#installation). For the current CANN 9.2.0 daily build, use `quay.io/ascend/sglang:main-cann9.2.0-a3`. Map `/dev/davinci0` through `/dev/davinci15` and mount your model directory into the container, for example `-v /path/to/models:/models`.
 2. Check device health and allocation with `npu-smi info` inside the container. Confirm that all 16 dies are visible. For source builds, follow [installation with NPU support](/docs/hardware-platforms/ascend-npus/getting-started/installation), keep the CANN, TorchNPU, and kernel versions compatible, and record the SGLang commit you install.
 3. Reserve space for the **230.82 GB** main weights, the draft model, download cache, and at least **30 GB** for the container image. Download both models below, or reuse complete copies from shared storage.
 
