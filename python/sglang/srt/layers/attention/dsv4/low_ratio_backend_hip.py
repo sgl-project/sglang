@@ -437,7 +437,9 @@ def low_ratio_index_topk_hip_decode(
         decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
         page8=page8,
         rowgroup_table_columns=rowgroup_table_columns(
-            backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+            backend.model_runner.model_config.context_len,
+            ratio,
+            LOW_RATIO_PAGE_TABLE_BUCKET,
         ),
     )
     # level one is bounded on device by the compressed lengths: a captured step cannot read them back
@@ -649,7 +651,9 @@ def low_ratio_index_topk_hip_extend(
             extend_lens_cpu,
             page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
             table_columns=rowgroup_table_columns(
-                backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+                backend.model_runner.model_config.context_len,
+                ratio,
+                LOW_RATIO_PAGE_TABLE_BUCKET,
             ),
         )
 

@@ -7,6 +7,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs as _envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
@@ -28,18 +29,11 @@ from sglang.srt.layers.moe.utils import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.runtime_context import get_lora, get_parallel
-from sglang.srt.utils.common import get_bool_env_var
-from sglang.srt.utils.device import get_device, is_hip
-
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-from sglang.srt.environ import envs as _envs
+from sglang.srt.utils.device import get_device
 
 _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackendLike
 
 
@@ -119,12 +113,6 @@ class StandardDispatcher(BaseDispatcher):
         self.runner_backend = backend
         self.enable_flashinfer_cutlass_moe = (
             backend is not None and backend.is_flashinfer_cutlass()
-        )
-        self.enable_flashinfer_mxfp4_moe = (
-            backend is not None and backend.is_flashinfer_mxfp4()
-        )
-        self.enable_flashinfer_trtllm_routed_moe = (
-            backend is not None and backend.is_flashinfer_trtllm_routed()
         )
         self.use_aiter_moe_runner = backend is not None and backend.is_aiter()
         self.skip_local_expert_mapping = _keeps_global_expert_ids(backend)
@@ -249,7 +237,6 @@ class StandardDispatcher(BaseDispatcher):
                 router_logits=topk_output.router_logits,  # never tested
             )
         else:
-            hidden_states = hidden_states
             hidden_states_scale = None
 
         if (
