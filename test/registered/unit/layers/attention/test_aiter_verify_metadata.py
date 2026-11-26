@@ -275,7 +275,9 @@ def _init_mha_backend(kv_cache_layout):
         model_config=model_config,
         device=torch.device("cpu"),
         kv_cache_dtype=torch.bfloat16,
-        req_to_token_pool=SimpleNamespace(req_to_token=None, size=_BATCH_SIZE),
+        req_to_token_pool=SimpleNamespace(
+            max_context_len=4096, req_to_token=None, size=_BATCH_SIZE
+        ),
         runner_ids=None,
         token_to_kv_pool=pool,
         is_draft_worker=False,

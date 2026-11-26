@@ -4,6 +4,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 
 @triton.jit
@@ -220,14 +223,27 @@ def _linear_k_groups_split(flat, weight, bias, out):
     )
 
 
-def uses_k_groups(x: torch.Tensor, weight: torch.Tensor) -> bool:
+def _k_group_tiles(x: torch.Tensor, weight: torch.Tensor) -> int:
+    rows = x.numel() // x.shape[-1] if x.shape[-1] else 0
+    return triton.cdiv(rows, 16) * triton.cdiv(weight.shape[0], 32)
+
+
+def uses_k_groups(
+    x: torch.Tensor, weight: torch.Tensor, *, partials: bool = False
+) -> bool:
+    # gfx950's 160 KB LDS fits the split-K partials path only up to 128 rows; with
+    # partials (the caller sums them) ROCm also takes the 1-, 2- and 4-output weights
     return (
         x.is_cuda
         and torch.cuda.get_device_capability(x.device)[0] in (9, 10)
+        and (
+            not _is_hip
+            or (x.numel() <= 128 * x.shape[-1] and _k_group_tiles(x, weight) < 256)
+        )
         and x.dtype == weight.dtype == torch.bfloat16
         and x.stride(-1) == weight.stride(-1) == 1
         and weight.shape[1] >= 2560
-        and weight.shape[0] not in (1, 2, 4)
+        and (weight.shape[0] not in (1, 2, 4) or (partials and _is_hip))
     )
 
 
