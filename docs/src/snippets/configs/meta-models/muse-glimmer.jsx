@@ -407,6 +407,21 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
+    {
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
+      verificationStatus: (s) => s.modality === "text" ? "verified" : "unverified",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser muse",
+        "--tool-call-parser muse",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path {{DRAFT_PATH}}",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
 
     {
       match: { hw: "mac", variant: "default", quant: "mlx-q4", strategy: "standard", nodes: "single" },
