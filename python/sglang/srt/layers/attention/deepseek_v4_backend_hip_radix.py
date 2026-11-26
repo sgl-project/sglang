@@ -78,7 +78,9 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+    LowRatioExtendSlots,
     build_low_ratio_decode_workspaces,
+    build_low_ratio_extend_k_slots,
     low_ratio_candidate_span,
     low_ratio_decode_rows_are_identity,
     low_ratio_identity_skip_enabled,
@@ -919,7 +921,6 @@ class DeepseekV4HipRadixBackend(
         super().__init__()
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
-        self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert head_dim == 512, (
             "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
@@ -967,6 +968,8 @@ class DeepseekV4HipRadixBackend(
         )
         # published by the candidate-source layer, consumed by the later index-source layers
         self.candidate_masks = None
+        # this forward's extend slot tables by ratio, built in _refresh_fp4_prefill_workspace
+        self.low_ratio_extend_k_slots: Dict[int, LowRatioExtendSlots] = {}
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer
         )
@@ -1055,7 +1058,11 @@ class DeepseekV4HipRadixBackend(
 
             if aiter_has_fp4_rowgroup():
                 self._fp4_c4_rowgroup_columns = rowgroup_table_columns(
-                    max(self.max_context_len, self.MAX_SEQ_LEN_FOR_CAPTURE), 4
+                    max(
+                        model_runner.model_config.context_len,
+                        self.MAX_SEQ_LEN_FOR_CAPTURE,
+                    ),
+                    4,
                 )
                 logger.info(
                     "DSv4 C4 indexer: decode / target-verify on the row-group FP4 "
@@ -1786,7 +1793,7 @@ class DeepseekV4HipRadixBackend(
                             StepMetadata.LOW_RATIO_DECODE_SCHEDULE,
                         )
                     },
-                    max_context_len=self.max_context_len,
+                    max_context_len=self.model_runner.model_config.context_len,
                     num_requests=forward_batch.batch_size,
                     page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
@@ -1872,6 +1879,7 @@ class DeepseekV4HipRadixBackend(
         kernel reads, so only the pinned buffers it fills may be read from a graph."""
         if metadata is None:
             metadata = self.forward_metadata
+        self.low_ratio_extend_k_slots = {}
         if (
             isinstance(metadata, DSV4Metadata)
             and metadata.core_metadata.low_ratios
@@ -1887,9 +1895,17 @@ class DeepseekV4HipRadixBackend(
                         if metadata.late_layer_tail is not None
                         else _as_int_list(forward_batch.extend_seq_lens_cpu)
                     ),
-                    max_context_len=self.max_context_len,
+                    max_context_len=self.model_runner.model_config.context_len,
                     page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
+            )
+            self.low_ratio_extend_k_slots = build_low_ratio_extend_k_slots(
+                self.req_to_token,
+                ratios=metadata.core_metadata.low_ratios,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                req_pool_indices=forward_batch.req_pool_indices,
+                index_topk=self.index_topk,
+                identity_skip=self.low_ratio_identity_skip,
             )
         if not self._fp4_workspaces_enabled(metadata):
             return
@@ -2473,7 +2489,7 @@ class DeepseekV4HipRadixBackend(
             is_draft_runner=self.is_draft_worker,
             skip_prefill=False,
             max_bs=max_bs,
-            max_context_len=self.max_context_len,
+            max_context_len=self.model_runner.model_config.context_len,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             is_read=False,
@@ -2550,8 +2566,9 @@ class DeepseekV4HipRadixBackend(
 
         win = self.token_to_kv_pool.unified_swa_window
         ctx = min(
-            envs.SGLANG_DSV4_FP8_DECODE_SPLIT_CTX.get() or self.max_context_len,
-            self.max_context_len,
+            envs.SGLANG_DSV4_FP8_DECODE_SPLIT_CTX.get()
+            or self.model_runner.model_config.context_len,
+            self.model_runner.model_config.context_len,
         )
         # longest KV one decode row of each stream can see
         self._fp8_split_kv_hint = {

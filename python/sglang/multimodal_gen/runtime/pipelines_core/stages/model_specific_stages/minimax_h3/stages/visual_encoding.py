@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -20,7 +21,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    get_global_server_args,
+)
 
 
 class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
@@ -228,7 +232,11 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
 
         # Parallel tiling gives each replicated rank complete tiles, then gathers
         # them before the seeded posterior sample.
-        prepared = minimax_h3_prepared_keyframes(batch, plan)
+        prepared = minimax_h3_prepared_keyframes(
+            batch,
+            plan,
+            keyframe_fit=get_global_server_args().pipeline_config.keyframe_fit,
+        )
         prepared_indices = tuple(prepared.get("semantic_frame_indices") or ())
         if prepared_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES or len(
             prepared.get("images") or ()
@@ -276,6 +284,7 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             "frame_count": prepared.get("frame_count"),
         }
 
+    @use_gpu_conditioning_hash()
     def _encode_reference_video(self, batch: Req, plan) -> None:
         """ref2va video/video_audio encode from shared transformed frames."""
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
@@ -324,6 +333,7 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
         payload["videos"] = entries
         batch.extra[MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY] = payload
 
+    @use_gpu_conditioning_hash()
     def _encode_reference_image(self, batch: Req, plan, server_args) -> None:
         """ref2va reference image encode: cap_resize (intrinsic
         geometry) + the verified keyframe recipe; rows use the image's OWN

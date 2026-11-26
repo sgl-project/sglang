@@ -20,9 +20,11 @@ if not is_cpu():
     )
 
 if is_npu():
-    from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
-        fused_sigmoid_gating_delta_rule_update_decode_npu as fused_sigmoid_gating_delta_rule_update,
+    from sgl_kernel_npu.operators.attention.gdn import (
+        chunk_gated_delta_rule_npu,
+    )
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_gdn_decode as fused_sigmoid_gating_delta_rule_update,
     )
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
@@ -46,6 +48,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
     supports_strided_target_verify_qkv: bool = True
     # The chunk kernel steps slots by the pool's stride(0) in int64.
     extend_honors_slot_pitch: bool = True
+
+    def __init__(self, *, round_beta_to_input_dtype: bool = False):
+        self._recurrent_kwargs = (
+            {"round_beta_to_input_dtype": True} if round_beta_to_input_dtype else {}
+        )
 
     def packed_decode(
         self,
@@ -168,6 +175,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
+            **self._recurrent_kwargs,
         )
 
     def extend(
@@ -272,6 +280,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
+            **self._recurrent_kwargs,
             is_kda=False,
             # target_verify specific parameters
             disable_state_update=True,

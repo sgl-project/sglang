@@ -10,30 +10,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
+from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
 from sglang.srt.layers.utils.common import set_weight_attrs
 
 NVFP4_BLOCK_SIZE = 16
-_FP4_E2M1_LUT = torch.tensor(
-    [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        -0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
-    ],
-    dtype=torch.float32,
-)
+_FP4_E2M1_LUT = torch.tensor(E2M1_VALUES, dtype=torch.float32)
 
 
 def copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:

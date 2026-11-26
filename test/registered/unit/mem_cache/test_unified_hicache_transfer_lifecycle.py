@@ -491,7 +491,7 @@ class _UnifiedHiCacheCase(_ConfigCase):
         self.allocator = bundle.token_to_kv_pool_allocator
         self.rows = _Rows(bundle)
         self.req_to_token_pool = ReqToTokenPool(
-            size=4, max_context_len=tokens, device="cpu", enable_memory_saver=False
+            size=4, row_width=tokens, device="cpu", enable_memory_saver=False
         )
         params = CacheInitParams(
             req_to_token_pool=self.req_to_token_pool,
@@ -624,6 +624,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         req.host_loaded_length = 0
         req.window_host_hit_lengths = dict(match.window_host_hit_lengths)
         req.retracted_stain = False
+        req.beam_group = None
         req.needs_host_load_back.return_value = True
         req.finished.return_value = False
         req.materialized_host_hit_len.return_value = match.host_hit_length

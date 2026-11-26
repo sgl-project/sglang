@@ -114,7 +114,7 @@ def _result(batch):
     )
 
 
-def _run(cls, *, hisparse=False):
+def _run(cls, *, hisparse=False, auxiliary=False):
     """One prefill result through ``cls``; returns the log of KV calls, free group
     and send."""
     log = []
@@ -144,6 +144,11 @@ def _run(cls, *, hisparse=False):
     )
     batch = _batch()
     result = _result(batch)
+    if auxiliary:
+        result.auxiliary_host_output = Mock()
+        result.auxiliary_host_output.consume.side_effect = lambda *_: log.append(
+            "consume"
+        )
     memory = SimpleNamespace(enable_hisparse=hisparse)
     with (
         published_topology(),
@@ -171,6 +176,15 @@ class TestFlushPrefill(CustomTestCase):
     def test_kv_calls_run_before_the_send(self):
         log = _run(SchedulerBatchResultProcessor)
         self.assertEqual(log, ["free_group_begin", *KV_CALLS, "free_group_end", SEND])
+
+    def test_auxiliary_output_can_defer_released_requests_before_send(self):
+        for processor in (SchedulerBatchResultProcessor, _StreamFirst):
+            with self.subTest(processor=processor):
+                log = _run(processor, auxiliary=True)
+                self.assertLess(
+                    log.index(("release", "r0", True)), log.index("consume")
+                )
+                self.assertLess(log.index("consume"), log.index(SEND))
 
     def test_override_sends_before_the_kv_calls(self):
         log = _run(_StreamFirst)

@@ -139,7 +139,7 @@ Glyph supports tool calling capabilities. Enable the tool call parser:
 python -m sglang.launch_server \
   --model-path zai-org/Glyph \
   --reasoning-parser glm45 \
-  --tool-call-parser glm45 \
+  --tool-call-parser glm \
   --tp 4
 ```
 

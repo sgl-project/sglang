@@ -123,6 +123,12 @@ class AllReduceConfig(NamedTuple):
       - ``num_mc_blocks``  : mc 2shot_pull; ``None`` disables multicast
       - ``num_ring_simple_channels``: ring_simple and hier_ring_simple grid,
                              one channel (ring) per block
+
+    ``default_max_size`` raises the workspace cap (``max_size``) to what the
+    table needs when neither the caller nor
+    ``SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB`` sets it; 0 keeps the default.
+    ``ring_simple_buffer_size`` is the ring_simple FIFO bytes per channel when
+    the caller doesn't pass one; 0 keeps ``RING_SIMPLE_BUFFER_SIZE``.
     """
 
     graph: Heuristic
@@ -131,6 +137,8 @@ class AllReduceConfig(NamedTuple):
     num_pull_blocks: int
     num_mc_blocks: Optional[int]
     num_ring_simple_channels: int = 0
+    default_max_size: int = 0
+    ring_simple_buffer_size: int = 0
 
     def max_push_bytes(self, world_size: int) -> int:
         return max(
@@ -364,7 +372,7 @@ def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
 # decode throughput. Pull stays off: it lost at every measured size.
 @cache
 def _rocm_gfx1250_configs(
-    num_sm: int, dev_kernarg: bool = False
+    num_sm: int, dev_kernarg: bool = False, spx: bool = False
 ) -> dict[int, AllReduceConfig]:
     def config(
         one_shot: int, two_shot_push: int, hier_ring_from: int = 0
@@ -409,12 +417,12 @@ def _rocm_gfx1250_configs(
     # unset or 0). With HIP_FORCE_DEV_KERNARG=1 the kernels after a 2shot_push
     # run at full speed, so TP2/4/8 take 2shot_push to the last size it wins
     # back to back. 1shot_push also serves decode further, to the last size it
-    # wins in CUDA graphs with a late rank or a GEMM before it (768 KB at TP8,
-    # every decode size at TP2/4): DeepSeek-V4-Flash decode gains about 2-4% at
-    # TP4/TP8.
+    # wins in CUDA graphs with a late rank (768 KB at TP8, also with a GEMM
+    # before it; 1 MB at TP2/4: at 2 MB 2shot_push wins back to back and with a
+    # late rank).
     if dev_kernarg:
         cutoffs.update(
-            {2: (2 * MB, 16 * MB), 4: (2 * MB, 32 * MB), 8: (768 * KB, 32 * MB)}
+            {2: (1 * MB, 16 * MB), 4: (1 * MB, 16 * MB), 8: (768 * KB, 32 * MB)}
         )
     # Where the group is made of partition pairs (both partitions of every
     # accelerator), hier_ring_simple takes over from 2shot_push and ring_simple
@@ -430,35 +438,75 @@ def _rocm_gfx1250_configs(
     configs = {
         ws: config(*cutoff, hier_ring_from.get(ws, 0)) for ws, cutoff in cutoffs.items()
     }
+    if dev_kernarg:
+        # TP8 on partition pairs: hier_2shot_push, tried before hier_ring_simple,
+        # beats 2shot_push by 21% and hier_ring_simple by 14% (10% / 11% with a
+        # late rank) at 16 MB; hier_ring_simple wins from 24 MB
+        tp8 = configs[8].graph._replace(hier_2shot_push=Range(8 * MB + 16, 16 * MB))
+        configs[8] = configs[8]._replace(graph=tp8, eager=tp8)
     # 16 ranks span two hosts in one fabric clique. Tuned there with and
     # without a late rank: across hosts 2shot_push pays two fabric hops, so
     # 1shot_push wins to 256 KB, and a block per CU keeps 2shot_push ahead of
     # RCCL to 64 MB. When both partitions of every accelerator are in the group,
     # hier_2shot_push reduces each pair first, so only half the tensor crosses
-    # the fabric: above 256 KB it beats 2shot_push by 17-31% back to back and
-    # 9-14% with a late rank, so it takes over to 64 MB. ring_simple takes
-    # the sizes above that.
+    # the fabric: above 2 MB it beats 2shot_push by 13-33% back to back, so it
+    # takes over to 64 MB. Up to 2 MB 2shot_push stays: it is 13% faster than
+    # hier with a late rank, as in serving after the MoE, and 7-11% slower
+    # back to back at 512 KB-1 MB. ring_simple takes the sizes above 64 MB.
     tp16 = Heuristic(
         256 * KB,
         0,
         0,
         two_shot_push_threshold=64 * MB,
-        hier_2shot_push=Range(256 * KB, 64 * MB),
+        hier_2shot_push=Range(2 * MB + 16, 64 * MB),
         ring_simple=Range(64 * MB + 16, 4 * 1024 * MB),
     )
+    if dev_kernarg:
+        # Partition pairs at TP16: hier_ring_simple beats ring_simple by 17% at
+        # 128 MB and 7% at 512 MB, also with a late rank, and 2shot_push from
+        # 32 MB (21% at 64 MB). hier_2shot_push is tried first and keeps the
+        # sizes it covers, so this takes 32-64 MB only where the default
+        # max_size caps hier at 32 MB.
+        tp16 = tp16._replace(hier_ring_simple=Range(32 * MB + 16, 4 * 1024 * MB))
     configs[16] = configs[8]._replace(graph=tp16, eager=tp16, num_push_blocks=num_sm)
+    if spx and dev_kernarg:
+        # SPX (a whole accelerator per rank), tuned at TP2/TP4: a push block
+        # per CU, as many as the device reports (num_sm); 1shot_push beats
+        # RCCL to 6 MB at TP2 and 2 MB at TP4; 2shot_push beats ring_simple to
+        # 96 MB at TP2 and 160 MB at TP4, where ring_simple loses to RCCL at
+        # 80-112 MB. 2shot push workspace is 4x its top size per rank; a 2 MB
+        # ring FIFO per channel (one channel per CU) is as fast as 4 MB and
+        # halves the ring's workspace.
+        def spx_row(world_size: int, one_shot: int, two_shot: int) -> AllReduceConfig:
+            heuristic = Heuristic(
+                one_shot,
+                0,
+                0,
+                two_shot_push_threshold=two_shot,
+                ring_simple=Range(two_shot + 16, 4 * 1024 * MB),
+            )
+            return configs[world_size]._replace(
+                graph=heuristic,
+                eager=heuristic,
+                num_push_blocks=num_sm,
+                default_max_size=two_shot_push_slot_bytes(two_shot, world_size),
+                ring_simple_buffer_size=2 * MB,
+            )
+
+        configs[2] = spx_row(2, 6 * MB, 96 * MB)
+        configs[4] = spx_row(4, 2 * MB, 160 * MB)
     return configs
 
 
 @cache
-def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
+def _get_all_reduce_configs(spx: bool = False) -> dict[int, AllReduceConfig]:
     props = torch.cuda.get_device_properties()
     num_sm = props.multi_processor_count
     if torch.version.hip:
         # ROCm reports gfx9xx as capability 9.x: never fall into the SM90 table
         if props.gcnArchName.startswith("gfx1250"):
             dev_kernarg = os.environ.get("HIP_FORCE_DEV_KERNARG") == "1"
-            return _rocm_gfx1250_configs(num_sm, dev_kernarg)
+            return _rocm_gfx1250_configs(num_sm, dev_kernarg, spx)
         return _rocm_configs(num_sm)
     cuda_major, cuda_minor = torch.cuda.get_device_capability()
     if cuda_major == 9:
@@ -484,10 +532,11 @@ def get_supported_world_sizes() -> tuple[int, ...]:
 
 
 @cache
-def get_all_reduce_config(world_size: int) -> AllReduceConfig:
+def get_all_reduce_config(world_size: int, spx: bool = False) -> AllReduceConfig:
     """Tuned thresholds and block counts for the current arch / world size.
 
     Only SM90, SM100 and SM107 are benchmarked so far; other archs get a
-    conservative default (1 MB one-shot crossovers, no multicast).
+    conservative default (1 MB one-shot crossovers, no multicast). ``spx``
+    (ROCm gfx1250: every rank is a whole accelerator) picks the SPX rows.
     """
-    return _get_all_reduce_configs()[world_size]
+    return _get_all_reduce_configs(spx)[world_size]
