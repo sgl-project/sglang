@@ -874,7 +874,9 @@ class TestShardConfig(unittest.TestCase):
         self.assertTrue(cfg["enable_fp32_lm_head"])
         self.assertEqual(cfg["init_expert_location"], "trivial")
 
-    def _rocm_fp4_shard_config(self, backend, quantization="quark", is_hip=True):
+    def _rocm_fp4_shard_config(
+        self, backend, quantization="quark", is_hip=True, bf16=False
+    ):
         from sglang.srt.layers.quantization import fp4_utils
 
         loader = object.__new__(PreshardedModelLoader)
@@ -906,6 +908,11 @@ class TestShardConfig(unittest.TestCase):
                 ),
             ),
             mock.patch("sglang.srt.model_loader.loader.is_hip", return_value=is_hip),
+            mock.patch(
+                "sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4."
+                "_dequant_linear_to_bf16",
+                return_value=bf16,
+            ),
             mock.patch.object(
                 loader, "_compute_structural_signature", return_value="sig16"
             ),
@@ -925,6 +932,18 @@ class TestShardConfig(unittest.TestCase):
         unmarked = {k: v for k, v in triton.items() if k != "rocm_fp4_gemm_layout"}
         names = {loader._build_subfolder_name(c) for c in (triton, aiter, unmarked)}
         self.assertEqual(len(names), 3)
+
+    def test_gfx1250_bf16_layout_has_its_own_key(self):
+        # gfx1250 expands MXFP4 linears to bf16 at load; it must not reuse a
+        # packed gfx950 cache (whatever the FP4 backend says).
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        loader, packed = self._rocm_fp4_shard_config(Fp4GemmRunnerBackend.TRITON)
+        _, bf16 = self._rocm_fp4_shard_config(Fp4GemmRunnerBackend.TRITON, bf16=True)
+        self.assertEqual(bf16["rocm_fp4_gemm_layout"], "bf16")
+        self.assertNotEqual(
+            loader._build_subfolder_name(packed), loader._build_subfolder_name(bf16)
+        )
 
     def test_rocm_fp4_layout_only_keys_rocm_quark(self):
         from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend

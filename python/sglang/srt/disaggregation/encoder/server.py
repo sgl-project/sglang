@@ -45,7 +45,10 @@ from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
     initialize_dp_attention_flags,
 )
-from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
+from sglang.srt.layers.quantization.fp4_utils import (
+    initialize_fp4_gemm_config,
+    reject_rocm_only_fp4_gemm_backend,
+)
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -594,6 +597,8 @@ class MMEncoder:
         # FP4 GEMM backend for this device before the Quark linears are built.
         if is_hip():
             initialize_fp4_gemm_config(self.gpu_id)
+        else:
+            reject_rocm_only_fp4_gemm_backend()
 
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),

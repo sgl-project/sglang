@@ -224,6 +224,13 @@ def resolve_rocm_fp4_gemm_backend(
     return backend
 
 
+def reject_rocm_only_fp4_gemm_backend() -> None:
+    """Raise if --fp4-gemm-backend names a ROCm-only backend on another platform."""
+    backend = get_exec().kernel.fp4_gemm_runner_backend
+    if not is_hip() and backend in _ROCM_ONLY_FP4_GEMM_BACKENDS:
+        raise ValueError(f"--fp4-gemm-backend={backend} is only supported on ROCm.")
+
+
 def initialize_fp4_gemm_config(gpu_id: Optional[int] = None) -> None:
     """Initialize the FP4 GEMM backend from the published configuration.
 
@@ -247,7 +254,7 @@ def initialize_fp4_gemm_config(gpu_id: Optional[int] = None) -> None:
             legacy_use_aiter_asm=legacy_env.get() if legacy_env.is_set() else None,
         )
     elif backend in _ROCM_ONLY_FP4_GEMM_BACKENDS:
-        raise ValueError(f"--fp4-gemm-backend={backend} is only supported on ROCm.")
+        reject_rocm_only_fp4_gemm_backend()
     elif backend == "auto":
         if get_platform().is_sm100:
             backend = "flashinfer_cutedsl"

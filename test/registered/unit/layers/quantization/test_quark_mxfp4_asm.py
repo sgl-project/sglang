@@ -176,6 +176,27 @@ class TestInitializeFp4GemmConfig(CustomTestCase):
             fp4_utils.get_fp4_gemm_runner_backend(), Fp4GemmRunnerBackend.AITER
         )
 
+    def test_reject_rocm_only_backend_off_rocm(self):
+        # The CUDA encoder path calls this instead of initializing the backend.
+        for backend, should_raise in (
+            ("aiter", True),
+            ("triton", True),
+            ("auto", False),
+        ):
+            exec_ctx = SimpleNamespace(
+                kernel=SimpleNamespace(fp4_gemm_runner_backend=backend)
+            )
+            with (
+                self.subTest(backend=backend),
+                mock.patch.object(fp4_utils, "get_exec", return_value=exec_ctx),
+                mock.patch.object(fp4_utils, "is_hip", return_value=False),
+            ):
+                if should_raise:
+                    with self.assertRaisesRegex(ValueError, "only supported on ROCm"):
+                        fp4_utils.reject_rocm_only_fp4_gemm_backend()
+                else:
+                    fp4_utils.reject_rocm_only_fp4_gemm_backend()
+
     def test_rocm_only_backends_rejected_off_rocm(self):
         for backend in ("aiter", "triton"):
             with self.subTest(backend=backend):
@@ -202,7 +223,30 @@ class TestQuarkMxfp4Gfx1250Fallback(CustomTestCase):
             self.assertFalse(
                 quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cuda", 1))
             )
-        self.assertFalse(quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cpu")))
+
+    def test_bf16_fallback_uses_the_worker_gpu_for_offloaded_weights(self):
+        # A weight parked on the CPU (offload) is checked against the GPU the
+        # worker executes on, not skipped.
+        archs = {0: "gfx950:sramecc+:xnack-", 1: "gfx1250"}
+        with (
+            mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
+            mock.patch.object(
+                quark_w4a4_mxfp4.torch.cuda,
+                "get_device_properties",
+                side_effect=lambda d: SimpleNamespace(gcnArchName=archs[d.index]),
+            ),
+            mock.patch.object(
+                quark_w4a4_mxfp4.torch.cuda, "current_device", return_value=1
+            ),
+        ):
+            self.assertTrue(
+                quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cpu"))
+            )
+            self.assertTrue(quark_w4a4_mxfp4._dequant_linear_to_bf16())
+        with mock.patch.object(quark_w4a4_mxfp4, "_is_hip", False):
+            self.assertFalse(
+                quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cpu"))
+            )
 
 
 class TestQuarkMxfp4BackendSelection(CustomTestCase):
@@ -390,6 +434,9 @@ class TestQuarkMxfp4AiterLayerSelection(CustomTestCase):
         self.loaded_weight = layer.weight
         with (
             mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
+            mock.patch.object(
+                quark_w4a4_mxfp4, "_dequant_linear_to_bf16", return_value=False
+            ),
             mock.patch.object(
                 quark_w4a4_mxfp4,
                 "shuffle_weight",

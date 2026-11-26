@@ -1913,15 +1913,21 @@ class PreshardedModelLoader(DefaultModelLoader):
             from sglang.srt.layers.quantization.fp4_utils import (
                 get_fp4_gemm_runner_backend,
             )
-
-            # The AITER FP4 GEMM stores Quark MXFP4 weights and scales
-            # preshuffled, the Triton GEMM row-major. Key both layouts explicitly
-            # (so caches from before this key existed are rebuilt) and gather
-            # them over the group, since ranks on different GPU architectures
-            # can resolve different layouts but must share one cache directory.
-            local_layout = (
-                "aiter" if get_fp4_gemm_runner_backend().is_aiter() else "triton"
+            from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                _dequant_linear_to_bf16,
             )
+
+            # Quark MXFP4 linears are stored preshuffled for the AITER FP4 GEMM,
+            # row-major for the Triton GEMM, and expanded to bf16 on gfx1250. Key
+            # every layout explicitly (so caches from before this key existed are
+            # rebuilt) and gather them over the group, since ranks on different
+            # GPU architectures can differ but must share one cache directory.
+            if _dequant_linear_to_bf16(target_device):
+                local_layout = "bf16"
+            elif get_fp4_gemm_runner_backend().is_aiter():
+                local_layout = "aiter"
+            else:
+                local_layout = "triton"
             shard_config["rocm_fp4_gemm_layout"] = self._rank_invariant_value(
                 local_layout
             )

@@ -102,9 +102,13 @@ def _asm_fp4_prequantized_input(
 # dequantize their FP4 weights to bf16 once at load and run a plain bf16 GEMM.
 # This trades a little memory for correctness on hardware that cannot execute
 # the fp4 kernel at all. Checked per device: a node can mix architectures.
-def _dequant_linear_to_bf16(device: torch.device) -> bool:
-    if not _is_hip or device.type != "cuda":
+def _dequant_linear_to_bf16(device: Optional[torch.device] = None) -> bool:
+    """Whether MXFP4 linears on ``device`` run as bf16. A weight parked on the
+    CPU (offload) or no device means the worker's current GPU."""
+    if not _is_hip:
         return False
+    if device is None or device.type != "cuda":
+        device = torch.device("cuda", torch.cuda.current_device())
     return "gfx1250" in torch.cuda.get_device_properties(device).gcnArchName
 
 
