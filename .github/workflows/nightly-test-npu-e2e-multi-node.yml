@@ -107,7 +107,9 @@ jobs:
     if: ${{ inputs.deepswe_env_check == 'true' }}
     runs-on: ${{ inputs.runner }}
     container:
-      image: swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main-x86
+      # Mirror the eval-pod image so the check also validates that the
+      # multi-arch tag pulls on amd64 and ships Python >=3.12.
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
