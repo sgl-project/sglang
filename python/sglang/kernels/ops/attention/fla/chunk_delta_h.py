@@ -442,6 +442,12 @@ def chunk_gated_delta_rule_fwd_h(
     if initial_state_int8:
         if not initial_state.is_cuda or torch.version.hip is not None:
             raise ValueError("fused INT8 GDN prefill requires NVIDIA CUDA")
+        expected_shape = (u.shape[-2], u.shape[-1], k.shape[-1])
+        if initial_state.shape[1:] != expected_shape:
+            raise ValueError(
+                f"INT8 state must have shape [slots, {expected_shape[0]}, "
+                f"{expected_shape[1]}, {expected_shape[2]}] to match prefill activations"
+            )
         if (
             initial_state_scale.shape != initial_state.shape[:-1]
             or initial_state_scale.stride(-1) != 1
