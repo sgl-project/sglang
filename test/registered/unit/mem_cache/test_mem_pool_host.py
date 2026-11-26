@@ -43,6 +43,11 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    AclHostMemoryBackend,
+    MemfabricHostMemoryBackend,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -51,6 +56,84 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestHostKVCache(CustomTestCase):
+    def _lifecycle_group(self):
+        return HostPoolGroup(
+            [
+                PoolEntry(
+                    PoolName.KV, self.host_pool, self.device_pool, lambda layer: layer
+                )
+            ]
+        )
+
+    def test_unsupported_side_pool_keeps_whole_group_resident(self):
+        group = self._lifecycle_group()
+        side = DeepSeekV4PagedHostPool(
+            pool_name="c4",
+            device_buffers=[torch.zeros(4, 8, dtype=torch.uint8)],
+            item_bytes=8,
+            num_host_pages=4,
+            slot_page_size=2,
+            pin_memory=False,
+        )
+        group.add_entry(
+            PoolEntry(PoolName.DEEPSEEK_V4_C4, side, None, lambda layer: layer)
+        )
+        original = self.host_pool.kv_buffer
+        with self.assertLogs(
+            "sglang.srt.mem_cache.pool_host.group", level="WARNING"
+        ) as logs:
+            group.release_memory_occupation()
+        self.assertIn("DeepSeekV4PagedHostPool", logs.output[0])
+        group.resume_memory_occupation()
+        self.assertIs(self.host_pool.kv_buffer, original)
+        self.assertFalse(group.memory_occupation_released)
+
+    def test_registered_npu_allocator_keeps_host_pool_resident(self):
+        group = self._lifecycle_group()
+        original = self.host_pool.kv_buffer
+        target = "sglang.srt.mem_cache.pool_host.group"
+        for backend in (AclHostMemoryBackend(), MemfabricHostMemoryBackend()):
+            name = type(backend).__name__
+            with (
+                self.subTest(backend=name),
+                unittest.mock.patch(target + ".is_npu", return_value=True),
+                unittest.mock.patch(
+                    target + ".get_host_memory_backend",
+                    return_value=backend,
+                ),
+                self.assertLogs(target, level="WARNING") as logs,
+            ):
+                group.release_memory_occupation()
+                self.assertIn(name, logs.output[0])
+                group.resume_memory_occupation()
+                self.assertIs(self.host_pool.kv_buffer, original)
+
+    def test_storage_attach_waits_for_host_memory_resume(self):
+        group = self._lifecycle_group()
+        attachment = unittest.mock.Mock()
+        attachment.attach.return_value = (True, "attached")
+        cache = SimpleNamespace(
+            enable_storage=True,
+            cache_controller=SimpleNamespace(mem_pool_host=group),
+            _storage_attachment=attachment,
+        )
+        original = self.host_pool.kv_buffer
+        UnifiedRadixCache.release_memory_occupation(cache)
+        self.assertIs(self.host_pool.kv_buffer, original)
+        cache.enable_storage = False
+        UnifiedRadixCache.release_memory_occupation(cache)
+        self.assertTrue(group.memory_occupation_released)
+        ok, message = UnifiedRadixCache.attach_storage_backend(cache, "file")
+        self.assertFalse(ok)
+        self.assertIn("Resume", message)
+        attachment.attach.assert_not_called()
+        UnifiedRadixCache.resume_memory_occupation(cache)
+        self.assertFalse(group.memory_occupation_released)
+        self.assertEqual(
+            UnifiedRadixCache.attach_storage_backend(cache, "file"), (True, "attached")
+        )
+        attachment.attach.assert_called_once()
+
     def setUp(self):
         self.page_size = 2
         # Small device pool is enough to construct the host pool.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,6 +16,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
+from sglang.srt.mem_cache.pool_host.npu_host_memory import get_host_memory_backend
+from sglang.srt.utils import is_npu
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,6 +58,7 @@ class HostPoolGroup:
             raise ValueError("HostPoolGroup requires at most one anchor pool.")
 
         self.entries = list(entries)
+        self.memory_occupation_released = False
         self.entry_map = {entry.name: entry for entry in entries}
         self.anchor_entry = anchors[0] if anchors else entries[0]
 
@@ -65,6 +71,26 @@ class HostPoolGroup:
 
     def release_memory_occupation(self) -> None:
         """Offload every pool in the group (each one is idempotent)."""
+        if is_npu() and (backend := get_host_memory_backend()) is not None:
+            # Registered ACL mappings and the process-wide MemFabric reservation
+            # have no matching per-pool release/rebind operation.
+            logger.warning(
+                "Keeping HiCache host memory resident with %s.", type(backend).__name__
+            )
+            return
+        for entry in self.entries:
+            pool = entry.host_pool
+            if isinstance(pool, HostKVCache) and not hasattr(
+                pool, "_host_memory_released"
+            ):
+                # Some custom layouts allocate their own buffers and do not
+                # initialize the HostKVCache lifecycle. Keep the whole group.
+                logger.warning(
+                    "Keeping HiCache host memory resident with %s.", type(pool).__name__
+                )
+                return
+        # A partial release must also block storage attachment until resume.
+        self.memory_occupation_released = True
         for entry in self.entries:
             release = getattr(entry.host_pool, "release_memory_occupation", None)
             if release is not None:
@@ -72,10 +98,13 @@ class HostPoolGroup:
 
     def resume_memory_occupation(self) -> None:
         """Restore every pool in the group that was offloaded."""
+        if not self.memory_occupation_released:
+            return
         for entry in self.entries:
             resume = getattr(entry.host_pool, "resume_memory_occupation", None)
             if resume is not None:
                 resume()
+        self.memory_occupation_released = False
 
     def _refresh_transfer_capabilities(self) -> None:
         child_write_back_jit = [

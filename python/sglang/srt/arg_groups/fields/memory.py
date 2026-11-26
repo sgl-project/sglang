@@ -195,7 +195,9 @@ class Memory(msgspec.Struct):
     release_hicache: A[
         bool,
         "Release the HiCache host KV pool together with the KV cache during "
-        "release_memory_occupation, and rebuild it on resume.",
+        "release_memory_occupation, and rebuild it empty on resume. L2 remains "
+        "resident with active L3 storage, unsupported host layouts, or the ACL "
+        "and MemFabric NPU host allocators.",
     ] = False
     hicache_storage_prefetch_retry_poll_interval: A[
         int,

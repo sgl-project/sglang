@@ -4179,6 +4179,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 "HiCache is not initialized; launch with "
                 "--enable-hierarchical-cache to attach a storage backend.",
             )
+        if self.cache_controller.mem_pool_host.memory_occupation_released:
+            return (
+                False,
+                "Resume HiCache host memory before attaching a storage backend.",
+            )
         return self._storage_attachment.attach(
             storage_backend=storage_backend,
             storage_backend_extra_config_json=storage_backend_extra_config_json,
