@@ -1,3 +1,4 @@
+# i48424 CI dispatch probe 2026-11-26T03:35Z (temporary; PR will be closed)
 """The vectorized row-scale kernel must be BIT-identical to the triton
 apply_log_scaling_tau kernel it replaces (same fp32 multiply + bf16 round),
 including on the row-strided qkvr-slice layouts."""
