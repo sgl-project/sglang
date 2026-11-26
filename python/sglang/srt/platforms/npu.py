@@ -9,7 +9,11 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
+from sglang.srt.platforms.interface import (
+    HostMemoryMapping,
+    PlatformCapabilities,
+    SRTPlatform,
+)
 
 
 class NPUDeviceMixin(DeviceMixin):
@@ -81,3 +85,29 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
 
     def get_dispatch_key_name(self) -> str:
         return "npu"
+
+    def register_host_memory(
+        self, host_ptr: int, nbytes: int
+    ) -> Optional[HostMemoryMapping]:
+        from sglang.srt.hardware_backend.npu.host_memory import (
+            register_host_memory as _register,
+        )
+
+        mapping = _register(host_ptr, nbytes)
+        if mapping is None:
+            raise RuntimeError(
+                "cannot map host memory for device access: aclrtHostRegister "
+                f"failed for {nbytes} bytes at {host_ptr:#x}"
+            )
+        return mapping
+
+    def unregister_host_memory(self, mapping: HostMemoryMapping) -> None:
+        from sglang.srt.hardware_backend.npu.host_memory import (
+            unregister_host_memory as _unregister,
+        )
+
+        _unregister(mapping)
+
+    def get_max_kernel_grid_size(self) -> Optional[int]:
+        # Ascend rejects launches with grid (coreDim) > 65535.
+        return 65535
