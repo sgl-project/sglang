@@ -7,6 +7,7 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
@@ -30,7 +31,7 @@ from sglang.srt.layers.quantization.utils import (
     swap_w13_to_w31,
 )
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.utils import get_bool_env_var, is_hip, is_xpu
+from sglang.srt.utils import is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -43,7 +44,7 @@ __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -384,9 +385,14 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif _is_xpu and moe_runner_backend.is_intel_xpu():
+            self.runner = None
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            raise ValueError(
+                "compressed-tensors FP8 MoE supports --moe-runner-backend auto, "
+                "aiter, triton, intel_xpu, flashinfer_trtllm and "
+                f"flashinfer_trtllm_routed; got {moe_runner_backend.value}."
+            )
 
     def apply_weights(
         self,
