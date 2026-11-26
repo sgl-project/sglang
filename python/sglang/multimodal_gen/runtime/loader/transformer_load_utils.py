@@ -972,6 +972,17 @@ def _resolve_weight_override_quantization(
         reverse_param_names_mapping=reverse_param_names_mapping,
         quant_ignore_remap=quant_ignore_remap,
     )
+    if description_config is None and detected_quantized_tensors:
+        from sglang.multimodal_gen.runtime.layers.quantization.lightx2v_fp8 import (
+            build_lightx2v_fp8_config,
+        )
+
+        description_config = build_lightx2v_fp8_config(safetensors_list)
+        if description_config is not None:
+            logger.info(
+                "Detected LightX2V Qwen-Image rowwise FP8 checkpoint (%d layers)",
+                len(description_config.fp8_layers),
+            )
     return (
         description_config,
         detected_quantized_tensors or description_config is not None,
