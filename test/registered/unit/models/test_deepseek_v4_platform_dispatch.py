@@ -409,7 +409,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         self.assertEqual(seen["args"], (residual, comb, x, post_mix))
         torch.testing.assert_close(out, residual + 1.0)
 
-    def test_npu_v41_a3_post_dispatch(self):
+    def test_npu_v41_non_arch35_post_dispatch(self):
         cfg = self._sub_layer().cfg
         x = torch.zeros(2, 128, dtype=torch.bfloat16)
         residual = torch.zeros(2, 4, 128, dtype=torch.bfloat16)
@@ -422,7 +422,6 @@ class TestNpuMhcSeam(unittest.TestCase):
         with (
             patch.object(mhc, "_is_npu", True),
             patch.object(mhc, "is_npu_arch35", return_value=False),
-            patch.object(npu_mhc, "_is_ascend_a3", return_value=True) as is_a3,
             patch.object(npu_mhc, "post_torch", fallback),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
@@ -441,9 +440,6 @@ class TestNpuMhcSeam(unittest.TestCase):
             empty = mhc.post(cfg, x[:0], residual[:0], post_mix[:0], comb[:0])
             self.assertEqual(empty.shape, (0, 4, 128))
             fallback.assert_not_called()
-            is_a3.return_value = False
-            mhc.post(cfg, x, residual, post_mix, comb)
-            fallback.assert_called_once_with(x, residual, post_mix, comb)
             cann.assert_not_called()
 
     def test_npu_v4_post_delegates_the_kernel_choice_to_sgl_kernel_npu(self):

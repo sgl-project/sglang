@@ -1,8 +1,7 @@
-"""A3 DSV4.1 mHC coefficient and residual mixing."""
+"""NPU DSV4.1 mHC coefficient and residual mixing."""
 
 from __future__ import annotations
 
-from functools import cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,13 +36,6 @@ def mix_stats_torch(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     return pre, post_mix, comb
 
 
-@cache
-def _is_ascend_a3() -> bool:
-    from torch_npu.npu._backends import get_soc_version
-
-    return get_soc_version() // 10 == 25
-
-
 def post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -58,7 +50,6 @@ def post(
         and x.dtype == residual.dtype
         and x.dtype in (torch.float16, torch.bfloat16)
         and post_mix.dtype == comb.dtype == torch.float32
-        and _is_ascend_a3()
     ):
         from sgl_kernel_npu.operators.hyper_conn import mhc_post_dpskv4
 
