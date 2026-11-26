@@ -163,7 +163,7 @@ python3 -m sglang.launch_server \
     --hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'
 ```
 
-> **Note**: For DSA models, `--kv-cache-dtype` defaults to `auto`, which resolves to `fp8_e4m3` on SM100+ (Blackwell) and `bfloat16` on older architectures. The DSA decode backend is automatically selected based on KV dtype (`bfloat16` → `flashmla_sparse`, `fp8_e4m3` → `flashmla_kv`), except for GLM DSA models on SM120/SM121 with `fp8_e4m3`, which use `flashinfer_sparse_mla`. DSA backend flags apply only to DSA models; DeepSeek V4 uses its own `dsv4` attention backend.
+> **Note**: For DSA models, `--kv-cache-dtype` defaults to `auto`, which resolves to `fp8_e4m3` on SM100+ (Blackwell) and on MI355X (gfx950) with AITER enabled and the `triton` or `tilelang` DSA backends, and `bfloat16` elsewhere. Pass `--kv-cache-dtype bfloat16` to keep a BF16 KV cache. The DSA decode backend is automatically selected based on KV dtype (`bfloat16` → `flashmla_sparse`, `fp8_e4m3` → `flashmla_kv`), except for GLM DSA models on SM120/SM121 with `fp8_e4m3`, which use `flashinfer_sparse_mla`. DSA backend flags apply only to DSA models; DeepSeek V4 uses its own `dsv4` attention backend.
 
 ### MiniMax M3
 

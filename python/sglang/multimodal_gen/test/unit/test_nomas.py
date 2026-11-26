@@ -276,6 +276,41 @@ def condition(device="cpu", dtype=torch.float32, padded=True):
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires CUDA graph capture",
+)
+@torch.inference_mode()
+def test_offline_graph_replays_with_current_action_mask():
+    from functools import partial
+
+    from msgspec.structs import replace
+
+    model = tiny_model("cuda", "flex").bfloat16()
+    runner = model.offline_graph(warmup=True)
+    results = []
+    shape = (2, 2, 2)
+    for index, padded in enumerate((True, False, True)):
+        event = condition("cuda", torch.bfloat16, padded)
+        event = replace(event, camera_embedding=None, camera_has_mask=None)
+
+        def generate(graph_predict=None):
+            session = NomasLatentSession(model, cache_capacity=0, seed=11, steps=2)
+            return session.generate_segment(
+                shape, event, cache_segment=False, graph_predict=graph_predict
+            )
+
+        expected = generate()
+        result = generate(partial(runner.predict, warmup=index == 0))
+        assert len(runner.entries) == 1
+        assert torch.equal(result, expected)
+        results.append(result)
+    assert torch.equal(results[0], results[2])
+    assert not torch.equal(results[0], results[1])
+    model.release_cuda_graphs()
+    assert not runner.entries and model.offline_graph(warmup=False) is None
+
+
 def tiny_decoder():
     torch.manual_seed(5)
     arch = NomasVAEArchConfig(
@@ -870,6 +905,69 @@ def test_pixelumm_fused_qk_norm_mrope_is_bitwise_exact(tokens, heads, batch):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires NVIDIA CUDA",
+)
+@torch.inference_mode()
+def test_pixelumm_mrope_fusion_matches_compiled_reference_and_fallback(monkeypatch):
+    from sglang.kernels import ops
+    from sglang.kernels.arch import current_arch
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.vaes import nomas
+
+    if not current_arch().is_sm_at_least(10):
+        pytest.skip("fusion requires SM100+")
+    gate = BitExactFusionGate("test Nomas VAE MRoPE", per_signature=True)
+    monkeypatch.setattr(nomas, "_QK_MROPE_FUSION", gate)
+    kernel = ops.diffusion.fused_nomas_qk_norm_mrope
+    calls = []
+
+    def counted(*args):
+        calls.append(args[0].shape)
+        return kernel(*args)
+
+    monkeypatch.setattr(ops.diffusion, "fused_nomas_qk_norm_mrope", counted)
+    torch.manual_seed(831)
+    for dim, batch, tokens, heads in (
+        (128, 1, 16384, 32),
+        (128, 2, 36, 8),
+        (64, 2, 36, 8),
+    ):
+        attention = (
+            nomas.GenAttention(nomas.GenExpertArch(hidden_size=128, head_dim=dim))
+            .cuda()
+            .bfloat16()
+        )
+        attention.q_norm_t.weight.normal_()
+        attention.q_norm_hw.weight.normal_()
+        x = torch.randn(batch, 35200, heads, dim, device="cuda", dtype=torch.bfloat16)[
+            :, :tokens
+        ]
+        cos, sin = nomas.mrope_tables(attention.arch, (10, 44, 80), "cuda")
+        cos, sin = cos[:, :tokens], sin[:, :tokens]
+        half = dim // 2
+        expected = nomas._compiled_qk_norm_mrope()(
+            x,
+            nomas._mean_square(x[..., :half]),
+            nomas._mean_square(x[..., half:]),
+            attention.q_norm_t.eps,
+            attention.q_norm_t.weight,
+            attention.q_norm_hw.weight,
+            cos,
+            sin,
+            attention.arch.rope_sections,
+            x.dtype,
+        )
+        before = len(calls)
+        actual = attention._prepare_qk(
+            x, cos, sin, attention.q_norm_t, attention.q_norm_hw, x.dtype
+        )
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        assert (len(calls) > before) == (dim == 128)
+    assert gate.verified_sigs and not gate.disabled
+
+
 def test_scheduler_loader_uses_effective_shift(tmp_path):
 
     from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -1098,6 +1196,56 @@ def test_latent_preparation_preserves_offline_noise_and_skips_online_draw(online
         expected = LatentPreparationStage(scheduler, None).forward(request(), args)
         torch.testing.assert_close(result.latents, expected.latents, atol=0, rtol=0)
         assert torch.equal(result.generator.get_state(), expected.generator.get_state())
+
+
+def test_offline_request_with_several_outputs_runs_one_sample_per_output():
+    from sglang.multimodal_gen.configs.sample.nomas import NomasSamplingParams
+    from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+        SyncExecutor,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.stages import (
+        NomasInputValidationStage,
+        NomasLatentPreparationStage,
+    )
+
+    args = SimpleNamespace(
+        pipeline_config=NomasPipelineConfig(), enable_cfg_parallel=False
+    )
+    stages = [
+        object.__new__(NomasInputValidationStage),
+        NomasLatentPreparationStage(FlowMatchEulerDiscreteScheduler(shift=5.0), None),
+    ]
+    executor = object.__new__(SyncExecutor)
+    executor.execute_group = lambda stages, batches, server_args: [
+        stages[0].forward(batch, server_args) for batch in batches
+    ]
+    executor.execute = lambda stages, batch, server_args: stages[0].forward(
+        batch, server_args
+    )
+
+    def run(num_outputs):
+        batch = Req(
+            sampling_params=NomasSamplingParams(
+                request_id="job",
+                prompt="road",
+                num_frames=17,
+                height=64,
+                width=64,
+                seed=42,
+                num_outputs_per_prompt=num_outputs,
+            )
+        )
+        batch.prompt_embeds = [torch.zeros(1, 8, 128)]
+        return list(executor.execute_group_sequentially(stages, [batch], args))
+
+    (single,) = run(1)
+    outputs = run(2)
+    assert [getattr(out, "error", None) for out in outputs] == [None, None]
+    assert [out.seed for out in outputs] == [42, 43]
+    assert [out.latents.shape for out in outputs] == [(1, 32, 5, 2, 2)] * 2
+    torch.testing.assert_close(outputs[0].latents, single.latents, atol=0, rtol=0)
+    assert not torch.equal(outputs[0].latents, outputs[1].latents)
 
 
 def _fp8_linear(in_features, out_features, device=None):
@@ -1395,6 +1543,39 @@ def test_int8_group_boundary_and_partial_final_group(int8_layer):
     inputs[1, 128] = 1
     expected = (127 * int8_layer.weight_scale).bfloat16().T + int8_layer.bias
     torch.testing.assert_close(int8_layer(inputs), expected, rtol=0, atol=0)
+
+
+def test_int8_loading_rejects_invalid_group_metadata(int8_layer):
+    """Reject malformed groupwise scales during weight loading."""
+    int8_layer.quant_method.process_weights_after_loading(int8_layer)
+    int8_layer.weight_scale = torch.nn.Parameter(
+        torch.ones((2, 1), dtype=torch.float32), requires_grad=False
+    )
+    with pytest.raises(ValueError, match="groupwise shape"):
+        int8_layer.quant_method.process_weights_after_loading(int8_layer)
+
+
+@torch.inference_mode()
+def test_int8_dequant_survives_device_moves_and_compile(int8_layer):
+    """Fused dequantization supports component offload and compiled inference."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    inputs = torch.ones(2, 130, dtype=torch.bfloat16)
+    expected = int8_layer(inputs)
+    int8_layer.quant_method.process_weights_after_loading(int8_layer)
+    for device in ("cuda", "cpu", "cuda"):
+        int8_layer.to(device)
+        actual = int8_layer(inputs.to(device)).cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    compiled = torch.compile(int8_layer, fullgraph=True)
+    torch.testing.assert_close(compiled(inputs.cuda()).cpu(), expected, rtol=0, atol=0)
+    if torch.cuda.device_count() > 1:
+        current = torch.cuda.current_device()
+        other = (current + 1) % torch.cuda.device_count()
+        int8_layer.to(f"cuda:{other}")
+        actual = int8_layer(inputs.to(f"cuda:{other}")).cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.cuda.current_device() == current
 
 
 @pytest.mark.parametrize(

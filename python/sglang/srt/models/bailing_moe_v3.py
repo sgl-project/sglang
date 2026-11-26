@@ -85,16 +85,13 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
-from sglang.srt.models.utils import bind_or_assign
+from sglang.srt.models.utils import apply_qk_norm, bind_or_assign
 from sglang.srt.runtime_context import (
     get_parallel,
-    get_platform,
     get_stream,
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    is_cuda,
-    is_flashinfer_available,
     log_info_on_rank0,
 )
 
@@ -116,10 +113,6 @@ def _get_awq_dequantize():
 
         return awq_dequantize
     return None
-
-
-_is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and get_platform().is_sm100
 
 
 class DsV3MLA(DeepseekV2AttentionMLA):
@@ -904,10 +897,12 @@ class BailingMoEAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = None,
         prefix: str = "mha",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.layer_id = layer_id
+        self.alt_stream = alt_stream
 
         self.hidden_size = config.hidden_size
         tp_size = get_parallel().attn_tp_size
@@ -978,17 +973,6 @@ class BailingMoEAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        q_by_head = q.reshape(-1, self.head_dim)
-        q_by_head = self.query_layernorm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.reshape(-1, self.head_dim)
-        k_by_head = self.key_layernorm(k_by_head)
-        k = k_by_head.view(k.shape)
-        return q, k
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -999,7 +983,14 @@ class BailingMoEAttention(nn.Module):
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            q, k = self._apply_qk_norm(q, k)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.query_layernorm,
+                k_norm=self.key_layernorm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.dense(attn_output)
@@ -1063,6 +1054,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     quant_config=quant_config,
                     layer_id=self.layer_id,
                     prefix=prefix + ".attention",
+                    alt_stream=alt_stream,
                 )
         else:
             raise ValueError(f"Unsupported attention type: {config.attention_type}")
@@ -1189,15 +1181,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         return hidden_states
 
-    @staticmethod
-    def shared_moe_coefficient_loader(
-        param: torch.Tensor, loaded_weight: torch.Tensor
-    ) -> None:
-        assert param.size() == loaded_weight.size()
-
-        param.data.copy_(loaded_weight.to(torch.float32))
-        return
-
 
 class BailingMoELinearModel(nn.Module):
     def __init__(
@@ -1281,7 +1264,6 @@ class BailingMoELinearModel(nn.Module):
             self.norm = RMSNorm(config.hidden_size, **norm_kwargs)
         else:
             self.norm = PPMissingLayer()
-        self.embed_scale = 1.0
 
         # Hidden-state capture for speculative decoding (DSpark / DFlash / EAGLE3).
         # When set, ``forward`` appends each captured layer's final
@@ -1723,9 +1705,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
         # guard); a second model-level pass double-packs the scales and
         # crashes, which is why deepseek_v2 dropped its copy too.
 
-    def get_decoder_attention_types(self):
-        return self.model.decoder_attention_types
-
     def get_input_embeddings(self) -> nn.Module:
         return self.model.word_embeddings
 
@@ -2035,16 +2014,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         return loaded_params
-
-    def post_process_weights_if_quant(self):
-        for name, module in self.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                post_process = getattr(
-                    quant_method, "process_weights_after_loading", None
-                )
-                if post_process is not None:
-                    post_process(module)
 
     def get_embed_and_head(self):
         return self.model.word_embeddings.weight, self.lm_head.weight

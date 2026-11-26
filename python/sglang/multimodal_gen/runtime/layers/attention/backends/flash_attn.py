@@ -343,8 +343,6 @@ class FlashAttentionBackend(AttentionBackend):
     def supports_ring_rotation(cls) -> bool:
         return True
 
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]
@@ -356,10 +354,6 @@ class FlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["FlashAttentionImpl"]:
         return FlashAttentionImpl
-
-    @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        raise NotImplementedError
 
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:

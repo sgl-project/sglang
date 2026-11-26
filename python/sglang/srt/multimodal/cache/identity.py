@@ -429,7 +429,6 @@ def build_processor_fingerprint(
         "model_config": hf_payload,
         "model_revision": get_model().revision,
         "processor_revision": get_model().revision,
-        "disable_fast_image_processor": get_mm().disable_fast_image_processor,
         "mm_process_config": get_mm().mm_process_config or {},
         "processor": processor_payload,
         "extra": extra or {},

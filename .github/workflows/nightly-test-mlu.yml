@@ -27,8 +27,8 @@ jobs:
         suite:
           - nightly-test-2-mlu
     runs-on:
-      group: mlu-ci
-      labels: mlu-nightly
+      group: mlu-ci-runners
+      labels: mlu-nightly-test
     timeout-minutes: 480
     steps:
       # Fetch the helper from the trusted workflow commit, never the PR/test ref.

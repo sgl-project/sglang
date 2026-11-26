@@ -23,6 +23,8 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
+    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE3,
@@ -38,6 +40,8 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.pause_generate_url = cls.lb_url
         cls.pause_target_urls = [cls.prefill_url, cls.decode_url]
+        cls.extra_prefill_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
+        cls.extra_decode_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
         cls.launch_all()
 
     def test_gsm8k(self):
@@ -132,6 +136,56 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         output = response.json()["text"]
         # ensure the output is a valid JSON
         json.loads(output)
+
+    def test_prefill_answers_one_token_request_alone(self):
+        def generate(url, prompt, max_new_tokens, n=1):
+            return requests.post(
+                url + "/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": max_new_tokens,
+                        "n": n,
+                    },
+                },
+                timeout=60,
+            )
+
+        # A request for one token that names no decode gets from the prefill
+        # server the answer the prefill and decode give through the router.
+        prompt = "The capital of France is"
+        routed = generate(self.lb_url, prompt, 1).json()
+        alone = generate(self.prefill_url, prompt, 1)
+        self.assertEqual(alone.status_code, 200, alone.text)
+        alone = alone.json()
+        self.assertEqual(alone["output_ids"], routed["output_ids"])
+        self.assertEqual(
+            alone["meta_info"]["finish_reason"], routed["meta_info"]["finish_reason"]
+        )
+
+        # Its prompt is cached like any other, unlike a fake-bootstrap probe's.
+        unseen = " ".join(["An unseen prompt about cached prefixes."] * 40)
+        first = generate(self.prefill_url, unseen, 1).json()["meta_info"]
+        again = generate(self.prefill_url, unseen, 1).json()["meta_info"]
+        self.assertGreater(again["cached_tokens"], first["cached_tokens"])
+
+        # A request for no token is answered too, with none.
+        empty = generate(self.prefill_url, prompt, 0)
+        self.assertEqual(empty.status_code, 200, empty.text)
+        self.assertEqual(empty.json()["output_ids"], [])
+
+        # Parallel samples first warm the prompt up with such a request.
+        samples = generate(self.prefill_url, prompt, 1, n=2)
+        self.assertEqual(samples.status_code, 200, samples.text)
+        self.assertEqual(
+            [sample["output_ids"] for sample in samples.json()],
+            [routed["output_ids"]] * 2,
+        )
+
+        # Nothing would continue a longer request.
+        longer = generate(self.prefill_url, prompt, 2)
+        self.assertEqual(longer.status_code, 400, longer.text)
 
     def test_first_token_finish(self):
         client = openai.Client(api_key="empty", base_url=f"{self.lb_url}/v1")
@@ -437,6 +491,7 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.extra_decode_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
         cls.launch_all()
 
     def test_retract_pause_decode_running_batch(self):
@@ -469,6 +524,7 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
             async with session.post(
                 url,
                 json=json_data,
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 resp.raise_for_status()
@@ -613,6 +669,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             "--max-running-requests",
             str(cls.MAX_RUNNING),
             "--enable-metrics",
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
         cls.launch_all()
 
@@ -635,12 +692,14 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             async with session.post(
                 self.prefill_url + "/pause_generation",
                 json={"mode": mode},
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
             async with session.post(
                 self.prefill_url + "/continue_generation",
                 json={},
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
@@ -708,6 +767,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             async with session.post(
                 url,
                 json=json_data,
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp.raise_for_status()

@@ -2,6 +2,7 @@ import inspect
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
+from sglang.srt.arg_groups.choices import removed_choice_message
 from sglang.srt.entrypoints.openai.protocol import (
     LegacyStructuralTagResponseFormat,
     StructuralTagResponseFormat,
@@ -25,6 +26,7 @@ from sglang.srt.function_call.dots_detector import DotsToolDetector
 from sglang.srt.function_call.ernie55_detector import Ernie5_5Detector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
+from sglang.srt.function_call.gigachat4_detector import GigaChat4Detector
 from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
 from sglang.srt.function_call.glm4_moe_detector import (
     Glm4MoeDetector,
@@ -33,8 +35,10 @@ from sglang.srt.function_call.glm4_moe_detector import (
 )
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.granite_toolcall_detector import GraniteToolCallDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
+from sglang.srt.function_call.inkling2_detector import Inkling2Detector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
@@ -72,7 +76,7 @@ class FunctionCallParser:
     Parser for function/tool calls in model outputs.
 
     This class handles both streaming and non-streaming parsing of function calls using a detector.
-    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_increment
+    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_segments
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
@@ -88,10 +92,10 @@ class FunctionCallParser:
         "dots": DotsToolDetector,
         "ernie55": Ernie5_5Detector,
         "glm": Glm4MoeDetector,
-        "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
         "flint": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
+        "granite_toolcall_parser": GraniteToolCallDetector,
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
@@ -105,7 +109,6 @@ class FunctionCallParser:
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,
-        "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "spark25": Spark25Detector,
         "step3": Step3Detector,
@@ -120,8 +123,10 @@ class FunctionCallParser:
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
         "gigachat35": GigaChat35Detector,
+        "gigachat4": GigaChat4Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
+        "inkling2": Inkling2Detector,
         "iquest_q1": IQuestQ1Detector,
         "response_template": ResponseTemplateToolDetector,
     }
@@ -152,7 +157,10 @@ class FunctionCallParser:
                 kwargs["tools"] = self.structural_tag_tools()
             detector = detector_class(**kwargs)
         else:
-            raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+            message = removed_choice_message("tool_call_parser", tool_call_parser)
+            raise ValueError(
+                message or f"Unsupported tool_call_parser: {tool_call_parser}"
+            )
 
         if isinstance(detector, Glm47MoeDetector):
             detector.use_full_assistant_constraint = not any(
@@ -225,9 +233,27 @@ class FunctionCallParser:
         else:
             return full_text, []
 
+    def parse_stream_segments(
+        self, chunk_text: str
+    ) -> list[Tuple[str, list[ToolCallItem]]]:
+        """Parse a streamed chunk into (normal_text, calls) segments.
+
+        Each segment is sent text first, then calls; the segments are in
+        generation order.
+        """
+        if not self.tools and not self.detector.parses_without_tools():
+            return [(chunk_text, [])]
+        return [
+            (result.normal_text, result.calls)
+            for result in self.detector.parse_streaming_segments(chunk_text, self.tools)
+        ]
+
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
         Streaming incremental parsing of chunks of text as they arrive.
+
+        parse_stream_segments merged into one pair, for callers that do not
+        depend on the order of text and calls.
 
         Args:
             chunk_text: The new chunk of text to parse
@@ -237,19 +263,11 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        if not self.tools and not self.detector.parses_without_tools():
-            return chunk_text, []
-        final_normal_text = ""
-        final_calls = []
-
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
-        if sp_result.normal_text:
-            final_normal_text = sp_result.normal_text
-        if sp_result.calls:
-            final_calls.extend(sp_result.calls)
-            final_normal_text = sp_result.normal_text
-
-        return final_normal_text, final_calls
+        normal_text, calls = "", []
+        for text, segment_calls in self.parse_stream_segments(chunk_text):
+            normal_text += text
+            calls.extend(segment_calls)
+        return normal_text, calls
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.

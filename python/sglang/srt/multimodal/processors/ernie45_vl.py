@@ -19,7 +19,12 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import is_npu, logger
+from sglang.srt.multimodal.qwen_vl_media_processing import (
+    ceil_by_factor,
+    floor_by_factor,
+    round_by_factor,
+)
+from sglang.srt.utils import is_cpu, is_npu, logger
 
 _is_npu = is_npu()
 
@@ -101,27 +106,6 @@ def resize_image(
     return image
 
 
-def round_by_factor(number: int | float, factor: int) -> int:
-    return round(number / factor) * factor
-
-
-def ceil_by_factor(number: int | float, factor: int) -> int:
-    return math.ceil(number / factor) * factor
-
-
-def floor_by_factor(number: int | float, factor: int) -> int:
-    return math.floor(number / factor) * factor
-
-
-async def resize_image_async(
-    image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
-):
-    return resize_image(image, min_pixels, max_pixels, size_factor)
-
-
 def smart_nframes(
     ele: dict,
     total_frames: int,
@@ -176,12 +160,11 @@ async def preprocess_video(
     image_factor: int = IMAGE_FACTOR,
 ) -> torch.Tensor:
 
-    total_frames, video_fps = len(vr), vr.get_avg_fps()
+    total_frames, video_fps = len(vr), vr.avg_fps
     nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
-    video_np = vr.get_batch(idx).asnumpy()
-    video = torch.from_numpy(video_np).pin_memory()
+    video = vr.get_frames_as_tensor(idx.tolist())
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
     nframes, _, height, width = video.shape
     min_pixels = VIDEO_MIN_PIXELS
@@ -205,7 +188,8 @@ async def preprocess_video(
     )
 
     video = video.permute(0, 2, 3, 1)
-    video = video.pin_memory()
+    if not is_cpu() and video.device.type == "cpu":
+        video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,
@@ -223,17 +207,9 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        self.hf_config = hf_config
-        self.model_type = hf_config.model_type
         self.image_start_token_id = hf_config.image_start_token_id
         self.image_end_token_id = hf_config.image_end_token_id
-        self.video_start_token_id = hf_config.video_start_token_id
-        self.video_end_token_id = hf_config.video_end_token_id
 
-        self.IMAGE_FACTOR = 28
-        self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
-        self.MAX_RATIO = 200
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>",
             video_token="<|VIDEO_START|><|video@placeholder|><|VIDEO_END|>",
@@ -241,7 +217,6 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             video_token_id=hf_config.im_patch_id,  # image and video use the same token_id
         ).build(_processor)
 
-        self.tokenizer = self._processor.tokenizer
         self.image_processor = self._processor.image_processor
 
     def _pixel_values_norm(
@@ -354,7 +329,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
                     if result["pixel_values_videos"].numel() == 0:
                         del result["pixel_values_videos"]
 
-        if not self.use_cuda_ipc:
+        if not self._feature_transport.use_cuda_ipc:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result and isinstance(
