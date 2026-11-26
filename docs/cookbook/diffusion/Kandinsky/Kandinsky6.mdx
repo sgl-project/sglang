@@ -265,10 +265,13 @@ the `transformer.` prefix. Both video and audio branches belong to `transformer`
 an adapter can change both outputs.
 
 Add `--lora-path /path/to/adapter.safetensors` to load an adapter at startup.
-To switch an existing server to dynamic LoRA without restarting:
+To switch an existing server to dynamic LoRA without restarting, launch it with
+`--admin-api-key <key>` (the LoRA endpoints answer 403 without one) and send
+that key:
 
 ```bash
 curl --fail-with-body http://localhost:30000/v1/set_lora \
+  -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "lora_nickname": "kandinsky6",
@@ -286,6 +289,7 @@ model:
 
 ```bash
 curl --fail-with-body http://localhost:30000/v1/unmerge_lora_weights \
+  -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" \
   -H "Content-Type: application/json" -d '{"target": "transformer"}'
 ```
 

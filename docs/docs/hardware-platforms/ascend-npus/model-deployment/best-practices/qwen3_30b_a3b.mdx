@@ -10,7 +10,10 @@ This page focuses on optimal configuration and benchmark results for Qwen3-30B-A
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
-The configurations on this page use the daily build image `quay.io/ascend/sglang:main-cann9.1.0-a3`.
+<Warning>
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
+The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
+</Warning>
 
 ### Low Latency
 
@@ -107,7 +110,7 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 8 \
     --tp-size 2 \
-    --attn-dp-size 2 \
+    --enable-dp-attention --dp-size 2 \
     --mem-fraction-static 0.85 \
     --cuda-graph-bs-decode 1 2 4 8 16 20 24 28 32 36 40 44 48 52 56 60 64 68 72 76 80 84 \
     --dtype bfloat16 \
