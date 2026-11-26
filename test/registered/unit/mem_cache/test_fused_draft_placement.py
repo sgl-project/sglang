@@ -754,6 +754,7 @@ class TestFusedDraftDecision(CustomTestCase):
         draft_window_size=None,
         platform=None,
         draft_overrides=None,
+        disaggregation_mode="null",
     ):
         """``draft_quant_config`` is the quant config the draft model keeps
         once built; by default one declaring an FP8 KV cache exactly when the
@@ -862,7 +863,8 @@ class TestFusedDraftDecision(CustomTestCase):
                 kvc,
                 "get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_retraction_backup=retraction_backup
+                    disaggregation_decode_retraction_backup=retraction_backup,
+                    disaggregation_mode=disaggregation_mode,
                 ),
             ),
             patch.object(kvc, "get_spec", return_value=spec),
@@ -916,7 +918,9 @@ class TestFusedDraftDecision(CustomTestCase):
                         placement.new_bands[band].window, int(band.split("_")[1])
                     )
 
-    def _all_window_dflash(self, *, sliding_window=128, layer_types=None, **kwargs):
+    def _all_window_dflash_decision(
+        self, *, sliding_window=128, layer_types=None, **kwargs
+    ):
         options = dict(
             algorithm="DFLASH",
             draft_backend="trtllm_mha",
@@ -930,12 +934,17 @@ class TestFusedDraftDecision(CustomTestCase):
             platform={"is_cuda": True},
         )
         options.update(kwargs)
-        return self._decide(**options).placement
+        return self._decide(**options)
+
+    def _all_window_dflash(self, **kwargs):
+        return self._all_window_dflash_decision(**kwargs).placement
 
     def test_an_all_window_dflash_draft_is_placed_on_a_window_band(self):
-        placement = self._all_window_dflash()
-        self.assertEqual(placement.hosts(), ("window_127",))
-        self.assertEqual(placement.new_bands, {})
+        for draft_backend in ("trtllm_mha", "fa4"):
+            with self.subTest(draft_backend):
+                placement = self._all_window_dflash(draft_backend=draft_backend)
+                self.assertEqual(placement.hosts(), ("window_127",))
+                self.assertEqual(placement.new_bands, {})
         placement = self._all_window_dflash(sliding_window=65)
         self.assertEqual(set(placement.new_bands), {"window_64"})
 
@@ -958,12 +967,36 @@ class TestFusedDraftDecision(CustomTestCase):
                 dict(draft_overrides={"disable_hybrid_swa_memory": True}),
             ),
             ("block-scaled draft KV", dict(draft_kv_dtype="mxfp8")),
+            ("window geometry differs", dict(draft_overrides={"swa_head_dim": 32})),
+            (
+                "window KV heads differ",
+                dict(draft_overrides={"get_swa_num_kv_heads": lambda tp: 2}),
+            ),
         ):
             with self.subTest(name):
                 placement = self._all_window_dflash(**kwargs)
                 self.assertIsNotNone(placement)
                 self.assertEqual(placement.hosts(), ("full",))
                 self.assertEqual(placement.new_bands, {})
+
+    def test_pd_admits_only_a_draft_in_the_target_window_sub_pools(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode, draft="target window"):
+                decision = self._all_window_dflash_decision(disaggregation_mode=mode)
+                self.assertEqual(decision.placement.hosts(), ("window_127",))
+            for name, kwargs in (
+                ("full band", dict(draft_window_size=64)),
+                ("own window band", dict(sliding_window=65)),
+            ):
+                with self.subTest(mode=mode, draft=name):
+                    self.assertIsNotNone(self._all_window_dflash(**kwargs))
+                    decision = self._all_window_dflash_decision(
+                        disaggregation_mode=mode, **kwargs
+                    )
+                    self.assertIsNone(decision.placement)
+                    self.assertRegex(
+                        decision.declined, "share the target's sliding-window"
+                    )
 
     def test_a_draft_window_known_only_once_built_is_refused(self):
         with self.assertRaisesRegex(ValueError, "sliding_layer_window_size"):

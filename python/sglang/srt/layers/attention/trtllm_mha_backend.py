@@ -296,7 +296,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         config = model_runner.model_config
 
         # MHA-specific dimensions
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
@@ -397,18 +397,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         else:
             self._swa_full_to_swa_mapping = None
-        # ENCODER_ONLY verification uses one page table;
-        # window-only drafts need the SWA table.
-        self._encoder_only_reads_swa = (
-            self.runner_ids.is_fused_draft
-            and self.expand_encoder_only_verify
-            and self._swa_kv_pool is not None
-            and all(
-                self._is_window_layer(module)
-                for module in model_runner.model.modules()
-                if isinstance(module, RadixAttention)
-                and module.attn_type == AttentionType.ENCODER_ONLY
-            )
+        self._encoder_only_reads_swa = self._encoder_only_reads_window_table(
+            model_runner.model
         )
 
         # Static page-table width (upper bound). The CUDA-graph path builds the
@@ -736,6 +726,27 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return self._swa_kv_pool.layer_router.plays(
             layer.layer_id, IdSpaceKind.SLIDING_WINDOW
         )
+
+    def _encoder_only_reads_window_table(self, model: torch.nn.Module) -> bool:
+        # ENCODER_ONLY verify rows read one page table for all their layers.
+        if not (
+            self.runner_ids.is_fused_draft
+            and self.expand_encoder_only_verify
+            and self._swa_kv_pool is not None
+        ):
+            return False
+        on_window = {
+            self._is_window_layer(module)
+            for module in model.modules()
+            if isinstance(module, RadixAttention)
+            and module.attn_type == AttentionType.ENCODER_ONLY
+        }
+        if on_window == {True, False}:
+            raise ValueError(
+                "trtllm_mha reads one page table for ENCODER_ONLY verify, but this "
+                "fused draft has ENCODER_ONLY layers on both the window and full bands."
+            )
+        return on_window == {True}
 
     def _get_layer_cache_loc(
         self,

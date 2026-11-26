@@ -302,6 +302,8 @@ def _is_all_greedy(sampling_info) -> bool:
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
+    # Row 0 is the anchor, unless shift_label: then row i drafts token i + 1.
+    pred_hidden = pred_hidden[:, :-1] if draft_model.shift_label else pred_hidden[:, 1:]
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
     candidate_ids, unary_logits = draft_model.compute_candidates(
@@ -409,7 +411,7 @@ class _SelectorDraftSampler:
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
-        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
+        hs = hidden_states.view(bs, self.block_size, -1)
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
@@ -788,10 +790,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         # budget.
         self._runtime = bind_dflash_runtime(self, target_model)
         # Side stream only where KV frees wait on it (overlap scheduler, no unified
-        # memory or HiCache) and the stock round owns the draft KV writes.
+        # memory or HiCache), and beside a bound runtime only if it joins the aux.
         self._aux_overlap = (
             self._use_aux_graph
-            and self._runtime is None
+            and (self._runtime is None or "join_aux" in self._runtime.bindings)
             and envs.SGLANG_OPT_DFLASH_AUX_OVERLAP.get()
             and not get_schedule().disable_overlap_schedule
             and not get_memory().enable_unified_memory
@@ -1884,13 +1886,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH selector draft returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
-        num_pred = pred_hidden.shape[1]
+        num_pred = int(self.block_size) - 1
 
         candidate_ids, scores = _selector_lattice(
-            draft_model, pred_hidden, anchor_token_ids
+            draft_model, draft_hidden, anchor_token_ids
         )
-        device = pred_hidden.device
+        device = draft_hidden.device
         # Clamped like DSpark so greedy rows don't divide by zero.
         temperatures = (
             torch.ones(bs, dtype=torch.float32, device=device)

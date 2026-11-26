@@ -16,7 +16,7 @@ from sglang.srt.managers.schedule_batch import (
     branch_checkpoint,
     prefill_checkpoint_boundary,
 )
-from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import decode_alloc_lens
 from sglang.srt.mem_cache.kv.alloc.demand import (
     chunk_granule,
     largest_fitting_chunk,
@@ -94,6 +94,13 @@ class _WindowCache(RadixCache):
         return sum(len(call.args[0]) for call in calls)
 
 
+def _decode_reserve(reserve):
+    return patch(
+        "sglang.srt.mem_cache.allocation_sizing.get_decode_reserve",
+        return_value=reserve,
+    )
+
+
 def _retired_peak(
     prompt,
     new_tokens,
@@ -117,7 +124,7 @@ def _retired_peak(
     picks (`prefill_checkpoint_boundary`, or `branch_checkpoint` for a
     ``full_kv_hit``) and the tree retires behind it, as `checkpoint_into_tree`
     does. A speculative ``reserve`` allocates ahead per decode step
-    (`page_aligned_decode_alloc_lens`) and accepts one token per step."""
+    (`decode_alloc_lens`) and accepts one token per step."""
     cache = _WindowCache(
         window=window,
         page_size=page_size,
@@ -207,9 +214,10 @@ def _retired_peak(
                 kv = SimpleNamespace(
                     kv_allocated_len=allocated, kv_committed_len=committed
                 )
-                _, nxt, _ = page_aligned_decode_alloc_lens(
-                    [SimpleNamespace(kv=kv)], reserve=reserve, page_size=page_size
-                )
+                with _decode_reserve(reserve):
+                    _, nxt, _ = decode_alloc_lens(
+                        [SimpleNamespace(kv=kv)], page_size=page_size
+                    )
                 allocated = nxt[0]
                 peak = max(peak, live(allocated))
                 committed += 1
@@ -357,9 +365,8 @@ class TestDecodeRowsAllocatedAhead(CustomTestCase):
         req = SimpleNamespace(
             kv=SimpleNamespace(kv_allocated_len=prompt, kv_committed_len=prompt)
         )
-        _, nxt, _ = page_aligned_decode_alloc_lens(
-            [req], reserve=reserve, page_size=page_size
-        )
+        with _decode_reserve(reserve):
+            _, nxt, _ = decode_alloc_lens([req], page_size=page_size)
         return nxt[0]
 
     def test_a_speculative_reserve_beyond_a_short_request(self):

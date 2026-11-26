@@ -26,6 +26,9 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
+from sglang.srt.disaggregation.common.head_slice_layout import (
+    draft_window_chunk_start,
+)
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
@@ -42,7 +45,6 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     bind_thread_to_device,
     build_dcp_token_transfer_plan,
-    concurrent_contiguous_runs,
     group_concurrent_contiguous,
     pack_int_lists,
     run_on_device,
@@ -211,6 +213,9 @@ class KVArgsRegisterInfo:
     # the field; a PP>1 sender stage without a draft runner cannot derive the
     # host-backed/device-only boundary from its own registration.
     num_draft_entries: Optional[int] = None
+    # Decode with a radix cache reuses draft KV beyond the sliding window;
+    # a decode that does not say otherwise gets every draft page.
+    dst_needs_full_draft_kv: bool = True
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -269,6 +274,7 @@ class KVArgsRegisterInfo:
                 if len(msg) > 22 and msg[22] != b""
                 else None
             ),
+            dst_needs_full_draft_kv=len(msg) <= 23 or msg[23] != b"0",
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
@@ -399,6 +405,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._peers: Dict[str, PeerBuffers] = {}
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.draft_kv_tensors = None
+        self._draft_head_packer = None
+        self._draft_head_packer_lock = threading.Lock()
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
@@ -1370,27 +1379,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ``dst_device_entries`` lists the destination entries that use
         ``dst_device_data_indices``.
         """
-
-        # Scattered pages yield one run per page, so list grouping causes GC churn.
-        def units_for(index_slice: slice) -> tuple:
-            def to_units(src_indices, dst_indices) -> npt.NDArray[np.uint64]:
-                runs = concurrent_contiguous_runs(src_indices, dst_indices)
-                return np.stack(runs, axis=1).astype(np.uint64)
-
-            # Host and device buffers may use different destination page spaces.
-            kv_units = to_units(
-                prefill_data_indices[index_slice], dst_data_indices[index_slice]
-            )
-            device_kv_units = None
-            if dst_device_data_indices is not None:
-                device_kv_units = to_units(
-                    prefill_data_indices[index_slice],
-                    dst_device_data_indices[index_slice],
-                )
-            return kv_units, device_kv_units
-
+        # Host and device buffers may use different destination page spaces.
         # Build both transfer plans once, then select per destination buffer.
-        units = units_for(slice(None))
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_data_indices, dst_data_indices
+        )
+        device_prefill_kv_blocks = device_dst_kv_blocks = None
+        if dst_device_data_indices is not None:
+            device_prefill_kv_blocks, device_dst_kv_blocks = (
+                group_concurrent_contiguous(
+                    prefill_data_indices, dst_device_data_indices
+                )
+            )
 
         # Skipped once registration has cleared this peer's layout.
         if (
@@ -1428,45 +1428,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         if layers_params is None:
             return -1
-        # A negative page id would wrap to a huge uint64 offset.
-        for dst_indices in (dst_data_indices, dst_device_data_indices):
-            if (
-                dst_indices is not None
-                and prefill_data_indices.size
-                and dst_indices.size
-                and min(prefill_data_indices.min(), dst_indices.min()) < 0
-            ):
-                raise OverflowError("negative page index in a KV transfer")
 
-        def make_layer_copy(
-            src_entry: int, dst_entry: int, item_len: int, units: tuple
-        ) -> Copy:
-            kv_units, device_kv_units = units
-            if dst_device_entries and dst_entry in dst_device_entries:
-                assert device_kv_units is not None
-                kv_units = device_kv_units
+        kv_units = group_units(prefill_kv_blocks, dst_kv_blocks)
+        device_kv_units = (
+            group_units(device_prefill_kv_blocks, device_dst_kv_blocks)
+            if device_prefill_kv_blocks is not None
+            else None
+        )
+
+        def layer_copy(src_entry: int, dst_entry: int, item_len: int, units) -> Copy:
             return Copy(
                 src=src_keys[src_entry],
                 dst=dst_keys[dst_entry],
-                ranges=kv_units * item_len,
+                ranges=units * item_len,
             )
 
+        def make_layer_copy(src_entry: int, dst_entry: int, item_len: int) -> Copy:
+            if dst_device_entries and dst_entry in dst_device_entries:
+                assert device_kv_units is not None
+                units = device_kv_units
+            else:
+                units = kv_units
+            return layer_copy(src_entry, dst_entry, item_len, units)
+
         # Worker function for processing a single layer
-        def process_layer(
-            src_entry: int, dst_entry: int, item_len: int, units: tuple
-        ) -> int:
+        def process_layer(src_entry: int, dst_entry: int, item_len: int) -> int:
             return self._transfer_copies(
-                mooncake_session_id,
-                [make_layer_copy(src_entry, dst_entry, item_len, units)],
+                mooncake_session_id, [make_layer_copy(src_entry, dst_entry, item_len)]
             )
 
         # Worker function for processing all layers in a batch
-        def process_layers(
-            layers_params: List[Tuple[int, int, int]], units: tuple
-        ) -> int:
+        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             return self._transfer_copies(
                 mooncake_session_id,
-                [make_layer_copy(*params, units) for params in layers_params],
+                [make_layer_copy(*params) for params in layers_params],
             )
 
         if (
@@ -1474,8 +1469,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
             futures = [
-                executor.submit(process_layer, *params, units)
-                for params in layers_params
+                executor.submit(process_layer, *params) for params in layers_params
             ]
             return self._await_transfer_futures(futures)
         else:
@@ -1484,16 +1478,53 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # users explicitly opt in to bounded index batches.
             max_batch_indices = self.max_transfer_batch_indices
             if max_batch_indices <= 0 or prefill_data_indices.size <= max_batch_indices:
-                return process_layers(layers_params, units)
+                return process_layers(layers_params)
+
+            def process_index_batch(
+                prefill_blocks,
+                dst_blocks,
+                device_prefill_blocks=None,
+                device_dst_blocks=None,
+            ) -> int:
+                units = group_units(prefill_blocks, dst_blocks)
+                device_units = (
+                    group_units(device_prefill_blocks, device_dst_blocks)
+                    if device_prefill_blocks is not None
+                    else None
+                )
+                copies = []
+                for src_entry, dst_entry, item_len in layers_params:
+                    if dst_device_entries and dst_entry in dst_device_entries:
+                        assert device_units is not None
+                        copies.append(
+                            layer_copy(src_entry, dst_entry, item_len, device_units)
+                        )
+                    else:
+                        copies.append(layer_copy(src_entry, dst_entry, item_len, units))
+                return self._transfer_copies(mooncake_session_id, copies)
 
             for start in range(
                 0,
                 prefill_data_indices.size,
                 max_batch_indices,
             ):
-                ret = process_layers(
-                    layers_params,
-                    units_for(slice(start, start + max_batch_indices)),
+                batch_prefill_blocks, batch_dst_blocks = group_concurrent_contiguous(
+                    prefill_data_indices[start : start + max_batch_indices],
+                    dst_data_indices[start : start + max_batch_indices],
+                )
+                batch_device_prefill_blocks = batch_device_dst_blocks = None
+                if dst_device_data_indices is not None:
+                    batch_device_prefill_blocks, batch_device_dst_blocks = (
+                        group_concurrent_contiguous(
+                            prefill_data_indices[start : start + max_batch_indices],
+                            dst_device_data_indices[start : start + max_batch_indices],
+                        )
+                    )
+                ret = process_index_batch(
+                    batch_prefill_blocks,
+                    batch_dst_blocks,
+                    batch_device_prefill_blocks,
+                    batch_device_dst_blocks,
                 )
                 if ret != 0:
                     return ret
@@ -2320,6 +2351,211 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return self._await_transfer_futures(futures)
 
+    def set_draft_kv_tensors(self, tensors: List[torch.Tensor]) -> None:
+        """Draft K/V tensors in kv_data_ptrs order, for packing head slices on GPU."""
+        self.draft_kv_tensors = tensors
+
+    def _get_draft_head_packer(self):
+        # Built on the first heterogeneous-TP send, so same-TP serving holds no staging.
+        from sglang.srt.disaggregation.mooncake.draft_head_packer import (
+            DraftHeadPacker,
+        )
+
+        with self._draft_head_packer_lock:
+            if self._draft_head_packer is None:
+                self._draft_head_packer = DraftHeadPacker(
+                    tensors=self.draft_kv_tensors,
+                    page_size=self.kv_args.page_size,
+                    window_pages=self.kv_args.draft_window_pages,
+                    register=self.engine.batch_register,
+                )
+            return self._draft_head_packer
+
+    def send_kvcache_page_row_slice(
+        self,
+        *,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        dst_kv_item_lens: list[int],
+        dst_layer_ids: List[int],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        draft_start: int = 0,
+    ) -> int:
+        """Head-sliced send for the MSA-v1 NVFP4 page-row main KV and its draft KV.
+
+        Draft KV is sent only for this chunk's pages from `draft_start` on.
+        """
+        from sglang.srt.disaggregation.common.head_slice_layout import (
+            paged_segment_addresses,
+        )
+
+        try:
+            segment_jobs, draft_segment_jobs, draft_jobs = (
+                self._plan_head_sliced_entries(
+                    dst_kv_ptrs=dst_kv_ptrs,
+                    dst_tp_rank=dst_tp_rank,
+                    dst_attn_tp_size=dst_attn_tp_size,
+                    dst_kv_item_lens=dst_kv_item_lens,
+                    dst_layer_ids=dst_layer_ids,
+                )
+            )
+            # Built lazily: its staging allocation and registration can fail,
+            # and a raise from this thread would stop the transfer worker.
+            draft_head_packer = self._get_draft_head_packer() if draft_jobs else None
+        except (ValueError, RuntimeError) as e:
+            logger.error(f"[{mooncake_session_id}] head-sliced KV send: {e}")
+            return -1
+
+        def transfer(src, dst, lengths) -> int:
+            if not src:
+                return 0
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src, dst, lengths
+            )
+
+        def transfer_segments(job, src_pages, dst_pages) -> int:
+            return transfer(
+                *paged_segment_addresses(
+                    src_page_indices=src_pages,
+                    dst_page_indices=dst_pages,
+                    **job,
+                )
+            )
+
+        futures = [
+            executor.submit(transfer_segments, job, prefill_kv_indices, dst_kv_indices)
+            for job in segment_jobs
+        ]
+        draft_src_pages = prefill_kv_indices[draft_start:]
+        draft_dst_pages = dst_kv_indices[draft_start:]
+        if len(draft_src_pages) > 0:
+            futures += [
+                executor.submit(
+                    transfer_segments, job, draft_src_pages, draft_dst_pages
+                )
+                for job in draft_segment_jobs
+            ]
+            if draft_head_packer is not None:
+                futures.append(
+                    executor.submit(
+                        draft_head_packer.send,
+                        src_page_indices=draft_src_pages,
+                        dst_page_indices=draft_dst_pages,
+                        jobs=draft_jobs,
+                        transfer=transfer,
+                    )
+                )
+        return self._await_transfer_futures(futures)
+
+    def _plan_head_sliced_entries(
+        self,
+        *,
+        dst_kv_ptrs: list[int],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        dst_kv_item_lens: list[int],
+        dst_layer_ids: List[int],
+    ):
+        """Byte segments for target entries, and for draft entries either GPU pack
+        jobs or token-major byte segments.
+
+        Draft entries are token-major. They are packed on GPU into one run per page
+        when each decode page is a run of local heads; otherwise one run per token.
+        """
+        from sglang.srt.disaggregation.common.head_slice_layout import (
+            page_row_head_segments,
+            token_major_head_segments,
+        )
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+        )
+        from sglang.srt.disaggregation.mooncake.draft_head_packer import DraftEntryJob
+
+        src_ptrs = self.kv_args.kv_data_ptrs
+        src_item_lens = self.kv_args.kv_item_lens
+        num_target_entries = len(src_ptrs) - self.kv_args.num_draft_entries
+        page_size = self.kv_args.page_size
+        draft_total_heads = self.kv_args.draft_kv_head_num * self.attn_tp_size
+        tp_args = dict(
+            src_attn_tp_size=self.attn_tp_size,
+            dst_attn_tp_size=dst_attn_tp_size,
+            src_tp_rank=self.kv_args.engine_rank,
+            dst_tp_rank=dst_tp_rank,
+        )
+        main_segments, src_row_bytes, dst_row_bytes = page_row_head_segments(
+            total_kv_heads=self.kv_args.total_kv_head_num,
+            head_dim=self.kv_args.main_kv_head_dim,
+            page_size=page_size,
+            **tp_args,
+        )
+        pack_draft = (
+            self.draft_kv_tensors is not None and dst_attn_tp_size >= self.attn_tp_size
+        )
+        segment_jobs, draft_segment_jobs, draft_jobs = [], [], []
+        for i, j in build_transfer_entry_pairs(
+            self.kv_args.kv_layer_ids, dst_layer_ids, len(src_ptrs), len(dst_kv_ptrs)
+        ):
+            if i < num_target_entries:
+                if (
+                    src_item_lens[i] != src_row_bytes
+                    or dst_kv_item_lens[j] != dst_row_bytes
+                ):
+                    raise ValueError(
+                        f"page row width mismatch at entry {i}: local "
+                        f"{src_item_lens[i]} vs {src_row_bytes}, peer "
+                        f"{dst_kv_item_lens[j]} vs {dst_row_bytes}"
+                    )
+                jobs = segment_jobs
+                segments = main_segments
+            elif pack_draft:
+                head_start, num_heads, _, _ = compute_head_slice_params(
+                    self.attn_tp_size,
+                    dst_attn_tp_size,
+                    self.kv_args.engine_rank,
+                    dst_tp_rank,
+                    draft_total_heads,
+                )
+                head_bytes = (
+                    src_item_lens[i] // page_size // self.kv_args.draft_kv_head_num
+                )
+                if dst_kv_item_lens[j] != page_size * num_heads * head_bytes:
+                    raise ValueError(
+                        f"draft entry {i}: peer page {dst_kv_item_lens[j]} is not "
+                        f"{num_heads} heads of {head_bytes} bytes"
+                    )
+                draft_jobs.append(
+                    DraftEntryJob(
+                        entry=i - num_target_entries,
+                        dst_base_ptr=dst_kv_ptrs[j],
+                        head_start=head_start,
+                        num_heads=num_heads,
+                    )
+                )
+                continue
+            else:
+                jobs = draft_segment_jobs
+                segments = token_major_head_segments(
+                    total_kv_heads=draft_total_heads,
+                    src_item_len=src_item_lens[i],
+                    dst_item_len=dst_kv_item_lens[j],
+                    page_size=page_size,
+                    **tp_args,
+                )
+            jobs.append(
+                dict(
+                    src_base_ptr=src_ptrs[i],
+                    dst_base_ptr=dst_kv_ptrs[j],
+                    src_page_bytes=src_item_lens[i],
+                    dst_page_bytes=dst_kv_item_lens[j],
+                    segments=segments,
+                )
+            )
+        return segment_jobs, draft_segment_jobs, draft_jobs
+
     def send_aux(
         self,
         req: TransferInfo,
@@ -2793,15 +3029,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     raise RuntimeError(
                         "PD disagg: PP>1 not supported for MiniMax state yet."
                     )
-                if (
-                    target_rank_registration_info is not None
-                    and self.attn_tp_size
-                    != target_rank_registration_info.dst_attn_tp_size
-                ):
-                    raise RuntimeError(
-                        "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "state yet."
-                    )
+                dst_attn_tp_size = (
+                    self.attn_tp_size
+                    if target_rank_registration_info is None
+                    else target_rank_registration_info.dst_attn_tp_size
+                )
+                if dst_attn_tp_size != self.attn_tp_size:
+                    if st == StateType.MINIMAX_DENSE_KV:
+                        raise RuntimeError(
+                            "PD disagg: heterogeneous TP not supported for MiniMax "
+                            "dense KV state."
+                        )
+                    # The index state is replicated per rank: with fewer decode
+                    # ranks, one of the prefill ranks feeding a decode rank sends it.
+                    if (
+                        self.attn_tp_size > dst_attn_tp_size
+                        and self.kv_args.engine_rank
+                        % (self.attn_tp_size // dst_attn_tp_size)
+                    ):
+                        continue
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if st == StateType.MINIMAX_DENSE_KV:
@@ -3342,6 +3588,33 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                                 dst_num_draft_entries=target_rank_registration_info.num_draft_entries,
                             )
+                        elif self.kv_args.main_kv_page_row:
+                            ret = self.send_kvcache_page_row_slice(
+                                mooncake_session_id=req.mooncake_session_id,
+                                prefill_kv_indices=kv_chunk.prefill_kv_indices,
+                                dst_kv_ptrs=target_rank_registration_info.dst_kv_ptrs,
+                                dst_kv_indices=chunked_dst_kv_indice,
+                                dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                                dst_attn_tp_size=(
+                                    target_rank_registration_info.dst_attn_tp_size
+                                ),
+                                dst_kv_item_lens=(
+                                    target_rank_registration_info.dst_kv_item_lens
+                                ),
+                                dst_layer_ids=(
+                                    target_rank_registration_info.dst_kv_layer_ids
+                                ),
+                                executor=executor,
+                                draft_start=draft_window_chunk_start(
+                                    window_pages=(
+                                        0
+                                        if target_rank_registration_info.dst_needs_full_draft_kv
+                                        else self.kv_args.draft_window_pages
+                                    ),
+                                    chunk_page_start=kv_chunk.index_slice.start,
+                                    total_pages=len(req.dst_kv_indices),
+                                ),
+                            )
                         elif (
                             self.enable_staging
                             and staging_strategy is not None
@@ -3516,16 +3789,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
                 # follow), not on the last chunk alone since an earlier deferred
                 # chunk may still need to transfer.
+                # Read the status once: the scheduler can clear a Failed room
+                # between two reads.
+                status = self.request_status.get(kv_chunk.room)
                 if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                    or (
-                        kv_chunk.is_last_chunk
-                        and self.check_status(kv_chunk.room) == KVPoll.Failed
-                    )
+                    status is None
+                    or status == KVPoll.Success
+                    or (kv_chunk.is_last_chunk and status == KVPoll.Failed)
                 ):
-                    if kv_chunk.room in self.transfer_infos:
-                        self.transfer_infos.pop(kv_chunk.room)
+                    self.transfer_infos.pop(kv_chunk.room, None)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
                     if self.enable_staging:
                         # Purge prefetch bookkeeping for the finished room.
@@ -3959,6 +4231,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ),
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
             str(self.kv_args.num_draft_entries).encode("ascii"),
+            b"1" if self.decode_enable_radix_cache else b"0",
         ]
 
     def build_receiver_metadata_message(

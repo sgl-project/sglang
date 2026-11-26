@@ -168,27 +168,39 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
 
     def test_pd_speculative_decoding_over_mooncake_is_dflash_on_cuda(self):
         """Both PD roles admit a speculative draft over Mooncake only for DFLASH
-        on CUDA; each refused algorithm is accepted without PD."""
+        on CUDA with a trtllm_mha or fa4 draft; each refusal is accepted without
+        PD."""
         for mode in ("prefill", "decode"):
             for algorithm in ("DFLASH", "DSPARK", "EAGLE", "EAGLE3", None):
-                for is_cuda in (True, False):
-                    with self.subTest(mode=mode, algorithm=algorithm, cuda=is_cuda):
-                        with override_platform(is_cuda=is_cuda):
-                            accepted = _accepts(
-                                algorithm,
-                                draft_backend="trtllm_mha",
-                                disaggregation_mode=mode,
-                                disaggregation_transfer_backend="mooncake",
-                                pp_size=1,
+                for draft_backend in ("trtllm_mha", "fa4", "triton", None):
+                    for is_cuda in (True, False):
+                        with self.subTest(
+                            mode=mode,
+                            algorithm=algorithm,
+                            draft_backend=draft_backend,
+                            cuda=is_cuda,
+                        ):
+                            with override_platform(is_cuda=is_cuda):
+                                accepted = _accepts(
+                                    algorithm,
+                                    draft_backend=draft_backend,
+                                    disaggregation_mode=mode,
+                                    disaggregation_transfer_backend="mooncake",
+                                    pp_size=1,
+                                )
+                                accepted_without_pd = _accepts(
+                                    algorithm, draft_backend=draft_backend
+                                )
+                            self.assertTrue(accepted_without_pd)
+                            self.assertEqual(
+                                accepted,
+                                algorithm is None
+                                or (
+                                    is_cuda
+                                    and algorithm == "DFLASH"
+                                    and draft_backend in ("trtllm_mha", "fa4")
+                                ),
                             )
-                            accepted_without_pd = _accepts(
-                                algorithm, draft_backend="trtllm_mha"
-                            )
-                        self.assertTrue(accepted_without_pd)
-                        self.assertEqual(
-                            accepted,
-                            algorithm is None or (is_cuda and algorithm == "DFLASH"),
-                        )
 
     def test_pd_speculative_decoding_over_nixl_is_refused(self):
         """NIXL unified-memory PD refuses a DFLASH draft that Mooncake admits."""

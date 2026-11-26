@@ -26,7 +26,6 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
-    concurrent_contiguous_runs,
     group_concurrent_contiguous,
 )
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
@@ -1481,10 +1480,17 @@ class TestPPSyncPolls(CustomTestCase):
         window = PPSyncSendWindow(rounds=3)
         rounds = [[KVPoll.Bootstrapping], [KVPoll.WaitingForInput], [KVPoll.Success]]
         for polls in rounds:
-            self.assertEqual(pp_sync_polls(polls, pp_group, 0, 2, window), polls)
+            self.assertEqual(
+                pp_sync_polls(
+                    polls, pp_group, 0, 2, window, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC
+                ),
+                polls,
+            )
         self.assertEqual([w.waited for w in pp_group.sent_works], [False] * 3)
 
-        pp_sync_polls([KVPoll.Success], pp_group, 0, 2, window)
+        pp_sync_polls(
+            [KVPoll.Success], pp_group, 0, 2, window, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC
+        )
         self.assertEqual(
             [w.waited for w in pp_group.sent_works], [True, False, False, False]
         )
@@ -1497,20 +1503,20 @@ class TestPPSyncPolls(CustomTestCase):
         """A middle rank adopts the polls received from the previous rank and
         forwards them on the same tag; the last rank only receives."""
         pp0_polls = [KVPoll.Success, KVPoll.Failed]
+        tag = P2PTag.DISAGG_TRANSFER_PP_SYNC
         middle = _FakePPGroup(recv_data=pp0_polls)
         self.assertEqual(
-            pp_sync_polls([], middle, 1, 3, PPSyncSendWindow(rounds=3)), pp0_polls
+            pp_sync_polls([], middle, 1, 3, PPSyncSendWindow(rounds=3), tag),
+            pp0_polls,
         )
-        self.assertEqual(middle.recv_calls, [(0, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)])
-        self.assertEqual(
-            middle.send_calls, [(pp0_polls, 2, True, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)]
-        )
+        self.assertEqual(middle.recv_calls, [(0, tag)])
+        self.assertEqual(middle.send_calls, [(pp0_polls, 2, True, tag)])
 
         last = _FakePPGroup(recv_data=pp0_polls)
         self.assertEqual(
-            pp_sync_polls([], last, 2, 3, PPSyncSendWindow(rounds=3)), pp0_polls
+            pp_sync_polls([], last, 2, 3, PPSyncSendWindow(rounds=3), tag), pp0_polls
         )
-        self.assertEqual(last.recv_calls, [(1, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)])
+        self.assertEqual(last.recv_calls, [(1, tag)])
         self.assertEqual(last.send_calls, [])
 
 
@@ -2618,37 +2624,6 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
-        with self.assertRaises(ValueError):
-            concurrent_contiguous_runs(self._arr([1, 2, 3]), self._arr([1, 2]))
-
-    def test_array_runs_are_the_list_groups(self):
-        rng = np.random.default_rng(0)
-        cases = [
-            ([], []),
-            ([], [1, 2]),
-            ([3, 4], []),
-            ([4], [9]),
-            ([4, 5, 6], [9, 10, 11]),
-            ([4, 5, 6], [9, 3, 4]),
-            ([7, 3, 4, 5], [1, 2, 3, 4]),
-        ]
-        for _ in range(200):
-            n = int(rng.integers(1, 64))
-            src = np.sort(rng.choice(512, n, replace=False))
-            dst = np.arange(n) + int(rng.integers(0, 64))
-            if rng.random() < 0.5:
-                dst = rng.permutation(512)[:n]
-            cases.append((src.tolist(), dst.tolist()))
-        for src, dst in cases:
-            src_starts, dst_starts, lengths = concurrent_contiguous_runs(
-                self._arr(src), self._arr(dst)
-            )
-            src_groups, dst_groups = group_concurrent_contiguous(
-                self._arr(src), self._arr(dst)
-            )
-            self.assertEqual(src_starts.tolist(), [g[0] for g in src_groups])
-            self.assertEqual(dst_starts.tolist(), [g[0] for g in dst_groups])
-            self.assertEqual(lengths.tolist(), [len(g) for g in src_groups])
 
 
 class TestStagingWatermark(unittest.TestCase):
@@ -3019,6 +2994,7 @@ class TestMooncakeRegistrationDraftCount(CustomTestCase):
         manager.enable_staging = False
         manager.exchange_aux_item_lens = False
         manager.customized_info_enabled = False
+        manager.decode_enable_radix_cache = False
         manager.local_ip = "127.0.0.1"
         manager.rank_port = 1234
         manager.get_session_id = lambda: "session"
@@ -3033,7 +3009,8 @@ class TestMooncakeRegistrationDraftCount(CustomTestCase):
         self.assertEqual(info.dst_kv_ptrs, [0x1000, 0x2000])
 
     def test_registration_without_the_field_parses_none(self):
-        msg = self._manager(2).build_receiver_registration_message()[:-1]
+        # A peer predating num_draft_entries also predates the frame after it.
+        msg = self._manager(2).build_receiver_registration_message()[:-2]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
 

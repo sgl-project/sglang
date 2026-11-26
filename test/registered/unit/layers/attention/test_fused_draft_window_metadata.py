@@ -13,6 +13,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.attention import aiter_backend as ab
+from sglang.srt.layers.attention import flashattention_backend as fa
 from sglang.srt.layers.attention import flashinfer_backend as fb
 from sglang.srt.layers.attention import triton_backend as tb
 from sglang.srt.layers.attention import trtllm_mha_backend as tm
@@ -41,7 +42,8 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.utils import is_cuda
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import is_cuda, is_sm100_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods import (
     dense_attention as _kit,
@@ -158,7 +160,9 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         old = allocator.alloc(7)
         allocator.free_window_segment(host, old, start_pos=0)
         virtual = allocator.alloc(512)
-        req = SimpleNamespace(size=1, req_to_token=virtual.reshape(1, -1))
+        req = SimpleNamespace(
+            size=1, req_to_token=virtual.reshape(1, -1), max_context_len=virtual.numel()
+        )
         layer = RadixAttention(
             num_heads=1,
             head_dim=8,
@@ -554,17 +558,24 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             )
         )
 
-    def _trtllm_verify_backend(self, window, *, full_layer=False):
-        """A trtllm_mha backend built by its own init for the fused window
-        draft, whose layers all run ENCODER_ONLY, as a non-causal DFLASH
-        draft's do; with ``full_layer``, one of them lives on the full band."""
+    def _encoder_only_verify_backend(
+        self,
+        window,
+        *,
+        full_layer=False,
+        window_attn_type=AttentionType.ENCODER_ONLY,
+        backend="trtllm_mha",
+    ):
+        """A ``backend`` built by its own init for the fused window draft,
+        whose layers run ENCODER_ONLY as a non-causal DFLASH draft's do;
+        with ``full_layer``, a second ENCODER_ONLY layer lives on the full band."""
         override = get_parallel().override(attn_tp_size=1, attn_dcp_rank=0)
         override.__enter__()
         self.addCleanup(override.__exit__, None, None, None)
         self._fixture(window, 128, backend_kind="trtllm", full_layer=full_layer)
         case = DenseAttentionCase(
             name="fused_draft_encoder_only_verify",
-            backend="trtllm_mha",
+            backend=backend,
             forward_mode=ForwardMode.TARGET_VERIFY,
             num_heads=1,
             num_kv_heads=1,
@@ -602,27 +613,40 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 num_kv_heads=1,
                 layer_id=layer_id,
                 sliding_window_size=window if layer_id == 0 else -1,
-                attn_type=AttentionType.ENCODER_ONLY,
+                attn_type=(
+                    window_attn_type if layer_id == 0 else AttentionType.ENCODER_ONLY
+                ),
             )
             for layer_id in ((0, 1) if full_layer else (0,))
         )
+        self.verify_layers = runner.model
+        if backend == "fa4":
+            # The kit marks any windowed config chunked-local; a DFLASH draft's
+            # window layers are sliding-window.
+            runner.model_config.is_local_attention_model = False
+            # Sizes the verify width the graph tables cover: the draft block.
+            runner.spec_algorithm = SpeculativeAlgorithm.DFLASH
+            return fa.FlashAttentionBackend(runner, fa_impl_ver=4)
         return tm.TRTLLMHAAttnBackend(runner)
 
-    def _verify_batch(self, seq_len):
+    def _verify_batch(self, seq_len, *, write=False):
         seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
         rows = torch.zeros(1, dtype=torch.int64, device="cuda")
+        written = self.virtual[seq_len : seq_len + _VERIFY] if write else None
         plan = self.reader.plan(
             req_pool_indices=rows,
             seq_lens=seq_lens,
             seq_lens_cpu=None,
-            write_virtual=None,
+            write_virtual=written,
             read_extent=_VERIFY,
         )
-        return SimpleNamespace(
+        batch = SimpleNamespace(
             batch_size=1,
             forward_mode=ForwardMode.TARGET_VERIFY,
             req_pool_indices=rows,
             seq_lens=seq_lens,
+            seq_lens_cpu=None,
+            encoder_lens=None,
             input_ids=torch.zeros(_VERIFY, dtype=torch.int64, device="cuda"),
             positions=torch.arange(_VERIFY, dtype=torch.int64, device="cuda"),
             ragged_verify_layout=None,
@@ -630,6 +654,9 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             out_cache_loc=None,
             spec_info=None,
         )
+        if write:
+            plan.bind(batch, self.reader)
+        return batch
 
     def _assert_encoder_rows_read(self, metadata, kind, seq_len, window):
         """Every expanded verify row reads ``kind``'s ids over the window that
@@ -653,7 +680,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         every graph replay; the full table holds other ids for the same
         tokens, so a draft reading it attends the wrong KV without failing."""
         window, seq_len = 64, 300
-        backend = self._trtllm_verify_backend(window)
+        backend = self._encoder_only_verify_backend(window)
         self.assertTrue(backend._encoder_only_reads_swa)
 
         backend.init_forward_metadata(self._verify_batch(seq_len))
@@ -683,16 +710,84 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             )
 
     @unittest.skipUnless(is_cuda(), "trtllm_mha runs on CUDA only")
-    def test_trtllm_encoder_only_verify_with_a_full_layer_reads_the_full_table(self):
-        """The ENCODER_ONLY rows take one table for all their layers, so a
-        draft with any such layer on the full band keeps the full table."""
+    def test_trtllm_encoder_only_verify_across_both_bands_is_refused(self):
+        """The ENCODER_ONLY rows take one table for all their layers, so either
+        table reads the wrong KV for the layers on the other band."""
+        with self.assertRaisesRegex(ValueError, "both the window and full bands"):
+            self._encoder_only_verify_backend(64, full_layer=True)
+
+    @unittest.skipUnless(is_cuda(), "trtllm_mha runs on CUDA only")
+    def test_trtllm_causal_window_layer_keeps_the_full_table(self):
+        """A causal-default DFLASH draft runs its window layers as DECODER, so
+        only its full layer verifies ENCODER_ONLY; it must not be refused."""
         window, seq_len = 64, 300
-        backend = self._trtllm_verify_backend(window, full_layer=True)
+        backend = self._encoder_only_verify_backend(
+            window, full_layer=True, window_attn_type=AttentionType.DECODER
+        )
         self.assertFalse(backend._encoder_only_reads_swa)
         backend.init_forward_metadata(self._verify_batch(seq_len))
         self._assert_encoder_rows_read(
             backend.forward_metadata, IdSpaceKind.FULL, seq_len, window
         )
+
+    def _assert_fa4_verify_uses_window_ids(self, backend, batch, seq_len, window):
+        layer = self.verify_layers[0]
+        seen = {}
+
+        def kernel(**kwargs):
+            seen.update(kwargs)
+            return torch.zeros_like(kwargs["q"])
+
+        q = torch.zeros((_VERIFY, 1, 8), dtype=torch.bfloat16, device="cuda")
+        k = (torch.arange(_VERIFY * 8, device="cuda") + seq_len % 64).view(-1, 1, 8)
+        k = k.to(torch.bfloat16)
+        with patch.object(backend, "flash_attn_with_kvcache", side_effect=kernel):
+            backend.forward_extend(q, k, -k, layer, batch, save_kv_cache=True)
+        window_ids = self.reader.space(IdSpaceKind.SLIDING_WINDOW).ids(self.virtual)
+        written = window_ids[seq_len : seq_len + _VERIFY]
+        key_cache, value_cache = backend.kv_layers.read(layer.layer_id).kv()
+        self.assertTrue(torch.equal(key_cache.view(-1, 1, 8)[written], k))
+        self.assertTrue(torch.equal(value_cache.view(-1, 1, 8)[written], -k))
+        # The first draft token attends back to `window` tokens before it.
+        reads = slice(seq_len - window, seq_len + _VERIFY)
+        full_ids = self.allocator.translate_kv_loc(self.virtual)
+        self.assertFalse(torch.equal(window_ids[reads], full_ids[reads]))
+        self.assertTrue(
+            torch.equal(seen["page_table"][0, reads].to(torch.int64), window_ids[reads])
+        )
+
+    @unittest.skipUnless(is_sm100_supported(), "fa4 runs on SM100 only")
+    def test_fa4_encoder_only_verify_uses_the_window_ids(self):
+        """An all-sliding non-causal DFLASH draft on a window band, verified by
+        fa4: the window layer must use the window ids in eager metadata
+        and on every graph replay, for its writes and its reads. The full
+        table holds other ids for the same tokens, so using it attends the wrong
+        KV without failing."""
+        window, seq_len = 64, 300
+        backend = self._encoder_only_verify_backend(window, backend="fa4")
+        self.assertTrue(backend.use_sliding_window_kv_pool)
+
+        batch = self._verify_batch(seq_len, write=True)
+        backend.init_forward_metadata(batch)
+        self._assert_fa4_verify_uses_window_ids(backend, batch, seq_len, window)
+
+        backend.init_cuda_graph_state(max_bs=1, max_num_tokens=_VERIFY)
+        batch = self._verify_batch(seq_len, write=True)
+        backend.init_forward_metadata_out_graph(batch, in_capture=True)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            backend.init_forward_metadata_in_graph(batch)
+        torch.cuda.current_stream().wait_stream(stream)
+        for length in (seq_len + 1, seq_len + 40):
+            replay = self._verify_batch(length, write=True)
+            batch.seq_lens.copy_(replay.seq_lens)
+            replay.iteration_ids.bind(batch, self.reader)
+            backend.init_forward_metadata_out_graph(batch, in_capture=False)
+            graph.replay()
+            torch.cuda.synchronize()
+            self._assert_fa4_verify_uses_window_ids(backend, batch, length, window)
 
     def test_aiter_refuses_a_routed_window_view_at_init(self):
         """BUG REGRESSION. With the draft backend lists gone, an aiter draft
