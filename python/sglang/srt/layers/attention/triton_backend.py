@@ -703,6 +703,21 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            # Sliding-window layers (e.g. the MiMo-V2 MTP layer) read the
+            # window-clipped prefix, as the eager draft-extend path builds it.
+            _, _, _, self.cuda_graph_window_kv_offsets[:bs] = (
+                update_sliding_window_buffer(
+                    self.window_kv_indptr,
+                    self.kv_index_translator,
+                    req_pool_indices,
+                    self.sliding_window_size,
+                    kv_lens,
+                    bs,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    window_kv_indices=self.cuda_graph_window_kv_indices,
+                )
+            )
         return qo_indptr, kv_indptr, num_tokens_per_req
 
     def init_forward_metadata_out_graph(
@@ -1303,10 +1318,13 @@ class TritonAttnBackend(AttentionBackend):
                 qo_indptr=self.qo_indptr[: bs + 1],
                 custom_mask=None,
                 mask_indptr=None,
-                window_kv_indptr=self.window_kv_indptr,
-                window_kv_indices=None,
+                window_kv_indptr=(
+                    self.window_kv_indptr[: bs + 1] if swa else self.window_kv_indptr
+                ),
+                window_kv_indices=self.cuda_graph_window_kv_indices if swa else None,
+                # Extend reads through qo_indptr, never through kv splits.
                 window_num_kv_splits=None,
-                window_kv_offsets=None,
+                window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
@@ -1733,6 +1751,12 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.window_kv_indptr
             kv_indices = self.forward_metadata.window_kv_indices
             window_kv_offsets = self.forward_metadata.window_kv_offsets
+            # A null read rail reaches Triton as `None + offsets` and fails as
+            # an unreadable IR-build error; say what is actually missing.
+            assert kv_indices is not None, (
+                f"layer {layer.layer_id} is a sliding-window layer but this "
+                "extend forward built no window_kv_indices"
+            )
         else:
             sliding_window_size = -1
             kv_indptr = self.forward_metadata.kv_indptr
