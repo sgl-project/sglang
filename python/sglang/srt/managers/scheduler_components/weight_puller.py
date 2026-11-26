@@ -5,12 +5,13 @@ from typing import Any, Optional, Tuple
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.managers.io_struct import PullWeightsReqInput, PullWeightsReqOutput
 from sglang.srt.managers.scheduler_components.ipc_channels import (
     SchedulerIpcChannels,
 )
 from sglang.srt.model_loader.weight_utils import download_weights_from_hf
-from sglang.srt.runtime_context import get_exec, get_model, get_parallel
+from sglang.srt.runtime_context import get_context, get_exec, get_model, get_parallel
 from sglang.srt.weight_sync import local_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -48,11 +49,18 @@ class SchedulerWeightPuller:
     def _pull(self, recv_req: PullWeightsReqInput) -> None:
         model = get_model()
         try:
+            # Disk reload changes the served model_path. A snapshot rebuilt from a
+            # delta-only stream still needs the launch checkpoint as version zero.
+            base_model_path = (
+                resolution_result(get_context().server_args, "model_path")
+                if recv_req.snapshot
+                else model.model_path
+            )
             local_checkpoint.pull(
                 local_checkpoint_dir=recv_req.local_checkpoint_dir,
                 # the served weights are already on disk, so an HF repo id resolves to its cache
                 base_dir=download_weights_from_hf(
-                    model.model_path,
+                    base_model_path,
                     cache_dir=model.download_dir,
                     allow_patterns=["*.safetensors"],
                     revision=model.revision,
@@ -60,6 +68,7 @@ class SchedulerWeightPuller:
                 source_dir=recv_req.source_dir,
                 target_version=recv_req.target_version,
                 pre_read_hook=model.custom_pull_weights_pre_read_hook,
+                snapshot=recv_req.snapshot,
             )
         except Exception:
             self._error = traceback.format_exc()

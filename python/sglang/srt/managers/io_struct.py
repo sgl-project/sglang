@@ -1870,6 +1870,8 @@ class PullWeightsReqInput(BaseReq, kw_only=True):
     source_dir: str
     # The version to bring the local checkpoint up to.
     target_version: int
+    # Publish an immutable checkpoint path for reloads that can overlap the next pull.
+    snapshot: bool = False
 
 
 class PullWeightsReqOutput(BaseReq, kw_only=True):

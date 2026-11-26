@@ -330,9 +330,25 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 
 #### Pull Published Weights to a Host-Local Checkpoint
 
+When reloading the host-local checkpoint in place, wait for every host to
+finish its pull. Complete the disk reload before the next pull into that
+directory. To overlap pulls and reloads, send `"snapshot": true` in the pull
+request. Each host rebuilds the requested checkpoint in private staging from
+the latest full publication at or below the target and its subsequent deltas.
+The worker checks the indexed shard and tensor names before publishing. When
+all workers succeed, pass the returned `model_path` to `/update_weights_from_disk`.
+
+Use the same absolute `local_checkpoint_dir` on all workers and one publication
+stream per directory. Publish each version once. Every host must read the same
+bytes for that version, including on retry. Keep the seed and deltas until all hosts have
+published their snapshot. A retry reuses an existing snapshot on each host.
+The ordinary in-place checkpoint advances on ordinary pulls only. Each retained
+snapshot costs one full checkpoint of local storage. Remove it on each host
+after all readers, including memory mappings, have finished.
+
 When the trainer publishes each weight version to a shared filesystem, `POST /pull_weights` has every host of the deployment bring its own local checkpoint up to a target version; a following `update_weights_from_disk` with `model_path` set to that local dir then loads it. The pull only touches disk and runs off the scheduler thread, so it can overlap generation.
 
-The trainer writes version `N` as `weight_v{N:06d}/` under `source_dir`. A version is either a full HF checkpoint, which is copied as is, or a delta against version `N-1` (its index metadata carries `delta_encoding`), which is applied in place and checked against per-tensor checksums. Version 0 is the server's own `--model-path`. A pull seeds from the newest full version at or below the target and applies the deltas after it; one that fails midway leaves the host to reseed on its next pull. The local checkpoint only moves forward: pulling a version below it fails.
+The trainer writes version `N` as `weight_v{N:06d}/` under `source_dir`. A version is either a full HF checkpoint, which is copied as is, or a delta against version `N-1` (its index metadata carries `delta_encoding`), which is applied in place and checked against per-tensor checksums. Version 0 is the server's own `--model-path`. A pull seeds from the newest full version at or below the target and applies the deltas after it; one that fails midway leaves the host to reseed on its next pull. The in-place checkpoint only moves forward. An older snapshot can be reused, or rebuilt if its publication chain is still available.
 
 If the shared filesystem lacks cross-host read-after-write consistency (common for object-store mounts), set `--custom-pull-weights-pre-read-hook` to a `hook(source_dir, target_version)` that makes the published files visible before they are read.
 

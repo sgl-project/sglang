@@ -39,6 +39,7 @@ from typing import List, Optional
 import msgspec
 import numpy as np
 import zstandard
+from safetensors import safe_open
 
 from sglang.srt.utils import dynamic_import
 
@@ -59,30 +60,115 @@ def pull(
     source_dir: str,
     target_version: int,
     pre_read_hook: Optional[str] = None,
+    snapshot: bool = False,
 ) -> None:
     """Bring the host-local checkpoint up to ``target_version``: seed from the newest full
     version at or below it (v0 is ``base_dir``), then apply the deltas after it in order."""
+    if snapshot:
+        destination = snapshot_path(local_checkpoint_dir, target_version)
+        with _pull_lock(local_checkpoint_dir):
+            if os.path.isdir(destination):
+                return
+            if target_version > 0 and pre_read_hook:
+                dynamic_import(pre_read_hook)(source_dir, target_version)
+            _publish_snapshot(destination, base_dir, source_dir, target_version)
+        return
+
     if target_version > 0 and pre_read_hook:
         dynamic_import(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
-        applied = _read_applied_version(local_checkpoint_dir)  # None on a fresh host
-        if applied is not None and target_version < applied:
-            raise RuntimeError(
-                f"{local_checkpoint_dir} is at v{applied}, past the requested v{target_version}; "
-                "deltas only apply forward, so pull an older version into a fresh local_checkpoint_dir"
-            )
-        # below the local state a reseed is never needed; a fresh host bottoms out at v0
-        floor = applied if applied is not None else 0
-        start = target_version
-        while start > floor and _is_delta(_version_dir(source_dir, start)):
-            start -= 1
-        if applied is None or start > applied:
-            seed_dir = base_dir if start == 0 else _version_dir(source_dir, start)
-            _reset_checkpoint(seed_dir, local_checkpoint_dir, start)
-        else:
-            start = applied
-        for version in range(start + 1, target_version + 1):
-            _apply_delta(local_checkpoint_dir, _version_dir(source_dir, version))
+        _materialize(local_checkpoint_dir, base_dir, source_dir, target_version)
+
+
+def _materialize(
+    local_checkpoint_dir: str,
+    base_dir: str,
+    source_dir: str,
+    target_version: int,
+    *,
+    validate_index: bool = False,
+) -> None:
+    applied = _read_applied_version(local_checkpoint_dir)  # None on a fresh host
+    if applied is not None and target_version < applied:
+        raise RuntimeError(
+            f"{local_checkpoint_dir} is at v{applied}, past the requested v{target_version}; "
+            "deltas only apply forward, so pull an older version into a fresh local_checkpoint_dir"
+        )
+    # below the local state a reseed is never needed; a fresh host bottoms out at v0
+    floor = applied if applied is not None else 0
+    start = target_version
+    while start > floor and _is_delta(_version_dir(source_dir, start)):
+        start -= 1
+    if applied is None or start > applied:
+        seed_dir = base_dir if start == 0 else _version_dir(source_dir, start)
+        _reset_checkpoint(seed_dir, local_checkpoint_dir, start)
+        if validate_index:
+            _validate_snapshot_seed(local_checkpoint_dir)
+    else:
+        start = applied
+    for version in range(start + 1, target_version + 1):
+        _apply_delta(
+            local_checkpoint_dir,
+            _version_dir(source_dir, version),
+            validate_index=validate_index,
+        )
+
+
+def snapshot_path(local_checkpoint_dir: str, version: int) -> str:
+    if not os.path.isabs(local_checkpoint_dir):
+        raise ValueError("snapshot requires an absolute local_checkpoint_dir")
+    if version < 0:
+        raise ValueError("snapshot requires a nonnegative target_version")
+    return os.path.join(local_checkpoint_dir, SYNC_DIR, "snapshots", f"v{version:06d}")
+
+
+def _validate_snapshot_seed(directory: str) -> None:
+    # Check the files actually copied. Opening the header validates tensor offsets
+    # and file length without reading a second copy of the tensor data.
+    shards = sorted(glob.glob(os.path.join(directory, "*.safetensors")))
+    index = os.path.join(directory, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index) as f:
+            expected = json.load(f)["weight_map"]
+        if not isinstance(expected, dict):
+            raise ValueError("Snapshot checkpoint index requires a weight_map object")
+    elif shards == [os.path.join(directory, "model.safetensors")]:
+        expected = None
+    else:
+        raise ValueError("Snapshot requires a checkpoint index or model.safetensors")
+    found = {}
+    for shard in shards:
+        with safe_open(shard, framework="np") as reader:
+            for name in reader.keys():
+                if name in found:
+                    raise ValueError(f"Duplicate tensor {name} in snapshot seed")
+                found[name] = os.path.basename(shard)
+    if not found or (expected is not None and found != expected):
+        raise ValueError(
+            "Incomplete snapshot seed: tensors do not match the checkpoint index"
+        )
+
+
+def _publish_snapshot(
+    destination: str, base_dir: str, source_dir: str, version: int
+) -> None:
+    # Build from the trainer publication, independent of any unvalidated state
+    # left by a legacy in-place pull. Only the final rename exposes it to readers.
+    root = os.path.dirname(destination)
+    os.makedirs(root, exist_ok=True)
+    staging = os.path.join(root, ".staging")
+    if os.path.isdir(staging):
+        shutil.rmtree(staging)
+    os.makedirs(os.path.join(staging, SYNC_DIR))
+    try:
+        _materialize(staging, base_dir, source_dir, version, validate_index=True)
+        if _read_applied_version(staging) != version:
+            raise RuntimeError(f"Checkpoint did not reach version {version}")
+        shutil.rmtree(os.path.join(staging, SYNC_DIR))
+        os.rename(staging, destination)
+    finally:
+        if os.path.isdir(staging):
+            shutil.rmtree(staging)
 
 
 def _version_dir(source_dir: str, version: int) -> str:
@@ -267,10 +353,15 @@ _PATCHERS = {"xor": _patch_xor, "overwrite": _patch_overwrite}
 
 
 def _read_patches(
-    *, version_dir: str, locations: dict, stack: ExitStack
+    *,
+    version_dir: str,
+    locations: dict,
+    stack: ExitStack,
+    expected: Optional[dict] = None,
 ) -> List[_TensorPatch]:
     mmaps = {}
     patches = []
+    seen = set()
     for delta_file in sorted(glob.glob(os.path.join(version_dir, "*.safetensors"))):
         with open(delta_file, "rb") as f:
             blob = memoryview(f.read())
@@ -279,6 +370,12 @@ def _read_patches(
         checksums = header.pop("__metadata__")
         data_start = 8 + header_len
         for name, info in header.items():
+            if expected is not None:
+                if name in seen or expected.get(name) != os.path.basename(delta_file):
+                    raise ValueError(
+                        f"Delta tensor {name} does not match the checkpoint index"
+                    )
+                seen.add(name)
             begin, end = info["data_offsets"]
             path, offset, nbytes = locations[name]
             if path not in mmaps:
@@ -294,6 +391,10 @@ def _read_patches(
                     checksum=checksums[name],
                 )
             )
+    if expected is not None and seen != expected.keys():
+        raise ValueError(
+            "Incomplete snapshot delta: tensors do not match the checkpoint index"
+        )
     # prefetch into page cache (evicted during the rollout) so the apply
     # doesn't fault from cold storage
     for mm in mmaps.values():
@@ -301,9 +402,14 @@ def _read_patches(
     return patches
 
 
-def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
+def _apply_delta(
+    local_checkpoint_dir: str, version_dir: str, *, validate_index: bool = False
+) -> None:
     with open(os.path.join(version_dir, "model.safetensors.index.json")) as f:
-        meta = json.load(f)["metadata"]
+        index = json.load(f)
+    meta = index["metadata"]
+    if validate_index and not isinstance(index.get("weight_map"), dict):
+        raise ValueError("Snapshot delta index requires a weight_map object")
     applied = _read_applied_version(local_checkpoint_dir)
     if applied == int(meta["version"]):
         return
@@ -329,7 +435,10 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     _clear_applied_version(local_checkpoint_dir)
     with ExitStack() as stack:
         patches = _read_patches(
-            version_dir=version_dir, locations=locations, stack=stack
+            version_dir=version_dir,
+            locations=locations,
+            stack=stack,
+            expected=index["weight_map"] if validate_index else None,
         )
         # each patch writes a distinct mmap region, so the workers never conflict
         with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
