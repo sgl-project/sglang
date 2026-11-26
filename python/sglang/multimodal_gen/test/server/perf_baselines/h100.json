@@ -2464,8 +2464,8 @@
             "expected_median_denoise_ms": 467.69,
             "load_peak_vram_mb": 31246.0,
             "runtime_peak_vram_mb": 37788.0,
-            "load_peak_allocated_mb": 29869.0,
-            "runtime_peak_allocated_mb": 33843.0,
+            "load_peak_allocated_mb": 33307.0,
+            "runtime_peak_allocated_mb": 36430.0,
             "estimated_full_test_time_s": 90.0
         },
         "wan2_2_t2v_a14b_lora_2gpu": {
