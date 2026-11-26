@@ -249,7 +249,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
 
 
 class AscendMamba2AttnBackend(AscendMambaAttnBackendBase, Mamba2AttnBackend):
-    pass
+    _native_causal_conv_only = True
 
 
 class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):

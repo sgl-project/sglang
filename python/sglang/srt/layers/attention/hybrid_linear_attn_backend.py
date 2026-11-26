@@ -1182,6 +1182,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     """Attention backend wrapper for Mamba2Mixer kernels."""
 
     needs_cpu_seq_lens: bool = False
+    _native_causal_conv_only = False
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -1252,11 +1253,16 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         use_triton_causal_conv: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
-        # Page-major stores state strided; only the stride-aware Triton causal-conv
-        # reads it (CUDA causal_conv1d garbles it). A model may also force Triton.
+        if self._native_causal_conv_only and self.forward_metadata.is_target_verify:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support speculative target verification: "
+                "its native causal convolution does not save intermediate states."
+            )
+        # Page-major state requires stride-aware Triton causal convolution.
+        # The model preference only applies to backends that provide Triton.
         use_triton_causal_conv = (
-            use_triton_causal_conv or get_memory().enable_page_major_kv_layout
-        )
+            use_triton_causal_conv and not self._native_causal_conv_only
+        ) or get_memory().enable_page_major_kv_layout
         layer_cache = self.state_layer_cache(layer_id)
         mixer_out, intermediate_states, track_states = mixer.forward(
             hidden_states=hidden_states,
