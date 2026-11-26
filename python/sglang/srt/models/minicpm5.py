@@ -28,7 +28,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_rope_config
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -42,12 +41,7 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    LinearParallelGroup,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -74,6 +68,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.glm4_moe import Glm4MoeMLP
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 
@@ -191,46 +186,6 @@ class MiniCPM5Attention(nn.Module):
         return output
 
 
-class MiniCPM5MLP(nn.Module):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        intermediate_size: int,
-        quant_config: Optional[QuantizationConfig],
-        prefix: str,
-        parallel_group: LinearParallelGroup,
-    ) -> None:
-        super().__init__()
-        if config.hidden_act != "silu":
-            raise ValueError(f"MiniCPM5 only supports SiLU, got {config.hidden_act}.")
-        self.is_replicated = parallel_group == "replicated"
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [intermediate_size, intermediate_size],
-            bias=False,
-            quant_config=quant_config,
-            parallel_group=parallel_group,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=False,
-            parallel_group=parallel_group,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.act = SiluAndMul()
-
-    def forward(self, hidden_states: torch.Tensor, forward_batch=None) -> torch.Tensor:
-        if self.is_replicated and hidden_states.shape[0] == 0:
-            return hidden_states
-        gate_up, _ = self.gate_up_proj(hidden_states)
-        output, _ = self.down_proj(self.act(gate_up))
-        return output
-
-
 class MiniCPM5Gate(nn.Module):
     """Compute router logits in FP32 with weights stored in the model dtype."""
 
@@ -323,11 +278,13 @@ class MiniCPM5Moe(nn.Module):
         )
         self.shared_experts = None
         if config.n_shared_experts and not self.num_fused_shared_experts:
-            self.shared_experts = MiniCPM5MLP(
-                config=config,
+            self.shared_experts = Glm4MoeMLP(
+                hidden_size=config.hidden_size,
                 intermediate_size=config.moe_intermediate_size
                 * config.n_shared_experts,
+                hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group=(
                     "replicated"
@@ -448,10 +405,12 @@ class MiniCPM5DecoderLayer(nn.Module):
             )
         else:
             mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
-            self.mlp = MiniCPM5MLP(
-                config=config,
+            self.mlp = Glm4MoeMLP(
+                hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=False,
                 prefix=add_prefix("mlp", prefix),
                 parallel_group=mlp_parallel_group,
             )
