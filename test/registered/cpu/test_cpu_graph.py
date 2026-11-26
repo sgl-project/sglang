@@ -513,6 +513,7 @@ class TestCPUGraph(CustomTestCase):
         import sglang.srt.model_executor.cuda_graph_config as cuda_graph_config_mod
 
         exec_ctx = SimpleNamespace(
+            moe=SimpleNamespace(enable_paged_experts=False),
             graph=SimpleNamespace(
                 cuda_graph_config=CudaGraphConfig(
                     prefill=PhaseConfig(backend=prefill_backend, max_bs=prefill_max_bs),
