@@ -23,7 +23,7 @@ from sglang.kernels.ops.gemm.inkling2_linear import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
-from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     get_bf16_gemm_backend,
@@ -37,6 +37,7 @@ from sglang.srt.models.inkling_common.attn import (
     serving_attention_backend,
 )
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
+from sglang.srt.models.inkling_common.qkvr_linear import Inkling2QKVRLinear
 from sglang.srt.models.inkling_common.sconv import SconvType
 from sglang.srt.runtime_context import (
     get_exec,
@@ -51,6 +52,12 @@ PADDED_DECODE_MIN_TOKENS = 8
 # linear() sums split-K partials up to this many rows (its tiles < 256 branch).
 PAIRED_PARTIALS_MAX_TOKENS = 2048
 VERIFY_REL_BIAS_MAX_TOKENS = 32
+# Cold-L2 crossover for 3-slice BF16 linear vs 1 stacked (3M) GEMM is M=48 on
+# RTX 5090 and M=128 (unbiased) / M=256 (biased) on RTX PRO 6000; gating
+# unbiased at 128 and biased at 256 wins on both GPUs and avoids M=48..96
+# regressions (including batch=8 verify at M=64).
+_QKVR_3SLICE_MIN_TOKENS = 128
+_QKVR_3SLICE_MIN_TOKENS_BIASED = 256
 
 
 def wave_fill_splits(tiles, sms, max_splits=128, min_fill=0.9):
@@ -148,9 +155,9 @@ class Inkling2Attention(nn.Module):
         self.log_scaling_n_floor = config.log_scaling_n_floor
         self.log_scaling_alpha = config.log_scaling_alpha
         self.split_sizes = [
+            self.num_tp_kv_heads * self.head_dim,
+            self.num_tp_kv_heads * self.head_dim,
             self.num_tp_heads * self.head_dim,
-            self.num_tp_kv_heads * self.head_dim,
-            self.num_tp_kv_heads * self.head_dim,
             self.num_tp_heads * self.d_rel,
             self.num_tp_heads * self.head_dim,
             self.num_tp_heads,
@@ -158,7 +165,7 @@ class Inkling2Attention(nn.Module):
         qkvr_pad_size = -sum(self.split_sizes) % 8
         if qkvr_pad_size:
             self.split_sizes.append(qkvr_pad_size)
-        self.qkvr = MergedColumnParallelLinear(
+        self.qkvr = Inkling2QKVRLinear(
             config.hidden_size,
             [size * self.tp_size for size in self.split_sizes],
             bias=config.q_bias,
@@ -429,11 +436,12 @@ class Inkling2Attention(nn.Module):
 
     def _project_qkvr(self, x):
         projected, _ = self.qkvr(x)
-        return projected.split(self.split_sizes, dim=-1)[:6]
+        k, v, q, r, gate, sinks = projected.split(self.split_sizes, dim=-1)[:6]
+        return q, k, v, r, gate, sinks
 
     def _can_use_qkvr_fast_path(self, sources) -> bool:
         if (
-            type(self.qkvr) is not MergedColumnParallelLinear
+            type(self.qkvr) is not Inkling2QKVRLinear
             or type(self.qkvr.quant_method) is not UnquantizedLinearMethod
             or self.qkvr.gather_output
             or self.qkvr.skip_bias_add
@@ -457,44 +465,114 @@ class Inkling2Attention(nn.Module):
             )
         )
 
-    def _project_sources(self, sources):
-        if len({id(sources.q), id(sources.k), id(sources.v)}) == 3:
-            if get_platform().is_sm120 and self._can_use_qkvr_fast_path(sources):
-                from sglang.kernels.ops.gemm.sm12x_bf16_gemv import (
-                    sm12x_bf16_gemv_3src,
-                    use_sm12x_bf16_gemv_3src,
+    def _can_slice_qkvr_prefill(self, sources, weight, bias) -> bool:
+        q, k, v = sources.q, sources.k, sources.v
+        min_tokens = (
+            _QKVR_3SLICE_MIN_TOKENS if bias is None else _QKVR_3SLICE_MIN_TOKENS_BIASED
+        )
+        return (
+            q.ndim == 2
+            and q.shape[0] >= min_tokens
+            and k.shape == q.shape
+            and v.shape == q.shape
+            and weight.ndim == 2
+            and q.shape[1] == weight.shape[1]
+            and q.dtype == k.dtype == v.dtype == weight.dtype
+            and q.device == k.device == v.device == weight.device
+            and (
+                bias is None
+                or (
+                    bias.ndim == 1
+                    and bias.shape[0] == weight.shape[0]
+                    and bias.dtype == weight.dtype
+                    and bias.device == weight.device
                 )
+            )
+        )
 
-                k_lo = self.split_sizes[0]
-                v_lo = k_lo + self.split_sizes[1]
-                r_lo = v_lo + self.split_sizes[2]
-                if use_sm12x_bf16_gemv_3src(
-                    sources.q,
-                    sources.k,
-                    sources.v,
-                    self.qkvr.weight,
-                    k_lo,
-                    v_lo,
-                    r_lo,
-                    self.qkvr.bias,
-                ):
-                    projected = sm12x_bf16_gemv_3src(
+    def _project_qkvr_3src_sliced(self, sources, weight, bias, v_lo, q_lo):
+        m = sources.q.shape[0]
+        n = weight.shape[0]
+        projected = sources.q.new_empty((m, n))
+        if m == 0:
+            return projected
+        for src, lo, hi in (
+            (sources.k, 0, v_lo),
+            (sources.v, v_lo, q_lo),
+            (sources.q, q_lo, n),
+        ):
+            if lo == hi:
+                continue
+            w_slice = weight[lo:hi]
+            out_slice = projected[:, lo:hi]
+            if bias is None:
+                torch.mm(src, w_slice.t(), out=out_slice)
+            else:
+                torch.addmm(bias[lo:hi], src, w_slice.t(), out=out_slice)
+        return projected
+
+    def _project_sources(self, sources):
+        if (
+            sources.q.shape[0] > 0
+            and len({id(sources.q), id(sources.k), id(sources.v)}) == 3
+            and type(self.qkvr) is Inkling2QKVRLinear
+        ):
+            if get_platform().is_sm120 and self._can_use_qkvr_fast_path(sources):
+                v_lo = self.split_sizes[Inkling2QKVRLinear.SHARD_K]
+                q_lo = v_lo + self.split_sizes[Inkling2QKVRLinear.SHARD_V]
+                weight = self.qkvr.weight
+                bias = self.qkvr.bias
+                if sources.q.is_cuda and sources.q.shape[0] <= 32:
+                    from sglang.kernels.ops.gemm.sm12x_bf16_gemv import (
+                        sm12x_bf16_gemv_3src,
+                        use_sm12x_bf16_gemv_3src,
+                    )
+
+                    if use_sm12x_bf16_gemv_3src(
                         sources.q,
                         sources.k,
                         sources.v,
-                        self.qkvr.weight,
-                        k_lo,
+                        weight,
+                        0,
                         v_lo,
-                        r_lo,
-                        self.qkvr.bias,
+                        q_lo,
+                        bias,
+                    ):
+                        projected = sm12x_bf16_gemv_3src(
+                            sources.q,
+                            sources.k,
+                            sources.v,
+                            weight,
+                            0,
+                            v_lo,
+                            q_lo,
+                            bias,
+                        )
+                        k, v, q, r, gate, sinks = projected.split(
+                            self.split_sizes, dim=-1
+                        )[:6]
+                        return q, k, v, r, gate, sinks
+                if self._can_slice_qkvr_prefill(sources, weight, bias):
+                    projected = self._project_qkvr_3src_sliced(
+                        sources, weight, bias, v_lo, q_lo
                     )
-                    return projected.split(self.split_sizes, dim=-1)[:6]
+                    k, v, q, r, gate, sinks = projected.split(self.split_sizes, dim=-1)[
+                        :6
+                    ]
+                    return q, k, v, r, gate, sinks
             q_proj, k_proj, v_proj = (
                 projected.split(self.split_sizes, dim=-1)[:6]
                 for projected in self.qkvr(_stacked(sources))[0].chunk(3)
             )
-            q, _, _, r, gate, sinks = q_proj
-            return q, k_proj[1], v_proj[2], r, gate, sinks
+            _, _, q, r, gate, sinks = q_proj
+            return (
+                q,
+                k_proj[Inkling2QKVRLinear.SHARD_K],
+                v_proj[Inkling2QKVRLinear.SHARD_V],
+                r,
+                gate,
+                sinks,
+            )
         q_proj = self._project_qkvr(sources.q)
         k_proj = q_proj if sources.k is sources.q else self._project_qkvr(sources.k)
         v_proj = (

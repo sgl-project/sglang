@@ -697,6 +697,47 @@ class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         return torch.concat([q, k, v, r], dim=0)
 
 
+class Inkling2QKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
+    def slice_lora_a_weights(self, A: torch.Tensor):
+        if A.shape[-2] % 4 != 0:
+            raise ValueError(
+                f"Expected 4 stacked Inkling2 qkvr LoRA-A slices, got {tuple(A.shape)}."
+            )
+        a_q, a_k, a_v, a_r = A.chunk(4, dim=-2)
+        return torch.cat([a_k, a_v, a_q, a_r], dim=-2).contiguous()
+
+    def slice_lora_b_weights(self, B: torch.Tensor):
+        local_tp_rank = get_group_rank_size(self.base_layer.tp_group)[0]
+        base = self.base_layer
+        k_full = base.output_sizes[base.SHARD_K]
+        v_full = base.output_sizes[base.SHARD_V]
+        q_full = base.output_sizes[base.SHARD_Q]
+        r_full = base.output_sizes[base.SHARD_R]
+        k_part = base.output_partition_sizes[base.SHARD_K]
+        v_part = base.output_partition_sizes[base.SHARD_V]
+        q_part = base.output_partition_sizes[base.SHARD_Q]
+        r_part = base.output_partition_sizes[base.SHARD_R]
+        expected_rows = q_full + k_full + v_full + r_full
+        if B.shape[0] != expected_rows:
+            raise ValueError(
+                f"Expected Inkling2 qkvr LoRA-B rows {expected_rows}, got {B.shape[0]}."
+            )
+        q_off = 0
+        k_off = q_full
+        v_off = k_off + k_full
+        r_off = v_off + v_full
+        slices = [
+            B[off + local_tp_rank * part : off + (local_tp_rank + 1) * part, :]
+            for off, part in (
+                (k_off, k_part),
+                (v_off, v_part),
+                (q_off, q_part),
+                (r_off, r_part),
+            )
+        ]
+        return torch.concat(slices, dim=0).contiguous()
+
+
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
         self,
@@ -1437,6 +1478,11 @@ def get_lora_layer(
     # Inkling QKVR needs custom LoRA-B slicing despite being a merged linear.
     if getattr(layer, "is_inkling_qkvr", False):
         return InklingQKVRLinearWithLoRA(layer, lora_backend)
+    if isinstance(layer, MergedColumnParallelLinear):
+        from sglang.srt.models.inkling_common.qkvr_linear import Inkling2QKVRLinear
+
+        if isinstance(layer, Inkling2QKVRLinear):
+            return Inkling2QKVRLinearWithLoRA(layer, lora_backend)
 
     supported_layer_types = {
         # the order matters

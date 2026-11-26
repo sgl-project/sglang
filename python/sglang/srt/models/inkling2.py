@@ -47,6 +47,7 @@ from sglang.srt.models.inkling_common.inkling2_moe import (
 )
 from sglang.srt.models.inkling_common.inkling2_norm import RMSNorm
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
+from sglang.srt.models.inkling_common.qkvr_linear import Inkling2QKVRLinear
 from sglang.srt.models.inkling_common.sconv import SconvType
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
@@ -586,17 +587,85 @@ class Inkling2ForConditionalGeneration(nn.Module):
             aux_hidden_states=auxiliary,
         )
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> tuple[int, int]:
+        from sglang.srt.lora.layers import unwrap_lora_layer
+        from sglang.srt.lora.utils import get_default_hidden_dim
+
+        if module_name == "qkvr":
+            qkvr = unwrap_lora_layer(self.llm.layers[layer_idx].attn.qkvr)
+            return qkvr.input_size, sum(qkvr.output_sizes[:4])
+        if module_name == "wo_ud":
+            wo_ud = unwrap_lora_layer(self.llm.layers[layer_idx].attn.wo_ud)
+            return wo_ud.input_size, wo_ud.output_size
+        return get_default_hidden_dim(module_name, self.text_config, layer_idx)
+
+    def get_stacked_multiply(self, module_name: str) -> int:
+        if module_name == "qkvr":
+            return 4
+        return 1
+
+    def _load_legacy_packed_qkvr(
+        self,
+        name: str,
+        checkpoint_name: str,
+        param: torch.nn.Parameter,
+        weight: torch.Tensor,
+        loader,
+    ) -> None:
+        from sglang.srt.lora.layers import unwrap_lora_layer
+
+        qkvr = unwrap_lora_layer(self.get_submodule(name.rsplit(".", 1)[0]))
+        sizes = qkvr.output_sizes
+        k_full = sizes[Inkling2QKVRLinear.SHARD_K]
+        v_full = sizes[Inkling2QKVRLinear.SHARD_V]
+        q_full = sizes[Inkling2QKVRLinear.SHARD_Q]
+        r_full = sizes[Inkling2QKVRLinear.SHARD_R]
+        gate_full = sizes[Inkling2QKVRLinear.SHARD_GATE]
+        sink_full = sizes[Inkling2QKVRLinear.SHARD_SINK]
+        pad_full = (
+            sizes[Inkling2QKVRLinear.SHARD_PAD]
+            if len(sizes) > Inkling2QKVRLinear.SHARD_PAD
+            else 0
+        )
+        sum_6 = k_full + v_full + q_full + r_full + gate_full + sink_full
+        if name.endswith(".bias") and weight.ndim == 1 and weight.shape[0] == q_full:
+            param.data.zero_()
+            loader(param, weight, Inkling2QKVRLinear.SHARD_Q)
+            return
+        valid_rows = {sum_6, sum_6 + pad_full, sum_6 + (-sum_6 % 8)}
+        if weight.shape[0] not in valid_rows:
+            raise ValueError(
+                f"{checkpoint_name}: unexpected packed qkvr rows {weight.shape[0]}"
+            )
+        offset = 0
+        for shard_id, size in (
+            (Inkling2QKVRLinear.SHARD_Q, q_full),
+            (Inkling2QKVRLinear.SHARD_K, k_full),
+            (Inkling2QKVRLinear.SHARD_V, v_full),
+            (Inkling2QKVRLinear.SHARD_R, r_full),
+            (Inkling2QKVRLinear.SHARD_GATE, gate_full),
+            (Inkling2QKVRLinear.SHARD_SINK, sink_full),
+        ):
+            loader(param, weight.narrow(0, offset, size), shard_id)
+            offset += size
+        if pad_full:
+            if weight.shape[0] == sum_6 + pad_full:
+                loader(
+                    param,
+                    weight.narrow(0, sum_6, pad_full),
+                    Inkling2QKVRLinear.SHARD_PAD,
+                )
+            else:
+                loader(
+                    param,
+                    weight.new_zeros((pad_full, *weight.shape[1:])),
+                    Inkling2QKVRLinear.SHARD_PAD,
+                )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
         loaded = set()
-        projections = (
-            "wq_du",
-            "wk_dv",
-            "wv_dv",
-            "wr_du",
-            "gate_attn",
-            "attn_sink_proj",
-        )
+        projections = Inkling2QKVRLinear.PROJECTION_NAMES
         packed_shards: dict[str, set[int]] = {}
         for checkpoint_name, weight in weights:
             name = checkpoint_name.removeprefix("model.")
@@ -641,16 +710,31 @@ class Inkling2ForConditionalGeneration(nn.Module):
                     )
                 if shard in packed_shards.get(name, set()):
                     raise ValueError(f"Repeated checkpoint tensor: {checkpoint_name}")
+                if name.endswith(".bias") and name not in packed_shards:
+                    param.data.zero_()
                 loader(param, weight, shard)
                 packed_shards.setdefault(name, set()).add(shard)
             else:
+                if name in packed_shards:
+                    raise ValueError(
+                        f"Checkpoint mixes packed and unpacked tensors: {checkpoint_name}"
+                    )
                 if name in loaded:
                     raise ValueError(f"Repeated checkpoint tensor: {checkpoint_name}")
-                loader(param, weight)
+                if ".attn.qkvr." in name:
+                    self._load_legacy_packed_qkvr(
+                        name, checkpoint_name, param, weight, loader
+                    )
+                else:
+                    loader(param, weight)
             loaded.add(name)
         missing = set(params) - loaded
         for name, shards in packed_shards.items():
-            expected = set(range(len(projections))) if name.endswith(".weight") else {0}
+            expected = (
+                set(range(len(projections)))
+                if name.endswith(".weight")
+                else {Inkling2QKVRLinear.SHARD_Q}
+            )
             if not expected.issubset(shards):
                 missing.add(f"{name} shards {sorted(expected - shards)}")
         if missing:
