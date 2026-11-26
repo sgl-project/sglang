@@ -144,7 +144,8 @@ def test_request_ordered_byte_gather():
     fixture._init_world()
     group = ps._WORLD
     rank, world = group.rank_in_group, group.world_size
-    # Empty local shares, request boundaries and both word widths above 64 MiB.
+    # Empty local shares, both word widths above 64 MiB, and a multi-request
+    # batch above the 128 MiB receive limit.
     cases = [
         ([1, 7, 9], 132),
         ([65, 63, 129], 656),
@@ -152,6 +153,7 @@ def test_request_ordered_byte_gather():
         ([524288], 132),
         ([131072], 656),
         ([131073], 512),
+        ([131073, 131072], 656),
     ]
     with (
         published_topology(tp_size=world, dcp_size=world),
