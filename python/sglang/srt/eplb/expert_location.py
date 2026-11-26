@@ -70,6 +70,15 @@ def _compute_elastic_expert_layout(
     )
 
 
+def layer_selection(sorted_ids: list[int]) -> slice | list[int]:
+    """Use a view for a contiguous run of sorted, distinct layer IDs."""
+    if not sorted_ids:
+        return slice(0, 0)
+    if sorted_ids[-1] - sorted_ids[0] + 1 == len(sorted_ids):
+        return slice(sorted_ids[0], sorted_ids[-1] + 1)
+    return sorted_ids
+
+
 @dataclass
 class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
@@ -327,10 +336,18 @@ class ExpertLocationMetadata:
         other: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        for field in [
-            "ep_size",
-        ]:
-            assert getattr(self, field) == getattr(other, field)
+        assert self.ep_size == other.ep_size
+        # Copy contiguous routed layers directly into graph-visible storage.
+        # A full-table torch.where materializes the padded replica table even
+        # when every layer is selected. Retain masking for sparse layer sets.
+        layer_ids = set(update_layer_ids)
+        layers = layer_selection(
+            sorted(i for i in layer_ids if 0 <= i < self.num_layers)
+        )
+        if not isinstance(layers, slice):
+            mask = torch.tensor(
+                [i in layer_ids for i in range(self.num_layers)], device="cpu"
+            )
 
         for field in [
             "physical_to_logical_map",
@@ -344,12 +361,15 @@ class ExpertLocationMetadata:
             self_field = getattr(self, field)
             assert (other_field is not None) == (self_field is not None)
             if self_field is not None:
-                mask_update = torch.tensor(
-                    [i in update_layer_ids for i in range(self.num_layers)]
-                )
-                mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
-                mask_update = mask_update.to(self_field.device, non_blocking=True)
-                self_field[...] = torch.where(mask_update, other_field, self_field)
+                if isinstance(layers, slice):
+                    self_field[layers].copy_(other_field[layers])
+                else:
+                    mask_update = mask.view(-1, *([1] * (self_field.dim() - 1)))
+                    self_field[...] = torch.where(
+                        mask_update.to(self_field.device, non_blocking=True),
+                        other_field,
+                        self_field,
+                    )
 
         for algorithm, (to_physical_map, logical_count) in self._mega_gate_maps.items():
             if algorithm == "static":
@@ -664,13 +684,27 @@ def compute_logical_to_rank_dispatch_physical_map(
     seed: int = 42,
 ):
 
-    r = random.Random(seed)
+    maps = compute_static_dispatch_maps(
+        logical_to_all_physical_map, ep_size, num_physical_experts, seed
+    )
+    return maps[:, :, ep_rank].contiguous().to(logical_to_all_physical_map)
 
-    device = logical_to_all_physical_map.device
+
+def compute_static_dispatch_maps(
+    logical_to_all_physical_map,
+    ep_size,
+    num_physical_experts,
+    seed=42,
+    *,
+    prefer_same_node=None,
+):
+    """Build all source ranks' static physical-slot maps on CPU, in shared RNG order."""
+    r = random.Random(seed)
     logical_to_all_physical_map = logical_to_all_physical_map.cpu()
 
     num_local_gpu_physical_experts = num_physical_experts // ep_size
-    prefer_same_node = _prefer_same_node_experts()
+    if prefer_same_node is None:
+        prefer_same_node = _prefer_same_node_experts()
     num_gpus_per_node = (
         get_parallel().ep_size // get_parallel().nnodes if prefer_same_node else None
     )
@@ -679,7 +713,6 @@ def compute_logical_to_rank_dispatch_physical_map(
         if num_gpus_per_node is not None
         else None
     )
-    dtype = logical_to_all_physical_map.dtype
 
     candidates, num_valid = _compact_candidates(logical_to_all_physical_map)
     # [layer, logical expert, rank]; -1 where no same-GPU / narrowing same-node replica exists.
@@ -709,7 +742,7 @@ def compute_logical_to_rank_dispatch_physical_map(
         )
 
     assert torch.all(result != -1)
-    return result[:, :, ep_rank].contiguous().to(dtype=dtype, device=device)
+    return result
 
 
 def _compact_candidates(
@@ -775,6 +808,16 @@ def _nearest_expert_dispatch(
     num_local_node_physical_experts: Optional[int],
 ) -> torch.Tensor:
     """Vectorized _find_nearest_expert for every (layer, logical expert, rank)."""
+    # Every source uses the sole replica directly. Only rows with a choice
+    # need per-rank ownership and locality calculations.
+    replicated = (num_valid != 1).nonzero(as_tuple=True)
+    dense_result = None
+    if replicated[0].numel() < num_valid.numel():
+        dense_result = candidates[..., :1].expand(*num_valid.shape, ep_size).clone()
+        if replicated[0].numel() == 0:
+            return dense_result
+        candidates = candidates[replicated]
+        num_valid = num_valid[replicated]
     width = candidates.shape[-1]
     device = candidates.device
     valid = torch.arange(width, device=device) < num_valid[..., None]
@@ -783,7 +826,11 @@ def _nearest_expert_dispatch(
     _, result = _first_match(
         candidates, valid, candidates // num_local_gpu_physical_experts, ranks
     )
-    if num_gpus_per_node is not None and num_local_node_physical_experts is not None:
+    if (
+        num_gpus_per_node is not None
+        and num_gpus_per_node < ep_size
+        and num_local_node_physical_experts is not None
+    ):
         node_count, node_pick = _first_match(
             candidates,
             valid,
@@ -792,8 +839,10 @@ def _nearest_expert_dispatch(
         )
         narrows = (node_count > 0) & (node_count < num_valid[..., None])
         result = torch.where((result == -1) & narrows, node_pick, result)
-    single = (num_valid == 1)[..., None]
-    return torch.where(single, candidates[..., :1].expand_as(result), result)
+    if dense_result is not None:
+        dense_result[replicated] = result
+        return dense_result
+    return result
 
 
 def _compute_gpu_id_of_physical_expert(

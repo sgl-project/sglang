@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import time
 from abc import ABC
 from collections import deque
@@ -41,7 +42,6 @@ import torch.distributed
 from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_eplb_group
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -60,6 +60,7 @@ from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,10 @@ class ExpertDistributionRecorder(ABC):
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
+
+    def hooks_enabled(self) -> bool:
+        """Whether this pass needs recorder inputs, including graph capture."""
+        return False
 
     def get_current_pass_count_buffer(self):
         return None
@@ -296,7 +301,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def get_current_pass_count_buffer(self):
-        if not self._hook_enabled():
+        if not self.hooks_enabled():
             return None
         gatherer = self._single_pass_gatherers.get(_SINGLE_PASS_GATHERER_KEY_PRIMARY)
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
@@ -339,7 +344,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             local_physical_count_of_layer=local_physical_count_of_layer,
         )
 
-    def _hook_enabled(self) -> bool:
+    def hooks_enabled(self) -> bool:
         if self._disable_all:
             return False
         if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
@@ -349,7 +354,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         )
 
     def _on_hook(self, hook_name: str, **kwargs):
-        if not self._hook_enabled():
+        if not self.hooks_enabled():
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
@@ -386,10 +391,23 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._recording = False
 
     def dump_record(self, output_mode: _OutputMode = "file"):
-        """Dump the expert distribution record and reset the recorder after dumping."""
+        """The interval adviser shares its rolling history with file and manager reads."""
         output = self._accumulator.dump(output_mode=output_mode)
-        self._reset()
+        if not self._accumulator.preserve_window_on_dump:
+            self._reset()
         return output
+
+    def peek_interval_window(self):
+        """Borrow this rank's rolling logical counts until the next forward."""
+        return self._accumulator.interval_window()
+
+    def counts_for_interval_rebalance(self):
+        """DeepSeek placement consumes only the sum over forwards."""
+        counts = self.peek_interval_window().sum_steps()
+        torch.distributed.all_reduce(
+            counts, group=self._accumulator._communication_group
+        )
+        return counts
 
     @property
     def recording(self):
@@ -758,6 +776,8 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 
 class _Accumulator(ABC):
+    preserve_window_on_dump = False
+
     @staticmethod
     def init_new(
         expert_location_metadata: ExpertLocationMetadata,
@@ -979,11 +999,14 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._global_physical_count_of_buffered_step = _Buffer.init_new(
+        self.preserve_window_on_dump = get_exec().moe.eplb_interval_policy != "fixed"
+        self._counts = _Buffer.init_new(
             item_shape=(
                 self._expert_location_metadata.num_layers,
                 # Cannot use local_physical_count to support select_experts
-                self._expert_location_metadata.num_physical_experts,
+                self._expert_location_metadata.num_logical_experts
+                if self.preserve_window_on_dump
+                else self._expert_location_metadata.num_physical_experts,
             ),
             buffer_size=get_exec().moe.expert_distribution_recorder_buffer_size,
             dtype=torch.int32,
@@ -998,22 +1021,43 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         single_pass_data: Dict,
         outputs: Dict[str, Any],
     ):
+        if self.preserve_window_on_dump and _is_model_capture_mode():
+            return
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
         # Can optimize if overhead here is large
-        self._global_physical_count_of_buffered_step.append(
-            single_pass_data["global_physical_count"]
-        )
+        counts = single_pass_data["global_physical_count"]
+        if self.preserve_window_on_dump:
+            # Later forwards may install another map while this row is retained.
+            self._counts.append_physical(
+                counts, self._expert_location_metadata.physical_to_logical_map
+            )
+        else:
+            self._counts.append(counts)
 
     def reset(self):
         super().reset()
-        self._global_physical_count_of_buffered_step.reset()
+        self._counts.reset()
+
+    def interval_window(self):
+        assert self.preserve_window_on_dump and isinstance(
+            self._counts, _CircularBuffer
+        )
+        return self._counts
+
+    def _to_logical(self, counts):
+        return _convert_global_physical_count_to_logical_count(
+            counts,
+            self._expert_location_metadata.num_layers,
+            self._expert_location_metadata.num_logical_experts,
+            self._expert_location_metadata.physical_to_logical_map,
+        )
 
     def dump(self, output_mode: _OutputMode):
-        logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
-            num_layers=self._expert_location_metadata.num_layers,
-            num_logical_experts=self._expert_location_metadata.num_logical_experts,
-            physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+        # all_reduce is in-place. A peek must keep the rank-local ring intact.
+        logical_count_of_buffered_step = (
+            self._counts.snapshot()
+            if self.preserve_window_on_dump
+            else self._to_logical(self._counts.get_all())
         )
 
         if self._first_dump:
@@ -1031,6 +1075,10 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
+        if self.preserve_window_on_dump:
+            output["valid_steps"] = min(
+                self._counts.samples_written, len(logical_count_of_buffered_step)
+            )
 
         if output_mode == "file":
             if self._rank == 0:
@@ -1105,16 +1153,64 @@ class _CircularBuffer(_Buffer):
             (buffer_size, *item_shape), dtype=dtype, device=device
         )
         self._curr_index = 0
+        self.samples_written = 0
+        self.generation = 0
 
     def append(self, value: torch.Tensor):
         self._buffer[self._curr_index] = value
+        self._advance()
+
+    def append_physical(self, counts, physical_to_logical):
+        row = self._buffer[self._curr_index]
+        row.zero_().scatter_add_(1, physical_to_logical.long(), counts.to(row.dtype))
+        self._advance()
+
+    def _advance(self):
         self._curr_index = (self._curr_index + 1) % len(self._buffer)
+        self.samples_written += 1
+
+    def sum_steps(self):
+        # Some device backends widen the entire input before reducing. Bound
+        # that temporary to 8 MiB (or one row) even for a long decode window.
+        rows = max(1, (8 << 20) // (8 * self._buffer[0].numel()))
+        chunks = iter(self._buffer.split(rows))
+        total = next(chunks).sum(dim=0, dtype=torch.int64)
+        for chunk in chunks:
+            total.add_(chunk.sum(dim=0, dtype=torch.int64))
+        return total
+
+    def latest(self):
+        """Borrow the last appended row until the next forward."""
+        if not self.samples_written:
+            raise ValueError("The recorder window is empty")
+        return self._buffer[self._curr_index - 1]
+
+    def sample_recent(self, steps: int, sample_count: int, seed: int = 0):
+        """Stratified rows from the last block, in chronological order."""
+        if not 0 < steps <= min(len(self._buffer), self.samples_written):
+            raise ValueError("Requested steps are outside the recorder window")
+        n = min(steps, sample_count)
+        rng = random.Random(seed)
+        offsets = (
+            range(steps)
+            if steps == n
+            else [rng.randrange(i * steps // n, (i + 1) * steps // n) for i in range(n)]
+        )
+        indices = [(self._curr_index - steps + i) % len(self._buffer) for i in offsets]
+        return self._buffer[indices]
+
+    def snapshot(self):
+        """Owned chronological rows for export; unused rows follow the valid prefix."""
+        oldest = self._curr_index - min(self.samples_written, len(self._buffer))
+        return self._buffer.roll(-oldest, dims=0)
 
     def get_all(self) -> torch.Tensor:
         return self._buffer
 
     def reset(self):
         self._buffer[...] = 0
+        self.samples_written = 0
+        self.generation += 1
 
 
 class _InfiniteBuffer(_Buffer):

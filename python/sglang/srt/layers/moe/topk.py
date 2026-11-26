@@ -1899,6 +1899,26 @@ def _mask_topk_ids_padded_region(
         topk_ids[_padded_row_mask(topk_ids, num_token_non_padded), :] = fill_value
 
 
+def _mask_npu_topk_padding(
+    topk_weights: torch.Tensor,
+    recorder_ids: Optional[torch.Tensor],
+    num_token_non_padded: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    # NPU dispatch consumes valid IDs even on padding. Only the recorder
+    # needs a copy with those rows marked -1, while all dispatch weights
+    # (including shared experts) must be zero there.
+    if num_token_non_padded is None:
+        return recorder_ids
+    padded = _padded_row_mask(topk_weights, num_token_non_padded)[:, None]
+    topk_weights.masked_fill_(padded, 0.0)
+    if (
+        recorder_ids is None
+        or not get_global_expert_distribution_recorder().hooks_enabled()
+    ):
+        return None
+    return recorder_ids.masked_fill(padded, -1)
+
+
 def _zero_topk_weights_padded_region(
     topk_weights: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -2783,11 +2803,9 @@ def _post_process_topk_ids(
         topk_weights[:, -num_shared_topk_slots:] *= fused_shared_experts_scaling_factor
 
     if _is_npu:
-        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
-        if recorder_topk_ids is not None and num_token_non_padded is not None:
-            recorder_topk_ids = recorder_topk_ids.masked_fill(
-                _padded_row_mask(topk_ids, num_token_non_padded)[:, None], -1
-            )
+        recorder_topk_ids = _mask_npu_topk_padding(
+            topk_weights, recorder_topk_ids, num_token_non_padded
+        )
 
     if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
         # Shared-expert append/remap can introduce non-zero weights after the
