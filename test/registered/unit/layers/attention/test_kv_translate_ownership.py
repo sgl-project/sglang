@@ -21,6 +21,7 @@ import ast
 import os
 import re
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.layers.attention import triton_backend as _anchor_module
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -130,10 +131,6 @@ class _Inner(AttentionBackend):
         self.dense_layer_ids = []
 
 
-class _InnerModelConfig:
-    context_len = 8
-
-
 class _Runner:
     """HybridAttnBackend takes its `RunnerIds` from the runner, not an inner."""
 
@@ -141,8 +138,7 @@ class _Runner:
         self.runner_ids = runner_ids
         self.kv_cache_dtype = None
         self.token_to_kv_pool = None
-        self.req_to_token_pool = None
-        self.model_config = _InnerModelConfig()
+        self.req_to_token_pool = SimpleNamespace(max_context_len=8)
 
 
 def _build_wrappers(runner_ids):

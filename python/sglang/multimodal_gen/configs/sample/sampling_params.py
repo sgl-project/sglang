@@ -599,6 +599,11 @@ class SamplingParams:
         """Resolve model-specific facts for one synthetic warmup request."""
         del req, server_args
 
+    def request_task(self) -> str | None:
+        """Task name that ``--request-time-limit TASK=SECONDS`` matches, or None
+        for models without named tasks."""
+        return None
+
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         """Return model-resolved fields to publish with the queued video job."""
         del req
