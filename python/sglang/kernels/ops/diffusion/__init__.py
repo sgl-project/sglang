@@ -809,6 +809,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_indexed_gate_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_triton",
     "can_use_rmsnorm_indexed_scale_shift": "norm.rmsnorm_scale_shift_triton",
     "indexed_gate_rmsnorm_scale_shift_": "norm.rmsnorm_scale_shift_triton",
+    "indexed_gate_rmsnorm_scale_shift_sum2_": "norm.rmsnorm_scale_shift_triton",
     "rmsnorm_indexed_scale_shift": "norm.rmsnorm_scale_shift_triton",
     "rmsnorm_scale_shift_per_token": "norm.rmsnorm_scale_shift_triton",
     "h3_vae_rmsnorm": "norm.h3_vae_fused_norm",
@@ -816,6 +817,8 @@ _EXPORTS: dict[str, str] = {
     # adaLN modulation, gating and timestep conditioning
     "indexed_gate_bf16": "modulate.indexed_modulation_triton",
     "indexed_gate_bf16_": "modulate.indexed_modulation_triton",
+    "indexed_gate_bf16_sum2_": "modulate.indexed_modulation_triton",
+    "can_use_indexed_gate_bf16_sum2": "modulate.indexed_modulation_triton",
     "indexed_scale_shift_bf16_": "modulate.indexed_modulation_triton",
     "indexed_gate_fp32": "modulate.indexed_modulation_triton",
     "indexed_gate_fp32_": "modulate.indexed_modulation_triton",
