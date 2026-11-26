@@ -7,7 +7,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.hardware_backend.rocm.speculative.dflash_worker_v2_rocm import (
+from sglang.srt.hardware_backend.gpu.speculative.dflash_worker_v2_rocm import (
     DFlashWorkerV2ROCm,
 )
 from sglang.srt.speculative import spec_info

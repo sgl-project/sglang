@@ -603,7 +603,7 @@ class _AcceptBonusBuffers:
 
 class DFlashWorkerV2(BaseSpecWorker):
     # Platform hooks below are overridden by DFlashWorkerV2ROCm
-    # (hardware_backend/rocm/speculative/dflash_worker_v2_rocm.py); the defaults are the portable path.
+    # (hardware_backend/gpu/speculative/dflash_worker_v2_rocm.py); the defaults are the portable path.
     _packed_draft_argmax = False
     _publish_before_mamba_commit = False
 
