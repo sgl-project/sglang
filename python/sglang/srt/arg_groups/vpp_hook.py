@@ -35,6 +35,10 @@ def validate_vpp_options(server_args: Any) -> None:
         raise ValueError("VPP requires CUDA")
     if cfg.pp_size < 2 or cfg.pp_async_batch_depth < 0:
         raise ValueError("VPP requires --pp-size > 1 and nonnegative async batch depth")
+    if cfg.pp_size != 2 or cfg.pp_virtual_stages != 2:
+        raise ValueError(
+            "VPP scheduling requires --pp-size 2 and --pp-virtual-stages 2"
+        )
     unsupported = (
         ("data parallelism", cfg.dp_size != 1 or cfg.attn_dp_size != 1),
         (

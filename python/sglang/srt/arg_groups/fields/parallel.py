@@ -77,7 +77,7 @@ class Parallel(msgspec.Struct):
     pp_virtual_stages: A[
         int,
         "Logical stages per physical pipeline rank. 1 uses ordinary PP; "
-        "values greater than 1 enable fixed-TP VPP for DeepSeek V4 and text-only "
+        "2 enables fixed-TP VPP with --pp-size 2 for DeepSeek V4 and text-only "
         "V4.1 on CUDA, with --disaggregation-mode prefill.",
     ] = 1
     pp_vpp_layer_partition: A[

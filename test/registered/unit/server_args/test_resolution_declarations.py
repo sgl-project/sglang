@@ -853,14 +853,14 @@ class TestVPPResolution(CustomTestCase):
                         model_path=path,
                         device="cuda",
                         pp_size=2,
-                        pp_virtual_stages=3,
+                        pp_virtual_stages=2,
                         random_seed=42,
                         disaggregation_mode=role,
                     )
                     args.resolve_once()
                     cfg = resolving_view(args)
                     layout = resolve_vpp_layout(model_config_of(args), cfg)
-                    self.assertEqual(layout.logical_size, 6)
+                    self.assertEqual(layout.logical_size, 4)
                     self.assertEqual(cfg.attention_backend, "dsv4")
                     self.assertEqual(
                         (
@@ -890,8 +890,8 @@ class TestVPPResolution(CustomTestCase):
         add_cli_args_from_dataclass(parser, Parallel)
         self.assertEqual(parser.parse_args([]).pp_vpp_max_inflight, 8)
         parsed = parser.parse_args(
-            "--pp-size 2 --pp-virtual-stages 3 --pp-vpp-max-inflight 4 "
-            "--pp-vpp-layer-partition 1 2 3 1 2 3".split()
+            "--pp-size 2 --pp-virtual-stages 2 --pp-vpp-max-inflight 4 "
+            "--pp-vpp-layer-partition 1 2 3 6".split()
         )
         args = ServerArgs(
             model_path="dummy",
@@ -917,8 +917,8 @@ class TestVPPResolution(CustomTestCase):
         publish(child, role="scheduler")
         self.assertEqual(get_parallel().pp_vpp_max_inflight, 4)
         layout = resolve_vpp_layout(model_config, get_parallel())
-        self.assertEqual(layout.layer_ids_for_rank(0), (0, 3, 4, 5, 7, 8))
-        self.assertEqual(layout.layer_ids_for_rank(1), (1, 2, 6, 9, 10, 11))
+        self.assertEqual(layout.layer_ids_for_rank(0), (0, 3, 4, 5))
+        self.assertEqual(layout.layer_ids_for_rank(1), (1, 2, 6, 7, 8, 9, 10, 11))
         self.assertEqual(
             [
                 getattr(get_exec().graph.cuda_graph_config, p).backend
@@ -941,7 +941,7 @@ class TestVPPResolution(CustomTestCase):
                         model_path="dummy",
                         device="cuda",
                         pp_size=2,
-                        pp_virtual_stages=3,
+                        pp_virtual_stages=2,
                         disaggregation_mode=role,
                         disaggregation_transfer_backend=backend,
                     )
@@ -964,6 +964,8 @@ class TestVPPResolution(CustomTestCase):
             ({"pp_vpp_max_inflight": 1}, "--pp-vpp-max-inflight"),
             ({"pp_vpp_max_inflight": -1}, "--pp-vpp-max-inflight"),
             ({"pp_size": 1}, "--pp-size"),
+            ({"pp_size": 3}, "--pp-size 2"),
+            ({"pp_virtual_stages": 3}, "--pp-virtual-stages 2"),
             ({"pp_async_batch_depth": -1}, "async batch"),
             ({"disaggregation_mode": "decode"}, "--disaggregation-mode prefill"),
             ({"disaggregation_mode": "null"}, "--disaggregation-mode prefill"),
