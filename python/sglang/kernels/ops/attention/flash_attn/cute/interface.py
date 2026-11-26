@@ -1924,6 +1924,7 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
+            max_seqlen_q=max_seqlen_q,
         )
     if (
         not fake_mode
@@ -2562,6 +2563,7 @@ def _compile_fwd_combine(
         mNumSplitsDynamic,
         mVarlenBatchIdx,
         mSemaphore,
+        Int32(1) if has_cu_seqlens else None,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -2606,6 +2608,8 @@ def _flash_attn_fwd_combine(
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     varlen_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
+    *,
+    max_seqlen_q: Optional[int] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -2623,7 +2627,7 @@ def _flash_attn_fwd_combine(
         seqused: Used sequence lengths for each batch
         num_splits_dynamic_ptr: Dynamic number of splits per batch
         semaphore_to_reset: Semaphore for synchronization
-        k_block_size: Block size for head dimension
+        max_seqlen_q: Upper bound on each packed query length, including on graph replay.
 
     Returns:
         None
@@ -2637,8 +2641,6 @@ def _flash_attn_fwd_combine(
         assert (
             out_partial.is_cuda and lse_partial.is_cuda
         ), "tensors must be on CUDA device"
-    # Determine if this is variable length based on dimensions
-    is_varlen = out_partial.dim() == 4
     # Validate optional tensors
     for t, name in [
         (cu_seqlens, "cu_seqlens"),
@@ -2667,6 +2669,10 @@ def _flash_attn_fwd_combine(
             *compile_key, use_pdl=use_pdl
         )
     if not is_fake_mode():
+        grid_q = None
+        if cu_seqlens is not None:
+            total_q = out_partial.shape[1]
+            grid_q = Int32(min(max_seqlen_q or total_q, total_q))
         _flash_attn_fwd_combine.compile_cache[compile_key](
             out_partial,
             lse_partial,
@@ -2677,6 +2683,7 @@ def _flash_attn_fwd_combine(
             num_splits_dynamic_ptr,
             varlen_batch_idx,
             semaphore_to_reset,
+            grid_q,
         )
 
 
