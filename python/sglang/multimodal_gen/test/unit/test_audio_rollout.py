@@ -57,7 +57,6 @@ from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     PRIMARY_STREAM,
     derive_extra_stream_generators,
     finalize_rollout_if_enabled,
-    init_rollout_env_if_enabled,
     pipeline_config_sp_fns,
     prepare_rollout_if_enabled,
     publish_rollout_if_enabled,
@@ -651,7 +650,7 @@ def test_stage_cleanup_allows_retry(batch, stage_cls, denoise_method_name):
 
     def denoise(batch, args):
         _prepare_primary_stream(batch)
-        batch._rollout_denoising_env_state = {"env": None}
+        batch._rollout_denoising_env_state = object()
         batch.rollout_trajectory_data = object()
         if fail:
             raise RuntimeError("model failed")
@@ -865,6 +864,8 @@ def test_ltx2_collects_audio_before_post_processing_and_publishes_after_it(batch
         batch.audio_latents = torch.full_like(batch.audio_latents, -1.0)
 
     stage = object.__new__(ltx2_denoising.LTX2DenoisingStage)
+    stage._extra_func_kwarg_names_cache = {}
+    stage.transformer = SimpleNamespace(forward=lambda hidden_states, **kwargs: None)
     stage._prepare_denoising_loop = prepare_denoising_loop
     stage._run_denoising_loop = run_denoising_loop
     stage._post_denoising_loop = post_denoising_loop
@@ -880,49 +881,6 @@ def test_ltx2_collects_audio_before_post_processing_and_publishes_after_it(batch
             rtol=0,
             atol=0,
         )
-
-
-@pytest.mark.parametrize("return_env", [True, False])
-def test_published_env_is_the_gathered_conditioning_at_the_loop_end(batch, return_env):
-    """The env is read again at publish and passed through the config's SP gather."""
-    batch.rollout_extra_streams = ()
-    batch.rollout_return_denoising_env = return_env
-    pos_cond_kwargs = {"kept": torch.ones(2), "dropped": torch.ones(2)}
-    neg_cond_kwargs = {"kept": torch.zeros(2), "dropped": torch.zeros(2)}
-    pipeline_config = SimpleNamespace(
-        shard_latents_for_sp=_PIPELINE_CONFIG.shard_latents_for_sp,
-        gather_denoising_env_static_for_sp=lambda batch, cond_kwargs: {
-            key: value for key, value in cond_kwargs.items() if key != "dropped"
-        },
-    )
-    with rollout_scope(batch):
-        _prepare_primary_stream(batch)
-        init_rollout_env_if_enabled(
-            batch=batch,
-            image_kwargs={},
-            pos_cond_kwargs=pos_cond_kwargs,
-            neg_cond_kwargs=neg_cond_kwargs,
-            guidance=None,
-        )
-        pos_cond_kwargs["added_in_the_loop"] = torch.ones(2)
-        neg_cond_kwargs["added_in_the_loop"] = torch.zeros(2)
-        for timestep in batch.timesteps:
-            batch.latents = batch.scheduler.step(
-                torch.zeros_like(batch.latents),
-                timestep,
-                batch.latents,
-                **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
-                return_dict=False,
-            )[0]
-        _finalize_stream(batch, PRIMARY_STREAM, batch.latents)
-        publish_rollout_if_enabled(batch=batch, pipeline_config=pipeline_config)
-
-    env = batch.rollout_trajectory_data.denoising_env
-    if not return_env:
-        assert env is None
-        return
-    assert set(env.pos_cond_kwargs) == {"kept", "added_in_the_loop"}
-    assert set(env.neg_cond_kwargs) == {"kept", "added_in_the_loop"}
 
 
 def test_extra_stream_needs_a_flow_match_euler_scheduler(batch):

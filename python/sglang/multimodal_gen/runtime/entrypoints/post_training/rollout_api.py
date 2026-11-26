@@ -104,11 +104,6 @@ def _slice_denoising_env_for_sample(
     if env is None:
         return None
     return RolloutDenoisingEnv(
-        image_kwargs=(
-            _extract_single_sample_tensor(env.image_kwargs, sample_idx, batch_size)
-            if env.image_kwargs
-            else None
-        ),
         pos_cond_kwargs=(
             _extract_single_sample_tensor(env.pos_cond_kwargs, sample_idx, batch_size)
             if env.pos_cond_kwargs
@@ -117,11 +112,6 @@ def _slice_denoising_env_for_sample(
         neg_cond_kwargs=(
             _extract_single_sample_tensor(env.neg_cond_kwargs, sample_idx, batch_size)
             if env.neg_cond_kwargs
-            else None
-        ),
-        guidance=(
-            _extract_single_sample_tensor(env.guidance, sample_idx, batch_size)
-            if env.guidance is not None
             else None
         ),
     )
@@ -256,7 +246,7 @@ def _serialize_denoising_env_via_store(
 ) -> dict | None:
     if env is None:
         return None
-    serialized_denoising_env = {
+    return {
         name: (
             _store_leaves(
                 kwargs,
@@ -269,19 +259,10 @@ def _serialize_denoising_env_via_store(
             else None
         )
         for name, kwargs in (
-            ("image_kwargs", env.image_kwargs),
             ("pos_cond_kwargs", env.pos_cond_kwargs),
             ("neg_cond_kwargs", env.neg_cond_kwargs),
         )
     }
-    serialized_denoising_env["guidance"] = (
-        _maybe_serialize(
-            _extract_single_sample_tensor(env.guidance, sample_idx, batch_size)
-        )
-        if env.guidance is not None
-        else None
-    )
-    return serialized_denoising_env
 
 
 def _serialize_stream(
@@ -316,17 +297,11 @@ def _serialize_denoising_env(env: RolloutDenoisingEnv | None) -> dict | None:
     if env is None:
         return None
     return {
-        "image_kwargs": (
-            _maybe_serialize(env.image_kwargs) if env.image_kwargs else None
-        ),
         "pos_cond_kwargs": (
             _maybe_serialize(env.pos_cond_kwargs) if env.pos_cond_kwargs else None
         ),
         "neg_cond_kwargs": (
             _maybe_serialize(env.neg_cond_kwargs) if env.neg_cond_kwargs else None
-        ),
-        "guidance": (
-            _maybe_serialize(env.guidance) if env.guidance is not None else None
         ),
     }
 

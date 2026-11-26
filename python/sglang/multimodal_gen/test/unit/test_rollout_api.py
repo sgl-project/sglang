@@ -231,10 +231,8 @@ class TestSerializeStreamAndEnv(unittest.TestCase):
 
     def test_with_denoising_env(self):
         denoising_env = RolloutDenoisingEnv(
-            image_kwargs={"encoder_hidden_states_image": [torch.randn(1, 8)]},
             pos_cond_kwargs={"encoder_hidden_states": torch.randn(1, 8)},
             neg_cond_kwargs={"encoder_hidden_states": torch.randn(1, 8)},
-            guidance=torch.tensor([3.5]),
         )
         stream_data = RolloutStreamData(
             dit_trajectory=RolloutDitTrajectory(
@@ -595,8 +593,8 @@ def _store_batch(B=2, T=2, D=4, L=5, latent_steps=(0, 1, 2)):
                     "pooled": torch.randn(L, D),
                     "img_shapes": [[1, 2, 3], [4, 5, 6]],
                     "txt_seq_lens": [7, 8],
+                    "guidance": torch.tensor([1.0, 2.0]),
                 },
-                guidance=torch.tensor([1.0, 2.0]),
             ),
             dit_trajectory=RolloutDitTrajectory(
                 latents=torch.randn(B, K, D),
@@ -671,6 +669,8 @@ class TestBuildResponseViaStore(unittest.TestCase):
                 "denoising_env.pos_cond_kwargs.encoder_hidden_states.0.0",
                 "denoising_env.pos_cond_kwargs.encoder_hidden_states.0.1",
                 "denoising_env.pos_cond_kwargs.pooled",
+                "denoising_env.pos_cond_kwargs.guidance.0",
+                "denoising_env.pos_cond_kwargs.guidance.1",
                 "generated_output.0",
                 "generated_output.1",
             },
@@ -717,6 +717,10 @@ class TestBuildResponseViaStore(unittest.TestCase):
             )
             self.assertEqual(cond["img_shapes"], [[[1, 2, 3], [4, 5, 6]][row]])
             self.assertEqual(cond["txt_seq_lens"], [7, 8])
+            self.assertEqual(
+                cond["guidance"],
+                {"__store__": f"denoising_env.pos_cond_kwargs.guidance.{row}"},
+            )
             self.assertIsNone(resp.rollout_debug_tensors["rollout_variance_noises"])
             self.assertIsNone(resp.output_store_ref)
 
@@ -746,10 +750,6 @@ class TestBuildResponseViaStore(unittest.TestCase):
         for row, resp in enumerate(resps):
             self.assertEqual(
                 bytes_to_tensor(resp.rollout_log_probs["data"]).shape, (2,)
-            )
-            self.assertEqual(
-                bytes_to_tensor(resp.denoising_env["guidance"]["data"]).item(),
-                row + 1.0,
             )
             self.assertEqual(
                 bytes_to_tensor(resp.dit_trajectory["timesteps"]["data"]).shape, (2,)

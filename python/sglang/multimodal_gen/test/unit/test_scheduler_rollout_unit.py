@@ -899,10 +899,9 @@ class TestRolloutStopStepUnit(unittest.TestCase):
         _prepare_primary_stream(batch, pipeline_config)
         init_rollout_env_if_enabled(
             batch=batch,
-            image_kwargs={},
             pos_cond_kwargs={},
-            neg_cond_kwargs={},
-            guidance=None,
+            neg_cond_kwargs=None,
+            pipeline_config=pipeline_config,
         )
         timesteps = batch.timesteps
         self.assertEqual(len(timesteps), 3)
