@@ -192,5 +192,19 @@ def test_verify_paths_only_on_hopper_with_16bit_cache(monkeypatch):
     assert path(12, mxfp8=False) == (0, False)
 
 
+def test_main_path_shapes_skip_the_sm_check(monkeypatch):
+    """Decode, a sliding-window layer's verify and blocks of at most 16 or over 64
+    rows return main's path before the SM check, which only a global layer's verify
+    of 17 to 64 rows reaches."""
+    from sglang.kernels.ops.attention import inkling2_decode_attention_sm90 as attn
+
+    def no_arch():
+        raise AssertionError("_verify_path read the arch")
+
+    monkeypatch.setattr(attn, "current_arch", no_arch)
+    for qlen, window in ((1, None), (8, 1023), (2, None), (11, None)):
+        assert attn._verify_path(qlen, 6, window, False) == (0, False)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

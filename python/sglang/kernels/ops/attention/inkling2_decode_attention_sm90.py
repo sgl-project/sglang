@@ -362,9 +362,9 @@ def _verify_path(qlen, group, window_size_left, mxfp8):
     than main at 32 rows (3 to 5 tokens) on 1536 keys, and 128-key ones spilled at 128
     rows; at 16 rows (2 tokens) the bias prefetch alone ran up to 4% slower than
     main."""
+    if qlen == 1 or window_size_left is not None or not 16 < qlen * group <= 64:
+        return 0, False
     # The interior tiles read no MXFP8 scales; SM120 and MXFP8 caches were not timed.
     if mxfp8 or not current_arch().is_sm(9):
-        return 0, False
-    if qlen == 1 or window_size_left is not None or not 16 < qlen * group <= 64:
         return 0, False
     return (64 if qlen * group > 32 else 0), True
