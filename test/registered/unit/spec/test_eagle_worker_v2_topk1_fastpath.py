@@ -17,7 +17,7 @@ import torch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
-from sglang.srt.speculative.eagle_info import EagleVerifyInput
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
@@ -167,6 +167,33 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             result = worker.draft_forward(forward_batch)
 
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
+
+
+class TestEagleWorkerV2ZeroStepVerifyInput(CustomTestCase):
+    def test_zero_step_verify_candidates_are_int64(self):
+        """The steps=0 verify input must carry int64 candidates, the only dtype the
+        greedy and sampling verify kernels accept."""
+        worker = object.__new__(EAGLEWorkerV2)
+        worker.device = DEVICE
+        worker.topk = 1
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                attn_backend=SimpleNamespace(verify_mask=None, max_context_len=64)
+            )
+        )
+        bonus_tokens = torch.tensor([11, 22, 33], dtype=torch.int32, device=DEVICE)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            spec_info=EagleDraftInput(bonus_tokens=bonus_tokens),
+            seq_lens=torch.tensor([5, 6, 7], dtype=torch.int64, device=DEVICE),
+            seq_lens_sum=18,
+            seq_lens_cpu=None,
+        )
+
+        verify_input = worker._build_trivial_verify_input(batch)
+
+        self.assertEqual(verify_input.draft_token.dtype, torch.int64)
+        self.assertEqual(verify_input.draft_token.tolist(), [11, 22, 33])
 
 
 class _Fold:
