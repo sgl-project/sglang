@@ -668,7 +668,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
         if (
             envs.SGLANG_ENABLE_HICACHE_MAMBA_TAIL_ONLY_STORAGE.get()
-            and self.buffer_pipeline is None
             and ComponentType.MAMBA in self.tree_components
             and not self.tree_core.is_eagle
         ):
@@ -4162,12 +4161,13 @@ class UnifiedRadixCache(BasePrefixCache):
         page_size = self.page_size
         short = requested_tokens is not None and agreed_tokens < requested_tokens
         if self.buffer_pipeline is not None:
-            self.buffer_pipeline.finish_storage_write_ack(
+            entry = self.buffer_pipeline.finish_storage_write_ack(
                 operation.id,
                 written_pages=(
                     None if requested_tokens is None else agreed_tokens // page_size
                 ),
             )
+            superseded = entry.superseded_mamba_keys if entry is not None else None
         else:
             self._backup_requested_tokens.pop(operation.id, None)
             entry = self.ongoing_backup.pop(operation.id, None)
@@ -4175,16 +4175,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, lock_params = entry
                 self.dec_host_lock_ref(node_id, lock_params)
             superseded = self._superseded_mamba_by_backup.pop(operation.id, None)
-            result = getattr(operation, "pool_storage_result", None)
-            if (
-                superseded
-                and not short
-                and result is not None
-                and result.extra_pool_hit_pages.get(PoolName.MAMBA, 0) > 0
-            ):
-                self.mamba_storage_retention.remover.submit(
-                    self.cache_controller.storage_backend, superseded
-                )
+        result = getattr(operation, "pool_storage_result", None)
+        if (
+            superseded
+            and not short
+            and result is not None
+            and result.extra_pool_hit_pages.get(PoolName.MAMBA, 0) > 0
+        ):
+            # Buffer mode would otherwise skip re-writing a removed state.
+            self.storage_existence_cache.pool(PoolName.MAMBA).invalidate_beyond(
+                superseded, 0
+            )
+            self.mamba_storage_retention.remover.submit(
+                self.cache_controller.storage_backend, superseded
+            )
         if short:
             logger.warning(
                 "HiCache storage backup operation %d wrote %d of %d tokens; the "
