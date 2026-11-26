@@ -1543,7 +1543,6 @@ class IndexerKPool(MultiPlatformOp):
             positions,
             forward_batch,
             layer_id,
-            act_quant=None,
             metadata=metadata,
             return_indices=False,
         )
