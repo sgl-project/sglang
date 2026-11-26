@@ -1071,7 +1071,7 @@ at::Tensor fused_experts_cpu(
       sorted_ids, expert_ids, topk_ids_.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
 
   // unlike triton kernel, we fuse silu with gemm1 so only need 2 intermediate_caches:
-  //   1. intermediate_cache1 : [T, N] for full FP8, [M * topk, N] otherwise
+  //   1. intermediate_cache1 : [T, N] for FP8_W8A8, [M * topk, N] otherwise
   //   2. intermediate_cache2 : [M * topk, K]
   //   3. A_tmp : [T, BLOCK_M * K]
   //   4. C_tmp : [T, 2 * BLOCK_M * BLOCK_N]
@@ -1080,9 +1080,14 @@ at::Tensor fused_experts_cpu(
   //   5. Aq_tmp : [M, K] or [M * topk, N]
   //   6. As_tmp : [M * topk]
   //
-  // for fp8 w8a16 / fp8 w8a8 and mxfp4:
+  // for fp8 w8a16 and mxfp4:
   //   7. intermediate_cache0 : [M * topk, 2N]
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
+  //
+  // for fp8 w8a8:
+  //   7. intermediate_cache0 : [M * topk, 2N]
+  //   9. Ukernel_tmp : [T, 2 * BLOCK_M * BLOCK_N]
+  //   10. Aq_tmp : [M * topk, N], As_tmp : [M * topk]
   const int64_t activation_size_bytes =
       (moe_comp_method == CPUQuantMethod::INT8_W8A8 || moe_comp_method == CPUQuantMethod::INT4_W4A8 ||
        moe_comp_method == CPUQuantMethod::FP8_W8A8)
@@ -1236,7 +1241,6 @@ at::Tensor fused_experts_cpu(
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ after_ic0 = intermediate_cache0 + M * topk * 2 * N;
-      scalar_t* __restrict__ B_tmp = nullptr;
       float* __restrict__ Ukernel_tmp = (float*)((void*)(after_ic0));
       at::Float8_e4m3fn* __restrict__ Aq_tmp = (at::Float8_e4m3fn*)(Ukernel_tmp + num_threads * 2 * BLOCK_M * BLOCK_N);
       float* __restrict__ As_tmp = (float*)(Aq_tmp + M * topk * N);
@@ -1250,7 +1254,6 @@ at::Tensor fused_experts_cpu(
           intermediate_cache1,
           intermediate_cache2,
           A_tmp,
-          B_tmp,
           C_tmp,
           Ukernel_tmp,
           Aq_tmp,

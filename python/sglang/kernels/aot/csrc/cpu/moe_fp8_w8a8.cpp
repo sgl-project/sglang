@@ -390,7 +390,6 @@ void fused_experts_fp8_a8_kernel_impl(
     scalar_t* __restrict__ ic1,
     scalar_t* __restrict__ ic2,
     at::Float8_e4m3fn* __restrict__ A_tmp,
-    scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     float* __restrict__ Ukernel_tmp,
     at::Float8_e4m3fn* __restrict__ Aq_tmp,
@@ -413,23 +412,19 @@ void fused_experts_fp8_a8_kernel_impl(
     int64_t E,
     int64_t topk,
     int64_t num_tokens_post_pad) {
-  //   1. intermediate_cache1 : [T, N] for full FP8, [M * topk, N] otherwise
+  //   1. intermediate_cache1 : [T, N]
   //   2. intermediate_cache2 : [M * topk, K]
   //   3. A_tmp : [T, BLOCK_M * K]
   //   4. C_tmp : [T, 2 * BLOCK_M * BLOCK_N]
   //   7. intermediate_cache0 : [M * topk, 2N]
-  //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
   //   9. ukernel buffer: [T, 2 * BLOCK_M * BLOCK_N]
 
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
-  int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
   // stage 1: intermediate_cache0 = hidden_states @ w1
   const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
   const int64_t KB = K / BLOCK_K;  // use div_up
-  int64_t scale_size_N = div_up(2 * N, block_size_N);
-  int64_t scale_size_K = div_up(K, block_size_K);
   int64_t blocks_n_per_group = block_size_N / BLOCK_N;  // use div_up
   int64_t num_groups = div_up(K, block_size_K);         // G, block_size_K is group size
   int64_t blocks_k_per_group = block_size_K / BLOCK_K;  // use div_up
@@ -520,7 +515,7 @@ void fused_experts_fp8_a8_kernel_impl(
     }
   });
 
-  // Full FP8 quantizes each BF16 SiLU row immediately, reusing per-thread scratch.
+  // Quantizes each BF16 SiLU row immediately, reusing per-thread scratch.
   at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
     scalar_t* thread_silu = ic1 + get_thread_num() * N;
     for (int64_t m = begin; m < end; ++m) {
@@ -553,7 +548,6 @@ void fused_experts_fp8_a8_kernel_impl(
       TYPE* __restrict__ ic1,                           \
       TYPE* __restrict__ ic2,                           \
       at::Float8_e4m3fn* __restrict__ A_tmp,            \
-      TYPE* __restrict__ B_tmp,                         \
       float* __restrict__ C_tmp,                        \
       float* __restrict__ Ukernel_tmp,                  \
       at::Float8_e4m3fn* __restrict__ Aq_tmp,           \

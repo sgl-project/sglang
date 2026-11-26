@@ -204,7 +204,6 @@ void fused_experts_fp8_a8_kernel_impl(
     scalar_t* __restrict__ ic1,
     scalar_t* __restrict__ ic2,
     at::Float8_e4m3fn* __restrict__ A_tmp,
-    scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     float* __restrict__ Ukernel_tmp,
     at::Float8_e4m3fn* __restrict__ Aq_tmp,

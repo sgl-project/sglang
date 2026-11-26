@@ -249,7 +249,6 @@ class TestFp8MoE:
         )
         method = Fp8MoEMethod(config)
         assert method.use_cpu_w8a8 == expected
-        assert method.use_fp8_moe == expected
 
     @pytest.mark.parametrize(
         "m,n,k,e,topk,skewed",
@@ -361,7 +360,6 @@ class TestFp8MoE:
     def test_mode_is_snapshotted(self, fp8_method, monkeypatch):
         monkeypatch.setattr(fp8_module, "cpu_fp8_w8a8_available", lambda: False)
         layer, _, _ = make_fp8_moe_weights(fp8_method, 2, 256, 128)
-        assert fp8_method.use_fp8_moe
         assert layer.use_intel_amx_backend
         assert layer.w13_weight.shape == (2, 16, 1, 128, 32)
         assert layer.w2_weight.shape == (2, 4, 2, 128, 32)
@@ -397,7 +395,6 @@ class TestFp8MoE:
             torch.nn.Module(), MoeRunnerConfig(activation="gelu")
         )
         assert not fp8_method.use_cpu_w8a8
-        assert not fp8_method.use_fp8_moe
 
     @pytest.mark.parametrize("n,k", [(128, 320), (352, 256)])
     def test_rejects_unaligned_weights(self, fp8_method, n, k):
@@ -427,7 +424,6 @@ class TestFp8MoE:
             weight_loader=lambda *args, **kwargs: None,
         )
         assert not fp8_method.use_cpu_w8a8
-        assert not fp8_method.use_fp8_moe
 
     @pytest.mark.parametrize("m", [0, 3])
     def test_fullgraph_and_scalar_overload(self, fp8_method, m):
