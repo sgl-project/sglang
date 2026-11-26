@@ -1119,10 +1119,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         remote = self.transport.import_registration(
             session_id=mooncake_session_id, bases=bases
         )
-        return PeerBuffers(
-            remote=remote,
-            keys=keys,
-        )
+        return PeerBuffers(remote=remote, keys=keys)
 
     def _kv_layout_mismatch(self, info: KVArgsRegisterInfo) -> Optional[str]:
         """Reject a decode peer whose KV page stride differs from ours.

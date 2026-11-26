@@ -2247,7 +2247,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> dict[str, torch.Tensor]:
         """Snapshot shared KV and index pages in logical request-page order."""
         return {
-            name: buffer.index_select(0, page_ids).clone()
+            name: buffer.index_select(0, page_ids)
             for name, buffer, page_ids in self._source_page_buffers(
                 source_layer_id, full_page_ids
             )

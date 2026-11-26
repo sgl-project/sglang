@@ -60,16 +60,11 @@ class SchedulingVPPCore:
     def _pp_vpp_can_queue_admit(
         self: Scheduler,
         batch_seq: int,
-        pending_admits: set[int],
         slot_batch_seqs: List[Optional[int]],
         rank_schedule: PipelineRankSchedule,
     ) -> bool:
         slot_id = batch_seq % len(slot_batch_seqs)
-        return (
-            len(pending_admits) < len(slot_batch_seqs)
-            and slot_batch_seqs[slot_id] is None
-            and rank_schedule.can_admit(batch_seq)
-        )
+        return slot_batch_seqs[slot_id] is None and rank_schedule.can_admit(batch_seq)
 
     def _pp_vpp_batch_manifest(
         self: Scheduler,
@@ -177,7 +172,6 @@ class SchedulingVPPCore:
             self._pp_vpp_ready_proxies[key] = proxy
             if hasattr(self, "_pp_vpp_arrivals"):
                 self._pp_vpp_arrivals.append(key)
-        self._pp_vpp_pending_recv = None
 
     def _pp_vpp_promote_early_activations(self: Scheduler, batch_seq: int) -> None:
         slot_id = batch_seq % len(self._pp_vpp_slot_batch_seqs)
@@ -308,7 +302,6 @@ class SchedulingVPPCore:
     def _pp_vpp_fixed_record_dispatch(
         self: Scheduler,
         action: PipelineWavefrontAction,
-        rank_schedule: PipelineRankSchedule,
     ) -> None:
         batch_seq = action.batch_seq
         stage_id = action.stage_id
@@ -772,7 +765,7 @@ class SchedulingVPPCore:
             return None
 
         action = rank_schedule.dispatch(tick, batch_seq, stage_id)
-        self._pp_vpp_fixed_record_dispatch(action, rank_schedule)
+        self._pp_vpp_fixed_record_dispatch(action)
         return action
 
     def _pp_vpp_find_req(self: Scheduler, rid: str) -> Optional[Req]:
@@ -803,7 +796,6 @@ class SchedulingVPPCore:
         self._pp_vpp_ready_proxies = {}
         self._pp_vpp_early_activations = {}
         self._pp_vpp_arrivals = deque()
-        self._pp_vpp_pending_recv = None
         self._pp_vpp_pending_control_recv = None
         self._pp_vpp_control_outbox = deque()
         self._pp_vpp_stage_events = {}
@@ -820,7 +812,6 @@ class SchedulingVPPCore:
         self._pp_vpp_activation_receiver = VPPSchedulerActivationReceiver(
             self._pp_vpp_activation_group(source_rank),
             self.pp_group.vpp_activation_tp_group,
-            _VPP_SEND_CREDITS,
             batch_p2p=self.pp_group.world_size == 2,
             tag=_VPP_ACTIVATION_TAG,
         )
@@ -832,8 +823,6 @@ class SchedulingVPPCore:
         max_control_sends = _VPP_SEND_CREDITS * rank_schedule.logical_size
         max_control_sends = max(64, max_control_sends)
         next_batch_seq = 0
-        pending_admits: set[int] = set()
-        pending_remote_admits = deque()
         pending_bootstrap_applies = deque()
         bootstrap_round_active = False
         transfer_round_active = False
@@ -1075,63 +1064,6 @@ class SchedulingVPPCore:
                 forward_control(envelope, wire)
                 return
 
-            if envelope.kind == PipelineControlKind.ADMIT:
-                if returned_to_source:
-                    if envelope.batch_seq not in pending_admits:
-                        raise RuntimeError(
-                            f"unexpected VPP admission response {envelope.batch_seq}"
-                        )
-                    errors = payload.get("errors") or ()
-                    if errors:
-                        raise RuntimeError(f"VPP admission failed: {errors}")
-                    pending_admits.remove(envelope.batch_seq)
-                    return
-                if not self._pp_vpp_remote_admit_slot_available(
-                    envelope, slot_batch_seqs
-                ):
-                    # Keep the admission pending until the old slot is retired.
-                    pending_remote_admits.appendleft((envelope, wire))
-                    return
-
-                if not self._pp_vpp_remote_manifest_ready(envelope):
-                    pending_remote_admits.appendleft((envelope, wire))
-                    return
-                batch = self._pp_vpp_prepare_wavefront_batch(
-                    envelope.batch_seq,
-                    slot_batch_seqs,
-                    expected_manifest=payload["manifest"],
-                )
-                local_manifest = (
-                    None
-                    if batch is None
-                    else self._pp_vpp_batch_manifest(
-                        envelope.batch_seq,
-                        envelope.slot_id,
-                        batch,
-                    )
-                )
-                expected_manifest = payload.get("manifest")
-                if batch is None:
-                    self.mbs[envelope.slot_id] = None
-                    self.mb_metadata[envelope.slot_id] = None
-                    slot_batch_seqs[envelope.slot_id] = None
-                    pending_remote_admits.appendleft((envelope, wire))
-                    return
-                if local_manifest != expected_manifest:
-                    raise RuntimeError(
-                        f"VPP admission manifest mismatch: expected "
-                        f"{expected_manifest}, got {local_manifest}"
-                    )
-                self._pp_vpp_register_prefix_batch(batch)
-                rank_schedule.admit(envelope.batch_seq)
-                self._pp_vpp_highest_admitted_batch_seq = max(
-                    self._pp_vpp_highest_admitted_batch_seq, envelope.batch_seq
-                )
-                if not payload.get("errors"):
-                    self._pp_vpp_promote_early_activations(envelope.batch_seq)
-                forward_control(envelope, wire)
-                return
-
             if envelope.kind == PipelineControlKind.FIRST_PASS_DONE:
                 if self.pp_group.rank_in_group == 0:
                     pending_first_pass[envelope.batch_seq].add(envelope.source_rank)
@@ -1227,28 +1159,12 @@ class SchedulingVPPCore:
                 if control_message is None:
                     break
                 envelope, wire = control_message
-                returned_to_source = (
-                    envelope.source_rank == self.pp_group.rank_in_group
-                    and envelope.hops >= self.pp_group.world_size
-                )
-                if (
-                    envelope.kind == PipelineControlKind.ADMIT
-                    and pending_remote_admits
-                    and not returned_to_source
-                ):
-                    pending_remote_admits.append((envelope, wire))
-                else:
-                    handle_control(envelope, wire)
+                handle_control(envelope, wire)
                 if envelope.kind not in (
                     PipelineControlKind.BOOTSTRAP_STATUS,
                     PipelineControlKind.TRANSFER_STATUS,
                 ):
                     mark_progress(f"control:{envelope.kind.value}")
-            if pending_remote_admits:
-                envelope, wire = pending_remote_admits[0]
-                if self._pp_vpp_remote_admit_slot_available(envelope, slot_batch_seqs):
-                    pending_remote_admits.popleft()
-                    handle_control(envelope, wire)
             if pending_bootstrap_applies:
                 apply_args = pending_bootstrap_applies.popleft()
                 if not try_apply_bootstrap(*apply_args):
@@ -1386,7 +1302,6 @@ class SchedulingVPPCore:
                     and self.pause_state.may_launch()
                     and self._pp_vpp_can_queue_admit(
                         next_batch_seq,
-                        pending_admits,
                         slot_batch_seqs,
                         rank_schedule,
                     )
@@ -1556,8 +1471,7 @@ class SchedulingVPPCore:
             )
             now = time.monotonic()
             has_pending_work = (
-                bool(pending_admits)
-                or bool(self._pp_vpp_pending_batch_controls)
+                bool(self._pp_vpp_pending_batch_controls)
                 or bootstrap_round_active
                 or bool(pending_chunk_batches)
                 or bool(pending_bootstrap_applies)
@@ -1579,7 +1493,7 @@ class SchedulingVPPCore:
                 logger.warning(
                     "[VPP-STALL] no scheduler progress for %.1fs "
                     "tick=%s last_progress=%s@%s pp=%s "
-                    "pending_admit=%s bootstrap_round=%s transfer_round=%s "
+                    "bootstrap_round=%s transfer_round=%s "
                     "pending_chunks=%s pending_first_pass=%s "
                     "slots=%s ready=%s running=%s "
                     "waiting=%s bootstrap=%s inflight=%s "
@@ -1592,7 +1506,6 @@ class SchedulingVPPCore:
                     stall_last_progress_event,
                     stall_last_progress_tick,
                     self.pp_group.rank_in_group,
-                    sorted(pending_admits),
                     bootstrap_round_active,
                     transfer_round_active,
                     sorted(pending_chunk_batches),

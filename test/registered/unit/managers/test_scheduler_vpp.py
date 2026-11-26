@@ -648,37 +648,6 @@ class TestSchedulingVPPCore(CustomTestCase):
         self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
         self.assertEqual(context["rank_schedule"].inflight_count, 0)
 
-    def test_control_admission_retries_missing_batch_then_promotes_its_activation(self):
-        scheduler, context = self._control_loop()
-        req = scheduler.waiting_queue[0]
-        batch = SimpleNamespace(reqs=[req], prefix_lens=[4], extend_lens=[5])
-        manifest = scheduler._pp_vpp_batch_manifest(0, 0, batch)
-        activation = self._wire(stage=1)
-        activation["vpp_batch_manifest"] = manifest
-        scheduler._pp_vpp_accept_received_tensors(activation)
-        envelope, wire = self._control_message(
-            scheduler,
-            PipelineControlKind.ADMIT,
-            payload={"manifest": manifest},
-            seq=0,
-        )
-        scheduler.candidate_batch = None
-        context["handle_control"](envelope, wire)
-        self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [None, None])
-        self.assertEqual(scheduler.mb_metadata, [None, None])
-        self.assertEqual(context["rank_schedule"].inflight_count, 0)
-        scheduler.candidate_batch = batch
-        pending = context["pending_remote_admits"].popleft()
-        context["handle_control"](*pending)
-        self.assertEqual(context["rank_schedule"].slot_batch_seqs, (0, None))
-        self.assertEqual(scheduler._pp_vpp_highest_admitted_batch_seq, 0)
-        self.assertEqual(scheduler._pp_vpp_early_activations, {})
-        self.assertIn((0, 1), scheduler._pp_vpp_ready_proxies)
-        forwarded = PipelineControlEnvelope.from_dict(
-            scheduler._pp_vpp_control_outbox.popleft()
-        )
-        self.assertEqual(forwarded.hops, 2)
-
     def test_control_cancel_preserves_newer_incarnations_and_marks_the_batch(self):
         scheduler, context = self._control_loop()
         req = scheduler.waiting_queue[0]
@@ -1471,7 +1440,7 @@ class TestSchedulingVPPCore(CustomTestCase):
             target = scheduler._pp_vpp_fixed_next_task(schedule)
             self.assertEqual(target, (seq, 0))
             action = schedule.dispatch(seq, *target)
-            scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
+            scheduler._pp_vpp_fixed_record_dispatch(action)
             schedule.complete(action)
         scheduler._pp_vpp_accept_received_tensors(self._wire(batch_seq=1))
         self.assertIsNone(scheduler._pp_vpp_fixed_next_task(schedule))
@@ -1482,7 +1451,7 @@ class TestSchedulingVPPCore(CustomTestCase):
             target = scheduler._pp_vpp_fixed_next_task(schedule)
             self.assertEqual(target, (seq, 2))
             action = schedule.dispatch(seq + 2, *target)
-            scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
+            scheduler._pp_vpp_fixed_record_dispatch(action)
             schedule.complete(action)
         self.assertFalse(scheduler._pp_vpp_fixed_waves)
         self.assertEqual(list(scheduler._pp_vpp_fixed_received), [])
@@ -1494,7 +1463,7 @@ class TestSchedulingVPPCore(CustomTestCase):
         schedule = PipelineRankSchedule(0, 2, 2, 2)
         schedule.admit(0)
         action = schedule.dispatch(0, *scheduler._pp_vpp_fixed_next_task(schedule))
-        scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
+        scheduler._pp_vpp_fixed_record_dispatch(action)
         schedule.complete(action)
         self.assertIsNone(scheduler._pp_vpp_fixed_next_task(schedule))
         scheduler._pp_vpp_accept_received_tensors(self._wire())
@@ -1502,7 +1471,7 @@ class TestSchedulingVPPCore(CustomTestCase):
         target = scheduler._pp_vpp_fixed_next_task(schedule)
         self.assertEqual(target, (0, 2))
         action = schedule.dispatch(1, *target)
-        scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
+        scheduler._pp_vpp_fixed_record_dispatch(action)
         schedule.complete(action)
         self.assertFalse(scheduler._pp_vpp_fixed_waves)
 
@@ -1522,7 +1491,7 @@ class TestSchedulingVPPCore(CustomTestCase):
             target = scheduler._pp_vpp_fixed_next_task(schedule)
             self.assertEqual(target, (seq, 1))
             action = schedule.dispatch(seq, *target)
-            scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
+            scheduler._pp_vpp_fixed_record_dispatch(action)
             schedule.complete(action)
         self.assertIsNone(scheduler._pp_vpp_fixed_next_task(schedule))
 
@@ -1783,19 +1752,10 @@ class TestSchedulingVPPCore(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "slot identity"):
             scheduler._pp_vpp_remote_admit_slot_available(invalid, [None, None])
         schedule = PipelineRankSchedule(0, 2, 2, 2)
-        self.assertTrue(
-            scheduler._pp_vpp_can_queue_admit(2, set(), [None, None], schedule)
-        )
-        self.assertFalse(
-            scheduler._pp_vpp_can_queue_admit(2, {0, 1}, [None, None], schedule)
-        )
-        self.assertFalse(
-            scheduler._pp_vpp_can_queue_admit(2, set(), [0, None], schedule)
-        )
+        self.assertTrue(scheduler._pp_vpp_can_queue_admit(2, [None, None], schedule))
+        self.assertFalse(scheduler._pp_vpp_can_queue_admit(2, [0, None], schedule))
         schedule.admit(0)
-        self.assertFalse(
-            scheduler._pp_vpp_can_queue_admit(2, set(), [None, None], schedule)
-        )
+        self.assertFalse(scheduler._pp_vpp_can_queue_admit(2, [None, None], schedule))
 
     def test_activation_rejects_wrong_identity_stale_owner_and_duplicates(self):
         """Bad activations must not enter either the ready or temporary store."""
@@ -2525,9 +2485,7 @@ class TestNativeVPPAdapter(CustomTestCase):
         scheduler.chunked_reqs = [first]
         scheduler.mbs = [SimpleNamespace(reqs=[first]), None]
         schedule = PipelineRankSchedule(0, 2, 2, 2)
-        self.assertTrue(
-            scheduler._pp_vpp_can_queue_admit(1, set(), [0, None], schedule)
-        )
+        self.assertTrue(scheduler._pp_vpp_can_queue_admit(1, [0, None], schedule))
         with scheduler._pp_vpp_select_chunk():
             self.assertIsNone(scheduler.chunked_req)
             scheduler.chunked_reqs.append(second)

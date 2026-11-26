@@ -217,9 +217,7 @@ class TestVPPTransport(CustomTestCase):
                 handles.popleft()
             ),
         )
-        receiver = VPPSchedulerActivationReceiver(
-            group, None, 2, batch_p2p=False, tag=17
-        )
+        receiver = VPPSchedulerActivationReceiver(group, None, batch_p2p=False, tag=17)
         receiver.start()
         receiver.progress()
         self.assertEqual(receiver.receive_count(), 0)

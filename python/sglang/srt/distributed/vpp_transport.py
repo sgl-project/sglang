@@ -59,7 +59,7 @@ class P2PWorkGroup:
 class VPPSchedulerActivationReceiver:
     """Receive a FIFO on each TP lane and reconstruct on a dedicated group."""
 
-    def __init__(self, pp_group, tp_group, max_inflight, *, batch_p2p, tag):
+    def __init__(self, pp_group, tp_group, *, batch_p2p, tag):
         self.pp_group = pp_group
         self.tp_group = tp_group
         self.batch_p2p = batch_p2p
