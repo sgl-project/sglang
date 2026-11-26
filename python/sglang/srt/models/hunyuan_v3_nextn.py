@@ -14,7 +14,6 @@
 
 """Inference-only HunyuanV3 NextN (MTP) Speculative Decoding."""
 
-import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -34,8 +33,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.hunyuan_v3 import HYV3DecoderLayer
 from sglang.srt.runtime_context import get_stream
 from sglang.srt.utils import is_cuda
-
-logger = logging.getLogger(__name__)
 
 
 class HYV3ModelNextN(nn.Module):
@@ -106,10 +103,7 @@ class HYV3ModelNextN(nn.Module):
         )
 
         if not forward_batch.forward_mode.is_idle():
-            if residual is not None:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-            else:
-                hidden_states = self.shared_head.norm(hidden_states)
+            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
         return hidden_states
 
@@ -192,12 +186,6 @@ class HYV3ForCausalLMNextN(nn.Module):
                     name = f"model.decoder.{subname}"
             elif name == "model.shared_head.norm.weight":
                 pass
-            elif (
-                "embed_tokens" in name
-                or "shared_head.head" in name
-                or "lm_head" in name
-            ):
-                continue
             else:
                 continue
 
