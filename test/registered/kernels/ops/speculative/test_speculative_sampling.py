@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
+from sglang.srt.speculative.spec_sampling_mask import build_tree_sampling_mask
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 if torch.version.cuda is not None:
@@ -313,6 +314,62 @@ def test_uno_compact_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
         torch.tensor([[[0, 1, 2, 3]]], dtype=support_ids.dtype, device="cuda"),
     )
     torch.testing.assert_close(support_probs, expected_probs[:, :4].view(1, 1, 4))
+
+
+@pytest.mark.skipif(torch.version.cuda is None, reason="CUDA tree mask producer")
+def test_tree_sampling_mask_follows_the_actual_accept_and_bonus():
+    device = "cuda"
+    # The first request rejects child 1 then accepts sibling 2. The second
+    # rejects both and samples its final token from the residual at the root.
+    probs = torch.tensor(
+        [[[0.0, 0.125, 0.375, 0.5], [1.0, 0, 0, 0], [0.25, 0, 0.75, 0]]],
+        device=device,
+    ).repeat(2, 1, 1)
+    predicts = torch.full((6,), -1, device=device, dtype=torch.int32)
+    indices = torch.full((2, 2), -1, device=device, dtype=torch.int32)
+    num_drafts = torch.zeros(2, device=device, dtype=torch.int32)
+    tree_speculative_sampling_target_only(
+        predicts=predicts,
+        accept_index=indices,
+        accept_token_num=num_drafts,
+        candidates=torch.tensor([[0, 1, 2]] * 2, device=device),
+        retrive_index=torch.arange(6, device=device).view(2, 3),
+        retrive_next_token=torch.tensor([[1, -1, -1]] * 2, device=device),
+        retrive_next_sibling=torch.tensor([[-1, 2, -1]] * 2, device=device),
+        uniform_samples=torch.tensor([[0.25, 0, 0], [0.75, 0, 0]], device=device),
+        uniform_samples_for_final_sampling=torch.tensor([0.125, 0.5], device=device),
+        target_probs=probs,
+        draft_probs=torch.zeros_like(probs),
+    )
+    out = build_tree_sampling_mask(
+        SimpleNamespace(
+            sampling_mask_batch_indices=torch.arange(2, device=device),
+            sampling_support_logprobs_capture_indices=torch.arange(2, device=device),
+        ),
+        probs,
+        predicts,
+        indices,
+        num_drafts + 1,
+        max_tokens=3,
+    )
+    assert indices.tolist() == [[0, 2], [3, -1]]
+    assert out.num_accept_tokens.tolist() == [2, 1]
+    assert predicts[indices[0]].tolist() == [2, 0]
+    assert predicts[indices[1, 0]].item() == 3
+    for request, slot, selected_p, support in (
+        (0, 0, 0.375, [0, 0.125, 0.375, 0.5]),
+        (0, 1, 0.25, [0.25, 0, 0.75, 0]),
+        (1, 0, 0.5, [0, 0.125, 0.375, 0.5]),
+    ):
+        length = out.lengths[request, slot].item()
+        ids = out.token_ids[request, slot, :length].long()
+        values = out.support_logprobs[request, slot, :length].exp()
+        dense = torch.zeros(4, device=device).scatter_(0, ids, values)
+        torch.testing.assert_close(dense, torch.tensor(support, device=device))
+        assert out.selected_logprobs[request, slot].exp().item() == pytest.approx(
+            selected_p
+        )
+        assert out.statuses[request, slot].item() == 0
 
 
 def _reference(candidates, coins, final_coins, target_probs, draft_probs):

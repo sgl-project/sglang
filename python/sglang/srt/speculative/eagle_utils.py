@@ -1037,7 +1037,8 @@ def _tree_accept(
     # Sample tokens
     mask_rows = (
         getattr(batch.sampling_info, "sampling_mask_batch_indices", None)
-        if getattr(verify_input, "spec_input_type", None) is SpecInputType.NGRAM_VERIFY
+        if getattr(verify_input, "spec_input_type", None)
+        in (SpecInputType.NGRAM_VERIFY, SpecInputType.EAGLE_VERIFY)
         else None
     )
     mask_target_probs = None
@@ -1346,15 +1347,15 @@ def _tree_accept(
         accept_lens = num_correct_drafts + 1
     if mask_rows is not None:
         from sglang.srt.runtime_context import get_exec
-        from sglang.srt.speculative.spec_sampling_mask import build_ngram_sampling_mask
+        from sglang.srt.speculative.spec_sampling_mask import build_tree_sampling_mask
 
-        # NGRAM has a branching tree and supplies no compact UNO top-k, so the
-        # sampling path above must have captured the dense verifier's target.
+        # The accepted tokens must refer to the dense target actually passed to
+        # the verifier. Never synthesize a singleton for a stochastic row.
         if not greedy and mask_target_probs is None:
             raise RuntimeError(
-                "Missing target probabilities for the NGRAM sampling mask."
+                "Missing target probabilities for the tree sampling mask."
             )
-        logits_output.sampling_mask_output = build_ngram_sampling_mask(
+        logits_output.sampling_mask_output = build_tree_sampling_mask(
             batch.sampling_info,
             mask_target_probs,
             predict,

@@ -321,6 +321,7 @@ class TestPostVerifyGraphs(CustomTestCase):
                 step_penalties=None,
                 logit_bias=None,
                 has_custom_logit_processor=False,
+                sampling_mask_batch_indices=None,
                 sampling_seed=None,
                 need_min_p_sampling=False,
                 watermark=None,
@@ -356,6 +357,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             dict(step_penalties=object()),
             dict(logit_bias=torch.zeros(1)),
             dict(has_custom_logit_processor=True),
+            dict(sampling_mask_batch_indices=torch.tensor([0])),
             dict(sampling_seed=torch.zeros(1)),
             dict(need_min_p_sampling=True),
         ):

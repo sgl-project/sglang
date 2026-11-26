@@ -12,11 +12,11 @@ from sglang.srt.speculative.dflash_utils import (
     build_speculative_verify_target_probs,
     is_dflash_sampling_verify_available,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def validate_spec_sampling_mask_request(
@@ -24,14 +24,29 @@ def validate_spec_sampling_mask_request(
 ) -> Optional[str]:
     """Reject configurations whose committed tokens are not exact samples from
     the captured target distribution."""
-    is_ngram = spec_algorithm.is_ngram()
-    if not (spec_algorithm.is_dflash_family() or is_ngram):
+    is_eagle = spec_algorithm in (
+        SpeculativeAlgorithm.EAGLE,
+        SpeculativeAlgorithm.EAGLE3,
+    )
+    tree_verify = is_eagle or spec_algorithm is SpeculativeAlgorithm.NGRAM
+    if not (spec_algorithm.is_dflash_family() or tree_verify):
         return "return_sampling_mask is not supported with speculative decoding."
 
-    if is_ngram and (
+    if tree_verify and (
         not is_cuda() or envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
     ):
-        return "return_sampling_mask with NGRAM requires the CUDA tree verifier."
+        return f"return_sampling_mask with {spec_algorithm.name} requires the CUDA tree verifier."
+
+    if is_eagle:
+        cfg = get_spec()
+        if cfg.speculative_use_rejection_sampling:
+            return "EAGLE sampling masks require target-only verification."
+        if cfg.enable_multi_layer_eagle and cfg.speculative_eagle_topk > 1:
+            return "Multi-layer EAGLE sampling masks require chain drafting."
+        if envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get():
+            return (
+                "EAGLE sampling masks require compact verify sampling to be disabled."
+            )
 
     if req.sampling_params.min_p > 0:
         return "return_sampling_mask with speculative decoding does not support min_p."
@@ -42,7 +57,7 @@ def validate_spec_sampling_mask_request(
             "acceptance."
         )
 
-    if spec_algorithm.is_dflash() or is_ngram:
+    if spec_algorithm.is_dflash() or tree_verify:
         if (
             get_spec().speculative_accept_threshold_single != 1.0
             or get_spec().speculative_accept_threshold_acc != 1.0
@@ -139,7 +154,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
             if accept_index is None:
                 target_probs = self.target_probs.index_select(0, batch_indices)
             else:
-                # NGRAM tree slots can skip siblings. Each accepted index identifies
+                # Tree slots can skip siblings. Each accepted index identifies
                 # both the committed token and the target row that emitted it.
                 rows = accept_index.index_select(0, batch_indices)
                 target_probs = self.target_probs.flatten(0, 1)[rows]
@@ -196,7 +211,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
         )
 
 
-def build_ngram_sampling_mask(
+def build_tree_sampling_mask(
     sampling_info, target_probs, predict, accept_index, accept_lens, max_tokens
 ):
     # Unused tree slots are -1. Materialization discards them using accept_lens.

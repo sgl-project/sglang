@@ -201,7 +201,9 @@ class SchedulerInternalStateController:
         # A relaxed threshold stops acceptance from sampling exactly from the
         # target policy, which is what a captured sampling mask describes.
         algorithm = self.scheduler.spec_algorithm
-        if not (algorithm.is_dflash() or algorithm.is_ngram()) or float(value) == 1.0:
+        if float(value) == 1.0 or not (
+            algorithm.is_dflash() or algorithm.is_ngram() or algorithm.is_eagle()
+        ):
             return
         if self._has_active_sampling_mask_request():
             raise UpdateRejected(
