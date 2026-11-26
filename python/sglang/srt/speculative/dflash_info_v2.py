@@ -11,9 +11,8 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
     add_spec_decode_headroom_pages,
-    page_aligned_decode_alloc_lens,
+    decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.device import is_pin_memory_available
 
@@ -141,26 +140,11 @@ class DFlashDraftInputV2(SpecInput):
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
 
-        # For DFLASH, each decode step needs a fixed-size verify block.
-        block_size = int(get_spec().speculative_num_draft_tokens)
-        if block_size <= 0:
-            raise ValueError(
-                f"DFLASH invalid speculative_num_draft_tokens={block_size}."
-            )
-        reserve = 2 * block_size
-        page_size = batch.token_to_kv_pool_allocator.page_size
-
-        cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
-            batch.reqs,
-            reserve=reserve,
-            page_size=page_size,
+        cur_kv_lens, nxt_kv_lens, num_needed_tokens = decode_alloc_lens(
+            batch.reqs, page_size=batch.token_to_kv_pool_allocator.page_size
         )
         nxt_kv_lens, num_needed_tokens = add_spec_decode_headroom_pages(
-            batch,
-            nxt_kv_lens,
-            num_needed_tokens,
-            reserve=reserve,
-            page_size=page_size,
+            batch, nxt_kv_lens, num_needed_tokens
         )
 
         committed_lens = [int(req.kv.kv_committed_len) for req in batch.reqs]
