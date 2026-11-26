@@ -169,10 +169,6 @@ class ExpertDistributionRecorder(ABC):
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
-    def hooks_enabled(self) -> bool:
-        """Whether this pass needs recorder inputs, including graph capture."""
-        return False
-
     def get_current_pass_count_buffer(self):
         return None
 
@@ -342,9 +338,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             "on_deepep_dispatch_low_latency",
             local_physical_count_of_layer=local_physical_count_of_layer,
         )
-
-    def hooks_enabled(self) -> bool:
-        return self._hook_enabled()
 
     def _hook_enabled(self) -> bool:
         if self._disable_all:

@@ -281,6 +281,7 @@ class HashTopK(nn.Module):
         routed_cols = topk_ids_logical_to_physical(
             routed_ids, expert_location_dispatch_info, log2phy_prob
         )
+        recorder_topk_ids = routed_cols if num_shared_topk_slots else None
         if has_per_rank_fused_shared_slots(num_shared_topk_slots):
             num_physical_routed_experts = (
                 expert_location_dispatch_info.num_physical_experts
@@ -305,28 +306,27 @@ class HashTopK(nn.Module):
             )
         else:
             topk_ids = routed_cols
-        recorder_topk_ids = routed_cols
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.moe.routing import mask_topk_padding
-
-            recorder_topk_ids = mask_topk_padding(
-                topk_weights, routed_cols, num_token_non_padded
-            )
-        elif _is_hip:
+        if _is_hip or _is_npu:
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
         else:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-            if num_shared_topk_slots:
+            if recorder_topk_ids is not None:
                 _mask_topk_ids_padded_region(recorder_topk_ids, num_token_non_padded)
-        if recorder_topk_ids is not None:
-            get_global_expert_distribution_recorder().on_select_experts(
-                topk_ids=recorder_topk_ids
+        if recorder_topk_ids is None:
+            recorder_topk_ids = topk_ids
+        if _is_npu and num_token_non_padded is not None:
+            rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+            recorder_topk_ids = recorder_topk_ids.masked_fill(
+                (rows >= num_token_non_padded)[:, None], -1
             )
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=recorder_topk_ids
+        )
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
         topk_output = self._apply_waterfill(topk_output, hidden_states.shape[0])
-        if _is_hip or (_is_npu and self.waterfill_balancer is not None):
+        if _is_hip or _is_npu:
             _zero_topk_weights_padded_region(
                 topk_output.topk_weights, num_token_non_padded
             )

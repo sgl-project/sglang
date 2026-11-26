@@ -70,15 +70,6 @@ def _compute_elastic_expert_layout(
     )
 
 
-def layer_selection(sorted_ids: list[int]) -> slice | list[int]:
-    """Use a view for a contiguous run of sorted, distinct layer IDs."""
-    if not sorted_ids:
-        return slice(0, 0)
-    if sorted_ids[-1] - sorted_ids[0] + 1 == len(sorted_ids):
-        return slice(sorted_ids[0], sorted_ids[-1] + 1)
-    return sorted_ids
-
-
 @dataclass
 class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
@@ -336,18 +327,10 @@ class ExpertLocationMetadata:
         other: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        assert self.ep_size == other.ep_size
-        # Copy contiguous routed layers directly into graph-visible storage.
-        # A full-table torch.where materializes the padded replica table even
-        # when every layer is selected. Retain masking for sparse layer sets.
-        layer_ids = set(update_layer_ids)
-        layers = layer_selection(
-            sorted(i for i in layer_ids if 0 <= i < self.num_layers)
-        )
-        if not isinstance(layers, slice):
-            mask = torch.tensor(
-                [i in layer_ids for i in range(self.num_layers)], device="cpu"
-            )
+        for field in [
+            "ep_size",
+        ]:
+            assert getattr(self, field) == getattr(other, field)
 
         for field in [
             "physical_to_logical_map",
@@ -361,15 +344,12 @@ class ExpertLocationMetadata:
             self_field = getattr(self, field)
             assert (other_field is not None) == (self_field is not None)
             if self_field is not None:
-                if isinstance(layers, slice):
-                    self_field[layers].copy_(other_field[layers])
-                else:
-                    mask_update = mask.view(-1, *([1] * (self_field.dim() - 1)))
-                    self_field[...] = torch.where(
-                        mask_update.to(self_field.device, non_blocking=True),
-                        other_field,
-                        self_field,
-                    )
+                mask_update = torch.tensor(
+                    [i in update_layer_ids for i in range(self.num_layers)]
+                )
+                mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
+                mask_update = mask_update.to(self_field.device, non_blocking=True)
+                self_field[...] = torch.where(mask_update, other_field, self_field)
 
         for algorithm, (to_physical_map, logical_count) in self._mega_gate_maps.items():
             if algorithm == "static":
@@ -808,16 +788,6 @@ def _nearest_expert_dispatch(
     num_local_node_physical_experts: Optional[int],
 ) -> torch.Tensor:
     """Vectorized _find_nearest_expert for every (layer, logical expert, rank)."""
-    # Every source uses the sole replica directly. Only rows with a choice
-    # need per-rank ownership and locality calculations.
-    replicated = (num_valid != 1).nonzero(as_tuple=True)
-    dense_result = None
-    if replicated[0].numel() < num_valid.numel():
-        dense_result = candidates[..., :1].expand(*num_valid.shape, ep_size).clone()
-        if replicated[0].numel() == 0:
-            return dense_result
-        candidates = candidates[replicated]
-        num_valid = num_valid[replicated]
     width = candidates.shape[-1]
     device = candidates.device
     valid = torch.arange(width, device=device) < num_valid[..., None]
@@ -826,11 +796,7 @@ def _nearest_expert_dispatch(
     _, result = _first_match(
         candidates, valid, candidates // num_local_gpu_physical_experts, ranks
     )
-    if (
-        num_gpus_per_node is not None
-        and num_gpus_per_node < ep_size
-        and num_local_node_physical_experts is not None
-    ):
+    if num_gpus_per_node is not None and num_local_node_physical_experts is not None:
         node_count, node_pick = _first_match(
             candidates,
             valid,
@@ -839,10 +805,8 @@ def _nearest_expert_dispatch(
         )
         narrows = (node_count > 0) & (node_count < num_valid[..., None])
         result = torch.where((result == -1) & narrows, node_pick, result)
-    if dense_result is not None:
-        dense_result[replicated] = result
-        return dense_result
-    return result
+    single = (num_valid == 1)[..., None]
+    return torch.where(single, candidates[..., :1].expand_as(result), result)
 
 
 def _compute_gpu_id_of_physical_expert(

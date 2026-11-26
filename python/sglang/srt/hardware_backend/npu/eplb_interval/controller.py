@@ -100,6 +100,14 @@ class IntervalController:
             self.window,
         )
 
+    def set_routed_layers(self, layer_ids):
+        # Keep contiguous layer selections as views of the sampled tensors.
+        layers = sorted(layer_ids)
+        if layers and layers[-1] - layers[0] + 1 == len(layers):
+            self.routed_layers = slice(layers[0], layers[-1] + 1)
+        else:
+            self.routed_layers = layers
+
     def reset_observation(self):
         self.planner.discard()
         self.replay = None

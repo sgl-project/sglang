@@ -16,7 +16,6 @@ from sglang.srt.eplb.expert_location import (
     format_expert_location_layout,
     format_expert_location_layout_diff,
     get_global_expert_location_metadata,
-    layer_selection,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel
@@ -117,9 +116,7 @@ class EPLBManager:
     def _adaptive_entrypoint(self):
         controller = self.interval_controller
         recorder = get_global_expert_distribution_recorder()
-        controller.routed_layers = layer_selection(
-            sorted(self._get_model().routed_experts_weights_of_layer)
-        )
+        controller.set_routed_layers(self._get_model().routed_experts_weights_of_layer)
         while True:
             if self._rebalance_disabled_reason is None and controller.advance(recorder):
                 # Reuse the synchronized timer so pending forward work is not
