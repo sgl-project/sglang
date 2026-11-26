@@ -541,6 +541,9 @@ SAMPLES = {
     ),
 }
 
+# GigaChat4 inherits the GCML tool-call format from GigaChat3.5.
+SAMPLES["gigachat4"] = SAMPLES["gigachat35"]
+
 # Parsers that cannot be driven from a fixed sample, with the reason.
 NOT_COVERED = {
     "gigachat3": "the chat template renders only one tool call per message",
