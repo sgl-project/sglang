@@ -22,6 +22,7 @@ from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
+    ModelConfig,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -36,6 +37,7 @@ from sglang.srt.configs.model_config import (
     uses_compressed_kv_attention,
     uses_minimax_m3_packed_nvfp4_kv,
 )
+from sglang.srt.configs.step5 import Step5Config, parse_step5_attention_profile
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.allocation_sizing import get_spec_decode_reach
@@ -228,6 +230,13 @@ def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[
     if len(layer_ids) != num_layers:
         return list(range(num_layers))
     return layer_ids
+
+
+def _step5_index_key_bytes_per_token(model_config: ModelConfig) -> int:
+    if not isinstance(model_config.hf_text_config, Step5Config):
+        return 0
+    profile = parse_step5_attention_profile(model_config.hf_text_config)
+    return profile.index_head_dim // profile.region_size
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -921,6 +930,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
                 * kv_size
             )
+            self._full_per_token += _step5_index_key_bytes_per_token(model_config)
 
         if self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
