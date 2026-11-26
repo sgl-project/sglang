@@ -638,11 +638,13 @@ def fp4_index_logits_paged(
         and batch % rows_per_request == 0
         and heads == 32
         and candidate_mask is None
-        and current_arch().is_sm(9)
+        and (current_arch().is_sm(9) or current_arch().is_sm(12))
     ):
         groups = batch // rows_per_request
+        block_l = 64 if current_arch().is_sm(12) else 128
         workers = min(
-            triton.cdiv(max_len, 128), triton.cdiv(current_arch().num_sms * 4, groups)
+            triton.cdiv(max_len, block_l),
+            triton.cdiv(current_arch().num_sms * 4, groups),
         )
         _fp4_index_logits_paged_grouped_kernel[(groups, workers)](
             q,
@@ -663,7 +665,7 @@ def fp4_index_logits_paged(
             RATIO=ratio,
             GROUP=rows_per_request,
             LANES=triton.next_power_of_2(rows_per_request),
-            BLOCK_L=128,
+            BLOCK_L=block_l,
             HALF_D=INDEX_HEAD_DIM // 2,
             H=heads,
             num_warps=4,
@@ -966,4 +968,240 @@ def _launch_fp4_index_logits_paged_balanced(
         BLOCK_L=block_l,
         BLOCK_B=triton.next_power_of_2(batch),
         num_warps=num_warps,
+    )
+
+
+@triton.jit
+def _fp4_index_logits_candidates_kernel(
+    q_ptr,
+    w_ptr,
+    req_ptr,
+    req_table_ptr,
+    lens_ptr,
+    blocks_ptr,
+    table_ptr,
+    out_ptr,
+    num_blocks,
+    cand_width,
+    page_size,
+    row_stride,
+    req_stride,
+    blocks_stride,
+    out_stride,
+    stride_qb,
+    stride_qh,
+    stride_wb,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+    RATIO: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_TILE: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n_vis = tl.load(lens_ptr + b)
+    req = tl.load(req_ptr + b).to(tl.int64)
+    q_even, q_odd, w = _fp4_index_row_query(
+        q_ptr, w_ptr, b, stride_qb, stride_qh, stride_wb, H, HALF_D
+    )
+    num_tiles = tl.cdiv(num_blocks, BLOCKS_PER_TILE)
+    for tile in range(tl.program_id(1), num_tiles, tl.num_programs(1)):
+        blk_offs = tile * BLOCKS_PER_TILE + tl.arange(0, BLOCKS_PER_TILE)
+        blk_ids = tl.load(
+            blocks_ptr + b * blocks_stride + blk_offs,
+            mask=blk_offs < num_blocks,
+            other=-1,
+        )
+        out_offs = tile * BLOCK_L + tl.arange(0, BLOCK_L)
+        if tl.max(blk_ids, axis=0) < 0:
+            tl.store(
+                out_ptr + b * out_stride + out_offs,
+                float("-inf"),
+                mask=out_offs < cand_width,
+            )
+        else:
+            blk_2d = tl.broadcast_to(blk_ids[:, None], (BLOCKS_PER_TILE, BLOCK_SIZE))
+            sub_2d = tl.broadcast_to(
+                tl.arange(0, BLOCK_SIZE)[None, :], (BLOCKS_PER_TILE, BLOCK_SIZE)
+            )
+            blk_flat = tl.reshape(blk_2d, (BLOCK_L,))
+            pos = blk_flat * BLOCK_SIZE + tl.reshape(sub_2d, (BLOCK_L,))
+            valid = (blk_flat >= 0) & (pos < n_vis) & (out_offs < cand_width)
+            slot = (
+                tl.load(
+                    req_table_ptr + req * req_stride + pos.to(tl.int64) * RATIO,
+                    mask=valid,
+                    other=0,
+                ).to(tl.int64)
+                // RATIO
+            )
+            k_low, k_high = _fp4_index_k_tile(
+                table_ptr, slot, valid, page_size, row_stride, BLOCK_L, HALF_D
+            )
+            logit = _fp4_index_logits_from_k(q_even, q_odd, w, k_low, k_high, valid)
+            tl.store(
+                out_ptr + b * out_stride + out_offs,
+                logit,
+                mask=out_offs < cand_width,
+            )
+
+
+def fp4_index_logits_candidates(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    req: torch.Tensor,
+    req_table: torch.Tensor,
+    lens: torch.Tensor,
+    blocks: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+    ratio: int,
+    block_size: int = 8,
+) -> torch.Tensor:
+    """Score only the candidate blocks published by the source layer."""
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+    assert table.dtype == torch.uint8 and table.ndim == 2
+    assert ratio in (1, 2) and block_size == 8
+    assert req_table.stride(1) == 1
+    batch, heads, _ = q.shape
+    num_blocks = blocks.shape[1]
+    cand_width = num_blocks * block_size
+    q = q.contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
+    req = req.contiguous()
+    lens = lens.contiguous()
+    blocks = blocks.contiguous()
+    out = aligned_new_empty(
+        shape=(batch, cand_width),
+        dtype=torch.float32,
+        device=q.device,
+        alignment_bytes=get_input_stride_alignment_bytes(),
+    )
+    if not batch or not cand_width:
+        return out
+    num_sms = current_arch().num_sms
+    blocks_per_tile = 8
+    block_l = blocks_per_tile * block_size
+    workers = min(
+        triton.cdiv(num_blocks, blocks_per_tile),
+        triton.cdiv(num_sms * 4, batch),
+    )
+    _fp4_index_logits_candidates_kernel[(batch, workers)](
+        q,
+        weights,
+        req,
+        req_table,
+        lens,
+        blocks,
+        table,
+        out,
+        num_blocks,
+        cand_width,
+        page_size,
+        table.stride(0),
+        req_table.stride(0),
+        blocks.stride(0),
+        out.stride(0),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        H=heads,
+        HALF_D=INDEX_HEAD_DIM // 2,
+        RATIO=ratio,
+        BLOCK_SIZE=block_size,
+        BLOCKS_PER_TILE=blocks_per_tile,
+        BLOCK_L=block_l,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _finish_candidate_indexer_topk_kernel(
+    Indices,
+    Scores,
+    Lengths,
+    Requests,
+    ReqTable,
+    Blocks,
+    Pages,
+    BATCH: tl.constexpr,
+    K: tl.constexpr,
+    CAND_WIDTH: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    OUT_WIDTH: tl.constexpr,
+    IDX_STRIDE: tl.constexpr,
+    SCORE_STRIDE: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    BLOCKS_STRIDE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+    RATIO: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    sentinel = 0x7FFFFFFF
+    cidx = tl.load(Indices + row * IDX_STRIDE + col, (row < BATCH) & (col < K), -1)
+    valid_c = (row < BATCH) & (col < K) & (cidx >= 0) & (cidx < CAND_WIDTH)
+    score = tl.load(Scores + row * SCORE_STRIDE + cidx, valid_c, -float("inf"))
+    valid_c = valid_c & (score > -float("inf"))
+    blk_i = cidx // BLOCK_SIZE
+    blk_id = tl.load(
+        Blocks + row * BLOCKS_STRIDE + blk_i, valid_c & (blk_i < NUM_BLOCKS), -1
+    )
+    length = tl.load(Lengths + row, row < BATCH, 0)
+    raw_pos = blk_id * BLOCK_SIZE + (cidx % BLOCK_SIZE)
+    raw_pos = tl.where(valid_c & (blk_id >= 0) & (raw_pos < length), raw_pos, sentinel)
+    raw_pos = tl.sort(raw_pos, descending=False)
+    valid = (row < BATCH) & (col < K) & (raw_pos < length) & (raw_pos < sentinel)
+    req = tl.load(Requests + row, row < BATCH, 0)
+    slot = tl.load(
+        ReqTable + req.to(tl.int64) * TABLE_STRIDE + raw_pos.to(tl.int64) * RATIO,
+        valid,
+        0,
+    )
+    tl.store(
+        Pages + row * PAGE_STRIDE + col,
+        tl.where(valid, slot.to(tl.int64) // RATIO, -1),
+        col < OUT_WIDTH,
+    )
+
+
+def finish_candidate_indexer_topk(
+    indices: torch.Tensor,
+    scores: torch.Tensor,
+    lengths: torch.Tensor,
+    req: torch.Tensor,
+    req_table: torch.Tensor,
+    blocks: torch.Tensor,
+    page_indices: torch.Tensor,
+    ratio: int,
+    block_size: int = 8,
+) -> None:
+    """Sort selected candidate positions and map them to compressed KV slots."""
+    if not page_indices.shape[0]:
+        return
+    _finish_candidate_indexer_topk_kernel[(page_indices.shape[0],)](
+        indices,
+        scores,
+        lengths,
+        req,
+        req_table,
+        blocks,
+        page_indices,
+        lengths.numel(),
+        indices.shape[1],
+        scores.shape[1],
+        blocks.shape[1],
+        page_indices.shape[1],
+        indices.stride(0),
+        scores.stride(0),
+        req_table.stride(0),
+        blocks.stride(0),
+        page_indices.stride(0),
+        ratio,
+        block_size,
+        triton.next_power_of_2(max(page_indices.shape[1], indices.shape[1])),
+        num_warps=4,
     )

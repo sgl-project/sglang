@@ -10,7 +10,6 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     amax_topk_blocks,
-    candidate_block_mask,
     candidate_row_lens,
     candidate_topk,
     select_candidate_block_ids,
@@ -30,9 +29,11 @@ from .scoring import (
     get_deep_gemm_prefill_data,
     prefill_requests,
     score_tiles,
+    select_candidate_decode,
     select_decode,
     select_prefill_block_ids,
     topk_ragged,
+    use_paged_decode_indexer,
     write_decode,
     write_prefill,
 )
@@ -135,10 +136,7 @@ class DenseBlocksBackend:
             blocks = amax_topk_blocks(
                 d.scores, d.lens, (d.lens + 7) // 8, self.topk_blocks
             )
-            published = BlockIds(
-                blocks=blocks,
-                decode_mask=candidate_block_mask(blocks, d.lmax, self.block_size),
-            )
+            published = BlockIds(blocks=blocks)
         else:
             published = BlockIds(
                 blocks=select_candidate_block_ids(
@@ -156,6 +154,20 @@ class DenseBlocksBackend:
         inputs: DecodeInputs,
         published: Optional[BlockIds],
     ) -> None:
+        if (
+            use_paged_decode_indexer()
+            and self.block_size == 8
+            and published is not None
+        ):
+            assert published.blocks.shape[0] == inputs.req_rows.shape[0]
+            select_candidate_decode(
+                inputs=inputs,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                blocks=published.blocks,
+                block_size=self.block_size,
+            )
+            return
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
