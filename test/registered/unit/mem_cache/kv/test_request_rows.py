@@ -107,7 +107,7 @@ class TestRowStates(CustomTestCase):
         table = RequestTable(
             size=4,
             pre_alloc_size=2,
-            max_context_len=8,
+            row_width=8,
             state_sub_pool=None,
             tracking=None,
             device="cpu",

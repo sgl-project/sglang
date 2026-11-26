@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod chat_formatter;
 mod kimi;
+pub mod prompt;
 pub mod stats;
 
 use anyhow::Result;
@@ -23,6 +24,16 @@ pub enum ForwardingScope {
     Guarded,
     /// Every non-multimodal chat.
     AllText,
+}
+
+/// Whether a chat request can forward rendered `input_ids` to the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputIdsForwarding {
+    Forwarded,
+    Disabled,
+    Ineligible,
+    IneligibleMultimodal,
+    TokenizeFailed,
 }
 
 /// A model's chat formatter plus its fallback-logging state.
@@ -872,12 +883,9 @@ mod tests {
             "tools": [{"type": "function", "function": {"name": "hello"}}],
             "chat_template_kwargs": {"greeting": "world"}
         });
-        let tokens = crate::policies::request_tokens_for(
-            &reg,
-            &crate::discovery::ModelId("tiny".into()),
-            &request,
-        )
-        .expect("request tokenizes");
+        let tokens =
+            prompt::request_tokens_for(&reg, &crate::discovery::ModelId("tiny".into()), &request)
+                .expect("request tokenizes");
         assert_eq!(tokens.ids, adapter::encode(&tok, "hello world").unwrap());
     }
 

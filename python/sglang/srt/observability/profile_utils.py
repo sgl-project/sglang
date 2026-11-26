@@ -17,21 +17,14 @@ from sglang.srt.model_executor.step_span_utils import (
     detailed_annotations_enabled,
     set_detailed_annotations_enabled,
 )
+from sglang.srt.observability.profile_analysis_npu import NPUTraceHandler
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 _is_npu = is_npu()
 if _is_npu:
-    import torch_npu
-
-    patches = [
-        ["profiler.profile", torch_npu.profiler.profile],
-        ["profiler.ProfilerActivity.CUDA", torch_npu.profiler.ProfilerActivity.NPU],
-        ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
-    ]
-    apply_torch_npu_patches(torch_npu, patches)
+    NPUTraceHandler.apply_patches("srt")
 
 logger = logging.getLogger(__name__)
 
@@ -342,9 +335,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
                 self.record_shapes if self.record_shapes is not None else False
             ),
             on_trace_ready=(
-                None
-                if not _is_npu
-                else torch_npu.profiler.tensorboard_trace_handler(self.output_dir)
+                NPUTraceHandler.get_on_trace_ready(self.output_dir) if _is_npu else None
             ),
         )
         self.torch_profiler.start()
@@ -352,8 +343,10 @@ class _ProfilerTorch(_ProfilerConcreteBase):
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
-        self.torch_profiler.stop()
-        if not _is_npu:
+        if _is_npu:
+            NPUTraceHandler.stop_capture(self.torch_profiler)
+        else:
+            self.torch_profiler.stop()
             # Build filename with only non-zero ranks to maintain backward compatibility
             filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 
