@@ -754,6 +754,90 @@ def test_late_bound_host_binding_honours_a_wider_row_stride() -> None:
 
 
 @_requires_shared_sources
+# 656 B (GLM-5.2 FP8 MLA) at 960 threads; 1152 B spans two 1 KiB chunks at 256 threads;
+# 24 B, one 16 B pair plus the 8 B remainder.
+@pytest.mark.parametrize("kv_dim,block_size", [(164, 960), (288, 256), (6, 256)])
+def test_many_misses_copy_byte_exact_through_a_strided_host(
+    kv_dim: int, block_size: int
+) -> None:
+    """Each miss must land byte-exactly, and nowhere else.
+
+    40 misses give some warps more than one;
+    rows come through a page_first host stride and permuted host and device maps.
+    """
+    # Four layers keep host rows 16 B aligned (CUDA needs it); so do even device rows.
+    hot, layers, seq_len = 64, 4, 300
+    item_size_bytes = kv_dim * torch.empty((), dtype=DTYPE).element_size()
+    gen = torch.Generator().manual_seed(0)
+    host = torch.empty(
+        (seq_len, layers, kv_dim), dtype=DTYPE, device="cpu", pin_memory=True
+    )
+    host.copy_(torch.arange(host.numel(), dtype=DTYPE).view_as(host))
+    # Every per-request table has a decoy row 0; the request uses row 1.
+    host_locs = torch.stack(
+        [torch.randperm(seq_len, generator=gen), torch.randperm(seq_len, generator=gen)]
+    )
+    # Row 1 maps slots to permuted even rows;
+    # the decoy's odd rows stay -1 as canaries.
+    even_rows = 2 * torch.randperm(hot + 1, generator=gen)
+    device_buffer_locs = torch.stack([even_rows + 1, even_rows]).to(torch.int32)
+    device_buffer = torch.full(
+        (2 * (hot + 1), 1, kv_dim), -1, dtype=DTYPE, device=DEVICE
+    )
+    for slot in range(hot):  # slot s holds token s
+        device_buffer[device_buffer_locs[1, slot], 0].copy_(
+            host[host_locs[1, slot], 0].to(DEVICE)
+        )
+    device_buffer_tokens = torch.cat(
+        [torch.arange(hot, dtype=torch.int32), torch.tensor([-1], dtype=torch.int32)]
+    ).repeat(2, 1)
+    before = device_buffer.clone()
+    hits, misses = list(range(10)), list(range(100, 140))
+    top_k = torch.tensor([hits + misses], dtype=torch.int32, device=DEVICE)
+    out = torch.full_like(top_k, -1)
+
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=top_k,
+        device_buffer_tokens=device_buffer_tokens.to(DEVICE),
+        host_cache_locs=host_locs.to(DEVICE),
+        device_buffer_locs=device_buffer_locs.to(DEVICE),
+        host_cache=None,
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([1], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
+        lru_slots=torch.arange(hot, dtype=torch.int16, device=DEVICE).repeat(2, 1),
+        item_size_bytes=item_size_bytes,
+        num_top_k=top_k.shape[1],
+        hot_buffer_size=hot,
+        page_size=1,
+        block_size=block_size,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+        # All -1, so nothing is pool-resident;
+        # the table still selects the kernel variant the HiCache backend runs.
+        device_locs=torch.full((2, seq_len), -1, dtype=torch.int32, device=DEVICE),
+        host_binding=torch.tensor(
+            [host.data_ptr(), layers * item_size_bytes],
+            dtype=torch.int64,
+            device=DEVICE,
+        ),
+    )
+    get_device_module().synchronize()
+
+    locs = out.cpu()[0].tolist()
+    assert min(locs) >= 0, locs
+    assert len(set(locs)) == len(locs), locs
+    for token, loc in zip(hits + misses, locs):
+        assert torch.equal(device_buffer[loc, 0].cpu(), host[host_locs[1, token], 0]), (
+            f"token {token} at loc {loc} is not byte-exact"
+        )
+    untouched = [row for row in range(device_buffer.shape[0]) if row not in set(locs)]
+    assert torch.equal(device_buffer[untouched].cpu(), before[untouched].cpu()), (
+        "a copy wrote outside its destination row"
+    )
+
+
+@_requires_shared_sources
 def test_graph_replay_reads_updated_host_binding() -> None:
     """A captured swap-in must read the current host address on every replay."""
     state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])

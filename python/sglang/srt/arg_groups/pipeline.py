@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
+from sglang.srt.environ import validate_env_values
 
 
 def run_resolution_pipeline(server_args: Any) -> None:
@@ -27,6 +28,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.kernel_plugins.nvidia.kimi_k31_gb_runtime_optimization import (
         apply_k31_gb_runtime_optimization,
     )
+
+    validate_env_values()
 
     # Before any step reads the environment; spawned processes inherit it.
     apply_k31_gb_runtime_optimization()
@@ -218,6 +221,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_amd_specifics,
         handle_cpu_backends,
         handle_hpu_backends,
+        handle_mlu_backends,
         handle_mps_backends,
         handle_nccl_pre_warm,
         handle_npu_backends,
@@ -237,6 +241,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # keys off enable_symm_mem.
     run_hook(handle_symm_mem_device_support, server_args)
 
+    run_hook(handle_mlu_backends, server_args)
     run_hook(handle_platform_defaults, server_args)
 
     from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
