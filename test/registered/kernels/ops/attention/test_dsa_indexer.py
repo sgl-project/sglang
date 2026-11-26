@@ -240,6 +240,7 @@ class MockModelRunner:
                     dtype=torch.int32,
                     device=self.device,
                 ),
+                "row_width": max_context_len,
             },
         )()
 
