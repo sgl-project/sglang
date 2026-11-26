@@ -63,10 +63,10 @@ if TYPE_CHECKING:
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
 
-def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
+def _pp_can_skip_output_comm(batch: ScheduleBatch, *, spec_relay: bool = False) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
-        envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
+        (envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get() or spec_relay)
         # The output message carries every chunk's routed experts to stage 0.
         and not get_exec().features.enable_return_routed_experts
         and batch is not None
@@ -1194,6 +1194,7 @@ class SchedulerPPMixin:
             logits_output=None,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=placeholder,
+            next_draft_input=batch.spec_info,
             can_run_cuda_graph=(
                 mb_metadata.can_run_cuda_graph if mb_metadata else False
             ),
@@ -1336,6 +1337,8 @@ class SchedulerPPMixin:
                 dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
             )
             batch.spec_info = next_draft_input
+            if mb_metadata.fwd_batch is not None:
+                mb_metadata.fwd_batch.spec_info = next_draft_input
         elif batch.spec_algorithm.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_draft import (
                 make_next_draft_input,
@@ -1527,6 +1530,26 @@ class SchedulerPPMixin:
             )
         self._pp_spec_set_relay(batch, relayed)
 
+    def _pp_spec_normalize_relay_input(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Normalize a PD-prefilled root before merging PP relay batches."""
+        if not self._pp_spec_relay:
+            return
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+        if isinstance(batch.spec_info, PPSpecRelayInput):
+            return
+        if not isinstance(batch.spec_info, EagleDraftInput):
+            raise TypeError(
+                "PP-spec PD decode expected EagleDraftInput before batch merge, "
+                f"got {type(batch.spec_info).__name__}"
+            )
+        batch.spec_info = PPSpecRelayInput.degenerate(
+            rids=[req.rid for req in batch.reqs],
+            bonus_tokens=batch.spec_info.bonus_tokens,
+            num_draft_tokens=get_spec().speculative_num_draft_tokens,
+        )
+
     def _pp_spec_set_relay(self: Scheduler, batch: ScheduleBatch, relayed) -> None:
         """Attach rows labelled with the forward-time composition to the live
         batch: fold them into what the requests already carry, or relabel them
@@ -1574,7 +1597,7 @@ class SchedulerPPMixin:
         plus zero drafts over a chain topology -- whose drafts simply get
         rejected, costing acceptance rate, not correctness."""
         from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
-        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+        from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
         from sglang.srt.speculative.eagle_utils import (
             build_tree_kernel_efficient,
             default_tree_mask_mode,
@@ -1596,12 +1619,27 @@ class SchedulerPPMixin:
             )
             return
 
-        relay: PPSpecRelayInput = batch.spec_info
+        live_rids = [req.rid for req in batch.reqs]
+        if isinstance(batch.spec_info, EagleDraftInput):
+            if batch.spec_info.bonus_tokens is None:
+                raise ValueError("PP EAGLE PD first decode requires draft bonus_tokens")
+            relay = PPSpecRelayInput.degenerate(
+                rids=live_rids,
+                bonus_tokens=batch.spec_info.bonus_tokens,
+                num_draft_tokens=num_draft_tokens,
+            )
+            batch.spec_info = relay
+        elif isinstance(batch.spec_info, PPSpecRelayInput):
+            relay = batch.spec_info
+        else:
+            raise TypeError(
+                "PP EAGLE verify requires EagleDraftInput or PPSpecRelayInput, "
+                f"got {type(batch.spec_info).__name__}"
+            )
         # The rows track the batch through filter / merge, but a recomposition
         # that bypasses those hooks would leave them labelled for a different
         # order, and the rebuild reads them positionally. Relabel rather than
         # hand the verify kernel another request's bonus token.
-        live_rids = [req.rid for req in batch.reqs]
         if relay.rids != live_rids:
             relay = relay.reindex(live_rids)
             batch.spec_info = relay
@@ -1688,7 +1726,9 @@ class SchedulerPPMixin:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if (
                     not target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target)
+                    and not _pp_can_skip_output_comm(
+                        target, spec_relay=self._pp_spec_relay
+                    )
                 ):
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
@@ -1766,7 +1806,7 @@ class SchedulerPPMixin:
             target = mbs[next_mb_id]
             if target is None or target.forward_mode.is_prebuilt():
                 return
-            if _pp_can_skip_output_comm(target):
+            if _pp_can_skip_output_comm(target, spec_relay=self._pp_spec_relay):
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )
@@ -1858,7 +1898,9 @@ class SchedulerPPMixin:
             if target_send is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if not target_send.forward_mode.is_prebuilt():
-                    if _pp_can_skip_output_comm(target_send):
+                    if _pp_can_skip_output_comm(
+                        target_send, spec_relay=self._pp_spec_relay
+                    ):
                         send_dict = {"__msg_type__": "output", "__skip__": True}
                     else:
                         self.device_module.current_stream().wait_event(q_event)

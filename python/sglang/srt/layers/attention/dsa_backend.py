@@ -3221,9 +3221,10 @@ class DeepseekSparseAttnBackend(
         else:
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
-                topk_indices=topk_indices,
+                topk_indices=topk_indices[: metadata.page_table_1.shape[0]],
                 page_size=1,
             )
+            page_table_1 = self._pad_topk_indices(page_table_1, q_nope.shape[0])
 
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:

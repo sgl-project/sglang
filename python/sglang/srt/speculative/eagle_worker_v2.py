@@ -1714,6 +1714,52 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
+    def draft_next_pp_round(
+        self, batch: ScheduleBatch, batch_output: GenerationBatchResult
+    ) -> None:
+        """Draft the next PP tree without changing the live scheduler batch."""
+        original_state = (
+            batch.spec_info,
+            batch.seq_lens,
+            batch.forward_mode,
+            batch.input_ids,
+            batch.seq_lens_cpu,
+            batch.seq_lens_sum,
+        )
+        try:
+            batch.spec_info = batch_output.next_draft_input
+            batch.seq_lens = batch_output.new_seq_lens
+            if not batch.forward_mode.is_idle():
+                batch.forward_mode = ForwardMode.DECODE
+            batch.input_ids = None
+            batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            with (
+                draft_tp_context(self.draft_worker.parallel_layout),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
+            ):
+                next_verify_input, parent_list, top_scores_index = (
+                    self.draft_worker.draft(batch, with_topology=True)
+                )
+            batch_output.next_verify_chain = next_verify_input.draft_token
+            batch_output.next_verify_parent_list = (
+                parent_list.clone() if parent_list is not None else None
+            )
+            batch_output.next_verify_top_scores_index = (
+                top_scores_index.clone() if top_scores_index is not None else None
+            )
+        finally:
+            (
+                batch.spec_info,
+                batch.seq_lens,
+                batch.forward_mode,
+                batch.input_ids,
+                batch.seq_lens_cpu,
+                batch.seq_lens_sum,
+            ) = original_state
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1811,42 +1857,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             if (
                 get_parallel().pp_size > 1
-                and not batch.forward_mode.is_idle()
+                # Idle attention-DP lanes must enter the same draft MoE
+                # collectives as the lanes that own requests.
+                and (not batch.forward_mode.is_idle() or get_parallel().attn_dp_enabled)
                 and self.speculative_num_steps > 0
             ):
                 # PP tail-draft: draft the NEXT round's chain now — earlier
                 # stages must have the tokens before running their half of the
                 # next verify forward, so drafting cannot wait for the next
-                # iteration. Mimic the head-of-iteration state draft() expects;
-                # the scheduler's forward isolation reverts these SB edits, and
-                # the chain rides out on batch_output.
-                batch.spec_info = batch_output.next_draft_input
-                batch.seq_lens = batch_output.new_seq_lens
-                batch.forward_mode = ForwardMode.DECODE
-                # eagle_prepare_for_verify left the verify tokens here; the
-                # head-of-iteration draft always sees None (the scheduler
-                # clears it), so mirror that state.
-                batch.input_ids = None
-                # Attention metadata planning reads the CPU copies; one D2H
-                # per round (TODO: async or upper-bound estimate).
-                batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
-                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                with (
-                    draft_tp_context(self.draft_worker.parallel_layout),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
-                    next_verify_input, parent_list, top_scores_index = (
-                        self.draft_worker.draft(batch, with_topology=True)
-                    )
-                batch_output.next_verify_chain = next_verify_input.draft_token
-                # The tree shape is data-dependent once topk > 1, so the other
-                # stages cannot re-derive it; relay it alongside the tokens.
-                # clone(): both come out of cuda-graph-owned buffers under
-                # decode replay and would be overwritten before the relay.
-                batch_output.next_verify_parent_list = parent_list.clone()
-                batch_output.next_verify_top_scores_index = top_scores_index.clone()
+                # iteration. The chain rides out on batch_output.
+                self.draft_next_pp_round(batch, batch_output)
 
             return batch_output
 
