@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
@@ -137,23 +137,8 @@ class HunyuanDetector(BaseFormatDetector):
         self.arg_value_start_token = arg_value
         self.arg_value_end_token = _close(arg_value)
 
-        tc_end = _close(tool_call)
         ak_end = _close(arg_key)
         av_end = _close(arg_value)
-        self.tool_call_regex = re.compile(
-            re.escape(tool_call)
-            + r"(.*?)"
-            + r"(?:"
-            + re.escape(tool_sep)
-            + r"|(?="
-            + re.escape(arg_key)
-            + r"|"
-            + re.escape(tc_end)
-            + r"))"
-            + r"(.*?)"
-            + re.escape(tc_end),
-            re.DOTALL,
-        )
         self.func_args_regex = re.compile(
             re.escape(arg_key)
             + r"(.*?)"
@@ -305,6 +290,32 @@ class HunyuanDetector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
+    def _iter_tool_calls(self, text: str) -> Iterator[Tuple[str, str]]:
+        """Yield (name, args_text) for each closed <tool_call> block.
+
+        Uses str.find instead of a regex: a regex with two lazy groups
+        backtracked cubically on unclosed blocks (#52090).
+        """
+        start_token, end_token = self.tool_call_start_token, self.tool_call_end_token
+        pos = 0
+        while (start := text.find(start_token, pos)) != -1:
+            body_start = start + len(start_token)
+            end = text.find(end_token, body_start)
+            if end == -1:
+                return
+            body = text[body_start:end]
+            pos = end + len(end_token)
+
+            # The name ends at <tool_sep> (dropped) or the first <arg_key> (kept).
+            sep = body.find(self.tool_sep_token)
+            key = body.find(self.arg_key_start_token)
+            if sep != -1 and (key == -1 or sep < key):
+                yield body[:sep], body[sep + len(self.tool_sep_token) :]
+            elif key != -1:
+                yield body[:key], body[key:]
+            else:
+                yield body, ""
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
@@ -317,7 +328,7 @@ class HunyuanDetector(BaseFormatDetector):
 
         calls: List[ToolCallItem] = []
         try:
-            for function_name, function_args in self.tool_call_regex.findall(text):
+            for function_name, function_args in self._iter_tool_calls(text):
                 function_name = function_name.strip()
                 if function_name not in tool_indices and not forward_unknown:
                     logger.warning(
