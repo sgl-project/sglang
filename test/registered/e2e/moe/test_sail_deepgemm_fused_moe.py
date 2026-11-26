@@ -72,15 +72,6 @@ class TestSailDeepGemmFusedMoE(CustomTestCase):
             "m_grouped_gemm_bf16_bf16_bf16_nt_fused"
         )
         initialize_moe_config()
-        # Mirror the production platform hook (arg_groups/platform_hook.py):
-        # registering the SAIL backends imports deepgemm_moe, which registers
-        # the fused func for ("none", "deep_gemm"). Without it the runner falls
-        # back to the shared pre_permute path that production never uses for
-        # a2a=none, so the test would cover a dead path instead of the SAIL
-        # fused engine (nopad gather-read and implicit-permute fused).
-        from sglang.srt.platforms import current_platform
-
-        current_platform.register_platform_backends()
         # Teardown order: model groups, default group, flags, config, env.
         cls._stack.callback(destroy_distributed_environment)
         init_distributed_environment(

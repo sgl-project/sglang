@@ -454,6 +454,7 @@ DFlash V2 on MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.se
 - **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-mi355-1106`.
 - **Monokernels.** At low concurrency, add the monokernel flags below.
 - **HiCache.** At high concurrency, add the TP4 HiCache flags below instead. `--hicache-size` is the host tier in GB per rank, so 310 GB needs about 1.24 TB of host memory across the four ranks.
+- **SWA slot reuse.** The HiCache flags set `SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1`, which frees SWA KV slots that have left the sliding window, so the SWA pool no longer saturates above concurrency 40 and throughput keeps scaling to concurrency 58. They also set `HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0`, which avoids `HSA_STATUS_ERROR_OUT_OF_RESOURCES` on the TP4 ranks. The InferenceX points through concurrency 40 ran without these two variables; [InferenceX #5193](https://github.com/SemiAnalysisAI/InferenceX/pull/5193) adds the concurrency 58 point with them.
 
 ```bash Command
 SGLANG_USE_AITER=1 \
@@ -498,6 +499,8 @@ python -m sglang.launch_server \
 PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
+HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0 \
   --tp-size 4 \
   --ep-size 4 \
   --page-size 128 \

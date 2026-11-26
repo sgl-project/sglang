@@ -13,7 +13,7 @@ hybrid sparse/linear-attention architecture.
 
 This document demonstrates the deployment of GLM-5.3 on Ascend NPUs using SGLang, including single-node deployment,
 multi-node co-located (mixed) deployment, prefill-decode disaggregation, feature configuration, and performance optimization.
-The examples use a ModelSlim W8A8 `GLM-5.3-w8a8` checkpoint and a CANN 9.1.0 runtime.
+The examples use a ModelSlim W8A8 `GLM-5.3-w8a8` checkpoint and a CANN 9.2.0 runtime.
 
 ## Supported features
 
@@ -55,7 +55,7 @@ Before following this tutorial, complete the environment setup in the documents 
   and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize the
   environment instead of using the official image.
 
-The mixed and PD disaggregation scripts below assume the CANN **9.1.0** environment from the image, including the ATB
+The mixed and PD disaggregation scripts below assume the CANN **9.2.0** environment from the image, including the ATB
 and customized operator libraries, and require working inter-node HCCL/Gloo connectivity. Ensure that
 all participating nodes use compatible software versions and can access the model weights. The PD topology additionally requires the configured MemFabric components.
 
@@ -85,8 +85,8 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable release yet, so the command
-below uses the validated build tag `cann9.1.0-a3-B105`.
+Both **stable releases** and **daily builds** are available. CANN 9.2.0 has no stable release yet, so the command
+below uses the validated build tag `cann9.2.0-a3-B050`.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 The command requires
@@ -102,7 +102,7 @@ on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 NAME=sglang-glm-5-3
 
 # pull image
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
 
 # create container
 docker run -itd --shm-size=16g --name "$NAME" \
@@ -113,7 +113,7 @@ docker run -itd --shm-size=16g --name "$NAME" \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
 
 # enter container
 docker exec -it "$NAME" bash
@@ -289,7 +289,7 @@ bootstrap and should be started before the router.
 #   D_IP: two decode node IP addresses (rank 0 first)
 #   NIC: HCCL/Gloo network interface name
 #   MODEL_PATH: local/shared GLM-5.3 W8A8 model directory
-# Ensure MemFabric, ATB, and CANN 9.1.0 custom ops are installed.
+# Ensure MemFabric, ATB, and CANN 9.2.0 custom ops are installed.
 # ============================================================
 P_IP=('<prefill-node-0-ip>' '<prefill-node-1-ip>')
 D_IP=('<decode-node-0-ip>' '<decode-node-1-ip>')

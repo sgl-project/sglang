@@ -594,16 +594,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # that was about to be taken.
             _PAGE_SLACK = 4  # pages of headroom over the derived width
             max_ctx = getattr(config, "max_position_embeddings", 0) or 0
-            extra = 4
-            try:
-                from sglang.srt.runtime_context import get_spec
+            from sglang.srt.mem_cache.allocation_sizing import (
+                get_req_to_token_headroom,
+            )
 
-                if get_spec().speculative_num_draft_tokens is not None:
-                    extra += int(get_spec().speculative_num_draft_tokens)
-            except Exception:  # spec config not available: the +4 still applies
-                pass
+            headroom = get_req_to_token_headroom()
             if max_ctx:
-                pages = -(-(max_ctx + extra) // 64) + _PAGE_SLACK
+                pages = -(-(max_ctx + headroom) // 64) + _PAGE_SLACK
                 max_ctx = pages * 64
             if max_ctx:
                 prealloc_workspace(
