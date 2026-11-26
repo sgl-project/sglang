@@ -33,8 +33,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # push wins below ~0.5 MB on B200x8/GB300 (bs<=32 @ H=7168); NVLS 2shot wins
-# above (measured: push 8.5us vs pull 11.0us at 448KB, 15.5 vs 11.0 at 896KB)
+# above (measured: push 8.5us vs pull 11.0us at 448KB, 15.5 vs 11.0 at 896KB).
 _PUSH_MAX_BYTES = 512 * 1024
+
+# Deferred-finalize push eliminates the standalone MoE finalize write+read on
+# [M, NORM_DIM] and runs across all SMs, so using the full already-allocated
+# 2 MB V2 push slot covers up to M=292 (at NORM_DIM=3584) with zero extra
+# symmetric memory (measured on 8x B300: 24.3-38.3 us across M=96..288).
+_FINALIZE_PUSH_MAX_BYTES = 2 * 1024 * 1024
 
 # Latent width of the K3 latent|shared MoE buffer the fused-norm AR expects
 # ([N, NORM_DIM] latent then [N, 2*NORM_DIM] shared). MUST match kNormDim in
@@ -359,12 +365,12 @@ def all_reduce_norm(
 
 
 def finalize_push_fits(num_tokens: int) -> bool:
-    """Whether a [num_tokens, NORM_DIM] latent fits the push window; the
-    finalize-fused AR is push-only."""
+    """Whether a [num_tokens, NORM_DIM] latent fits the deferred-finalize push
+    window (up to the full 2 MB V2 push slot, i.e. M <= 292 at NORM_DIM=3584)."""
     state = _get_state()
     assert state is not None
     nbytes = num_tokens * NORM_DIM * 2
-    return nbytes <= min(_PUSH_MAX_BYTES, state.push_slot_bytes)
+    return nbytes <= min(_FINALIZE_PUSH_MAX_BYTES, state.push_slot_bytes)
 
 
 # Largest batch where the sharded up_proj tail beats the replicated GEMM + add3,
