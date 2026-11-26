@@ -3776,7 +3776,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         fused_moe_kwargs = None
         gate_up_interleaved = getattr(layer, "_aiter_gate_up_interleaved", None)
-        if gate_up_interleaved is not None:
+        if self.is_fp4_expert and gate_up_interleaved is not None:
             from aiter.ops.flydsl.moe_common import GateMode
 
             fused_moe_kwargs = {
