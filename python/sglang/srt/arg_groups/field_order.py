@@ -350,7 +350,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_linear_replayssm",
     "linear_replayssm_cache_len",
     "enable_linear_replayssm_spec",
-    "enable_replayssm_int8_checkpoint",
     "enable_hierarchical_cache",
     "hicache_host_memory_mode",
     "hicache_ratio",

@@ -715,10 +715,6 @@ class ExecMamba(msgspec.Struct):
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
     ] = False
-    enable_replayssm_int8_checkpoint: A[
-        bool,
-        "Use an INT8 active GDN checkpoint and single-dot ReplaySSM commits for DFLASH.",
-    ] = False
 
 
 class ExecGraph(msgspec.Struct):

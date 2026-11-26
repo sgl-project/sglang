@@ -1026,26 +1026,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token
         )
 
-    def _materialize_deferred_before_state_read(self, layer, forward_batch):
-        # Metadata preparation can run on the planning stream. Drain on the
-        # forward stream, once for all layers, before checkpoint-only readers.
-        # Target verify already consumes checkpoint + accepted ring history.
-        if forward_batch.forward_mode.is_target_verify():
-            return
-        pool = getattr(self, "state_pool", None)
-        deferred = getattr(pool, "replayssm_deferred_state", None)
-        if deferred is None or layer.layer_id != pool.mamba_layer_ids[0]:
-            return
-        meta = self.prefill_graph_metadata
-        indices = (
-            meta.cache_indices
-            if meta is not None
-            else self.forward_metadata.mamba_cache_indices
-        )
-        deferred.materialize(
-            indices[: forward_batch.batch_size], reason="non_verify_forward"
-        )
-
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -1063,7 +1043,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
-        self._materialize_deferred_before_state_read(layer, forward_batch)
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -1233,31 +1212,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_state_indices=cache_indices,
             )
 
-        temporal_int8 = ssm_states.dtype == torch.int8
-        if temporal_int8:
-            from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
-                dequantize_ssm_rows,
-                quantize_ssm_rows,
-            )
-
-            ssm_work = torch.empty(
-                (cache_indices.shape[0], *ssm_states.shape[1:]),
-                dtype=torch.bfloat16,
-                device=ssm_states.device,
-            )
-            dequantize_ssm_rows(
-                ssm_states, layer_cache.temporal_scale, ssm_work, cache_indices
-            )
-            ssm_run_states = ssm_work
-            ssm_run_indices = torch.arange(
-                cache_indices.shape[0],
-                device=cache_indices.device,
-                dtype=cache_indices.dtype,
-            )
-        else:
-            ssm_run_states = ssm_states
-            ssm_run_indices = cache_indices
-
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
         if self.kernel_dispatcher.supports_packed_decode:
@@ -1268,8 +1222,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
                 scale=layer.head_k_dim**-0.5,
-                ssm_states=ssm_run_states,
-                cache_indices=ssm_run_indices,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
                 replayssm_d=replayssm_d,
@@ -1278,44 +1232,34 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
-        else:
-            query, key, value = torch.split(
-                mixed_qkv,
-                [layer.q_dim, layer.k_dim, layer.v_dim],
-                dim=-1,
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
             )
-            # Reshape from [bs, h*d] to [1, bs, h, d]
-            bs = forward_batch.batch_size
-            query = query.view(1, bs, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
+            return (core_attn_out, z) if return_z else core_attn_out
 
-            core_attn_out = self.kernel_dispatcher.decode(
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                ssm_states=ssm_run_states,
-                cache_indices=ssm_run_indices,
-                query_start_loc=query_start_loc,
-            )
+        query, key, value = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+        # Reshape from [bs, h*d] to [1, bs, h, d]
+        bs = forward_batch.batch_size
+        query = query.view(1, bs, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
-        if temporal_int8:
-            quantize_ssm_rows(
-                ssm_work, ssm_states, layer_cache.temporal_scale, cache_indices
-            )
-            if forward_batch.mamba_track_mask is not None:
-                mask = forward_batch.mamba_track_mask[: forward_batch.batch_size]
-                if bool(mask.any()):
-                    src_i = cache_indices[mask]
-                    dst_i = self.forward_metadata.mamba_track_indices[mask]
-                    valid_t = (src_i >= 0) & (dst_i >= 0)
-                    layer_cache.temporal_scale[dst_i[valid_t]] = (
-                        layer_cache.temporal_scale[src_i[valid_t]]
-                    )
+        core_attn_out = self.kernel_dispatcher.decode(
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+        )
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
@@ -1479,7 +1423,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if _is_hip and seq_len == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
-        self._materialize_deferred_before_state_read(layer, forward_batch)
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         if self.prefill_graph_metadata is not None and not is_target_verify:
             return self._forward_extend_in_graph(
@@ -1535,7 +1478,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # A strided state pool (unified memory) is read and written in place when
         # the prefill kernels address slots by its stride, else through packed
         # copies; CPU kernels index any pool directly.
-        extend_temporal_int8 = (not is_target_verify) and ssm_states.dtype == torch.int8
         needs_state_gather = (
             self.requires_contiguous_prefill_state
             and (not is_target_verify)
@@ -1543,52 +1485,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
             and not self._prefill_kernels_follow_slot_pitch(ssm_states)
         )
-        if extend_temporal_int8:
-            from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
-                dequantize_ssm_rows,
-            )
-
-            conv_states_contig = (
-                conv_states[cache_indices].contiguous()
-                if needs_state_gather
-                else conv_states
-            )
-            ssm_states_contig = torch.empty(
-                (cache_indices.shape[0], *ssm_states.shape[1:]),
-                dtype=torch.bfloat16,
-                device=ssm_states.device,
-            )
-            dequantize_ssm_rows(
-                ssm_states,
-                mamba_cache_params.temporal_scale,
-                ssm_states_contig,
-                cache_indices,
-            )
-            conv_state_indices = (
-                torch.arange(
-                    cache_indices.shape[0],
-                    device=cache_indices.device,
-                    dtype=cache_indices.dtype,
-                )
-                if needs_state_gather
-                else cache_indices
-            )
-            state_cache_indices = torch.arange(
-                cache_indices.shape[0],
-                device=cache_indices.device,
-                dtype=cache_indices.dtype,
-            )
-        elif needs_state_gather:
+        if needs_state_gather:
             staging = self._prefill_state_staging()
             conv_states_contig, ssm_states_contig = stage_pool_states(
                 (conv_states, ssm_states), staging
             )
             state_cache_indices = staging.kernel_rows
-            conv_state_indices = state_cache_indices
         else:
             conv_states_contig = conv_states
             ssm_states_contig = ssm_states
-            conv_state_indices = cache_indices
             state_cache_indices = cache_indices
 
         if is_target_verify:
@@ -1625,7 +1530,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 forward_batch,
                 mixed_qkv,
                 conv_states_contig,
-                conv_state_indices,
+                state_cache_indices,
             )
 
         actual_seq_len = mixed_qkv.shape[0]
@@ -1774,53 +1679,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
 
-            if extend_temporal_int8:
-                from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
-                    quantize_ssm_rows,
+            if needs_state_gather:
+                # Scatter the in-place-updated contiguous copies back to the
+                # strided envelope pool (advanced indexing handles the strides).
+                unstage_pool_states(
+                    (conv_states, ssm_states),
+                    (conv_states_contig, ssm_states_contig),
+                    staging,
                 )
 
-                if needs_state_gather:
-                    conv_states[cache_indices] = conv_states_contig
-                quantize_ssm_rows(
-                    ssm_states_contig,
+            if forward_metadata.has_mamba_track_mask:
+                self._track_mamba_state_extend(
+                    forward_batch,
+                    h,
                     ssm_states,
-                    mamba_cache_params.temporal_scale,
-                    cache_indices,
+                    forward_metadata,
+                    h_track_buf=h_track_buf,
                 )
-                if forward_metadata.has_mamba_track_mask:
-                    t_scale = mamba_cache_params.temporal_scale
-                    if forward_metadata.track_ssm_h_src.numel() > 0:
-                        if h_track_buf is not None:
-                            src_h = h_track_buf[forward_metadata.track_ssm_h_batch_src]
-                        else:
-                            assert h is not None
-                            src_h = h.squeeze(0)[forward_metadata.track_ssm_h_src]
-                        quantize_ssm_rows(
-                            src_h, ssm_states, t_scale, forward_metadata.track_ssm_h_dst
-                        )
-                    if forward_metadata.track_ssm_final_src.numel() > 0:
-                        ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
-                            forward_metadata.track_ssm_final_src
-                        ]
-                        t_scale[forward_metadata.track_ssm_final_dst] = t_scale[
-                            forward_metadata.track_ssm_final_src
-                        ]
-            else:
-                if needs_state_gather:
-                    unstage_pool_states(
-                        (conv_states, ssm_states),
-                        (conv_states_contig, ssm_states_contig),
-                        staging,
-                    )
-
-                if forward_metadata.has_mamba_track_mask:
-                    self._track_mamba_state_extend(
-                        forward_batch,
-                        h,
-                        ssm_states,
-                        forward_metadata,
-                        h_track_buf=h_track_buf,
-                    )
 
         return core_attn_out
 
@@ -2096,7 +1971,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             checkpoint_state=layer_cache.temporal,
-            checkpoint_scale=layer_cache.temporal_scale,
             d_cache=d_cache,
             k_cache=layer_cache.replayssm_k,
             g_cache=layer_cache.replayssm_g,

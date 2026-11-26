@@ -480,7 +480,7 @@ def _fused_conv_window_scatter_with_mask_kernel(
     # dst window is contiguous in (dim, K-1) order -> flat element index `e`.
     dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + e
 
-    data = tl.load(src_ptr + src_off, mask=mask, other=0)
+    data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
     tl.store(dst_ptr + dst_off, data, mask=mask)
 
 
@@ -653,7 +653,7 @@ def _fused_conv_window_scatter_multi_kernel(
                     e % last_axis
                 ) * src_win_stride
             dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + e
-            data = tl.load(src_ptr + src_off, mask=mask, other=0)
+            data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
             tl.store(dst_ptr + dst_off, data, mask=mask)
 
 

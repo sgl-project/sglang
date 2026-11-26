@@ -521,48 +521,6 @@ class ReqToTokenPool:
             )
 
 
-class ReplaySSMInt8ScaleState:
-    """Per-slot float32 V-row scale for INT8 ReplaySSM checkpoints.
-
-    Stored slot-major [num_slots, num_layers, hv, v_dim] so MambaPoolHost and
-    Mooncake zero-copy carry all layers' scales in a single contiguous buffer
-    per checkpoint slot; transposed to [num_layers, num_slots, hv, v_dim] for
-    MambaPool.State.at_layer_idx().
-    """
-
-    def __init__(
-        self,
-        *,
-        num_layers: int,
-        num_slots: int,
-        hv: int,
-        v_dim: int,
-        layer_ids: List[int],
-        device: str,
-    ):
-        self.layer_map = {layer_id: i for i, layer_id in enumerate(layer_ids)}
-        self.scale = torch.zeros(
-            (num_slots, num_layers, hv, v_dim),
-            dtype=torch.float32,
-            device=device,
-        )
-
-    def reset_slots(self, indices: torch.Tensor) -> None:
-        self.scale[indices] = 0
-
-    def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
-        self.scale[dst_index] = self.scale[src_index]
-
-    def get_cpu_slots(self, indices: torch.Tensor):
-        return self.scale[indices].to("cpu", non_blocking=True)
-
-    def load_cpu_slots(self, data, indices: torch.Tensor) -> None:
-        self.scale[indices] = data.to(self.scale.device, non_blocking=True)
-
-    def iter_transfer_state_entries(self):
-        yield ("replayssm_int8_scale", self.scale, None, None)
-
-
 class MambaPool:
     host_capacity_tokens: Optional[int] = None
     host_capacity_bytes: Optional[int] = None
@@ -584,7 +542,6 @@ class MambaPool:
     class State:
         conv: List[torch.Tensor]
         temporal: torch.Tensor
-        temporal_scale: Optional[torch.Tensor] = None
         # GDN ReplaySSM ring buffers (slice 1a). Only allocated when
         # `--enable-linear-replayssm` is set; otherwise None so the legacy path is
         # byte-identical. Per-layer layout: [num_layers, num_slots, ...].
@@ -715,18 +672,11 @@ class MambaPool:
         enable_linear_replayssm_spec: bool = False,
         replayssm_request_ring: bool = False,
         allocate_intermediate_ssm: bool = True,
-        enable_replayssm_int8_checkpoint: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
-        use_replayssm_int8 = bool(
-            enable_replayssm_int8_checkpoint
-            and enable_linear_replayssm_spec
-            and not cache_params.is_kda
-        )
-        ckpt_dtype = torch.int8 if use_replayssm_int8 else ssm_dtype
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -755,7 +705,6 @@ class MambaPool:
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        temporal_scale_state = None
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
             (
@@ -822,18 +771,9 @@ class MambaPool:
 
                 temporal_state = torch.zeros(
                     size=(num_mamba_layers, size + 1) + temporal_state_shape,
-                    dtype=ckpt_dtype,
+                    dtype=ssm_dtype,
                     device=device,
                 )
-                if use_replayssm_int8:
-                    temporal_scale_state = ReplaySSMInt8ScaleState(
-                        num_layers=num_mamba_layers,
-                        num_slots=size + 1,
-                        hv=temporal_state_shape[0],
-                        v_dim=temporal_state_shape[1],
-                        layer_ids=self.mamba_layer_ids,
-                        device=device,
-                    )
 
             # GDN ReplaySSM ring buffers (slice 1a). Allocated only when the
             # flag is on; otherwise left as None so the legacy State is
@@ -951,13 +891,10 @@ class MambaPool:
                         dtype=torch.float32,
                         device=device,
                     )
-                elif (
-                    enable_linear_replayssm_spec
-                    and ring_dtype != torch.float32
-                    and not use_replayssm_int8
-                ):
-                    # Low parts of compact D and normalized K (skipped for INT8
-                    # checkpoints where 7-bit rounding dominates bf16 truncation).
+                elif enable_linear_replayssm_spec and ring_dtype != torch.float32:
+                    # Low parts of compact D and normalized K. The rings follow
+                    # the activation dtype regardless of checkpoint dtype, so
+                    # materialization always needs both parts.
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
                         dtype=conv_dtype,
@@ -1075,11 +1012,6 @@ class MambaPool:
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
-                    temporal_scale=(
-                        temporal_scale_state.scale.transpose(0, 1)
-                        if temporal_scale_state is not None
-                        else None
-                    ),
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
                     replayssm_d=replayssm_d,
@@ -1108,11 +1040,6 @@ class MambaPool:
                 self.mamba_cache = self.State(
                     conv=conv_state,
                     temporal=temporal_state,
-                    temporal_scale=(
-                        temporal_scale_state.scale.transpose(0, 1)
-                        if temporal_scale_state is not None
-                        else None
-                    ),
                     replayssm_d=replayssm_d,
                     replayssm_k=replayssm_k,
                     replayssm_g=replayssm_g,
@@ -1189,8 +1116,6 @@ class MambaPool:
         # attn_tp_size (GDN: [key_dim, key_dim, value_dim]); None otherwise.
         self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
         self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
-        if temporal_scale_state is not None:
-            self.register_slot_state(temporal_scale_state)
         self._warmup_fused_copy_slot_kernel()
 
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
@@ -1268,9 +1193,6 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
-        deferred = getattr(self, "replayssm_deferred_state", None)
-        if deferred is not None:
-            deferred.reset(indices)
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
         idx64 = indices.to(torch.int64)
@@ -1320,10 +1242,6 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
-        deferred = getattr(self, "replayssm_deferred_state", None)
-        if deferred is not None:
-            deferred.materialize(src_indices, reason="copy")
-            deferred.reset(dst_indices)
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
@@ -1356,9 +1274,6 @@ class MambaPool:
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
-        deferred = getattr(self, "replayssm_deferred_state", None)
-        if deferred is not None:
-            deferred.materialize(indices, reason="cpu_export")
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
             for conv in self.mamba_cache.conv
@@ -1386,9 +1301,6 @@ class MambaPool:
         else:
             conv_cpu, temporal_cpu = mamba_cache_cpu
         current_platform.synchronize()
-        deferred = getattr(self, "replayssm_deferred_state", None)
-        if deferred is not None:
-            deferred.reset(indices)
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
@@ -1538,7 +1450,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
         allocate_intermediate_ssm: bool = True,
-        enable_replayssm_int8_checkpoint: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1579,7 +1490,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
             allocate_intermediate_ssm=allocate_intermediate_ssm,
-            enable_replayssm_int8_checkpoint=enable_replayssm_int8_checkpoint,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
@@ -1602,7 +1512,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
         allocate_intermediate_ssm: bool = True,
-        enable_replayssm_int8_checkpoint: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1625,7 +1534,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
             replayssm_request_ring=replayssm_request_ring,
             allocate_intermediate_ssm=allocate_intermediate_ssm,
-            enable_replayssm_int8_checkpoint=enable_replayssm_int8_checkpoint,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
