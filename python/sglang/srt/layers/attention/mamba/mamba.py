@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.mamba.mamba2_replayssm_spec import (
-    record_mamba2_replayssm_spec,
+    verify_mamba2_replayssm_spec,
 )
 from sglang.kernels.ops.mamba.triton_ops import (
     mamba_chunk_scan_combined,
@@ -696,20 +696,6 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             hidden_states_d, B_d, C_d = split_hidden_states_B_C_fn(hidden_states_B_C_d)
-            replay_ring = is_target_verify and layer_cache.replayssm_decay is not None
-            if replay_ring:
-                record_mamba2_replayssm_spec(
-                    x=hidden_states_d,
-                    B=B_d,
-                    dt=dt_d,
-                    dt_bias=self.dt_bias,
-                    A=self.A,
-                    x_ring=layer_cache.replayssm_rawv,
-                    b_ring=layer_cache.replayssm_rawk,
-                    dt_ring=layer_cache.replayssm_g,
-                    decay_ring=layer_cache.replayssm_decay,
-                    num_steps=metadata.draft_token_num,
-                )
 
             # 3. State Space Model sequence transformation
             n_groups = local_num_groups
@@ -725,7 +711,25 @@ class MambaMixer2(torch.nn.Module):
             C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
             hidden_states_d = hidden_states_d.view(-1, local_num_heads, self.head_dim)
 
-            if is_target_verify:
+            if is_target_verify and layer_cache.replayssm_cursor is not None:
+                verify_shape = (num_decodes, draft_token_num, local_num_heads, -1)
+                verify_mamba2_replayssm_spec(
+                    state=ssm_state,
+                    x_ring=layer_cache.replayssm_rawv,
+                    b_ring=layer_cache.replayssm_rawk,
+                    dt_ring=layer_cache.replayssm_g,
+                    cursor=layer_cache.replayssm_cursor,
+                    x=hidden_states_d.view(verify_shape),
+                    dt=dt_d.view(verify_shape),
+                    A=A_d,
+                    B=B_d.view(num_decodes, draft_token_num, n_groups, -1),
+                    C=C_d.view(num_decodes, draft_token_num, n_groups, -1),
+                    out=preallocated_ssm_out_d.view(verify_shape),
+                    D=D_d,
+                    dt_bias=dt_bias,
+                    state_batch_indices=state_indices_tensor_d[:num_decodes],
+                )
+            elif is_target_verify:
                 selective_state_update(
                     ssm_state,
                     hidden_states_d.view(
@@ -791,3 +795,12 @@ class MambaMixer2(torch.nn.Module):
     @property
     def mamba_type(self) -> str:
         return "mamba2"
+
+
+def mamba2_A_by_layer(model: nn.Module) -> List[torch.Tensor]:
+    """Each Mamba2 mixer's ``A``, in mamba pool layer order."""
+    params = model.__dict__.get("_mamba2_A_by_layer")
+    if params is None:
+        params = [m.A for m in model.modules() if isinstance(m, MambaMixer2)]
+        model.__dict__["_mamba2_A_by_layer"] = params
+    return params

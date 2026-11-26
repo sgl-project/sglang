@@ -1334,14 +1334,16 @@ def commit_mamba_states_after_verify(
         from sglang.kernels.ops.mamba.mamba2_replayssm_spec import (
             commit_mamba2_replayssm_after_verify,
         )
+        from sglang.srt.layers.attention.mamba.mamba import mamba2_A_by_layer
 
+        assert src_indices_raw is None
         commit_mamba2_replayssm_after_verify(
             spec_state=mamba_pool.get_speculative_mamba2_params_all_layers(),
+            A_by_layer=mamba2_A_by_layer(model_runner.model),
             state_batch_indices=replay_state_indices,
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
-            src_indices_raw=src_indices_raw,
         )
         commit_ple_states_after_verify(
             model_runner.token_to_kv_pool.layer_router,

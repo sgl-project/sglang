@@ -713,7 +713,7 @@ class ExecMamba(msgspec.Struct):
     # of the same length. Linear-chain (topk <= 1) only.
     enable_linear_replayssm_spec: A[
         bool,
-        "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models and Nemotron-H Mamba2 layers, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
+        "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models and Nemotron-H Mamba2 layers (with --mamba-backend flashinfer), linear-chain (--speculative-eagle-topk in {None, 1}) only.",
     ] = False
 
 

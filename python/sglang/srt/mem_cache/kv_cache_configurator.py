@@ -3749,12 +3749,18 @@ class KVCacheConfigurator:
         # request scratch. KDA replay stays on each mamba slot unless host-only
         # checkpoints are on, in which case it follows live requests too.
         replayssm_active = self._replayssm_spec_model()
+        mamba2_replay = self._mamba2_replayssm_spec()
         if replayssm_active:
-            record_len = (
-                max_speculative_num_draft_tokens()
-                if self._mamba2_replayssm_spec()
-                else get_exec().mamba.linear_replayssm_cache_len
-            )
+            if mamba2_replay:
+                from sglang.kernels.ops.mamba.mamba2_replayssm_spec import (
+                    mamba2_replayssm_ring_len,
+                )
+
+                record_len = mamba2_replayssm_ring_len(
+                    max_speculative_num_draft_tokens()
+                )
+            else:
+                record_len = get_exec().mamba.linear_replayssm_cache_len
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
                     record_len=record_len
@@ -3763,8 +3769,10 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
-        request_scoped = replayssm_active and (
-            self.hybrid_kda_config is None or host_only_mamba_checkpoint()
+        request_scoped = (
+            replayssm_active
+            and not mamba2_replay
+            and (self.hybrid_kda_config is None or host_only_mamba_checkpoint())
         )
         replayssm_fixed_bytes, replayssm_ring_per_slot = replayssm_ring_memory_charge(
             replayssm_ring_per_req,

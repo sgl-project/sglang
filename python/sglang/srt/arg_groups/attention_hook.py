@@ -31,6 +31,7 @@ from sglang.srt.arg_groups.overrides import (
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
     declare_resolution,
+    max_speculative_num_draft_tokens,
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.platform_hook import (
@@ -459,7 +460,7 @@ def handle_linear_attn_backend(server_args: Any):
     # same length and folds via its own fused verify ring-write +
     # commit_kda_replayssm_after_verify.
     if cfg.enable_linear_replayssm_spec and _is_mamba2_ssd_model(server_args):
-        _validate_mamba2_replayssm_spec(cfg)
+        _validate_mamba2_replayssm_spec(cfg, server_args)
     elif cfg.enable_linear_replayssm_spec:
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(
@@ -549,7 +550,10 @@ def _is_mamba2_ssd_model(server_args: Any) -> bool:
     return isinstance(mamba2_config(model_config_of(server_args)), NemotronHConfig)
 
 
-def _validate_mamba2_replayssm_spec(cfg: Any) -> None:
+def _validate_mamba2_replayssm_spec(cfg: Any, server_args: Any) -> None:
+    from sglang.kernels.ops.mamba.mamba2_replayssm_spec import (
+        MAX_DRAFT_TOKENS as MAMBA2_REPLAYSSM_MAX_DRAFT_TOKENS,
+    )
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
         read_ragged_verify_mode,
@@ -572,10 +576,23 @@ def _validate_mamba2_replayssm_spec(cfg: Any) -> None:
             "--enable-linear-replayssm-spec for Mamba2 does not support "
             "SGLANG_ENABLE_PP_SPEC yet."
         )
-    if cfg.mamba_backend != "triton":
+    if cfg.mamba_backend != "flashinfer":
         raise ValueError(
-            "--enable-linear-replayssm-spec for Mamba2 replays the Triton "
-            f"selective-state-update; got --mamba-backend={cfg.mamba_backend!r}."
+            "--enable-linear-replayssm-spec for Mamba2 runs FlashInfer's "
+            "checkpointing SSU; pass --mamba-backend flashinfer, got "
+            f"{cfg.mamba_backend!r}."
+        )
+    if cfg.enable_mamba_cache_stochastic_rounding:
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 does not support "
+            "--enable-mamba-cache-stochastic-rounding yet."
+        )
+    max_draft_tokens = max_speculative_num_draft_tokens(server_args)
+    if (max_draft_tokens or 0) > MAMBA2_REPLAYSSM_MAX_DRAFT_TOKENS:
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 supports at most "
+            f"{MAMBA2_REPLAYSSM_MAX_DRAFT_TOKENS} draft tokens, got "
+            f"{max_draft_tokens}."
         )
     if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
         raise ValueError(

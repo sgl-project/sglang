@@ -34,11 +34,11 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="mamba.mamba2_replayssm_record",
-        backend=KernelBackend.TRITON,
+        op="mamba.mamba2_replayssm_verify",
+        backend=KernelBackend.FLASHINFER,
         target=(
             "sglang.kernels.ops.mamba.mamba2_replayssm_spec:"
-            "record_mamba2_replayssm_spec"
+            "verify_mamba2_replayssm_spec"
         ),
         capabilities=CUDA_ONLY,
     )
@@ -46,7 +46,7 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="mamba.mamba2_replayssm_fold",
-        backend=KernelBackend.TRITON,
+        backend=KernelBackend.FLASHINFER,
         target=(
             "sglang.kernels.ops.mamba.mamba2_replayssm_spec:fold_mamba2_replayssm_spec"
         ),

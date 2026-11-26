@@ -136,10 +136,14 @@ class BaseLinearStateParams(ABC):
         conv_b = self.dtype.conv.itemsize
         fp32_b = 4
         if self.is_mamba2_ssd:
-            per_layer = record_len * (
-                hv * v_dim * conv_b
-                + self.mamba2_local_groups * k_dim * conv_b
-                + 2 * hv * fp32_b
+            per_layer = (
+                record_len
+                * (
+                    hv * v_dim * conv_b
+                    + self.mamba2_local_groups * k_dim * conv_b
+                    + hv * fp32_b
+                )
+                + fp32_b  # int32 cursor
             )
         elif self.is_kda:
             per_layer = (

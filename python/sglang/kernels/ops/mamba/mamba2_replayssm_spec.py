@@ -1,220 +1,120 @@
 # SPDX-License-Identifier: Apache-2.0
 """ReplaySSM speculative verify for Mamba2 SSD mixers (linear draft chain).
 
-The target verify keeps the per-draft SSM states out of memory: it records each
-draft token's post-conv x, B, softplus(dt + dt_bias) and exp(A * dt) into a ring
-indexed by verify batch row, and the commit replays the accepted prefix into
-the SSM state. Both kernels repeat the tied-head-dim arithmetic of
-``_selective_scan_update_kernel`` (triton_ops/mamba_ssm.py), so the committed
-state matches the one the per-draft snapshot path would scatter.
+FlashInfer's checkpointing SSU computes the verify outputs from the committed
+state and appends each draft token's post-conv x, B and processed dt to a ring
+on the request's mamba slot; the commit replays the accepted prefix into the
+state with ``replayssm_materialize``. Every commit folds, so the ring is empty
+before each verify and ``ring_start`` / ``prev_num_accepted_tokens`` stay zero.
 
-Coverage: CUDA, ``dt``/``A``/``dt_bias`` tied across head_dim (one decay per
-head), any head_dim / d_state; rows are ``[rows, T, ...]`` contiguous rings.
+Coverage: CUDA with FlashInfer Mamba, BF16 activations, ``dt``/``A``/
+``dt_bias``/``D`` tied across head_dim, at most 8 draft tokens (the ring holds
+two windows and FlashInfer caps the replay window at 16).
 """
 
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
 
-from sglang.kernels.ops.mamba.triton_ops.mamba_ssm import softplus
-
-
-@triton.jit
-def _mamba2_replayssm_record_kernel(
-    x_ptr,
-    b_ptr,
-    dt_ptr,
-    dt_bias_ptr,
-    a_ptr,
-    x_ring_ptr,
-    b_ring_ptr,
-    dt_ring_ptr,
-    decay_ring_ptr,
-    stride_x_tok,
-    stride_b_tok,
-    stride_dt_tok,
-    num_steps,
-    RING_T: tl.constexpr,
-    HV: tl.constexpr,
-    V: tl.constexpr,
-    G: tl.constexpr,
-    K: tl.constexpr,
-    HEADS_PER_GROUP: tl.constexpr,
-    BV: tl.constexpr,
-    BK: tl.constexpr,
-):
-    tok = tl.program_id(0).to(tl.int64)
-    h = tl.program_id(1)
-    slot = (tok // num_steps) * RING_T + tok % num_steps
-
-    offs_v = tl.arange(0, BV)
-    x = tl.load(x_ptr + tok * stride_x_tok + h * V + offs_v, mask=offs_v < V)
-    tl.store(x_ring_ptr + (slot * HV + h) * V + offs_v, x, mask=offs_v < V)
-
-    dt = tl.load(dt_ptr + tok * stride_dt_tok + h).to(tl.float32)
-    dt += tl.load(dt_bias_ptr + h).to(tl.float32)
-    dt = softplus(dt)
-    a = tl.load(a_ptr + h).to(tl.float32)
-    tl.store(dt_ring_ptr + slot * HV + h, dt)
-    tl.store(decay_ring_ptr + slot * HV + h, tl.exp(a * dt))
-
-    if h % HEADS_PER_GROUP == 0:
-        g = h // HEADS_PER_GROUP
-        offs_k = tl.arange(0, BK)
-        b = tl.load(b_ptr + tok * stride_b_tok + g * K + offs_k, mask=offs_k < K)
-        tl.store(b_ring_ptr + (slot * G + g) * K + offs_k, b, mask=offs_k < K)
+MAX_DRAFT_TOKENS = 8
+_pointer_tables: dict[tuple, tuple] = {}
 
 
-def record_mamba2_replayssm_spec(
+def mamba2_replayssm_ring_len(num_draft_tokens: int) -> int:
+    if not 0 < num_draft_tokens <= MAX_DRAFT_TOKENS:
+        raise ValueError(
+            "Mamba2 ReplaySSM supports 1 to "
+            f"{MAX_DRAFT_TOKENS} draft tokens, got {num_draft_tokens}."
+        )
+    return 2 * num_draft_tokens
+
+
+def verify_mamba2_replayssm_spec(
     *,
-    x: torch.Tensor,
-    B: torch.Tensor,
-    dt: torch.Tensor,
-    dt_bias: torch.Tensor,
-    A: torch.Tensor,
+    state: torch.Tensor,
     x_ring: torch.Tensor,
     b_ring: torch.Tensor,
     dt_ring: torch.Tensor,
-    decay_ring: torch.Tensor,
-    num_steps: int,
+    cursor: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    out: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_batch_indices: torch.Tensor,
 ) -> None:
-    """Record one layer's verify window of ``num_steps`` tokens per request.
+    """One layer's verify: ``x`` [reqs, T, HV, V], rings of at least ``2 * T`` rows.
 
-    ``x`` [rows * num_steps, HV * V], ``B`` [rows * num_steps, G * K] and raw
-    ``dt`` [rows * num_steps, HV] may be row-strided views; token ``i`` lands in
-    ring row ``i // num_steps`` step ``i % num_steps``. Rings: ``x_ring``
-    [R, T, HV, V], ``b_ring`` [R, T, G, K], ``dt_ring`` / ``decay_ring``
-    [R, T, HV] fp32, with ``num_steps <= T`` and enough rows for every request.
+    ``cursor`` is a zero int32 [slots] tensor: the ring start and the count of
+    pending accepted rows, both always zero under fold-every-commit.
     """
-    num_tokens = x.shape[0]
-    if num_tokens == 0:
-        return
-    num_rows, ring_t, HV, V = x_ring.shape
-    G, K = b_ring.shape[-2:]
-    assert x.stride(-1) == 1 and B.stride(-1) == 1 and dt.stride(-1) == 1
-    assert x.dtype == x_ring.dtype and B.dtype == b_ring.dtype
-    assert dt_bias.shape == (HV,) and A.shape == (HV,)
-    assert dt_bias.is_contiguous() and A.is_contiguous()
-    assert 0 < num_steps <= ring_t and num_tokens % num_steps == 0
-    assert num_tokens // num_steps <= num_rows
-    for ring in (x_ring, b_ring, dt_ring, decay_ring):
-        assert ring.is_contiguous()
-    _mamba2_replayssm_record_kernel[(num_tokens, HV)](
-        x,
-        B,
-        dt,
-        dt_bias,
-        A,
+    from flashinfer.mamba import checkpointing_ssu
+
+    assert x.dtype == torch.bfloat16, x.dtype
+    assert 2 * x.shape[1] <= x_ring.shape[2], (x.shape, x_ring.shape)
+    checkpointing_ssu(
+        state,
         x_ring,
         b_ring,
         dt_ring,
-        decay_ring,
-        x.stride(0),
-        B.stride(0),
-        dt.stride(0),
-        num_steps,
-        RING_T=ring_t,
-        HV=HV,
-        V=V,
-        G=G,
-        K=K,
-        HEADS_PER_GROUP=HV // G,
-        BV=triton.next_power_of_2(V),
-        BK=triton.next_power_of_2(K),
-        num_warps=1,
+        cursor,
+        cursor,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=state_batch_indices,
+        pad_slot_id=-1,
     )
 
 
-@triton.jit
-def _mamba2_replayssm_fold_kernel(
-    state_ptr,
-    x_ring_ptr,
-    b_ring_ptr,
-    dt_ring_ptr,
-    decay_ring_ptr,
-    state_indices_ptr,
-    last_step_ptr,
-    src_rows_ptr,
-    track_indices_ptr,
-    track_steps_ptr,
-    stride_state_layer,
-    stride_state_slot,
-    stride_state_head,
-    stride_state_dim,
-    stride_ring_x_layer,
-    stride_ring_b_layer,
-    stride_ring_dt_layer,
-    T: tl.constexpr,
-    HV: tl.constexpr,
-    V: tl.constexpr,
-    G: tl.constexpr,
-    K: tl.constexpr,
-    HEADS_PER_GROUP: tl.constexpr,
-    BM: tl.constexpr,
-    BK: tl.constexpr,
-    HAS_SRC_ROWS: tl.constexpr,
-    HAS_TRACK: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    req = tl.program_id(1)
-    pid_lh = tl.program_id(2)
-    layer = (pid_lh // HV).to(tl.int64)
-    h = pid_lh % HV
-    g = h // HEADS_PER_GROUP
-
-    slot = tl.load(state_indices_ptr + req).to(tl.int64)
-    n_commit = tl.load(last_step_ptr + req).to(tl.int32) + 1
-    if (slot < 0) | (n_commit <= 0):
-        return
-    if HAS_SRC_ROWS:
-        row = tl.load(src_rows_ptr + req).to(tl.int64)
-    else:
-        row = req.to(tl.int64)
-    if HAS_TRACK:
-        track_slot = tl.load(track_indices_ptr + req).to(tl.int64)
-        track_step = tl.load(track_steps_ptr + req).to(tl.int32)
-    else:
-        track_slot = -1
-        track_step = -1
-
-    offs_m = pid_m * BM + tl.arange(0, BM)
-    offs_k = tl.arange(0, BK)
-    mask_m = offs_m < V
-    mask_k = offs_k < K
-    mask = mask_m[:, None] & mask_k[None, :]
-    head_offs = (
-        layer * stride_state_layer
-        + h * stride_state_head
-        + offs_m[:, None] * stride_state_dim
-        + offs_k[None, :]
+def _layer_table(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    step = t.stride(0) * t.element_size()
+    ptrs = [t.data_ptr() + i * step for i in range(t.shape[0])]
+    return (
+        torch.tensor(ptrs, dtype=torch.int64, device=t.device),
+        torch.full((t.shape[0],), t.stride(1), dtype=torch.int64, device=t.device),
     )
-    state_ptrs = state_ptr + slot * stride_state_slot + head_offs
-    state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-    tok0 = row * T
-    x_base = x_ring_ptr + layer * stride_ring_x_layer + h * V + offs_m
-    b_base = b_ring_ptr + layer * stride_ring_b_layer + g * K + offs_k
-    dt_base = dt_ring_ptr + layer * stride_ring_dt_layer + h
-    decay_base = decay_ring_ptr + layer * stride_ring_dt_layer + h
-    for t in range(0, n_commit):
-        tok = tok0 + t
-        x = tl.load(x_base + tok * HV * V, mask=mask_m, other=0.0).to(tl.float32)
-        B = tl.load(b_base + tok * G * K, mask=mask_k, other=0.0).to(tl.float32)
-        dt = tl.load(dt_base + tok * HV)
-        dA = tl.load(decay_base + tok * HV)
-        dB = B * dt
-        state = state * dA + dB * x[:, None]
-        if HAS_TRACK:
-            if (t == track_step) and (track_slot >= 0):
-                tl.store(
-                    state_ptr + track_slot * stride_state_slot + head_offs,
-                    state.to(state_ptr.dtype.element_ty),
-                    mask=mask,
-                )
 
-    tl.store(state_ptrs, state.to(state_ptr.dtype.element_ty), mask=mask)
+def _pointer_tables_for(
+    temporal: torch.Tensor,
+    x_ring: torch.Tensor,
+    b_ring: torch.Tensor,
+    dt_ring: torch.Tensor,
+    A_by_layer: list[torch.Tensor],
+) -> tuple:
+    key = tuple(
+        (t.data_ptr(), t.dtype, tuple(t.shape), t.stride())
+        for t in (temporal, x_ring, b_ring, dt_ring)
+    ) + tuple(a.data_ptr() for a in A_by_layer)
+    tables = _pointer_tables.get(key)
+    if tables is None:
+        a_ptrs = torch.tensor(
+            [a.data_ptr() for a in A_by_layer],
+            dtype=torch.int64,
+            device=temporal.device,
+        )
+        no_scale = torch.zeros_like(a_ptrs)
+        tables = (
+            *_layer_table(temporal),
+            *_layer_table(x_ring),
+            *_layer_table(b_ring),
+            *_layer_table(dt_ring),
+            a_ptrs,
+            no_scale,
+            no_scale,
+        )
+        _pointer_tables[key] = tables
+    return tables
 
 
 def fold_mamba2_replayssm_spec(
@@ -223,91 +123,92 @@ def fold_mamba2_replayssm_spec(
     x_ring: torch.Tensor,
     b_ring: torch.Tensor,
     dt_ring: torch.Tensor,
-    decay_ring: torch.Tensor,
-    state_indices: torch.Tensor,
-    last_correct_step_indices: torch.Tensor,
-    src_rows: torch.Tensor | None = None,
-    mamba_track_indices: torch.Tensor | None = None,
-    mamba_steps_to_track: torch.Tensor | None = None,
+    A_by_layer: list[torch.Tensor],
+    src_slots: torch.Tensor,
+    dst_slots: torch.Tensor,
+    replay_len: torch.Tensor,
 ) -> None:
-    """Replay each request's accepted steps ``0..last_step`` into ``temporal``.
+    """Write ``src`` advanced by its first ``replay_len`` ring rows into ``dst``.
 
     All layers in one launch. ``temporal`` [L, slots, HV, V, K]; rings
-    [L, R, T, ...] as recorded by :func:`record_mamba2_replayssm_spec`. Request
-    ``i`` reads ring row ``src_rows[i]`` (default ``i``); a negative slot or step
-    skips it. With track indices, the state after ``mamba_steps_to_track[i]``
-    is also written to that slot.
+    [L, slots, HV, R, V], [L, slots, G, R, K] and [L, slots, HV, R];
+    ``A_by_layer`` holds each layer's fp32 [HV] ``A``. A slot of -1 skips the
+    request; ``src`` and ``dst`` may be the same slot.
     """
-    num_reqs = state_indices.shape[0]
-    if num_reqs == 0 or temporal.numel() == 0:
+    from flashinfer.mamba import replayssm_materialize
+
+    num_reqs = src_slots.shape[0]
+    if num_reqs == 0:
         return
-    num_layers, _, HV, V, K = temporal.shape
-    T = x_ring.shape[2]
-    G = b_ring.shape[-2]
-    assert temporal.stride(-1) == 1
-    has_track = mamba_track_indices is not None
-    if has_track:
-        assert mamba_steps_to_track is not None
-    BM = min(16, triton.next_power_of_2(V))
-    grid = (triton.cdiv(V, BM), num_reqs, HV * num_layers)
-    _mamba2_replayssm_fold_kernel[grid](
-        temporal,
-        x_ring,
-        b_ring,
-        dt_ring,
-        decay_ring,
-        state_indices,
-        last_correct_step_indices,
-        src_rows if src_rows is not None else state_indices,
-        mamba_track_indices if has_track else state_indices,
-        mamba_steps_to_track if has_track else state_indices,
-        temporal.stride(0),
-        temporal.stride(1),
-        temporal.stride(2),
-        temporal.stride(3),
-        x_ring.stride(0),
-        b_ring.stride(0),
-        dt_ring.stride(0),
-        T=T,
-        HV=HV,
-        V=V,
-        G=G,
-        K=K,
-        HEADS_PER_GROUP=HV // G,
-        BM=BM,
-        BK=triton.next_power_of_2(K),
-        HAS_SRC_ROWS=src_rows is not None,
-        HAS_TRACK=has_track,
-        num_warps=2,
+    num_layers, _, num_heads, dim, dstate = temporal.shape
+    ring_len = x_ring.shape[3]
+    assert len(A_by_layer) == num_layers
+    assert all(a.dtype == torch.float32 and a.is_contiguous() for a in A_by_layer)
+    device = temporal.device
+    replayssm_materialize(
+        *_pointer_tables_for(temporal, x_ring, b_ring, dt_ring, A_by_layer),
+        src_slots.to(torch.int32).expand(num_layers, num_reqs).contiguous(),
+        dst_slots.to(torch.int32).expand(num_layers, num_reqs).contiguous(),
+        torch.zeros(num_reqs, dtype=torch.int32, device=device),
+        replay_len.to(torch.int32).clamp(0, ring_len // 2),
+        torch.arange(num_reqs, dtype=torch.int32, device=device),
+        state_dtype=temporal.dtype,
+        input_dtype=x_ring.dtype,
+        matrixA_dtype=torch.float32,
+        dim=dim,
+        dstate=dstate,
+        num_heads=num_heads,
+        heads_per_group=num_heads // b_ring.shape[2],
+        max_window=ring_len // 2,
+        ring_buffer_len=ring_len,
+        dependency_inputs=[x_ring, b_ring, dt_ring],
+        dependency_outputs=[temporal],
     )
 
 
 def commit_mamba2_replayssm_after_verify(
     *,
     spec_state,
+    A_by_layer: list[torch.Tensor],
     state_batch_indices: torch.Tensor,
     last_correct_step_indices: torch.Tensor,
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
-    src_indices_raw: torch.Tensor | None = None,
 ) -> None:
-    """Fold the accepted SSM steps and roll back conv from the verify windows."""
+    """Fold the accepted SSM steps and roll back conv from the verify windows.
+
+    A track slot receives the state after ``mamba_steps_to_track`` when that
+    step was accepted; it is replayed from the pre-commit working state.
+    """
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         fused_conv_window_scatter_with_mask,
     )
 
-    track_steps = mamba_steps_to_track if mamba_track_indices is not None else None
-    fold_mamba2_replayssm_spec(
+    working = torch.where(
+        last_correct_step_indices >= 0, state_batch_indices.to(torch.int32), -1
+    )
+    rings = dict(
         temporal=spec_state.temporal,
         x_ring=spec_state.replayssm_rawv,
         b_ring=spec_state.replayssm_rawk,
         dt_ring=spec_state.replayssm_g,
-        decay_ring=spec_state.replayssm_decay,
-        state_indices=state_batch_indices,
-        last_correct_step_indices=last_correct_step_indices,
-        src_rows=src_indices_raw,
-        mamba_track_indices=mamba_track_indices,
-        mamba_steps_to_track=track_steps,
+        A_by_layer=A_by_layer,
+    )
+    if mamba_track_indices is not None:
+        tracked = (mamba_steps_to_track >= 0) & (
+            mamba_steps_to_track <= last_correct_step_indices
+        )
+        fold_mamba2_replayssm_spec(
+            **rings,
+            src_slots=working,
+            dst_slots=torch.where(tracked, mamba_track_indices.to(torch.int32), -1),
+            replay_len=mamba_steps_to_track + 1,
+        )
+    fold_mamba2_replayssm_spec(
+        **rings,
+        src_slots=working,
+        dst_slots=working,
+        replay_len=last_correct_step_indices + 1,
     )
     for conv_states, interm_conv in zip(
         spec_state.conv, spec_state.intermediate_conv_window
@@ -317,13 +218,13 @@ def commit_mamba2_replayssm_after_verify(
             interm_conv,
             state_batch_indices,
             last_correct_step_indices,
-            src_indices_raw,
+            None,
         )
         if mamba_track_indices is not None:
             fused_conv_window_scatter_with_mask(
                 conv_states,
                 interm_conv,
                 mamba_track_indices,
-                track_steps,
-                src_indices_raw,
+                mamba_steps_to_track,
+                None,
             )

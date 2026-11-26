@@ -1671,14 +1671,16 @@ class HybridLinearAttnBackend(AttentionBackend):
             from sglang.kernels.ops.mamba.mamba2_replayssm_spec import (
                 commit_mamba2_replayssm_after_verify,
             )
+            from sglang.srt.layers.attention.mamba.mamba import mamba2_A_by_layer
 
+            assert src_indices_raw is None
             commit_mamba2_replayssm_after_verify(
                 spec_state=mamba_caches,
+                A_by_layer=mamba2_A_by_layer(model),
                 state_batch_indices=state_indices_tensor,
                 last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
-                src_indices_raw=src_indices_raw,
             )
             self._update_ple_state_after_mtp_verify(
                 state_indices_tensor,
