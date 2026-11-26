@@ -33,7 +33,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.staged_layout import StagedMediaLayout, VideoTiming
 from sglang.srt.runtime_context import get_mm, get_model
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
@@ -525,16 +524,6 @@ def _optional_token_id(tokenizer, token: str) -> Optional[int]:
         return None
 
 
-def muse_audio_delimiters(tokenizer):
-    """A Muse checkpoint supports audio only if its tokenizer defines both spans."""
-    if tokenizer is None:
-        return None, None
-    return (
-        _optional_token_id(tokenizer, "<|soft_audio_start|>"),
-        _optional_token_id(tokenizer, "<|soft_audio_end|>"),
-    )
-
-
 def _encode(tokenizer, text: str) -> list[int]:
     try:
         return list(tokenizer.encode(text, add_special_tokens=False))
@@ -693,35 +682,9 @@ class MuseImagePreprocessArtifact:
         )
 
 
-class _MuseStagedLayout(StagedMediaLayout):
-    def vision_merge_size(self, processor, video):
-        return 1
-
-    def language_audio_enabled(self, scheduler):
-        return None not in muse_audio_delimiters(scheduler.tokenizer)
-
-
 class MuseSpark1xOmniMultimodalProcessor(
     MediaArtifactCacheMixin, BaseMultimodalProcessor
 ):
-    staged_layouts = {
-        "muse_spark": _MuseStagedLayout(video=VideoTiming.TIMESTAMPS, audio=True)
-    }
-
-    def get_staged_prompt_markers(self):
-        from sglang.srt.disaggregation.encoder.handoff import StagedPromptMarkers
-
-        return StagedPromptMarkers(
-            self.patch_id,
-            self.video_id,
-            (
-                tuple(self.image_placeholder_ids),
-                tuple(self.video_placeholder_ids),
-                tuple(getattr(self, "audio_placeholder_ids", None) or ()),
-            ),
-            audio=getattr(self, "audio_id", None),
-        )
-
     models = [MuseSparkForConditionalGeneration]
     gpu_image_decode = False
     # Decode on CPU even when optional GPU resizing is enabled. Decoder worker
@@ -749,7 +712,8 @@ class MuseSpark1xOmniMultimodalProcessor(
         # The published Muse-Spark-1.2-OSS tokenizer keeps <|audio|> but leaves the
         # soft-audio delimiters as reserved placeholders. Treat them as optional so
         # a text/image/video server still starts; audio input fails loudly instead.
-        self.audio_start_id, self.audio_end_id = muse_audio_delimiters(tokenizer)
+        self.audio_start_id = _optional_token_id(tokenizer, "<|soft_audio_start|>")
+        self.audio_end_id = _optional_token_id(tokenizer, "<|soft_audio_end|>")
         self.audio_supported = (
             self.audio_start_id is not None and self.audio_end_id is not None
         )
@@ -1085,8 +1049,6 @@ class MuseSpark1xOmniMultimodalProcessor(
             )
             ids = self._expand_mm_placeholders(ids, images, videos, audios)
             output = self._build_output(ids, images, videos, audios, transport=False)
-        if embeddings is None:
-            return output
         consumed = {}
         for item in output.mm_items:
             start = consumed.get(item.modality, 0)

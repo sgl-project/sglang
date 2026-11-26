@@ -2065,22 +2065,13 @@ class Envs:
     # ===================================================================
     # Encoder pipeline and disaggregation
     # ===================================================================
-    # Issue signed Stage receipts on E or accept them on a Rust language worker.
-    SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF = EnvBool(False)
-    SGLANG_ENCODER_HANDOFF_KEY_FILE = EnvStr(None)
-    SGLANG_ENCODER_HANDOFF_ENDPOINT = EnvStr(None)
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
+    # A Rust language worker accepts the encoder an external router selected.
+    SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF = EnvBool(False)
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
-    # Includes staged image encodes, unclaimed leases and deliveries in flight.
-    SGLANG_ENCODER_MAX_STAGED_REQUESTS = EnvInt(64)
-    # Pre-registered NIXL host region on P/PD (MiB). Zero selects per-write registration.
-    SGLANG_ENCODER_NIXL_POOL_SIZE_MB = EnvInt(256)
-    # P/PD reclaims a NIXL destination this long after losing its encoder's
-    # write fence. Arbitrary, well past UCX transport timeouts; zero never reclaims.
-    SGLANG_ENCODER_NIXL_QUARANTINE_SECS = EnvFloat(600.0)
     SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
     SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)

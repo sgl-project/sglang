@@ -739,13 +739,6 @@ class EmbeddingCacheController:
             if not processed_any:
                 time.sleep(0.001)
 
-    def discard_prefetch_waiter(self, req_id: str) -> None:
-        """Forget the consumer after a failed/timed-out request. The cache I/O
-        worker still owns its operation and completes the cache entry itself.
-        """
-        with self.lock:
-            self.ongoing_prefetch.pop(req_id, None)
-
     def check_prefetch_progress(self, req_id: str) -> bool:
         """TP-Group barrier: ensures all cards have the request batch ready."""
         local_ready = False
@@ -769,7 +762,8 @@ class EmbeddingCacheController:
             local_ready = ready_tensor.item() == 1
 
         if local_ready:
-            self.discard_prefetch_waiter(req_id)
+            with self.lock:
+                self.ongoing_prefetch.pop(req_id, None)
             return True
         return False
 

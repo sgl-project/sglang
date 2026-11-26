@@ -349,7 +349,6 @@ def resolve_multimodal_item_identity(
     metadata: Any = None,
     namespace: Optional[str] = None,
     existing_hash: Optional[int] = None,
-    require_content_hash: bool = False,
 ) -> bytes:
     """Identify the actual encoder inputs, including their semantic metadata.
 
@@ -359,7 +358,7 @@ def resolve_multimodal_item_identity(
     """
     from sglang.srt.managers.mm_utils import hash_feature_digest
 
-    if not require_content_hash and envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+    if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
         return structured_digest(("uncached-mm", uuid.uuid4().bytes))
     if namespace is not None:
         namespace = parse_content_hash(namespace)

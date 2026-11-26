@@ -327,8 +327,7 @@ def handle_encoder_disaggregation(server_args: Any):
             "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
         )
 
-    external_handoff = envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get()
-    if cfg.language_only and not cfg.encoder_urls and not external_handoff:
+    if cfg.language_only and len(cfg.encoder_urls) == 0:
         logger.info(
             "--language-only is set without --encoder-urls. Encoders are "
             "expected to register dynamically via the "
@@ -349,19 +348,12 @@ def handle_encoder_disaggregation(server_args: Any):
     # Validate model type for encoder disaggregation
     hf_config = model_config_of(server_args).hf_config
     model_arch = hf_config.architectures[0]
-    if cfg.encoder_transfer_backend == "nixl" and not external_handoff:
-        raise ValueError(
-            "--encoder-transfer-backend nixl requires SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF=1"
-        )
     if cfg.encoder_transfer_backend == "auto":
         declare_resolution(
             server_args,
             "_handle_encoder_disaggregation",
             encoder_transfer_backend=resolve_encoder_transfer_backend(
-                cfg.encoder_transfer_backend,
-                model_arch,
-                cfg.tp_size,
-                external_handoff=external_handoff,
+                cfg.encoder_transfer_backend, model_arch, cfg.tp_size
             ),
         )
         if cfg.encoder_only or cfg.language_only:
@@ -371,7 +363,7 @@ def handle_encoder_disaggregation(server_args: Any):
                 model_arch,
                 cfg.tp_size,
             )
-    supported_architectures = [
+    if (cfg.encoder_only or cfg.language_only) and model_arch not in [
         "Qwen2VLForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
@@ -392,20 +384,7 @@ def handle_encoder_disaggregation(server_args: Any):
         "MiniMaxM3SparseForConditionalGeneration",
         "MuseSparkForConditionalGeneration",
         "Inkling2ForConditionalGeneration",
-    ]
-    if external_handoff and cfg.encoder_transfer_backend in (
-        "nixl",
-        "zmq_to_scheduler",
-    ):
-        from sglang.srt.multimodal.staged_layout import staged_layout_for
-
-        if staged_layout_for(hf_config.model_type) is not None:
-            supported_architectures.append(model_arch)
-        elif cfg.encoder_transfer_backend == "nixl":
-            raise ValueError(f"Staged NIXL embeddings do not support {model_arch}")
-    if (
-        cfg.encoder_only or cfg.language_only
-    ) and model_arch not in supported_architectures:
+    ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "

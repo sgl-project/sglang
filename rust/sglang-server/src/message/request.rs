@@ -325,8 +325,17 @@ pub fn into_requests(
     // by rid, and a later turn names one through `session_params.rid`, so the
     // client's rid must reach the scheduler as sent. A collision is then the
     // client's to avoid, as it is under Python.
+    //
+    // So is an encoder handoff: the router's encoder keys its work by this rid,
+    // and the receiver registers under it.
+    let external_encoder = encoder_handoff.is_some();
+    if external_encoder && rid.is_none() {
+        return Err(Error::Validation(
+            "encoder_handoff requires the rid the encoder was given".into(),
+        ));
+    }
     let client_rid = |r: &str| {
-        if in_session {
+        if in_session || external_encoder {
             Rid::from(r.to_owned())
         } else {
             Rid::from_client(r)
@@ -541,8 +550,8 @@ pub fn into_requests(
         },
     )
     .collect();
-    // A staged embedding has a single receiver. Passing the descriptor as a
-    // named buffer preserves it across native gRPC/HTTP and the scheduler ring.
+    // The encoder pushes its embeddings to one receiver, keyed by this
+    // request's rid. The scheduler reads the descriptor from this named buffer.
     if let Some(handoff) = encoder_handoff {
         let g = &mut requests[0];
         if is_batch || g.input_ids.is_none() || g.mm.is_some() || g.sampling_params.n != 1 {
@@ -552,14 +561,6 @@ pub fn into_requests(
         }
         g.mm_buffers
             .push(Buffer::inline("epd.handoff", handoff.into_bytes()));
-        if !mm_hashes.is_empty() {
-            let hashes: Vec<_> = mm_hashes
-                .iter()
-                .map(|h| crate::multi_modality::worker::parse_caller_hash(h))
-                .collect();
-            let hashes = rmp_serde::to_vec(&hashes).map_err(|e| Error::Internal(e.to_string()))?;
-            g.mm_buffers.push(Buffer::inline("epd.hashes", hashes));
-        }
     }
     // Single requests only (batches rejected above). Malformed entries are
     // dropped here and warned about in `mm::apply_caller_hashes`, never a 400.
@@ -1256,12 +1257,14 @@ mod tests {
     }
 
     #[test]
-    fn staged_handoff_keeps_unexpanded_ids_without_media_work() {
+    fn encoder_handoff_keeps_unexpanded_ids_without_media_work() {
         let (mut parsed, _) = requests(
-            r#"{"input_ids":[4,2,4],"encoder_handoff":{"version":1},"mm_hashes":["0xff","bogus"]}"#,
+            r#"{"rid":"r1","input_ids":[4,2,4],"encoder_handoff":{"encoder_url":"http://e:30000"}}"#,
         )
         .unwrap();
         let g = &mut parsed[0];
+        // The encoder was given this rid, so it reaches the scheduler as sent.
+        assert_eq!(g.rid.as_str(), "r1");
         assert!(g.mm.is_none());
         assert_eq!(g.input_ids.as_deref(), Some(&[4, 2, 4][..]));
         let names: Vec<_> = g
@@ -1269,19 +1272,13 @@ mod tests {
             .iter()
             .map(|buffer| buffer.name.as_str())
             .collect();
-        assert_eq!(names, ["epd.handoff", "epd.hashes"]);
-        let super::super::buffers::BufferStore::Inline(hashes) = &g.mm_buffers[1].store else {
-            panic!("expected routing hash metadata inline");
-        };
-        assert_eq!(
-            rmp_serde::from_slice::<Vec<Option<u64>>>(hashes.as_bytes()).unwrap(),
-            [Some(255), None]
-        );
+        assert_eq!(names, ["epd.handoff"]);
         for body in [
-            r#"{"input_ids":[4],"encoder_handoff":{},"image_data":"source"}"#,
-            r#"{"input_ids":[[4]],"encoder_handoff":{}}"#,
-            r#"{"input_ids":[4],"encoder_handoff":{},"sampling_params":{"n":2}}"#,
-            r#"{"text":"image","encoder_handoff":{}}"#,
+            r#"{"rid":"r","input_ids":[4],"encoder_handoff":{},"image_data":"source"}"#,
+            r#"{"rid":"r","input_ids":[[4]],"encoder_handoff":{}}"#,
+            r#"{"rid":"r","input_ids":[4],"encoder_handoff":{},"sampling_params":{"n":2}}"#,
+            r#"{"rid":"r","text":"image","encoder_handoff":{}}"#,
+            r#"{"input_ids":[4],"encoder_handoff":{}}"#,
         ] {
             assert!(
                 requests(body)

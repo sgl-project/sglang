@@ -444,7 +444,6 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
 
 
 class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
-    build_default_vision_encoder = False
     config: Qwen3OmniMoeThinkerConfig
 
     def __init__(
@@ -456,16 +455,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         super().__init__(
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )
-        if not getattr(config, "language_only", False):
-            self.audio_tower = Qwen3OmniMoeAudioEncoder(
-                config.audio_config, quant_config
-            )
-            self.visual = Qwen3OmniMoeVisionEncoder(
-                config.vision_config,
-                quant_config=quant_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                prefix=add_prefix("visual", prefix),
-            )
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config, quant_config)
+        self.visual = Qwen3OmniMoeVisionEncoder(
+            config.vision_config,
+            quant_config=quant_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            prefix=add_prefix("visual", prefix),
+        )
 
     def get_audio_feature(self, items: List[MultimodalDataItem]):
         device = next(self.audio_tower.parameters()).device
@@ -502,8 +498,6 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         super().__init__(config)
         self.config = config
 
-        config.thinker_config.encoder_only = getattr(config, "encoder_only", False)
-        config.thinker_config.language_only = getattr(config, "language_only", False)
         self.thinker = Qwen3OmniMoeThinkerForConditionalGeneration(
             config.thinker_config, quant_config=quant_config, prefix=prefix
         )
@@ -554,13 +548,6 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
-            is_encoder_weight = name.startswith(
-                ("thinker.visual.", "thinker.audio_tower.")
-            )
-            if (self.config.thinker_config.language_only and is_encoder_weight) or (
-                self.config.thinker_config.encoder_only and not is_encoder_weight
-            ):
-                continue
             name = name.replace(r"model.language_model.", r"model.")
 
             if ("talker" in name or "code2wav" in name) and not self.enable_talker:

@@ -396,8 +396,8 @@ impl CoreHandle {
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
-        // External language workers have no local MM pool. Reject raw media
-        // before fetching any URLs or admitting the request to the scheduler.
+        // This worker has no local MM pool: the router's encoder owns the media.
+        // Reject raw media before fetching any URL or admitting the request.
         if self.inner.metadata.external_encoder_handoff {
             if requests.iter().any(GenerateRequest::has_multimodal) {
                 return Err(CoreError::InvalidArgument(

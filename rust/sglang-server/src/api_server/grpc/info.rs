@@ -45,7 +45,7 @@ pub(super) fn model_info(info: ModelInfo) -> Result<api::GetModelInfoResponse, S
 
 pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse, String> {
     let ServerInfo {
-        launch_fields,
+        launch_fields: _,
         model_path,
         served_model_name,
         tokenizer_path,
@@ -74,39 +74,6 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("internal_states are not JSON: {error}"))?;
     Ok(api::GetServerInfoResponse {
-        staged_layout_id: launch_fields
-            .get("staged_layout_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        staged_transfer_backend: launch_fields
-            .get("staged_transfer_backend")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        encoder_handoff_key_id: launch_fields
-            .get("encoder_handoff_key_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        supports_staged_images: launch_fields
-            .get("supports_staged_images")
-            .and_then(serde_json::Value::as_bool),
-        staged_audio_model_type: launch_fields
-            .get("staged_audio_model_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        native_model_type: launch_fields
-            .get("native_model_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        supports_staged_video: launch_fields
-            .get("supports_staged_video")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        accepts_encoder_handoff: launch_fields
-            .get("accepts_encoder_handoff")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
         model_path,
         served_model_name,
         tokenizer_path,

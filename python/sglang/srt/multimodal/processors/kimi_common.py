@@ -22,7 +22,6 @@ from sglang.srt.multimodal.cache import (
 )
 from sglang.srt.multimodal.cache.digest import media_identity
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
-from sglang.srt.multimodal.staged_layout import StagedMediaLayout
 
 _CALLER_IDENTITY_KEYS = ("hash", "pad_value", "pad_values", "identity")
 
@@ -65,11 +64,6 @@ def _item_grid_thw(item: MultimodalDataItem) -> List[int]:
     if len(values) != 3:
         raise ValueError(f"Kimi image item needs one [t, h, w] grid, got {values}")
     return values
-
-
-class KimiStagedLayout(StagedMediaLayout):
-    def vision_rows(self, processor, layout, video):
-        return processor._num_image_tokens_from_grid([layout.t, layout.h, layout.w])
 
 
 class KimiGridMMDataMixin:
@@ -281,18 +275,12 @@ class KimiGridMMDataMixin:
                 "The number of image placeholders does not match img_grid_thw entries."
             )
 
-        image_embeddings = (
-            embeddings[Modality.IMAGE] if embeddings is not None else None
-        )
+        image_embeddings = embeddings[Modality.IMAGE]
         mm_items = []
         consumed = 0
         for (start, end), grid in zip(offsets, img_grid_thw):
             num_tokens = end - start + 1
-            embedding_slice = (
-                image_embeddings[consumed : consumed + num_tokens]
-                if image_embeddings is not None
-                else None
-            )
+            embedding_slice = image_embeddings[consumed : consumed + num_tokens]
             consumed += num_tokens
             mm_items.append(
                 MultimodalDataItem(
@@ -303,7 +291,7 @@ class KimiGridMMDataMixin:
                 )
             )
 
-        if embeddings is not None and self.uses_wide_image_identity:
+        if self.uses_wide_image_identity:
             self.assign_kimi_image_identities(mm_items, None)
 
         return MultimodalProcessorOutput(

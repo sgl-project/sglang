@@ -1801,7 +1801,6 @@ class Scheduler(
         if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
             "zmq_to_scheduler",
             "mooncake",
-            "nixl",
         ]:
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
@@ -1809,14 +1808,6 @@ class Scheduler(
                 hf_config=self.model_config.hf_config,
                 scheduler=self,
             )
-
-            if (
-                self.rust_server is not None
-                and envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get()
-            ):
-                self.rust_server.bind_external_encoder_processor(
-                    self.mm_receiver.mm_processor
-                )
 
     def _gpu_work_on_forward_stream(self) -> bool:
         # Muse Spark's monokernel launches need every one of their workgroups resident

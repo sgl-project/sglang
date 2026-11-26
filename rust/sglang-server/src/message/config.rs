@@ -233,7 +233,7 @@ pub struct ServerArgs {
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
     pub allow_auto_truncate: bool,
-    /// This language worker receives staged embeddings from an external encoder.
+    /// An external router picks the encoder; this worker runs no media pipeline.
     pub external_encoder_handoff: bool,
     /// The resolved `--enable-return-hidden-states`;
     /// decides the mode only when `return_hidden_states_mode` is unset.

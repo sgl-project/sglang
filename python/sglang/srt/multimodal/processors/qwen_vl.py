@@ -52,7 +52,6 @@ from sglang.srt.multimodal.qwen_vl_media_processing import (
     smart_nframes as smart_nframes,
 )
 from sglang.srt.multimodal.qwen_vl_media_processing import smart_resize as smart_resize
-from sglang.srt.multimodal.staged_layout import StagedMediaLayout, VideoTiming
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
@@ -200,50 +199,7 @@ async def preprocess_video(
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
-class _QwenStagedLayout(StagedMediaLayout):
-    def vision_merge_size(self, processor, video):
-        return processor.spatial_merge_size
-
-    def embedding_width(self, processor, hidden_size, visual):
-        if not visual:
-            return hidden_size
-        vision = processor.hf_config.vision_config
-        levels = 1 + len(getattr(vision, "deepstack_visual_indexes", None) or ())
-        if hidden_size is not None:
-            return hidden_size * levels
-        if processor.model_type == "qwen2_vl":
-            width = vision.hidden_size
-        elif getattr(vision, "disable_merger_proj", False):
-            width = vision.hidden_size * processor.spatial_merge_size**2
-        else:
-            width = vision.out_hidden_size
-        return width * levels
-
-    def audio_rows(self, lengths):
-        from sglang.srt.multimodal.mrope_rope_index import (
-            _get_feat_extract_output_lengths,
-        )
-
-        return _get_feat_extract_output_lengths(lengths)
-
-
 class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
-    staged_layouts = {
-        "qwen2_vl": _QwenStagedLayout(video=VideoTiming.NONE, legacy_vision=True),
-        "qwen2_5_vl": _QwenStagedLayout(
-            video=VideoTiming.GRID_DURATION, legacy_vision=True
-        ),
-        "qwen3_omni_moe": _QwenStagedLayout(
-            video=VideoTiming.GRID_DURATION, legacy_vision=True, audio=True
-        ),
-        **dict.fromkeys(
-            ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe", "intern_s2_preview"),
-            _QwenStagedLayout(
-                video=VideoTiming.TIMESTAMPS, per_frame_items=True, legacy_vision=True
-            ),
-        ),
-    }
-
     supports_transformers_backend = True
     generates_input_ids_from_raw_prompt = True
     artifact_modality = Modality.IMAGE
@@ -346,16 +302,16 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         modality_list = []
         cur_idx = 0
 
-        media_positions = []
-        for i, token in enumerate(prompt):
-            if img_token_id is not None and token == img_token_id:
-                media_positions.append((i, Modality.IMAGE))
-            elif video_token_id is not None and token == video_token_id:
-                media_positions.append((i, Modality.VIDEO))
+        vision_start_indices = []
+        for i in range(len(prompt) - 1):
+            if img_token_id is not None and prompt[i + 1] == img_token_id:
+                vision_start_indices.append((i, Modality.IMAGE))
+            elif video_token_id is not None and prompt[i + 1] == video_token_id:
+                vision_start_indices.append((i, Modality.VIDEO))
 
         img_idx = 0
         video_idx = 0
-        for mm_start_idx, modality in media_positions:
+        for mm_start_idx, modality in vision_start_indices:
             modality_list.append(modality)
             video_tokens = None
             if modality == Modality.IMAGE:
@@ -369,7 +325,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                     spatial_merge_size**2
                 )
                 video_tokens = []
-                _current_offset = len(input_ids) + mm_start_idx - cur_idx
+                _current_offset = len(input_ids) + mm_start_idx + 1 - cur_idx
                 # take single frame as one mm_item
                 for frame_idx in range(num_frames):
                     if frame_idx > 0:
@@ -404,14 +360,14 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 )
                 continue
             assert cur_idx <= mm_start_idx
-            input_ids.extend(prompt[cur_idx:mm_start_idx])
+            input_ids.extend(prompt[cur_idx : mm_start_idx + 1])
             if modality == Modality.VIDEO:
                 input_ids.extend(video_tokens)
             else:
                 mm_offset_start = len(input_ids)
                 input_ids.extend([mm_token_id] * mm_token_num)
                 offsets.append((mm_offset_start, len(input_ids) - 1))
-            cur_idx = mm_start_idx + 1
+            cur_idx = mm_start_idx + 2  # jump to vision_end_id
         else:
             input_ids.extend(prompt[cur_idx:])
 
@@ -599,14 +555,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             grid = input_data[0].get(key)
         return grid
 
-    def get_staged_media_layout(self, prompt, **kwargs):
-        """Rebuild Qwen token spans and M-RoPE before receiving staged tensors."""
-        return self._get_mm_data(prompt, None, **kwargs)
-
     def get_mm_data(self, prompt, embeddings, **kwargs):
-        return self._get_mm_data(prompt, embeddings, **kwargs)
-
-    def _get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
@@ -679,11 +628,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         for modality, offset in zip(modality_list, offsets):
             num_tokens = offset[1] - offset[0] + 1
             embedding_start = consumed_per_modality.get(modality, 0)
-            embedding_slice = (
-                embeddings[modality][embedding_start : embedding_start + num_tokens]
-                if embeddings is not None
-                else None
-            )
+            embedding_slice = embeddings[modality][
+                embedding_start : embedding_start + num_tokens
+            ]
             consumed_per_modality[modality] = embedding_start + num_tokens
             mm_items.append(
                 MultimodalDataItem(

@@ -21,7 +21,6 @@ Current coverage:
 """
 
 import asyncio
-import hashlib
 import json
 import unittest
 from types import SimpleNamespace
@@ -169,73 +168,6 @@ class TestServerInfoTransportParity(CustomTestCase):
         # `test_rust_server_followers_skip_runtime_metadata_server`), so pin the
         # mode against an inherited SGLANG_RUST_SERVER=1.
         self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
-
-    def test_external_handoff_advertises_video_for_supported_models(self):
-        scheduler = SimpleNamespace(
-            server_args=ServerArgs(model_path="dummy"),
-            max_total_num_tokens=2048,
-            max_req_input_len=1024,
-            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-        )
-        with (
-            envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(True),
-            patch(
-                "sglang.srt.disaggregation.encoder.handoff_auth.require_handoff_key",
-                return_value=bytes(32),
-            ),
-        ):
-            for name, supported in (
-                ("qwen3_vl", True),
-                ("qwen3_5", True),
-                ("kimi_k3", False),
-                ("glm4v", True),
-                ("qwen3", False),
-            ):
-                with self.subTest(model=name):
-                    scheduler.model_config.hf_config.model_type = name
-                    info = json.loads(rust_config._launch_server_info(scheduler))
-                    layout = rust_config.staged_layout_for(name)
-                    self.assertEqual(
-                        info.get("accepts_encoder_handoff", False), layout is not None
-                    )
-                    self.assertEqual(
-                        info.get("staged_layout_id"),
-                        layout.wire_id(name) if layout else None,
-                    )
-                    self.assertEqual(
-                        info.get("encoder_handoff_key_id"),
-                        hashlib.sha256(bytes(32)).hexdigest() if layout else None,
-                    )
-                    self.assertEqual(
-                        info.get("supports_staged_video", False), supported
-                    )
-                    self.assertEqual(
-                        info.get("native_model_type"),
-                        name if name in {"kimi_k3", "glm4v"} else None,
-                    )
-
-            scheduler.model_config.hf_config.model_type = "qwen3_vl"
-            for mode, backend in (
-                ("prefill", "nixl"),
-                ("null", "zmq_to_scheduler"),
-                ("decode", "nixl"),
-            ):
-                with self.subTest(mode=mode, backend=backend):
-                    scheduler.server_args = ServerArgs(
-                        model_path="dummy",
-                        disaggregation_mode=mode,
-                        encoder_transfer_backend=backend,
-                    )
-                    info = json.loads(rust_config._launch_server_info(scheduler))
-                    self.assertEqual(
-                        info.get("staged_transfer_backend"),
-                        None if mode == "decode" else backend,
-                    )
-
-        with envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(False):
-            info = json.loads(rust_config._launch_server_info(scheduler))
-            self.assertNotIn("staged_layout_id", info)
-            self.assertNotIn("staged_transfer_backend", info)
 
     def test_rust_launch_info_redacts_the_api_keys(self):
         # Only the API key (or nothing) guards /server_info, so reporting the

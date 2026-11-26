@@ -26,7 +26,6 @@ from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.multimodal.staged_layout import staged_layout_for
 from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
 from sglang.srt.observability.request_logger import (
     WHITELISTED_HEADERS,
@@ -498,26 +497,6 @@ def _launch_server_info(scheduler: Scheduler) -> str:
             build_server_info(scheduler.server_args, scheduler_info)
         )
     )
-    if envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get():
-        from sglang.srt.disaggregation.encoder.handoff_auth import (
-            handoff_key_id,
-            require_handoff_key,
-        )
-
-        model_type = scheduler.model_config.hf_config.model_type
-        layout = staged_layout_for(model_type)
-        if layout is not None:
-            info["accepts_encoder_handoff"] = True
-            info["encoder_handoff_key_id"] = handoff_key_id(require_handoff_key())
-            if info["disaggregation_mode"] != "decode":
-                info["staged_transfer_backend"] = info["encoder_transfer_backend"]
-            info["staged_layout_id"] = layout.wire_id(model_type)
-            info["supports_staged_images"] = layout.images
-            info["supports_staged_video"] = layout.video is not None
-            if layout.language_audio_enabled(scheduler):
-                info["staged_audio_model_type"] = model_type
-            if (layout.images or layout.video is not None) and not layout.legacy_vision:
-                info["native_model_type"] = model_type
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 

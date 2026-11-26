@@ -38,6 +38,7 @@ from sglang.srt.managers.utils import (
     msgpack_decode_explained,
 )
 from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.request_dump import (
     CRASH_DUMP_GRACE_SECS,
     crash_dump_hostname,
@@ -103,8 +104,18 @@ DRAIN_FORCE_REQUESTED = 2
 DRAIN_CLOSED = 4
 
 
-class MissingEncoderHandoff(ValueError):
-    pass
+class EncoderHandoffPart(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    modality: str
+    items: int
+
+
+class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """The ``encoder_handoff`` request field. The router has sent this encoder
+    one native encode request per part, under request ids
+    ``{rid}_local_part_{index}``, with ``num_parts=len(parts)``."""
+
+    encoder_url: str
+    parts: list[EncoderHandoffPart]
 
 
 def _is_loopback(host: str) -> bool:
@@ -221,6 +232,8 @@ class RustServer:
         self.mm_spec = mm_spec
         self._multimodal_enabled = mm_spec is not None
         self._mm_cache_namespace: Optional[str] = None
+        self._external_encoder = False
+        self._allowed_encoder_urls: frozenset[str] = frozenset()
         self._max_per_poll = max_per_poll
         # The engine-level startup timings `/server_info` reports, set once
         # the scheduler finishes initializing (see `set_startup_time`).
@@ -261,9 +274,6 @@ class RustServer:
         # The launching process, which `_fail_startup` signals; looked up now,
         # so a failure after it died cannot signal whoever adopted this one.
         self._launcher = psutil.Process().parent()
-        self._handoff_key = None
-        self._external_media_markers = None
-        self._external_media_limits = {}
 
     @classmethod
     def _request_input_class(cls) -> type:
@@ -495,15 +505,16 @@ class RustServer:
         listen_port = get_serving().port + port_offset
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
-        external_handoff = envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get()
-        if external_handoff:
-            from sglang.srt.disaggregation.encoder.handoff_auth import (
-                require_handoff_key,
+        external_encoder = envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get()
+        if external_encoder and (
+            get_disagg().encoder_transfer_backend != "zmq_to_scheduler"
+        ):
+            raise RuntimeError(
+                "External encoder handoff requires --encoder-transfer-backend "
+                f"zmq_to_scheduler, got {get_disagg().encoder_transfer_backend}."
             )
-
-            cls._check_external_encoder_handoff(scheduler)
-            handoff_key = require_handoff_key()
-        rust_mm = scheduler.model_config.is_multimodal and not external_handoff
+        # The router's encoder owns the media, so this worker starts no pipeline.
+        rust_mm = scheduler.model_config.is_multimodal and not external_encoder
 
         launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
@@ -555,10 +566,11 @@ class RustServer:
         instance.server_cores = server_cores
         instance.frontend_cpu_share = frontend_cpu_share
         instance._broadcasts_shutdown = get_parallel().tp_rank == 0
-
-        if external_handoff:
-            instance._handoff_key = handoff_key
-            instance._external_media_limits = get_mm().limit_mm_data_per_request or {}
+        if external_encoder:
+            instance._external_encoder = True
+            instance._allowed_encoder_urls = frozenset(
+                url.rstrip("/") for url in get_disagg().encoder_urls
+            )
 
         if rust_mm:
             # New threads inherit the spawning thread's affinity, and this launch
@@ -617,29 +629,6 @@ class RustServer:
         )
 
         return instance
-
-    @staticmethod
-    def _check_external_encoder_handoff(scheduler: Scheduler) -> None:
-        from sglang.srt.multimodal.staged_layout import staged_layout_for
-
-        # The effective backend and DP size can be resolved after argument validation.
-        backend = get_disagg().encoder_transfer_backend
-        if backend not in ("zmq_to_scheduler", "nixl"):
-            raise RuntimeError(
-                "External encoder handoff requires --encoder-transfer-backend "
-                f"zmq_to_scheduler or nixl, got {backend}."
-            )
-        if get_parallel().num_dp_ranks != 1:
-            raise RuntimeError("External encoder handoff requires one DP rank.")
-        model_type = scheduler.model_config.hf_config.model_type
-        if staged_layout_for(model_type) is None:
-            raise RuntimeError(f"No staged encoder layout for {model_type!r}")
-
-    def bind_external_encoder_processor(self, processor):
-        """Use the same raw prompt markers as the receiver that expands them."""
-        from sglang.srt.disaggregation.encoder.handoff import StagedPromptMarkers
-
-        self._external_media_markers = StagedPromptMarkers.from_processor(processor)
 
     def _fail_startup(self, error: str) -> None:
         """Take the server down after a failed startup warmup, as Python's
@@ -968,28 +957,25 @@ class RustServer:
                 type(e).__name__,
                 e,
             )
-            if not (
-                isinstance(e, MissingEncoderHandoff)
-                or (
-                    "epd.handoff" in buffers
-                    and isinstance(e, (ValueError, msgspec.DecodeError))
-                )
+            if "epd.handoff" in buffers and isinstance(
+                e, (ValueError, msgspec.DecodeError)
             ):
+                # The descriptor is client input, so its faults are the caller's.
+                self._push_abort_frame(
+                    AbortReq(
+                        rid=obj.rid,
+                        finished_reason={
+                            "type": "abort",
+                            "message": f"invalid encoder_handoff: {e}",
+                            "status_code": 400,
+                        },
+                    ),
+                    prompt_tokens=len(obj.input_ids),
+                    cached_tokens=0,
+                    reasoning_tokens=0,
+                )
+            else:
                 self.server.push_error(obj.rid, f"invalid request: {e}")
-                raise
-            self._push_abort_frame(
-                AbortReq(
-                    rid=obj.rid,
-                    finished_reason={
-                        "type": "abort",
-                        "message": str(e),
-                        "status_code": 400,
-                    },
-                ),
-                prompt_tokens=len(obj.input_ids),
-                cached_tokens=0,
-                reasoning_tokens=0,
-            )
             raise
         return obj
 
@@ -1022,43 +1008,39 @@ class RustServer:
                     obj.mm_inputs.input_ids, obj.mm_inputs.mm_items
                 )
         handoff = buffers.get("epd.handoff")
-        markers = self._external_media_markers
         if handoff is not None:
-            from sglang.srt.disaggregation.encoder.handoff import EncoderHandoff
-            from sglang.srt.disaggregation.encoder.handoff_auth import verify_handoff
+            self._attach_encoder_handoff(obj, handoff)
 
-            if markers is None or self._handoff_key is None:
+    def _attach_encoder_handoff(self, obj, handoff) -> None:
+        """Point the scheduler's receiver at the encoder a router already asked
+        to encode this request, as the tokenizer does for a native dispatch."""
+        if not self._external_encoder:
+            raise ValueError(
+                "encoder_handoff requires SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF=1"
+            )
+        selected = msgspec.json.decode(memoryview(handoff), type=EncoderHandoff)
+        url = selected.encoder_url.rstrip("/")
+        if self._allowed_encoder_urls and url not in self._allowed_encoder_urls:
+            raise ValueError("encoder_handoff names an encoder outside --encoder-urls")
+        limits = get_mm().limit_mm_data_per_request or {}
+        assigned = {}
+        for part in selected.parts:
+            modality = Modality.from_str(part.modality)
+            if part.items <= 0 or modality in assigned:
+                raise ValueError("encoder_handoff parts must be nonempty and distinct")
+            limit = limits.get(modality.name.lower())
+            if limit is not None and part.items > limit:
                 raise ValueError(
-                    "encoder_handoff requires SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF=1"
+                    f"{modality.name.lower()} count exceeds --limit-mm-data-per-request"
                 )
-            receipt = EncoderHandoff.parse(
-                memoryview(handoff),
-                *markers.counts(obj.input_ids),
-            )
-            verify_handoff(receipt, self._handoff_key)
-            obj.encoder_handoff = receipt
-            for modality, count in (
-                ("image", obj.encoder_handoff.image_count),
-                ("video", len(obj.encoder_handoff.videos)),
-                ("audio", len(obj.encoder_handoff.audios)),
-            ):
-                limit = self._external_media_limits.get(modality)
-                if limit is not None and count > limit:
-                    raise ValueError(
-                        f"staged {modality} count exceeds --limit-mm-data-per-request"
-                    )
-            hashes = buffers.get("epd.hashes")
-            if hashes is not None:
-                obj.encoder_routing_hashes = msgspec.msgpack.decode(memoryview(hashes))
-            obj.need_wait_for_mm_inputs = True
-        elif (
-            markers is not None
-            and ids is not None
-            and markers.contains_media(obj.input_ids)
-        ):
-            raise MissingEncoderHandoff(
-                "A media prompt requires a staged encoder_handoff"
-            )
+            # One entry per encoder in encoder_urls, in the order the router
+            # numbered its encode parts.
+            assigned[modality] = [part.items]
+        if not assigned:
+            raise ValueError("encoder_handoff names no media")
+        obj.need_wait_for_mm_inputs = True
+        obj.num_items_assigned = assigned
+        obj.encoder_urls = [url]
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting

@@ -571,13 +571,12 @@ ServerArgs = msgspec.defstruct(
 
 
 def resolve_encoder_transfer_backend(
-    backend: str, model_arch: str, tp_size: int, *, external_handoff: bool = False
+    backend: str, model_arch: str, tp_size: int
 ) -> str:
     if backend != "auto":
         return backend
     if (
-        not external_handoff
-        and model_arch
+        model_arch
         in ("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
         and tp_size > 1
     ):

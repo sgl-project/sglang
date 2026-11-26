@@ -5863,43 +5863,17 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 self._resolve([])
             self._resolve([], rust_server=False)
 
-    def test_external_handoff_requires_a_grpc_encoder_or_language_only_rust_server(
-        self,
-    ):
-        with (
-            patch.dict(os.environ),
-            envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(True),
-            tempfile.NamedTemporaryFile() as key,
-            tempfile.NamedTemporaryFile() as invalid_key,
-            envs.SGLANG_ENCODER_HANDOFF_KEY_FILE.override(key.name),
-        ):
-            key.write(bytes(32))
-            key.flush()
+    def test_external_encoder_handoff_allows_language_only_on_the_rust_server(self):
+        with envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(True):
+            self._resolve(["--language-only"])
             self._resolve(
                 ["--language-only", "--encoder-transfer-backend", "zmq_to_scheduler"]
             )
-            self._resolve(["--encoder-only", "--grpc-mode"], rust_server=False)
             for flags, rust, error in (
-                ([], True, "requires SGLANG_RUST_SERVER"),
-                (["--language-only"], False, "requires SGLANG_RUST_SERVER"),
-                (["--encoder-only"], False, "requires --grpc-mode"),
-                (
-                    ["--encoder-only", "--grpc-mode", "--nnodes", "2"],
-                    False,
-                    "single-node",
-                ),
+                ([], True, "requires --language-only"),
+                (["--language-only"], False, "requires --language-only"),
                 (["--language-only", "--pp-size", "2"], True, "PP=1"),
                 (["--language-only", "--dp-size", "2"], True, "one DP rank"),
-                (
-                    [
-                        "--encoder-only",
-                        "--grpc-mode",
-                        "--encoder-transfer-backend",
-                        "zmq_to_tokenizer",
-                    ],
-                    False,
-                    "zmq_to_scheduler or nixl",
-                ),
                 (
                     [
                         "--language-only",
@@ -5907,7 +5881,7 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                         "zmq_to_tokenizer",
                     ],
                     True,
-                    "zmq_to_scheduler or nixl",
+                    "zmq_to_scheduler",
                 ),
                 (
                     ["--language-only", "--enable-adaptive-dispatch-to-encoder"],
@@ -5920,58 +5894,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                     self.assertRaisesRegex(ValueError, error),
                 ):
                     self._resolve(flags, rust_server=rust)
-
-            for role, rust in (
-                (["--encoder-only", "--grpc-mode"], False),
-                (["--language-only"], True),
-            ):
-                for key_path, message in (
-                    ("", "SGLANG_ENCODER_HANDOFF_KEY_FILE"),
-                    (invalid_key.name, "32 bytes"),
-                ):
-                    with (
-                        self.subTest(role=role, missing=not key_path),
-                        envs.SGLANG_ENCODER_HANDOFF_KEY_FILE.override(key_path),
-                        self.assertRaisesRegex(ValueError, message),
-                    ):
-                        self._resolve(role, rust_server=rust)
-
-    def test_kimi_tp_external_handoff_resolves_scheduler_transport_for_all_roles(self):
-        for arch, model_type in (
-            ("KimiK3ForConditionalGeneration", "kimi_k3"),
-            ("KimiK31ForConditionalGeneration", "kimi_k31"),
-        ):
-            for encoder, mode in (
-                (True, "null"),
-                (False, "null"),
-                (False, "prefill"),
-                (False, "decode"),
-            ):
-                for external in (False, True):
-                    args = ServerArgs(
-                        model_path="dummy",
-                        encoder_only=encoder,
-                        grpc_mode=encoder,
-                        language_only=not encoder,
-                        disaggregation_mode=mode,
-                        tp_size=4,
-                    )
-                    args._model_config = SimpleNamespace(
-                        hf_config=SimpleNamespace(
-                            architectures=[arch], model_type=model_type
-                        )
-                    )
-                    with (
-                        self.subTest(
-                            arch=arch, encoder=encoder, mode=mode, external=external
-                        ),
-                        envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(external),
-                    ):
-                        pd_disaggregation_hook.handle_encoder_disaggregation(args)
-                        self.assertEqual(
-                            resolution_result(args, "encoder_transfer_backend"),
-                            "zmq_to_scheduler" if external else "zmq_to_tokenizer",
-                        )
 
     def test_args_a_model_package_honors_are_not_refused(self):
         args = prepare_server_args(

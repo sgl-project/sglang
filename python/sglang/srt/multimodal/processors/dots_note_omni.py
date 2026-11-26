@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar
 
+import numpy as np
 import torch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -18,7 +19,6 @@ from sglang.srt.models.dots3_common.dots_omni_towers import (
     DotsNoteOmniImagePreprocessor,
     get_audio_token_string,
     load_omni_component_config,
-    normalize_audio,
 )
 from sglang.srt.multimodal.media_io import VideoData, get_video_bytes
 from sglang.srt.multimodal.modality import Modality
@@ -26,7 +26,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.staged_layout import StagedMediaLayout
 
 logger = logging.getLogger(__name__)
 
@@ -174,15 +173,8 @@ def preprocess_dots_video(
         return run(_cfg_for_pure_visual(cfg))
 
 
-class _DotsStagedLayout(StagedMediaLayout):
-    def vision_merge_size(self, processor, video):
-        return processor.image_preprocessor.merge_size
-
-
 class DotsNoteOmniProcessor(BaseMultimodalProcessor):
     """Native image/audio processor for dots.note.omni."""
-
-    staged_layouts = {"dots3_note": _DotsStagedLayout(audio=True)}
 
     models: ClassVar[list] = [Dots3NoteForCausalLM]
     gpu_image_decode = False
@@ -227,48 +219,6 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
         )
         super().__init__(hf_config, server_args, processor, transport_mode, **kwargs)
 
-    def get_staged_media_layout(
-        self, prompt, img_grid_thw=None, audio_feature_lens=None
-    ):
-        """Expand the native image and audio pads within their original delimiters."""
-        image_token = self.mm_token_ids["im_token_id"]
-        audio_token = self.mm_token_ids.get("audio_token_id")
-        grids = [] if img_grid_thw is None else img_grid_thw
-        audio_lengths = [] if audio_feature_lens is None else audio_feature_lens
-        if prompt.count(image_token) != len(grids) or prompt.count(audio_token) != len(
-            audio_lengths
-        ):
-            raise ValueError("Dots media placeholders differ from the encoder layout")
-        grids = iter(grids)
-        audio_lengths = iter(audio_lengths)
-        ids = []
-        items = []
-        for token in prompt:
-            if token == image_token:
-                grid = next(grids)
-                count = int(grid.prod()) // self.image_preprocessor.merge_size**2
-                modality = Modality.IMAGE
-                metadata = {"image_grid_thw": grid.reshape(1, 3)}
-            elif token == audio_token:
-                count = int(next(audio_lengths))
-                modality = Modality.AUDIO
-                metadata = {}
-            else:
-                ids.append(token)
-                continue
-            start = len(ids)
-            ids.extend([token] * count)
-            items.append(
-                MultimodalDataItem(
-                    modality=modality,
-                    offsets=[(start, len(ids) - 1)],
-                    model_specific_data=metadata,
-                )
-            )
-        return MultimodalProcessorOutput(
-            input_ids=ids, mm_items=items, **self.mm_token_ids
-        )
-
     @staticmethod
     def _token_id(processor, token: str) -> int:
         token_ids = processor.encode(token, add_special_tokens=False)
@@ -278,6 +228,21 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
                 f"{token_ids}"
             )
         return token_ids[0]
+
+    @staticmethod
+    def _normalize_audio(audio) -> torch.Tensor:
+        if isinstance(audio, torch.Tensor):
+            waveform = audio
+        elif isinstance(audio, np.ndarray):
+            waveform = torch.from_numpy(audio)
+        else:
+            waveform = torch.as_tensor(audio)
+        waveform = waveform.float().squeeze()
+        if waveform.ndim != 1:
+            raise ValueError(
+                f"Dots omni audio must be mono, got shape={tuple(waveform.shape)}"
+            )
+        return waveform.contiguous()
 
     def _render_video_content(
         self,
@@ -530,7 +495,7 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
             if base_output.images
             else ([], [], [])
         )
-        audio_features = [normalize_audio(audio) for audio in base_output.audios]
+        audio_features = [self._normalize_audio(audio) for audio in base_output.audios]
         audio_token_strings = [
             get_audio_token_string(waveform.numel(), self.audio_processor_config)
             for waveform in audio_features

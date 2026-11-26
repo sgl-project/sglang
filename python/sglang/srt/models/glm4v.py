@@ -600,17 +600,12 @@ class Glm4vForConditionalGeneration(nn.Module):
         self.config = config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
-
-        self.visual = None
-        if not getattr(config, "language_only", False):
-            self.visual = Glm4vVisionModel(
-                config.vision_config,
-                quant_config=quant_config,
-                prefix=add_prefix("visual", prefix),
-                use_data_parallel=self.use_data_parallel,
-            )
-        if getattr(config, "encoder_only", False):
-            return
+        self.visual = Glm4vVisionModel(
+            config.vision_config,
+            quant_config=quant_config,
+            prefix=add_prefix("visual", prefix),
+            use_data_parallel=self.use_data_parallel,
+        )
 
         self.model = Glm4Model(
             config,

@@ -890,8 +890,6 @@ class WaitingMMRequestBase(ABC):
     TP-consistent status. Subclasses bind the transport.
     """
 
-    needs_recv_socket = True
-
     def __init__(
         self,
         rid: str,
@@ -915,7 +913,7 @@ class WaitingMMRequestBase(ABC):
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
         self.zmq_context = zmq_context or zmq.Context()
-        if embedding_port is None and self.needs_recv_socket:
+        if embedding_port is None:
             self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
                 self.zmq_context, zmq.PULL, host=host_name
             )
@@ -1311,267 +1309,6 @@ class WaitingZmqRequest(WaitingMMRequestBase):
         return True
 
 
-async def _release_staged_transfer(handoff, rid):
-    try:
-        await handoff.release(envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get())
-    except Exception as exc:
-        logger.warning(
-            "Early release of staged media for rid=%s failed; encoder lease will expire: %s",
-            rid,
-            exc,
-        )
-
-
-class WaitingStagedImage(WaitingZmqRequest):
-    """One private PULL socket. The native part and local scheduler rid differ."""
-
-    def send_encode_request(self):
-        self._release_submitted = False
-        handoff = self.recv_req.encoder_handoff
-        receive_url = NetworkAddress(
-            self.host_name, self.embedding_port
-        ).to_host_port_str()
-        self._start_registration(
-            handoff.deliver(receive_url, envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get())
-        )
-
-    def __init__(self, *args, staged_layout, expected_identities, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.staged_layout = staged_layout
-        self.expected_identities = expected_identities
-        self.verification_future = None
-
-    def _embedding_shape(self):
-        handoff = self.recv_req.encoder_handoff
-        if handoff.version >= 3:
-            from sglang.srt.disaggregation.encoder.handoff import staged_embedding_shape
-
-            return staged_embedding_shape(
-                sum(item.embedding_rows for item in (*handoff.images, *handoff.videos)),
-                handoff.embedding_width,
-                handoff.audios,
-            )
-        layout = self.mm_processor.staged_layouts[self.model_type]
-        rows = sum(
-            layout.vision_rows(self.mm_processor, image, video=False)
-            for image in handoff.images
-        ) + sum(
-            layout.vision_rows(self.mm_processor, video, video=True)
-            for video in handoff.videos
-        )
-        width = layout.embedding_width(self.mm_processor, None, visual=True)
-        return rows, width
-
-    def _is_valid_embedding_part(self, recv_obj):
-        handoff = self.recv_req.encoder_handoff
-        if (
-            not isinstance(recv_obj, EmbeddingData)
-            or recv_obj.req_id != handoff.part_id
-        ):
-            return False  # A stale frame from an earlier user of this port.
-        packed_modality = handoff.packed_modality
-        if (recv_obj.num_parts, recv_obj.part_idx, recv_obj.modality) != (
-            1,
-            0,
-            packed_modality,
-        ):
-            raise ValueError("received part metadata differs from staged descriptor")
-        if not recv_obj.error_msg:
-            if (
-                handoff.version == 1
-                and _cat_grid([recv_obj.grid_dim]).tolist() != handoff.grids()
-            ):
-                raise ValueError("received image grid differs from staged descriptor")
-            if handoff.version >= 2 and (
-                tuple(recv_obj.shape) != self._embedding_shape()
-                or recv_obj.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-            ):
-                raise ValueError(
-                    "received tensor differs from staged media layout/model"
-                )
-        recv_obj.req_id = self.rid
-        return True
-
-    def _embedding_views(self, packed):
-        # The transfer groups rows by modality. The rebuilt request interleaves
-        # media in prompt order, so each modality has its own read cursor.
-        handoff = self.recv_req.encoder_handoff
-        if handoff.version >= 3:
-            image_rows = sum(image.embedding_rows for image in handoff.images)
-        else:
-            layout = self.mm_processor.staged_layouts[self.model_type]
-            image_rows = sum(
-                layout.vision_rows(self.mm_processor, image, video=False)
-                for image in handoff.images
-            )
-        width = handoff.embedding_width if handoff.version >= 3 else packed.shape[1]
-        audio_elements = sum(
-            a.embedding_rows * a.embedding_width for a in handoff.audios
-        )
-        packed = packed.view(-1)
-        image_end = image_rows * width
-        audio_start = packed.numel() - audio_elements
-        ends = {
-            Modality.IMAGE: image_end,
-            Modality.VIDEO: audio_start,
-            Modality.AUDIO: packed.numel(),
-        }
-        offsets = {
-            Modality.IMAGE: 0,
-            Modality.VIDEO: image_end,
-            Modality.AUDIO: audio_start,
-        }
-        audios = iter(handoff.audios)
-        views = []
-        for item in self.staged_layout.mm_items:
-            rows = sum(end - start + 1 for start, end in item.offsets)
-            item_width = (
-                next(audios).embedding_width
-                if item.modality == Modality.AUDIO
-                else width
-            )
-            start = offsets[item.modality]
-            end = start + rows * item_width
-            offsets[item.modality] = end
-            views.append(packed[start:end].view(rows, item_width))
-        if offsets != ends:
-            raise ValueError("staged media rows differ from rebuilt prompt")
-        return views
-
-    def _verify_embeddings(self, packed):
-        from sglang.srt.disaggregation.encoder.handoff import verify_staged_embeddings
-
-        verify_staged_embeddings(
-            self.staged_layout.mm_items,
-            self._embedding_views(packed),
-            self.expected_identities,
-        )
-
-    def _assemble_mm_inputs_from_embeddings(self):
-        # Verify the received host tensor before publishing it or reserving a GPU
-        # pool slot. The background call retains the host storage through abort.
-        (packed,) = self.recv_embedding_data.embedding_list
-        if self.verification_future is None:
-            self.verification_future = self.registration_runner.submit(
-                asyncio.to_thread(self._verify_embeddings, packed)
-            )
-            return False
-        if not self.verification_future.done():
-            return False
-        try:
-            self.verification_future.result()
-        except Exception as exc:
-            self._fail_and_release(
-                f"Failed to verify staged embeddings: {exc}", HTTPStatus.BAD_GATEWAY
-            )
-            return True
-        if self.embedding_pool is not None:
-            return super()._assemble_mm_inputs_from_embeddings()
-        try:
-            self._finish_assemble(
-                {self.recv_req.encoder_handoff.packed_modality: packed}
-            )
-        except Exception as exc:
-            self._fail_assemble(exc)
-        return True
-
-    def _finish_assemble(self, recv_embedding):
-        (packed,) = recv_embedding.values()
-        for item, view in zip(
-            self.staged_layout.mm_items, self._embedding_views(packed), strict=True
-        ):
-            item.precomputed_embeddings = view
-        self._bind_pool_slot_to_mm_inputs(self.staged_layout)
-        self._publish_layout()
-
-    def _publish_layout(self):
-        mm = self.staged_layout
-        attach_mm_routing_labels(mm.mm_items, self.recv_req.mm_routing_labels)
-        self.recv_req.mm_inputs = mm
-        self.recv_req.input_ids = array("q", mm.input_ids)
-        self.status = WaitingMMRequestStatus.SUCCESS
-
-    def release_resources(self):
-        if self.verification_future is not None:
-            self.verification_future.cancel()
-        super().release_resources()
-        if not getattr(self, "_release_submitted", False) and self.registration_runner:
-            self._release_submitted = True
-            self.registration_runner.submit(
-                _release_staged_transfer(self.recv_req.encoder_handoff, self.rid)
-            )
-
-
-class WaitingStagedTpPeer(WaitingStagedImage):
-    """A non-owner TP rank waits for the leader's one completed transfer."""
-
-    needs_recv_socket = False
-
-    def send_encode_request(self):
-        self._publish_layout()
-
-    def release_resources(self):
-        # Only the leader owns the lease and any registered receive buffer.
-        WaitingMMRequestBase.release_resources(self)
-
-
-class WaitingStagedNixlImage(WaitingStagedImage):
-    """Wait for E's NIXL WRITE without blocking the scheduler thread."""
-
-    needs_recv_socket = False
-
-    def __init__(self, *args, nixl_receiver, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.nixl_receiver = nixl_receiver
-
-    def send_encode_request(self):
-        handoff = self.recv_req.encoder_handoff
-        self._start_registration(
-            handoff.receive_nixl(
-                self.nixl_receiver,
-                self._embedding_shape(),
-                envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get(),
-            )
-        )
-
-    def _try_recv_mm_data(self):
-        if self.status != WaitingMMRequestStatus.PENDING:
-            return
-        if self.recv_embedding_data is None:
-            future = self.registration_future
-            if future is None or not future.done():
-                return
-            if future.cancelled():
-                self._fail_and_release(
-                    "NIXL embedding receive cancelled", HTTPStatus.BAD_GATEWAY
-                )
-                return
-            try:
-                tensor = future.result()
-                handoff = self.recv_req.encoder_handoff
-                part = EmbeddingData(
-                    self.rid,
-                    1,
-                    0,
-                    (
-                        torch.tensor([a.feature_length for a in handoff.audios])
-                        if handoff.packed_modality == Modality.AUDIO
-                        else None
-                    ),
-                    handoff.packed_modality,
-                    embedding=tensor,
-                )
-                self.recv_embedding_data = _aggregate_embedding_part(
-                    None, part, self.model_type
-                )
-            except Exception as exc:
-                self._fail_and_release(
-                    f"NIXL embedding receive failed: {exc}", HTTPStatus.BAD_GATEWAY
-                )
-                return
-        self._assemble_mm_inputs_from_embeddings()
-
-
 class WaitingZmqRequestGrpc(WaitingZmqRequest):
     def send_encode_request(self):
         async def send_embedding_port(req_id, receive_count, host_name, embedding_port):
@@ -1941,7 +1678,7 @@ def _sort_responses_and_compute_total_bytes(response_json_list, total_num_parts)
 
 
 class EmbeddingPool:
-    """Persistent host or device buffer pool for received multimodal embeddings.
+    """Persistent GPU buffer pool for received multimodal embeddings.
 
     Allocator: first-fit on a free-segment list with 256-byte alignment.
     `alloc()` blocks on a Condition when the pool is full and resumes once
@@ -1971,10 +1708,9 @@ class EmbeddingPool:
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         logger.info(
-            "Allocated %d MiB embedding pool on %s (base=0x%x)",
-            size_bytes // (1024 * 1024),
-            self.buffer.device,
-            self.base,
+            f"EmbeddingPool allocated: gpu={gpu_id}, "
+            f"size={size_bytes // (1024 * 1024)}MB, base=0x{self.base:x}, "
+            f"rdma_registered={engine is not None}"
         )
 
     def try_alloc(self, nbytes: int) -> Optional[Tuple[torch.Tensor, int, int]]:
@@ -2184,29 +1920,13 @@ class MMReceiverBase(ABC):
         self.registration_runner = None
         self.scheduler_embedding_port = None
         self.scheduler_recv_socket = None
-        self.nixl_receiver = None
-        if scheduler is not None and self.encoder_transfer_backend in (
-            "zmq_to_scheduler",
-            "nixl",
+        if (
+            self.encoder_transfer_backend == "zmq_to_scheduler"
+            and scheduler is not None
         ):
             self.registration_runner = _ReceiveRegistrationRunner(
                 f"encoder-receive-registration-{self.tp_rank}"
             )
-        # In staged mode, only TP0 on P/PD receives and stages embeddings.
-        # Followers get the TP broadcast and decode rebuilds only the layout.
-        staged_receiver_rank = (
-            self.tp_rank == 0 and get_disagg().disaggregation_mode != "decode"
-        )
-        if self.encoder_transfer_backend == "nixl" and staged_receiver_rank:
-            from sglang.srt.disaggregation.encoder.nixl import NixlReceiver
-
-            self.nixl_receiver = NixlReceiver(
-                capacity=envs.SGLANG_ENCODER_MAX_STAGED_REQUESTS.get()
-            )
-        if (
-            scheduler is not None
-            and self.encoder_transfer_backend == "zmq_to_scheduler"
-        ):
             (
                 self.scheduler_embedding_port,
                 self.scheduler_recv_socket,
@@ -2260,19 +1980,11 @@ class MMReceiverBase(ABC):
                     self.embedding_pool = None
             if hf_config is not None:
                 self._init_mm_processor(server_args, hf_config)
-        elif self.encoder_transfer_backend in ("zmq_to_scheduler", "nixl"):
+        elif self.encoder_transfer_backend == "zmq_to_scheduler":
             # Unlike mooncake, do NOT apply the default pool size: explicitly
             # set SGLANG_EMBEDDING_POOL_SIZE_MB=<MB> to bound received
             # embeddings on GPU; unset/0 keeps the unpooled CPU receive.
-            native_zmq = (
-                self.encoder_transfer_backend == "zmq_to_scheduler"
-                and not envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get()
-            )
-            if (
-                envs.SGLANG_EMBEDDING_POOL_SIZE_MB.is_set()
-                and scheduler is not None
-                and (staged_receiver_rank or native_zmq)
-            ):
+            if envs.SGLANG_EMBEDDING_POOL_SIZE_MB.is_set() and scheduler is not None:
                 pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
                 if pool_mb and pool_mb > 0:
                     try:
@@ -2307,8 +2019,6 @@ class MMReceiverBase(ABC):
         """Load processor and initialize mm_processor, shared by all backends."""
         transport_mode = determine_tensor_transport_mode()
         import_processors("sglang.srt.multimodal.processors")
-        if package := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
-            import_processors(package, overwrite=True)
         register_token_space_models()
 
         extra_kwargs = {}
@@ -2636,59 +2346,12 @@ class MMReceiverBase(ABC):
                 # that assignment must index into this exact list.  Falling
                 # back to ``self.encode_urls`` would only matter if the
                 # tokenizer never set encoder_urls (legacy / static path).
-                handoff = recv_req.encoder_handoff
-                cls = waiting_cls
-                transport_kwargs = extra_kwargs
-                encode_urls = (
-                    []
-                    if handoff is not None
-                    else (recv_req.encoder_urls or list(self.encode_urls))
-                )
+                encode_urls = recv_req.encoder_urls or list(self.encode_urls)
 
                 waiting_req = None
                 local_error = None
-                error_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 try:
-                    if handoff is not None:
-                        mm = handoff.build_layout(
-                            self.mm_processor,
-                            recv_req.input_ids,
-                            self.scheduler.max_req_input_len,
-                            hidden_size=(
-                                self.scheduler.model_config.hidden_size
-                                if handoff.version >= 3
-                                else None
-                            ),
-                        )
-                        # Validate rebuilt placeholders on every TP rank, including decode,
-                        # before allocating a receiver or issuing Deliver.
-                        expected = handoff.bind_identities(
-                            mm.mm_items,
-                            recv_req.encoder_routing_hashes,
-                            use_routing_hash=self.mm_processor.staged_layouts[
-                                self.model_type
-                            ].use_routing_hash,
-                        )
-                        transport_kwargs = {
-                            **extra_kwargs,
-                            "embedding_pool": self.embedding_pool,
-                            "staged_layout": mm,
-                            "expected_identities": expected,
-                        }
-                        if get_disagg().disaggregation_mode == "decode" or (
-                            self.tp_size > 1 and self.tp_rank != 0
-                        ):
-                            cls = WaitingStagedTpPeer
-                        elif self.encoder_transfer_backend == "nixl":
-                            cls = WaitingStagedNixlImage
-                            transport_kwargs["nixl_receiver"] = self.nixl_receiver
-                        else:
-                            cls = WaitingStagedImage
-                    elif self.encoder_transfer_backend == "nixl":
-                        raise ValueError(
-                            "NIXL embedding receive requires a staged media handoff"
-                        )
-                    waiting_req = cls(
+                    waiting_req = waiting_cls(
                         rid=recv_req.rid,
                         recv_req=recv_req,
                         mm_processor=self.mm_processor,
@@ -2698,27 +2361,16 @@ class MMReceiverBase(ABC):
                         receive_count=self.tp_size,
                         zmq_context=(
                             None
-                            if handoff is None
-                            and self.scheduler_recv_socket is not None
+                            if self.scheduler_recv_socket is not None
                             else self.scheduler_context
                         ),
-                        embedding_port=(
-                            None
-                            if handoff is not None
-                            else self.scheduler_embedding_port
-                        ),
-                        **transport_kwargs,
+                        embedding_port=self.scheduler_embedding_port,
+                        **extra_kwargs,
                     )
                     self.waiting_by_rid[waiting_req.rid] = waiting_req
                     waiting_req.send_encode_request()
                 except Exception as error:
-                    if (
-                        handoff is not None
-                        and waiting_req is None
-                        and isinstance(error, ValueError)
-                    ):
-                        error_code = HTTPStatus.BAD_REQUEST
-                    local_error = (f"{type(error).__name__}: {error}", error_code)
+                    local_error = f"{type(error).__name__}: {error}"
                     logger.exception(
                         "Failed to start multimodal receive for rid=%s", recv_req.rid
                     )
@@ -2735,11 +2387,8 @@ class MMReceiverBase(ABC):
                 ]
                 if failed_ranks:
                     details = "; ".join(
-                        f"rank {rank}: {rank_errors[rank][0]}" for rank in failed_ranks
+                        f"rank {rank}: {rank_errors[rank]}" for rank in failed_ranks
                     )
-                    # All ranks return the same failure, including when only a
-                    # follower rejected the request or failed to bind a resource.
-                    error_code = rank_errors[failed_ranks[0]][1]
                     error_msg = f"Failed to start multimodal receive ({details})"
                     logger.error(error_msg)
                     if waiting_req is not None:
@@ -2759,29 +2408,15 @@ class MMReceiverBase(ABC):
                                 waiting_req.rid,
                             )
                         self.waiting_by_rid.pop(waiting_req.rid, None)
-                    elif (
-                        handoff is not None
-                        and (self.tp_size == 1 or self.tp_rank == 0)
-                        and self.registration_runner is not None
-                        and get_disagg().disaggregation_mode != "decode"
-                    ):
-                        # Admission may fail before a waiting object owns the lease.
-                        self.registration_runner.submit(
-                            _release_staged_transfer(handoff, recv_req.rid)
-                        )
                     abort_reqs.append(
                         (
                             self.create_req(recv_req),
                             error_msg,
-                            error_code,
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
                         )
                     )
                     continue
 
-                if handoff is not None and get_disagg().disaggregation_mode == "decode":
-                    self.waiting_by_rid.pop(waiting_req.rid)
-                    new_recv_reqs.append(recv_req)
-                    continue
                 self.waiting_list.append(waiting_req)
             else:
                 new_recv_reqs.append(recv_req)
@@ -2817,22 +2452,6 @@ class MMReceiverBase(ABC):
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
             if status_value == WaitingMMRequestStatus.SUCCESS:
-                if isinstance(waiting_req, WaitingStagedImage) and self.tp_size > 1:
-                    # Exactly one rank consumes the encoder lease. Everyone has
-                    # already validated the same native layout. Broadcast only
-                    # its tensors on the matching CPU/GPU process group.
-                    items = waiting_req.recv_req.mm_inputs.mm_items
-                    embeddings = self.tp_group.broadcast_tensor_dict(
-                        {
-                            str(i): item.precomputed_embeddings
-                            for i, item in enumerate(items)
-                        }
-                        if self.tp_rank == 0
-                        else None
-                    )
-                    if self.tp_rank != 0:
-                        for index, item in enumerate(items):
-                            item.precomputed_embeddings = embeddings[str(index)]
                 new_recv_reqs.append(waiting_req.recv_req)
             elif status_value == WaitingMMRequestStatus.FAIL:
                 self._sync_fail_info_across_tp(waiting_req)

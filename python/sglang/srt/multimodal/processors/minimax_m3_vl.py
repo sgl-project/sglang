@@ -23,7 +23,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_resize
-from sglang.srt.multimodal.staged_layout import StagedMediaLayout, VideoTiming
 
 # Per-request media limits; requests outside them are rejected with HTTP 400.
 MAX_IMAGE_PIXELS = 12845056
@@ -473,11 +472,6 @@ def _media_token_runs(input_ids: List[int], token_id: int) -> List[Tuple[int, in
 
 
 class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
-    staged_layouts = {
-        "minimax_m3_vl": StagedMediaLayout(video=VideoTiming.OPTIONAL_TIMESTAMPS)
-    }
-
-    accepts_staged_expanded_spans = True
     models = [MiniMaxM3SparseForConditionalGeneration]
 
     gpu_image_decode = False
@@ -812,11 +806,9 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
                     MultimodalDataItem(
                         modality=modality,
                         offsets=offsets,
-                        precomputed_embeddings=(
-                            embeddings[modality][row_start : row_start + num_rows]
-                            if embeddings is not None
-                            else None
-                        ),
+                        precomputed_embeddings=embeddings[modality][
+                            row_start : row_start + num_rows
+                        ],
                     )
                 )
                 run_start += run_count

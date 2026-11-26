@@ -9,23 +9,11 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.kimi_common import (
-    KimiGridMMDataMixin,
-    KimiStagedLayout,
-)
+from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 
 
 # Compatible with KimiVLForConditionalGeneration
-class _KimiVLStagedLayout(KimiStagedLayout):
-    def processor_image_grids(self, grids):
-        if any(t != 1 for t, _, _ in grids):
-            raise ValueError("Kimi-VL images require a single temporal patch")
-        return [grid[1:] for grid in grids]
-
-
 class KimiVLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
-    staged_layouts = {"kimi_vl": _KimiVLStagedLayout()}
-
     models = [KimiVLForConditionalGeneration]
     gpu_image_decode = False  # KimiVL HF processor does not support tensor inputs
 

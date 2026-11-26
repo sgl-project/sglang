@@ -3,7 +3,7 @@ import concurrent.futures
 import re
 import types
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -59,90 +59,6 @@ def _fake_preprocess_dots_video(raw_video, question, **kwargs):
         {"type": "audio_url", "audio_url": {"url": f"{raw_video}-audio"}},
         {"type": "text", "text": question},
     ]
-
-
-class TestDotsEncoderRoles(CustomTestCase):
-    def test_only_construct_and_load_the_requested_towers(self):
-        from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
-        from sglang.srt.models.dots3_common import dots_omni_towers, modeling
-
-        for encoder_only, language_only in (
-            (True, False),
-            (False, True),
-            (False, False),
-        ):
-            config = types.SimpleNamespace(
-                encoder_only=encoder_only,
-                language_only=language_only,
-                _name_or_path="dots",
-            )
-            with (
-                self.subTest(encoder_only=encoder_only, language_only=language_only),
-                patch.object(modeling, "get_parallel") as parallel,
-                patch.object(modeling, "Dots3LanguageModelForCausalLM") as lm,
-                patch.object(dots_omni_towers, "DotsNoteOmniVisionEncoder") as vision,
-                patch.object(dots_omni_towers, "DotsNoteOmniAudioEncoder") as audio,
-            ):
-                parallel.return_value.pp_group.is_first_rank = True
-                audio.return_value.config = types.SimpleNamespace(sampling_rate=22050)
-                model = modeling.Dots3NoteForCausalLM(config)
-                loaded = []
-                lm.return_value.load_weights.side_effect = loaded.extend
-                checkpoint = iter(
-                    [
-                        ("vision_encoder.patch", 1),
-                        ("model.layers.0.weight", 2),
-                        ("audio_encoder.adapter", 3),
-                        ("lm_head.weight", 4),
-                    ]
-                )
-                model.load_weights(checkpoint)
-                model.post_load_weights()
-                if encoder_only:
-                    p = EncoderPreprocessor.__new__(EncoderPreprocessor)
-                    p.encoder_media_processor_config = (
-                        model.encoder_media_processor_config
-                    )
-                    p.vision_config = {}
-                    self.assertEqual(p._resolve_audio_sr(), 22050)
-                    p.vision_config = {"audio": {"audio_sampling_rate": 24000}}
-                    self.assertEqual(p._resolve_audio_sr(), 24000)
-                    lm.assert_not_called()
-                    lm.return_value.load_weights.assert_not_called()
-                    lm.return_value.post_load_weights.assert_not_called()
-                    # The image hook preserves the checkpoint's patch layout
-                    # and the per-request image processor options.
-                    image_processor = Mock(return_value={"image_grid_thw": [1, 2, 2]})
-                    self.assertEqual(
-                        model.preprocess_mm_for_encoder(
-                            ["image"],
-                            Modality.IMAGE,
-                            {"image": {"detail": "high"}},
-                            image_processor=image_processor,
-                        ),
-                        image_processor.return_value,
-                    )
-                    image_processor.assert_called_once_with(
-                        images=["image"], detail="high"
-                    )
-                else:
-                    lm.assert_called_once()
-                    lm.return_value.post_load_weights.assert_called_once()
-                    self.assertEqual(
-                        loaded, [("model.layers.0.weight", 2), ("lm_head.weight", 4)]
-                    )
-                if language_only:
-                    vision.assert_not_called()
-                    audio.assert_not_called()
-                else:
-                    vision.assert_called_once()
-                    audio.assert_called_once()
-                    vision.return_value.load_converted_state.assert_called_once_with(
-                        {"patch": 1}
-                    )
-                    audio.return_value.load_converted_state.assert_called_once_with(
-                        {"adapter": 3}
-                    )
 
 
 class TestDotsNoteOmniVideoMixing(CustomTestCase):
