@@ -383,6 +383,7 @@ class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
     _staging_ctx = None
+    _status_lock = threading.Lock()
 
     # Wire layout of the prefill->decode terminal status message. The legacy
     # layout (mooncake, and ascend which inherits it) is three untagged frames
@@ -431,6 +432,11 @@ class CommonKVManager(BaseKVManager):
         self.exchange_aux_item_lens = self.customized_info_enabled or (
             get_disagg().disaggregation_max_top_logprobs_num
             != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
+        )
+        # Decode reports this at registration: with a radix cache it reuses
+        # draft KV beyond the sliding window, so prefill must send all of it.
+        self.decode_enable_radix_cache = (
+            get_disagg().disaggregation_decode_enable_radix_cache
         )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
@@ -522,6 +528,7 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Union[Dict[int, KVPoll], PPConsensusStore] = {}
+        self._status_lock = threading.Lock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
@@ -880,36 +887,31 @@ class CommonKVManager(BaseKVManager):
             )
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        current = self.request_status.get(bootstrap_room)
-        if current is None:
-            # The room does not exist yet, or clear() already popped it. Only a
-            # request's opening status may create it: Bootstrapping normally, or
-            # WaitingForInput for a dummy CP rank (see CommonKVSender.__init__).
-            # Anything else would resurrect a concluded room and pollute a later
-            # request that reuses the same bootstrap_room.
-            if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
-                # A new room lifecycle drops deferred-ACK state left by the
-                # previous request that used this bootstrap_room.
-                self._deferred_ack_targets.pop(bootstrap_room, None)
-                self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
-                self._staging_outstanding.pop(bootstrap_room, None)
-                self._forget_sends(bootstrap_room)
-                if isinstance(self.request_status, PPConsensusStore):
-                    self.request_status.pop(_pp_held_key(bootstrap_room), None)
-                self.request_status[bootstrap_room] = status
-            return
-        if status == KVPoll.Failed:
+        # Bootstrap thread and scheduler thread can both open the same room.
+        with self._status_lock:
+            current = self.request_status.get(bootstrap_room)
+            if current is None:
+                # Only an opening status may create a room; anything else would
+                # resurrect a cleared one. A new room drops stale deferred-ACK state.
+                if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
+                    self._deferred_ack_targets.pop(bootstrap_room, None)
+                    self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
+                    self._staging_outstanding.pop(bootstrap_room, None)
+                    self._forget_sends(bootstrap_room)
+                    if isinstance(self.request_status, PPConsensusStore):
+                        self.request_status.pop(_pp_held_key(bootstrap_room), None)
+                    self.request_status[bootstrap_room] = status
+                return
+            if status != KVPoll.Failed:
+                if current != KVPoll.Failed:
+                    # Failed is terminal and sorts lowest, so max() must not see it.
+                    self.request_status[bootstrap_room] = max(current, status)
+                return
             self.request_status[bootstrap_room] = KVPoll.Failed
-            if self.deferred_bootstrap is not None:
-                self._notify_bootstrap(
-                    bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
-                )
-            return
-        if current == KVPoll.Failed:
-            # Failed is terminal. It also sorts lowest, so the max() below would
-            # happily promote it back to Transferring or Success.
-            return
-        self.request_status[bootstrap_room] = max(current, status)
+            if self.deferred_bootstrap is None:
+                return
+            notification = self.deferred_bootstrap.fail(bootstrap_room)
+        self._notify_bootstrap(bootstrap_room, notification)
 
     def send_record(self, bootstrap_room: int) -> SendRecord:
         """The room's send record, created by its first send (scheduler
@@ -1623,14 +1625,23 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        minimax_state_types = set(getattr(self.kv_args, "state_types", ())) & {
+            StateType.MINIMAX_INDEX_K,
+            StateType.MINIMAX_DENSE_KV,
+        }
         if (
-            StateType.MINIMAX_INDEX_K in getattr(self.kv_args, "state_types", ())
+            minimax_state_types
             and info.attn_tp_size != self.attn_tp_size
+            and (
+                not self.kv_args.main_kv_page_row
+                or StateType.MINIMAX_DENSE_KV in minimax_state_types
+            )
         ):
-            # MiniMax main KV pages are head-major page rows and its index state
-            # is replicated per rank; neither can be resliced by attention head.
+            # Only the NVFP4 page-row main KV has a head-sliced sender; dense KV
+            # state is a compacted layer list with no per-head split.
             raise RuntimeError(
-                "MiniMax sparse PD requires matching attention TP sizes: "
+                "MiniMax sparse PD with different attention TP sizes needs the "
+                "NVFP4 page-row KV pool and no dense layers: "
                 f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
             )
 
@@ -2732,9 +2743,17 @@ class CommonKVSender(BaseKVSender):
             status = self.kv_mgr.request_status.get(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if isinstance(self.kv_mgr.request_status, PPConsensusStore):
-            self.kv_mgr.request_status.pop(_pp_held_key(self.bootstrap_room), None)
+        # Serialized with update_status and, under PP, the staging counter's _sync
+        # (same lock order), so neither writes the room back after the pop.
+        with self.kv_mgr._status_lock:
+            if isinstance(self.kv_mgr.request_status, PPConsensusStore):
+                with self.kv_mgr._staging_outstanding._lock:
+                    self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+                    self.kv_mgr.request_status.pop(
+                        _pp_held_key(self.bootstrap_room), None
+                    )
+            else:
+                self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self._retire_sends()
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
@@ -2777,6 +2796,19 @@ class CommonKVSender(BaseKVSender):
 
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
+            return
+        # A landed transfer stays Success. A nonzero count means a chunk can still
+        # fail; with deferred allocation the entry itself means the worker is still
+        # cleaning up, poll() reports Transferring and decode has not been told.
+        outstanding = self.kv_mgr._staging_outstanding
+        if (
+            self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Success
+            and outstanding.get(self.bootstrap_room, 0) == 0
+            and not (
+                self.kv_mgr.defer_decode_allocation
+                and self.bootstrap_room in outstanding
+            )
+        ):
             return
         self.kv_mgr.record_failure(
             self.bootstrap_room,
@@ -3257,7 +3289,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self.conclude_state = (
                 status if status in (KVPoll.Success, KVPoll.Failed) else KVPoll.Failed
             )
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr._status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(

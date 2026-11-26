@@ -61,6 +61,7 @@ def _compression_layout():
 def _construct_sparse_backend(
     *,
     max_context_len=256,
+    row_headroom=0,
     chunked_prefill_size=64,
     max_running_requests=1,
     use_flashinfer=False,
@@ -71,7 +72,7 @@ def _construct_sparse_backend(
         req_to_sparse_k2_token=torch.empty(0),
     )
     flash_attn_backend = SimpleNamespace(
-        max_context_len=max_context_len,
+        max_context_len=max_context_len + row_headroom,
         device="cpu",
         decode_cuda_graph_metadata={},
         req_to_token_pool=req_pool,
@@ -86,6 +87,7 @@ def _construct_sparse_backend(
             enable_memory_saver=False,
         ),
         model_config=SimpleNamespace(
+            context_len=max_context_len,
             hf_config=SimpleNamespace(
                 has_minicpm_sparse_attention=True,
                 sparse_config={
@@ -177,6 +179,13 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             "requires context_length >= 128, got 64",
         ):
             _construct_sparse_backend(max_context_len=64)
+
+    def test_sparse_backend_guard_ignores_row_headroom(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires context_length >= 128, got 64",
+        ):
+            _construct_sparse_backend(max_context_len=64, row_headroom=256)
 
     def test_fused_topk_rejects_disabled_chunked_prefill(self):
         with self.assertRaisesRegex(
@@ -397,6 +406,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
                 enable_memory_saver=False,
             ),
             model_config=SimpleNamespace(
+                context_len=256,
                 hf_config=hf_config,
                 num_attention_heads=16,
                 head_dim=128,

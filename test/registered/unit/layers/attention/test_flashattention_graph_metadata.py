@@ -48,7 +48,7 @@ class _DraftWidthModelRunner:
         )
         self.device = "cpu"
         self.req_to_token_pool = SimpleNamespace(
-            req_to_token=torch.zeros((3, 128), dtype=torch.int32)
+            max_context_len=128, req_to_token=torch.zeros((3, 128), dtype=torch.int32)
         )
         self.token_to_kv_pool = SimpleNamespace(
             layer_router=SimpleNamespace(routes_to=lambda _kind: False)
