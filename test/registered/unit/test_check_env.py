@@ -1,5 +1,7 @@
 """Regression tests for environment checker backend selection."""
 
+import os
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -51,6 +53,52 @@ class TestCheckEnvBackendSelection(CustomTestCase):
                     "XPU 0,1": "Intel GPU",
                 },
             )
+
+
+class TestCheckEnvMissingVendorTool(CustomTestCase):
+    def test_missing_vendor_tool_is_reported_not_raised(self):
+        """The report must still be produced where the vendor's SMI tool or compiler
+        is not installed, for example a CUDA torch wheel on a machine with no GPU."""
+        not_available = "Not Available"
+        probes = [
+            (check_env.GPUEnv, "get_topology", (), {}),
+            (check_env.HIPEnv, "get_topology", (), {}),
+            (
+                check_env.HIPEnv,
+                "_get_rocm_driver_version",
+                (),
+                {"ROCM Driver Version": not_available},
+            ),
+            (check_env.NPUEnv, "get_topology", (), {}),
+            (
+                check_env.NPUEnv,
+                "_get_ascend_driver_version",
+                (),
+                {"Ascend Driver Version": not_available},
+            ),
+            (
+                check_env.NPUEnv,
+                "_get_cann_info",
+                ("/nonexistent-cann-home",),
+                {"CANN": not_available, "BiSheng": not_available},
+            ),
+            (check_env.MUSAEnv, "get_topology", (), {}),
+            (
+                check_env.MUSAEnv,
+                "_get_musa_driver_version",
+                (),
+                {"MUSA Driver Version": not_available},
+            ),
+        ]
+        with (
+            tempfile.TemporaryDirectory() as empty_dir,
+            patch.dict(os.environ, {"PATH": empty_dir}),
+            # NPUEnv() extends the module-level list in place.
+            patch.object(check_env, "PACKAGE_LIST", list(check_env.PACKAGE_LIST)),
+        ):
+            for env_class, probe, args, expected in probes:
+                with self.subTest(env=env_class.__name__, probe=probe):
+                    self.assertEqual(getattr(env_class(), probe)(*args), expected)
 
 
 if __name__ == "__main__":
