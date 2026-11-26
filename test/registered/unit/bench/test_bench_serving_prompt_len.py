@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    async_request_openai_completions,
     set_global_args,
     wrap_multi_turn_request_func,
 )
@@ -22,7 +23,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 ROW_PROMPT_LEN = 9999
 
 
-class _ChatHandler(BaseHTTPRequestHandler):
+class _OpenAIHandler(BaseHTTPRequestHandler):
     """Reports server.prompt_tokens[i] for the i-th request. Like a default SGLang
     server, a streamed response carries usage only when include_usage is set."""
 
@@ -34,7 +35,12 @@ class _ChatHandler(BaseHTTPRequestHandler):
             "prompt_tokens": self.server.prompt_tokens[len(self.server.bodies) - 1],
         }
         if body.get("stream"):
-            chunks = [{"choices": [{"index": 0, "delta": {"content": "hi"}}]}]
+            choice = (
+                {"index": 0, "text": "hi"}
+                if self.path == "/v1/completions"
+                else {"index": 0, "delta": {"content": "hi"}}
+            )
+            chunks = [{"choices": [choice]}]
             if (body.get("stream_options") or {}).get("include_usage"):
                 chunks.append({"choices": [], "usage": usage})
             content_type = "text/event-stream"
@@ -56,18 +62,27 @@ class _ChatHandler(BaseHTTPRequestHandler):
 
 class TestBenchServingPromptLen(CustomTestCase):
     def setUp(self):
-        self.server = HTTPServer(("127.0.0.1", 0), _ChatHandler)
+        self.server = HTTPServer(("127.0.0.1", 0), _OpenAIHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
-    def _run(self, request_func, prompt, prompt_tokens, stream=True, extra=None):
+    def _run(
+        self,
+        request_func,
+        prompt,
+        prompt_tokens,
+        stream=True,
+        extra=None,
+        endpoint="/v1/chat/completions",
+    ):
         self.server.bodies = []
         self.server.prompt_tokens = prompt_tokens
         set_global_args(
             Namespace(
                 disable_stream=not stream,
                 disable_ignore_eos=True,
+                return_logprob=False,
                 print_requests=False,
                 tokenizer="",
                 header=None,
@@ -76,7 +91,7 @@ class TestBenchServingPromptLen(CustomTestCase):
         )
         request = RequestFuncInput(
             prompt=prompt,
-            api_url=f"http://127.0.0.1:{self.server.server_port}/v1/chat/completions",
+            api_url=f"http://127.0.0.1:{self.server.server_port}{endpoint}",
             prompt_len=ROW_PROMPT_LEN,
             output_len=8,
             model="dummy-model",
@@ -88,7 +103,7 @@ class TestBenchServingPromptLen(CustomTestCase):
         outputs = out if isinstance(out, list) else [out]
         for o in outputs:
             self.assertTrue(o.success, o.error)
-        return [o.prompt_len for o in outputs]
+        return outputs
 
     def test_single_request(self):
         usage_on = {"stream_options": {"include_usage": True}}
@@ -99,14 +114,26 @@ class TestBenchServingPromptLen(CustomTestCase):
         ]
         for name, stream, extra, expected in cases:
             with self.subTest(name):
-                lens = self._run(
+                outputs = self._run(
                     async_request_openai_chat_completions,
                     "hello",
                     [123],
                     stream=stream,
                     extra=extra,
                 )
-                self.assertEqual(lens, [expected])
+                self.assertEqual([output.prompt_len for output in outputs], [expected])
+
+    def test_streamed_completions_preserve_usage(self):
+        (output,) = self._run(
+            async_request_openai_completions,
+            "hello",
+            [123],
+            extra={"stream_options": {"include_usage": True}},
+            endpoint="/v1/completions",
+        )
+        self.assertEqual(output.generated_text, "hi")
+        self.assertEqual(output.prompt_len, 123)
+        self.assertEqual(output.output_len, 1)
 
     def test_multi_turn_requests_usage_per_round(self):
         per_round = [100, 250, 400]
@@ -126,10 +153,10 @@ class TestBenchServingPromptLen(CustomTestCase):
         ]
         for extra, sent, expected in cases:
             with self.subTest(extra=extra):
-                lens = self._run(
+                outputs = self._run(
                     multi_turn, ["one", "two", "three"], per_round, extra=extra
                 )
-                self.assertEqual(lens, expected)
+                self.assertEqual([output.prompt_len for output in outputs], expected)
                 self.assertEqual(
                     [b["stream_options"] for b in self.server.bodies], [sent] * 3
                 )

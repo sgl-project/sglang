@@ -354,14 +354,17 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
                             _record_server_prompt_len(data, output)
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
 
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            # Usage and extension events can have no choices.
+                            choices = data["choices"]
+                            text = choices[0]["text"] if choices else ""
+                            if text:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -370,16 +373,11 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
+                                    output.text_chunks.append(text)
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
+                                generated_text += text
 
                     output.generated_text = generated_text
                     output.success = True
