@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 # bumped on any breaking change to the contracts in this module
 MEGAKERNEL_API_VERSION = 3
 
+# The EAGLE draft graph runners run a draft model's capture check (Step).
+EAGLE_DRAFT_CAPTURE_CHECK = True
+
 
 class Feature(enum.Enum):
     """SGLang features refused unless a spec lists them."""

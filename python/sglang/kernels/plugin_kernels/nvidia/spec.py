@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compatibility imports and NVIDIA settings for megakernel providers."""
 
+from sglang.kernels.plugin_kernels.megakernel.spec import (
+    EAGLE_DRAFT_CAPTURE_CHECK as EAGLE_DRAFT_CAPTURE_CHECK,
+)
 from sglang.kernels.plugin_kernels.megakernel.spec import ENTRIES as ENTRIES
 from sglang.kernels.plugin_kernels.megakernel.spec import (
     GRAPH_VARIANT_RUNNERS as GRAPH_VARIANT_RUNNERS,
@@ -87,9 +90,6 @@ from sglang.kernels.plugin_kernels.megakernel.spec import (
 # the sglang.srt.plugins entry point that registers the specs
 ENTRY_POINT = "nvidia_megakernel"
 FLAG = "--enable-nvidia-megakernel"
-# The EAGLE draft graph runners run a draft model's capture check (Step); a draft
-# spec that serves steps can require it
-EAGLE_DRAFT_CAPTURE_CHECK = True
 # The variables of Requirements.env that the flag sets to the spec's value when they
 # are unset, at argument resolution: SGLang reads each only when a model is built, in
 # the model processes started after it. A value the user set is kept and checked.
