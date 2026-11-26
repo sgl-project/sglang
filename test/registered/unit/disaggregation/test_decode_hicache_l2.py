@@ -78,7 +78,11 @@ class _CPUController:
         self.layer_done_counter = SimpleNamespace(
             producer_index=-1,
             num_counters=3,
-            events=[SimpleNamespace(finish_event=_Event()) for _ in range(3)],
+            finish_submissions=lambda: None,
+            events=[
+                SimpleNamespace(finish_event=_Event(), finish_submission=lambda: None)
+                for _ in range(3)
+            ],
         )
         self.load_queue = []
         self.ack_load_queue = []
