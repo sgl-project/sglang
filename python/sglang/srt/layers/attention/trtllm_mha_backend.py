@@ -296,7 +296,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         config = model_runner.model_config
 
         # MHA-specific dimensions
-        self.max_context_len = model_runner.model_config.context_len
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
@@ -333,7 +332,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if self.prefill_uses_native_fp4 and not skip_prefill:
                 # Includes PP dynamic-chunk growth and piecewise capture bounds.
                 prefill_limit = _native_fp4_prefill_output_capacity(
-                    self.max_context_len,
+                    self.req_to_token_pool.row_width,
                     get_schedule().max_prefill_tokens or 0,
                     max_prefill_buffer_tokens(),
                 )
@@ -402,7 +401,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # page table on-device sized to this constant, so it never reads a runtime
         # max. See _fill_page_table_device.
         self.max_num_pages = (
-            self.max_context_len + self.page_size - 1
+            self.req_to_token_pool.row_width + self.page_size - 1
         ) // self.page_size
 
         # Forward metadata
@@ -934,7 +933,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             is_draft_runner=self.is_draft_runner,
             skip_prefill=self.skip_prefill,
             max_bs=max_bs,
-            max_context_len=self.max_context_len,
+            max_context_len=self.req_to_token_pool.row_width,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             is_read=False,
@@ -1692,7 +1691,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     workspace_buffer=self.workspace_buffer,
                     block_tables=group_block_tables,
                     seq_lens=group_seq_lens,
-                    max_seq_len=self.max_context_len,
+                    max_seq_len=self.req_to_token_pool.row_width,
                     bmm1_scale=bmm1_scale,
                     bmm2_scale=bmm2_scale,
                     window_left=window_left,
@@ -2028,7 +2027,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     workspace_buffer=self.workspace_buffer,
                     block_tables=self.forward_metadata.encoder_page_table,
                     seq_lens=self.forward_metadata.encoder_cache_seqlens,
-                    max_seq_len=self.max_context_len,
+                    max_seq_len=self.req_to_token_pool.row_width,
                     bmm1_scale=bmm1_scale,
                     bmm2_scale=bmm2_scale,
                     window_left=layer.sliding_window_size,
@@ -2047,7 +2046,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     workspace_buffer=self.workspace_buffer,
                     block_tables=page_table,
                     seq_lens=self.forward_metadata.cache_seqlens_int32,
-                    max_seq_len=self.max_context_len,
+                    max_seq_len=self.req_to_token_pool.row_width,
                     bmm1_scale=bmm1_scale,
                     bmm2_scale=bmm2_scale,
                     window_left=layer.sliding_window_size,
@@ -2095,7 +2094,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 workspace_buffer=self.fmha_v2_workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
-                max_kv_len=self.max_context_len,
+                max_kv_len=self.req_to_token_pool.row_width,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 batch_size=forward_batch.batch_size,
@@ -2143,7 +2142,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     block_tables=block_tables,
                     seq_lens=cache_seqlens,
                     max_q_len=max_seqlen_q,
-                    max_kv_len=self.max_context_len,
+                    max_kv_len=self.req_to_token_pool.row_width,
                     bmm1_scale=bmm1_scale,
                     bmm2_scale=bmm2_scale,
                     batch_size=cu_seqlens_q.shape[0] - 1,
