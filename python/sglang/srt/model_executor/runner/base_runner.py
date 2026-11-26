@@ -46,7 +46,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.model_runner_components.capture_state import (
+    prepare_capture_state,
+)
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    attach_flashinfer_managed_autotune_cache,
     autotune_dummy_run_ctx,
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
@@ -58,6 +62,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_model,
     get_parallel,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import empty_context, log_info_on_rank0
@@ -239,7 +244,6 @@ class BaseRunner(ABC):
             if model_runner.is_draft_worker
             else get_server_return_hidden_states_mode()
         )
-        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -263,10 +267,14 @@ class BaseRunner(ABC):
         if mr.device != "cuda":
             return
 
+        # First, so that everything below tunes into the store serving reads.
+        attach_flashinfer_managed_autotune_cache(mr)
+
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
         self._pre_initialize_dcp_push_combine()
         self._pre_initialize_pcie_ipc_workspace()
+        self._prepare_capture_state()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -291,7 +299,9 @@ class BaseRunner(ABC):
                 "_autotune_buffers() must return a reusable buffer set for autotune"
             )
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
-            maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
+            maybe_flashinfer_autotune_extend(
+                self, decode_num_tokens=self._decode_autotune_num_tokens(batch_size)
+            )
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
@@ -399,6 +409,16 @@ class BaseRunner(ABC):
             max_rows=self._widest_decode_rows(),
         )
 
+    def _prepare_capture_state(self):
+        """With CUDA graph persistence, build the lazy comm state before CG capture."""
+        mr = self.model_runner
+        prepare_capture_state(
+            model=mr.model,
+            dtype=mr.dtype,
+            is_draft_worker=mr.is_draft_worker,
+            is_ep_scale_joiner=get_exec().moe.is_ep_scale_joiner,
+        )
+
     def _widest_decode_rows(self) -> Optional[int]:
         """Rows in the widest decode reduction, or None when no graph is captured.
 
@@ -423,6 +443,17 @@ class BaseRunner(ABC):
         if not capture_bs:
             return None
         return max(capture_bs) * tokens_per_req
+
+    def _decode_autotune_num_tokens(self, batch_size: int) -> int:
+        mr = self.model_runner
+        is_pd_prefill_target = (
+            get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
+        )
+        if mr.spec_algorithm.is_speculative() and not is_pd_prefill_target:
+            return batch_size * mr.decode_num_tokens_per_req(
+                num_draft_tokens=max_speculative_num_draft_tokens()
+            )
+        return batch_size
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
@@ -537,7 +568,16 @@ class BaseRunner(ABC):
         _is_pd_prefill_target = (
             get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
-        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
+        # A speculative target prefills with plain EXTEND forwards, so an EXTEND
+        # dummy keeps its mode; its other dummies take the verify shape.
+        _is_target_extend = (
+            forward_mode_override == ForwardMode.EXTEND and not mr.is_draft_worker
+        )
+        if (
+            mr.spec_algorithm.is_speculative()
+            and not _is_pd_prefill_target
+            and not _is_target_extend
+        ):
             if mr.is_draft_worker:
                 assert mr.spec_algorithm.supports_target_verify_for_draft(), (
                     "This should not happen"
@@ -545,11 +585,8 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
         if extend_num_tokens_per_req is not None:
-            assert capture_forward_mode == ForwardMode.EXTEND and (
-                not mr.spec_algorithm.is_speculative() or _is_pd_prefill_target
-            ), (
-                "extend_num_tokens_per_req requires an ordinary or PD-prefill "
-                "target EXTEND dummy"
+            assert capture_forward_mode == ForwardMode.EXTEND, (
+                "extend_num_tokens_per_req requires an EXTEND dummy"
             )
             num_tokens_per_req = extend_num_tokens_per_req
 
@@ -585,8 +622,8 @@ class BaseRunner(ABC):
                 )
                 get_flags().capture.enable_torch_compile = False
 
-        # NOTE: aux hidden state capture (eagle3/dflash) is already
-        # configured by init_aux_hidden_state_capture() in initialize().
+        # NOTE: aux hidden state capture (eagle3/dflash) is already configured
+        # by configure_aux_hidden_state_capture() in init_attention_backends().
 
         # Token-axis buffer views and counters.
         input_ids = buffers.input_ids[:num_tokens]

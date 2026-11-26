@@ -9,13 +9,16 @@ the checked-in GB200/GB300 tuning envelope.
 from __future__ import annotations
 
 import logging
+from functools import cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.symm_workspace import (
@@ -26,7 +29,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _HIDDEN_SIZE = 7168
-_SUPPORTED_WORLD_SIZES = (4, 8, 16)
+_SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
 
 # Named persistent symmetric buffers, one per NVLS-aliased tensor. Every rank
 # must resolve the same (buffer, offset) for these, which a per-forward
@@ -87,7 +90,7 @@ def _init_state() -> Optional[_State]:
     has_multicast = lease is not None and lease.has_multicast
     if not has_multicast:
         message = (
-            "K3 SP collective requires SM100/SM103, TP4/TP8/TP16, "
+            "K3 SP collective requires SM100/SM103, TP2/TP4/TP8/TP16, "
             "MegaMoE/DeepEP, and a multicast symmetric workspace; using NCCL "
             "(sm=%s, world_size=%s, a2a=%s, workspace=%s, has_multicast=%s)."
             % (
@@ -476,3 +479,125 @@ def attn_res_all_gather(
         write_prefix=write_prefix,
     )
     return output
+
+
+# --- LayerNorm SP collectives over the TP group -------------------------------
+# Multicast kernels on k3_ar_fusion's plane when it is up and the shard is whole
+# 16 B vectors; layernorm_sp's NCCL collectives otherwise.
+
+# Measured on GB300 TP8 at 16K rows; re-tune when the kernels change.
+_SP_RS_BLOCKS = 96
+# A low-SM launch for a reduce-scatter that overlaps GEMMs on another stream. At
+# most 8 blocks: the routed experts' cooperative routing kernel takes all but 8
+# SMs and cannot start beside a kernel that holds more.
+SP_RS_OVERLAP_BLOCKS = 8
+_SP_AG_BLOCKS = 32
+_SP_BLOCK_SIZE = 1024
+
+
+@cache
+def _sp_multicast() -> bool:
+    ready = (
+        k3_ar_fusion.enabled()
+        and get_parallel().tp_group.world_size in _SUPPORTED_WORLD_SIZES
+        and k3_ar_fusion.register_sp_collective_comm()
+    )
+    logger.info(
+        "K3 LayerNorm SP collectives: %s",
+        "pull reduce-scatter / direct all-gather on the TP multicast plane"
+        if ready
+        else "NCCL",
+    )
+    return ready
+
+
+def _sp_tuning(num_blocks: int):
+    from sglang.kernels.ops.communication import sp_collective
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+
+    comm = get_parallel().tp_group.ca_comm
+    if isinstance(comm, CustomAllReduceV2):
+        num_blocks = max(1, min(num_blocks, comm.config.num_pull_blocks))
+    return sp_collective.Tuning(num_blocks, _SP_BLOCK_SIZE)
+
+
+def _sp_kernel_takes(x: torch.Tensor, shard_rows: int) -> bool:
+    return (
+        x.dtype == torch.bfloat16
+        and x.ndim == 2
+        and x.is_contiguous()
+        and shard_rows > 0
+        # The kernels move whole 16 B vectors.
+        and shard_rows * x.shape[1] * x.element_size() % 16 == 0
+        and _sp_multicast()
+    )
+
+
+def sp_all_gather(local_rows: torch.Tensor, total_rows: int) -> torch.Tensor:
+    """Gather every rank's token-row shard and trim the padding. The result is
+    overwritten by the next gather of that width."""
+    world_size = get_parallel().tp_group.world_size
+    rows, width = local_rows.shape[0] * world_size, local_rows.shape[1]
+    output = (
+        k3_ar_fusion.try_symm_buffer(
+            f"sp_gather_{width}", rows, width, local_rows.dtype
+        )
+        if _sp_kernel_takes(local_rows, local_rows.shape[0])
+        else None
+    )
+    if output is None:
+        return layernorm_sp.all_gather_token_rows(local_rows, total_rows=total_rows)
+    from sglang.kernels.ops.communication import sp_collective
+
+    sp_collective.all_gather_direct(
+        world_size,
+        local_rows,
+        output,
+        output_mc_ptr=k3_ar_fusion.get_mc_ptr(output),
+        tuning=_sp_tuning(_SP_AG_BLOCKS),
+    )
+    return output[:total_rows]
+
+
+def sp_partial_rows(name: str, like: torch.Tensor, width: int) -> torch.Tensor:
+    """``[like.shape[0], width]`` storage for a TP-partial output that
+    sp_reduce_scatter can read in place."""
+    rows = like.shape[0]
+    if _sp_multicast():
+        padded = ceil_align(rows, get_parallel().tp_group.world_size)
+        buffer = k3_ar_fusion.try_symm_buffer(
+            f"sp_partial_{name}", padded, width, like.dtype
+        )
+        if buffer is not None:
+            return buffer[:rows]
+    return like.new_empty((rows, width))
+
+
+def sp_reduce_scatter(
+    partial: torch.Tensor, num_blocks: int = _SP_RS_BLOCKS
+) -> torch.Tensor:
+    """Sum a TP-partial ``[rows, width]`` output onto this rank's token-row
+    shard, padding the rows to whole shards."""
+    world_size = get_parallel().tp_group.world_size
+    rows = partial.shape[0]
+    padded = ceil_align(rows, world_size)
+    full = (
+        k3_ar_fusion.extend_rows(partial, padded)
+        if _sp_kernel_takes(partial, padded // world_size)
+        else None
+    )
+    if full is None:
+        return layernorm_sp.reduce_scatter_token_rows(partial)
+    from sglang.kernels.ops.communication import sp_collective
+
+    full[rows:].zero_()
+    return sp_collective.reduce_scatter_pull(
+        world_size,
+        full,
+        partial.new_empty((padded // world_size, partial.shape[1])),
+        None,
+        input_mc_ptr=k3_ar_fusion.get_mc_ptr(full),
+        tuning=_sp_tuning(num_blocks),
+    )
