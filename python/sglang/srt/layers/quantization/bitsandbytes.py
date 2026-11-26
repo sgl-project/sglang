@@ -431,20 +431,7 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         quant_config: BitsAndBytesConfig,
     ):
         super().__init__()
-        try:
-            import bitsandbytes
-
-            if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
-                raise ImportError(
-                    "bitsandbytes version is wrong. Please "
-                    "install bitsandbytes>=0.46.1."
-                )
-        except ImportError as err:
-            raise ImportError(
-                "Please install bitsandbytes>=0.46.1 via "
-                "`pip install bitsandbytes>=0.46.1` to use "
-                "bitsandbytes quantizer."
-            ) from err
+        require_bitsandbytes()
         self.quant_config = quant_config
 
     def create_weights(

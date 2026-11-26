@@ -16,6 +16,139 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=42, suite="base-a-test-cpu")
 
 
+@pytest.mark.parametrize("fields", [{}, {"shift_label": False}, {"shift_label": True}])
+def test_legacy_selector_shift_label_parsing_is_unchanged(fields):
+    config = parse_dflash_draft_config(
+        draft_hf_config={
+            "architectures": ["DFlash2DraftModel"],
+            # The new default belongs to the draft architecture, not every
+            # draft that happens to use the GigaChat config class/model_type.
+            "model_type": "gigachat4",
+            "num_hidden_layers": 2,
+            "shift_label": True,
+            "dflash_config": {"selector_rank": 2, "selector_top_k": 1, **fields},
+        }
+    )
+    assert config.shift_label is None
+
+
+def _tagged_selector_model(shift_label, observed):
+    """Use row tags as candidate IDs so choosing a wrong row changes tokens."""
+
+    def compute_candidates(hidden):
+        observed["candidate_hidden"] = hidden.clone()
+        return hidden[:, :1].long(), hidden[:, :1].float()
+
+    def build_lattice(**kwargs):
+        observed["selector_hidden"] = kwargs["hidden_states"].clone()
+        observed["anchor_ids"] = kwargs["anchor_token_ids"].clone()
+        return kwargs["unary_logits"].unsqueeze(-2)
+
+    def sample_path(**kwargs):
+        candidates = kwargs["candidate_ids"]
+        return candidates[..., 0], torch.ones_like(candidates, dtype=torch.float32)
+
+    return SimpleNamespace(
+        lm_head=None,
+        shift_label=shift_label,
+        candidate_selector=SimpleNamespace(
+            top_k=1, build_lattice=build_lattice, sample_path=sample_path
+        ),
+        compute_candidates=compute_candidates,
+    )
+
+
+@pytest.mark.parametrize("path", ["lattice", "eager", "graph_sampler"])
+@pytest.mark.parametrize(
+    "shift_label, positions",
+    [(True, [0, 1, 2]), (False, [1, 2, 3]), (None, [1, 2, 3])],
+    ids=["shifted", "unshifted", "legacy"],
+)
+def test_selector_prediction_rows_follow_shift_label(path, shift_label, positions):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    hidden = torch.arange(16, dtype=torch.float32).view(2, 4, 2)
+    block_ids = torch.tensor([[91, 0, 0, 0], [92, 0, 0, 0]])
+    observed = {}
+    model = _tagged_selector_model(shift_label, observed)
+    if path == "lattice":
+        candidates, _ = worker_mod._selector_lattice(model, hidden, block_ids[:, 0])
+        tokens = candidates[..., 0]
+    elif path == "eager":
+        worker = SimpleNamespace(
+            draft_model=model,
+            selector=model.candidate_selector,
+            block_size=4,
+            _selector_sampling_enabled=False,
+            _selector_sample=None,
+            _acceptance_estimator=None,
+        )
+        tokens = worker_mod.DFlashWorkerV2._propose_selector_block(
+            worker,
+            draft_logits_output=SimpleNamespace(hidden_states=hidden.view(-1, 2)),
+            bs=2,
+            lm_head=object(),
+            anchor_token_ids=block_ids[:, 0],
+            sampling_info=None,
+        )
+    else:
+        sampler = worker_mod._SelectorDraftSampler(
+            draft_model=model,
+            block_size=4,
+            max_bs=2,
+            device="cpu",
+            sampling_enabled=False,
+        )
+        sampler(hidden.view(-1, 2), block_ids.flatten())
+        tokens = sampler.out.view(2, 3)
+
+    expected = hidden[:, positions]
+    torch.testing.assert_close(tokens, expected[..., 0].long())
+    torch.testing.assert_close(observed["candidate_hidden"], expected.reshape(-1, 2))
+    torch.testing.assert_close(observed["selector_hidden"], expected)
+    torch.testing.assert_close(observed["anchor_ids"], block_ids[:, 0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "shift_label, positions",
+    [(True, [0, 1, 2]), (False, [1, 2, 3])],
+    ids=["shifted", "unshifted"],
+)
+def test_selector_prediction_rows_in_cuda_graph(shift_label, positions):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    hidden = torch.arange(16, dtype=torch.float32, device="cuda").view(2, 4, 2)
+    block_ids = torch.tensor([[91, 0, 0, 0], [92, 0, 0, 0]], device="cuda")
+    observed = {}
+    sampler = worker_mod._SelectorDraftSampler(
+        draft_model=_tagged_selector_model(shift_label, observed),
+        block_size=4,
+        max_bs=2,
+        device="cuda",
+        sampling_enabled=False,
+    )
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            sampler(hidden.view(-1, 2), block_ids.flatten())
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sampler(hidden.view(-1, 2), block_ids.flatten())
+
+    # Replay must read fresh rows and anchors, not warmup/capture values.
+    hidden.add_(100)
+    block_ids[:, 0].add_(1)
+    graph.replay()
+    expected = hidden[:, positions]
+    torch.testing.assert_close(sampler.out.view(2, 3), expected[..., 0].long())
+    torch.testing.assert_close(observed["candidate_hidden"], expected.reshape(-1, 2))
+    torch.testing.assert_close(observed["selector_hidden"], expected)
+    torch.testing.assert_close(observed["anchor_ids"], block_ids[:, 0])
+
+
 def test_dflash_unary_logit_transform():
     logits = torch.tensor([[-100.0, 0.0, 100.0]], dtype=torch.bfloat16)
     for fields in ({}, {"output_multiplier": 0.2, "final_logit_softcapping": 20.0}):
@@ -367,6 +500,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     )
     draft_model = SimpleNamespace(
         lm_head=None,
+        shift_label=False,
         candidate_selector=selector,
         compute_candidates=lambda hidden: (
             torch.zeros((1, 2), dtype=torch.int64),
