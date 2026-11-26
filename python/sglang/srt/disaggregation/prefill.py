@@ -689,9 +689,14 @@ class PrefillBootstrapQueue:
                 req.time_stats.set_wait_queue_entry_time()
                 req.arrival_processed_tokens = self.scheduler.processed_tokens_counter
             else:
-                raise RuntimeError(
-                    f"Unexpected poll state {poll} for req {req.rid} in move_bootstrapped"
+                # Sender advanced past the bootstrap handshake before the request
+                # left the queue (a racing n>1 fan-out can do this); fail just this
+                # request rather than raising and killing the scheduler.
+                logger.warning(
+                    f"Unexpected poll state {poll} for req {req.rid} in "
+                    "move_bootstrapped; failing the request."
                 )
+                self.scheduler.handle_bootstrap_failure(req)
 
         move(bootstrapped_reqs, dst)
 
@@ -1683,9 +1688,14 @@ class SchedulerDisaggregationPrefillMixin:
             self.checkpoint_disagg_prefill(req)
             return True
         else:
-            raise RuntimeError(
-                f"Unexpected poll state {poll} for req {req.rid} in handle_pending_bootstrap"
+            # See move_bootstrapped: an unexpected post-handshake poll fails this
+            # request rather than raising and killing the scheduler.
+            logger.warning(
+                f"Unexpected poll state {poll} for req {req.rid} in "
+                "handle_pending_bootstrap; failing the request."
             )
+            self.handle_bootstrap_failure(req)
+            return False
 
     def check_bootstrap(self: Scheduler, req: Req) -> bool:
         """Check bootstrap status for an optimistic prefilled request.

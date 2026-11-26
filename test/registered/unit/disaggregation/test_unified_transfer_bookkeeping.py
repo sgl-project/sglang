@@ -619,5 +619,27 @@ class TestTransferBookkeeping(CustomTestCase):
         self.assertEqual(np.asarray(use.ids).tolist(), [3])
 
 
+class TestCheckStatusMissingRoom(CustomTestCase):
+    """check_status reports an absent room as Failed instead of raising KeyError.
+
+    Regression: a disaggregated decode hit KeyError in check_status when it polled
+    a bootstrap_room already removed from request_status (seen under a racing n>1
+    fan-out). The raw dict lookup escaped the scheduler event loop and killed the
+    whole scheduler; a missing room must poll as Failed so only that one transfer
+    fails.
+    """
+
+    def test_missing_room_polls_failed(self):
+        manager = _Manager()
+        self.assertEqual(manager.check_status(6957026300721322536), KVPoll.Failed)
+
+    def test_present_room_keeps_its_status(self):
+        # The default must not swallow a live status: a registered room still
+        # reports what it holds.
+        manager = _Manager()
+        manager.request_status[5] = KVPoll.Transferring
+        self.assertEqual(manager.check_status(5), KVPoll.Transferring)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1065,6 +1065,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
 
+    def _opens_kv_handshake(self, obj: GenerateReqInput) -> bool:
+        """Whether any item of this normalized request registers its
+        bootstrap_room with a real transfer backend. A hostless request the
+        prefill answers alone and the fake backend transfer nothing, so their
+        samples can share a room harmlessly."""
+        if self.disaggregation_mode not in (
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.DECODE,
+        ):
+            return False
+        if get_disagg().disaggregation_transfer_backend == "fake":
+            return False
+        hosts = obj.bootstrap_host
+        if not isinstance(hosts, list):
+            hosts = [hosts]
+        return any(
+            host is not None or self.disaggregation_mode == DisaggregationMode.DECODE
+            for host in hosts
+        )
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1083,6 +1103,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError(
                 "max_thinking_tokens requires the server to be launched with "
                 "--enable-strict-thinking"
+            )
+
+        if (
+            isinstance(obj, GenerateReqInput)
+            and getattr(obj, "parallel_sample_num", 1) > 1
+            and self._opens_kv_handshake(obj)
+        ):
+            # The fan-out below gives every sample the same bootstrap_room, so
+            # n samples would share one prefill<->decode handshake room.
+            raise ValueError(
+                "Parallel sampling (n > 1) is not supported under PD "
+                "disaggregation; send n separate requests instead."
             )
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
