@@ -104,13 +104,7 @@ class K31SparseVerifyHostBinding(K31VerifyHostBinding):
         return self.graph_policy
 
     def can_run_graph(self, built, forward_batch):
-        from sgl_nvidia_mega.kimi_k31.verify_contract import request_capacity
-
-        return (
-            forward_batch.forward_mode.is_target_verify()
-            and request_capacity(int(forward_batch.batch_size), built.request_batches)
-            is not None
-        )
+        return forward_batch.forward_mode.is_target_verify()
 
     def plan(self, built, input_ids, forward_batch, *args, **kwargs):
         if not self.can_run_graph(built, forward_batch):
