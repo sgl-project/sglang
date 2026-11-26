@@ -264,7 +264,11 @@ class ForwardBatchDeepSeekMHAMixin:
         if self.mha_one_shot_kv_indices is not None:
             return self.mha_one_shot_kv_indices
         batch_size = self.batch_size
-        paged_kernel_lens_sum = sum(self.seq_lens_cpu)
+        paged_kernel_lens_sum = (
+            int(self.seq_lens_sum)
+            if getattr(self, "seq_lens_sum", None) is not None
+            else int(self.seq_lens_cpu.sum())
+        )
         kv_indices = torch.empty(
             paged_kernel_lens_sum,
             dtype=torch.int32,

@@ -1,3 +1,5 @@
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -96,12 +98,22 @@ def _get_sum_extend_prefix_lens(forward_batch):
     )
 
 
+def _get_sum_seq_lens(forward_batch) -> int:
+    seq_lens_sum = getattr(forward_batch, "seq_lens_sum", None)
+    if seq_lens_sum is not None:
+        return int(seq_lens_sum)
+    seq_lens_cpu = forward_batch.seq_lens_cpu
+    if seq_lens_cpu is None:
+        return 0
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        return int(seq_lens_cpu.sum())
+    return sum(seq_lens_cpu)
+
+
 def _support_mha_one_shot(attn, forward_batch, backend_name):
-    attn_supported = backend_name in MHA_ONE_SHOT_SUPPORTED_BACKENDS
-    sum_seq_lens = (
-        sum(forward_batch.seq_lens_cpu) if forward_batch.seq_lens_cpu is not None else 0
-    )
-    return attn_supported and sum_seq_lens <= forward_batch.get_max_chunk_capacity()
+    if backend_name not in MHA_ONE_SHOT_SUPPORTED_BACKENDS:
+        return False
+    return _get_sum_seq_lens(forward_batch) <= forward_batch.get_max_chunk_capacity()
 
 
 def _handle_attention_backend(attn, forward_batch, backend_name):

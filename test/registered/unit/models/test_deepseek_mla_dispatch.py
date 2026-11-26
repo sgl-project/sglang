@@ -14,6 +14,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
@@ -331,6 +333,81 @@ class TestMLUAttentionRouting(CustomTestCase):
                             abh.handle_attention_mlu(attn, forward_batch),
                             expected_methods[threshold_index],
                         )
+
+
+class _PoisonSeqLens:
+    def __iter__(self):
+        raise AssertionError("seq_lens_cpu must not be iterated")
+
+    def sum(self):
+        raise AssertionError("seq_lens_cpu.sum() must not be called")
+
+
+class TestSupportMhaOneShot(CustomTestCase):
+    def test_unsupported_backend_short_circuits(self):
+        def _fail_capacity():
+            raise AssertionError("get_max_chunk_capacity() must not be called")
+
+        for backend in ("fa4", "intel_xpu", "triton"):
+            with self.subTest(backend=backend):
+                batch = SimpleNamespace(
+                    seq_lens_cpu=_PoisonSeqLens(),
+                    seq_lens_sum=None,
+                    get_max_chunk_capacity=_fail_capacity,
+                )
+                self.assertFalse(abh._support_mha_one_shot(None, batch, backend))
+
+    def test_uses_cached_seq_lens_sum(self):
+        batch_ok = SimpleNamespace(
+            seq_lens_cpu=_PoisonSeqLens(),
+            seq_lens_sum=512,
+            get_max_chunk_capacity=lambda: 512,
+        )
+        batch_over = SimpleNamespace(
+            seq_lens_cpu=_PoisonSeqLens(),
+            seq_lens_sum=513,
+            get_max_chunk_capacity=lambda: 512,
+        )
+        self.assertTrue(abh._support_mha_one_shot(None, batch_ok, "fa3"))
+        self.assertFalse(abh._support_mha_one_shot(None, batch_over, "fa3"))
+
+    def test_falls_back_to_tensor_sum_and_none(self):
+        t = torch.tensor([10, 20, 30], dtype=torch.int64)
+        self.assertTrue(
+            abh._support_mha_one_shot(
+                None,
+                SimpleNamespace(
+                    seq_lens_cpu=t,
+                    seq_lens_sum=None,
+                    get_max_chunk_capacity=lambda: 60,
+                ),
+                "flashinfer",
+            )
+        )
+        self.assertFalse(
+            abh._support_mha_one_shot(
+                None,
+                SimpleNamespace(
+                    seq_lens_cpu=t,
+                    seq_lens_sum=None,
+                    get_max_chunk_capacity=lambda: 59,
+                ),
+                "flashinfer",
+            )
+        )
+        for seq_lens_cpu in (torch.empty(0, dtype=torch.int64), None):
+            with self.subTest(seq_lens_cpu=seq_lens_cpu):
+                self.assertTrue(
+                    abh._support_mha_one_shot(
+                        None,
+                        SimpleNamespace(
+                            seq_lens_cpu=seq_lens_cpu,
+                            seq_lens_sum=None,
+                            get_max_chunk_capacity=lambda: 0,
+                        ),
+                        "flashmla",
+                    )
+                )
 
 
 if __name__ == "__main__":
