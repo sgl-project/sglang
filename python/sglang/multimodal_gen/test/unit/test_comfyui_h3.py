@@ -1599,3 +1599,134 @@ def test_comfyui_h3_run_dit_captures_and_replays_same_bcg_signature(monkeypatch)
     assert runner.replays == 3
     assert runner.replay_text_lens == [8, 8, 12]
     assert live_packed_prompt.get() is None
+
+
+def test_h3_forward_dit_bypasses_bcg_for_spectrum_requests(monkeypatch):
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+        live_packed_prompt,
+    )
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        _signature_kwargs,
+    )
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        get_forward_context,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
+        MiniMaxH3ComfyUIRunState,
+        MiniMaxH3ComfyUIStepStage,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+        MiniMaxH3DenoisingStage,
+    )
+
+    class _RecordingMiniMaxH3DiTModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.eager_calls = []
+
+        def forward(self, **kwargs):
+            fb = get_forward_context().forward_batch
+            self.eager_calls.append(
+                (
+                    kwargs["prompt_embeds"].shape[0],
+                    bool(
+                        getattr(fb, "enable_spectrum", False)
+                        or getattr(
+                            getattr(fb, "sampling_params", None),
+                            "enable_spectrum",
+                            False,
+                        )
+                    ),
+                    "adaln_timestep_bits" in kwargs,
+                )
+            )
+            return torch.ones(1), torch.ones(1)
+
+    class _RecordingRunner:
+        def __init__(self):
+            self.entries = {}
+            self.captures = 0
+            self.replays = 0
+
+        def capture(self, **kwargs):
+            key = _signature_kwargs(kwargs)
+            if key not in self.entries:
+                self.entries[key] = kwargs
+                self.captures += 1
+            return True
+
+        def __call__(self, **kwargs):
+            key = _signature_kwargs(kwargs)
+            assert key in self.entries
+            self.replays += 1
+            return torch.zeros(1), torch.zeros(1)
+
+    model = _RecordingMiniMaxH3DiTModel()
+    runner = _RecordingRunner()
+    denoise_stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    denoise_stage._maybe_get_bcg_runner = lambda _m: runner
+    monkeypatch.setattr(
+        MiniMaxH3DenoisingStage, "_bcg_text_buckets", staticmethod(lambda: (64, 128))
+    )
+
+    step_stage = MiniMaxH3ComfyUIStepStage.__new__(MiniMaxH3ComfyUIStepStage)
+    step_stage.transformer = model
+    step_stage._cache_stage = denoise_stage
+
+    video, audio, context, timestep, sample_sigmas = _t2va_tensors()
+
+    def _make_state_and_fk(text_len: int):
+        ctx = torch.randn(1, text_len, context.shape[-1])
+        inputs = comfyui_payload_to_branch_inputs(
+            video,
+            audio,
+            ctx,
+            minimax_payload={},
+            sample_sigmas=sample_sigmas,
+            timestep=timestep,
+        )
+        fk, branch = build_step_forward_kwargs(inputs, device=torch.device("cpu"))
+        state = MiniMaxH3ComfyUIRunState(
+            branch=branch,
+            used=inputs["used"],
+            orig_video_shape=inputs["orig_video_shape"],
+            padded_video_shape=inputs["padded_video_shape"],
+            sample_sigmas=sample_sigmas,
+        )
+        return state, fk
+
+    # Warm / capture the 64-token bucket with Spectrum disabled.
+    warm_batch = SimpleNamespace(enable_spectrum=False, is_warmup=True)
+    _, fk_warm = _make_state_and_fk(8)
+    denoise_stage._forward_dit(model, fk_warm, 0, batch=warm_batch, packed_branches={})
+    assert runner.captures == 2  # buckets (64, 128)
+    assert runner.replays == 1
+    assert model.eager_calls == []
+
+    # A Spectrum request with a different prompt length in the same bucket must
+    # bypass BCG rather than replay the Spectrum-off graph.
+    spec_batch = SimpleNamespace(enable_spectrum=True, is_warmup=False)
+    _, fk_spec = _make_state_and_fk(12)
+    assert "adaln_timestep_bits" in fk_spec
+    denoise_stage._forward_dit(model, fk_spec, 0, batch=spec_batch, packed_branches={})
+    assert runner.captures == 2
+    assert runner.replays == 1
+    assert model.eager_calls == [(12, True, True)]
+    assert live_packed_prompt.get() is None
+
+    # SamplingParams-only Spectrum flag also bypasses BCG.
+    sp_batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(enable_spectrum=True), is_warmup=False
+    )
+    _, fk_sp = _make_state_and_fk(10)
+    denoise_stage._forward_dit(model, fk_sp, 1, batch=sp_batch, packed_branches={})
+    assert runner.replays == 1
+    assert model.eager_calls[-1] == (10, True, True)
+
+    # ComfyUI integrated mode (capture_bcg=True) also bypasses BCG for Spectrum.
+    state_spec, fk_comfy = _make_state_and_fk(14)
+    step_stage._run_dit(spec_batch, fk_comfy, state_spec)
+    assert runner.captures == 2
+    assert runner.replays == 1
+    assert model.eager_calls[-1] == (14, True, True)
+    assert live_packed_prompt.get() is None
