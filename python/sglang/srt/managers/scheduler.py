@@ -3099,12 +3099,17 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
+        # max_req_len is the largest number of tokens that can be forwarded for
+        # one request. The last generated token is sampled but never forwarded,
+        # so a request may generate max_req_len - input_len + 1 tokens.
+        context_max_new_tokens = self.max_req_len - input_len + 1
+
         # Keep this bound consistent with PrefillAdder's admission budget.
         max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                context_max_new_tokens,
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.

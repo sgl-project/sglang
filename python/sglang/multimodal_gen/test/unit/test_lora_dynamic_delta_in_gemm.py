@@ -151,6 +151,33 @@ def test_fp16_adapter_keeps_activations_beyond_the_fp16_range(quality, stacked):
     assert torch.equal(actual, bf16_copy)
 
 
+@pytest.mark.parametrize("stacked", [False, True])
+def test_fp32_adapter_computes_as_its_bf16_copy_only_at_high(stacked):
+    # Lightning LoRAs ship fp32 and bf16 files of the same weights. At "high"
+    # the fp32 file computes in the activations' dtype, i.e. exactly as the
+    # bf16 file; "exact" and "lossless" keep the fp32 operands.
+    a, b = _adapter(stacked, torch.float32)
+    fp32_layer = _layer(a, b, alpha=RANK, strength=1.0)
+    bf16_layer = _layer(a.bfloat16(), b.bfloat16(), alpha=RANK, strength=1.0)
+    x = _activations(TOKENS, IN_DIM, seed=6).to(torch.bfloat16)
+    results = {}
+    for quality in ("exact", "lossless", "high"):
+        with torch.inference_mode(), set_forward_context(0, None, _batch(quality)):
+            out = fp32_layer.base_layer(x)
+            results[quality] = (
+                fp32_layer._add_lora_delta(out.clone(), x, 1.0),
+                bf16_layer._add_lora_delta(out.clone(), x, 1.0),
+                out,
+            )
+    actual, bf16_copy, _ = results["high"]
+    assert torch.equal(actual, bf16_copy)
+    for quality in ("exact", "lossless"):
+        kept, bf16_copy, out = results[quality]
+        assert not torch.equal(kept, bf16_copy)
+        expected = out.float() + _compute_lora_delta(x.float(), a.float(), b.float())
+        torch.testing.assert_close(kept.float(), expected, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("adapter_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("stacked", [False, True])
 def test_lossless_delta_under_bf16_autocast_with_a_non_bf16_adapter(

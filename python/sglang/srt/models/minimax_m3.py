@@ -506,9 +506,6 @@ class MiniMaxM3MoE(nn.Module):
                 "M3.1 hybrid MoE requires matching attention TP and MoE EP groups"
             )
 
-        if get_moe_a2a_backend().is_deepep():
-            self.top_k = config.num_experts_per_tok
-
         # The finalize kernels never rescale: the routed scaling factor is already
         # in the top-k weights (apply_routed_scaling_factor_on_output).
         self.supports_deferred_finalize = (
