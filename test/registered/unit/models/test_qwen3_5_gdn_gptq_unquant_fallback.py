@@ -1315,15 +1315,19 @@ class TestQwen35GptqMoeUnquantFallback(CustomTestCase):
                 )
 
     def test_moe_wna16_awq_moe_does_not_run_the_gptq_probe(self):
-        cfg = MoeWNA16Config.from_config(
-            {
-                "quant_method": "awq",
-                "bits": 4,
-                "group_size": 128,
-                "zero_point": True,
-                "modules_to_not_convert": ["visual"],
-            }
-        )
+        with patch(
+            "sglang.srt.layers.quantization.moe_wna16.get_device_capability",
+            return_value=(8, 0),
+        ):
+            cfg = MoeWNA16Config.from_config(
+                {
+                    "quant_method": "awq",
+                    "bits": 4,
+                    "group_size": 128,
+                    "zero_point": True,
+                    "modules_to_not_convert": ["visual"],
+                }
+            )
         with patch.object(
             MoeWNA16Config, "is_linear_unquantized", side_effect=AssertionError
         ):
