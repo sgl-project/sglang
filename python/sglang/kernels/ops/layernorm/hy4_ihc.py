@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
 import logging
 
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,81 @@ def _hpc_ihc_op(op_name: str, hc_mult: int, hidden_size: int):
 
     logger.info("HY4 iHC: using hpc.%s.", op_name)
     return op
+
+
+_IHC_POLICIES = ("hpc", "triton", "mode", "batch")
+# Set per model forward: op selection cannot see the ForwardBatch, and decode
+# CUDA graphs bake in whatever this holds during capture.
+_ihc_decode_forward = contextvars.ContextVar("hy4_ihc_decode_forward", default=False)
+_ihc_logged_choices: set = set()
+
+
+@contextlib.contextmanager
+def hy4_ihc_forward_mode(is_decode: bool):
+    token = _ihc_decode_forward.set(is_decode)
+    try:
+        yield
+    finally:
+        _ihc_decode_forward.reset(token)
+
+
+@functools.lru_cache(maxsize=None)
+def _ihc_policy() -> tuple[str, int]:
+    policy = envs.SGLANG_HY4_IHC_DECODE_POLICY.get()
+    if policy not in _IHC_POLICIES:
+        raise ValueError(
+            f"SGLANG_HY4_IHC_DECODE_POLICY={policy!r}; expected one of {_IHC_POLICIES}"
+        )
+    return policy, envs.SGLANG_HY4_IHC_PRE_T_THRESHOLD.get()
+
+
+def _selected_hpc_ihc_op(op_name: str, hc_mult: int, hidden_size: int, num_tokens: int):
+    policy, pre_threshold = _ihc_policy()
+    op = _hpc_ihc_op(op_name, hc_mult, hidden_size)
+    if op is None:
+        return None
+    is_decode = _ihc_decode_forward.get()
+    if policy == "triton":
+        use_hpc = False
+    elif policy == "mode":
+        use_hpc = not is_decode
+    elif policy == "batch":
+        use_hpc = op_name != "fuse_ihc_pre" or num_tokens >= pre_threshold
+    else:
+        use_hpc = True
+    choice = (op_name, use_hpc, is_decode)
+    if choice not in _ihc_logged_choices:
+        _ihc_logged_choices.add(choice)
+        logger.info(
+            "HY4 iHC policy=%s: %s -> %s (%s, first T=%d).",
+            policy,
+            op_name,
+            "hpc" if use_hpc else "triton/torch",
+            "decode" if is_decode else "extend",
+            num_tokens,
+        )
+    return op if use_hpc else None
+
+
+@functools.lru_cache(maxsize=None)
+def _hpc_ihc_head_folds_rms_norm() -> bool:
+    # Probe the registered schema: hpc's Python wrapper can drop the optional
+    # RMSNorm arguments that the op itself still accepts. An uninspectable
+    # schema means the folded variant is unavailable, not a startup failure.
+    try:
+        schema = torch.ops.hpc.fuse_ihc_head.default._schema
+    except AttributeError:
+        return False
+    return any(argument.name == "rms_weight" for argument in schema.arguments)
+
+
+def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    x_float = x.float()
+    return (
+        x_float
+        * torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + eps)
+        * weight.float()
+    ).to(x.dtype)
 
 
 @triton.jit
@@ -330,7 +409,7 @@ def fused_hy4_ihc_pre(
             torch.empty((0, hc_mult), dtype=torch.float32, device=x.device),
         )
 
-    hpc_op = _hpc_ihc_op("fuse_ihc_pre", hc_mult, hidden_size)
+    hpc_op = _selected_hpc_ihc_op("fuse_ihc_pre", hc_mult, hidden_size, T)
     if hpc_op is not None:
         return hpc_op(
             x,
@@ -411,12 +490,7 @@ def fused_hy4_ihc_pre(
         enable_fp_fusion=False,
     )
     if rms_weight is not None:
-        y_float = y.float()
-        y = (
-            y_float
-            * torch.rsqrt(y_float.square().mean(dim=-1, keepdim=True) + rms_eps)
-            * rms_weight.float()
-        ).to(y.dtype)
+        y = _rms_norm(y, rms_weight, rms_eps)
     return y, post
 
 
@@ -440,7 +514,7 @@ def fused_hy4_ihc_post(
             (0, hc_mult, hidden_size), dtype=output.dtype, device=output.device
         )
 
-    hpc_op = _hpc_ihc_op("fuse_ihc_post", hc_mult, hidden_size)
+    hpc_op = _selected_hpc_ihc_op("fuse_ihc_post", hc_mult, hidden_size, T)
     if hpc_op is not None:
         return hpc_op(output, residual, post)
 
@@ -484,7 +558,7 @@ def fused_hy4_ihc_post_pre(
             torch.empty((0, hc_mult), dtype=torch.float32, device=output.device),
         )
 
-    hpc_op = _hpc_ihc_op("fuse_ihc_post_pre", hc_mult, hidden_size)
+    hpc_op = _selected_hpc_ihc_op("fuse_ihc_post_pre", hc_mult, hidden_size, num_tokens)
     if hpc_op is not None:
         return hpc_op(
             output.contiguous(),
@@ -532,19 +606,22 @@ def fused_hy4_ihc_head(
             (0, hidden_size), dtype=hidden_states.dtype, device=hidden_states.device
         )
 
-    hpc_op = _hpc_ihc_op("fuse_ihc_head", hc_mult, hidden_size)
-    if hpc_op is not None:
-        return hpc_op(
+    if (
+        _selected_hpc_ihc_op("fuse_ihc_head", hc_mult, hidden_size, num_tokens)
+        is not None
+    ):
+        args = (
             hidden_states.contiguous(),
             hc_fn.contiguous(),
             hc_scale.contiguous(),
             hc_base.contiguous(),
             norm_eps,
             hc_eps,
-            rms_weight,
-            rms_eps,
-            True,
         )
+        if _hpc_ihc_head_folds_rms_norm():
+            return torch.ops.hpc.fuse_ihc_head(*args, rms_weight, rms_eps, True)
+        output = torch.ops.hpc.fuse_ihc_head(*args)
+        return output if rms_weight is None else _rms_norm(output, rms_weight, rms_eps)
 
     flat = hidden_states.flatten(1).float()
     scale = torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
@@ -554,12 +631,7 @@ def fused_hy4_ihc_head(
         hidden_states.dtype
     )
     if rms_weight is not None:
-        output_float = output.float()
-        output = (
-            output_float
-            * torch.rsqrt(output_float.square().mean(dim=-1, keepdim=True) + rms_eps)
-            * rms_weight.float()
-        ).to(output.dtype)
+        output = _rms_norm(output, rms_weight, rms_eps)
     return output
 
 

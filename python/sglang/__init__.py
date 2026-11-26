@@ -9,10 +9,14 @@ from sglang.srt.debug_utils.rocprofiler_register import torch_built_with_hip as 
 # those claim these cache dirs early, and the first value set is the one that
 # sticks. Safe here -- environ has no heavy dependency (no torch).
 from sglang.srt.environ import (
+    keep_triton_blackwell_ptxas as _keep_triton_blackwell_ptxas,
+)
+from sglang.srt.environ import (
     redirect_third_party_caches as _redirect_third_party_caches,
 )
 
 _redirect_third_party_caches()
+_keep_triton_blackwell_ptxas()
 
 from sglang._logging_once import install_logging_once as _install_logging_once
 

@@ -679,6 +679,7 @@ class DeepseekV2MoE(nn.Module):
         is_deepseek_v4: bool = False,
         vl_correction_bias: bool = False,
         reduce_results: bool = True,
+        serves_fused_mxfp4: bool = True,
     ):
         super().__init__()
         # False when a stage boundary completes this output's sum.
@@ -781,6 +782,7 @@ class DeepseekV2MoE(nn.Module):
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
+            serves_fused_mxfp4=serves_fused_mxfp4,
             prefix=add_prefix("experts", prefix),
             uses_expert_location=uses_expert_location,
         )
@@ -822,8 +824,9 @@ class DeepseekV2MoE(nn.Module):
                     and (not get_moe_runner_backend().is_flashinfer_trtllm())
                     else None
                 ),
+                is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             )
-            # DSV4 override: ungrouped sqrtsoftplus + fp4 expert layout flag.
+            # DSV4 override: ungrouped sqrtsoftplus.
             if is_deepseek_v4:
                 topk_kwargs.update(
                     use_grouped_topk=False,
@@ -834,7 +837,6 @@ class DeepseekV2MoE(nn.Module):
                     fused_gate_packed_ids=(
                         getattr(config, "model_type", None) == "deepseek_v41"
                     ),
-                    is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
                     # aiter's topk_gating folds the factor regardless; the flag makes
                     # the other routes (e.g. the vision routing fallback) fold too.
                     apply_routed_scaling_factor_on_output=(

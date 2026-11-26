@@ -359,6 +359,7 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        "HYV4VLForConditionalGeneration",
         "Gemma4ForConditionalGeneration",
         "HYV4FlashForConditionalGeneration",
     )

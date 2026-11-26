@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import msgspec
@@ -17,6 +18,7 @@ TRTLLM_MAX_BATCH_ROWS = 65535
 # the rest is kernel scratch.
 _SOFTMAX_BYTES_PER_ROW_HEAD = 256 * 8
 _SCRATCH_RESERVE_BYTES = 128 << 20
+_LOG2E = math.log2(math.e)
 
 
 def trtllm_rows_per_call(*, workspace_bytes: int, heads: int) -> int:
@@ -119,6 +121,23 @@ def dcp_trtllm_sparse_attention(
         outputs.append(output)
     output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return output.view(rows, 1, heads, -1), lse
+
+
+def fold_attention_sink(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    sink: torch.Tensor,
+    *,
+    head_offset: int,
+) -> None:
+    """Fold sink logits in place into heads ``[head_offset, +len(sink))`` of a partial
+    with base-2 LSE; each head must be folded on exactly one DCP rank."""
+    heads = slice(head_offset, head_offset + sink.numel())
+    partial_lse = lse[:, heads]
+    folded_lse = torch.logaddexp2(partial_lse, sink * _LOG2E)
+    scale = torch.exp2(partial_lse - folded_lse).unsqueeze(-1)
+    output[:, heads] = (output[:, heads].float() * scale).to(output.dtype)
+    lse[:, heads] = folded_lse
 
 
 def dcp_split_rows(rows: int) -> Tuple[int, int, int, int]:

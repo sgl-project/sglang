@@ -22,7 +22,7 @@ from dataclasses import fields
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PretrainedConfig
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_backends import TorchvisionBackend
 from transformers.image_transforms import group_images_by_shape, reorder_images
@@ -418,11 +418,17 @@ def vision_token_count(grid_thw, config, modality):
     return frames * (rows * cols + 2 * int(bool(config.cat_extra_token)))
 
 
-def _default_hy_v4_vl_config():
-    # lazy: sglang.srt.configs.hy_v4_flash imports this module to register the processor.
-    from sglang.srt.configs.hy_v4_flash import HYV4FlashConfig
+def _hy_v4_config_class(model_type):
+    # lazy: sglang.srt.configs.hy_v4 and hy_v4_flash import this module to register it.
+    if model_type == "hy_v4_vl":
+        from sglang.srt.configs.hy_v4 import HYV4VLConfig
 
-    return HYV4FlashConfig
+        return HYV4VLConfig
+    if model_type == "hy_v4_flash":
+        from sglang.srt.configs.hy_v4_flash import HYV4FlashConfig
+
+        return HYV4FlashConfig
+    raise ValueError(f"HYV4 processor does not support model_type={model_type!r}")
 
 
 class HYV4VLProcessorKwargs(ProcessingKwargs, total=False):  # type: ignore[call-arg]
@@ -448,7 +454,7 @@ class HYV4VLProcessor(ProcessorMixin):
             video_processor=video_processor,
             chat_template=chat_template,
         )
-        self.config = config or _default_hy_v4_vl_config()()
+        self.config = config or _hy_v4_config_class("hy_v4_vl")()
         self._private_tokenizer_source = None
         self._private_tokenizer_copy = None
         for name in (
@@ -516,9 +522,13 @@ class HYV4VLProcessor(ProcessorMixin):
         kwargs.pop("trust_remote_code", None)
         kwargs.pop("use_fast", None)
         kwargs.pop("backend", None)
-        config = config or _default_hy_v4_vl_config().from_pretrained(
-            pretrained_model_name_or_path, **load_kwargs
-        )
+        if config is None:
+            config_dict, _ = PretrainedConfig.get_config_dict(
+                pretrained_model_name_or_path, **load_kwargs
+            )
+            config = _hy_v4_config_class(config_dict.get("model_type")).from_pretrained(
+                pretrained_model_name_or_path, **load_kwargs
+            )
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(
                 pretrained_model_name_or_path, trust_remote_code=False, **load_kwargs

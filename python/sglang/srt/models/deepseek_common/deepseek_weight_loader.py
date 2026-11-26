@@ -16,7 +16,7 @@ import concurrent.futures
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsLinearMethod,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8,
     CompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -147,6 +148,14 @@ def _resolve_layer_weight_block_size(
     quant_method = getattr(layer, "quant_method", None)
     if quant_method is not None and hasattr(quant_method, "weight_block_size"):
         return quant_method.weight_block_size
+    if isinstance(quant_method, CompressedTensorsLinearMethod):
+        # The layer's own scheme decides; other config groups may use blocks.
+        scheme = layer.scheme
+        return (
+            scheme.weight_block_size
+            if isinstance(scheme, CompressedTensorsW8A8Fp8)
+            else None
+        )
 
     selected_quant_config = getattr(quant_config, "linear_fp8_config", None)
     if selected_quant_config is None:
@@ -160,21 +169,21 @@ def _load_fused_indexer_wk(
     params_dict: Dict[str, torch.Tensor],
     pending: Dict[str, Dict[str, torch.Tensor]],
     quant_config: Optional[QuantizationConfig],
-) -> bool:
+) -> Optional[str]:
     """Load an indexer wk / weights_proj shard into the fused bf16 wk_weights_proj
     param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
     weights_proj the bottom n_heads rows. A block-fp8 weight and its scale wait
     in ``pending`` by module name and name suffix until both arrive, as clones:
     the caller may reuse its buffer meanwhile.
 
-    Returns False when there is no fused param (non-CUDA, or CUDA with
-    SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and weights_proj are
-    separate) so the caller falls through to per-tensor loading.
+    Returns the fused param name, or None when there is no fused param
+    (non-CUDA, or CUDA with SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and
+    weights_proj are separate) so the caller falls through to per-tensor loading.
     """
     fused_name = name.rsplit(".indexer.", 1)[0] + ".indexer.wk_weights_proj.weight"
     fused_param = params_dict.get(fused_name)
     if fused_param is None or fused_param.dtype != torch.bfloat16:
-        return False
+        return None
 
     # A bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
     is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
@@ -183,12 +192,12 @@ def _load_fused_indexer_wk(
     else:
         rows = _pair_block_fp8_half(name, loaded_weight, pending, quant_config)
         if rows is None:
-            return True
+            return fused_name
     if ".indexer.weights_proj." in name:
         fused_param.data[-rows.shape[0] :].copy_(rows)
     else:
         fused_param.data[: rows.shape[0]].copy_(rows)
-    return True
+    return fused_name
 
 
 def _pair_block_fp8_half(
@@ -215,7 +224,7 @@ def _load_fused_expert_tensor(
     name: str,
     loaded_weight: torch.Tensor,
     params_dict: Dict[str, torch.Tensor],
-) -> bool:
+) -> Optional[str]:
     mappings = (
         (".experts.gate_up_proj_scale", ".experts.w13_weight_scale_inv", "w13"),
         (".experts.down_proj_scale", ".experts.w2_weight_scale_inv", "w2"),
@@ -228,7 +237,7 @@ def _load_fused_expert_tensor(
         param_name = name[: -len(source)] + target
         param = params_dict.get(param_name)
         if param is None:
-            return False
+            return None
         weight_loader = param.weight_loader
         for expert_id, expert_weight in enumerate(loaded_weight):
             if shard_id == "w13":
@@ -245,8 +254,8 @@ def _load_fused_expert_tensor(
                     shard_id="w2",
                     expert_id=expert_id,
                 )
-        return True
-    return False
+        return param_name
+    return None
 
 
 @dataclass
@@ -327,6 +336,7 @@ class DeepseekV2WeightLoaderMixin:
         pending_halves = self._get_pending_weight_halves()
         pending_qkv_a_proj = pending_halves.qkv_a_proj
         pending_indexer_wk = pending_halves.indexer_wk_weights_proj
+        loaded_params: Set[str] = set()
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
@@ -414,7 +424,11 @@ class DeepseekV2WeightLoaderMixin:
                     if name is None:
                         continue
 
-                if _load_fused_expert_tensor(name, loaded_weight, params_dict):
+                fused_expert_param = _load_fused_expert_tensor(
+                    name, loaded_weight, params_dict
+                )
+                if fused_expert_param is not None:
+                    loaded_params.add(fused_expert_param)
                     continue
 
                 if "rotary_emb.inv_freq" in name:
@@ -426,16 +440,17 @@ class DeepseekV2WeightLoaderMixin:
                     continue
 
                 # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
-                # helper returns True once it has consumed the shard.
-                if (
-                    ".indexer.wk." in name or ".indexer.weights_proj." in name
-                ) and _load_fused_indexer_wk(
-                    name,
-                    loaded_weight,
-                    params_dict,
-                    pending_indexer_wk,
-                    self.quant_config,
+                # helper returns the fused param name once it has consumed the shard.
+                if (".indexer.wk." in name or ".indexer.weights_proj." in name) and (
+                    fused_indexer_param := _load_fused_indexer_wk(
+                        name,
+                        loaded_weight,
+                        params_dict,
+                        pending_indexer_wk,
+                        self.quant_config,
+                    )
                 ):
+                    loaded_params.add(fused_indexer_param)
                     continue
 
                 for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -465,6 +480,7 @@ class DeepseekV2WeightLoaderMixin:
                         func=weight_loader,
                         func_args=(param, loaded_weight, shard_id),
                     )
+                    loaded_params.add(name)
                     break
                 else:
                     for mapping in expert_params_mapping:
@@ -493,6 +509,7 @@ class DeepseekV2WeightLoaderMixin:
                                 "expert_id": expert_id,
                             },
                         )
+                        loaded_params.add(name)
                         break
                     else:
                         # Skip loading extra bias for GPTQ models.
@@ -567,6 +584,7 @@ class DeepseekV2WeightLoaderMixin:
                                     func=weight_loader,
                                     func_args=(param, fused_weight),
                                 )
+                                loaded_params.add(param_name)
                                 pending_qkv_a_proj.pop(q_a_proj_name)
                                 pending_qkv_a_proj.pop(kv_a_proj_name)
                         else:
@@ -600,6 +618,7 @@ class DeepseekV2WeightLoaderMixin:
                                 func=weight_loader,
                                 func_args=(param, loaded_weight),
                             )
+                            loaded_params.add(name)
 
             if num_unused_expert_input_scale:
                 log_info_on_rank0(
@@ -612,7 +631,26 @@ class DeepseekV2WeightLoaderMixin:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
+        self._check_loaded_weights(
+            unloaded_params=set(params_dict) - loaded_params,
+            unresolved_indexer_pairs=set(pending_indexer_wk),
+        )
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+    def _check_loaded_weights(
+        self, unloaded_params: Set[str], unresolved_indexer_pairs: Set[str]
+    ) -> None:
+        """Inspect parameters that received no checkpoint tensor once loading ends.
+
+        A parameter counts as loaded when any of its shards does. Models whose
+        checkpoints must provide these tensors override this to raise.
+        """
+        if unresolved_indexer_pairs:
+            logger.warning(
+                "FP8 indexer weight/scale pairs never completed; these fused "
+                "indexer projections were not loaded: %s",
+                ", ".join(sorted(unresolved_indexer_pairs)),
+            )
 
     def _get_pending_weight_halves(self) -> _PendingWeightHalves:
         # The mixin has no __init__ of its own, so the first load creates it.

@@ -1416,6 +1416,44 @@ class TestCPInterleaveStrategy(CustomTestCase):
             self.assertTrue(torch.equal(helper_x, expected_x))
             self.assertTrue(torch.equal(helper_positions, expected_positions))
 
+    def test_interleave_shards_mrope_positions_with_their_hidden_rows(self):
+        """(3, N) mRoPE positions shard along tokens, so local column i holds the
+        three position rows of local hidden row i; padded columns are zero."""
+        cp_size = 4
+        total_tokens = 10
+        x = torch.arange(total_tokens)
+        positions = torch.stack(
+            [torch.arange(total_tokens) * 7 + row for row in range(3)]
+        )
+
+        for rank in range(cp_size):
+            metadata = self._metadata_for_rank(
+                rank,
+                cp_size=cp_size,
+                seq_lens=[total_tokens],
+                extend_seq_lens=[total_tokens],
+            )
+            with patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                return_value=4,
+            ):
+                pad_logical_token_to_physical(metadata)
+            fb = self._forward_batch(metadata, [total_tokens])
+            strategy = InterleaveCPStrategy(cp_size=cp_size)
+            with get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size):
+                local_x = strategy.shard_hidden_states(x, fb)
+                local_positions = strategy.shard_position_ids(positions, fb)
+
+            logical_len = metadata.per_rank_logical_token[rank]
+            self.assertEqual(local_positions.shape, (3, 4))
+            self.assertTrue(
+                torch.equal(
+                    local_positions[:, :logical_len],
+                    positions[:, local_x[:logical_len]],
+                )
+            )
+            self.assertFalse(local_positions[:, logical_len:].any())
+
     def test_interleave_padding_preserves_shard_and_gather(self):
         cp_size = 4
         total_tokens = 10

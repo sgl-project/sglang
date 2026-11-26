@@ -221,6 +221,11 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 
     def shard_position_ids(self, positions: Any, forward_batch) -> Any:
         metadata = forward_batch.attn_cp_metadata
+        if positions.ndim == 2:
+            # (3, num_tokens) mRoPE positions: shard the token axis, keep the rows.
+            tokens_major = positions[:, : metadata.total_seq_lens].t()
+            local_positions = self._interleave_shard(tokens_major).t().contiguous()
+            return pad_local_rows(local_positions, metadata, dim=-1)
         local_positions = self._interleave_shard(positions[: metadata.total_seq_lens])
         return pad_local_rows(local_positions, metadata, dim=0)
 

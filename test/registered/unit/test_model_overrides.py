@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
@@ -34,6 +35,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import (
     get_context,
@@ -3094,6 +3096,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dsa_prefill_backend=None,
                 dsa_decode_backend=None,
                 enable_hisparse=False,
+                enable_prefill_cp=False,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -3142,27 +3145,41 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 },
             )
             for arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+                sink_view = partial(
+                    _view, arch=arch, learnable_sink=True, kv_cache_dtype="bfloat16"
+                )
                 with self.subTest(arch=arch, backends="default"):
                     self.assertEqual(
-                        _dsa_split_backend_resolution(
-                            _view(arch=arch, learnable_sink=True)
-                        ),
+                        _dsa_split_backend_resolution(sink_view()),
                         {
                             "dsa_prefill_backend": "flashmla_sparse",
                             "dsa_decode_backend": "flashmla_sparse",
                         },
                     )
-                for field, value in (
-                    ("dsa_prefill_backend", "fa3"),
-                    ("dsa_decode_backend", "trtllm"),
+                # DCP needs TRT-LLM-gen, which FlashInfer's fmhaRunner rejects on
+                # SM90 only once decode CUDA graph capture runs.
+                for kw in (dict(dcp_size=2), dict(dsa_decode_backend="trtllm")):
+                    with self.subTest(arch=arch, **kw):
+                        with self.assertRaisesRegex(ValueError, "Got SM90"):
+                            _dsa_split_backend_resolution(sink_view(**kw))
+                for field, value, dcp_size in (
+                    ("dsa_prefill_backend", "fa3", 1),
+                    ("dsa_decode_backend", "fa3", 1),
+                    ("dsa_prefill_backend", "flashmla_sparse", 2),
+                    ("dsa_decode_backend", "flashmla_sparse", 2),
                 ):
-                    with self.subTest(arch=arch, field=field, value=value):
+                    with self.subTest(arch=arch, field=field, dcp_size=dcp_size):
                         with self.assertRaisesRegex(
                             ValueError, field.replace("_", "-")
                         ):
                             _dsa_split_backend_resolution(
-                                _view(arch=arch, learnable_sink=True, **{field: value})
+                                sink_view(dcp_size=dcp_size, **{field: value})
                             )
+                with self.subTest(arch=arch, kv_cache_dtype="fp8_e4m3"):
+                    with self.assertRaisesRegex(ValueError, "SM100"):
+                        _dsa_split_backend_resolution(
+                            sink_view(kv_cache_dtype="fp8_e4m3")
+                        )
             # non-family arch declares nothing
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
@@ -3181,6 +3198,82 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "flashinfer_sparse_mla",
                 },
             )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            # FP8 KV with sinks: only TRT-LLM both reads the FP8 pool and folds the sink.
+            sink_view = partial(
+                _view, arch="HYV4VLForConditionalGeneration", learnable_sink=True
+            )
+            self.assertEqual(
+                _dsa_split_backend_resolution(sink_view()),
+                {"dsa_prefill_backend": "trtllm", "dsa_decode_backend": "trtllm"},
+            )
+            for kw, pattern in (
+                (dict(dsa_prefill_backend="flashmla_sparse"), "dsa-prefill-backend"),
+                (dict(dsa_decode_backend="flashmla_sparse"), "dsa-decode-backend"),
+                (dict(dcp_size=2), "dcp_size=2"),
+                (dict(enable_prefill_cp=True), "enable-prefill-cp"),
+            ):
+                with self.subTest(**kw):
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        _dsa_split_backend_resolution(sink_view(**kw))
+            # BF16 KV keeps the mixed flashmla_sparse/trtllm choice.
+            self.assertEqual(
+                _dsa_split_backend_resolution(
+                    sink_view(kv_cache_dtype="bfloat16", dsa_decode_backend="trtllm")
+                ),
+                {"dsa_prefill_backend": "flashmla_sparse"},
+            )
+            self.assertEqual(
+                _dsa_split_backend_resolution(
+                    sink_view(kv_cache_dtype="bfloat16", dcp_size=2)
+                ),
+                {"dsa_prefill_backend": "trtllm", "dsa_decode_backend": "trtllm"},
+            )
+        # SM12x is major >= 10 but has no TRT-LLM-gen runner.
+        for capability, supported in (
+            ((10, 3), True),
+            ((10, 7), True),
+            ((12, 0), False),
+            ((12, 1), False),
+        ):
+            with (
+                patch(
+                    "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+                ),
+                override_platform(is_npu=False),
+                override_platform(is_xpu=False),
+                override_platform(is_hip=False),
+                patch("torch.cuda.get_device_capability", return_value=capability),
+                self.subTest(capability=capability),
+            ):
+                if supported:
+                    self.assertEqual(
+                        _dsa_split_backend_resolution(sink_view()),
+                        {
+                            "dsa_prefill_backend": "trtllm",
+                            "dsa_decode_backend": "trtllm",
+                        },
+                    )
+                    continue
+                with self.assertRaisesRegex(ValueError, "Got SM12"):
+                    _dsa_split_backend_resolution(sink_view())
+                with self.assertRaisesRegex(ValueError, "Got SM12"):
+                    _dsa_split_backend_resolution(
+                        sink_view(kv_cache_dtype="bfloat16", dcp_size=2)
+                    )
+                self.assertEqual(
+                    _dsa_split_backend_resolution(sink_view(kv_cache_dtype="bfloat16")),
+                    {
+                        "dsa_prefill_backend": "flashmla_sparse",
+                        "dsa_decode_backend": "flashmla_sparse",
+                    },
+                )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),
@@ -3434,6 +3527,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _dsa_kv_cache_dtype_default(_view()),
                     {"kv_cache_dtype": "fp8_e4m3"},
                 )
+                # Sinks keep auto on bf16; FP8 KV is opt-in only.
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view(learnable_sink=True)),
+                    {"kv_cache_dtype": "bfloat16"},
+                )
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(
+                        _view(learnable_sink=True, kv_cache_dtype="fp8_e4m3")
+                    ),
+                    {},
+                )
+                with self.assertRaisesRegex(ValueError, "fp8_e4m3 KV cache"):
+                    _dsa_kv_cache_dtype_default(
+                        _view(learnable_sink=True, kv_cache_dtype="fp8_e5m2")
+                    )
         # gfx950 reports capability 9.5.
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
@@ -4469,6 +4577,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dcp_size=1,
                 attn_cp_size=1,
                 moe_dense_tp_size=None,
+                pp_size=1,
+                speculative_algorithm=None,
+                disaggregation_mode="null",
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(backend=Backend.DISABLED)
+                ),
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -4484,7 +4598,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             _deepseek_family_overrides(_args(), None),
                             {"attention_backend": "dsa", "page_size": 64},
                         )
-                        for arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+                        for arch in (
+                            "HYV4ForCausalLM",
+                            "HYV4ForCausalLMNextN",
+                            "HYV4VLForConditionalGeneration",
+                        ):
                             hf_config = SimpleNamespace(architectures=[arch])
                             with self.subTest(arch=arch, prefill_cp=True):
                                 with self.assertRaisesRegex(
@@ -4493,13 +4611,150 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                     _deepseek_family_overrides(
                                         _args(enable_prefill_cp=True), hf_config
                                     )
-                            with self.subTest(arch=arch, dcp_size=2):
-                                with self.assertRaisesRegex(
-                                    ValueError, "--dcp-size > 1.*HYV4"
-                                ):
-                                    _deepseek_family_overrides(
-                                        _args(dcp_size=2), hf_config
+                            interleave = dict(
+                                enable_prefill_cp=True,
+                                cp_strategy="interleave",
+                                tp_size=8,
+                                dp_size=1,
+                                attn_dp_size=1,
+                                ep_size=1,
+                                moe_a2a_backend="none",
+                                kv_cache_dtype="auto",
+                            )
+                            if arch == "HYV4VLForConditionalGeneration":
+                                with self.subTest(arch=arch, cp="interleave"):
+                                    result = _deepseek_family_overrides(
+                                        _args(**interleave, attn_cp_size=2), hf_config
                                     )
+                                    self.assertEqual(result["attn_cp_size"], 2)
+                                    self.assertNotIn("attn_dp_size", result)
+                                    self.assertNotIn("dp_size", result)
+                                for field, value in (
+                                    ("cp_strategy", "zigzag"),
+                                    ("pp_size", 2),
+                                    ("speculative_algorithm", "EAGLE"),
+                                    ("attn_dp_size", 2),
+                                    ("disaggregation_mode", "prefill"),
+                                ):
+                                    with self.subTest(arch=arch, cp_with=field):
+                                        with self.assertRaisesRegex(
+                                            ValueError,
+                                            "--enable-prefill-cp for HYV4.*"
+                                            + (
+                                                "attention DP"
+                                                if field == "attn_dp_size"
+                                                else field
+                                            ),
+                                        ):
+                                            _deepseek_family_overrides(
+                                                _args(**{**interleave, field: value}),
+                                                hf_config,
+                                            )
+                            else:
+                                with self.subTest(arch=arch, cp="interleave"):
+                                    with self.assertRaisesRegex(
+                                        ValueError,
+                                        "--enable-prefill-cp for HYV4.*architecture",
+                                    ):
+                                        _deepseek_family_overrides(
+                                            _args(**interleave), hf_config
+                                        )
+                            dcp = dict(
+                                dcp_size=2,
+                                enable_hisparse=False,
+                                enable_hierarchical_cache=False,
+                                speculative_eagle_topk=None,
+                                dsa_prefill_backend=None,
+                                dsa_decode_backend=None,
+                                dcp_replicate_q_proj=None,
+                                dcp_comm_backend="ag_rs",
+                            )
+                            if arch == "HYV4VLForConditionalGeneration":
+                                with self.subTest(arch=arch, dcp_size=2):
+                                    result = _deepseek_family_overrides(
+                                        _args(**dcp), hf_config
+                                    )
+                                    self.assertEqual(
+                                        result["dsa_decode_backend"], "trtllm"
+                                    )
+                                for field, value, reason in (
+                                    ("pp_size", 2, "pp_size"),
+                                    ("attn_dp_size", 2, "attention DP"),
+                                ):
+                                    with self.subTest(arch=arch, dcp_with=field):
+                                        with self.assertRaisesRegex(
+                                            ValueError,
+                                            "--dcp-size > 1 for HYV4.*" + reason,
+                                        ):
+                                            _deepseek_family_overrides(
+                                                _args(**dcp, **{field: value}),
+                                                hf_config,
+                                            )
+                            else:
+                                with self.subTest(arch=arch, dcp_size=2):
+                                    with self.assertRaisesRegex(
+                                        ValueError,
+                                        "--dcp-size > 1 for HYV4.*architecture",
+                                    ):
+                                        _deepseek_family_overrides(
+                                            _args(**dcp), hf_config
+                                        )
+                            pp_spec = dict(pp_size=2, speculative_algorithm="EAGLE")
+                            for env, mode in (
+                                (False, "null"),
+                                (True, "prefill"),
+                                (False, "prefill"),
+                            ):
+                                with self.subTest(
+                                    arch=arch, pp_spec_env=env, mode=mode
+                                ):
+                                    with envs.SGLANG_ENABLE_PP_SPEC.override(env):
+                                        with self.assertRaisesRegex(
+                                            ValueError,
+                                            "--pp-size > 1 with speculative.*"
+                                            "SGLANG_ENABLE_PP_SPEC=1",
+                                        ):
+                                            _deepseek_family_overrides(
+                                                _args(
+                                                    **pp_spec, disaggregation_mode=mode
+                                                ),
+                                                hf_config,
+                                            )
+                            with self.subTest(arch=arch, pp_spec_env=True, mode="null"):
+                                with envs.SGLANG_ENABLE_PP_SPEC.override(True):
+                                    _deepseek_family_overrides(
+                                        _args(**pp_spec), hf_config
+                                    )
+                            graphed = SimpleNamespace(
+                                prefill=SimpleNamespace(backend=Backend.BREAKABLE)
+                            )
+                            for lm_only in (False, True):
+                                graphed_pp_spec = _args(
+                                    **pp_spec,
+                                    cuda_graph_config=graphed,
+                                    _model_config=SimpleNamespace(is_lm_only=lm_only),
+                                )
+                                with self.subTest(
+                                    arch=arch, prefill_graph=True, lm_only=lm_only
+                                ):
+                                    with envs.SGLANG_ENABLE_PP_SPEC.override(True):
+                                        if (
+                                            arch == "HYV4VLForConditionalGeneration"
+                                            and not lm_only
+                                        ):
+                                            with self.assertRaisesRegex(
+                                                ValueError,
+                                                "prefill CUDA graph.*HYV4 VL multimodal",
+                                            ):
+                                                _deepseek_family_overrides(
+                                                    graphed_pp_spec, hf_config
+                                                )
+                                        else:
+                                            _deepseek_family_overrides(
+                                                graphed_pp_spec, hf_config
+                                            )
+                            with self.subTest(arch=arch, pp_size=2, spec=False):
+                                _deepseek_family_overrides(_args(pp_size=2), hf_config)
                     # HIP without the preshuffle path: page 1
                     with override_platform(is_hip=True):
                         with patch(
@@ -4599,6 +4854,58 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             with override_platform(is_sm100=False):
                 self.assertEqual(_deepseek_family_overrides(_args(), None), {})
+
+    def test_hyv4_dcp_rejects_an_explicit_prefill_cuda_graph(self):
+        """An explicit prefill graph skips the DCP auto-disable, and capture then
+        crashes on the DCP-gathered q; HYV4 DCP must refuse it at resolution."""
+        from sglang.srt.arg_groups.cuda_graph_hook import handle_cuda_graph_config
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        hf_config = SimpleNamespace(architectures=["HYV4VLForConditionalGeneration"])
+
+        def _resolve(**kw):
+            args = ServerArgs(model_path="dummy", **kw)
+            args._model_config = SimpleNamespace(
+                is_multimodal=True,
+                is_multimodal_breakable_cuda_graph_supported=True,
+                is_multimodal_piecewise_cuda_graph_supported=True,
+                attention_arch=AttentionArch.MLA,
+                hf_config=hf_config,
+            )
+            handle_cuda_graph_config(args)
+            return _deepseek_family_overrides(args, hf_config)
+
+        explicit = {
+            "convenience flag": dict(cuda_graph_backend_prefill="breakable"),
+            "json": dict(cuda_graph_config={"prefill": {"backend": "breakable"}}),
+        }
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+        ):
+            for form, kw in explicit.items():
+                with self.subTest(dcp_size=2, prefill_graph=form):
+                    with self.assertRaisesRegex(
+                        ValueError, "--dcp-size > 1 for HYV4.*prefill CUDA graph"
+                    ):
+                        _resolve(dcp_size=2, **kw)
+                with self.subTest(dcp_size=1, prefill_graph=form):
+                    _resolve(dcp_size=1, **kw)
+            for form, kw in {
+                "default": {},
+                "disabled": dict(cuda_graph_backend_prefill="disabled"),
+                "json disabled": dict(
+                    cuda_graph_config={"prefill": {"backend": "disabled"}}
+                ),
+            }.items():
+                with self.subTest(dcp_size=2, prefill_graph=form):
+                    result = _resolve(dcp_size=2, **kw)
+                    self.assertEqual(result["dsa_decode_backend"], "trtllm")
 
     def test_qwen3_moe_family_quant_absorption(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_moe import (

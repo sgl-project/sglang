@@ -35,6 +35,7 @@ from sglang.srt.configs.hy_v4_flash import (
     SLIDING_ATTENTION,
     HYV4FlashConfig,
     HYV4FlashTextConfig,
+    parse_dfly_config,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -67,6 +68,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -78,7 +80,7 @@ from sglang.srt.models.hunyuan_v4 import (
 )
 from sglang.srt.models.hunyuan_v4_vl import HYV4VisionTransformer
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
@@ -94,6 +96,14 @@ def _maybe_all_reduce(x: torch.Tensor) -> torch.Tensor:
     if get_parallel().tp_size > 1:
         return tensor_model_parallel_all_reduce(x)
     return x
+
+
+def _mrope_rows_are_equal(forward_mode: ForwardMode) -> bool:
+    return (
+        forward_mode.is_decode()
+        or forward_mode.is_target_verify()
+        or forward_mode.is_draft_extend_v2()
+    )
 
 
 class _FlashMRotaryEmbedding(nn.Module):
@@ -169,11 +179,14 @@ class _RowLayout:
             row_to_batch = torch.arange(num_rows, device=device)
         else:
             lengths = metadata.get_seqlens_expanded()[:num_rows].to(torch.int64)
-            row_to_batch = torch.repeat_interleave(
-                torch.arange(forward_batch.batch_size, device=device),
-                forward_batch.extend_seq_lens.to(torch.int64),
-                output_size=num_rows,
-            )
+            if mode.is_target_verify():
+                row_to_batch = torch.arange(num_rows, device=device)
+            else:
+                row_to_batch = torch.repeat_interleave(
+                    torch.arange(forward_batch.batch_size, device=device),
+                    forward_batch.extend_seq_lens.to(torch.int64),
+                    output_size=num_rows,
+                )
         self.lengths = lengths
         self.positions = (lengths - 1).contiguous()
         self.seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -209,7 +222,9 @@ class _RowLayout:
 def _row_layout(forward_batch: ForwardBatch, metadata, num_rows: int) -> _RowLayout:
     """The row layout is the same for every layer of a forward pass; the model
     resets `forward_batch.hy4f_layouts` at the start of each pass."""
-    cache = forward_batch.hy4f_layouts
+    cache = getattr(forward_batch, "hy4f_layouts", None)
+    if cache is None:
+        return _RowLayout(forward_batch, metadata, num_rows)
     key = (id(metadata.attn_metadata), num_rows)
     layout = cache.get(key)
     if layout is None:
@@ -327,6 +342,7 @@ class FlashIndexPool(nn.Module):
         self._raw_keys: Optional[torch.Tensor] = None
         self._weights_t = None
         self._key_head_weight = None
+        self.dfly_topk_capture: Optional[torch.Tensor] = None
         self._direct_weight_update_error = _DIRECT_WEIGHT_UPDATE_ERROR
 
     @staticmethod
@@ -427,6 +443,9 @@ class FlashIndexPool(nn.Module):
         raw_buf[layout_clamp(out_loc, raw_buf.shape[0])] = keys
         ratio = self.ratio
         device = keys.device
+        if forward_batch.forward_mode.is_target_verify():
+            self._verify_pool_groups(forward_batch, layout, keys.shape[0])
+            return
         ends = forward_batch.seq_lens.to(torch.int64)
         starts = ends - forward_batch.extend_seq_lens.to(torch.int64)
         first_group = starts // ratio
@@ -454,6 +473,38 @@ class FlashIndexPool(nn.Module):
         if self.rope_store is not None:
             first_positions = self.rope_store.buffer[member_slots[:, 0]]
         self._pool_groups(member_slots, first_positions, member_slots[:, 0])
+
+    def _verify_pool_groups(self, forward_batch, layout: "_RowLayout", rows: int):
+        ratio = self.ratio
+        bs = forward_batch.batch_size
+        width = rows // bs
+        device = layout.positions.device
+        starts = forward_batch.seq_lens[:bs].to(torch.int64)
+        groups = starts[:, None] // ratio + torch.arange(
+            width // ratio + 1, device=device
+        )
+        live = (groups + 1) * ratio <= starts[:, None] + width
+        members = groups[..., None] * ratio + torch.arange(ratio, device=device)
+        first_rows = torch.arange(bs, device=device) * width
+        live &= (forward_batch.out_cache_loc[first_rows] != 0)[:, None]
+        member_slots = layout.slots(members, first_rows[:, None]).view(-1, ratio)
+        # Slot 0 is the pool's padding slot: no request reads it.
+        write_slots = torch.where(live.view(-1), member_slots[:, 0], 0)
+        first_positions = members[..., 0].reshape(-1)
+        if self.rope_store is not None:
+            first_positions = self.rope_store.buffer[member_slots[:, 0]]
+        self._pool_groups(member_slots, first_positions, write_slots)
+
+    def _capture_dfly_topk(self, indices, forward_batch):
+        mode = forward_batch.forward_mode
+        capture = self.dfly_topk_capture
+        if mode.is_target_verify():
+            capture[: indices.shape[0]].copy_(indices)
+        elif mode.is_extend():
+            lens = forward_batch.extend_seq_lens.to(torch.int64)
+            last = torch.cumsum(lens, 0) - 1
+            seeds = get_attn_backend().prepare_mtp_seed_indices(indices[last], mode)
+            capture[: last.shape[0]].copy_(seeds)
 
     def _select(self, layout: "_RowLayout", q_fp8, weights, decode: bool):
         """Top groups strictly before each query's group, expanded to tokens, plus
@@ -541,9 +592,16 @@ class FlashIndexPool(nn.Module):
             self.num_heads,
             mrope_section=self.mrope_section,
         )
-        return self._select(
-            layout, q_fp8, weights, decode=forward_batch.forward_mode.is_decode()
+        mode = forward_batch.forward_mode
+        indices = self._select(
+            layout,
+            q_fp8,
+            weights,
+            decode=mode.is_decode() or mode.is_target_verify(),
         )
+        if self.dfly_topk_capture is not None:
+            self._capture_dfly_topk(indices, forward_batch)
+        return indices
 
 
 def _topk(logits: torch.Tensor, k: int):
@@ -622,6 +680,7 @@ class FlashEngramHasher(EngramHasher):
         self.visual_token_ids: tuple[int, ...] = ()
         self._cpu_hash_params = None
         self._loaded = False
+        self.verify_recent: Optional[torch.Tensor] = None
 
     def load_lookup(self, value: torch.Tensor) -> None:
         if self._loaded:
@@ -663,6 +722,10 @@ class FlashEngramHasher(EngramHasher):
             restored = torch.where(match.any(-1), token_ids[first], restored)
         return torch.where(pads, restored, tokens)
 
+    def commit_verify(self, req_pool_indices: torch.Tensor, rows: torch.Tensor):
+        recent = self.verify_recent[rows]
+        self.history[req_pool_indices] = recent.flip(-1).to(self.history.dtype)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -685,16 +748,22 @@ class FlashEngramHasher(EngramHasher):
             commit_rows, commit_last = req[:num_tokens], row
         else:
             token_index = torch.arange(num_tokens, device=device)
-            lens = forward_batch.extend_seq_lens.to(torch.int64)
-            starts = torch.cumsum(lens, 0) - lens
-            row = torch.repeat_interleave(
-                torch.arange(lens.shape[0], device=device),
-                lens,
-                output_size=num_tokens,
-            )
-            offset = token_index - starts[row]
-            staged = forward_batch.engram_history
-            past = staged if staged is not None else history[req]
+            if mode.is_target_verify():
+                width = num_tokens // req.shape[0]
+                row = token_index // width
+                offset = token_index % width
+                past = history[req]
+            else:
+                lens = forward_batch.extend_seq_lens.to(torch.int64)
+                starts = torch.cumsum(lens, 0) - lens
+                row = torch.repeat_interleave(
+                    torch.arange(lens.shape[0], device=device),
+                    lens,
+                    output_size=num_tokens,
+                )
+                offset = token_index - starts[row]
+                staged = forward_batch.engram_history
+                past = staged if staged is not None else history[req]
             shifts = torch.arange(n, device=device)
             in_batch = shifts[None] <= offset[:, None]
             from_batch = ids[(token_index[:, None] - shifts).clamp_min(0)]
@@ -702,8 +771,13 @@ class FlashEngramHasher(EngramHasher):
             from_hist = past.to(torch.int64)[row].gather(1, hist_col)
             tokens = torch.where(in_batch, from_batch, from_hist)
             positions = forward_batch.positions[:num_tokens].to(torch.int64)
-            commit_rows = req
-            commit_last = (starts + lens - 1).clamp_min(0)
+            if mode.is_target_verify():
+                commit_rows = None
+                if self.verify_recent is not None:
+                    self.verify_recent[:num_tokens].copy_(tokens[:, : n - 1])
+            else:
+                commit_rows = req
+                commit_last = (starts + lens - 1).clamp_min(0)
         if self.visual_token_ids and not mode.is_decode_or_idle():
             tokens = self._restore_visual_ids(tokens, mm_pad_ids)
         shifts = torch.arange(n, device=device)
@@ -720,7 +794,7 @@ class FlashEngramHasher(EngramHasher):
             for token_id in self.visual_token_ids:
                 no_hash |= input_ids == token_id
         hash_ids = hash_ids.masked_fill(no_hash[:, None, None], -1)
-        if num_tokens:
+        if commit_rows is not None and num_tokens:
             last = tokens[commit_last]
             # out_cache_loc 0 marks padded rows that must not commit.
             out_loc = forward_batch.out_cache_loc
@@ -956,6 +1030,7 @@ class HYV4FlashAttention(HYV4Attention):
         prefix,
         alt_stream,
         rope_store: Optional[_MRopePositionStore] = None,
+        external_indexer: Optional[nn.Module] = None,
     ):
         self.is_window_layer = config.layer_types[layer_id] == SLIDING_ATTENTION
         layer_config = copy(config)
@@ -982,7 +1057,9 @@ class HYV4FlashAttention(HYV4Attention):
             )
         # The sandwich norm needs the full sum before the post-projection norm.
         self.o_proj.reduce_results = True
-        if self.is_window_layer:
+        if external_indexer is not None:
+            self.indexer = external_indexer
+        elif self.is_window_layer:
             # The window holds at most `sliding_window` keys; a selection that
             # narrow lets the sparse kernel stop scanning there.
             width = min(config.index_topk, triton.cdiv(config.sliding_window, 64) * 64)
@@ -1391,14 +1468,26 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(text_config)
+        self.dfly = None
+        if get_spec().speculative_algorithm == "DFLY":
+            from sglang.srt.models.hunyuan_v4_flash_dfly import HYV4FlashDFly
+
+            self.dfly = HYV4FlashDFly(
+                text_config,
+                parse_dfly_config(text_config, get_spec().speculative_num_draft_tokens),
+                quant_config,
+            )
+            self.dfly.bind_target(self.model.embed_tokens, self.lm_head)
 
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
         mm_pad_ids = None
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
-            if forward_batch.forward_mode.is_decode():
+            if _mrope_rows_are_equal(forward_batch.forward_mode):
                 positions = positions[0]
+        if self.dfly is not None and forward_batch.forward_mode.is_target_verify():
+            self.dfly.draft_into_verify(input_ids, positions, forward_batch)
         if self.is_mrope_enabled and input_embeds is None:
             mm_pad_ids = self._mm_pad_ids(forward_batch, input_ids.device)
             input_embeds = prepare_mm_inputs(
@@ -1462,6 +1551,8 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         model = self.model
+        dfly_weights = []
+
         vision_weights = []
 
         def mapped_weights():
@@ -1472,7 +1563,13 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
                             (name.removeprefix("vit."), loaded_weight)
                         )
                     continue
-                if name.startswith(("model.dfly_layers.", "model.mtp_layers.")):
+                if name.startswith("model.dfly_layers."):
+                    if self.dfly is not None:
+                        dfly_weights.append(
+                            (name.removeprefix("model.dfly_layers."), loaded_weight)
+                        )
+                    continue
+                if name.startswith("model.mtp_layers."):
                     continue
                 if ".engram_layer." in name:
                     self._load_engram(name, loaded_weight)
@@ -1500,6 +1597,8 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
                 module.refresh_derived_weights()
         if self.visual is not None:
             self.visual.load_weights(vision_weights)
+        if self.dfly is not None and dfly_weights:
+            self.dfly.load_weights(dfly_weights)
         if model.engram_hasher is not None and not model.engram_hasher._loaded:
             raise ValueError("Hy4-Flash checkpoint is missing the Engram lookup_table")
 

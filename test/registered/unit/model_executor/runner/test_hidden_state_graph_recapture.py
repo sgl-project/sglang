@@ -13,8 +13,10 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
+    prefill_capture_hidden_mode,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -169,6 +171,30 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
         )
 
         self.assertTrue(runner.can_run_graph(forward_batch))
+
+    def test_dfly_target_prefill_graph_serves_its_last_hidden_request(self):
+        """An HY4 DFly target prefill asks for LAST hidden states to seed each
+        request's first draft. A graph captured below LAST makes every such
+        prefill fall back to eager silently; Hy4-Flash DFly prefill stays eager.
+        """
+        dfly_prefill = self._make_prefill_forward_batch(
+            CaptureHiddenMode.LAST, CaptureHiddenMode.NULL
+        )
+        for architecture, can_replay in (
+            ("HYV4VLForConditionalGeneration", True),
+            ("HYV4ForCausalLM", True),
+            ("HYV4FlashForConditionalGeneration", False),
+        ):
+            mode = prefill_capture_hidden_mode(
+                spec_algorithm=SpeculativeAlgorithm.DFLY,
+                is_draft_worker=False,
+                is_breakable=True,
+                architectures=[architecture],
+                server_mode=CaptureHiddenMode.NULL,
+            )
+            runner = self._make_prefill_runner_for_can_run(mode)
+            with self.subTest(architecture=architecture):
+                self.assertEqual(runner.can_run_graph(dfly_prefill), can_replay)
 
 
 if __name__ == "__main__":
