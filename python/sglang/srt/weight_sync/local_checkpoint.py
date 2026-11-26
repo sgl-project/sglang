@@ -59,12 +59,19 @@ def pull(
     source_dir: str,
     target_version: int,
     pre_read_hook: Optional[str] = None,
+    snapshot: bool = False,
 ) -> None:
     """Bring the host-local checkpoint up to ``target_version``: seed from the newest full
     version at or below it (v0 is ``base_dir``), then apply the deltas after it in order."""
-    if target_version > 0 and pre_read_hook:
+    if not snapshot and target_version > 0 and pre_read_hook:
         dynamic_import(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
+        if snapshot:
+            destination = snapshot_path(local_checkpoint_dir, target_version)
+            if os.path.isdir(destination):
+                return
+            if target_version > 0 and pre_read_hook:
+                dynamic_import(pre_read_hook)(source_dir, target_version)
         applied = _read_applied_version(local_checkpoint_dir)  # None on a fresh host
         if applied is not None and target_version < applied:
             raise RuntimeError(
@@ -83,6 +90,34 @@ def pull(
             start = applied
         for version in range(start + 1, target_version + 1):
             _apply_delta(local_checkpoint_dir, _version_dir(source_dir, version))
+        if snapshot:
+            if _read_applied_version(local_checkpoint_dir) != target_version:
+                raise RuntimeError(f"Checkpoint did not reach version {target_version}")
+            _publish_snapshot(local_checkpoint_dir, destination)
+
+
+def snapshot_path(local_checkpoint_dir: str, version: int) -> str:
+    return os.path.join(local_checkpoint_dir, SYNC_DIR, "snapshots", f"v{version:06d}")
+
+
+def _publish_snapshot(local_checkpoint_dir: str, destination: str) -> None:
+    """Holding the pull lock, publish a copy readers can keep across further pulls."""
+    root = os.path.dirname(destination)
+    os.makedirs(root, exist_ok=True)
+    # One publisher per local checkpoint. Reclaim an interrupted writer's staging
+    # directory on retry. Rename within the same filesystem publishes all shards.
+    staging = os.path.join(root, ".staging")
+    if os.path.isdir(staging):
+        shutil.rmtree(staging)
+    os.mkdir(staging)
+    try:
+        for entry in os.scandir(local_checkpoint_dir):
+            if entry.is_file():
+                shutil.copy2(entry.path, os.path.join(staging, entry.name))
+        os.rename(staging, destination)
+    finally:
+        if os.path.isdir(staging):
+            shutil.rmtree(staging)
 
 
 def _version_dir(source_dir: str, version: int) -> str:

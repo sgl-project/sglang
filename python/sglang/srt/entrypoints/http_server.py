@@ -1250,6 +1250,12 @@ async def pull_weights(obj: Annotated[PullWeightsReqInput, Body()], request: Req
     success, message = await _global_state.tokenizer_manager.pull_weights(obj, request)
 
     content = {"success": success, "message": message}
+    if success and obj.snapshot:
+        from sglang.srt.weight_sync.local_checkpoint import snapshot_path
+
+        content["model_path"] = snapshot_path(
+            obj.local_checkpoint_dir, obj.target_version
+        )
     return ORJSONResponse(
         content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
     )

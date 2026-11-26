@@ -5,9 +5,14 @@ import struct
 import tempfile
 import unittest
 import zlib
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Event
+from unittest.mock import patch
 
 import numpy as np
 import zstandard
+from safetensors.numpy import load_file, save_file
 
 from sglang.srt.weight_sync import local_checkpoint
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -183,6 +188,69 @@ class TestLocalCheckpointPull(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "past the requested v1"):
             self._pull(1)
         self.assertEqual(_read_tensors(self.local), self.V2)
+
+    def test_snapshot_reader_keeps_the_same_shards_across_the_next_pull(self):
+        # A loader opens different shards at different times. Pause between two
+        # opens while a later full pull replaces the active checkpoint.
+        for version in (1, 2):
+            directory = Path(self._vdir(version))
+            directory.mkdir()
+            for name in ("a", "b"):
+                save_file(
+                    {name: np.array([version], dtype=np.uint8)},
+                    directory / f"{name}.safetensors",
+                )
+
+        def snapshot(version):
+            local_checkpoint.pull(
+                self.local, self.base, self.source, version, snapshot=True
+            )
+            return Path(local_checkpoint.snapshot_path(self.local, version))
+
+        first = snapshot(1)
+        opened, resume = Event(), Event()
+
+        def read_across_pull():
+            a = load_file(first / "a.safetensors")["a"].item()
+            opened.set()
+            assert resume.wait(10)
+            return a, load_file(first / "b.safetensors")["b"].item()
+
+        with ThreadPoolExecutor(1) as executor:
+            reader = executor.submit(read_across_pull)
+            try:
+                self.assertTrue(opened.wait(10))
+                second = snapshot(2)
+            finally:
+                resume.set()
+            a, b = reader.result()
+        self.assertEqual((a, b), (1, 1))
+        self.assertEqual(_read_tensors(second), {"a": b"\x02", "b": b"\x02"})
+        self.assertEqual(snapshot(1), first)
+
+    def test_failed_snapshot_copy_is_not_published_and_can_retry(self):
+        self._pull(0)
+        final = Path(local_checkpoint.snapshot_path(self.local, 0))
+        copy = shutil.copy2
+
+        def fail_copy(src, dst):
+            copy(src, dst)
+            self.assertFalse(final.exists())
+            raise OSError("copy interrupted")
+
+        with patch.object(shutil, "copy2", side_effect=fail_copy):
+            with self.assertRaisesRegex(OSError, "copy interrupted"):
+                local_checkpoint.pull(
+                    self.local, self.base, self.source, 0, snapshot=True
+                )
+        self.assertFalse(final.exists())
+        # Also recover leftover private staging from a terminated process.
+        scratch = final.parent / ".staging"
+        scratch.mkdir()
+        (scratch / "stale").touch()
+        local_checkpoint.pull(self.local, self.base, self.source, 0, snapshot=True)
+        self.assertEqual(_read_tensors(final), self.V0)
+        self.assertFalse((final / "stale").exists())
 
     def test_out_of_order_delta_raises(self):
         _write_delta_version(self._vdir(1), 1, self.V0, self.V1, "xor")

@@ -60,6 +60,7 @@ class SchedulerWeightPuller:
                 source_dir=recv_req.source_dir,
                 target_version=recv_req.target_version,
                 pre_read_hook=model.custom_pull_weights_pre_read_hook,
+                snapshot=recv_req.snapshot,
             )
         except Exception:
             self._error = traceback.format_exc()
