@@ -6,8 +6,8 @@ import torch
 
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
-    decode_alloc_lens,
     get_req_to_token_headroom,
+    spec_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_schedule, get_spec, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -62,7 +62,9 @@ class TestRowHoldsDecodeAllocation(CustomTestCase):
                         )
                         for context_len in context_lens
                     ]
-                    _, nxt_kv_lens, _ = decode_alloc_lens(reqs, page_size=page_size)
+                    _, nxt_kv_lens, _ = spec_decode_alloc_lens(
+                        reqs, page_size=page_size
+                    )
                     for context_len, nxt_kv_len in zip(context_lens, nxt_kv_lens):
                         self.assertLessEqual(nxt_kv_len, context_len + headroom)
 
