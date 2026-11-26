@@ -2436,6 +2436,37 @@ For a measured lower-count AMD deployment, set both `--num-gpus` and
 BF16 SDPA at cosine similarity `0.9999991655` on MI355X and `0.9999991059` on
 MI300X.
 
+#### Tuned GEMM selection on ROCm
+
+The DiT's BF16 projections (QKV, gate+up, down) go through hipBLASLt, whose
+default heuristic does not always pick the fastest solution at H3's shapes.
+PyTorch [TunableOp](https://pytorch.org/docs/stable/cuda.tunable.html) can
+benchmark the candidates once and replay the winners from a file. Run one
+request with tuning on, then serve with tuning off:
+
+```bash
+# Tuning pass: one short run writes one result file per rank.
+export PYTORCH_TUNABLEOP_ENABLED=1
+export PYTORCH_TUNABLEOP_TUNING=1
+export PYTORCH_TUNABLEOP_FILENAME=/path/to/tunableop_h3_%d.csv
+
+# Serving: replay the tuned selections without benchmarking.
+export PYTORCH_TUNABLEOP_ENABLED=1
+export PYTORCH_TUNABLEOP_TUNING=0
+export PYTORCH_TUNABLEOP_FILENAME=/path/to/tunableop_h3_%d.csv
+```
+
+Set the variables before the Server command; `%d` becomes the device index.
+Under Ulysses every rank runs the same GEMM shapes, so the rank-0 file can be
+copied to the other indices. The file records the PyTorch, HIP and hipBLASLt
+versions and the GPU architecture. PyTorch rejects the file when they do not
+match the running stack, so tune again after an image upgrade.
+
+On 4× MI350X with Ulysses degree 4, a file tuned this way lowered the median
+latency of a 49-step, 124-frame text-to-video request from 48.71 s to 47.93 s
+(20 requests each). The file holds four entries: QKV, gate+up and the MLP down
+projection with two input strides.
+
 ## 10. Run in ComfyUI
 
 import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
