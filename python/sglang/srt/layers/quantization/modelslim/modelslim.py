@@ -36,10 +36,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
 from sglang.srt.layers.quantization.modelslim.schemes.modelslim_qk_mxfp8_dynamic_v_mxfp8_per_channel import (
     ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme,
 )
-from sglang.srt.layers.quantization.unquant import (
-    UnquantizedFusedMoEMethod,
-    UnquantizedLinearMethod,
-)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
 if TYPE_CHECKING:
@@ -96,6 +93,28 @@ def npu_wrapper_rmsnorm_forward(func):
         return out.to(x.dtype)
 
     return _rmsnorm_forward_oot
+
+
+_rmsnorm_bias_patched = False
+
+
+def _patch_rmsnorm_with_bias() -> None:
+    # The patch is process-wide and each call wraps the current method again,
+    # so apply it once however many norm biases or configs ask for it.
+    global _rmsnorm_bias_patched
+    if _rmsnorm_bias_patched:
+        return
+    apply_module_patch(
+        "sglang.srt.layers.layernorm.RMSNorm",
+        "__init__",
+        [npu_wrapper_rmsnorm_init],
+    )
+    apply_module_patch(
+        "sglang.srt.layers.layernorm.RMSNorm",
+        "forward_npu",
+        [npu_wrapper_rmsnorm_forward],
+    )
+    _rmsnorm_bias_patched = True
 
 
 def remap_dspark_weight_name_npu(
@@ -181,13 +200,21 @@ class ModelSlimConfig(QuantizationConfig):
         super().__init__()
         self.requested_kv_cache_dtype = "auto"
         quant_config = dict(quant_config or {})
-        keys = [k for k in quant_config if isinstance(k, str)]
-        # Some DSV4 ModelSlim exports omit unquantized hc_head_* entries.
-        is_dsv4 = any(
-            k.startswith("hc_head_")
-            or (k.startswith("layers.") and ".ffn.experts." in k)
-            for k in keys
-        )
+        hf_config = quant_config.pop("hf_config", None)
+        if hf_config is None:
+            # Legacy callers can supply just the quantization description.
+            is_dsv4 = any(
+                isinstance(k, str)
+                and (
+                    k.startswith("hc_head_")
+                    or (k.startswith("layers.") and ".ffn.experts." in k)
+                )
+                for k in quant_config
+            )
+        else:
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            is_dsv4 = is_deepseek_v4(hf_config)
         if is_dsv4:
             from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 
@@ -217,18 +244,8 @@ class ModelSlimConfig(QuantizationConfig):
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
 
-        for name in self.quant_description.keys():
-            if "norm.bias" in name:
-                apply_module_patch(
-                    "sglang.srt.layers.layernorm.RMSNorm",
-                    "__init__",
-                    [npu_wrapper_rmsnorm_init],
-                )
-                apply_module_patch(
-                    "sglang.srt.layers.layernorm.RMSNorm",
-                    "forward_npu",
-                    [npu_wrapper_rmsnorm_forward],
-                )
+        if any("norm.bias" in name for name in self.quant_description.keys()):
+            _patch_rmsnorm_with_bias()
         # Share DSpark path remapping while retaining config-specific suffixes,
         # checkpoint keys, and the precedence of explicitly configured aliases.
         dspark_quant_aliases = {}
@@ -528,9 +545,6 @@ class ModelSlimConfig(QuantizationConfig):
                 return candidate
         return prefix
 
-    def get_linear_method(self) -> ModelSlimLinearMethod:
-        return ModelSlimLinearMethod(self)
-
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.int8, torch.float16, torch.bfloat16]
@@ -768,11 +782,7 @@ class ModelSlimConfig(QuantizationConfig):
                 return None
             moe_schemes = self.get_moe_scheme(layer, prefix)
             if moe_schemes is None:
-                return UnquantizedFusedMoEMethod(
-                    layer.use_triton_kernels,
-                    layer.use_flashinfer_trtllm_moe,
-                    layer.use_deep_gemm,
-                )
+                raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
             layer.w13_scheme, layer.w2_scheme = moe_schemes
             layer.w13_kernel, layer.w2_kernel = (
                 layer.w13_scheme.kernel,
@@ -920,13 +930,6 @@ class ModelSlimConfig(QuantizationConfig):
                 f"Missing ModelSlim MoE quantization description for layer {prefix}: "
                 + "; ".join(all_attempted)
             )
-
-        # ModelSlim may leave entire MoE layers unquantized, e.g. DSpark MTP
-        # experts in an otherwise W4A8 checkpoint. Only FLOAT/FLOAT selects the
-        # unquantized method; missing/unknown schemes and partially FLOAT MoE
-        # layers still error.
-        if w13_scheme_name == "FLOAT" and w2_scheme_name == "FLOAT":
-            return None
 
         # Map scheme names to classes
         scheme_map = dict(

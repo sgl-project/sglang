@@ -5,7 +5,7 @@ import os
 import warnings
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 
 @functools.lru_cache(maxsize=1)
@@ -44,6 +44,9 @@ def _default_on_in_ci() -> bool:
 
 class EnvField:
     _allow_set_name = True
+    # An empty value reads as unset for a type where "" cannot parse; a string
+    # or list field keeps "" as its value.
+    _empty_is_unset = True
 
     def __init__(self, default: Any, secret: bool = False):
         self.default = default
@@ -72,21 +75,17 @@ class EnvField:
             assert value == str(None)
             return None
 
-        # Not set, return default
-        if value is None:
+        if not self.is_set():
             return self._resolve_default()
 
         try:
             return self.parse(value)
         except ValueError as e:
-            default = self._resolve_default()
-            warnings.warn(
-                f'Invalid value for {self.name}: {e}, using default "{default}"'
-            )
-            return default
+            raise ValueError(f"Invalid value for {self.name}: {e}") from None
 
     def is_set(self):
-        return self.name in os.environ
+        value = os.environ.get(self.name)
+        return value is not None and not (value == "" and self._empty_is_unset)
 
     def set(self, value: Any):
         self._set_to_none = value is None
@@ -123,31 +122,38 @@ class EnvField:
 
 
 class EnvTuple(EnvField):
+    _empty_is_unset = False
+
     def parse(self, value: str) -> tuple[str, ...]:
         return tuple(s.strip() for s in value.split(",") if s.strip())
 
 
 class EnvStr(EnvField):
+    _empty_is_unset = False
+
     def parse(self, value: str) -> str:
         return value
 
 
 class EnvJSON(EnvField):
-    def parse(self, value: str | None) -> list | dict | None:
-        if not value:
-            return None
-        if os.path.exists(value):
-            with open(value) as f:
-                return json.load(f)
-        return json.loads(value)
+    def parse(self, value: str) -> list | dict:
+        try:
+            if os.path.exists(value):
+                with open(value) as f:
+                    return json.load(f)
+            return json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f'"{value}" is not valid JSON, inline or in the file it names ({e})'
+            )
 
 
 class EnvBool(EnvField):
     def parse(self, value: str) -> bool:
         value = value.lower()
-        if value in ["true", "1", "yes", "y"]:
+        if value in ["true", "1", "yes", "y", "on"]:
             return True
-        if value in ["false", "0", "no", "n"]:
+        if value in ["false", "0", "no", "n", "off"]:
             return False
         raise ValueError(f'"{value}" is not a valid boolean value')
 
@@ -173,7 +179,7 @@ class _DeprecatedEnvFallback:
         self.deprecated_name = deprecated_name
 
     def get(self) -> Any:
-        if os.getenv(self.name) is None:
+        if not self.is_set():
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
                 warnings.warn(
@@ -332,6 +338,9 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # Fallback for the expert_pack load format when --model-loader-extra-config
+    # carries no pack_path.
+    SGLANG_EXPERT_PACK_PATH = EnvStr(None)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
@@ -1009,6 +1018,8 @@ class Envs:
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
+    MOONCAKE_ENABLE_EGM_STORE_POOL = EnvBool(False)
+    MOONCAKE_EGM_NUMA_NODES = EnvStr(None)
 
     # ===================================================================
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
@@ -1326,6 +1337,12 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
+    # <= 0 gathers the whole prefix in one.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP extend on NPU: above this many new tokens the prefix KV is gathered
+    # whatever the bytes say, as the query path's fp32 merge grows with them.
+    SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = EnvInt(4096)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa
@@ -1488,7 +1505,6 @@ class Envs:
     # decode. Exposed as a knob (e.g. set 2.0) for grid A/B tuning without a rebuild.
     SGLANG_FORCE_LEAN_GRID_CU_MULT = EnvFloat(1.0)
 
-    # Torch Compile
     # Compact extend-attention query-tile grid (parity with flash-attn's
     # ragged-aware launch). HIP only (ignored elsewhere), and used only when it
     # launches fewer tiles than the legacy grid; 0 turns it off.
@@ -1506,6 +1522,7 @@ class Envs:
     # cached-prefix shapes. Validated at 98% GSM8K accuracy.
     SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+    SGLANG_TORCH_COMPILE_MODE = EnvStr("max-autotune-no-cudagraphs")
     SGLANG_TORCH_DYNAMIC_SHAPE = EnvBool(False)
     # torch.compile backend for CPU graphs (defaults to "inductor"; "eager" or "aot_eager" for debugging)
     SGLANG_CPU_GRAPH_COMPILE_BACKEND = EnvStr("inductor")
@@ -1528,7 +1545,10 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM = EnvBool(True)
     SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
+    # Debug: cross-check every DeepGEMM matmul against the Triton kernel.
+    SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -1704,6 +1724,13 @@ class Envs:
     # equal torch.topk's; the default on every platform), 2 exact with the same
     # selected set on every run.
     SGLANG_TOPK_V2_MODE = EnvInt(1)
+    # DeepSelect bf16 top-k with more rows than any cluster tier runs in one wave:
+    # off keeps the one-CTA-per-row kernel, whose time follows the longest row. On
+    # runs the cluster tier with the most rows per wave over several waves instead,
+    # whose time follows the total row length. It wins on long-tailed row lengths
+    # (the DSV4.1 decode indexer at mixed contexts) and loses on uniform long ones.
+    # Same values as off; on ties it may pick other columns.
+    SGLANG_DEEP_SELECT_MULTIWAVE = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends
@@ -1765,6 +1792,11 @@ class Envs:
     # RoPE cache
     # ===================================================================
     SGLANG_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
+    # Tiled fused RoPE + KV-cache write (16 tokens x 8 q heads per program).
+    # Only used on gfx1250 (is_gfx1250_supported) for T >= 256, with fp32
+    # cos/sin, fp16/bf16/fp32 Q/K and neox layout; a no-op on every other arch.
+    # False forces the per-token kernel.
+    SGLANG_FUSED_ROPE_KV_TILED = EnvBool(True)
     SGLANG_ROPE_CACHE_FP32 = EnvBool(False)
     SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
     SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
@@ -2149,6 +2181,8 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
+    # Single-pass Mega-mHC prefill. SM100 uses DeepGEMM; gfx950 uses aiter
+    # flydsl_mega_mhc (ROCm/aiter#6179). Off by default.
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
@@ -2296,6 +2330,11 @@ class Envs:
     # Override shared-expert selection: true uses grouped GEMM, false uses BMM.
     # When unset, selection follows model, quantization, and LoRA requirements.
     SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE = EnvBool(True)
+    # Fold the MoE shared-expert partials into the custom AR kernels instead
+    # of a separate {routed + shared} torch.add per MoE layer; some buckets
+    # keep a pre-add during the AR stage-in. torch.add numerics
+    # (bit-identical). Requires SGLANG_OPT_USE_INKLING_CUSTOM_AR.
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED = EnvBool(True)
     # Fold the conditional long-context log-scaling tau into its producers
     # instead of separate output-sized scale kernels: the fused attn
     # prologue's q path (bit-exact, before MXFP8 quantization there) and the
@@ -2303,11 +2342,6 @@ class Envs:
     # the einsum, shrinking the pass by rel_extent/d_rel = 64x; rounding moves
     # before the GEMM). Flag-off keeps the standalone apply_log_scaling_tau
     # on the outputs.
-    # Fold the MoE shared-expert partials into the custom AR kernels instead
-    # of a separate {routed + shared} torch.add per MoE layer; some buckets
-    # keep a pre-add during the AR stage-in. torch.add numerics
-    # (bit-identical). Requires SGLANG_OPT_USE_INKLING_CUSTOM_AR.
-    SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED = EnvBool(True)
     SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU = EnvBool(True)
     # Dispatch the rel_logits projection around einsum's hidden compaction
     # copy of the strided r operand (a view into the packed qkvr output):
@@ -2620,6 +2654,7 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES = EnvInt(2)
 
     # ===================================================================
     # Plugin system
@@ -2659,6 +2694,10 @@ class Envs:
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+    # A request-log line that finds the log writer's buffer full: "wait" holds
+    # the request until the sink takes it, as in the Python server; "drop"
+    # drops the line (counted in sglang:request_log_dropped_lines_total).
+    SGLANG_RUST_REQUEST_LOG_FULL_BUFFER = EnvStr("wait")
 
     # ===================================================================
     # Weight Cache Daemon
@@ -2679,15 +2718,24 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
+def _registered_fields() -> Iterator[EnvField]:
+    return (value for value in vars(Envs).values() if isinstance(value, EnvField))
+
+
 def exportable_env_vars() -> dict[str, str]:
     return {
         field.name: _exportable_value(os.environ[field.name])
-        for field in sorted(
-            (value for value in vars(Envs).values() if isinstance(value, EnvField)),
-            key=lambda field: field.name,
-        )
+        for field in sorted(_registered_fields(), key=lambda field: field.name)
         if not field.secret and field.name in os.environ
     }
+
+
+def validate_env_values() -> None:
+    """Parse every registered variable that is set, so a malformed value stops
+    startup instead of failing at its first read, which may be mid-serving."""
+    for field in _registered_fields():
+        if field.is_set():
+            field.get()
 
 
 def _exportable_value(value: str) -> str:

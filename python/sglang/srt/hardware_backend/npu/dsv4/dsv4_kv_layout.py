@@ -15,6 +15,13 @@ import enum
 import torch
 
 
+def get_a3_c2_state_bank_count(num_req_slots: int) -> int:
+    from sglang.srt.layers.dp_attention import get_eager_max_batch_size
+
+    # CompressorV2 needs a bank even for TP-padded rows. Slot 0 is reserved.
+    return max(num_req_slots, get_eager_max_batch_size(num_req_slots - 1))
+
+
 class NPUDSV4KVLayout(str, enum.Enum):
     V4_BF16 = "v4_bf16"
     V4_FP8 = "v4_fp8"

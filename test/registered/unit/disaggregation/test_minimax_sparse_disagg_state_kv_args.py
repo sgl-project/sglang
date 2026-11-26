@@ -73,11 +73,18 @@ class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
             setup_state_kv_args(kv_args, _static_storage(pool))
 
     def test_decode_rejects_prefill_with_different_attention_tp(self):
-        # Main page rows are head-major and the index state is per rank, so
-        # neither can be resliced by head; reject before any transfer.
+        # Only the NVFP4 page-row main KV has a head-sliced sender, and dense KV
+        # state has no per-head split; this pool has dense layers, so reject
+        # before any transfer with or without page rows.
+        for main_kv_page_row in (False, True):
+            with self.subTest(main_kv_page_row=main_kv_page_row):
+                self._check_rejects_different_attention_tp(main_kv_page_row)
+
+    def _check_rejects_different_attention_tp(self, main_kv_page_row: bool):
         kv_args = KVArgs()
         kv_args.page_size = 4
         setup_state_kv_args(kv_args, _static_storage(_make_k_only_pool()))
+        kv_args.main_kv_page_row = main_kv_page_row
         manager = object.__new__(CommonKVManager)
         manager.kv_args = kv_args
         manager.attn_tp_size = 4
@@ -97,7 +104,7 @@ class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
             "sglang.srt.disaggregation.common.conn.requests.get",
             return_value=response,
         ):
-            with self.assertRaisesRegex(RuntimeError, "matching attention TP"):
+            with self.assertRaisesRegex(RuntimeError, "different attention TP sizes"):
                 manager.try_ensure_parallel_info("prefill:8998")
         self.assertEqual(manager.prefill_info_table, {})
 

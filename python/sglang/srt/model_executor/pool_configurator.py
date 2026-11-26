@@ -38,7 +38,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import get_decode_reach
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -68,33 +68,6 @@ from sglang.srt.utils.device import is_float4_e2m1fn_x2, is_hip, is_npu
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-
-
-def spec_decode_alloc_len_per_request(
-    *,
-    page_size,
-    speculative_num_steps,
-    speculative_eagle_topk,
-    speculative_num_draft_tokens,
-) -> int:
-    """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
-    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned. A pure
-    function of the resolved values its one caller reads off the bags.
-    """
-    len_per_topk = speculative_num_steps or 1
-    spec_topk = speculative_eagle_topk or 1
-    spec_tokens = speculative_num_draft_tokens or 1
-
-    if page_size > 1 and spec_topk > 1:
-        # last partial page and ceil alignment
-        len_per_topk = ceil_align(len_per_topk + page_size, page_size)
-        spec_tokens = ceil_align(spec_tokens, page_size)
-    elif page_size > 1:
-        # only page alignment
-        len_per_topk = ceil_align(len_per_topk, page_size)
-        spec_tokens = ceil_align(spec_tokens, page_size)
-
-    return max(len_per_topk * spec_topk, spec_tokens)
 
 
 @dataclass
@@ -1108,18 +1081,8 @@ def compute_swa_request_cap(
     trailing_tokens = window + eviction_interval * draft_tokens + page_size
     if get_spec().speculative_algorithm is None:
         decode_alloc = page_size
-    elif get_schedule().disable_overlap_schedule:
-        # spec-v1: new_tokens_required_next_decode per request.
-        decode_alloc = spec_decode_alloc_len_per_request(
-            page_size=page_size,
-            speculative_num_steps=get_spec().speculative_num_steps,
-            speculative_eagle_topk=get_spec().speculative_eagle_topk,
-            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
-        )
     else:
-        # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
-        # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
-        decode_alloc = 2 * get_alloc_len_per_decode()
+        decode_alloc = get_decode_reach(page_size)
     per_request = trailing_tokens + decode_alloc
 
     if max_running_requests is None:
@@ -1240,7 +1203,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
     _npu_low_ratio_bf16 = False
-    _npu_qsli_ratio = 0
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
@@ -1296,12 +1258,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         stage = range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
-        if _is_npu and not kvc.is_draft_worker and is_npu_arch35():
-            candidate = getattr(cfg.hf_config, "candidate_source_layer_id", -1)
-            if candidate in stage and candidate < len(cfg.compress_ratios):
-                ratio = cfg.compress_ratios[candidate]
-                if ratio in (1, 2):
-                    self._npu_qsli_ratio = ratio
         self.stage_compress_ratios = cfg.compress_ratios[stage.start : stage.stop]
         if kvc.pp_size > 1:
             logger.info(
@@ -1352,14 +1308,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         }
 
         self.num_layers_total = len(self.stage_compress_ratios)
-        # The low-ratio indexer pools are built with force_fp4=True
-        # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
+        # Low-ratio pools use BF16 rows on A3 and packed FP4 rows elsewhere.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
-            self.indexer_head_dim, use_fp4_indexer=True
+            self.indexer_head_dim,
+            use_fp4_indexer=not self._npu_low_ratio_bf16,
+            use_bf16_indexer=self._npu_low_ratio_bf16,
         )
-        if self._npu_low_ratio_bf16:
-            # Matches DSV41NPUIndexerPool: BF16 K only, no packed copy/scales.
-            self.low_ratio_index_bytes = self.indexer_head_dim * torch.bfloat16.itemsize
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
@@ -1658,17 +1612,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
         """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
-            if self._npu_qsli_ratio:
-                from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-                    DSV41_INDEX_PAGE_SIZE,
-                )
-
-                ratio = self._npu_qsli_ratio
-                size = (full_tokens + self.page_size) // ratio
-                # Combined records mirror the split index buffer's physical pages.
-                page = DSV41_INDEX_PAGE_SIZE
-                index_slots = ((size + page + 1) // page) * page
-                return (index_slots - full_tokens // ratio) * self.low_ratio_index_bytes
             if self._npu_low_ratio_bf16:
                 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
                     DSV41_INDEX_PAGE_SIZE,
@@ -1729,18 +1672,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_ratio = (
             0 if self._unified or self.swa_cap_tokens is not None else self.swa_ratio
         )
-        qsli_bytes = (
-            self.low_ratio_index_bytes / self._npu_qsli_ratio
-            if self._npu_qsli_ratio
-            else 0
-        )
-        return (
-            swa_ratio * self.bytes_per_swa_token
-            + qsli_bytes
-            + sum(
-                self._compressed_bytes_per_full_token(ratio) * len(layers)
-                for ratio, layers in self.stage_owner_layers.items()
-            )
+        return swa_ratio * self.bytes_per_swa_token + sum(
+            self._compressed_bytes_per_full_token(ratio) * len(layers)
+            for ratio, layers in self.stage_owner_layers.items()
         )
 
     def _get_swa_fixed_bytes(self) -> float:
@@ -1834,9 +1768,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[2]
-        # CompressStatePool allocates `size + ring_size + 1` rows, padded to the ratio.
+        row_alignment = 2
+        if self._npu_low_ratio_bf16:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+                get_a3_c2_state_bank_count,
+            )
+
+            num_req_slots = get_a3_c2_state_bank_count(num_req_slots)
+            # A3 requests a 3-D view with state_cache_page_size=ring_size.
+            row_alignment = ring_size
         state_rows = num_req_slots * ring_size + ring_size + 1
-        state_rows = ceil_div(state_rows, 2) * 2
+        state_rows = ceil_align(state_rows, row_alignment)
         state_last_dim = 2 * self.attn_head_dim
         return state_rows * state_last_dim * torch.float32.itemsize * num_layers
 

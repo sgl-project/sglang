@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=125, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=1400, suite="base-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=1400, suite="extra-a-test-1-gpu-large-amd")
 
 
 class TestTorchCompileMoe(CustomTestCase):

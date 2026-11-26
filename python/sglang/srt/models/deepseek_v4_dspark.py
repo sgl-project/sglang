@@ -17,7 +17,7 @@ from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecutio
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch22, is_npu_arch35
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
 )
@@ -81,7 +81,6 @@ logger = logging.getLogger(__name__)
 _PAD_NUM_HEADS = 64
 
 _is_npu = is_npu()
-_is_npu_a3 = _is_npu and not is_npu_arch35()
 _is_gfx1250_supported = is_gfx1250_supported()
 
 
@@ -140,6 +139,7 @@ class DSparkAttention(MqaAttentionBase):
         )
 
         self.alt_streams = alt_streams
+        self._is_npu_arch22 = is_npu_arch22()
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
         if _is_npu:
             self.register_buffer(
@@ -195,7 +195,8 @@ class DSparkAttention(MqaAttentionBase):
         q = self.q_norm(q)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if not self.q_head_norm and not _is_npu_a3:
+        # The no-head-norm path indexes complex RoPE frequencies, unsupported on arch22.
+        if not self.q_head_norm and not self._is_npu_arch22:
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
                 return q_out
@@ -282,7 +283,7 @@ class DSparkAttention(MqaAttentionBase):
                 dtype=torch.float8_e4m3fn,
                 device=hidden_states.device,
             )
-        elif self.n_local_heads < _PAD_NUM_HEADS and not _is_npu_a3:
+        elif self.n_local_heads < _PAD_NUM_HEADS and not self._is_npu_arch22:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
@@ -316,7 +317,9 @@ class DSparkAttention(MqaAttentionBase):
 
         if q_padded is not None:
             q = q_padded
-        attn_sink = self._local_attn_sink(self.n_local_heads if _is_npu_a3 else None)
+        attn_sink = self._local_attn_sink(
+            self.n_local_heads if self._is_npu_arch22 else None
+        )
 
         o = attn_backend.forward(
             q=q,
@@ -710,6 +713,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self._is_npu_arch22 = is_npu_arch22()
         self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
@@ -954,7 +958,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             if self.hc_pre_from_prev_sublayer:
                 pre, x = x.pre, x.residual
         if self.hc_pre_from_prev_sublayer:
-            if _is_npu_a3:
+            if self._is_npu_arch22:
                 x = mhc.combine_premix(x, pre)
             else:
                 from sglang.kernels.ops.layernorm.mhc import mhc_combine

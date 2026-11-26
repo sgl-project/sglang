@@ -26,15 +26,25 @@ indexer_weight_stream = None
 gva_is_inited = False
 
 
-@functools.lru_cache(maxsize=1)
-def is_npu_arch35() -> bool:
-    """Whether the runtime is on NPU architecture 35."""
+def _is_npu_arch(arch: int) -> bool:
     if not is_npu():
         return False
 
     import acl
 
-    return acl.rt.get_device_info(0, 601) == (3510, 0)
+    return acl.rt.get_device_info(0, 601) == (arch, 0)
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch22() -> bool:
+    """Whether the runtime is on NPU architecture 22 (Atlas A2/A3)."""
+    return _is_npu_arch(2201)
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch35() -> bool:
+    """Whether the runtime is on NPU architecture 35."""
+    return _is_npu_arch(3510)
 
 
 # SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
@@ -247,14 +257,18 @@ def set_default_server_args(args: "ServerArgs"):
 
 def _patch_npu_seed_trace_rules():
     """Keep aliased CUDA/NPU seed functions consistent with Dynamo's RNG rules."""
-    from torch._dynamo import trace_rules
-    from torch._dynamo.variables import (
-        SkipFunctionVariable,
-        TorchInGraphFunctionVariable,
-    )
-    from torch_npu.dynamo.trace_rule import (
-        torch_non_c_binding_in_graph_functions_npu as npu_rules,
-    )
+    try:
+        from torch._dynamo import trace_rules
+        from torch._dynamo.variables import (
+            SkipFunctionVariable,
+            TorchInGraphFunctionVariable,
+        )
+        from torch_npu.dynamo.trace_rule import (
+            torch_non_c_binding_in_graph_functions_npu as npu_rules,
+        )
+    except ImportError:
+        # Older torch_npu releases do not register aliases through this rule map.
+        return
 
     changed = False
     for name in ("manual_seed", "manual_seed_all"):
@@ -289,19 +303,18 @@ def init_npu_backend():
     except ImportError as e:
         logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
 
-    if is_npu_arch35():
-        try:
-            # A5 mHC still uses the standalone extension. A3 uses bundled bindings;
-            # importing the standalone package can register conflicting ops.
-            import cann_ops_transformer  # noqa: F401
-        except ImportError as e:
-            logger.warning(
-                "cann_ops_transformer unavailable; DeepSeek-V4.1 NPU operators "
-                "will not be registered: %s",
-                e,
-            )
-
     import torch_npu
+
+    def register_dsv41_vendor_ops():
+        if is_npu_arch35():
+            try:
+                import cann_ops_transformer  # noqa: F401
+            except ImportError as e:
+                logger.warning("DeepSeek-V4.1 A5 operator extension unavailable: %s", e)
+
+    # The A3 bundle registers overlapping Torch schemas (e.g. sparse_flash_mla).
+    # Don't register them again through the standalone CANN wheel.
+    torch_npu.npu._lazy_call(register_dsv41_vendor_ops)
 
     # These imports lead to unpredictable behavior in diffusion models
     # and a significant reduction in performance.

@@ -27,9 +27,11 @@ from sgl_kernel_npu.operators.mem_cache import (
 )
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+    NPUDSV4KVLayout,
+    get_a3_c2_state_bank_count,
+)
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4IndexerBufferInfo,
     DSV4PagedBufferInfo,
@@ -123,15 +125,14 @@ def _write_dsv41_bf16_rows(buf, loc, cache):
 class DSV41NPUSingleKVPool(NPUDeepSeekV4SingleKVPool):
     """NPU DeepSeek-V4.1 KV pool.
 
-    A3 uses unquantized BF16 rows. A5 rows are fully quantized by
-    ``kv_compress_epilog_v2`` (no bf16 RoPE tail). Both layouts are described
-    by :class:`NPUDSV4KVLayout`.
-    ``layout`` picks the side: ``V41_SWA_FP8`` is the model-wide window/main
-    pool (FP8 E4M3 group 32, 544 B) and ``V41_CMP_FP4`` one ratio's compressed
-    pool (FP4 E2M1 group 16, 320 B, whose page holds ``page_size // ratio``
-    rows so its page id lines up with the full page id). The ratio-1
-    compressed pool keeps the global page size like the window pool but must
-    still take the compressed row format; it arrives pre-tagged through
+    A3 stores unquantized BF16 rows. A5 rows are fully quantized by
+    ``kv_compress_epilog_v2`` (no bf16 RoPE tail), so
+    the row width and store dtype come from :class:`NPUDSV4KVLayout`.
+    ``V41_SWA_FP8`` is the model-wide window/main pool (FP8 E4M3 group 32, 544 B)
+    and ``V41_CMP_FP4`` one ratio's compressed pool (FP4 E2M1 group 16, 320 B,
+    whose page holds ``page_size // ratio`` rows so its page id lines up with the
+    full page id). The ratio-1 compressed pool keeps the global page size like the
+    window pool but still takes the compressed row format, pre-tagged through
     ``DSV4NPUTokenToKVPool.compressed_kv_layout()``.
     """
 
@@ -434,8 +435,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         self,
         *args,
         npu_window_generation: Optional[str] = None,
-        candidate_source_layer_id: int = -1,
-        candidate_block_size: int = 0,
         **kwargs,
     ):
         c128_page_size = get_schedule().c128_page_size
@@ -455,35 +454,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         self._npu_window_generation = npu_window_generation
         super().__init__(*args, **kwargs)
-        self._qsli_source = None
-        self._qsli_index_k = None
-        if (
-            is_npu_arch35()
-            and self._stage_start <= candidate_source_layer_id < self._stage_end
-            and self.compression_ratios[candidate_source_layer_id] in (1, 2)
-        ):
-            item = self.layer_mapping[candidate_source_layer_id]
-            indexer = self._indexer_pool(item.compress_ratio)
-            k = indexer.get_index_k(item.compress_layer_id)
-            scale = indexer.get_index_scale(item.compress_layer_id)
-            pages, page_rows = k.shape[:2]
-            if candidate_block_size <= 0 or page_rows % candidate_block_size:
-                raise ValueError(
-                    f"QSLI candidate_block_size ({candidate_block_size}) must "
-                    f"divide the index page size ({page_rows})"
-                )
-            self._qsli_source = (item.compress_ratio, item.compress_layer_id)
-            # One QSLI record packs a block of the same FP4 K and E8M0 scales.
-            # Allocate before PD registers the full-page buffers on either peer.
-            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                self._qsli_index_k = torch.zeros(
-                    pages,
-                    page_rows // candidate_block_size,
-                    1,
-                    candidate_block_size * (k.shape[-1] + scale.shape[-1]),
-                    dtype=torch.uint8,
-                    device=k.device,
-                )
 
     def _is_v41_model(self) -> bool:
         pinned = getattr(self, "_npu_window_generation", None)
@@ -494,9 +464,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
 
     def compressed_kv_layout(self, compress_ratio: int):
-        """NPU pools arrive at ``_make_kv_pool`` pre-tagged with their row
-        format: V4.1 uses BF16 on A3 and epilog_v2's fp4 rows on A5;
-        the shared CUDA layout option does not apply here."""
+        """V4.1 low ratios use BF16 on A3 and epilog_v2 FP4 rows on A5."""
         if compress_ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS and self._is_v41_model():
             return (
                 NPUDSV4KVLayout.V41_CMP_FP4
@@ -623,22 +591,16 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """Ratio-2 pending-pair state exposed as a physical
         ``[block_num, ring_size, 2*D]`` bank.
 
-        The community factory allocates the same ring buffer but leaves the flat
-        ``page_size=1`` default, on which :attr:`CompressStatePool.state_cache_3d`
-        raises — and that view is exactly the ``state_cache`` the fused
-        ``ds41.compressor`` gets on A5 (cache_mode=2 CYCLE addresses one request
-        bank per ``state_block_table`` row). A3 also needs physical capacity for
-        TP-padded batches. Ring ownership and PD transfer indices are unchanged.
+        The community factory leaves the flat ``page_size=1`` default, on which
+        :attr:`CompressStatePool.state_cache_3d` raises. That view is the
+        ``state_cache`` the fused ``ds41.compressor`` gets on arch35, with one
+        request bank per ``state_block_table`` row. A3 also needs physical
+        capacity for TP-padded batches.
         """
         ring_size = self.get_ring_size(2)
         num_req_slots = self.num_req_slots
         if not is_npu_arch35():
-            # CompressorV2 checks block_num >= batch_size even for seqused=0
-            # padding rows. Slot 0 is reserved; align the real request capacity
-            # without increasing the request allocator or changing bank IDs.
-            num_req_slots = max(
-                num_req_slots, get_eager_max_batch_size(num_req_slots - 1)
-            )
+            num_req_slots = get_a3_c2_state_bank_count(num_req_slots)
         return CompressStatePool(
             size=num_req_slots * ring_size,
             ring_size=ring_size,
@@ -732,8 +694,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 item_lens.append(buf[0].nbytes)
 
         # V4.1 has no C4 pool: its main component is the per-ratio compressed
-        # KV + index K + index scale + the candidate source's QSLI records.
-        # Both PD peers walk the V4.1 low ratios
+        # KV + index K + index scale. Both PD peers walk the V4.1 low ratios
         # against the same compression config, so entries pair up positionally;
         # pools without such layers contribute nothing.
         for ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS:
@@ -757,13 +718,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             ):
                 if not buf.numel():
                     continue  # A3 BF16 index K has no scale payload to transfer.
-                data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes * index_pages_per_full_page)
-
-            qsli_source = getattr(self, "_qsli_source", None)
-            if qsli_source is not None and qsli_source[0] == ratio:
-                buf = self._qsli_index_k
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
                 item_lens.append(buf[0].nbytes * index_pages_per_full_page)
@@ -888,15 +842,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return self._indexer_pool(item.compress_ratio).get_index_scale(
             item.compress_layer_id
         )
-
-    def get_qsli_index_k(self, layer_id: int) -> torch.Tensor:
-        self.wait_layer_transfer(layer_id)
-        item = self.layer_mapping[layer_id]
-        if self._qsli_source != (item.compress_ratio, item.compress_layer_id):
-            raise RuntimeError(
-                f"QSLI layer {layer_id} does not share the candidate source's index K"
-            )
-        return self._qsli_index_k
 
     def get_compress_buffer(
         self,

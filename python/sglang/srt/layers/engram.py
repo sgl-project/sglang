@@ -1335,6 +1335,7 @@ class EngramEmbedding(nn.Module):
                 "group_size": FP8_BLOCK_SIZE,
                 "axis": 1,
                 "scale_suffix": "scale",
+                # Safetensors scale tag; the loader keeps the raw bytes as uint8.
                 "scale_dtype": "F8_E8M0",
                 "weight_shape": [num_embeddings, dim],
                 "scale_shape": [num_embeddings, dim // FP8_BLOCK_SIZE],
@@ -1782,9 +1783,11 @@ def engram_gate(
     # Signed square root before the sigmoid, matching the training kernel.
     magnitude = dot.abs().clamp_min(clamp_value).sqrt()
     if dot.device.type == "npu":
-        # copysign can fall back to CPU during NPU graph capture. Read the
-        # FP32 sign bit through an integer view to preserve negative zero.
-        signed_root = torch.where(dot.view(torch.int32) < 0, -magnitude, magnitude)
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        # A3 reads the FP32 sign bit during graph capture, including for -0.
+        negative = dot < 0 if is_npu_arch35() else dot.view(torch.int32) < 0
+        signed_root = torch.where(negative, -magnitude, magnitude)
     else:
         signed_root = torch.copysign(magnitude, dot)
     gate = torch.sigmoid(signed_root)
@@ -1812,6 +1815,7 @@ class Engram(nn.Module):
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
         storage = None
+        # Select the INT8 layout only when the checkpoint declares it.
         if is_npu() and quant_config is not None:
             storage = (
                 getattr(quant_config, "quant_description", {})

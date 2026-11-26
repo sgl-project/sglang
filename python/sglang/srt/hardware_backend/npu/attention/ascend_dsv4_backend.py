@@ -104,27 +104,6 @@ def _seqused_q_kwargs(cu_seqlens_q: Optional[torch.Tensor]) -> dict:
     return {"seqused_q": (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32)}
 
 
-def _ensure_dsv41_static_verify_mode() -> None:
-    """Require fixed-width low-ratio verification on both NPU generations.
-
-    The low-ratio verify metadata pipeline assumes the STATIC request-major
-    rectangle (``bs * (num_draft_tokens + 1)`` rows of contiguous positions
-    per request), which COMPACT's ragged variable-length layout breaks.
-    CAP_ACCEPT only changes the accept-length accounting, so it rides the
-    STATIC execution path for free.  Failing at startup -- instead of at the
-    first verify step -- keeps the misconfiguration visible before any
-    compressed state is written.
-    """
-    if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
-        return
-    raise RuntimeError(
-        "DeepSeek-V4.1 on NPU does not support "
-        "SGLANG_RAGGED_VERIFY_MODE=compact: the low-ratio verify metadata "
-        "requires the STATIC request-major verify layout. Unset "
-        "SGLANG_RAGGED_VERIFY_MODE (or set it to 'static' or 'cap-accept')."
-    )
-
-
 @functools.cache
 def _ds41_ops():
     """Resolve the seven DSV4.1 DSL operator APIs (``_dsl`` suffix, sgl-kernel-npu
@@ -171,9 +150,6 @@ def _dsv41_a3_ops():
         attention=sparse_flash_mla,
         metadata=sparse_flash_mla_metadata,
         indexer=lightning_indexer_v2,
-        # The public API selects the four-output overload when candidate
-        # arguments are supplied; ordinary top-k still returns two outputs.
-        candidate=lightning_indexer_v2,
         sparse_indexer=sparse_lightning_indexer,
     )
 
@@ -297,15 +273,10 @@ def _build_explicit_state_block_table(
 
 
 def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tensor:
-    """Build the Ascend 950 cache_mode=2 request-bank table.
-
-    Ascend 950 interprets this input as one bank id per request and computes the
-    in-bank ring offset itself.  It must never receive the arch22 explicit
-    per-token location table.
-    """
+    """C2 takes one cycle-bank ID per request, not an explicit per-token table."""
     if req_pool_indices.ndim != 1:
         raise ValueError(
-            "Ascend 950 compressor requires a 1-D request-bank table, got "
+            "C2 compressor requires a 1-D request-bank table, got "
             f"shape={tuple(req_pool_indices.shape)}"
         )
     return req_pool_indices.to(dtype=torch.int32).contiguous()
@@ -382,7 +353,7 @@ class CompressorAscendBackendMixin:
         fm = self.forward_metadata
         fm.dsv4_cycle_state_block_table = (
             _build_cycle_state_block_table(forward_batch.req_pool_indices)
-            if is_npu_arch35() or self._dsv4_has_low_ratio
+            if 2 in self._dsv4_compress_ratios
             else None
         )
         forward_mode = forward_batch.forward_mode
@@ -440,57 +411,11 @@ class CompressorAscendBackendMixin:
                 self._build_seq_metadata_prefill(forward_batch)
             elif is_verify:
                 self._build_seq_metadata_verify(forward_batch)
-
-        # DeepSeek-V4.1 ratio 1/2 sources have no allocator bundle to read
-        # slots from; V4-only deployments skip this entirely.
-        if getattr(self, "_dsv4_has_low_ratio", False):
+            # Ratio 1/2 slots derive per token (no bundle), so their rows are
+            # planned by the V4.1 metadata contract; its own mode gate inside
+            # excludes draft_extend. An empty-ratio draft worker lands here
+            # too and returns immediately.
             self._build_low_ratio_compress_metadata(forward_batch)
-
-    def _build_seq_metadata_decode(self, seq_lens: torch.Tensor) -> None:
-        """``start_pos``/``seqused`` for eager decode; the shared seq scalars
-        both generations' compressors consume (last live position, live flag).
-        """
-        fm = self.forward_metadata
-        fm.start_pos = torch.clamp(seq_lens - 1, min=0).to(torch.int32)
-        fm.seqused = (seq_lens > 0).to(torch.int32)
-
-    def _build_seq_metadata_prefill(self, forward_batch: ForwardBatch):
-        """``start_pos``/``seqused``/``dsv4_max_input_capacity`` for eager
-        prefill; the shared seq scalars both generations' compressors consume.
-
-        Returns ``(cu_cpu, prefix_cpu)`` for the V4 ratio-block builders that
-        need the same host mirrors.
-        """
-        fm = self.forward_metadata
-        device = forward_batch.seq_lens.device
-        bs = forward_batch.batch_size
-        cu = fm.actual_seq_lengths_q_pa
-
-        cu_cpu = cu.cpu().tolist()
-        fm.dsv4_max_input_capacity = max(
-            1,
-            max(
-                (int(cu_cpu[idx + 1]) - int(cu_cpu[idx]) for idx in range(bs)),
-                default=0,
-            ),
-        )
-        prefix_cpu = self._extend_prefix_lens_cpu(forward_batch)
-        # start_pos is each request's global chunk start. cache_mode=2 uses it
-        # together with the explicit table to align history/current columns.
-        if forward_batch.extend_prefix_lens is not None:
-            fm.start_pos = forward_batch.extend_prefix_lens.to(
-                device=device, dtype=torch.int32
-            )
-        elif prefix_cpu is not None:
-            fm.start_pos = torch.tensor(
-                prefix_cpu[:bs] + [0] * max(0, bs - len(prefix_cpu)),
-                dtype=torch.int32,
-                device=device,
-            )
-        else:
-            fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
-        fm.seqused = (cu[1:] - cu[:-1]).to(torch.int32)
-        return cu_cpu, prefix_cpu
 
     def _build_npu_compress_metadata_prefill(self, forward_batch: ForwardBatch) -> None:
         # eager-only: prefill is never graph-captured, host reads (cu_cpu) are safe here
@@ -1396,7 +1321,7 @@ class LowRatioCompressAscendBackendMixin:
         if layer.layer_id == self.tail_source_kv_layer_id:
             run_compressor = False
 
-        query_tokens = self._dsv41_a3_verify_num_tokens(forward_batch)
+        query_tokens = self._dsv41_a3_query_tokens(forward_batch)
         if query_tokens is not None:
             # TP-only padding is not an extra query in the last request. Keep
             # compressor, indexer Q and candidate rows on the same TND geometry.
@@ -1524,7 +1449,7 @@ class LowRatioCompressAscendBackendMixin:
 
     def _dsv41_index_k_store(self, layer, latent) -> None:
         """Project, norm, RoPE and quantize the index K into the split index
-        pool (the cache QLI reads), via indexer_prologue_k storage_mode=0.
+        pool shared by QLI and QSLI.
         """
         if latent is None:
             raise RuntimeError(
@@ -1578,8 +1503,7 @@ class LowRatioCompressAscendBackendMixin:
         ds41 = _ds41_ops()
         # Keep the NZ cast inside the traced region: hoisting it into a cached
         # attribute makes aclgraph clone an NZ graph input back to ND.
-        # Both storage modes share every argument but the destination.
-        common = dict(
+        ds41.indexer_prologue_k_dsl(
             latent=latent.reshape(-1, latent.shape[-1]),
             wk=torch_npu.npu_format_cast(
                 indexer.wk.weight, torch_npu.Format.FRACTAL_NZ
@@ -1589,23 +1513,10 @@ class LowRatioCompressAscendBackendMixin:
             rope_cos=cos,
             cache_index=cache_index.to(torch.int64),
             norm_eps=indexer.k_norm.eps,
-        )
-        ds41.indexer_prologue_k_dsl(
-            **common,
             k_cache=pool.get_index_k(layer.layer_id),
             k_scale_cache=pool.get_index_scale(layer.layer_id),
             storage_mode=0,
         )
-        if indexer.is_candidate_source:
-            # Level-two K for QSLI: the same rows again, eight to a record,
-            # fused with their scales.
-            ds41.indexer_prologue_k_dsl(
-                **common,
-                k_cache=pool.get_qsli_index_k(layer.layer_id),
-                k_scale_cache=None,
-                storage_mode=1,
-                combined_block_size=indexer.candidate_block_size,
-            )
 
     def _dsv41_index_q(self, layer, x, q_lora, pos):
         """Packed MXFP4 Q, its E8M0 scales and the head weights, for both
@@ -1671,7 +1582,7 @@ class LowRatioCompressAscendBackendMixin:
         if not is_npu_arch35():
             kwargs = self._dsv41_a3_index_kwargs(forward_batch, ratio)
             if candidate:
-                indices, _, blocks, lengths = _dsv41_a3_ops().candidate(
+                indices, _, blocks, lengths = _dsv41_a3_ops().indexer(
                     q_packed,
                     k,
                     w,
@@ -1816,11 +1727,11 @@ class LowRatioCompressAscendBackendMixin:
                 "before the index layers."
             )
         topk = self._dsv4_index_topk
-        qsli_k = self.token_to_kv_pool.get_qsli_index_k(layer.layer_id)
+        pool = self.token_to_kv_pool
         indices, _ = _ds41_ops().quant_sparse_lightning_indexer_dsl(
             q=q_packed,
-            # QSLI takes the record rows without the singleton head axis.
-            k=qsli_k.squeeze(-2),
+            k=pool.get_index_k(layer.layer_id),
+            descale_k=pool.get_index_scale(layer.layer_id),
             w=w,
             descale_q=descale_q,
             candidate_block_indices=candidate_indices,
@@ -2163,14 +2074,19 @@ class LowRatioCompressAscendBackendMixin:
             out[key] = metadata
         return out
 
-    def _dsv41_a3_verify_num_tokens(self, forward_batch):
+    def _dsv41_a3_query_tokens(self, forward_batch) -> int | None:
         mode = getattr(forward_batch, "forward_mode", None)
-        if is_npu_arch35() or mode is None or not mode.is_target_verify():
+        if is_npu_arch35() or mode is None:
             return None
-        # Static verify geometry is known on the host; do not read cu[-1] from
-        # the device during graph capture. Compact verification is rejected.
-        width = int(forward_batch.spec_info.draft_token_num)
-        return int(forward_batch.batch_size) * width
+        if mode.is_target_verify():
+            # Fixed-width verify may be graph-captured: use host geometry.
+            width = int(forward_batch.spec_info.draft_token_num)
+            return int(forward_batch.batch_size) * width
+        if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            # Eager prefill: packed TND rows must end at cu_q[-1], even when
+            # MLP sync padded the token axis for attention TP.
+            return int(self.forward_metadata.actual_seq_lengths_q_pa_cpu[-1])
+        return None
 
     def _dsv41_a3_kv_lengths(self, forward_batch, *, metadata=None):
         fm = self.forward_metadata if metadata is None else metadata
@@ -2234,7 +2150,7 @@ class LowRatioCompressAscendBackendMixin:
                 f"available: {list(fm.kernel_metadata.keys())}."
             )
         if not is_npu_arch35():
-            query_tokens = self._dsv41_a3_verify_num_tokens(forward_batch)
+            query_tokens = self._dsv41_a3_query_tokens(forward_batch)
             attention_q = q if query_tokens is None else q[:query_tokens]
             kwargs = self._dsv41_a3_attention_kwargs(forward_batch, compress_ratio)
             if compress_ratio:
@@ -2407,18 +2323,17 @@ class LowRatioCompressAscendBackendMixin:
         device = forward_batch.positions.device
         positions = forward_batch.positions.reshape(-1).to(torch.int64)
         out_loc = forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
-        mode = getattr(forward_batch, "forward_mode", None)
+        query_tokens = self._dsv41_a3_query_tokens(forward_batch)
         is_a3_verify = (
-            not is_npu_arch35() and mode is not None and mode.is_target_verify()
+            query_tokens is not None and forward_batch.forward_mode.is_target_verify()
         )
         if is_a3_verify and out_loc.numel() < positions.numel():
+            # Fixed-width A3 verify needs one slot per query row. Fill missing
+            # slots with the dummy page and keep the shared full-slot mapping.
             out_loc = F.pad(out_loc, (0, positions.numel() - out_loc.numel()))
         n = min(int(positions.numel()), int(out_loc.numel()))
-        if is_a3_verify:
-            n = min(
-                n,
-                self._dsv41_a3_verify_num_tokens(forward_batch),
-            )
+        if query_tokens is not None:
+            n = min(n, query_tokens)
         positions, out_loc = positions[:n], out_loc[:n]
         bs = int(forward_batch.batch_size)
         if is_a3_verify:
@@ -2878,6 +2793,7 @@ class DeepseekV4AscendAttnBackend(
     )
 
     supports_ragged_verify_graph = True
+    _is_dsv41_a3_dspark_draft = False
 
     def __init__(
         self,
@@ -2921,21 +2837,24 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_has_low_ratio = any(
             ratio in (1, 2) for ratio in self._dsv4_compress_ratios
         )
-        if self._dsv4_has_low_ratio and is_npu_arch35():
-            # MQSMLA fixes N1 = 64 and does not shard query heads over TP; a
-            # narrower per-rank width would feed the op the wrong head count.
-            assert self._dsv4_q_head_num == 64, (
-                "DeepSeek-V4.1 on NPU needs all 64 query heads on every rank "
-                f"(got {self._dsv4_q_head_num}): check num_attention_heads and "
-                "the attention TP size."
-            )
         if self._dsv4_has_low_ratio:
-            # Both A3 indexers and the A5 metadata path require fixed Q blocks.
-            _ensure_dsv41_static_verify_mode()
-        if self._dsv4_has_low_ratio and not is_npu_arch35():
-            _dsv41_a3_ops()
-            # Resolve the public API here; graph warmup loads the lazy binding.
-            _dsv41_a3_compressor_kernel()
+            if is_npu_arch35():
+                # MQSMLA fixes N1 = 64 and does not shard query heads over TP.
+                assert self._dsv4_q_head_num == 64, (
+                    "DeepSeek-V4.1 on NPU needs all 64 query heads on every rank "
+                    f"(got {self._dsv4_q_head_num}): check num_attention_heads and "
+                    "the attention TP size."
+                )
+            else:
+                try:
+                    _dsv41_a3_ops()
+                    _dsv41_a3_compressor_kernel()
+                except ImportError as exc:
+                    raise ImportError(
+                        "DeepSeek-V4.1 on Ascend A3 requires sgl-kernel-npu built "
+                        "with the ops_transformer bundle for CANN 9.2.0. "
+                        f"Failed to import an A3 operator: {exc}"
+                    ) from exc
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
@@ -2954,6 +2873,11 @@ class DeepseekV4AscendAttnBackend(
         self._is_dspark_draft_worker = bool(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
+        )
+        self._is_dsv41_a3_dspark_draft = (
+            self._is_dspark_draft_worker
+            and self._dsv4_is_v41_model
+            and not is_npu_arch35()
         )
         self._validate_spec_support(model_runner.spec_algorithm)
         if getattr(model_runner, "is_draft_worker", False):
@@ -2988,6 +2912,9 @@ class DeepseekV4AscendAttnBackend(
         # Draft workers keep the eager prefill metadata path; their graph
         # coverage is handled by the speculative runner.
         if self.is_draft_worker:
+            return False
+        # The captured prefill state has no C1/C2 index or candidate buffers.
+        if self._dsv4_has_low_ratio and not is_npu_arch35():
             return False
         parallel = get_parallel()
         if parallel.attn_cp_size != 1 or parallel.attn_dcp_size != 1:
@@ -3071,10 +2998,7 @@ class DeepseekV4AscendAttnBackend(
     def _init_dspark_sparse_metadata(self, forward_batch: ForwardBatch) -> None:
         """Build block-noncausal SWA positions for a DSpark draft forward.
 
-        Every token in a DSpark draft block attends to the trailing SWA
-        context and to the whole current draft block.  The Ascend
-        sparse-attention operator consumes [T, N_kv, K] indices, where K must
-        be 128-aligned (logical token indices on both generations).
+        Each draft token attends to the trailing window and the whole block.
         """
         fm = self.forward_metadata
         fm.ori_sparse_indices = None
@@ -3087,7 +3011,7 @@ class DeepseekV4AscendAttnBackend(
             return
 
         block_size = int(forward_batch.spec_info.draft_token_num)
-        if not is_npu_arch35():
+        if self._is_dsv41_a3_dspark_draft:
             # The device batch carries committed prefixes even when there is
             # no CPU mirror; the full noncausal draft block is already in KV.
             fm.actual_seq_lengths_kv = (
@@ -3098,10 +3022,12 @@ class DeepseekV4AscendAttnBackend(
             seq_lens=forward_batch.seq_lens, block_size=block_size
         )
         # The query is padded to an attn_tp multiple (prepare_mlp_sync_batch),
-        # but seq_lens is not. A5 pads the tail with -1/0; A3 trims Q
-        # to the real query count in _forward_swa before padding the output.
+        # but seq_lens is not, so pad the tail with -1/0 to match.
         num_padded_tokens = forward_batch.out_cache_loc.shape[0]
-        if is_npu_arch35() and ori_sparse_indices.shape[0] < num_padded_tokens:
+        if (
+            not self._is_dsv41_a3_dspark_draft
+            and ori_sparse_indices.shape[0] < num_padded_tokens
+        ):
             pad_rows = num_padded_tokens - ori_sparse_indices.shape[0]
             indices_pad = torch.full(
                 (pad_rows, ori_sparse_indices.shape[1]),
@@ -3391,10 +3317,6 @@ class DeepseekV4AscendAttnBackend(
             )
 
         if self._is_dspark_draft_worker:
-            if not is_npu_arch35():
-                self.graph_metadata["kernel_metadata_c1a"] = torch.zeros(
-                    2048, dtype=torch.int32, device=device
-                )
             block_size = self._dsv4_graph_tokens_per_req
             sparse_width = _dspark_sparse_width(
                 self._dsv4_sliding_window_size, block_size
@@ -3491,42 +3413,22 @@ class DeepseekV4AscendAttnBackend(
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
-        if is_npu_arch35() or self._dsv4_has_low_ratio:
-            metadata.dsv4_cycle_state_block_table = torch.zeros(
-                bs, dtype=torch.int32, device=device
+        # C2 addresses a bank per request; C4/C128 use explicit token locations.
+        metadata.dsv4_cycle_state_block_table = (
+            torch.zeros(bs, dtype=torch.int32, device=device)
+            if 2 in self._dsv4_compress_ratios
+            else None
+        )
+        metadata.dsv4_explicit_state_block_tables = {
+            ratio: torch.full(
+                (bs, (2 if ratio == 4 else 1) * ratio + tokens_per_req),
+                state_pool.dummy_state_loc,
+                dtype=torch.int32,
+                device=device,
             )
-            # The V4 compressor op consumes the explicit table on every arch,
-            # so seed it for the V4 ratios. The V4.1 ratio-2 pair pool is a
-            # plain CompressStatePool with no ``dummy_state_loc`` sentinel;
-            # its ds41.compressor addresses state through the cycle table
-            # above instead.
-            metadata.dsv4_explicit_state_block_tables = {
-                ratio: torch.full(
-                    (
-                        bs,
-                        (2 if ratio == 4 else 1) * ratio + tokens_per_req,
-                    ),
-                    state_pool.dummy_state_loc,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
-                if ratio in (4, 128)
-            }
-        else:
-            metadata.dsv4_cycle_state_block_table = None
-            metadata.dsv4_explicit_state_block_tables = {
-                ratio: torch.full(
-                    (
-                        bs,
-                        (2 if ratio == 4 else 1) * ratio + tokens_per_req,
-                    ),
-                    state_pool.dummy_state_loc,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
-            }
+            for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
+            if ratio in (4, 128)
+        }
 
         metadata.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         metadata.seqused = torch.zeros(bs, dtype=torch.int32, device=device)
@@ -3613,10 +3515,7 @@ class DeepseekV4AscendAttnBackend(
             metadata.ori_win_left = self._dsv4_sliding_window_size + tokens_per_req - 1
             metadata.ori_win_right = 0
 
-        if self._is_dspark_draft_worker and not is_npu_arch35():
-            metadata.kernel_metadata["c1a_metadata"] = self.graph_metadata[
-                "kernel_metadata_c1a"
-            ]
+        if self._is_dsv41_a3_dspark_draft:
             metadata.kernel_metadata["c1a_metadata"].copy_(
                 self._dsv41_a3_draft_kernel_metadata(bs, metadata=metadata)
             )
@@ -3944,10 +3843,9 @@ class DeepseekV4AscendAttnBackend(
 
     def _refresh_cycle_state_block_table(self, ctx) -> None:
         """Cycle request-bank table: one bank id per request."""
-        if is_npu_arch35() or self._dsv4_has_low_ratio:
-            ctx.fm.dsv4_cycle_state_block_table.copy_(
-                ctx.forward_batch.req_pool_indices[: ctx.bs]
-            )
+        table = ctx.fm.dsv4_cycle_state_block_table
+        if table is not None:
+            table.copy_(ctx.forward_batch.req_pool_indices[: ctx.bs])
 
     def _refresh_graph_decode_rows(self, ctx) -> None:
         """Decode replay rows: shared seq scalars (start_pos = last live
@@ -4438,10 +4336,6 @@ class DeepseekV4AscendAttnBackend(
             fm.actual_seq_lengths_q_pa = None
             fm.actual_seq_lengths_q_pa_cpu = None
 
-        fm.swa_page_table = (
-            fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
-        )
-
         if ragged_layout is not None:
             fm.actual_seq_lengths_kv = (
                 (
@@ -4457,9 +4351,34 @@ class DeepseekV4AscendAttnBackend(
                 fm.actual_seq_lengths_kv = fm.seq_lens_cpu_int.to(
                     device=forward_batch.seq_lens.device, dtype=torch.int32
                 )
+            elif (
+                forward_batch.forward_mode.is_target_verify()
+                and self._dsv4_has_low_ratio
+                and not is_npu_arch35()
+            ):
+                # DSpark supplies the committed device prefix. Request slot 0
+                # is padding and does not own any rows of the verify block.
+                prefix = forward_batch.seq_lens.to(torch.int32)
+                fm.actual_seq_lengths_kv = torch.where(
+                    forward_batch.req_pool_indices != 0, prefix + n_draft, prefix
+                )
+                if self.is_hybrid_swa:
+                    # The base built only full pages. As in graph replay, leave
+                    # one page of slack for the potentially lagging host bound.
+                    hint = forward_batch.max_seq_len_host
+                    max_len = hint + self.page_size if hint else None
+                    full_locs = self.req_to_token[
+                        forward_batch.req_pool_indices, : max_len : self.page_size
+                    ]
+                    fm.block_tables_swa = (
+                        self.full_to_swa_index_mapping[full_locs] // self.page_size
+                    ).to(torch.int32)
             else:
                 fm.actual_seq_lengths_kv = forward_batch.seq_lens.to(torch.int32)
 
+        fm.swa_page_table = (
+            fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
+        )
         self._init_dspark_sparse_metadata(forward_batch)
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
 
@@ -4572,7 +4491,7 @@ class DeepseekV4AscendAttnBackend(
         actual_seq_lengths_kv: torch.Tensor,
     ) -> dict:
         fm = self.forward_metadata
-        if self._is_dspark_draft_worker and not is_npu_arch35():
+        if self._is_dsv41_a3_dspark_draft:
             return {"c1a_metadata": self._dsv41_a3_draft_kernel_metadata(bs)}
         common = {
             **_sparse_attn_kv_quant_kwargs(),
@@ -4752,7 +4671,7 @@ class DeepseekV4AscendAttnBackend(
             layout_kv="PA_BBND",
         )
         if indices is not None:
-            kwargs["ori_topk_length"] = (indices >= 0).sum(-1, dtype=torch.int32)
+            kwargs["ori_topk_length"] = fm.ori_topk_length
         return kwargs
 
     def _dsv41_a3_draft_kernel_metadata(self, bs, metadata=None):
@@ -4779,7 +4698,7 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
-        if self._is_dspark_draft_worker and not is_npu_arch35():
+        if self._is_dsv41_a3_dspark_draft:
             indices = getattr(fm, "ori_sparse_indices", None)
             num_rows = q.shape[0] if indices is None else indices.shape[0]
             # Attention TP may pad the projected Q (e.g. five rows to six for
@@ -4956,6 +4875,60 @@ class DeepseekV4AscendAttnBackend(
             loc=swa_loc,
             cache=swa_k,
         )
+
+    # ---- shared eager seq scalars ---------------------------------------------
+    #
+    # ``start_pos``/``seqused`` are consumed by both generations' compressors
+    # (V4 forward_compress, V4.1 _low_ratio_compress), so these mode builders
+    # live on the concrete class next to their replay counterparts
+    # (_refresh_graph_decode_rows / _refresh_graph_verify_rows), not in either
+    # generation's mixin.
+
+    def _build_seq_metadata_decode(self, seq_lens: torch.Tensor) -> None:
+        """``start_pos``/``seqused`` for eager decode; the shared seq scalars
+        both generations' compressors consume (last live position, live flag).
+        """
+        fm = self.forward_metadata
+        fm.start_pos = torch.clamp(seq_lens - 1, min=0).to(torch.int32)
+        fm.seqused = (seq_lens > 0).to(torch.int32)
+
+    def _build_seq_metadata_prefill(self, forward_batch: ForwardBatch):
+        """``start_pos``/``seqused``/``dsv4_max_input_capacity`` for eager
+        prefill; the shared seq scalars both generations' compressors consume.
+
+        Returns ``(cu_cpu, prefix_cpu)`` for the V4 ratio-block builders that
+        need the same host mirrors.
+        """
+        fm = self.forward_metadata
+        device = forward_batch.seq_lens.device
+        bs = forward_batch.batch_size
+        cu = fm.actual_seq_lengths_q_pa
+
+        cu_cpu = cu.cpu().tolist()
+        fm.dsv4_max_input_capacity = max(
+            1,
+            max(
+                (int(cu_cpu[idx + 1]) - int(cu_cpu[idx]) for idx in range(bs)),
+                default=0,
+            ),
+        )
+        prefix_cpu = self._extend_prefix_lens_cpu(forward_batch)
+        # start_pos is each request's global chunk start. cache_mode=2 uses it
+        # together with the explicit table to align history/current columns.
+        if forward_batch.extend_prefix_lens is not None:
+            fm.start_pos = forward_batch.extend_prefix_lens.to(
+                device=device, dtype=torch.int32
+            )
+        elif prefix_cpu is not None:
+            fm.start_pos = torch.tensor(
+                prefix_cpu[:bs] + [0] * max(0, bs - len(prefix_cpu)),
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
+        fm.seqused = (cu[1:] - cu[:-1]).to(torch.int32)
+        return cu_cpu, prefix_cpu
 
     def _build_seq_metadata_verify(self, forward_batch: ForwardBatch) -> None:
         """``start_pos``/``seqused``/``dsv4_max_input_capacity`` for eager

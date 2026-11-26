@@ -739,9 +739,7 @@ class DSparkDraftMixin:
         layer-major.
         """
         layers = list(self.layers)
-        if not layers or not (
-            hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")
-        ):
+        if not layers:
             return None
         # The fused kernel shares one location vector across every layer.
         if any(
