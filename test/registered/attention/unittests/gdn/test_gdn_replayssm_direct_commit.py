@@ -25,6 +25,7 @@ from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
     commit_gdn_replayssm_after_verify,
     commit_gdn_replayssm_spec,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
@@ -182,6 +183,9 @@ class _Arm:
         backend.kernel_dispatcher = self.dispatcher
         backend.mis_metadata = None
         backend._use_strided_target_verify_qkv = False
+        backend._replayssm_verify_num_stages = (
+            envs.SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES.get()
+        )
         hybrid = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
         hybrid.linear_attn_backend = backend
         self.hybrid = hybrid

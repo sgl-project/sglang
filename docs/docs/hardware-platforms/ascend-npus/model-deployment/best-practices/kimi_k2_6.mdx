@@ -648,7 +648,7 @@ do
         --device npu \
         --tp-size 16 \
         --disable-radix-cache \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --mem-fraction-static 0.78 \
         --max-running-requests 1 \
         --moe-a2a-backend deepep \
