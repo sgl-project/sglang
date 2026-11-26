@@ -35,7 +35,7 @@ _SCALE_GROUP_SIZE = 16
 _PAGE_ROW_ALIGN = 128
 
 
-def _main_page_components(head_num: int, head_dim: int, page_size: int):
+def main_page_components(head_num: int, head_dim: int, page_size: int):
     payload = (head_num, page_size, head_dim // 2)
     scale = (head_num, page_size, head_dim // _SCALE_GROUP_SIZE)
     return (
@@ -53,7 +53,7 @@ def _index_page_components(head_dim: int, page_size: int):
     )
 
 
-def _page_row_layout(components) -> tuple[list[int], int]:
+def page_row_layout(components) -> tuple[list[int], int]:
     """Byte offset of each ``(name, per-page byte shape)`` component inside one
     page row, and the row width."""
     offsets = []
@@ -69,8 +69,8 @@ def msa_v1_page_row_bytes(
 ) -> tuple[int, int]:
     """Main and index row widths of one sparse layer's page."""
     return (
-        _page_row_layout(_main_page_components(kv_heads, head_dim, page_size))[1],
-        _page_row_layout(_index_page_components(index_head_dim, page_size))[1],
+        page_row_layout(main_page_components(kv_heads, head_dim, page_size))[1],
+        page_row_layout(_index_page_components(index_head_dim, page_size))[1],
     )
 
 
@@ -80,7 +80,7 @@ def _allocate_page_rows(pool: KVCache, components, num_pages: int, device: str):
     A view keeps the exact per-page shape the kernels consume and differs from a
     dedicated tensor only in its page stride, which is the row width.
     """
-    offsets, row_bytes = _page_row_layout(components)
+    offsets, row_bytes = page_row_layout(components)
     with pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
         with (
             torch.cuda.use_mem_pool(pool.custom_mem_pool)
@@ -410,7 +410,7 @@ class MiniMaxM3Nvfp4MainKVPool(KVCache):
         # not implemented for every float8 dtype in PyTorch.
         self.slab, self.rows, self.row_bytes, views = _allocate_page_rows(
             self,
-            _main_page_components(head_num, head_dim, page_size),
+            main_page_components(head_num, head_dim, page_size),
             self.num_pages,
             device,
         )
