@@ -244,7 +244,7 @@ class TestDraftBindingDispatch(CustomTestCase):
             req_to_token_pool = RequestTable(
                 size=8,
                 pre_alloc_size=0,
-                max_context_len=64,
+                row_width=64,
                 state_sub_pool=None,
                 tracking=None,
                 device="cpu",
@@ -496,7 +496,7 @@ class TestSWARetainWindow(CustomTestCase):
 
     def _fixture(self, cache_cls, *, draft_swa_window, num_tokens=40, disable=False):
         req_to_token_pool = ReqToTokenPool(
-            size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+            size=4, row_width=64, device="cpu", enable_memory_saver=False
         )
         kv_pool = SWAKVPool(
             size=64,
