@@ -1218,8 +1218,9 @@ class Envs:
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
+    # ROCm Kimi-K3: static per-tensor FP8 for BF16 dense linears
+    # (models/kimi_k3_amd/dense_fp8.py): off | qkvg | front | wide.
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
-    SGLANG_DRAFT_FP8_ACTIVATION_SCHEME = EnvStr("dynamic")
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

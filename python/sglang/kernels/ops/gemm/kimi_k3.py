@@ -17,8 +17,8 @@ _K3_TINY_GEMM_MAX_TOKENS = {
     (1536, 128): 12,
 }
 
-# gfx950: the tiny kernel only wins up to these token counts; above them the
-# AITER tuned GEMM rows beat both it and F.linear.
+# ROCm: the tiny kernel only wins up to these token counts; above them
+# a16w16_linear (AITER tuned rows on gfx95x, else F.linear) is faster.
 _K3_ROCM_TUNED_TINY_MAX_TOKENS = {
     (144, 7168): 8,
     (1536, 128): 8,
@@ -38,11 +38,10 @@ def kimi_k3_tiny_gemm(
     max_num_tokens = _K3_TINY_GEMM_MAX_TOKENS.get((n, k))
     if _is_hip and (n, k) in _K3_ROCM_TUNED_TINY_MAX_TOKENS:
         if 0 < m <= _K3_ROCM_TUNED_TINY_MAX_TOKENS[(n, k)]:
-            return tiny_gemm_bf16(x, w, max_m=max_num_tokens)
-        if m > 0:
-            from aiter.tuned_gemm import tgemm
+            return tiny_gemm_bf16(x, w)
+        from sglang.srt.layers.quantization.unquant_hip import a16w16_linear
 
-            return tgemm.mm(x, w, None, otype=x.dtype)
+        return a16w16_linear(x, w)
     if not _is_npu and max_num_tokens is not None and 0 < m <= max_num_tokens:
         return tiny_gemm_bf16(x, w)
     return torch.nn.functional.linear(x, w)

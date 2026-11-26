@@ -43,39 +43,6 @@ def quantize_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q, scale.to(torch.float32)
 
 
-# One-slot producer -> consumer handoff for a pre-quantized activation. A kernel
-# that already holds the normalized row (attn_res aggregation) can emit its E4M3
-# copy; the next StaticFP8Weight call consumes it only if it receives that very
-# tensor (or a same-sized view of it; see _same_data), so a stale or reused buffer
-# can never be picked up. Anything else falls back to quantizing in the GEMM wrapper.
-_prequant_slot: tuple[torch.Tensor, torch.Tensor] | None = None
-
-
-def offer_prequantized(x: torch.Tensor, xq: torch.Tensor) -> None:
-    global _prequant_slot
-    _prequant_slot = (x, xq)
-
-
-def _same_data(src: torch.Tensor, x: torch.Tensor) -> bool:
-    # The slot holds a strong reference to src, so a tensor with the same
-    # address, size and dtype must alias its data.
-    return x is src or (
-        x.dtype == src.dtype
-        and x.numel() == src.numel()
-        and x.data_ptr() == src.data_ptr()
-        and x.is_contiguous()
-        and src.is_contiguous()
-    )
-
-
-def _take_prequantized(x: torch.Tensor) -> torch.Tensor | None:
-    global _prequant_slot
-    slot, _prequant_slot = _prequant_slot, None
-    if slot is not None and _same_data(slot[0], x):
-        return slot[1]
-    return None
-
-
 class StaticFP8Weight:
     """E4M3 [N, K] weight for aiter.gemm_a8w8_bpreshuffle; ``__call__`` is x @ W^T."""
 
@@ -104,23 +71,17 @@ class StaticFP8Weight:
         import aiter
 
         x2 = x.reshape(-1, x.shape[-1])
-        m = x2.shape[0]
         dtype = out_dtype or x.dtype
-        if dtype not in (torch.bfloat16, torch.float16) or m > self._MAX_TOKENS:
-            raise ValueError(
-                f"K3 ROCm FP8 linear: unsupported out dtype {dtype} or M={m}"
-            )
-        if m == 0:
-            y = x2.new_empty((0, self.n), dtype=dtype)
-        else:
-            xq = _take_prequantized(x)
-            if xq is None:
-                xq = torch.empty(x2.shape, dtype=_FP8, device=x2.device)
-                aiter.static_per_tensor_quant(xq, x2.contiguous(), self.unit)
-            else:
-                xq = xq.reshape(x2.shape)
-            y = aiter.gemm_a8w8_bpreshuffle(
-                xq, self.weight, self.x_scale[:m], self.w_scale, dtype=dtype
+        if dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(f"K3 ROCm FP8 linear: unsupported out dtype {dtype}")
+        y = x2.new_empty((x2.shape[0], self.n), dtype=dtype)
+        # x_scale is sized for one chunk; larger prefill chunks run in pieces.
+        for start in range(0, x2.shape[0], self._MAX_TOKENS):
+            xc = x2[start : start + self._MAX_TOKENS].contiguous()
+            xq = torch.empty(xc.shape, dtype=_FP8, device=xc.device)
+            aiter.static_per_tensor_quant(xq, xc, self.unit)
+            y[start : start + xc.shape[0]] = aiter.gemm_a8w8_bpreshuffle(
+                xq, self.weight, self.x_scale[: xc.shape[0]], self.w_scale, dtype=dtype
             )
         return y.reshape(*x.shape[:-1], self.n)
 

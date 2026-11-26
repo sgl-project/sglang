@@ -86,6 +86,7 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 _is_gfx95 = is_hip() and is_gfx95_supported()
+_is_hip = is_hip()
 
 
 def _gfx1250_try_gfx95():
@@ -127,14 +128,6 @@ _GFX950_ROWMAJOR_WEIGHTS = ((2560, 8192), (8192, 7168), (14336, 8192))
 _GFX950_HIPBLASLT_WEIGHTS = ((14336, 8192),)
 _GFX950_HIPBLASLT_ROWS = range(33, 129)
 logger = logging.getLogger(__name__)
-
-
-def _rocm_decode_gemm_tuned() -> bool:
-    """Tuned K3 decode GEMMs (ROCm + AITER only)."""
-    from sglang.srt.environ import envs
-    from sglang.srt.utils import is_hip
-
-    return is_hip() and envs.SGLANG_USE_AITER.get()
 
 
 def _logical_linear_weight_shape(
@@ -1370,18 +1363,14 @@ class DFlashDraftModel(nn.Module):
         ):
             projected = self._project_target_hidden_tp(target_hidden)
         elif (
-            0 < target_hidden.shape[0] <= 64
-            and target_hidden.dtype == torch.bfloat16
-            and self.fc.weight.dtype == torch.bfloat16
-            and _rocm_decode_gemm_tuned()
+            _is_hip
+            and 0 < target_hidden.shape[0] <= 64
+            and target_hidden.dtype == self.fc.weight.dtype == torch.bfloat16
         ):
-            # ROCm decode: tuned hipBLASLt row via AITER tgemm (falls back to
-            # torch for untuned token counts).
-            from aiter.tuned_gemm import tgemm
+            # ROCm decode: AITER tuned row when there is one, else F.linear.
+            from sglang.srt.layers.quantization.unquant_hip import a16w16_linear
 
-            projected = tgemm.mm(
-                target_hidden, self.fc.weight, None, otype=target_hidden.dtype
-            )
+            projected = a16w16_linear(target_hidden, self.fc.weight)
         else:
             projected = self.fc(target_hidden)
         return self.hidden_norm(projected)
