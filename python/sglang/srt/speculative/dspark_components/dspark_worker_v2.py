@@ -163,6 +163,13 @@ def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> boo
     )
 
 
+def folds_static_accept(
+    *, static_mode: bool, dsv41_static: bool, draft_fold: bool, npu: bool = _is_npu
+) -> bool:
+    """Whether the static verify graph folds the accept of a DSpark step."""
+    return dsv41_static or draft_fold or (static_mode and npu)
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
@@ -437,8 +444,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not dsv41_static
             and getattr(self.draft_model, "folds_static_verify_commit", False)
         )
-        static_epilogue_supported = (
-            dsv41_static or self._static_epilogue_needs_draft_fold
+        static_epilogue_supported = folds_static_accept(
+            static_mode=static_mode,
+            dsv41_static=dsv41_static,
+            draft_fold=self._static_epilogue_needs_draft_fold,
         )
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
         # need the group's pynccl communicator
@@ -449,7 +458,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             max_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
             self._deferred_draft_kv = maybe_build_deferred_draft_kv(
-                static_verify=static_epilogue_supported,
+                static_verify=dsv41_static or self._static_epilogue_needs_draft_fold,
                 draft_is_moe=self._draft_is_moe,
                 max_bs=max_bs,
                 stride=self.verify_num_draft_tokens,
