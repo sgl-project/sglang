@@ -18,6 +18,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    InputValidationStage,
+)
 from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
 
 
@@ -109,3 +112,28 @@ def test_warmup_resolution_aligns_to_the_patch_grid():
             server_based_warmup=True,
         )
     assert [(r.width, r.height) for r in reqs] == [(1920, 1072)]
+
+
+@pytest.mark.parametrize(
+    "fields,expected",
+    [
+        ({"width": 1920, "height": None}, (1920, 1072)),
+        ({"width": None, "height": 1080}, (1920, 1072)),
+        ({"width": 1000, "height": None}, (992, 560)),
+    ],
+)
+def test_one_missing_side_is_inferred_then_aligned(fields, expected):
+    """An explicit None side is inferred from 16:9 before the grid alignment."""
+    server_args = _server_args(HunyuanConfig())
+    server_args.enable_cfg_parallel = False
+    with patch.object(
+        SamplingParams, "from_pretrained", return_value=HunyuanSamplingParams()
+    ):
+        sampling = SamplingParams.from_user_sampling_params_args(
+            server_args.model_path, server_args, prompt="a cat", num_frames=17, **fields
+        )
+    req = Req(sampling_params=sampling)
+    req = InputValidationStage().forward(req, server_args)
+    assert (req.width, req.height) == expected
+    _, _, _, height, width = server_args.pipeline_config.prepare_latent_shape(req, 1, 5)
+    assert (height % 2, width % 2) == (0, 0)

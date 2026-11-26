@@ -72,6 +72,13 @@ class HunyuanSamplingParams(SamplingParams):
         # The diffusers backend keeps its own size handling.
         if not isinstance(pipeline_config, HunyuanConfig):
             return
+        if self.width is None and self.height is None:
+            return
+        # InputValidationStage fills a missing side from 16:9 after this runs.
+        if self.height is None and self.width > 0:
+            self.height = self.width * 720 // 1280
+        elif self.width is None and self.height > 0:
+            self.width = self.height * 1280 // 720
         if self.width is None or self.height is None:
             return
         if self.width <= 0 or self.height <= 0:
