@@ -2918,15 +2918,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 )
             else:
-                try:
-                    self._dispatch_to_scheduler(
-                        CancellationRetirementReq(
-                            rid=rid,
-                            cancellation_id=cancellation_id,
-                            request_instance_id=instance_id,
-                        )
-                    )
-                except Exception:
+                def _resolve_dispatch_unknown() -> None:
                     registry.resolve(
                         CancellationRetirementOutput(
                             rid=rid,
@@ -2936,6 +2928,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             reason="Cancellation dispatch failed; retirement is unknown",
                         )
                     )
+
+                try:
+                    enqueue_future = self._dispatch_to_scheduler(
+                        CancellationRetirementReq(
+                            rid=rid,
+                            cancellation_id=cancellation_id,
+                            request_instance_id=instance_id,
+                        )
+                    )
+                except Exception:
+                    _resolve_dispatch_unknown()
+                else:
+                    if isinstance(enqueue_future, asyncio.Future):
+                        def _observe_enqueue(fut: asyncio.Future) -> None:
+                            try:
+                                failed = fut.exception() is not None
+                            except asyncio.CancelledError:
+                                failed = True
+                            if failed:
+                                _resolve_dispatch_unknown()
+
+                        if enqueue_future.done():
+                            _observe_enqueue(enqueue_future)
+                        else:
+                            enqueue_future.add_done_callback(_observe_enqueue)
         output = await registry.wait(receipt, timeout_seconds)
         if output is None:
             return response("pending", "Retirement has not been confirmed")

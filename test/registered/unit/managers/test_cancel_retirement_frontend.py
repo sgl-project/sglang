@@ -220,6 +220,55 @@ class TestCancelRetirementFrontend(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retry.json()["status"], "retired")
         await self._no_request()
 
+    async def test_async_enqueue_failure_resolves_shared_receipt_without_http_waiter(
+        self,
+    ):
+        loop = asyncio.get_running_loop()
+        self._state()
+        disconnected_future = loop.create_future()
+        dispatched = []
+
+        def fake_dispatch(obj):
+            dispatched.append(obj)
+            return disconnected_future if len(dispatched) == 1 else loop.create_future()
+
+        with patch.object(self.tm, "_dispatch_to_scheduler", side_effect=fake_dispatch):
+            waiter = asyncio.create_task(
+                self._cancel(cancellation_id="async-disconnected", timeout=30)
+            )
+            self.tasks.append(waiter)
+            await asyncio.sleep(0)
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+
+            # Async zmq send failure arrives after the HTTP waiter disconnected.
+            disconnected_future.set_exception(zmq.ZMQError("send failed"))
+            await asyncio.sleep(0)
+
+            retry = await self._cancel(cancellation_id="async-disconnected", timeout=0)
+            self.assertEqual(retry.status_code, 409)
+            self.assertEqual(retry.json()["status"], "unknown")
+            self.assertIn("dispatch failed", retry.json()["reason"].lower())
+            self.assertEqual(len(dispatched), 1)
+
+            # Live waiter also wakes up immediately with unknown on async failure.
+            attached_future = loop.create_future()
+            fake_dispatch_second = lambda obj: dispatched.append(obj) or attached_future
+            with patch.object(
+                self.tm, "_dispatch_to_scheduler", side_effect=fake_dispatch_second
+            ):
+                attached = asyncio.create_task(
+                    self._cancel(cancellation_id="async-attached", timeout=30)
+                )
+                self.tasks.append(attached)
+                await asyncio.sleep(0)
+                attached_future.set_exception(zmq.ZMQError("send failed"))
+                response = await asyncio.wait_for(attached, 1)
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.json()["status"], "unknown")
+                self.assertEqual(len(dispatched), 2)
+
     async def test_negative_results_remain_bound_after_rid_reuse(self):
         cases = (
             ("unknown", {}, 409),
