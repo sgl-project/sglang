@@ -628,6 +628,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+        self._cuda_graph_custom_mask_numel = 0
         # Plain EXTEND under full prefill CUDA graph: one wrapper set
         # shared across all captured num_tokens buckets (bs fixed at 1).
         # Created lazily on first capture in _prepare_cuda_graph_metadata.
@@ -1248,6 +1249,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}
         self.draft_extend_cuda_graph_metadata = {}
+        self.forward_metadata = None
 
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
@@ -1284,11 +1286,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_kv_len),
-                dtype=torch.uint8,
-                device="cuda",
-            )
+            self._cuda_graph_custom_mask_numel = max_num_tokens * self.max_kv_len
+            self.cuda_graph_custom_mask = []
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
@@ -1330,11 +1329,22 @@ class FlashInferAttnBackend(AttentionBackend):
         # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
         # custom mask, so we must avoid initializing `custom_mask_buf`, otherwise
         # FlashInfer will treat the (zero) buffer as a real mask and block attention.
+        # Metadata setup runs before capture, so masked wrappers can allocate here.
+        if use_custom_mask and not self.cuda_graph_custom_mask:
+            self.cuda_graph_custom_mask = [
+                torch.zeros(
+                    (self._cuda_graph_custom_mask_numel,),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                for _ in range(self.num_wrappers)
+            ]
+
         wrappers = []
         for i in range(self.num_wrappers):
             extra = (
                 {
-                    "custom_mask_buf": self.cuda_graph_custom_mask,
+                    "custom_mask_buf": self.cuda_graph_custom_mask[i],
                     "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
                 }
                 if use_custom_mask
