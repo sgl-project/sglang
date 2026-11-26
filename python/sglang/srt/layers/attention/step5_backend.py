@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import msgspec
 import torch
+import triton
 
+from sglang.kernels.ops.attention.deep_select import is_deep_select_supported
 from sglang.kernels.ops.attention.step5_dsa_indexer import (
     STEP5_PAGE_SIZE,
-    Step5CompressionPlan,
-    can_use_step5_dsa_topk_deepselect,
     deepselect_score_width,
-    step5_dsa_build_compression_metadata,
 )
 from sglang.kernels.ops.attention.step5_dsa_sparse_attention import (
     step5_dsa_sparse_attention,
@@ -43,6 +42,168 @@ class Step5LayerIndexerState(msgspec.Struct, frozen=True, kw_only=True):
     index_positions: torch.Tensor
 
 
+class Step5CompressionPlan(msgspec.Struct, frozen=True, kw_only=True):
+    """Compression access plan shared by every DSA layer of one forward.
+
+    R = request rows, G = maximum completed blocks per request. Request rows need
+    not equal query rows: prefill packs a variable number of tokens per request.
+    """
+
+    request_slots: torch.Tensor  # [R], request-pool row, zero means padding
+    input_start_positions: torch.Tensor  # [R], absolute logical token position
+    input_start_rows: torch.Tensor  # [R], offset into this forward's packed K/Z
+    input_lengths: torch.Tensor  # [R], number of input K/Z rows for the request
+    # [G, R], flattened compressed-key address, NOT a physical KV page number;
+    # ordinal g names block floor(input_start_positions / region size) + g.
+    compressed_key_write_indices: torch.Tensor
+    num_input_tokens: int  # capacity of this forward's packed K/Z, including padding
+    # Input validity, shared by all layers; it does not cover layer-local ring tags.
+    request_active: torch.Tensor  # bool [R], live request row, excluding slot 0
+    request_mapping_valid: torch.Tensor  # bool [R], admission from input checks
+    request_count_valid: torch.Tensor  # bool [1], live count fits request capacity
+
+    @classmethod
+    def for_prefill(
+        cls,
+        *,
+        request_slots: torch.Tensor,
+        prefix_lengths: list[int],
+        append_lengths: list[int],
+        req_to_token: torch.Tensor,
+        compressed_index_key_pages: int,
+        region_size: int,
+    ) -> Step5CompressionPlan:
+        """A live request with an invalid completed block fails the ring admission
+        assert; padding rows consume input rows but never own ring cells."""
+        rows, source = [], 0
+        for base, length in zip(prefix_lengths, append_lengths):
+            rows.append((base, source, length))
+            source += length
+        device = req_to_token.device
+        raw_slots = torch.as_tensor(request_slots, dtype=torch.int64, device=device)
+        slots = raw_slots.clamp(0, req_to_token.shape[0] - 1)
+        packed = async_h2d(rows, dtype=torch.int64, device=device).reshape(-1, 3)
+        bases, sources, lengths = packed.T.contiguous().unbind(0)
+        active = (raw_slots != 0) & (lengths > 0)
+        uses = torch.zeros(req_to_token.shape[0], dtype=torch.int32, device=device)
+        uses.scatter_add_(0, slots, active.to(torch.int32))
+        admitted = (raw_slots == slots) & (uses[slots] == 1)
+        ratio = region_size
+        max_blocks = max(
+            ((row[0] % ratio + row[2]) // ratio for row in rows), default=0
+        )
+        block_idx = torch.arange(max_blocks, device=device)[:, None]
+        offsets = torch.arange(ratio, device=device)
+        logical = (bases // ratio + block_idx) * ratio
+        complete = logical + ratio <= bases + lengths
+        mapped = req_to_token[
+            slots[None, :, None],
+            (logical[:, :, None] + offsets).clamp_max(req_to_token.shape[1] - 1),
+        ].long()
+        first = mapped[:, :, 0]
+        valid = (
+            (first >= STEP5_PAGE_SIZE)
+            & (first < compressed_index_key_pages * STEP5_PAGE_SIZE)
+            & (first.remainder(ratio) == 0)
+            & (mapped == first[:, :, None] + offsets).all(2)
+        )
+        return cls(
+            request_slots=slots,
+            input_start_positions=bases,
+            input_start_rows=sources,
+            input_lengths=lengths,
+            request_active=active,
+            request_mapping_valid=admitted & (~complete | valid).all(0),
+            request_count_valid=torch.ones(1, dtype=torch.bool, device=device),
+            compressed_key_write_indices=(first // ratio).contiguous(),
+            num_input_tokens=source,
+        )
+
+    @classmethod
+    def for_decode(
+        cls,
+        *,
+        request_slots: torch.Tensor,
+        positions: torch.Tensor,
+        valid_rows: torch.Tensor,
+        req_to_token: torch.Tensor,
+        compressed_index_key_pages: int,
+        context_len: int,
+        region_size: int,
+    ) -> tuple[Step5CompressionPlan, torch.Tensor, torch.Tensor]:
+        """Decode plan with one input token per request, built on device only so it
+        can be captured; also returns int32 per-query request slots and positions."""
+        device = req_to_token.device
+        num_slots, num_tokens = req_to_token.shape
+        rows = request_slots.numel()
+        raw_slots = request_slots.to(torch.int64)
+        slots = raw_slots.clamp(0, num_slots - 1)
+        live = valid_rows.to(torch.int64)
+        active = (torch.arange(rows, device=device) < live) & (raw_slots != 0)
+        count_valid = (live >= 0) & (live <= rows)
+        uses = torch.zeros(num_slots, dtype=torch.int32, device=device)
+        uses.index_add_(0, slots, active.to(torch.int32))
+        bases = positions.to(torch.int64)
+        safe_positions = bases.clamp(0, num_tokens - 1)
+        physical_limit = compressed_index_key_pages * STEP5_PAGE_SIZE
+        current = req_to_token[slots, safe_positions]
+        query_valid = (
+            (bases >= 0)
+            & (bases < min(num_tokens, context_len))
+            & (current >= STEP5_PAGE_SIZE)
+            & (current < physical_limit)
+        )
+        offsets = torch.arange(region_size, device=device)
+        logical = (safe_positions // region_size * region_size)[:, None] + offsets
+        mapped = req_to_token[slots[:, None], logical.clamp_max(num_tokens - 1)]
+        first = mapped[:, 0].to(torch.int64)
+        block_valid = (
+            (first >= STEP5_PAGE_SIZE)
+            & (first < physical_limit)
+            & (first.remainder(region_size) == 0)
+            & (mapped == first[:, None] + offsets).all(1)
+        )
+        completes_block = bases.remainder(region_size) == region_size - 1
+        admitted = (
+            count_valid
+            & (slots == raw_slots)
+            & (uses[slots] == 1)
+            & query_valid
+            & (~completes_block | block_valid)
+        )
+        plan = cls(
+            request_slots=slots,
+            input_start_positions=safe_positions,
+            input_start_rows=torch.arange(rows, dtype=torch.int64, device=device),
+            input_lengths=torch.ones(rows, dtype=torch.int64, device=device),
+            request_active=active,
+            request_mapping_valid=admitted,
+            request_count_valid=count_valid,
+            compressed_key_write_indices=(
+                (first - first.remainder(region_size)) // region_size
+            )[None, :],
+            num_input_tokens=rows,
+        )
+        query_slots = torch.where(active, raw_slots, 0).to(torch.int32)
+        return plan, query_slots, safe_positions.to(torch.int32)
+
+    def prefill_query_layout(self) -> tuple[torch.Tensor, torch.Tensor]:
+        lengths = self.input_lengths
+        device = lengths.device
+        token_requests = torch.repeat_interleave(
+            torch.arange(lengths.numel(), device=device),
+            lengths,
+            output_size=self.num_input_tokens,
+        )
+        requests = self.request_slots[token_requests].to(torch.int32)
+        positions = (
+            self.input_start_positions[token_requests]
+            + torch.arange(self.num_input_tokens, device=device)
+            - self.input_start_rows[token_requests]
+        ).to(torch.int32)
+        return requests, torch.where(requests != 0, positions, 0)
+
+
 class Step5SelectionWorkspace(msgspec.Struct, frozen=True, kw_only=True):
     """Per-forward selection scratch, reused by every DSA layer in turn.
 
@@ -58,6 +219,85 @@ class Step5SelectionWorkspace(msgspec.Struct, frozen=True, kw_only=True):
     use_deepselect: bool = False
     topk_lengths: torch.Tensor | None = None
     topk_ids: torch.Tensor | None = None
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        rows: int,
+        score_width: int,
+        max_score_width: int,
+        row_to_req: torch.Tensor,
+        positions: torch.Tensor,
+        topk: int,
+        region_size: int,
+    ) -> Step5SelectionWorkspace:
+        device = positions.device
+        use_deepselect = score_width > topk
+        if use_deepselect:
+            score_width = deepselect_score_width(score_width)
+            if score_width > deepselect_score_width(max_score_width):
+                raise ValueError("Step5 score width exceeds the request capacity")
+        capacity = min(rows, STEP5_SCORE_WORKSPACE_ELEMENTS // max(score_width, 1))
+        workspace = cls(
+            packed=torch.empty((rows, topk + 1), dtype=torch.int64, device=device),
+            counts=torch.empty(rows, dtype=torch.int32, device=device),
+            lengths=torch.empty(rows, dtype=torch.int32, device=device),
+            indexer_logits=torch.empty(
+                (capacity, score_width), dtype=torch.float32, device=device
+            ),
+            ids=torch.empty((capacity, topk + 1), dtype=torch.int32, device=device),
+            use_deepselect=use_deepselect,
+            topk_lengths=(
+                torch.empty(rows, dtype=torch.int32, device=device)
+                if use_deepselect
+                else None
+            ),
+            topk_ids=(
+                torch.empty((capacity, topk), dtype=torch.int32, device=device)
+                if use_deepselect
+                else None
+            ),
+            tiles=cls._tiles(rows=rows, capacity=capacity),
+        )
+        return workspace.slice(
+            rows=rows,
+            row_to_req=row_to_req,
+            positions=positions,
+            region_size=region_size,
+        )
+
+    def slice(
+        self,
+        *,
+        rows: int,
+        row_to_req: torch.Tensor,
+        positions: torch.Tensor,
+        region_size: int,
+    ) -> Step5SelectionWorkspace:
+        capacity = min(rows, self.indexer_logits.shape[0])
+        topk_lengths = None
+        if self.use_deepselect:
+            topk_lengths = self.topk_lengths[:rows]
+            topk_lengths.copy_(torch.where(row_to_req > 0, positions // region_size, 0))
+        return Step5SelectionWorkspace(
+            packed=self.packed[:rows],
+            counts=self.counts[:rows],
+            lengths=self.lengths[:rows],
+            indexer_logits=self.indexer_logits[:capacity],
+            ids=self.ids[:capacity],
+            use_deepselect=self.use_deepselect,
+            topk_lengths=topk_lengths,
+            topk_ids=self.topk_ids[:capacity] if self.use_deepselect else None,
+            tiles=self._tiles(rows=rows, capacity=capacity),
+        )
+
+    @staticmethod
+    def _tiles(*, rows: int, capacity: int) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (start, min(start + capacity, rows))
+            for start in range(0, rows, capacity or 1)
+        )
 
 
 class Step5IndexerMetadata(msgspec.Struct, frozen=True, kw_only=True):
@@ -78,142 +318,6 @@ class Step5IndexerMetadata(msgspec.Struct, frozen=True, kw_only=True):
     compression_enabled: torch.Tensor  # bool [R], input AND layer-ring admission
     compression_success: torch.Tensor  # bool [R], success (including inert padding)
     selection_workspace: Step5SelectionWorkspace
-
-
-def _allocate_selection_workspace(
-    *,
-    rows: int,
-    score_width: int,
-    max_score_width: int,
-    row_to_req: torch.Tensor,
-    positions: torch.Tensor,
-    device: torch.device,
-    topk: int,
-    region_size: int,
-) -> Step5SelectionWorkspace:
-    use_deepselect = False
-    if score_width > topk and can_use_step5_dsa_topk_deepselect():
-        padded = deepselect_score_width(score_width)
-        if padded <= deepselect_score_width(max_score_width):
-            score_width, use_deepselect = padded, True
-    capacity = min(
-        int(rows), STEP5_SCORE_WORKSPACE_ELEMENTS // max(int(score_width), 1)
-    )
-    indexer_logits = torch.empty(
-        (capacity, score_width), dtype=torch.float32, device=device
-    )
-    topk_lengths = None
-    if use_deepselect:
-        topk_lengths = torch.empty(rows, dtype=torch.int32, device=device)
-        topk_lengths.copy_(torch.where(row_to_req > 0, positions // region_size, 0))
-    return Step5SelectionWorkspace(
-        packed=torch.empty((rows, topk + 1), dtype=torch.int64, device=device),
-        counts=torch.empty(rows, dtype=torch.int32, device=device),
-        lengths=torch.empty(rows, dtype=torch.int32, device=device),
-        indexer_logits=indexer_logits,
-        ids=torch.empty((capacity, topk + 1), dtype=torch.int32, device=device),
-        use_deepselect=use_deepselect,
-        topk_lengths=topk_lengths,
-        topk_ids=(
-            torch.empty((capacity, topk), dtype=torch.int32, device=device)
-            if use_deepselect
-            else None
-        ),
-        tiles=_selection_tiles(rows=rows, capacity=capacity),
-    )
-
-
-def _selection_tiles(*, rows: int, capacity: int) -> tuple[tuple[int, int], ...]:
-    return tuple(
-        (start, min(start + capacity, rows)) for start in range(0, rows, capacity or 1)
-    )
-
-
-def _slice_selection_workspace(
-    workspace: Step5SelectionWorkspace,
-    *,
-    rows: int,
-    row_to_req: torch.Tensor,
-    positions: torch.Tensor,
-    region_size: int,
-) -> Step5SelectionWorkspace:
-    capacity = min(rows, workspace.indexer_logits.shape[0])
-    topk_lengths = None
-    if workspace.use_deepselect:
-        topk_lengths = workspace.topk_lengths[:rows]
-        topk_lengths.copy_(torch.where(row_to_req > 0, positions // region_size, 0))
-    return Step5SelectionWorkspace(
-        packed=workspace.packed[:rows],
-        counts=workspace.counts[:rows],
-        lengths=workspace.lengths[:rows],
-        indexer_logits=workspace.indexer_logits[:capacity],
-        ids=workspace.ids[:capacity],
-        use_deepselect=workspace.use_deepselect,
-        topk_lengths=topk_lengths,
-        topk_ids=(workspace.topk_ids[:capacity] if workspace.use_deepselect else None),
-        tiles=_selection_tiles(rows=rows, capacity=capacity),
-    )
-
-
-def _build_prefill_compression_plan(
-    *,
-    request_slots: torch.Tensor,
-    prefix_lengths: list[int],
-    append_lengths: list[int],
-    req_to_token: torch.Tensor,
-    compressed_index_key_pages: int,
-    region_size: int,
-) -> Step5CompressionPlan:
-    """Build the prefill compression plan shared by every DSA layer.
-
-    A live request with an invalid completed block fails the ring admission assert;
-    padding rows consume input rows but never own ring cells or destinations.
-    """
-    rows, source = [], 0
-    for base, length in zip(prefix_lengths, append_lengths):
-        rows.append((base, source, length))
-        source += length
-    device = req_to_token.device
-    raw_slots = torch.as_tensor(request_slots, dtype=torch.int64, device=device)
-    slots = raw_slots.clamp(0, req_to_token.shape[0] - 1)
-    packed = async_h2d(rows, dtype=torch.int64, device=device).reshape(-1, 3)
-    bases, sources, lengths = packed.T.contiguous().unbind(0)
-    active = (raw_slots != 0) & (lengths > 0)
-    uses = torch.zeros(req_to_token.shape[0], dtype=torch.int32, device=device)
-    uses.scatter_add_(0, slots, active.to(torch.int32))
-    admitted = (raw_slots == slots) & (uses[slots] == 1)
-    ratio = region_size
-    max_blocks = max(((row[0] % ratio + row[2]) // ratio for row in rows), default=0)
-    block_idx = torch.arange(max_blocks, device=device)[:, None]
-    offsets = torch.arange(ratio, device=device)
-    logical = (bases // ratio + block_idx) * ratio
-    complete = logical + ratio <= bases + lengths
-    mapped = req_to_token[
-        slots[None, :, None],
-        (logical[:, :, None] + offsets).clamp_max(req_to_token.shape[1] - 1),
-    ].long()
-    first = mapped[:, :, 0]
-    valid = (
-        (first >= STEP5_PAGE_SIZE)
-        & (first < compressed_index_key_pages * STEP5_PAGE_SIZE)
-        & (first.remainder(ratio) == 0)
-        & (mapped == first[:, :, None] + offsets).all(2)
-    )
-    return Step5CompressionPlan(
-        request_slots=slots,
-        input_start_positions=bases,
-        input_start_rows=sources,
-        input_lengths=lengths,
-        request_active=active,
-        request_mapping_valid=admitted & (~complete | valid).all(0),
-        request_count_valid=torch.ones(1, dtype=torch.bool, device=device),
-        compressed_key_write_indices=(first // ratio).contiguous(),
-        num_input_tokens=source,
-    )
-
-
-def _num_blocks(num_tokens: int, region_size: int) -> int:
-    return (num_tokens + region_size - 1) // region_size
 
 
 def wrap_step5_attention_backend(runner, full_attn_backend: AttentionBackend):
@@ -241,6 +345,8 @@ def _validate_config(*, kv_pool, context_len: int, max_context_len: int) -> None
         raise ValueError("Step5 sparse attention requires BF16 KV cache")
     if kv_pool.post_capture_active:
         raise ValueError("Step5 indexer state requires an allocated full KV pool")
+    if not is_deep_select_supported():
+        raise ValueError("Step5 block selection requires a DeepSelect-capable GPU")
     if context_len > max_context_len:
         raise ValueError(f"Step5 context length must be at most {max_context_len}")
 
@@ -293,51 +399,6 @@ def _allocate_indexer_states(
         for layer_id, (index, is_swa) in kv_pool.layers_mapping.items()
         if not is_swa
     }
-
-
-def _check_forward_mode(mode: ForwardMode) -> None:
-    if not (
-        mode.is_decode_or_idle() or mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-    ):
-        raise ValueError(
-            f"Step5 sparse attention does not support forward mode {mode.name}; "
-            "speculative decoding is not supported"
-        )
-
-
-def _build_prefill_request_spans(fb: ForwardBatch) -> tuple[list[int], list[int]]:
-    prefixes = list(fb.extend_prefix_lens_cpu)
-    lengths = list(fb.extend_seq_lens_cpu)
-    tokens = sum(lengths)
-    padded_tokens = fb.input_ids.numel()
-    if tokens != padded_tokens:
-        # Prefill graphs and DP attention pad tokens without adding a request; give
-        # that tail an ownerless padding row so it never extends a live frontier.
-        prefixes.append(0)
-        lengths.append(padded_tokens - tokens)
-    return prefixes, lengths
-
-
-def _prefill_query_layout(
-    plan: Step5CompressionPlan,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    starts = plan.input_start_positions
-    sources = plan.input_start_rows
-    lengths = plan.input_lengths
-    num_tokens = plan.num_input_tokens
-    device = lengths.device
-    token_requests = torch.repeat_interleave(
-        torch.arange(lengths.numel(), device=device),
-        lengths,
-        output_size=num_tokens,
-    )
-    requests = plan.request_slots[token_requests].to(torch.int32)
-    positions = (
-        starts[token_requests]
-        + torch.arange(num_tokens, device=device)
-        - sources[token_requests]
-    ).to(torch.int32)
-    return requests, torch.where(requests != 0, positions, 0)
 
 
 class Step5AttnBackend(AttentionBackend):
@@ -397,7 +458,13 @@ class Step5AttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         self.forward_metadata = None
         mode = forward_batch.forward_mode
-        _check_forward_mode(mode)
+        if not (
+            mode.is_decode_or_idle() or mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        ):
+            raise ValueError(
+                f"Step5 sparse attention does not support forward mode {mode.name}; "
+                "speculative decoding is not supported"
+            )
         if mode.is_idle():
             return
         if mode.is_decode():
@@ -417,10 +484,9 @@ class Step5AttnBackend(AttentionBackend):
     ) -> Step5IndexerMetadata:
         req_to_token = self.req_to_token_pool.req_to_token
         if selection_workspace is None:
-            selection_workspace = _allocate_selection_workspace(
+            selection_workspace = Step5SelectionWorkspace.allocate(
                 rows=positions.numel(),
                 score_width=score_width,
-                device=plan.request_slots.device,
                 max_score_width=req_to_token.shape[1] // self.region_size,
                 row_to_req=row_to_req,
                 positions=positions,
@@ -441,11 +507,17 @@ class Step5AttnBackend(AttentionBackend):
 
     def _build_prefill_metadata(self, fb: ForwardBatch) -> Step5IndexerMetadata:
         req_to_token = self.req_to_token_pool.req_to_token
-        prefixes, lengths = _build_prefill_request_spans(fb)
+        prefixes = list(fb.extend_prefix_lens_cpu)
+        lengths = list(fb.extend_seq_lens_cpu)
         slots = fb.req_pool_indices
-        if len(lengths) > fb.batch_size:
+        padded_tokens = fb.input_ids.numel()
+        if sum(lengths) != padded_tokens:
+            # Prefill graphs and DP attention pad tokens without adding a request; give
+            # that tail an ownerless padding row so it never extends a live frontier.
+            prefixes.append(0)
+            lengths.append(padded_tokens - sum(lengths))
             slots = torch.cat((slots, slots.new_zeros(1)))
-        plan = _build_prefill_compression_plan(
+        plan = Step5CompressionPlan.for_prefill(
             request_slots=slots,
             prefix_lengths=prefixes,
             append_lengths=lengths,
@@ -453,10 +525,10 @@ class Step5AttnBackend(AttentionBackend):
             compressed_index_key_pages=self.full_num_pages,
             region_size=self.region_size,
         )
-        requests, positions = _prefill_query_layout(plan)
+        requests, positions = plan.prefill_query_layout()
         score_width = max(
             1,
-            _num_blocks(
+            triton.cdiv(
                 max((p + n for p, n in zip(prefixes, lengths)), default=0),
                 self.region_size,
             ),
@@ -490,7 +562,7 @@ class Step5AttnBackend(AttentionBackend):
         valid_rows: torch.Tensor,
         graph_workspace: Step5SelectionWorkspace | None = None,
     ) -> Step5IndexerMetadata:
-        plan, row_to_req, positions = step5_dsa_build_compression_metadata(
+        plan, row_to_req, positions = Step5CompressionPlan.for_decode(
             request_slots=fb.req_pool_indices,
             positions=fb.positions,
             valid_rows=valid_rows,
@@ -503,12 +575,11 @@ class Step5AttnBackend(AttentionBackend):
             plan=plan,
             row_to_req=row_to_req,
             positions=positions,
-            score_width=_num_blocks(self.context_len, self.region_size),
+            score_width=triton.cdiv(self.context_len, self.region_size),
             selection_workspace=(
                 None
                 if graph_workspace is None
-                else _slice_selection_workspace(
-                    graph_workspace,
+                else graph_workspace.slice(
                     rows=positions.numel(),
                     row_to_req=row_to_req,
                     positions=positions,
@@ -545,7 +616,7 @@ class Step5AttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         req_to_token = self.req_to_token_pool.req_to_token
         if (
-            _num_blocks(self.context_len, self.region_size) * self.region_size
+            triton.cdiv(self.context_len, self.region_size) * self.region_size
             > req_to_token.shape[1]
         ):
             raise ValueError("Step5 graph context exceeds native request capacity")
@@ -554,9 +625,9 @@ class Step5AttnBackend(AttentionBackend):
         self._graph_valid_rows = torch.zeros(
             1, dtype=torch.int32, device=req_to_token.device
         )
-        self._graph_workspace = _allocate_selection_workspace(
+        self._graph_workspace = Step5SelectionWorkspace.allocate(
             rows=max_bs,
-            score_width=_num_blocks(self.context_len, self.region_size),
+            score_width=triton.cdiv(self.context_len, self.region_size),
             max_score_width=req_to_token.shape[1] // self.region_size,
             row_to_req=torch.zeros(
                 max_bs, dtype=torch.int32, device=req_to_token.device
@@ -564,7 +635,6 @@ class Step5AttnBackend(AttentionBackend):
             positions=torch.zeros(
                 max_bs, dtype=torch.int32, device=req_to_token.device
             ),
-            device=req_to_token.device,
             topk=self.topk,
             region_size=self.region_size,
         )

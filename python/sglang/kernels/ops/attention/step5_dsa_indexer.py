@@ -8,13 +8,11 @@ top 512 completed regions plus its own region. QSA (qsa_indexer.py) also scores
 compressed blocks, but mean-pools raw keys and applies norm and RoPE afterwards.
 """
 
-import msgspec
 import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.arch import current_arch
-from sglang.kernels.ops.attention.deep_select import is_deep_select_supported, topk
+from sglang.kernels.ops.attention.deep_select import topk
 
 STEP5_PAGE_SIZE = 64
 
@@ -131,208 +129,7 @@ def step5_dsa_indexer_norm_rope(
     return q_out, k_out
 
 
-# Index-key compression: metadata, ring state and publication.
-
-
-@triton.jit
-def _count_request_owners_kernel(
-    Slots, Live, Uses, ROWS: tl.constexpr, CAP: tl.constexpr, BLOCK: tl.constexpr
-):
-    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    raw = tl.load(Slots + row, row < ROWS, other=0).to(tl.int64)
-    live = tl.load(Live)
-    slot = tl.minimum(tl.maximum(raw, 0), CAP - 1)
-    tl.atomic_add(
-        Uses + slot, 1, (row < ROWS) & (row < live) & (raw != 0), sem="relaxed"
-    )
-
-
-@triton.jit
-def _build_request_metadata_kernel(
-    Slots,
-    Bases,
-    Live,
-    Mapping,
-    Uses,
-    SafeSlots,
-    Starts,
-    Sources,
-    Lengths,
-    Active,
-    Admitted,
-    CountValid,
-    Writes,
-    QuerySlots,
-    QueryPositions,
-    ROWS: tl.constexpr,
-    CAP: tl.constexpr,
-    TOKENS: tl.constexpr,
-    MAP_STRIDE: tl.constexpr,
-    MAP_COL_STRIDE: tl.constexpr,
-    PHYSICAL_LIMIT: tl.constexpr,
-    CONTEXT: tl.constexpr,
-    WIDTH: tl.constexpr,
-    QBLOCK: tl.constexpr,
-    RBLOCK: tl.constexpr,
-    BLOCKS: tl.constexpr,
-    REGION: tl.constexpr,
-    PAGE: tl.constexpr,
-):
-    row = tl.program_id(0)
-    raw = tl.load(Slots + row).to(tl.int64)
-    slot = tl.minimum(tl.maximum(raw, 0), CAP - 1)
-    live = tl.load(Live).to(tl.int64)
-    active = (row < live) & (raw != 0)
-    count_ok = (live >= 0) & (live <= ROWS)
-    base = tl.load(Bases + row).to(tl.int64)
-    depth = tl.arange(0, QBLOCK)
-    pos = base + depth
-    safe_pos = tl.minimum(tl.maximum(pos, 0), TOKENS - 1)
-    current = tl.load(Mapping + slot * MAP_STRIDE + safe_pos * MAP_COL_STRIDE)
-    query_ok = (
-        (pos >= 0)
-        & (pos < tl.minimum(TOKENS, CONTEXT))
-        & (current >= PAGE)
-        & (current < PHYSICAL_LIMIT)
-    )
-    # Validate each completed R8 group once; current-token mappings above stay
-    # per query because native FULL pages need not be physically adjacent.
-    block_idx = tl.arange(0, RBLOCK)
-    closing_depth = REGION - 1 - (base % REGION + REGION) % REGION + block_idx * REGION
-    closing_pos = tl.minimum(
-        tl.maximum(base + tl.minimum(closing_depth, WIDTH - 1), 0), TOKENS - 1
-    )
-    offset = tl.arange(0, REGION)
-    logical = closing_pos[:, None] // REGION * REGION + offset[None, :]
-    mapped = tl.load(
-        Mapping + slot * MAP_STRIDE + tl.minimum(logical, TOKENS - 1) * MAP_COL_STRIDE
-    )
-    first = tl.sum(tl.where(offset[None, :] == 0, mapped.to(tl.int64), 0), 1)
-    block_ok = (
-        (first >= PAGE)
-        & (first < PHYSICAL_LIMIT)
-        & (first % REGION == 0)
-        & tl.min((mapped == first[:, None] + offset[None, :]).to(tl.int32), 1)
-    )
-    completed = (block_idx < BLOCKS) & (closing_depth < WIDTH)
-    admitted = (
-        count_ok
-        & (slot == raw)
-        & (tl.load(Uses + slot) == 1)
-        & tl.min(tl.where(depth < WIDTH, query_ok, True).to(tl.int32), 0)
-        & tl.min((~completed | block_ok).to(tl.int32), 0)
-    )
-    tl.store(SafeSlots + row, slot)
-    tl.store(Starts + row, tl.minimum(tl.maximum(base, 0), TOKENS - 1))
-    tl.store(Sources + row, row * WIDTH)
-    tl.store(Lengths + row, WIDTH)
-    tl.store(Active + row, active)
-    tl.store(Admitted + row, admitted)
-    if row == 0:
-        tl.store(CountValid, count_ok)
-
-    # Destinations are stored in [completed-block, request] order. An incomplete
-    # block is never consumed but still gets a deterministic value for graph replay.
-    tl.store(
-        Writes + block_idx * ROWS + row,
-        (first - (first % REGION + REGION) % REGION) // REGION,
-        block_idx < BLOCKS,
-    )
-
-    query_pos = safe_pos
-    tl.store(QueryPositions + row * WIDTH + depth, query_pos, depth < WIDTH)
-    tl.store(QuerySlots + row * WIDTH + depth, tl.where(active, raw, 0), depth < WIDTH)
-
-
-class Step5CompressionPlan(msgspec.Struct, frozen=True, kw_only=True):
-    """Compression access plan shared by every DSA layer of one forward.
-
-    R = request rows, G = maximum completed blocks per request. Request rows need
-    not equal query rows: prefill packs a variable number of tokens per request.
-    """
-
-    request_slots: torch.Tensor  # [R], request-pool row, zero means padding
-    input_start_positions: torch.Tensor  # [R], absolute logical token position
-    input_start_rows: torch.Tensor  # [R], offset into this forward's packed K/Z
-    input_lengths: torch.Tensor  # [R], number of input K/Z rows for the request
-    # [G, R], flattened compressed-key address, NOT a physical KV page number;
-    # ordinal g names block floor(input_start_positions / region size) + g.
-    compressed_key_write_indices: torch.Tensor
-    num_input_tokens: int  # capacity of this forward's packed K/Z, including padding
-    # Input validity, shared by all layers; it does not cover layer-local ring tags.
-    request_active: torch.Tensor  # bool [R], live request row, excluding slot 0
-    request_mapping_valid: torch.Tensor  # bool [R], admission from input checks
-    request_count_valid: torch.Tensor  # bool [1], live count fits request capacity
-
-
-def step5_dsa_build_compression_metadata(
-    *,
-    request_slots: torch.Tensor,
-    positions: torch.Tensor,
-    valid_rows: torch.Tensor,
-    req_to_token: torch.Tensor,
-    compressed_index_key_pages: int,
-    context_len: int,
-    region_size: int,
-) -> tuple[Step5CompressionPlan, torch.Tensor, torch.Tensor]:
-    """Build the decode compression plan (one input token per request).
-
-    Returns the plan fields plus int32 per-query request slots and positions.
-    """
-    device = req_to_token.device
-    rows = request_slots.numel()
-    num_slots, token_capacity = req_to_token.shape
-    num_blocks = 1
-    plan = Step5CompressionPlan(
-        request_slots=torch.empty(rows, dtype=torch.int64, device=device),
-        input_start_positions=torch.empty(rows, dtype=torch.int64, device=device),
-        input_start_rows=torch.empty(rows, dtype=torch.int64, device=device),
-        input_lengths=torch.empty(rows, dtype=torch.int64, device=device),
-        request_active=torch.empty(rows, dtype=torch.bool, device=device),
-        request_mapping_valid=torch.empty(rows, dtype=torch.bool, device=device),
-        request_count_valid=torch.empty(1, dtype=torch.bool, device=device),
-        compressed_key_write_indices=torch.empty(
-            (num_blocks, rows), dtype=torch.int64, device=device
-        ),
-        num_input_tokens=rows,
-    )
-    query_slots = torch.empty(rows, dtype=torch.int32, device=device)
-    query_positions = torch.empty(rows, dtype=torch.int32, device=device)
-    uses = torch.zeros(num_slots, dtype=torch.int32, device=device)
-    _count_request_owners_kernel[(triton.cdiv(rows, 128),)](
-        request_slots, valid_rows, uses, rows, num_slots, 128
-    )
-    _build_request_metadata_kernel[(rows,)](
-        request_slots,
-        positions,
-        valid_rows,
-        req_to_token,
-        uses,
-        plan.request_slots,
-        plan.input_start_positions,
-        plan.input_start_rows,
-        plan.input_lengths,
-        plan.request_active,
-        plan.request_mapping_valid,
-        plan.request_count_valid,
-        plan.compressed_key_write_indices,
-        query_slots,
-        query_positions,
-        rows,
-        num_slots,
-        token_capacity,
-        *req_to_token.stride(),
-        compressed_index_key_pages * STEP5_PAGE_SIZE,
-        context_len,
-        1,
-        1,
-        triton.next_power_of_2(num_blocks),
-        num_blocks,
-        region_size,
-        STEP5_PAGE_SIZE,
-        num_warps=4,
-    )
-    return plan, query_slots, query_positions
+# Index-key compression and ring state.
 
 
 @triton.jit
@@ -475,7 +272,6 @@ def _compress_kernel(
     ROWS: tl.constexpr,
     Z_ROW: tl.constexpr,
     D: tl.constexpr,
-    PAGE: tl.constexpr,
 ):
     block_offset, row = tl.program_id(0), tl.program_id(1)
     if ADMIT:
@@ -537,15 +333,7 @@ def _compress_kernel(
                 D,
             )
             dest = tl.load(physical + block_offset * ROWS + row).to(tl.int64)
-            page_rows = PAGE // CAPACITY
-            within = dest % page_rows
-            sw128 = (
-                (ch // 128) * (page_rows * 128)
-                + within * 128
-                + (((ch % 128) // 16) ^ within) * 16
-                + ch % 16
-            )
-            tl.store(paged + dest // page_rows * (page_rows * D) + sw128, packed)
+            tl.store(paged + dest * D + ch, packed)
 
 
 @triton.jit
@@ -620,7 +408,7 @@ def step5_dsa_append_ring(
     ring_positions: torch.Tensor,
     compressed_index_keys: torch.Tensor,
 ) -> None:
-    """Compress completed R8 blocks into the SW128 FP8 index-key pages, then keep
+    """Compress completed regions into the FP8 index-key pages, then keep
     each request's newest K/Z inputs in its ring for the next forward."""
     assert index_key.is_contiguous() and compression_logits.stride(-1) == 1
     rows = slots.numel()
@@ -663,7 +451,6 @@ def step5_dsa_append_ring(
             rows,
             compression_logits.stride(0),
             index_key.shape[-1],
-            STEP5_PAGE_SIZE,
             num_warps=8,
             enable_fp_fusion=True,
             debug=True,
@@ -710,7 +497,6 @@ def _score_blocks_kernel(
     WEIGHT_SCALE: tl.constexpr,
     D: tl.constexpr,
     REGION: tl.constexpr,
-    PAGE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     first_tile = tl.program_id(1)
@@ -739,17 +525,7 @@ def _score_blocks_kernel(
                 valid,
                 other=0,
             ).to(tl.int64)
-            page_rows = PAGE // REGION
-            page, slot = token // PAGE, token % PAGE // REGION
-            # Each page contains D / 128 channel atoms of 128 bytes, each with
-            # page_rows swizzled block rows. XOR uses the physical row, never logical ID.
-            offset = (
-                page[None, :] * (page_rows * D)
-                + (channel[:, None] // 128) * (page_rows * 128)
-                + slot[None, :] * 128
-                + (((channel[:, None] % 128) // 16) ^ slot[None, :]) * 16
-                + channel[:, None] % 16
-            )
+            offset = (token // REGION)[None, :] * D + channel[:, None]
             packed = tl.load(CompressedIndexKeys + offset, valid[None, :], other=0)
             keys = packed.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
             products = tl.dot(query, keys)
@@ -807,22 +583,11 @@ def _indexer_logits(
         1.0,
         head_dim,
         region_size,
-        STEP5_PAGE_SIZE,
         num_warps=4,
     )
 
 
 # Block top-k and packed attention addresses.
-
-
-@triton.jit
-def _canonicalize_zero_kernel(Scores, Out, N: tl.constexpr, BLOCK: tl.constexpr):
-    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    bits = tl.load(Scores + offset, offset < N, other=0.0).to(tl.uint32, bitcast=True)
-    # FlashInfer's radix ordering distinguishes signed zero. Preserve all other
-    # bits, including subnormals, so numerical ties prefer the smaller block ID.
-    bits = tl.where((bits & 0x7FFFFFFF) == 0, 0, bits)
-    tl.store(Out + offset, bits.to(tl.float32, bitcast=True), offset < N)
 
 
 @triton.jit
@@ -926,185 +691,9 @@ def _launch_block_pack(
 _SCORE_STRIDE_ALIGNMENT = 256
 
 
-def can_use_step5_dsa_topk_deepselect() -> bool:
-    cuda = current_arch().cuda
-    return cuda is not None and cuda.is_sm(10) and is_deep_select_supported()
-
-
 def deepselect_score_width(score_width: int) -> int:
     align = _SCORE_STRIDE_ALIGNMENT
     return (score_width + align - 1) // align * align
-
-
-def _topk_blocks_deepselect(
-    scores: torch.Tensor,
-    *,
-    positions: torch.Tensor,
-    row_to_req: torch.Tensor,
-    history_lengths: torch.Tensor,
-    req_to_token: torch.Tensor,
-    topk_ids: torch.Tensor,
-    block_indices: torch.Tensor,
-    counts: torch.Tensor,
-    packed: torch.Tensor,
-    causal_lengths: torch.Tensor,
-    topk_size: int,
-    region_size: int,
-) -> None:
-    """SM10x ``_topk_blocks`` that also writes the packed attention addresses.
-
-    ``history_lengths`` is int32 positions // region_size per row, zero for padding.
-    """
-    topk(
-        scores,
-        topk_size,
-        end=history_lengths,
-        output_idx=topk_ids,
-        idx_oob_fill_value=-1,
-    )
-    _launch_block_pack(
-        indices=topk_ids,
-        positions=positions,
-        row_to_req=row_to_req,
-        block_indices=block_indices,
-        counts=counts,
-        selected_k=topk_size,
-        topk=topk_size,
-        region_size=region_size,
-        req_to_token=req_to_token,
-        packed=packed,
-        causal_lengths=causal_lengths,
-    )
-
-
-def _topk_blocks(
-    scores: torch.Tensor,
-    *,
-    positions: torch.Tensor,
-    row_to_req: torch.Tensor,
-    block_indices: torch.Tensor,
-    counts: torch.Tensor,
-    topk_size: int,
-    region_size: int,
-) -> None:
-    """Select up to topk_size history blocks per row, sorted, then append the
-    current block.
-
-    ``block_indices`` is int32 [T, topk_size + 1] of logical block IDs padded with
-    -1; ``counts`` is int32 [T] and includes the current block.
-    """
-    assert scores.ndim == 2 and scores.dtype == torch.float32
-    assert scores.is_contiguous()
-    rows, width = scores.shape
-    assert block_indices.shape == (rows, topk_size + 1)
-    assert block_indices.dtype == torch.int32
-    assert counts.shape == (rows,) and counts.dtype == torch.int32
-    selected_k = 0
-    indices = block_indices
-    if width > topk_size:
-        import flashinfer
-
-        # Numerical equality includes +0/-0; the library's radix key does not.
-        # Keep the caller's scores intact, including during graph replay.
-        ordered_scores = torch.empty_like(scores)
-        size = scores.numel()
-        _canonicalize_zero_kernel[(triton.cdiv(size, 1024),)](
-            scores, ordered_scores, size, 1024, num_warps=4
-        )
-        _, indices = flashinfer.top_k(
-            ordered_scores,
-            topk_size,
-            sorted=False,
-            deterministic=True,
-            tie_break=1,
-            dsa_graph_safe=True,
-        )
-        selected_k = topk_size
-
-    _launch_block_pack(
-        indices=indices,
-        positions=positions,
-        row_to_req=row_to_req,
-        block_indices=block_indices,
-        counts=counts,
-        selected_k=selected_k,
-        topk=topk_size,
-        region_size=region_size,
-    )
-
-
-@triton.jit
-def _pack_decode_blocks_kernel(
-    Ids,
-    Counts,
-    Mapping,
-    Requests,
-    Positions,
-    Packed,
-    Lengths,
-    MAP_STRIDE: tl.constexpr,
-    WIDTH: tl.constexpr,
-    SELECTED: tl.constexpr,
-    BLOCK: tl.constexpr,
-    REGION: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    lane = tl.arange(0, BLOCK)
-    request = tl.load(Requests + row).to(tl.int64)
-    count = tl.load(Counts + row)
-    live = request > 0
-    active = live & (lane < count) & (lane < SELECTED)
-    block_idx = tl.load(Ids + row * SELECTED + lane, active, other=0).to(tl.int64)
-    logical_start = block_idx * REGION
-    physical_start = tl.load(
-        Mapping + request * MAP_STRIDE + logical_start,
-        active,
-        other=0,
-    ).to(tl.int64)
-    value = ((physical_start // REGION) << 32) | logical_start
-    tl.store(Packed + row * WIDTH + lane, tl.where(active, value, -1), lane < WIDTH)
-    position = tl.load(Positions + row).to(tl.int32)
-    tl.store(Lengths + row, tl.where(live, position + 1, 0))
-
-
-def _pack_selected_blocks(
-    block_indices: torch.Tensor,
-    counts: torch.Tensor,
-    *,
-    req_to_token: torch.Tensor,
-    row_to_req: torch.Tensor,
-    positions: torch.Tensor,
-    packed_blocks: torch.Tensor,
-    causal_lengths: torch.Tensor,
-    region_size: int,
-) -> None:
-    """Map selected logical blocks to packed int64 attention addresses.
-
-    Each output holds physical_start // region_size in the high word and
-    logical_start in the low word; slots past ``counts`` are -1 and padding rows get
-    causal length 0.
-    """
-    rows, selected = block_indices.shape
-    assert block_indices.dtype == torch.int32
-    assert packed_blocks.shape[0] == rows
-    assert packed_blocks.shape[1] in (selected, selected + 1, selected + 3)
-    assert packed_blocks.dtype == torch.int64 and packed_blocks.is_contiguous()
-    assert req_to_token.stride(1) == 1
-    _pack_decode_blocks_kernel[(rows,)](
-        block_indices,
-        counts,
-        req_to_token,
-        row_to_req,
-        positions,
-        packed_blocks,
-        causal_lengths,
-        req_to_token.stride(0),
-        packed_blocks.shape[1],
-        selected,
-        triton.next_power_of_2(selected),
-        region_size,
-        num_warps=4,
-    )
 
 
 def step5_dsa_select_blocks(
@@ -1128,50 +717,35 @@ def step5_dsa_select_blocks(
     region_size: int,
 ) -> None:
     for start, end in tiles:
-        tile_scores = indexer_logits[: end - start]
-        tile_ids = ids[: end - start]
-        _indexer_logits(
-            q=index_q[start:end],
-            weights=index_weights[start:end],
-            compressed_index_keys=compressed_index_keys,
-            req_to_token=req_to_token,
-            row_to_req=row_to_req[start:end],
-            positions=positions[start:end],
-            out=tile_scores,
-            region_size=region_size,
-        )
+        rows = slice(start, end)
         if use_deepselect:
-            _topk_blocks_deepselect(
-                tile_scores,
-                positions=positions[start:end],
-                row_to_req=row_to_req[start:end],
-                history_lengths=topk_lengths[start:end],
+            _indexer_logits(
+                q=index_q[rows],
+                weights=index_weights[rows],
+                compressed_index_keys=compressed_index_keys,
                 req_to_token=req_to_token,
-                topk_ids=topk_ids[: end - start],
-                block_indices=tile_ids,
-                counts=counts[start:end],
-                packed=packed[start:end],
-                causal_lengths=lengths[start:end],
-                topk_size=topk_size,
+                row_to_req=row_to_req[rows],
+                positions=positions[rows],
+                out=indexer_logits[: end - start],
                 region_size=region_size,
             )
-        else:
-            _topk_blocks(
-                tile_scores,
-                positions=positions[start:end],
-                row_to_req=row_to_req[start:end],
-                block_indices=tile_ids,
-                counts=counts[start:end],
-                topk_size=topk_size,
-                region_size=region_size,
+            topk(
+                indexer_logits[: end - start],
+                topk_size,
+                end=topk_lengths[rows],
+                output_idx=topk_ids[: end - start],
+                idx_oob_fill_value=-1,
             )
-            _pack_selected_blocks(
-                tile_ids,
-                counts[start:end],
-                req_to_token=req_to_token,
-                row_to_req=row_to_req[start:end],
-                positions=positions[start:end],
-                packed_blocks=packed[start:end],
-                causal_lengths=lengths[start:end],
-                region_size=region_size,
-            )
+        _launch_block_pack(
+            indices=topk_ids[: end - start] if use_deepselect else ids[: end - start],
+            positions=positions[rows],
+            row_to_req=row_to_req[rows],
+            block_indices=ids[: end - start],
+            counts=counts[rows],
+            selected_k=topk_size if use_deepselect else 0,
+            topk=topk_size,
+            region_size=region_size,
+            req_to_token=req_to_token,
+            packed=packed[rows],
+            causal_lengths=lengths[rows],
+        )
