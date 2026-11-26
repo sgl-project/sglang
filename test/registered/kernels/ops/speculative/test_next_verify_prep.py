@@ -3,7 +3,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_inputs,
@@ -333,6 +333,95 @@ def test_combined_verify_commit_metadata(bs, width, interval):
             torch.testing.assert_close(tracking, ref, rtol=0, atol=0)
         else:
             assert tracking is None
+
+
+def _legacy_chain_accept_indices(num_accept_tokens, block_size):
+    steps = torch.arange(block_size, device=num_accept_tokens.device)
+    rows = torch.arange(num_accept_tokens.numel(), device=num_accept_tokens.device)
+    flat = rows[:, None] * block_size + steps
+    return torch.where(steps < num_accept_tokens[:, None], flat, -1)
+
+
+@pytest.mark.parametrize("block_size", [2, 3, 5, 8, 16])
+@pytest.mark.parametrize("bs", [1, 7, 64])
+@pytest.mark.parametrize("accept", ["greedy", "sampled", "reject_all", "accept_all"])
+def test_dflash_commit_block_graph(block_size, bs, accept):
+    """The graph-replayed committed block and chain indices equal the eager ops
+    the DFlash worker ran before, bit for bit and dtype for dtype."""
+    from sglang.kernels.ops.speculative.dflash import (
+        compute_dflash_correct_drafts_and_bonus,
+        dflash_chain_accept_indices,
+        dflash_commit_block,
+    )
+    from sglang.srt.speculative.dflash_worker_v2 import _commit_accept
+
+    gen = torch.Generator(device="cuda").manual_seed(bs * 31 + block_size)
+
+    def draw(*shape):
+        return torch.randint(0, 1 << 40, shape, device="cuda", generator=gen)
+
+    candidates = draw(bs, block_size)
+    prefix_lens = draw(bs)
+    # A strided int32 view, as a sampler's accept column can be.
+    num_correct_drafts = torch.zeros((bs, 2), device="cuda", dtype=torch.int32)[:, 0]
+    bonus_tokens = draw(bs)
+    out_tokens = torch.full((bs, block_size), -7, device="cuda", dtype=torch.int64)
+    num_accept_tokens = torch.full((bs,), -7, device="cuda", dtype=torch.int32)
+    new_seq_lens = torch.full((bs,), -7, device="cuda", dtype=torch.int64)
+
+    def launch():
+        dflash_commit_block(
+            candidates=candidates,
+            num_correct_drafts=num_correct_drafts,
+            bonus_tokens=bonus_tokens,
+            prefix_lens=prefix_lens,
+            out_tokens=out_tokens,
+            num_accept_tokens_out=num_accept_tokens,
+            new_seq_lens_out=new_seq_lens,
+        )
+        return dflash_chain_accept_indices(
+            num_accept_tokens=num_accept_tokens, block_size=block_size
+        )
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        accept_indices = launch()
+    for _ in range(3):
+        candidates.copy_(draw(bs, block_size))
+        prefix_lens.copy_(draw(bs))
+        if accept == "greedy":
+            # Each target token matches the next draft with probability 3/4.
+            hit = torch.rand((bs, block_size), device="cuda", generator=gen) < 0.75
+            target = torch.where(hit, candidates.roll(-1, dims=1), draw(bs, block_size))
+            correct, bonus = compute_dflash_correct_drafts_and_bonus(
+                candidates=candidates, target_predict=target
+            )
+        else:
+            correct = {
+                "sampled": torch.randint(
+                    0, block_size, (bs,), device="cuda", generator=gen
+                ),
+                "reject_all": torch.zeros((bs,), device="cuda"),
+                "accept_all": torch.full((bs,), block_size - 1, device="cuda"),
+            }[accept]
+            bonus = draw(bs)
+        num_correct_drafts.copy_(correct)
+        bonus_tokens.copy_(bonus)
+        graph.replay()
+
+        ref_tokens, ref_num_accept = _commit_accept(
+            candidates, num_correct_drafts, bonus_tokens
+        )
+        expected = (
+            ref_tokens,
+            ref_num_accept,
+            prefix_lens + ref_num_accept.to(prefix_lens.dtype),
+            _legacy_chain_accept_indices(ref_num_accept, block_size),
+        )
+        actual = (out_tokens, num_accept_tokens, new_seq_lens, accept_indices)
+        for a, e in zip(actual, expected):
+            torch.testing.assert_close(a, e, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
