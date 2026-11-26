@@ -54,7 +54,6 @@ from sglang.srt.model_loader.weight_utils import (
     get_quant_config,
     inspect_safetensors_tensor_names,
 )
-from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration,
@@ -63,7 +62,12 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration,
 )
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
-from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet, Qwen3NextForCausalLM
+from sglang.srt.models.qwen3_next import (
+    Qwen3GatedDeltaNet,
+    Qwen3NextForCausalLM,
+    Qwen3NextModel,
+)
+from sglang.srt.models.qwen3_next_mtp import Qwen3NextForCausalLMMTP
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -1154,7 +1158,9 @@ class TestQwen35GdnGptqUnquantFallback(CustomTestCase):
                 "lm_head": False,
             }
         )
-        mock_moe = SimpleNamespace(__class__=FusedMoE)
+        mock_moe = SimpleNamespace(
+            __class__=FusedMoE, num_experts=1, num_fused_shared_experts=0
+        )
         with patch(
             "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", SimpleNamespace
         ):
@@ -1221,6 +1227,7 @@ class TestQwen35GptqMoeUnquantFallback(CustomTestCase):
             get_parallel().override(
                 tp_group=None,
                 attn_tp_group=None,
+                attn_tp_rank=0,
                 tp_rank=0,
                 moe_ep_rank=0,
                 moe_tp_rank=0,
@@ -1359,43 +1366,106 @@ class TestQwen35GptqMoeUnquantFallback(CustomTestCase):
                 moe = self._moe(cfg, "model.layers.0.mlp.experts")
                 self.assertIsInstance(moe.quant_method, UnquantizedFusedMoEMethod)
 
-    def _qwen3_next_mtp_experts(self, cfg, is_nextn):
+    @staticmethod
+    def _qwen3_next_config():
         config = Qwen3NextConfig(
+            vocab_size=256,
             hidden_size=256,
+            intermediate_size=256,
             moe_intermediate_size=256,
+            shared_expert_intermediate_size=256,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
             num_experts=2,
             num_experts_per_tok=1,
-            shared_expert_intermediate_size=0,
         )
-        block = Qwen2MoeSparseMoeBlock(
-            layer_id=0,
-            config=config,
-            quant_config=cfg,
-            prefix="model.layers.0.mlp",
-            is_nextn=is_nextn,
-        )
-        return block.experts
+        config.full_attention_interval = 1
+        return config
 
     def test_qwen3_next_draft_follows_the_mtp_checkpoint_prefix(self):
+        self.enterContext(
+            get_parallel().override(pp_group=SimpleNamespace(is_last_rank=False))
+        )
+        self.enterContext(
+            patch(
+                "sglang.srt.models.qwen3_next.get_rope",
+                return_value=torch.nn.Identity(),
+            )
+        )
         dynamic = {r"-:model\.layers\.0\..*": {}}
+        self.enterContext(
+            patch(
+                "sglang.srt.layers.quantization.marlin_utils.get_device_capability",
+                return_value=(8, 0),
+            )
+        )
+        self.enterContext(
+            patch("sglang.srt.layers.quantization.marlin_utils._is_cuda", True)
+        )
+        for name, cfg in (("marlin", _make_gptq_marlin_config(dynamic=dynamic)),):
+            with self.subTest(config=name):
+                target = Qwen3NextModel(self._qwen3_next_config(), cfg, prefix="model")
+                self.assertIsInstance(
+                    target.layers[0].mlp.experts.quant_method,
+                    UnquantizedFusedMoEMethod,
+                )
+                draft = Qwen3NextForCausalLMMTP(self._qwen3_next_config(), cfg)
+                names = {n for n, _ in draft.named_parameters()}
+                self.assertTrue(any("experts.w13_qweight" in n for n in names))
+                self.assertTrue(any("qkv_proj.qweight" in n for n in names))
+                self.assertTrue(any("shared_expert.gate_up_proj.qweight" in n for n in names))
+                qweight = dict(draft.named_parameters())[
+                    next(n for n in names if "experts.w13_qweight" in n)
+                ]
+                qweight.zero_()
+                with get_parallel().override(
+                    tp_group=SimpleNamespace(device=qweight.device)
+                ):
+                    Qwen3NextForCausalLMMTP.load_weights(
+                        draft,
+                        [
+                            (
+                                "mtp.layers.0.mlp.experts.0.gate_proj.qweight",
+                                self._gate_qweight_shard(),
+                            )
+                        ],
+                    )
+                self.assertTrue(bool((qweight != 0).any()))
+
+    def test_experts_with_mixed_precision_in_the_checkpoint_are_rejected(self):
+        prefix = "model.layers.0.mlp.experts"
+        tensors = [
+            f"{prefix}.{e}.{p}.{kind}"
+            for e, kind in ((0, "qweight"), (1, "weight"))
+            for p in ("gate_proj", "up_proj", "down_proj")
+        ]
         for name, cfg in (
-            ("marlin", _make_gptq_marlin_config(dynamic=dynamic)),
-            ("moe_wna16", self._moe_wna16_gptq(dynamic)),
+            ("marlin", _make_gptq_marlin_config()),
+            ("moe_wna16", self._moe_wna16_gptq({})),
         ):
             with self.subTest(config=name):
-                target = self._qwen3_next_mtp_experts(cfg, is_nextn=False)
-                self.assertIsInstance(target.quant_method, UnquantizedFusedMoEMethod)
-                draft = self._qwen3_next_mtp_experts(cfg, is_nextn=True)
-                self.assertIsInstance(
-                    draft.quant_method, (GPTQMarlinMoEMethod, MoeWNA16Method)
-                )
-                self._assert_qwen3_loader_fills_qweight(
-                    draft,
-                    lambda module, weights: Qwen3NextForCausalLM.load_weights(
-                        module, weights, is_mtp=True
-                    ),
-                    "mtp.layers.0.mlp.experts.0.gate_proj.qweight",
-                )
+                cfg.set_checkpoint_tensor_names(tensors)
+                with self.assertRaisesRegex(ValueError, "mixed dense and quantized"):
+                    self._moe(cfg, prefix)
+
+    def test_stacked_expert_tensors_decide_the_layout(self):
+        prefix = "model.layers.0.mlp.experts"
+        for name, make_cfg in (
+            ("marlin", _make_gptq_marlin_config),
+            ("moe_wna16", lambda: self._moe_wna16_gptq({})),
+        ):
+            for kind, expected in (
+                ("weight", UnquantizedFusedMoEMethod),
+                ("qweight", (GPTQMarlinMoEMethod, MoeWNA16Method)),
+            ):
+                with self.subTest(config=name, stacked=kind):
+                    cfg = make_cfg()
+                    cfg.set_checkpoint_tensor_names(
+                        [f"{prefix}.gate_up_proj.{kind}", f"{prefix}.down_proj.{kind}"]
+                    )
+                    self.assertIsInstance(self._moe(cfg, prefix).quant_method, expected)
 
     def test_moe_wna16_awq_moe_does_not_run_the_gptq_probe(self):
         with patch(

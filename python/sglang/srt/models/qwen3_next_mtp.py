@@ -72,7 +72,9 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         self.model = Qwen3NextModel(
             mtp_config,
             quant_config,
-            prefix=add_prefix("model", prefix),
+            # Checkpoint tensors are ``mtp.layers.N``; quantization exclusions
+            # are written against those names, not the target's ``model.layers.N``.
+            prefix=add_prefix("mtp", prefix),
             is_nextn=True,
         )
         self.lm_head = ParallelLMHead(
