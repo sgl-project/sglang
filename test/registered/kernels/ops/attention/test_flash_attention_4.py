@@ -1715,7 +1715,7 @@ class TestFlashAttention4SM90(CustomTestCase):
 
     def test_fp8_kv_cache_fp16_q(self):
         """fp16 Q on both hd 512 paths: FP8 MMA (page 64) keeps 8 of its 11
-        significant bits in the e4m3 pair, the cast (page 1) all of them."""
+        significant bits in the e4m3 + e5m2 pair, the cast (page 1) all of them."""
         for page_size in (64, 1):
             with self.subTest(page=page_size):
                 inputs = _gemma4_fp8_kv_inputs((2100, 3000), 2048, page_size, seed=2)
@@ -1878,6 +1878,71 @@ class TestFlashAttention4SM90(CustomTestCase):
                     )
                     ref = _fp8_kv_reference(inputs, q_len, q=q.float() * softmax_scale)
                     _assert_fp8_kv_close(out, ref, fp8_mma=True)
+
+    def _two_key_fp8_kv_inputs(self, batch, k0, dtype, page_size):
+        """Two keys per request, k0 and -k0, with V rows of ones and zeros:
+        every output element is the weight of key 0."""
+        inputs = _gemma4_fp8_kv_inputs((2,) * batch, 1, page_size, seed=5)
+        k = torch.zeros(inputs["k"].shape, device="cuda")
+        # Pages hold consecutive tokens of one request: key 0 is its first slot.
+        first = inputs["page_table"][:, 0].long()
+        second = first if page_size > 1 else inputs["page_table"][:, 1].long()
+        k[first, 0], k[second, 1 % page_size] = k0, -k0
+        v = torch.zeros_like(k)
+        v[first, 0] = 1.0
+        inputs["k"], inputs["v"] = k.to(torch.float8_e4m3fn), v.to(torch.float8_e4m3fn)
+        inputs["v_descale"] = torch.ones_like(inputs["v_descale"])
+        inputs["q"] = torch.zeros_like(inputs["q"], dtype=dtype)
+        return inputs
+
+    def _two_key_weight(self, inputs):
+        out, _ = _flash_attn_fwd(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            cu_seqlens_q=inputs["cu_seqlens_q"],
+            seqused_k=inputs["cache_seqlens"],
+            max_seqlen_q=1,
+            page_table=inputs["page_table"],
+            softmax_scale=1.0,
+            causal=True,
+            k_descale=inputs["k_descale"],
+            v_descale=inputs["v_descale"],
+            num_splits=1,
+        )
+        return out.float()
+
+    def test_fp8_kv_cache_adjacent_q_values(self):
+        """FP8 MMA keeps neighbouring bf16 Q values distinct: its e4m3 + e5m2
+        pair is exact for bf16. Q holds a value and the next one below it in
+        dims 0 and 1 against keys (16, -16) and (-16, 16), descaled so the two
+        scores are +1 and -1: a Q pair that merged them would tie the keys at
+        0.5. One request per binade from 2^-6 to 2^8, one mantissa and sign
+        per head. On the cast (page 1) the same holds for fp16."""
+        k0 = torch.zeros(512, device="cuda")
+        k0[0], k0[1] = 16.0, -16.0
+        binades = torch.arange(-6, 9, device="cuda", dtype=torch.float32)
+        heads = torch.arange(32, device="cuda", dtype=torch.float32)
+        for dtype, bits, page_size in ((torch.bfloat16, 7, 64), (torch.float16, 10, 1)):
+            with self.subTest(dtype=dtype):
+                inputs = self._two_key_fp8_kv_inputs(len(binades), k0, dtype, page_size)
+                ulp = torch.exp2(binades - bits)[:, None]
+                # Odd mantissas below 1.5, so the top binade stays under 448.
+                upper = torch.exp2(binades)[:, None] * (
+                    1 + (2 * heads[None, :] + 1) * 2 ** (bits - 7) / 2**bits
+                )
+                sign = torch.where(heads % 2 == 0, 1.0, -1.0)[None, :]
+                q = torch.zeros(len(binades), 32, 512, device="cuda")
+                q[..., 0], q[..., 1] = sign * upper, sign * (upper - ulp)
+                inputs["q"] = q.to(dtype)
+                self.assertTrue(torch.equal(inputs["q"].float(), q))
+                # score = +-16 * ulp * descale = +-1
+                inputs["k_descale"] = (1 / (16 * ulp)).expand(-1, 4).contiguous()
+                weight = self._two_key_weight(inputs)
+                expected = torch.sigmoid(2 * sign).expand(len(binades), -1)
+                torch.testing.assert_close(
+                    weight, expected[..., None].expand_as(weight), atol=0.01, rtol=0
+                )
 
     def test_fp8_kv_cache_mask_paths_bit_identical(self):
         """A text request gets the same bits whether it runs alone (causal) or

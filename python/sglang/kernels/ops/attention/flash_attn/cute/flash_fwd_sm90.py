@@ -88,7 +88,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Q and P are each an e4m3 high term plus an e5m2 residual (WGMMA takes
             # e5m2 x e4m3). e5m2 reaches 2^-16, so the residual keeps what underflows
             # e4m3 (Q components down to ~2^-17), and both terms share a scale and
-            # an accumulator.
+            # an accumulator. A bf16 value has 8 significant bits: the high term
+            # rounds to 4 and the residual, at most half its ulp, fits e5m2's 3,
+            # so bf16 Q is exact for 2^-6 <= |q| <= 464. fp16 Q (11 bits) keeps 8
+            # of them: within 2^-8 of each value.
             self.fp8_res_dtype = cutlass.Float8E5M2
             # P is scaled before its cast so small probabilities keep precision over
             # long contexts (down to ~2^-25 of the row max); the inverse joins the
