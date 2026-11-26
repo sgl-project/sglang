@@ -30,7 +30,7 @@ by this document and may introduce breaking changes.
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`              |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 94208` |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27` |
+| NPU Graph                     | enabled by default; disable with `--disable-decode-cuda-graph --disable-prefill-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27` |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
@@ -100,9 +100,18 @@ on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 
 {/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
 ```bash Command
+# ============================================================
+# Before running, update the following variables or use default values:
+#   NAME: container name
+# ============================================================
+
+NAME=sglang-qwen3-235b-a22b
+
+# pull image
 docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 
-docker run -itd --shm-size=16g --name ${NAME} \
+# create container
+docker run -itd --shm-size=16g --name "$NAME" \
 --privileged=true --net=host \
 -e ASCEND_VISIBLE_DEVICES=0-15 \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -111,12 +120,14 @@ docker run -itd --shm-size=16g --name ${NAME} \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --entrypoint=bash \
 quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
+
+# enter container
+docker exec -it "$NAME" bash
 ```
 
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
   container, for example: `-v /path/to/models:/models`.
-- Replace `${NAME}` with your own container name or remove `--name` to use default name.
 </Tip>
 
 ## Online service deployment
@@ -211,7 +222,7 @@ python3 -m sglang.launch_server \
     --disaggregation-transfer-backend ascend \
     --attention-backend ascend \
     --mem-fraction-static 0.8 \
-    --disable-cuda-graph \
+    --disable-decode-cuda-graph --disable-prefill-cuda-graph \
     --device npu \
     --quantization modelslim \
     --disable-radix-cache \
@@ -330,7 +341,7 @@ python3 -m sglang.launch_server \
     --quantization modelslim \
     --attention-backend ascend \
     --disable-radix-cache \
-    --disable-cuda-graph \
+    --disable-decode-cuda-graph --disable-prefill-cuda-graph \
     --mem-fraction-static 0.7 \
     --chunked-prefill-size 32768 \
     --skip-server-warmup \

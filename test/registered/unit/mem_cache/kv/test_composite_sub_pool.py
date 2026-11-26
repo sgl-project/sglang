@@ -140,6 +140,7 @@ def _build(plan, full_tokens=64):
             state_slots=4,
             max_running_requests=2,
             context_len=64,
+            req_to_token_row_width=64,
             alignment=1,
         ),
     )
@@ -154,7 +155,6 @@ def _build(plan, full_tokens=64):
             enable_memory_saver=False,
             need_sort=False,
             max_num_reqs=2,
-            model_context_len=64,
             disable_overlap_schedule=True,
         ),
     )
