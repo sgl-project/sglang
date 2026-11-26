@@ -75,6 +75,8 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
+CI prefetches the Hugging Face models each test file needs, found by a static scan of the repo ids and `DEFAULT_*` model constants the file names (`scripts/ci/hf_repo_scan.py`). A model id built at runtime is not found: write it into the file as a literal. A model the file names but does not load on CUDA is dropped next to the registration with `declare_models(skip_models=[...])`, whose items are repo id literals or model constants, e.g. `declare_models(skip_models=[DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST])`.
+
 Directories under `test/registered/` group tests by topic and are free-form
 (`lora/`, `hicache/`, `disaggregation/`, `perf/`, ...); unit tests cover one srt
 module, so they mirror the source tree under `unit/`. What a test costs, which
