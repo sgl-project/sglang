@@ -388,6 +388,9 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         scheduler._retract_batches.side_effect = Scheduler._retract_batches.__get__(
             scheduler
         )
+        scheduler._start_pause_window.side_effect = (
+            Scheduler._start_pause_window.__get__(scheduler)
+        )
 
         req = MagicMock()
         req.rid = "r1"
