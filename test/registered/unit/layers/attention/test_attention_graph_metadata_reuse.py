@@ -36,7 +36,7 @@ class TestFlashInferCudaGraphMetadataReuse(unittest.TestCase):
                 backend.prefill_cuda_graph_metadata = {}
                 backend.draft_extend_cuda_graph_metadata = {}
                 backend.num_wrappers = 1
-                backend.max_context_len = 4
+                backend.max_kv_len = 4
                 backend.skip_prefill = True
                 backend.use_sliding_window_kv_pool = False
                 backend.init_cuda_graph_state(
@@ -150,7 +150,7 @@ class TestTRTLLMMLAGraphMetadata(unittest.TestCase):
         backend = trtllm_mla.TRTLLMMLABackend.__new__(trtllm_mla.TRTLLMMLABackend)
         backend.decode_cuda_graph_metadata = {}
         backend.decode_cuda_graph_kv_indices = torch.zeros((4, 4), dtype=torch.int32)
-        backend.max_context_len = 32
+        backend.max_kv_len = 32
         backend.num_draft_tokens = 3
         backend._calc_padded_blocks = lambda _: 4
         backend.runner_ids = SimpleNamespace(
@@ -167,15 +167,10 @@ class TestTRTLLMMLAGraphMetadata(unittest.TestCase):
         ):
             with self.subTest(mode=mode):
                 lengths = torch.ones(2, dtype=torch.int64)
-                num_tokens = 2 if mode.is_decode_or_idle() else 6
-                backend._init_cuda_graph_metadata(
-                    2, num_tokens, mode, lengths, lengths.device
-                )
+                backend._init_cuda_graph_metadata(2, mode, lengths.device)
                 first = backend.forward_decode_metadata
                 captured.append(first.seq_lens_k)
-                backend._init_cuda_graph_metadata(
-                    2, num_tokens, mode, lengths, lengths.device
-                )
+                backend._init_cuda_graph_metadata(2, mode, lengths.device)
                 page_table = (
                     torch.arange(8, dtype=torch.int32).reshape(2, 4) + 8 * index
                 )
@@ -191,14 +186,10 @@ class TestTRTLLMMLAGraphMetadata(unittest.TestCase):
                 torch.testing.assert_close(first.block_kv_indices, page_table)
 
         lengths = torch.ones(4, dtype=torch.int64)
-        backend._init_cuda_graph_metadata(
-            4, 4, ForwardMode.DECODE, lengths, lengths.device
-        )
+        backend._init_cuda_graph_metadata(4, ForwardMode.DECODE, lengths.device)
         captured.append(backend.forward_decode_metadata.seq_lens_k)
         self.assertEqual(len({buffer.data_ptr() for buffer in captured}), 4)
-        backend._init_cuda_graph_metadata(
-            2, 2, ForwardMode.IDLE, lengths[:2], lengths.device
-        )
+        backend._init_cuda_graph_metadata(2, ForwardMode.IDLE, lengths.device)
         self.assertEqual(
             backend.forward_decode_metadata.seq_lens_k.data_ptr(),
             captured[0].data_ptr(),

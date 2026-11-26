@@ -994,6 +994,11 @@ def validate_removed_options(server_args: Any):
     The CLI rejects a removed value while parsing; this covers the Python API.
     """
     cfg = resolving_view(server_args)
+    if cfg.num_continuous_decode_steps is not None:
+        logger.warning("num_continuous_decode_steps is deprecated and has no effect.")
+        declare_resolution(
+            server_args, "validate_removed_options", num_continuous_decode_steps=None
+        )
     for field in REMOVED_CHOICES:
         message = removed_choice_message(field, getattr(cfg, field))
         if message is not None:

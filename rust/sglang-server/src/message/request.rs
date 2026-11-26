@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -947,6 +947,65 @@ pub struct MmData {
     pub mm_hashes: Vec<String>,
     /// How admission handled the media, for the processor's own timing.
     pub admission: MediaAdmission,
+    /// Cancelled by intake when the request is aborted while the MM pool
+    /// holds it, so the processor can stop work nobody will read.
+    pub cancellation: MmCancellation,
+}
+
+/// A request's cancellation, shared by its clones. Callbacks registered with
+/// [`Self::on_cancel`] run once, on the thread that cancels (at once if it
+/// already has), so they must not block. A default one is cancelled only by
+/// a holder of a clone calling [`Self::cancel`].
+#[derive(Clone, Default)]
+pub struct MmCancellation(Arc<Mutex<CancellationState>>);
+
+#[derive(Default)]
+struct CancellationState {
+    cancelled: bool,
+    callbacks: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+impl MmCancellation {
+    /// Idempotent: the first call runs the callbacks.
+    pub fn cancel(&self) {
+        let callbacks = {
+            let mut state = self.lock();
+            if state.cancelled {
+                return;
+            }
+            state.cancelled = true;
+            std::mem::take(&mut state.callbacks)
+        };
+        for callback in callbacks {
+            callback();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.lock().cancelled
+    }
+
+    pub fn on_cancel(&self, callback: impl FnOnce() + Send + 'static) {
+        let mut state = self.lock();
+        if state.cancelled {
+            drop(state);
+            callback();
+        } else {
+            state.callbacks.push(Box::new(callback));
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, CancellationState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl std::fmt::Debug for MmCancellation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmCancellation")
+            .field("cancelled", &self.is_cancelled())
+            .finish_non_exhaustive()
+    }
 }
 
 /// How admission handled one request's media before the MM processor runs:
