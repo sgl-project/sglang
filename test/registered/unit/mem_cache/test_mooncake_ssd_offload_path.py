@@ -225,6 +225,11 @@ class TestMooncakeSsdOffloadPath(CustomTestCase):
             self.assertFalse(store.should_split_heads)
             self.assertEqual(store.split_factor, 0)
 
+            standalone_cfg = _make_config(tp_rank=0, pp_rank=0, ssd_offload_path=None)
+            standalone_cfg.extra_config["standalone_storage"] = True
+            with self.assertRaises(RuntimeError):
+                MooncakeStore(storage_config=standalone_cfg, mem_pool=None)
+
             cfg = MooncakeStoreConfig.load_from_extra_config(
                 {
                     "master_server_address": None,
