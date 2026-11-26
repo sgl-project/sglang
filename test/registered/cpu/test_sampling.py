@@ -79,5 +79,41 @@ def test_watermark_state_folds_wide_multimodal_padding_ids():
     assert original_hash.item() == stored_hash.item()
 
 
+def test_watermark_state_folds_negative_int32_wide_ids_across_rollover():
+    from sglang.srt.sampling.watermarking.gumbel.algorithm import hash_contexts
+    from sglang.srt.sampling.watermarking.gumbel.state import WatermarkState
+
+    # The low 32 bits set the int32 sign bit (0x8000007B == -2147483525), so
+    # the folded value is negative on this platform.
+    wide_id = (1 << 62) | 0x8000007B
+    folded = ((wide_id & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+    assert folded == -2147483525
+
+    context_window = 4
+    state = WatermarkState(
+        max_num_reqs=1,
+        context_window=context_window,
+        max_contexts_per_req=2,
+        device="cpu",
+    )
+    state.init_from_prompt(torch.tensor([0], dtype=torch.int32), [[7, wide_id, 123]])
+    state.append(torch.tensor([0], dtype=torch.int32), torch.tensor([10]))
+    state.append(torch.tensor([0], dtype=torch.int32), torch.tensor([11]))
+
+    # Two appends roll the ring buffer past the window; the tail now starts at
+    # write position 1 and the folded negative id is still present.
+    contexts, lengths = state.contexts_tail(torch.tensor([0], dtype=torch.int32))
+    assert lengths.item() == context_window
+    assert contexts[0].tolist() == [folded, 123, 10, 11]
+
+    # Folding still preserves the original low-32-bit hash after rollover.
+    lengths = torch.tensor([context_window], dtype=torch.int32)
+    original_hash = hash_contexts(
+        torch.tensor([[wide_id, 123, 10, 11]], dtype=torch.int64), lengths
+    )
+    stored_hash = hash_contexts(contexts.to(torch.int64), lengths)
+    assert original_hash.item() == stored_hash.item()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
