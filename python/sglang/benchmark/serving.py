@@ -1174,14 +1174,20 @@ def calculate_metrics(
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
+                pending_itl = 0.0
                 for k, itl in enumerate(outputs[i].itl):
+                    pending_itl += itl
                     num_tokens = len(
                         tokenizer.encode(
                             outputs[i].text_chunks[k], add_special_tokens=False
                         )
                     )
-                    adjusted_itl = itl / num_tokens
+                    if num_tokens == 0:
+                        # Carry the elapsed time to the next chunk with tokens.
+                        continue
+                    adjusted_itl = pending_itl / num_tokens
                     retokenized_itls.extend([adjusted_itl] * num_tokens)
+                    pending_itl = 0.0
             else:
                 itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
