@@ -26,6 +26,46 @@ GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 
+@triton.jit
+def _int8_tile_absmax(tile, cols, K: tl.constexpr):
+    return tl.max(tl.where(cols[None, :] < K, tl.abs(tile), 0.0), axis=1)
+
+
+@triton.jit
+def _store_int8_tile(state, tile, scale, rows, cols, V: tl.constexpr, K: tl.constexpr):
+    q = tl.extra.cuda.libdevice.rint(tile / scale[:, None])
+    q = tl.maximum(tl.minimum(q, 127.0), -127.0).to(tl.int8)
+    tl.store(
+        state + rows[:, None] * K + cols[None, :],
+        q,
+        mask=(rows[:, None] < V) & (cols[None, :] < K),
+    )
+
+
+@triton.jit
+def _store_int8_rows(
+    state, scales, h1, h2, h3, h4, rows, V: tl.constexpr, K: tl.constexpr
+):
+    # One program owns all K columns of each V row, including a partial K tile.
+    cols = tl.arange(0, 64)
+    amax = _int8_tile_absmax(h1, cols, K)
+    if K > 64:
+        amax = tl.maximum(amax, _int8_tile_absmax(h2, cols + 64, K))
+    if K > 128:
+        amax = tl.maximum(amax, _int8_tile_absmax(h3, cols + 128, K))
+    if K > 192:
+        amax = tl.maximum(amax, _int8_tile_absmax(h4, cols + 192, K))
+    scale = tl.maximum(amax / 127.0, 1e-12)
+    _store_int8_tile(state, h1, scale, rows, cols, V, K)
+    if K > 64:
+        _store_int8_tile(state, h2, scale, rows, cols + 64, V, K)
+    if K > 128:
+        _store_int8_tile(state, h3, scale, rows, cols + 128, V, K)
+    if K > 192:
+        _store_int8_tile(state, h4, scale, rows, cols + 192, V, K)
+    tl.store(scales + rows, scale, mask=rows < V)
+
+
 @triton.autotune(
     # Single hardcoded config. The kernel writes ht (final state) back into
     # initial_state in-place; with multiple configs, triton's autotune benchmark
@@ -60,11 +100,16 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     initial_state,
     initial_state_indices,
+    initial_state_scale,
+    has_initial_state,
     stride_init_state,
+    stride_scale_slot,
+    stride_scale_head,
     cu_seqlens,
     chunk_offsets,
     track_state,
     track_chunk_idx,
+    track_state_indices,
     stride_track_state,
     T,
     H: tl.constexpr,
@@ -82,6 +127,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     NT_BUCKET: tl.constexpr,
     USE_EXP2: tl.constexpr,
     TRACK_STATE: tl.constexpr,
+    INITIAL_STATE_INT8: tl.constexpr,
+    HAS_INITIAL_STATE_MASK: tl.constexpr,
+    TRACK_STATE_INT8: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -102,10 +150,16 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
     if K > 64:
         b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
+    elif INITIAL_STATE_INT8:
+        b_h2 = b_h1
     if K > 128:
         b_h3 = tl.zeros([BV, 64], dtype=tl.float32)
+    elif INITIAL_STATE_INT8:
+        b_h3 = b_h1
     if K > 192:
         b_h4 = tl.zeros([BV, 64], dtype=tl.float32)
+    elif INITIAL_STATE_INT8:
+        b_h4 = b_h1
 
     # calculate offset
     # Widen before the products: casting afterwards only widens a wrapped int32.
@@ -136,12 +190,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     if INPLACE_UPDATE:
         ht = ht + i_h * V * K
 
-    if TRACK_STATE:
+    if TRACK_STATE or TRACK_STATE_INT8:
         i_track = tl.load(track_chunk_idx + i_n).to(tl.int32)
-        p_track_base = track_state + i_n.to(tl.int64) * stride_track_state + i_h * V * K
     else:
         i_track = -1
-        p_track_base = track_state
+    if TRACK_STATE:
+        p_track_base = track_state + i_n.to(tl.int64) * stride_track_state + i_h * V * K
+    if TRACK_STATE_INT8:
+        track_slot = tl.load(track_state_indices + i_n).to(tl.int64)
 
     o_v = i_v * BV + tl.arange(0, BV)
     m_v = o_v < V
@@ -158,8 +214,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     m_h3 = m_v[:, None] & m_k3[None, :]
     m_h4 = m_v[:, None] & m_k4[None, :]
 
-    # load initial state
-    if USE_INITIAL_STATE and valid_state:
+    if HAS_INITIAL_STATE_MASK:
+        load_initial_state = valid_state & tl.load(has_initial_state + i_n)
+    else:
+        load_initial_state = valid_state
+    if USE_INITIAL_STATE and load_initial_state:
         p_h0_1 = h0 + o_v[:, None] * K + o_k1[None, :]
         b_h1 += tl.load(p_h0_1, mask=m_h1, other=0.0).to(tl.float32)
         if K > 64:
@@ -171,6 +230,23 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         if K > 192:
             p_h0_4 = h0 + o_v[:, None] * K + o_k4[None, :]
             b_h4 += tl.load(p_h0_4, mask=m_h4, other=0.0).to(tl.float32)
+
+        if INITIAL_STATE_INT8:
+            row_scales = tl.load(
+                initial_state_scale
+                + index * stride_scale_slot
+                + i_h * stride_scale_head
+                + o_v,
+                mask=m_v,
+                other=0.0,
+            )
+            b_h1 *= row_scales[:, None]
+            if K > 64:
+                b_h2 *= row_scales[:, None]
+            if K > 128:
+                b_h3 *= row_scales[:, None]
+            if K > 192:
+                b_h4 *= row_scales[:, None]
 
     # main recurrence
     for i_t in range(NT):
@@ -200,6 +276,19 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             if K > 192:
                 p_t4 = p_track_base + o_v[:, None] * K + o_k4[None, :]
                 tl.store(p_t4, b_h4, mask=m_h4)
+
+        if TRACK_STATE_INT8 and valid_state and track_slot >= 0 and i_t == i_track:
+            track_checkpoint = (
+                initial_state + track_slot * stride_init_state + i_h * V * K
+            )
+            track_scales = (
+                initial_state_scale
+                + track_slot * stride_scale_slot
+                + i_h * stride_scale_head
+            )
+            _store_int8_rows(
+                track_checkpoint, track_scales, b_h1, b_h2, b_h3, b_h4, o_v, V, K
+            )
 
         p_w = w + o_t[:, None] * stride_w + o_k1[None, :]
         b_w = tl.load(p_w, mask=m_t[:, None] & m_k1[None, :], other=0.0)
@@ -303,17 +392,25 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # epilogue
     if INPLACE_UPDATE and valid_state:
-        p_ht = ht + o_v[:, None] * K + o_k1[None, :]
-        tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), mask=m_h1)
-        if K > 64:
-            p_ht = ht + o_v[:, None] * K + o_k2[None, :]
-            tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), mask=m_h2)
-        if K > 128:
-            p_ht = ht + o_v[:, None] * K + o_k3[None, :]
-            tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), mask=m_h3)
-        if K > 192:
-            p_ht = ht + o_v[:, None] * K + o_k4[None, :]
-            tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), mask=m_h4)
+        if INITIAL_STATE_INT8:
+            scales = (
+                initial_state_scale
+                + index * stride_scale_slot
+                + i_h * stride_scale_head
+            )
+            _store_int8_rows(ht, scales, b_h1, b_h2, b_h3, b_h4, o_v, V, K)
+        else:
+            p_ht = ht + o_v[:, None] * K + o_k1[None, :]
+            tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), mask=m_h1)
+            if K > 64:
+                p_ht = ht + o_v[:, None] * K + o_k2[None, :]
+                tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), mask=m_h2)
+            if K > 128:
+                p_ht = ht + o_v[:, None] * K + o_k3[None, :]
+                tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), mask=m_h3)
+            if K > 192:
+                p_ht = ht + o_v[:, None] * K + o_k4[None, :]
+                tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), mask=m_h4)
 
 
 def chunk_gated_delta_rule_fwd_h(
@@ -332,13 +429,31 @@ def chunk_gated_delta_rule_fwd_h(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    initial_state_scale: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    track_state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not (use_exp2 and g is not None), (
         "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
     )
-    assert (track_state is None) == (track_chunk_idx is None), (
-        "track_state and track_chunk_idx must be passed together"
-    )
+    initial_state_int8 = initial_state is not None and initial_state.dtype == torch.int8
+    if initial_state_int8 != (initial_state_scale is not None):
+        raise ValueError("INT8 initial state and FP32 scales must be supplied together")
+    if initial_state_int8:
+        if not initial_state.is_cuda or torch.version.hip is not None:
+            raise ValueError("fused INT8 GDN prefill requires NVIDIA CUDA")
+        if (
+            initial_state_scale.shape != initial_state.shape[:-1]
+            or initial_state_scale.stride(-1) != 1
+            or initial_state_scale.dtype != torch.float32
+            or initial_state_scale.device != initial_state.device
+        ):
+            raise ValueError("INT8 state requires FP32 scales with contiguous V rows")
+    if track_state_indices is not None:
+        if not initial_state_int8 or track_chunk_idx is None or track_state is not None:
+            raise ValueError("INT8 tracking requires chunk and destination indices")
+    elif (track_state is None) != (track_chunk_idx is None):
+        raise ValueError("track_state and track_chunk_idx must be passed together")
     if track_state is not None:
         # The caller rounds once to the pool dtype; a narrower buffer would
         # silently double-round the snapshot.
@@ -379,13 +494,18 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        initial_state_scale=initial_state_scale,
+        has_initial_state=has_initial_state,
         # Envelope-strided state pools (page-major / unified memory) have a
         # per-slot pitch != H*V*K; contiguous pools pass exactly H*V*K.
         stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
+        stride_scale_slot=initial_state_scale.stride(0) if initial_state_int8 else 0,
+        stride_scale_head=initial_state_scale.stride(1) if initial_state_int8 else 0,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         track_state=track_state,
         track_chunk_idx=track_chunk_idx,
+        track_state_indices=track_state_indices,
         stride_track_state=(track_state.stride(0) if track_state is not None else 0),
         T=T,
         H=H,
@@ -402,5 +522,8 @@ def chunk_gated_delta_rule_fwd_h(
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,
         TRACK_STATE=track_state is not None,
+        INITIAL_STATE_INT8=initial_state_int8,
+        HAS_INITIAL_STATE_MASK=has_initial_state is not None,
+        TRACK_STATE_INT8=track_state_indices is not None,
     )
     return h, v_new

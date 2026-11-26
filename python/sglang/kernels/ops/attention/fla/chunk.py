@@ -49,6 +49,10 @@ def chunk_gated_delta_rule_fwd(
     o_chunk_indices: torch.LongTensor | None = None,
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
+    initial_state_scale: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
+    track_state_indices: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -64,6 +68,16 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
 
+    int8_args = (
+        {
+            "initial_state_scale": initial_state_scale,
+            "has_initial_state": has_initial_state,
+            "track_chunk_idx": track_chunk_idx,
+            "track_state_indices": track_state_indices,
+        }
+        if initial_state_scale is not None
+        else {}
+    )
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -75,6 +89,7 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
         inplace_update=inplace_update,
         chunk_offsets=chunk_offsets,
+        **int8_args,
     )
     o = chunk_fwd_o(
         q=q,
@@ -106,7 +121,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
     @staticmethod
     # The kernels step initial_state's slots by its stride(0), so a strided
     # pool is read and updated in place; chunk_gated_delta_rule packs each slot.
-    @input_guard(keep_strides=("initial_state",))
+    @input_guard(keep_strides=("initial_state", "initial_state_scale"))
     @autocast_custom_fwd
     def forward(
         ctx,
@@ -125,6 +140,10 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         chunk_offsets: Optional[torch.LongTensor] = None,
         out: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
+        initial_state_scale: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        track_chunk_idx: Optional[torch.Tensor] = None,
+        track_state_indices: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -154,6 +173,10 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             o_chunk_indices=o_chunk_indices,
             out=out,
             output_indices=output_indices,
+            initial_state_scale=initial_state_scale,
+            has_initial_state=has_initial_state,
+            track_chunk_idx=track_chunk_idx,
+            track_state_indices=track_state_indices,
         )
         return o.to(q.dtype), h
 
@@ -176,6 +199,10 @@ def chunk_gated_delta_rule(
     chunk_offsets: Optional[torch.LongTensor] = None,
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
+    initial_state_scale: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
+    track_state_indices: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -206,6 +233,15 @@ def chunk_gated_delta_rule(
             Default: `False`.
         inplace_update (Optional[bool]):
             Whether to write final states back to `initial_state`. Default: `True`.
+        initial_state_scale (Optional[torch.Tensor]):
+            FP32 scales `[slots, H, V]` for an INT8 state pool. The kernel
+            dequantizes into FP32 and quantizes the final accumulator directly.
+        has_initial_state (Optional[torch.Tensor]):
+            Per-sequence boolean mask. False starts from zero without reading a slot.
+        track_chunk_idx, track_state_indices (Optional[torch.Tensor]):
+            Per-sequence chunk-start index and INT8 destination slot. Use -1
+            for an inactive destination. Tracking slots must be unique and
+            disjoint from the batch's active slots.
         out, output_indices (Optional[torch.Tensor]):
             Inference-only contiguous output buffer and one destination per input token.
             The caller supplies unique, in-range destinations and initializes unmapped
@@ -308,7 +344,46 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    if initial_state is not None and not _has_packed_slots(initial_state):
+    initial_state_int8 = initial_state is not None and initial_state.dtype == torch.int8
+    if initial_state_int8 != (initial_state_scale is not None):
+        raise ValueError("INT8 initial state and FP32 scales must be supplied together")
+    if initial_state_int8:
+        if not initial_state.is_cuda or torch.version.hip is not None:
+            raise ValueError("fused INT8 GDN prefill requires NVIDIA CUDA")
+        if initial_state.device != q.device:
+            raise ValueError("INT8 state and query must be on the same CUDA device")
+        if not _has_packed_slots(initial_state):
+            raise ValueError(
+                "each INT8 state slot must have a contiguous [H, V, K] layout"
+            )
+        state_rows = len(cu_seqlens) - 1 if cu_seqlens is not None else q.shape[0]
+        if initial_state_indices is None:
+            raise ValueError("INT8 prefill requires one state slot index per sequence")
+        for name, tensor, dtypes in (
+            (
+                "initial_state_indices",
+                initial_state_indices,
+                (torch.int32, torch.int64),
+            ),
+            ("has_initial_state", has_initial_state, (torch.bool,)),
+            ("track_chunk_idx", track_chunk_idx, (torch.int32, torch.int64)),
+            ("track_state_indices", track_state_indices, (torch.int32, torch.int64)),
+        ):
+            if tensor is not None and (
+                tensor.shape != (state_rows,)
+                or tensor.device != q.device
+                or tensor.dtype not in dtypes
+            ):
+                raise ValueError(
+                    f"{name} must have one value per sequence on the query device"
+                )
+    elif any(
+        t is not None for t in (has_initial_state, track_chunk_idx, track_state_indices)
+    ):
+        raise ValueError(
+            "prefill state masks and INT8 tracking require an INT8 checkpoint"
+        )
+    elif initial_state is not None and not _has_packed_slots(initial_state):
         initial_state = initial_state.contiguous()
     o, h = ChunkGatedDeltaRuleFunction.apply(
         q,
@@ -326,6 +401,10 @@ def chunk_gated_delta_rule(
         chunk_offsets,
         out,
         output_indices,
+        initial_state_scale,
+        has_initial_state,
+        track_chunk_idx,
+        track_state_indices,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

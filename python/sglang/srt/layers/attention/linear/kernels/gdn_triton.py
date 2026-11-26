@@ -193,6 +193,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
         use_qk_l2norm_in_kernel: bool = True,
         out: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
+        initial_state_scale: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        track_chunk_idx: Optional[torch.Tensor] = None,
+        track_state_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
@@ -231,6 +235,18 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
 
+        int8_args = {}
+        if ssm_states.dtype == torch.int8 or initial_state_scale is not None:
+            if is_cpu() or is_npu() or is_xpu():
+                raise NotImplementedError(
+                    "fused INT8 prefill requires the CUDA Triton kernel"
+                )
+            int8_args = {
+                "initial_state_scale": initial_state_scale,
+                "has_initial_state": has_initial_state,
+                "track_chunk_idx": track_chunk_idx,
+                "track_state_indices": track_state_indices,
+            }
         return chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -245,6 +261,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             **inplace_update_args,
             **graph_table_args,
             **output_args,
+            **int8_args,
         )
 
     def target_verify(
