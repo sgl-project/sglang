@@ -25,6 +25,11 @@ concurrency:
   group: xpu-ci-job-monitor-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only GITHUB_TOKEN: the jobs list runs and download artifacts through the API.
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   fetch-actions-data:
     name: Fetch Actions Snapshot
