@@ -16,6 +16,7 @@
 import filecmp
 import json
 import multiprocessing
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -31,14 +32,13 @@ from transformers.utils import cached_file
 
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
+from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_mm,
     get_model,
     get_parallel,
-    get_server_args,
     get_serving,
     process_model_config,
-    publish,
 )
 from sglang.srt.utils import logger
 
@@ -73,33 +73,47 @@ from .tokenizer import (
 _IMAGE_PROCESSOR_BACKENDS = {"auto", "torchvision", "pil"}
 
 
-def load_scheduler_tokenizer(*, is_multimodal: bool):
-    """Load the tokenizer and optional processor with the resolved serving options."""
+def _tokenizer_load_options(is_multimodal):
     serving = get_serving()
     model = get_model()
-    kwargs = dict(
+    tokenizer_opts = dict(
+        tokenizer_name=serving.tokenizer_path,
         tokenizer_mode=serving.tokenizer_mode,
         tokenizer_backend=serving.tokenizer_backend,
         trust_remote_code=model.trust_remote_code,
         revision=model.revision,
     )
+    processor_opts = None
     if is_multimodal:
-        processor = get_processor(
-            serving.tokenizer_path,
+        processor_opts = dict(
             image_processor_backend=get_mm().image_processor_backend,
             model_name=model.model_path,
-            **kwargs,
         )
+    return tokenizer_opts, processor_opts
+
+
+def load_scheduler_tokenizer(*, is_multimodal: bool):
+    """Load the tokenizer and optional processor with the resolved serving options."""
+    tokenizer_opts, processor_opts = _tokenizer_load_options(is_multimodal)
+    if processor_opts is not None:
+        processor = get_processor(**tokenizer_opts, **processor_opts)
         return get_tokenizer_from_processor(processor), processor
-    return get_tokenizer(serving.tokenizer_path, **kwargs), None
+    return get_tokenizer(**tokenizer_opts), None
 
 
-def _prewarm_in_subprocess(server_args, staging_dir):
-    # Tokenizer backends (e.g. fastokens) and custom modules can patch the
-    # interpreter. Only the completed Python sources should reach the launcher.
+def _prewarm_in_subprocess(
+    staging_dir, tokenizer_opts, processor_opts, python_frontend
+):
+    # spawn inherits sys.path. Prefer staged packages even when the launcher
+    # has already imported the checkpoint's AutoConfig from the shared cache.
     dynamic_module_utils.HF_MODULES_CACHE = staging_dir
-    publish(server_args, role="tokenizer")
-    load_scheduler_tokenizer(is_multimodal=process_model_config().is_multimodal)
+    sys.path.insert(0, staging_dir)
+    load_plugins()
+    if processor_opts is not None:
+        get_processor(**tokenizer_opts, **processor_opts)
+    if processor_opts is None or python_frontend:
+        # Python detokenizers load a standalone tokenizer even for MM models.
+        get_tokenizer(**tokenizer_opts)
 
 
 def maybe_prewarm_scheduler_tokenizer():
@@ -125,8 +139,14 @@ def maybe_prewarm_scheduler_tokenizer():
         cache = Path(dynamic_module_utils.HF_MODULES_CACHE)
         cache.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=cache) as staging:
+            # Unpickling ServerArgs can import a custom config before staging
+            # is active. Send only the resolved loader arguments across spawn.
+            tokenizer_opts, processor_opts = _tokenizer_load_options(
+                process_model_config().is_multimodal
+            )
             proc = multiprocessing.get_context("spawn").Process(
-                target=_prewarm_in_subprocess, args=(get_server_args(), staging)
+                target=_prewarm_in_subprocess,
+                args=(staging, tokenizer_opts, processor_opts, python_frontend),
             )
             proc.start()
             try:

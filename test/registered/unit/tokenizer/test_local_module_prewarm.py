@@ -22,7 +22,7 @@ from sglang.srt.hf_transformers.processor import (
     load_scheduler_tokenizer,
     maybe_prewarm_scheduler_tokenizer,
 )
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import process_model_config, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -53,6 +53,19 @@ def isolated_hf_modules_cache(cache):
         finally:
             pop_dynamic_modules()
             sys.modules.update(previous)
+
+
+def write_custom_tokenizer(model):
+    config_path = model / "tokenizer_config.json"
+    config = json.loads(config_path.read_text())
+    config["auto_map"] = {"AutoTokenizer": [None, "custom.LocalTokenizer"]}
+    config_path.write_text(json.dumps(config))
+    (model / "custom.py").write_text(
+        "from transformers import BertTokenizer\n"
+        "from .helper import MARKER\n"
+        "class LocalTokenizer(BertTokenizer):\n    marker = MARKER\n"
+    )
+    (model / "helper.py").write_text("MARKER = 'warm'\n")
 
 
 class TestLocalModulePrewarm(CustomTestCase):
@@ -143,6 +156,15 @@ class TestLocalModulePrewarm(CustomTestCase):
             LlavaProcessor(
                 image_processor=CLIPImageProcessor(), tokenizer=BertTokenizer()
             ).save_pretrained(model)
+            # A resolved ServerArgs can retain an HF config class from the real cache.
+            config_path = model / "config.json"
+            config = json.loads(config_path.read_text())
+            config["auto_map"] = {"AutoConfig": "configuration.LocalConfig"}
+            config_path.write_text(json.dumps(config))
+            (model / "configuration.py").write_text(
+                "from transformers import LlavaConfig\n"
+                "class LocalConfig(LlavaConfig):\n    pass\n"
+            )
             processor_config = model / "processor_config.json"
             config = json.loads(processor_config.read_text())
             config["auto_map"] = {"AutoProcessor": "processing.LocalProcessor"}
@@ -151,16 +173,7 @@ class TestLocalModulePrewarm(CustomTestCase):
                 "from transformers import LlavaProcessor\n"
                 "class LocalProcessor(LlavaProcessor):\n    pass\n"
             )
-            config_path = model / "tokenizer_config.json"
-            config = json.loads(config_path.read_text())
-            config["auto_map"] = {"AutoTokenizer": [None, "custom.LocalTokenizer"]}
-            config_path.write_text(json.dumps(config))
-            (model / "custom.py").write_text(
-                "from transformers import BertTokenizer\n"
-                "from .helper import MARKER\n"
-                "class LocalTokenizer(BertTokenizer):\n    marker = MARKER\n"
-            )
-            (model / "helper.py").write_text("MARKER = 'warm'\n")
+            write_custom_tokenizer(model)
 
             with isolated_hf_modules_cache(cache):
                 args = ServerArgs(
@@ -171,11 +184,16 @@ class TestLocalModulePrewarm(CustomTestCase):
                 )
                 publish(args, role="tokenizer")
 
+                self.assertEqual(
+                    type(process_model_config().hf_config).__name__, "LocalConfig"
+                )
+
                 def check_at_spawn():
                     package = f"{dynamic_module_utils.TRANSFORMERS_DYNAMIC_MODULE_NAME}.{model.name}"
                     self.assertFalse(
                         any(
-                            name == package or name.startswith(package + ".")
+                            name.startswith(package + ".")
+                            and name.endswith((".custom", ".processing"))
                             for name in sys.modules
                         )
                     )
@@ -193,6 +211,90 @@ class TestLocalModulePrewarm(CustomTestCase):
                 ) as start:
                     Engine._launch_scheduler_processes(args, None, None)
                     self.assertEqual(start.call_count, 1)
+
+    def test_minimax_detokenizer_reads_warmed_standalone_tokenizer(self):
+        from transformers import MiniMaxM3VLConfig
+
+        from sglang.srt.managers.detokenizer_manager import DetokenizerManager
+
+        self.addCleanup(reset_context)
+        with (
+            tempfile.TemporaryDirectory() as root,
+            isolated_hf_modules_cache(Path(root) / "modules"),
+        ):
+            model = Path(root) / "minimax"
+            MiniMaxM3VLConfig(
+                architectures=["MiniMaxM3SparseForConditionalGeneration"]
+            ).save_pretrained(model)
+            BertTokenizer().save_pretrained(model)
+            (model / "preprocessor_config.json").write_text("{}")
+            write_custom_tokenizer(model)
+            args = ServerArgs(
+                model_path=str(model),
+                device="cpu",
+                trust_remote_code=True,
+                detokenizer_worker_num=2,
+            )
+            publish(args, role="tokenizer")
+            self.assertTrue(process_model_config().is_multimodal)
+            maybe_prewarm_scheduler_tokenizer()
+            with patch(
+                "shutil.copyfile", side_effect=AssertionError("cold detokenizer cache")
+            ):
+                worker = DetokenizerManager.__new__(DetokenizerManager)
+                worker.init_tokenizer(args)
+            self.assertEqual(worker.tokenizer.marker, "warm")
+
+    def test_prewarm_loads_plugin_processor_modules(self):
+        self.addCleanup(reset_context)
+        with (
+            tempfile.TemporaryDirectory() as root,
+            isolated_hf_modules_cache(Path(root) / "modules"),
+        ):
+            model = Path(root) / "llava"
+            LlavaConfig(
+                architectures=["LlavaForConditionalGeneration"]
+            ).save_pretrained(model)
+            LlavaProcessor(
+                image_processor=CLIPImageProcessor(), tokenizer=BertTokenizer()
+            ).save_pretrained(model)
+            (model / "plugin_only.py").write_text("class LocalHelper:\n    pass\n")
+            # A discoverable plugin using a builtin config, so forgetting to load
+            # it silently falls back to the stock LlavaProcessor.
+            dist = Path(root) / "prewarm_test-1.0.dist-info"
+            dist.mkdir()
+            (dist / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: prewarm-test\nVersion: 1.0\n"
+            )
+            (dist / "entry_points.txt").write_text(
+                "[sglang.srt.plugins]\nprewarm_test = prewarm_plugin:register\n"
+            )
+            (Path(root) / "prewarm_plugin.py").write_text(
+                "from transformers import LlavaConfig, LlavaProcessor\n"
+                "from transformers.dynamic_module_utils import get_class_from_dynamic_module\n"
+                "from sglang.srt.multimodal.customized_mm_processor_utils import register_customized_processor\n"
+                "class PluginProcessor(LlavaProcessor):\n"
+                "    @classmethod\n"
+                "    def from_pretrained(cls, path, **kwargs):\n"
+                "        get_class_from_dynamic_module('plugin_only.LocalHelper', path)\n"
+                "        return LlavaProcessor.from_pretrained(path, **kwargs)\n"
+                "def register():\n"
+                "    register_customized_processor(PluginProcessor)(LlavaConfig)\n"
+            )
+            sys.path.insert(0, root)
+            publish(
+                ServerArgs(model_path=str(model), device="cpu", trust_remote_code=True),
+                role="tokenizer",
+            )
+            with envs.SGLANG_PLUGINS.override("prewarm_test"):
+                maybe_prewarm_scheduler_tokenizer()
+            with patch(
+                "shutil.copyfile", side_effect=AssertionError("cold plugin cache")
+            ):
+                helper = dynamic_module_utils.get_class_from_dynamic_module(
+                    "plugin_only.LocalHelper", model
+                )
+            self.assertEqual(helper.__name__, "LocalHelper")
 
     def test_failed_custom_import_leaves_launcher_and_cache_clean(self):
         """A failed warmup must leave the real worker to report its own error."""
