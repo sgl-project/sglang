@@ -853,7 +853,7 @@ class TestTriFactorySizing(_PoolTestCase):
             swa_max_total_num_tokens=32,
             max_mamba_cache_size=20,
             model_context_len=16,
-            extra_max_context_len=4,
+            req_to_token_headroom=4,
             max_num_reqs=4,
             enable_memory_saver=False,
             enable_mamba_extra_buffer=False,
