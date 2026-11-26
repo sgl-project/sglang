@@ -397,7 +397,7 @@ class DSAMetadata:
     cu_seqlens_k: torch.Tensor
     # Page table, the index of KV Cache Tables/Blocks
     # this table is always with page_size = 1.
-    # None for fused-decode CUDA graphs where the wide [bs, max_ctx_len] table is
+    # None for fused-decode CUDA graphs where the wide [bs, max_kv_len] table is
     # never read (attention uses topk_indices, indexer uses real_page_table); the
     # graph then only materializes the compact real_page_table. See
     # `dsa_drop_wide_page_table`.
@@ -785,6 +785,7 @@ class DeepseekSparseAttnBackend(
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+    draft_decode_len: int = 0
 
     def _call_flash_mla_sparse_fwd_small_heads(self, *args):
         from sglang.kernels.ops.attention.flash_mla_interface import (
@@ -831,6 +832,10 @@ class DeepseekSparseAttnBackend(
         hf_config = model_runner.model_config.hf_config
         self.use_dsa = is_deepseek_dsa(hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        if speculative_num_steps and getattr(
+            hf_config, "dsa_draft_attends_to_own_chain", False
+        ):
+            self.draft_decode_len = speculative_step_id + 1
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -856,7 +861,6 @@ class DeepseekSparseAttnBackend(
         if self.dsa_shards_index_k and self.dsa_index_kpool > 1:
             raise ValueError("DSA index kpool does not support --dcp-size > 1.")
         self._init_kpool_metadata_fusion()
-        self.max_context_len = model_runner.model_config.context_len
         self._memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=get_exec().features.enable_memory_saver
             and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
@@ -885,6 +889,7 @@ class DeepseekSparseAttnBackend(
         # Zero never gathers; init_dcp_prefill_crossover prices the route once
         # the model runner knows which owned route the model takes.
         self.dcp_gathered_prefill_crossover = 0.0
+        self.max_kv_len = self.req_to_token_pool.row_width
         # Translates the ids `req_to_token` holds into the physical ids the
         # page tables carry (`_read_v2p`); identity on a static pool.
         self.runner_ids = model_runner.runner_ids
@@ -1095,7 +1100,7 @@ class DeepseekSparseAttnBackend(
                     max_rows,
                     self.dsa_index_topk,
                     self.physical_page_size,
-                    self.max_context_len,
+                    model_runner.model_config.context_len,
                 )
 
         if _is_xpu:
@@ -1527,13 +1532,19 @@ class DeepseekSparseAttnBackend(
     def update_verify_buffers_to_fill_after_draft(self, *args, **kwargs):
         return None
 
+    def _with_draft_chain(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        # A chain draft step attends to the prefix plus its own earlier drafts.
+        if self.draft_decode_len:
+            return seq_lens + self.draft_decode_len
+        return seq_lens
+
     def _graph_page_table_width(self, metadata: DSAMetadata) -> int:
         """Column count to scan req_to_token during graph replay. Reads the wide
-        page_table_1 width when present, else req_to_token's width (the wide table
+        page_table_1 width when present, else max_kv_len (the wide table
         is dropped for fused decode graphs, see `dsa_drop_wide_page_table`)."""
         if metadata.page_table_1 is not None:
             return metadata.page_table_1.shape[1]
-        return self.req_to_token.shape[1]
+        return self.max_kv_len
 
     def dcp_gather_kv_cache(
         self, kv_cache: torch.Tensor, forward_batch: ForwardBatch, metadata: DSAMetadata
@@ -1635,13 +1646,15 @@ class DeepseekSparseAttnBackend(
 
         if forward_batch.forward_mode.is_target_verify():
             draft_token_num = self.speculative_num_draft_tokens
+        elif forward_batch.forward_mode.is_decode_or_idle():
+            draft_token_num = self.draft_decode_len
         else:
             draft_token_num = 0
 
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         max_seqlen_k = _eager_max_seqlen_k(
-            forward_batch, draft_token_num, self.req_to_token.shape[1]
+            forward_batch, draft_token_num, self.max_kv_len
         )
         # [b, max_seqlen_k]
         page_table = self._gather_token_table(
@@ -2166,7 +2179,7 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
-        # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
+        # Whether we can skip the wide [max_num_tokens, max_kv_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
         # and the indexer reads the compact real_page_table, so nothing reads the
@@ -2193,7 +2206,6 @@ class DeepseekSparseAttnBackend(
             and 0 < self.dsa_index_topk <= 2048
         )
 
-        max_ctx_len = self.req_to_token.shape[1]
         # rewritten in full before every replay; the init-once metadata below would resume zeroed
         with self._memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH):
             if self._trtllm_fused_q and self.dsa_decode_impl == "trtllm":
@@ -2223,7 +2235,7 @@ class DeepseekSparseAttnBackend(
                 if self.dsa_drop_wide_page_table
                 else torch.zeros(
                     max_num_tokens,
-                    max_ctx_len,
+                    self.max_kv_len,
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -2247,7 +2259,7 @@ class DeepseekSparseAttnBackend(
             "real_page_table": (
                 torch.zeros(
                     max_num_tokens,
-                    (max_ctx_len + self.real_page_span - 1) // self.real_page_span,
+                    (self.max_kv_len + self.real_page_span - 1) // self.real_page_span,
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -2302,6 +2314,7 @@ class DeepseekSparseAttnBackend(
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
+            seq_lens = self._with_draft_chain(seq_lens)
             cache_seqlens_int32 = seq_lens.to(torch.int32)
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
 
@@ -2309,7 +2322,7 @@ class DeepseekSparseAttnBackend(
             real_rows = bs
             if self.dsa_drop_wide_page_table:
                 page_table_1 = None
-                max_seqlen_k = self.req_to_token.shape[1]
+                max_seqlen_k = self.max_kv_len
             else:
                 page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
                 max_seqlen_k = page_table_1.shape[1]
@@ -2337,7 +2350,7 @@ class DeepseekSparseAttnBackend(
             real_rows = bs * self.speculative_num_draft_tokens
             if self.dsa_drop_wide_page_table:
                 page_table_1 = None
-                max_seqlen_k = self.req_to_token.shape[1]
+                max_seqlen_k = self.max_kv_len
             else:
                 page_table_1 = self.decode_cuda_graph_metadata["page_table"][
                     :real_rows, :
@@ -2482,6 +2495,7 @@ class DeepseekSparseAttnBackend(
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
+            seq_lens = self._with_draft_chain(seq_lens)
 
             if (
                 (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
@@ -5419,6 +5433,23 @@ class DeepseekSparseAttnMultiStepBackend:
 
     def _init_forward_metadata_replay(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
+        # Chain steps have different KV lengths and cannot share replay metadata.
+        if self.attn_backends[0].draft_decode_len:
+            for backend in self.attn_backends:
+                precomputed = backend._precompute_replay_metadata(
+                    bs=bs,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                    forward_mode=ForwardMode.DECODE,
+                )
+                backend.init_forward_metadata_replay_cuda_graph_from_precomputed(
+                    bs=bs,
+                    precomputed=precomputed,
+                    forward_mode=ForwardMode.DECODE,
+                )
+            return
+
         # Precompute metadata once (shared across all backends)
         precomputed = self.attn_backends[0]._precompute_replay_metadata(
             bs=bs,
