@@ -66,6 +66,77 @@ def gbsa(c, compact):
                           c.table, c.lengths, c.extends, c.q.shape[0], indices_are_blocks=compact)
 
 
+def test_prefill_schedule_before_indexer(monkeypatch):
+    from sgl_kernel_npu.operators import attention
+    from sglang.kernels.ops.attention.qsa_gbsa_prefill import prepare_prefill_gbsa_metadata
+    from sglang.srt.layers.attention.qsa.metadata import build_qsa_row_ranges
+
+    c = make_case([17, 111], [0, 4096])
+    starts, ends, _ = build_qsa_row_ranges(c.lengths, c.positions, c.sequence_ids, 4)
+    pages = (c.table.shape[1] + 127) // 128
+    meta = prepare_prefill_gbsa_metadata((starts, ends), None, c.lengths, c.extends, pages)
+    original = attention.generic_block_sparse_attention_metadata
+    built = []
+
+    def record(*args, **kwargs):
+        built.append(original(*args, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(attention, "generic_block_sparse_attention_metadata", record)
+    reference = gbsa(c, True)
+    rows = c.q.shape[0]
+    actual = qsa_gbsa_prefill(
+        c.q, c.k, c.v, c.groups, c.table, c.lengths, c.extends, rows,
+        indices_are_blocks=True, prepared_metadata=meta[0, rows],
+    )
+    assert len(built) == 1
+    torch.testing.assert_close(meta[0, rows], built[0], atol=0, rtol=0)
+    torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("fixed_topk_counts", [False, True])
+def test_prefill_meta_reuse_across_layer_selections(monkeypatch, fixed_topk_counts):
+    from sgl_kernel_npu.operators import attention
+
+    c = make_case([17, 111], [0, 4096])
+    cache = {}
+    build_meta = attention.generic_block_sparse_attention_metadata
+    builds = []
+
+    def track_build(*args, **kwargs):
+        meta = build_meta(*args, **kwargs)
+        builds.append(meta)
+        return meta
+
+    monkeypatch.setattr(attention, "generic_block_sparse_attention_metadata", track_build)
+    # Cover empty, short, and full top-k rows in the same forward.
+    visible = (c.positions[:, None] + 1) // 4
+    rotated = torch.where(
+        c.groups >= 0, (c.groups + 1) % visible.clamp_min(1), c.groups
+    )
+    fewer = rotated.clone()
+    fewer[-1, -1] = -1
+    cases = [(c.groups, cache, 1), (rotated, cache, 1)]
+    if fixed_topk_counts:
+        cases.append((rotated, {}, 2))  # New forward, same shape.
+    else:
+        cases.append((fewer, cache, 2))
+    for groups, forward_cache, expected_builds in cases:
+        args = (c.q, c.k, c.v, groups, c.table, c.lengths, c.extends, c.q.shape[0])
+        with monkeypatch.context() as patch:
+            if fixed_topk_counts:
+                patch.setattr(torch, "equal", lambda *_: pytest.fail("host count comparison"))
+            actual = qsa_gbsa_prefill(
+                *args, indices_are_blocks=True, meta_cache=forward_cache,
+                fixed_topk_counts=fixed_topk_counts,
+            )
+        assert len(builds) == expected_builds
+        with monkeypatch.context() as patch:
+            patch.setattr(attention, "generic_block_sparse_attention_metadata", build_meta)
+            expected = qsa_gbsa_prefill(*args, indices_are_blocks=True)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("extends,prefixes", [([128], [0]), ([128], [2048]), ([128], [11001]), ([17, 111], [0, 3001])])
 def test_compact_tail_multisequence_and_replay(extends, prefixes):
     c = make_case(extends, prefixes)

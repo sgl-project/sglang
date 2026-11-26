@@ -277,6 +277,39 @@ def test_common_replay_builds_host_payload_but_dsa_skips_host_update():
     assert len(received) == 1
 
 
+@pytest.mark.parametrize(
+    ("raw_bs", "greedy", "single_shard_graph", "expected"),
+    [
+        (2, True, False, "vocab_shards"),
+        (2, False, False, "full_logits"),
+        (1, False, False, "vocab_shards"),
+        (2, False, True, "vocab_shards"),
+    ],
+)
+def test_preplanned_verify_replay_selects_captured_logits_variant(
+    raw_bs, greedy, single_shard_graph, expected
+):
+    backend, runner, _ = make_backend(bs=2, raw_bs=raw_bs)
+    runner.raw_num_token = raw_bs
+    runner.ragged_verify_mode = False
+    runner.require_mlp_tp_gather = False
+    runner._verify_logits_processor = SimpleNamespace(
+        verify_uses_vocab_shards=lambda batch: greedy,
+        npu_qwen_greedy_shards=single_shard_graph,
+    )
+    runner.buffers = SimpleNamespace(input_ids=torch.zeros(2), positions=torch.zeros(2))
+    batch = SimpleNamespace(
+        needs_forward_metadata_init=lambda: False,
+        input_ids=torch.ones(raw_bs),
+        positions=torch.zeros(raw_bs),
+        mrope_positions=None,
+    )
+    assert backend.prepare_replay(batch)
+    assert runner._replay_graph_key == runner_mod.ShapeKey(
+        size=2, logits_variant=expected
+    )
+
+
 def test_dflash_preparation_refreshes_lengths_and_cache_slots():
     backend, runner, attention = make_backend(dflash=True)
     runner.require_mlp_tp_gather = False

@@ -1331,6 +1331,8 @@ class Envs:
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa
     # can increase memory usage during NPU compiled graph capture.
     SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
+    # Exchange one winning token per TP rank for eligible Qwen greedy verification.
+    SGLANG_NPU_QWEN4_GREEDY_SHARDS = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
@@ -1340,6 +1342,8 @@ class Envs:
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
     # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
     SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
+    # Shard prefill query rows in the indexer, or in both indexer and attention.
+    SGLANG_NPU_QSA_PREFILL_TP_SHARD = EnvStr("off")
 
     # ===================================================================
     # MUSA

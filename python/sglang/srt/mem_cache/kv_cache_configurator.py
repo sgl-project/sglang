@@ -2946,6 +2946,11 @@ class KVCacheConfigurator:
                 qsa_index_kv_heads=qsa_profile.kv_heads,
                 qsa_index_head_dim=qsa_profile.head_dim,
                 qsa_compress_ratio=qsa_profile.compress_ratio,
+                qsa_verify_width=(
+                    (max_speculative_num_draft_tokens() or 1)
+                    if _is_npu and get_disagg().disaggregation_mode == "null"
+                    else 1
+                ),
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),

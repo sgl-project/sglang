@@ -147,6 +147,13 @@ def bind_eagle_runtime_hooks(
     ]
     if (
         supports_sharded_verify
+        and type(model).__name__ == "Qwen4ExpForConditionalGeneration"
+        and len(processors) == 1
+        and getattr(processors[0], "npu_qwen_greedy_shards", False)
+    ):
+        processors[0].enable_sharded_verify(npu_qwen=True)
+    if (
+        supports_sharded_verify
         and type(model).__name__ in _SHARDED_VERIFY_TARGET_MODEL_CLASSES
         and len(processors) == 1
     ):

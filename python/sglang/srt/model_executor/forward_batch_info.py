@@ -1258,6 +1258,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 positions, ret.extend_start_loc, _ = extend_position_info
             if ret.positions is None:
                 ret.positions = positions
+                if (
+                    _is_npu
+                    and ret.forward_mode == ForwardMode.EXTEND
+                    and extend_position_info is None
+                    and isinstance(extend_prefix_lens, list)
+                    and isinstance(extend_seq_lens, list)
+                ):
+                    # This tensor was constructed from these exact host spans.
+                    ret._qsa_contiguous_extend = (
+                        positions, tuple(extend_prefix_lens), tuple(extend_seq_lens)
+                    )
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.ngram_embedding_manager.enabled:
@@ -2085,7 +2096,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
-        self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+        original_positions = self.positions
+        self.positions = self._pad_tensor_to_size(original_positions, num_tokens)
+        contiguous = getattr(self, "_qsa_contiguous_extend", None)
+        if contiguous is not None and contiguous[0] is original_positions:
+            # Only trailing rows were appended. The original live rows retain their positions.
+            self._qsa_contiguous_extend = (self.positions, contiguous[1], contiguous[2])
         if self.mamba_track_indices is not None:
             self.mamba_track_indices = self._pad_tensor_to_size(
                 self.mamba_track_indices, bs

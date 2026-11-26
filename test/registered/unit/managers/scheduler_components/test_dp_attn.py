@@ -28,6 +28,12 @@ register_cpu_ci(est_time=61, suite="base-a-test-cpu")
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
     def test_dp1_skip_preserves_local_tbo_metadata(self):
+        self._assert_replica_local_tbo_metadata(num_dp_ranks=1)
+
+    def test_two_independent_tp_replicas_keep_local_tbo_metadata(self):
+        self._assert_replica_local_tbo_metadata(num_dp_ranks=2)
+
+    def _assert_replica_local_tbo_metadata(self, num_dp_ranks):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 4,
@@ -46,11 +52,12 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(dp_attn, "dp_gather_width", return_value=1),
             patch.object(
                 dp_attn,
                 "get_parallel",
                 return_value=SimpleNamespace(
-                    num_dp_ranks=1,
+                    num_dp_ranks=num_dp_ranks,
                     attn_tp_size=4,
                     attn_cp_size=1,
                     tp_group=SimpleNamespace(
@@ -145,6 +152,7 @@ class TestDPBalanceStats(CustomTestCase):
             patch.object(dp_attn, "_ENABLE_METRICS_DP_ATTENTION", True),
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(dp_attn, "dp_gather_width", return_value=2),
             patch.object(
                 dp_attn,
                 "get_parallel",
@@ -627,6 +635,7 @@ class TestDPShutdownVote(CustomTestCase):
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(dp_attn, "dp_gather_width", return_value=2),
             patch.object(
                 dp_attn,
                 "get_parallel",
@@ -686,18 +695,14 @@ class TestDPShutdownVote(CustomTestCase):
             get_require_mlp_sync=lambda: True,
             get_shutting_down=lambda: True,
         )
-        for num_dp_ranks, skip_gather, pending in (
+        for gather_width, skip_gather, pending in (
             (2, False, True),
             (1, False, False),
             (2, True, False),
         ):
             with (
                 envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip_gather),
-                patch.object(
-                    dp_attn,
-                    "get_parallel",
-                    return_value=SimpleNamespace(num_dp_ranks=num_dp_ranks),
-                ),
+                patch.object(dp_attn, "dp_gather_width", return_value=gather_width),
             ):
                 self.assertIs(adapter.shutdown_vote_pending(), pending)
 
@@ -789,6 +794,7 @@ class TestDPDrainColumn(CustomTestCase):
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip_gather),
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(dp_attn, "dp_gather_width", return_value=2),
             patch.object(
                 dp_attn,
                 "get_parallel",

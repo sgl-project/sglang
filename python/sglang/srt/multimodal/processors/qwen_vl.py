@@ -84,9 +84,17 @@ class QwenVLImagePreprocessArtifact:
 
     def cache_value(self) -> "QwenVLImagePreprocessArtifact":
         """Keep CPU processor outputs but never retain a CUDA tensor."""
-        if self.feature is None or self.feature.device.type == "cpu":
+        feature = self.feature
+        if feature is None:
             return self
-        return replace(self, feature=None)
+        if feature.device.type != "cpu":
+            return replace(self, feature=None)
+        # A per-image view can otherwise retain the entire batch allocation.
+        if feature.untyped_storage().nbytes() > feature.nbytes:
+            return replace(
+                self, feature=feature.clone(memory_format=torch.contiguous_format)
+            )
+        return self
 
     def cache_size_items(self) -> tuple:
         return (

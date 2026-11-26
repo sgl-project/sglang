@@ -12,8 +12,25 @@ from test_qsa_compact_prefill_npu import (
     ForwardMode, make_case, torch,
 )
 from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import (
-    QSARequest, prepare_sg_prefill_inputs,
+    QSARequest, dispatch_sg_prefill, prepare_sg_prefill_inputs, prepare_sharded_prefill_inputs,
 )
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_native_shard_crossing_fia_and_gbsa_requests(dense):
+    c = make_case([73, 86], [0, 25001])
+    _, batch = backend_and_batch(c)
+    batch.seq_lens = c.lengths
+    full = prepare_sg_prefill_inputs(
+        batch.seq_lens_cpu, batch.extend_seq_lens_cpu, c.lengths, c.extends, c.table, c.positions
+    )
+    rows = slice(60, 103)
+    part = prepare_sharded_prefill_inputs(batch, c.table, rows, True)
+    slots = c.table[c.sequence_ids.long(), c.positions.long()].long()
+    k, v = (c.k[slots], c.v[slots]) if dense else (None, None)
+    expected = dispatch_sg_prefill(c.q, k, v, c.k, c.v, c.groups, full, 1/16)
+    actual = dispatch_sg_prefill(c.q[rows], k, v, c.k, c.v, c.groups[rows], part, 1/16)
+    torch.testing.assert_close(actual, expected[rows], atol=2e-3, rtol=1e-2)
 
 
 def backend_and_batch(c):

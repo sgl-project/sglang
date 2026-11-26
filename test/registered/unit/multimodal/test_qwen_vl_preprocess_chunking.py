@@ -13,11 +13,29 @@ from PIL import Image
 
 from sglang.srt.multimodal.processors import qwen_vl
 from sglang.srt.multimodal.processors.qwen_vl import (
+    QwenVLImagePreprocessArtifact,
     QwenVLImageProcessor,
     _chunk_by_byte_budget,
     _estimate_preprocess_bytes,
 )
 from sglang.test.test_utils import CustomTestCase
+
+
+class TestCachedImageFeature(CustomTestCase):
+    def test_cached_slice_owns_only_its_image_storage(self):
+        batch = torch.arange(24).reshape(6, 4)
+        feature = batch[2:4]
+        artifact = QwenVLImagePreprocessArtifact(
+            content_digest="digest",
+            artifact_key="key",
+            feature_hash=1,
+            feature=feature,
+            model_specific_data={},
+        )
+        cached = artifact.cache_value()
+        self.assertTrue(torch.equal(cached.feature, feature))
+        self.assertEqual(cached.feature.untyped_storage().nbytes(), feature.nbytes)
+        self.assertIs(cached.cache_value(), cached)
 
 
 class TestChunkByByteBudget(CustomTestCase):

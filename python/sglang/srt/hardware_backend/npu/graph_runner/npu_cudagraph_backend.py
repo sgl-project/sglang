@@ -334,8 +334,18 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                 is_encoder_decoder=runner.is_encoder_decoder,
             )
             runner.attn_backend.init_forward_metadata_out_graph(fb_view)
-        # Preserve the legacy NPU pre-planned replay key.
-        runner._replay_graph_key = runner._make_graph_key(runner.bs)
+        key = runner._make_graph_key(runner.bs)
+        if getattr(runner, "_verify_logits_processor", None) is not None:
+            padded = runner._replay_pads_rows(
+                raw_bs=runner.raw_bs,
+                bs=runner.bs,
+                is_ragged=runner.ragged_verify_mode
+                and forward_batch.ragged_verify_layout is not None,
+            )
+            key = runner._with_logits_variant(
+                key, runner._resolve_logits_variant(forward_batch, padded=padded)
+            )
+        runner._replay_graph_key = key
         return True
 
     @contextmanager

@@ -198,14 +198,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
-                dtype=torch.bool,
-                device=forward_batch.input_ids.device,
-            )
-        else:
-            has_initial_states = forward_batch.extend_prefix_lens > 0
-        if is_target_verify:
             num_token_padding = mixed_qkv.shape[0]
             if (
                 not self.graph_mode
@@ -218,19 +210,27 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
             batch_size = cache_indices.shape[0]
             draft_token_num = forward_batch.spec_info.draft_token_num
-            num_accepted_tokens = torch.full(
-                (batch_size,),
-                draft_token_num,
-                dtype=torch.int32,
-                device=mixed_qkv.device,
-            )
+            table = getattr(forward_batch, "npu_gdn_verify_inputs", None) if self.graph_mode else None
+            verify_lengths = None
+            conv_offsets, conv_slots = query_start_loc, cache_indices
+            if table is None or query_start_loc is None or mixed_qkv.shape[0] != batch_size * draft_token_num:
+                num_accepted_tokens = torch.full(
+                    (batch_size,), draft_token_num, dtype=torch.int32, device=mixed_qkv.device
+                )
+            else:
+                key = (query_start_loc, cache_indices, batch_size, draft_token_num)
+                if key not in table:
+                    lengths = torch.full((batch_size,), draft_token_num, dtype=torch.int32, device=mixed_qkv.device)
+                    table[key] = (query_start_loc.long(), cache_indices.long(), lengths, torch.ones_like(lengths))
+                conv_offsets, conv_slots, num_accepted_tokens, ones = table[key]
+                verify_lengths = (ones, num_accepted_tokens)
             mixed_qkv = causal_conv1d(
                 mixed_qkv,
                 self._get_conv_weights_t(layer),
                 conv_states=conv_states,
                 bias=layer.bias,
-                query_start_loc=query_start_loc,
-                cache_indices=cache_indices,
+                query_start_loc=conv_offsets,
+                cache_indices=conv_slots,
                 num_accepted_tokens=num_accepted_tokens,
                 activation_mode=1,
                 pad_slot_id=-1,
@@ -253,7 +253,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 bias=layer.bias,
                 query_start_loc=query_start_loc,
                 cache_indices=cache_indices,
-                has_initial_state=has_initial_states,
+                has_initial_state=forward_batch.extend_prefix_lens > 0,
                 activation_mode=1,
                 pad_slot_id=-1,
                 run_mode=0,
@@ -282,6 +282,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 g=g,
                 cache_indices=cache_indices,
                 intermediate_state=intermediate_state_cache,
+                verify_lengths=verify_lengths,
             )
             core_attn_out = core_attn_out.view(-1, num_value_heads, head_v_dim)
             if (not self.graph_mode) and core_attn_out.shape[0] < num_token_padding:
@@ -380,6 +381,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         g: torch.Tensor,
         cache_indices: torch.Tensor,
         intermediate_state: Optional[torch.Tensor] = None,
+        verify_lengths=None,
     ):
         beta = beta.to(torch.bfloat16)
         g = g.to(torch.float32)
@@ -393,12 +395,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
 
         if self.graph_mode:
-            num_accept_tokens = torch.full(
-                [batch_size], 1, dtype=torch.int32, device=cache_indices.device
-            )
-            actual_seq_lengths = torch.full(
-                [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
-            )
+            if verify_lengths is None:
+                num_accept_tokens = torch.full(
+                    [batch_size], 1, dtype=torch.int32, device=cache_indices.device
+                )
+                actual_seq_lengths = torch.full(
+                    [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
+                )
+            else:
+                num_accept_tokens, actual_seq_lengths = verify_lengths
             ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
         else:
             num_accept_tokens = self.num_accept_tokens

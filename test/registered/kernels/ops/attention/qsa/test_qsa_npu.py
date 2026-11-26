@@ -79,6 +79,59 @@ def test_qwen38_packed_prefill_selection():
     _check_selected(actual, scores, starts.cpu(), ends.cpu(), positions, row_lengths)
 
 
+def test_qsa_tp_topk_keeps_unsharded_order():
+    rows, keys = 8192, 2048
+    columns = torch.arange(keys, dtype=torch.int32, device="npu")
+    scores = ((columns * 1999) % 2063).float().expand(rows, -1).contiguous()
+    starts = torch.zeros(rows, dtype=torch.int32, device="npu")
+    ends = (torch.arange(rows, dtype=torch.int32, device="npu") + 1) // 4
+    expected = kernel.qsa_fast_topk(scores, starts, ends, 512)
+    shard = slice(-rows // 8, None)
+    actual = kernel.qsa_fast_topk(
+        scores[shard], starts[shard], ends[shard], 512, dispatch_rows=rows
+    )
+    torch.testing.assert_close(actual, expected[shard], atol=0, rtol=0)
+
+
+def test_sharded_prefill_clips_query_tail_and_preserves_request_route():
+    from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import prepare_sharded_prefill_inputs
+
+    # The first original chunk crosses the FIA threshold; its shard starts above it.
+    batch = SimpleNamespace(
+        seq_lens_cpu=[24600, 30008], extend_seq_lens_cpu=[64, 8],
+        seq_lens=torch.tensor([24600, 30008]), extend_seq_lens=torch.tensor([64, 8]),
+        positions=torch.cat((torch.arange(24536, 24600), torch.arange(30000, 30008))),
+    )
+    table = torch.arange(2 * 30080).reshape(2, -1)
+    inputs = prepare_sharded_prefill_inputs(batch, table, slice(48, 68), True)
+    assert inputs.sequence_lengths.tolist() == [24600, 30004]
+    assert inputs.extend_lengths.tolist() == [16, 4]
+    assert inputs.visible_lens.tolist() == (batch.positions[48:68] + 1).tolist()
+    assert [(r.query_start, r.query_end) for r in inputs.plan.fia_requests] == [(0, 16)]
+    assert inputs.plan.gbsa_spans == ((16, 20),)
+
+
+def test_sharded_short_rows_match_original_chunk_dispatch():
+    from sglang.kernels.ops.attention.qsa_short_rows_npu import packed_short_ranges, select_packed_groups
+
+    sizes, prefixes = (1103, 1970), (0, 8192)
+    rows = sum(sizes)
+    lengths = torch.tensor([p + n for p, n in zip(prefixes, sizes)], device="npu")
+    positions = torch.cat([torch.arange(p, p + n) for p, n in zip(prefixes, sizes)]).npu()
+    ids = torch.repeat_interleave(torch.arange(2), torch.tensor(sizes)).int().npu()
+    starts, ends, _ = build_qsa_row_ranges(lengths.int(), positions, ids, 4)
+    keys = _index_keys(sum((p + n) // 4 for p, n in zip(prefixes, sizes)))
+    q = torch.ones(rows, 4, 128, dtype=torch.bfloat16, device="npu")
+    spans = packed_short_ranges(prefixes, sizes, rows)
+    expected = select_packed_groups(q, keys, starts, ends, spans, 1024)
+    size = (rows + 7) // 8
+    for offset in range(0, rows, size):
+        local = slice(offset, offset + size)
+        got = select_packed_groups(q[local], keys, starts[local], ends[local], spans, 1024,
+                                   row_offset=offset, total_rows=rows)
+        torch.testing.assert_close(got, expected[local], atol=0, rtol=0)
+
+
 def test_qsa_prefill_request_mapping():
     table = torch.tensor(
         [[13, 2, 17, 5, 19, 7], [0] * 6, [23, 11, 29, 3, 31, 37]],
@@ -276,6 +329,7 @@ def test_qsa_pool_write_and_padding(monkeypatch, fia):
     backend.token_to_kv_pool = pool
     backend.forward_metadata = SimpleNamespace(
         is_cuda_graph=False,
+        indexer_metadata=SimpleNamespace(decode_page_table=None),
         token_to_batch_idx=torch.zeros(3, dtype=torch.int32, device="npu"),
         sequence_lengths=torch.tensor([128], device="npu", dtype=torch.int32),
         token_slot_table=torch.arange(128, device="npu", dtype=torch.int32)[None],

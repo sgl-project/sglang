@@ -463,6 +463,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self._verify_logits_processor is not None
             else (None,)
         )
+        if getattr(self._verify_logits_processor, "npu_qwen_greedy_shards", False):
+            # QSA stores replay metadata per batch size. Keep a single graph
+            # for each size and let EAGLE gather full logits when requested.
+            self.logits_graph_variants = (VERIFY_VOCAB_SHARDS,)
 
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
@@ -820,6 +824,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         processor = self._verify_logits_processor
         if processor is None:
             return None
+        if getattr(processor, "npu_qwen_greedy_shards", False):
+            return VERIFY_VOCAB_SHARDS
         # The full-logits graph gathers the vocabulary of every padding row too;
         # a padded replay keeps shards so the consumer gathers only real rows.
         if padded or processor.verify_uses_vocab_shards(forward_batch):

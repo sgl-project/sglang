@@ -102,6 +102,68 @@ class _FakeGroup:
 
 
 class TestShardedPolicy(CustomTestCase):
+    def test_native_winners_ignore_padding_and_choose_the_first_tied_token(self):
+        neg_inf, nan = float("-inf"), float("nan")
+        scores = torch.tensor(
+            [
+                [1, 5, 5, 0, 5],
+                [-9, -8, -7, -6, 4],
+                [neg_inf] * 5,
+                [-1, -0.0, -2, 0.0, -3],
+                [1, nan, 3, nan, 5],
+            ],
+            dtype=torch.bfloat16,
+        )
+        padded = torch.nn.functional.pad(scores, (0, 4), value=float("inf"))
+        parts = padded.split(3, dim=1)
+        expected_pairs = [
+            torch.tensor([[5, 1], [-7, 2], [neg_inf, 0], [-0.0, 1], [nan, 1]]),
+            torch.tensor([[5, 4], [4, 4], [neg_inf, 3], [0.0, 3], [nan, 3]]),
+            torch.tensor([[neg_inf, 5]]).expand(5, 2),
+        ]
+        for rank, part in enumerate(parts):
+
+            def gather(output, local):
+                torch.testing.assert_close(local, expected_pairs[rank], equal_nan=True)
+                output.copy_(torch.cat(expected_pairs))
+
+            shard = VocabShard(start=3 * rank, valid=(3, 2, 0)[rank], vocab_size=5)
+            group = SimpleNamespace(world_size=3, all_gather_into_tensor=gather)
+            tokens = sharded_verify._native_sharded_target_tokens(part, shard, group)
+            self.assertTrue(torch.equal(tokens, scores.float().argmax(dim=-1)))
+
+    def test_npu_opt_in_consumes_only_unmodified_greedy_rows(self):
+        sampling = _sampling_info(greedy=True)
+        batch = _verify_batch(sampling)
+        tree = _verify_tree()
+
+        def eligible():
+            return eagle_utils._sharded_sampling_applies(
+                verify_input=tree,
+                batch=batch,
+                grammar_mask=None,
+                watermark=False,
+                has_local_keys=True,
+            )
+
+        with (
+            patch.object(eagle_utils, "_is_cuda", False),
+            patch.object(eagle_utils, "_npu_greedy_shards", True),
+            patch.object(eagle_utils, "get_spec", return_value=_runtime_spec()),
+        ):
+            self.assertTrue(eligible())
+            batch.return_logprob = True
+            self.assertFalse(eligible())
+            batch.return_logprob = False
+            sampling.logit_bias = torch.zeros(2, 5)
+            self.assertFalse(eligible())
+            sampling.logit_bias = None
+            sampling.is_all_greedy = False
+            self.assertFalse(eligible())
+            sampling.is_all_greedy = True
+            with patch.object(eagle_utils, "_npu_greedy_shards", False):
+                self.assertFalse(eligible())
+
     def test_temperature_decline_gathers_then_enters_stock_without_early_rng(self):
         sampling = _sampling_info(greedy=False)
         shard = VocabShard(start=0, valid=5, vocab_size=5)

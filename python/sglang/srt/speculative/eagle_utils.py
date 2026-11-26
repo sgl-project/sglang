@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
@@ -64,6 +65,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
+_npu_greedy_shards = is_npu() and envs.SGLANG_NPU_QWEN4_GREEDY_SHARDS.get()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 
@@ -676,6 +678,8 @@ def _sharded_tokens(
     from sglang.srt.runtime_context import get_parallel
 
     tp_group = get_parallel().tp_group
+    if _npu_greedy_shards and temperatures is None:
+        return sharded_target_tokens(logits, vocab_shard, tp_group)
     if local_keys is None:
         # Runtime's built-in key path is greedy-only.  A temperature policy must
         # come through ``local_keys`` and may decline before stock sampling draws.
@@ -728,7 +732,7 @@ def _sharded_sampling_applies(
     stays on the stock gathered path.
     """
     return (
-        _is_cuda
+        (_is_cuda or (_npu_greedy_shards and batch.sampling_info.is_all_greedy))
         and verify_input.tree_topk == 1
         and grammar_mask is None
         and not watermark

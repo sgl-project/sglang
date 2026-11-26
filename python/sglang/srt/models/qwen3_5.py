@@ -1015,6 +1015,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             z = None
             b = projected_states_ba
             a = projected_states_ba
+        elif (
+            _is_npu
+            and getattr(forward_batch, "npu_gdn_verify_inputs", None) is not None
+            and forward_batch.forward_mode.is_target_verify()
+            and self.num_v_heads == 3 * self.num_k_heads
+            and self.num_k_heads % self.attn_tp_size == 0
+            and projected_states_qkvz.dtype == projected_states_ba.dtype == torch.bfloat16
+            and projected_states_qkvz.ndim == projected_states_ba.ndim == 2
+            and projected_states_qkvz.shape[0] > 0
+        ):
+            mixed_qkv, z, b, a = qwen3_5_gdn_prefill_projection_views(
+                projected_states_qkvz, projected_states_ba,
+                self.num_k_heads // self.attn_tp_size, self.num_v_heads // self.attn_tp_size,
+                self.head_k_dim, self.head_v_dim,
+            )
+            mixed_qkv = mixed_qkv.clone(memory_format=torch.contiguous_format)
+            b, a = b.contiguous(), a.contiguous()
         elif use_fused_contiguous_unpack:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size

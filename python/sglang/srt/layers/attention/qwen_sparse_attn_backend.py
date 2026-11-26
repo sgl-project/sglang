@@ -17,6 +17,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -30,6 +31,7 @@ from sglang.srt.layers.attention.qsa.kernel import (
 )
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
+    build_qsa_row_ranges,
     build_group_ring_slots,
     build_pending_ring_slots,
     build_rope_position_matrix,
@@ -45,6 +47,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
     sparse_gqa_paged_prefill_triton,
 )
+from sglang.srt.layers.attention.qsa.tp_shard import QSAPrefillTPLayout, qsa_all_to_all
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
@@ -56,7 +59,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_spec, get_stream
+from sglang.srt.runtime_context import get_parallel, get_spec, get_stream
 from sglang.srt.utils import is_hip, is_npu, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
@@ -220,6 +223,7 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     # KV-sharded extend.
     kv_shard_slot_table: Optional[torch.Tensor] = None
     npu_prefill_inputs: Optional[object] = None
+    prefill_gbsa_metadata: Optional[dict] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -246,6 +250,24 @@ class QSAMTPSharedSparseIndices:
             device=device,
         )
         self._tail_offsets = torch.arange(tail_width, device=device)
+        self.block_cache = None
+        if (
+            _is_npu
+            and os.getenv("SGLANG_NPU_QSA_PAGED_GBSA", "0") == "1"
+            and token_topk == 2051
+            and tail_width <= 5
+        ):
+            from sglang.kernels.ops.attention.qsa_mtp_blocks import CACHE_WIDTH
+
+            # Each draft can finish at most one four-token block in this window.
+            self.block_cache = torch.zeros(
+                (len(self.layer_slots), num_requests + 1, CACHE_WIDTH),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.block_cache[:, :, 1:512].fill_(16777215)
+            self.block_cache[:, :, 512].fill_(1)
+            self.block_cache[:, :, 513].fill_(4)
 
     def capture(
         self,
@@ -255,6 +277,17 @@ class QSAMTPSharedSparseIndices:
         layer_id: int,
     ) -> None:
         slot = self.layer_slots[int(layer_id)]
+        if self.block_cache is not None:
+            from sglang.kernels.ops.attention import qsa_mtp_blocks as blocks
+
+            packed = blocks.pack(topk_indices, captured_lens.contiguous())
+            anchors = torch.arange(
+                req_pool_indices.numel(), dtype=torch.int32, device=req_pool_indices.device
+            )
+            blocks.save(
+                packed, anchors, req_pool_indices, self.block_cache[slot], self.trash_row
+            )
+            return
         rows = req_pool_indices.to(torch.long)
         self.indices[slot, :, : topk_indices.shape[1]].index_copy_(
             0, rows, topk_indices.to(self.indices.dtype)
@@ -267,9 +300,12 @@ class QSAMTPSharedSparseIndices:
         current_positions: torch.Tensor,
         layer_id: int,
     ) -> torch.Tensor:
-        """Frozen selection plus a tail of positions drafted since the capture;
-        tail slots past current_position hold -1, which downstream drops."""
+        """Reuse the captured selection, including KV made visible by the draft."""
         slot = self.layer_slots[int(layer_id)]
+        if self.block_cache is not None:
+            from sglang.kernels.ops.attention.qsa_mtp_blocks import lookup
+
+            return lookup(self.block_cache[slot], req_pool_indices, current_positions)
         rows = req_pool_indices.to(torch.long)
         out = self.indices[slot, rows]
         base = self.captured_len[slot, rows].to(torch.int64)
@@ -332,6 +368,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         if config is None:
             config = getattr(model_config, "hf_config", None)
         self.qsa_profile = parse_qsa_profile(config)
+        self._prefill_shard = envs.SGLANG_NPU_QSA_PREFILL_TP_SHARD.get() if _is_npu else "off"
+        if self._prefill_shard not in ("off", "indexer", "attention"):
+            raise ValueError("SGLANG_NPU_QSA_PREFILL_TP_SHARD must be off, indexer or attention")
+        if getattr(runner, "is_draft_worker", False) or self._kv_shard_pool is not None:
+            self._prefill_shard = "off"
+        self._shard_gqa = (
+            self._prefill_shard == "attention"
+            and getattr(config, "num_attention_heads", None) == 24
+            and getattr(config, "num_key_value_heads", None) == 2
+            and get_parallel().attn_tp_size == 8
+        )
         self.max_context_len = int(getattr(model_config, "context_len", 0))
         self.compress_ratio = (
             self.qsa_profile.compress_ratio
@@ -364,6 +411,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_row_req_pool_indices = None
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
+        self._reuse_gbsa_meta = (
+            _is_npu and os.getenv("SGLANG_NPU_QSA_REUSE_GBSA_META", "1") == "1"
+        )
+        self._prepare_prefill_gbsa = (
+            self._reuse_gbsa_meta
+            and getattr(config, "num_attention_heads", 0) == 3 * get_parallel().attn_tp_size
+            and getattr(config, "head_dim", None) == 256
+            and getattr(model_config, "dtype", None) == torch.bfloat16
+        )
         self._trtllm_workspace = None
         self._trtllm_counters = {}
         self._graph_extend_lens = None
@@ -831,6 +887,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=sequence_lengths,
                 logical_positions=ring_logical_positions,
                 compress_ratio=self.compress_ratio,
+                ring_stride=getattr(self.token_to_kv_pool, "qsa_ring_stride", self.compress_ratio),
                 is_extend=group_member_rows is not None,
             )
             if write_locs.numel():
@@ -849,8 +906,43 @@ class QwenSparseAttnBackend(AttentionBackend):
                         group_end_positions=group_positions.long(),
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
+                        ring_stride=getattr(self.token_to_kv_pool, "qsa_ring_stride", self.compress_ratio),
                     )
+        npu_prefill_row_ranges = None
+        if (
+            _is_npu and not speculative_paged
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and self._can_defer_prefill_block_expansion(forward_batch.forward_mode)
+            and getattr(forward_batch, "attn_cp_metadata", None) is None
+        ):
+            npu_prefill_row_ranges = build_qsa_row_ranges(
+                sequence_lengths, forward_batch.positions.flatten()[:token_to_batch_idx.numel()],
+                token_to_batch_idx, self.compress_ratio,
+            )
+        rows = token_to_batch_idx.numel()
+        shard = layout = None
+        if (
+            self._prefill_shard != "off" and self._mtp_shared_sparse_indices is None
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and getattr(forward_batch, "attn_cp_metadata", None) is None
+            and not get_parallel().dcp_enabled
+            and 1 < get_parallel().attn_tp_size <= rows
+        ):
+            size, rank = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
+            count = (rows + size - 1) // size
+            shard = slice(rank * count, (rank + 1) * count)
+            if (
+                self._shard_gqa and forward_batch.forward_mode == ForwardMode.EXTEND
+                and rows >= 128
+                and forward_batch.seq_lens_cpu is not None
+                and forward_batch.extend_seq_lens_cpu is not None
+            ):
+                layout = QSAPrefillTPLayout.build(rows, size, rank)
+                shard = layout.indexer_slice
         indexer_metadata = QSAIndexerMetadata(
+            npu_prefill_row_ranges=npu_prefill_row_ranges,
+            npu_indexer_slice=shard,
+            prefill_tp_layout=layout,
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
@@ -878,16 +970,42 @@ class QwenSparseAttnBackend(AttentionBackend):
             ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
+        if layout is not None and indexer_metadata.defer_prefill_block_expansion:
+            from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import (
+                prepare_sharded_prefill_inputs,
+            )
+
+            prefill_inputs = prepare_sharded_prefill_inputs(
+                forward_batch, token_slot_table,
+                slice(layout.attention_slice.start, min(rows, layout.attention_slice.stop)),
+                os.getenv("SGLANG_NPU_QSA_VA_PREFILL_DISPATCH", "0") == "1",
+            )
+        else:
+            prefill_inputs = self._make_npu_prefill_inputs(
+                forward_batch, sequence_lengths, token_slot_table, rows
+            )
+        schedules = None
+        if self._prepare_prefill_gbsa and npu_prefill_row_ranges is not None and rows >= 128:
+            from sglang.kernels.ops.attention.qsa_gbsa_prefill import (
+                prepare_prefill_gbsa_metadata,
+            )
+
+            start, end, _ = npu_prefill_row_ranges
+            if layout is not None:
+                start, end = start[layout.attention_slice], end[layout.attention_slice]
+            if start.numel():
+                schedules = prepare_prefill_gbsa_metadata(
+                    (start, end), prefill_inputs, sequence_lengths, forward_batch.extend_seq_lens,
+                    (token_slot_table.shape[1] + 127) // 128,
+                )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
-            npu_prefill_inputs=self._make_npu_prefill_inputs(
-                forward_batch, sequence_lengths, token_slot_table,
-                token_to_batch_idx.numel(),
-            ),
+            npu_prefill_inputs=prefill_inputs,
+            prefill_gbsa_metadata=schedules,
         )
 
     def _make_npu_prefill_inputs(self, batch, lengths, token_table, rows):
@@ -1392,6 +1510,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=metadata.sequence_lengths,
                 logical_positions=current_positions,
                 compress_ratio=ratio,
+                ring_stride=getattr(pool, "qsa_ring_stride", ratio),
                 is_extend=False,
             )
         )
@@ -1401,6 +1520,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 group_end_positions=current_positions,
                 sequence_ids=metadata.token_to_batch_idx.long(),
                 compress_ratio=ratio,
+                ring_stride=getattr(pool, "qsa_ring_stride", ratio),
             ).to(torch.int32)
         )
 
@@ -1469,17 +1589,16 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def capture_mtp_sparse_indices(
         self, topk_indices: torch.Tensor, forward_batch, layer_id: int, metadata=None
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
         """Store each request's final accepted row as the iteration seed."""
         if topk_indices.shape[0] == 0:
             return
         if metadata is None:
             metadata = self.get_indexer_metadata(layer_id, forward_batch)
         if metadata.is_cuda_graph or forward_batch.forward_mode.is_draft_extend_v2():
-            self._capture_mtp_sparse_indices_from_extend_lens(
+            return self._capture_mtp_sparse_indices_from_extend_lens(
                 topk_indices, forward_batch, metadata, layer_id
             )
-            return
         if metadata.req_pool_indices is None or metadata.req_pool_indices.numel() == 0:
             return
         state = self._mtp_shared_sparse_indices
@@ -1513,7 +1632,7 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def _capture_mtp_sparse_indices_from_extend_lens(
         self, topk_indices, forward_batch, metadata, layer_id: int
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
         """DRAFT_EXTEND_V2 packs each request as [front rows][draft-window rows],
         so its last accepted row is block_end - (window - front - num_accept);
         rows with no real request (zero extend, padding slot 0) go to the trash row."""
@@ -1542,6 +1661,15 @@ class QwenSparseAttnBackend(AttentionBackend):
             req_pool_rows,
             state.trash_row,
         )
+        if state.block_cache is not None and self._uses_block_indices(topk_indices):
+            from sglang.kernels.ops.attention import qsa_mtp_blocks as blocks
+
+            packed = blocks.pack(topk_indices, metadata.get_seqlens_expanded().contiguous())
+            blocks.save(
+                packed, anchor_rows, req_rows, state.block_cache[state.layer_slots[layer_id]],
+                state.trash_row,
+            )
+            return packed
         captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
         state.capture(
             topk_indices.index_select(0, anchor_rows),
@@ -1572,9 +1700,12 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _logical_to_physical(
-        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
+        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata, row_slice=None
     ) -> torch.Tensor:
-        sequence_ids = metadata.token_to_batch_idx.long()
+        sequence_ids = metadata.token_to_batch_idx
+        if row_slice is not None:
+            sequence_ids = sequence_ids[row_slice]
+        sequence_ids = sequence_ids.long()
         if sequence_ids.numel() != logical_indices.shape[0]:
             raise ValueError("QSA top-k rows do not match query rows")
         row_lengths = metadata.sequence_lengths.to(torch.int32).index_select(
@@ -1621,6 +1752,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _can_defer_block_expansion(self, forward_mode):
+        if _is_npu and self._mtp_shared_sparse_indices is not None:
+            return (
+                forward_mode.is_draft_extend_v2()
+                and self._mtp_shared_sparse_indices.block_cache is not None
+                and self.qsa_profile is not None
+                and self.compress_ratio == 4
+                and self.qsa_profile.block_topk == 512
+            )
         return (
             (
                 self._mtp_shared_sparse_indices is None
@@ -1807,6 +1946,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
+        if getattr(self, "_shard_gqa", False) and forward_batch.forward_mode == ForwardMode.EXTEND:
+            metadata = self._resolve_metadata(forward_batch)
+            layout = metadata.indexer_metadata.prefill_tp_layout
+            if layout is not None:
+                output = self._forward_extend_tp(q, k, v, layer, topk_indices, metadata, layout)
+                return self._pad_extend_output(output, num_output_rows)
         num_valid_rows = topk_indices.shape[0]
         if num_valid_rows > num_output_rows:
             raise ValueError(
@@ -1869,6 +2014,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).key(), "key"),
                         _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).value(), "value"),
                         topk_indices, metadata.npu_prefill_inputs, layer.scaling,
+                        prepared_metadata=metadata.prefill_gbsa_metadata,
                     )
                     return self._pad_extend_output(output, num_output_rows)
                 # Keep original sequence boundaries: GBSA computes all selected
@@ -1884,6 +2030,13 @@ class QwenSparseAttnBackend(AttentionBackend):
                     q.shape[0],
                     layer.scaling,
                     indices_are_blocks=self._uses_block_indices(topk_indices),
+                    prepared_metadata=(
+                        metadata.prefill_gbsa_metadata[0, num_valid_rows]
+                        if metadata.prefill_gbsa_metadata is not None
+                        and self._uses_block_indices(topk_indices)
+                        and num_valid_rows == metadata.token_to_batch_idx.numel()
+                        else None
+                    ),
                 )
                 return self._pad_extend_output(output, num_output_rows)
             # The token consumer can fuse compact expansion with slot mapping.
@@ -1972,6 +2125,36 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer.scaling,
         )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _forward_extend_tp(self, q, chunk_k, chunk_v, layer, indices, metadata, layout):
+        """Transpose rows within each replicated KV group, with three Q heads per call."""
+        rows = metadata.token_to_batch_idx.numel()
+        padded_rows = sum(layout.attention_splits)
+        q = q[:rows].contiguous()
+        if rows != padded_rows:
+            q = F.pad(q, (0, 0, 0, 0, 0, padded_rows - rows))
+        received = qsa_all_to_all(q, layout.attention_splits)
+        chunks = received.view(-1, 2 * layout.rows_per_rank, *q.shape[1:])
+        out = torch.zeros_like(chunks)
+        count = indices.shape[0]
+        if count:
+            cache = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+            k, v = cache.key(), cache.value()
+            if metadata.indexer_metadata.defer_prefill_block_expansion:
+                from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import dispatch_sg_prefill
+
+                k = _flatten_qsa_kv_cache(k, "key")
+                v = _flatten_qsa_kv_cache(v, "value")
+                for i, x in enumerate(chunks):
+                    out[i, :count] = dispatch_sg_prefill(
+                        x[:count], chunk_k, chunk_v, k, v, indices, metadata.npu_prefill_inputs, layer.scaling,
+                        prepared_metadata=metadata.prefill_gbsa_metadata,
+                    )
+            else:
+                slots = self._logical_to_physical(indices, metadata, layout.attention_slice)
+                for i, x in enumerate(chunks):
+                    out[i, :count] = _npu_sparse_attention(x[:count], k, v, slots, layer.scaling)
+        return qsa_all_to_all(out.view_as(received), layout.attention_splits)[:rows]
 
     def prefetch_cp_kv(self, layer, k: torch.Tensor, v: torch.Tensor, forward_batch):
         """Run ``layer``'s prefill-CP K/V gather on a side stream; the layer's
@@ -2345,20 +2528,31 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_buffer = pool.layer_router.read(layer.layer_id).value()
         metadata = self._resolve_metadata(forward_batch)
         if _is_npu:
+            counts = None
+            positions = None
+            state = self._mtp_shared_sparse_indices
+            if state is not None and state.block_cache is not None:
+                from sglang.kernels.ops.attention import qsa_mtp_blocks as blocks
+
+                if topk_indices.shape[1] == blocks.PACK_WIDTH:
+                    ids, counts, lengths = blocks.unpack(topk_indices)
+                    topk_indices = ids[0]
             compact = self._uses_block_indices(topk_indices)
-            positions = (
-                metadata.indexer_metadata.decode_logical_positions
-                if compact
-                else None
-            )
-            if compact and positions is None:
+            if compact:
+                positions = metadata.indexer_metadata.decode_logical_positions
+            if compact and counts is None and positions is None:
                 raise RuntimeError("Compact QSA paged indices require logical positions")
             if compact:
                 output = self._try_npu_paged_gbsa(
-                    q, k_buffer, v_buffer, metadata, topk_indices, layer.scaling
+                    q, k_buffer, v_buffer, metadata, topk_indices, layer.scaling,
+                    sorted_block_counts=counts,
                 )
                 if output is not None:
                     return output.reshape(q.shape[0], -1)
+            if counts is not None:
+                positions = lengths - 1
+                # The slot mapper uses -1 padding; GBSA consumes counts instead.
+                topk_indices = topk_indices.masked_fill(topk_indices == 16777215, -1)
             slots = self._npu_indices_to_physical(topk_indices, metadata, positions)
             output = _npu_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
@@ -2464,7 +2658,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
-    def _try_npu_paged_gbsa(self, q, k, v, metadata, groups, scale):
+    def _try_npu_paged_gbsa(
+        self, q, k, v, metadata, groups, scale, *, sorted_block_counts=None
+    ):
         if not (
             os.getenv("SGLANG_NPU_QSA_PAGED_GBSA", "0") == "1"
             and q.shape[0] > 0
@@ -2497,6 +2693,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             q, _flatten_qsa_kv_cache(k, "key"), _flatten_qsa_kv_cache(v, "value"),
             groups, None, lengths, None, 1, scale,
             indices_are_blocks=True, page_table=pages, cu_seqlens_q=cu_q,
+            sorted_block_counts=sorted_block_counts,
+            paged_step=(
+                metadata
+                if self._reuse_gbsa_meta
+                and sorted_block_counts is None
+                and self._mtp_shared_sparse_indices is None
+                and indexer.defer_block_expansion
+                and getattr(self.token_to_kv_pool, "qsa_compressed_dtype", None) == torch.bfloat16
+                else None
+            ),
         )
 
 

@@ -557,13 +557,22 @@ class LogitsProcessor(nn.Module):
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
         self.defer_plain_gather = envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER.get()
-        self._sharded_verify_eligible = (
-            _runtime_optimized_vocab_shards_enabled()
-            and self.do_tensor_parallel_all_gather
+        shard_layout = (
+            self.do_tensor_parallel_all_gather
             and not self.use_attn_tp_group
             and not self.do_tensor_parallel_all_gather_dp_attn
             and not self.use_tp_lm_head_all_to_all
             and not return_full_logits
+        )
+        self._sharded_verify_eligible = (
+            _runtime_optimized_vocab_shards_enabled() and shard_layout
+        )
+        self.npu_qwen_greedy_shards = (
+            _is_npu
+            and envs.SGLANG_NPU_QWEN4_GREEDY_SHARDS.get()
+            and shard_layout
+            and self.vocab_size <= 2**24
+            and not envs.SGLANG_SANITIZE_NAN_LOGITS.get()
         )
         # A speculative worker must explicitly opt in after establishing that
         # its verify consumer understands ``next_token_logits_vocab_shard``.
@@ -618,13 +627,17 @@ class LogitsProcessor(nn.Module):
             self.vocab_size, chunking_group=chunking_group
         )
 
-    def enable_sharded_verify(self, *, temperature_keys: bool = False) -> None:
+    def enable_sharded_verify(
+        self, *, temperature_keys: bool = False, npu_qwen: bool = False
+    ) -> None:
         """Opt in a verify consumer that understands vocab-shard outputs.
 
         temperature_keys: the bound local key policy may serve temperature rows;
         the stock policy serves greedy rows only.
         """
-        self.sharded_verify = self._sharded_verify_eligible
+        self.sharded_verify = (
+            self.npu_qwen_greedy_shards if npu_qwen else self._sharded_verify_eligible
+        )
         self._sharded_verify_temperature_keys = temperature_keys
 
     def verify_uses_vocab_shards(self, forward_batch: ForwardBatch) -> bool:

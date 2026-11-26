@@ -254,7 +254,14 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
-        forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+        source_batch = forward_batch
+        forward_batch = self.load_batch(source_batch, pp_proxy_tensors)
+        contiguous = getattr(source_batch, "_qsa_contiguous_extend", None)
+        if contiguous is not None and contiguous[0] is source_batch.positions:
+            # Eager loading copies the live positions in order into its own view.
+            forward_batch._qsa_contiguous_extend = (
+                forward_batch.positions, contiguous[1], contiguous[2]
+            )
 
         cp_active = is_cp_active(forward_batch)
         if cp_active:

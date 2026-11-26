@@ -631,12 +631,41 @@ def _ll_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
     return tokens
 
 
+def _native_sharded_target_tokens(
+    logits: torch.Tensor, shard: VocabShard, tp_group
+) -> torch.Tensor:
+    """Exchange a winning score and exact global token id per row."""
+    rows = logits.shape[0]
+    if shard.valid:
+        valid_logits = logits[:, : shard.valid]
+        indices = valid_logits.float().argmax(-1, keepdim=True)
+        scores = valid_logits.gather(1, indices).float()
+        local = torch.cat((scores, (indices + shard.start).float()), dim=1)
+    else:
+        padding = torch.tensor(
+            [float("-inf"), float(shard.vocab_size)],
+            device=logits.device,
+            dtype=torch.float32,
+        )
+        local = padding.expand(rows, 2).contiguous()
+    pairs = local.new_empty((tp_group.world_size, rows, 2))
+    tp_group.all_gather_into_tensor(pairs.view(-1, 2), local)
+    ranks = pairs[:, :, 0].argmax(0, keepdim=True)
+    return pairs[:, :, 1].gather(0, ranks).squeeze(0).long()
+
+
 def sharded_target_tokens(
     logits: torch.Tensor,
     shard: VocabShard,
     tp_group,
 ) -> torch.Tensor:
     """[rows] token ids over the whole vocabulary from every rank's logits shard."""
+    if (
+        logits.device.type == "npu"
+        and envs.SGLANG_NPU_QWEN4_GREEDY_SHARDS.get()
+        and shard.vocab_size <= 2**24
+    ):
+        return _native_sharded_target_tokens(logits, shard, tp_group)
     # The final TP rank may have fewer valid vocabulary columns than its padded
     # local LM-head output.  Every rank must nevertheless enter the collective
     # with the same key shape, so derive the split count from the rank-uniform

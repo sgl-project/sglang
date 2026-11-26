@@ -5,7 +5,7 @@ The request/plan classes and builder below are copied from the fixed VA source;
 the SG adapter prepares common tensors once and keeps GBSA spans coalesced.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -22,6 +22,7 @@ class QSARequest:
     query_end: int
     kv_length: int
     is_prefill: bool
+    use_fia_override: bool | None = None
 
     @property
     def use_paged_kv(self) -> bool:
@@ -35,6 +36,8 @@ class QSARequest:
     @property
     def fia_query_end(self) -> int:
         """Keep a chunk crossing 24K on FIA; switch subsequent chunks."""
+        if self.use_fia_override is not None:
+            return self.query_end if self.use_fia_override else self.query_start
         if not self.is_prefill:
             return self.query_start
         query_length = self.query_end - self.query_start
@@ -78,6 +81,7 @@ def build_qsa_request_plan(
     seq_lens_cpu: torch.Tensor,
     num_actual_tokens: int,
     is_prefilling_cpu: torch.Tensor,
+    fia_routes=None,
 ) -> QSARequestPlan:
     """Classify mixed-batch rows once for reuse by every QSA layer."""
     if any(t.device.type != "cpu" for t in (query_start_loc_cpu, seq_lens_cpu, is_prefilling_cpu)):
@@ -93,7 +97,11 @@ def build_qsa_request_plan(
         end = min(max(end, start), num_actual_tokens)
         if end > start:
             requests.append(
-                QSARequest(request_index, start, end, int(lengths[request_index]), bool(phases[request_index]))
+                QSARequest(
+                    request_index, start, end, int(lengths[request_index]),
+                    bool(phases[request_index]),
+                    None if fia_routes is None else fia_routes[request_index],
+                )
             )
     requests_tuple = tuple(requests)
     fia_requests = tuple(request for request in requests_tuple if request.use_fia)
@@ -118,6 +126,8 @@ class SGPrefillInputs:
     extend_lengths: torch.Tensor
     # start/end query rows, first/last request indices, request offsets.
     gbsa_calls: tuple
+    # For a sharded query, dense current-chunk KV still has its original row layout.
+    direct_kv_rows: tuple | None = None
 
 
 def prepare_sg_prefill_inputs(
@@ -127,6 +137,8 @@ def prepare_sg_prefill_inputs(
     extend_lengths,
     token_table,
     logical_positions,
+    *,
+    fia_routes=None,
 ):
     """Build shared routing/mask inputs without reading device values."""
     lengths = [int(n) for n in sequence_lengths_cpu]
@@ -143,8 +155,9 @@ def prepare_sg_prefill_inputs(
         torch.tensor(lengths, dtype=torch.int32, device="cpu"),
         starts[-1],
         torch.ones(len(lengths), dtype=torch.bool, device="cpu"),
+        fia_routes,
     )
-    if not plan.fia_requests:
+    if not plan.fia_requests and fia_routes is None:
         return None
     # These views are shared by every QSA layer in this forward batch.
     page_table = (token_table[:, ::128] // 128).to(torch.int32).contiguous()
@@ -161,7 +174,44 @@ def prepare_sg_prefill_inputs(
     )
 
 
-def dispatch_sg_prefill(q, k, v, key_cache, value_cache, groups, inputs, scale):
+def prepare_sharded_prefill_inputs(batch, token_table, rows, use_fia):
+    """Preserve the original request route and causal end for each partial request."""
+    lengths, extends, routes, direct = [], [], [], []
+    start = 0
+    first = None
+    for i, (kv, ext) in enumerate(zip(batch.seq_lens_cpu, batch.extend_seq_lens_cpu)):
+        kv, ext = int(kv), int(ext)
+        end = start + ext
+        left, right = max(rows.start, start), min(rows.stop, end)
+        if right > left:
+            if first is None:
+                first = i
+            lengths.append(kv - (end - right))
+            extends.append(right - left)
+            routes.append(use_fia and QSARequest(i, start, end, kv, True).use_fia)
+            direct.append(slice(start, end) if kv == ext else None)
+        elif first is not None and start < rows.stop and ext == 0:
+            # Keep request indices aligned with the contiguous page-table view.
+            lengths.append(kv)
+            extends.append(0)
+            routes.append(False)
+            direct.append(None)
+        start = end
+    if first is None:
+        return None
+    positions = batch.positions.flatten()[rows]
+    inputs = prepare_sg_prefill_inputs(
+        lengths, extends, batch.seq_lens.new_tensor(lengths),
+        batch.extend_seq_lens.new_tensor(extends), token_table[first:first + len(extends)],
+        positions[:sum(extends)], fia_routes=routes,
+    )
+    return replace(inputs, direct_kv_rows=tuple(direct))
+
+
+def dispatch_sg_prefill(
+    q, k, v, key_cache, value_cache, groups, inputs, scale, *,
+    meta_cache=None, fixed_topk_counts=False, prepared_metadata=None,
+):
     """Use current-chunk KV or zero-copy paged KV with the VA request plan."""
     if groups.shape != (q.shape[0], 512):
         raise ValueError("SG prefill dispatch requires compact512 group indices")
@@ -170,7 +220,11 @@ def dispatch_sg_prefill(q, k, v, key_cache, value_cache, groups, inputs, scale):
     value_pages = value_cache.view(-1, 128, 1, 256)
     for request in inputs.plan.fia_requests:
         rows = slice(request.query_start, request.query_end)
-        if request.use_paged_kv or k is None or v is None:
+        dense = None if request.use_paged_kv else rows
+        if inputs.direct_kv_rows is not None:
+            dense = inputs.direct_kv_rows[request.request_index]
+        kv_length = request.kv_length
+        if dense is None or k is None or v is None:
             keys, values, table, _ = prepare_qsa_fia_paged_kv(
                 key_pages,
                 value_pages,
@@ -178,10 +232,11 @@ def dispatch_sg_prefill(q, k, v, key_cache, value_cache, groups, inputs, scale):
                 request.kv_length,
             )
         else:
-            keys, values, table = k[rows], v[rows], None
+            keys, values, table = k[dense], v[dense], None
+            kv_length = dense.stop - dense.start
         qsa_fia_attention(
             q[rows], keys, values, groups[rows], inputs.visible_lens[rows],
-            request.kv_length, output[rows], block_table=table, softmax_scale=scale,
+            kv_length, output[rows], block_table=table, softmax_scale=scale,
         )
     for start, end, first, last, cu_q in inputs.gbsa_calls:
         output[start:end].copy_(qsa_gbsa_prefill(
@@ -189,5 +244,8 @@ def dispatch_sg_prefill(q, k, v, key_cache, value_cache, groups, inputs, scale):
             inputs.sequence_lengths[first:last], inputs.extend_lengths[first:last],
             end - start, scale, indices_are_blocks=True,
             page_table=inputs.page_table[first:last], cu_seqlens_q=cu_q,
+            meta_cache=meta_cache, span=(start, end, first, last),
+            fixed_topk_counts=fixed_topk_counts,
+            prepared_metadata=prepared_metadata[start, end] if prepared_metadata is not None else None,
         ))
     return output

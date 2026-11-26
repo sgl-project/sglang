@@ -598,7 +598,7 @@ def prepare_mlp_sync_batch_raw(
     drain_column: Optional[DPDrainColumn] = None,
 ):
     parallel = get_parallel()
-    num_dp_ranks = parallel.num_dp_ranks
+    num_dp_ranks = dp_gather_width()
     attn_tp_size = parallel.attn_tp_size
     tp_group = parallel.tp_group
     # Check if other DP workers have running batches
@@ -825,7 +825,7 @@ class SchedulerDPAttnAdapter:
         A loop that stops scheduling batches on shutdown still runs one batch
         selection while this holds, so its gather tells the other DP ranks.
         """
-        num_dp_ranks = get_parallel().num_dp_ranks
+        num_dp_ranks = dp_gather_width()
         return (
             self.get_shutting_down()
             and not self.shutdown_vote_sent.value

@@ -111,6 +111,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         qsa_compress_ratio: int,
         qsa_token_topk: int,
         num_request_slots: int,
+        qsa_verify_width: int = 1,
         enable_memory_saver: bool = False,
         enable_kv_cache_copy: bool = False,
         start_layer: Optional[int] = None,
@@ -191,16 +192,18 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
-        # Pre-compression index-K state is a per-request ring, not a per-token cache:
-        # only the pending group's ``ratio`` members must survive a forward,
-        # addressed as ``req_pool_idx * ratio + position % ratio``.
-        # Request slot 0 is never allocated, so rows [0, ratio) are the inert dump.
+        # Keep the unfinished compression group and every speculative row alive
+        # until the accepted prefix is known. Request slot zero holds padding.
+        if qsa_verify_width < 1:
+            raise ValueError("QSA verify width must be positive")
+        ratio = self.qsa_compress_ratio
+        self.qsa_ring_stride = ((qsa_verify_width + 2 * ratio - 2) // ratio) * ratio
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        ring_slots = self.qsa_num_request_slots * self.qsa_ring_stride
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver
         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
@@ -252,6 +255,14 @@ class QSATokenToKVPool(HybridLinearKVPool):
             )
             for layer_offset in range(len(full_attention_layer_ids))
         ]
+        if self.qsa_ring_stride > self.qsa_compress_ratio:
+            logger.info(
+                "QSA pending ring: stride=%d, request_slots=%d, rows=%d, verify_width=%d",
+                self.qsa_ring_stride,
+                self.qsa_num_request_slots,
+                self.qsa_rope_position_buffer.shape[0],
+                qsa_verify_width,
+            )
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
 
@@ -313,7 +324,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
         return self._get_paged_state_buf_infos(
             tensors,
-            self.qsa_compress_ratio,
+            self.qsa_ring_stride,
         )
 
     def get_qsa_pending_state_layer_ids(self):

@@ -13,7 +13,59 @@ from test_qsa_request_li_npu import runtime_context  # noqa: F401
 import torch
 from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
 from sglang.srt.layers.attention.qsa.kernel import expand_qsa_block_indices
-from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend, QwenSparseAttnMetadata
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QSAMTPSharedSparseIndices,
+    QwenSparseAttnBackend,
+    QwenSparseAttnMetadata,
+)
+
+
+def test_paged_meta_reuse_reads_new_lengths_on_graph_replay(monkeypatch):
+    from sglang.kernels.ops.attention.qsa_gbsa_prefill import (
+        qsa_gbsa_prefill,
+        with_paged_gbsa_cache,
+    )
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    for flag in (
+        "SGLANG_NPU_QSA_REUSE_GBSA_META",
+        "SGLANG_NPU_QSA_PAGED_GBSA",
+        "SGLANG_NPU_QSA_LIGHTNING_INDEXER",
+    ):
+        monkeypatch.setenv(flag, "1")
+    c = make_case([1, 1], [128, 4096])
+    pages = (c.table[:, ::128] // 128).int().contiguous()
+    cu_q = torch.arange(3, device=c.q.device, dtype=torch.int64)
+    selections = (c.groups, c.groups.clone())
+    batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+    def run(ids, step):
+        return qsa_gbsa_prefill(
+            c.q, c.k, c.v, ids, None, c.lengths, None, 1,
+            indices_are_blocks=True, page_table=pages, cu_seqlens_q=cu_q,
+            paged_step=step,
+        )
+
+    @with_paged_gbsa_cache
+    def layers(self, input_ids, positions, forward_batch):
+        return tuple(run(ids, forward_batch) for ids in selections)
+
+    layers(None, None, None, batch)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, auto_dispatch_capture=False):
+        outputs = layers(None, None, None, batch)
+    for lengths in ([129, 4097], [3, 2049], [65, 4095]):
+        c.lengths.copy_(c.lengths.new_tensor(lengths))
+        for offset, ids in enumerate(selections):
+            ids.fill_(-1)
+            for row, length in enumerate(lengths):
+                blocks = length // 4
+                if blocks:
+                    rank = torch.arange(min(blocks, 512), device=ids.device)
+                    ids[row, :rank.numel()] = (rank + offset) % blocks
+        graph.replay()
+        for ids, output in zip(selections, outputs):
+            torch.testing.assert_close(output, run(ids, None), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("extends,prefixes,marker", [
@@ -105,3 +157,19 @@ def test_actual_paged_consumer(monkeypatch, extends, prefixes, marker):
     assert backend._try_npu_paged_gbsa(c.q, c.k.unsqueeze(1), c.v.unsqueeze(1), metadata, tokens, 1 / 16) is None
     expected = backend._forward_paged_attention(c.q, layer, None, tokens)
     torch.testing.assert_close(outputs["gbsa"], expected, atol=0.004, rtol=0.02)
+
+    # Replaying the selection at its capture position must reproduce both
+    # native paged attention and the slot-based fallback, including short tails.
+    monkeypatch.setenv("SGLANG_NPU_QSA_PAGED_GBSA", "1")
+    state = QSAMTPSharedSparseIndices(
+        layer_ids=[0], num_requests=rows + 1, token_topk=2051,
+        tail_width=4, device=c.q.device,
+    )
+    backend.set_mtp_shared_sparse_indices(state)
+    slots = row_ids + 1
+    state.capture(tokens, slots, lengths, 0)
+    packed = state.lookup(slots, c.positions, 0)
+    for enabled in ("1", "0"):
+        monkeypatch.setenv("SGLANG_NPU_QSA_PAGED_GBSA", enabled)
+        actual = backend._forward_paged_attention(c.q, layer, None, packed)
+        torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)

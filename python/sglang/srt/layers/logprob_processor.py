@@ -90,7 +90,8 @@ def compute_row_log_normalizer(
     shift-invariant order as log-softmax; a single absolute normalizer would
     round the log_sum term away for rows with a large common offset.
     """
-    if logits.is_cuda:
+    # Compatibility mode can report Tensor.is_cuda on NPU tensors.
+    if logits.device.type == "cuda":
         from sglang.srt.layers.logsumexp import row_logsumexp
 
         return row_logsumexp(logits)
@@ -826,7 +827,7 @@ class InputLogprobProcessor:
         split_len_token_ids = 0
 
         fused_kernel, fused_max_k = None, 0
-        if self.enable_fast_input_logprobs and pruned_states.is_cuda:
+        if self.enable_fast_input_logprobs and pruned_states.device.type == "cuda":
             from sglang.srt.layers.logsumexp import (
                 FUSED_TOPK_MAX_K,
                 row_logsumexp_topk,

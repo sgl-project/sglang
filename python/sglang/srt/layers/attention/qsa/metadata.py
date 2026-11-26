@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.qsa.kernel import (
     gather_qsa_compressed_keys,
     qsa_fast_topk,
 )
+from sglang.srt.layers.attention.qsa.tp_shard import QSAPrefillTPLayout
 
 
 def build_qsa_row_ranges(
@@ -99,6 +100,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     defer_prefill_block_expansion: bool = False
     # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
+    npu_indexer_slice: Optional[slice] = None
+    prefill_tp_layout: Optional[QSAPrefillTPLayout] = None
     # Separate stable request view for LI; other consumers retain row metadata.
     npu_lightning_inputs: Optional[object] = None
     # Paged GBSA uses one sequence per query row; the fixed offsets are shared
@@ -107,6 +110,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     # The device metadata builder assigns padded rows to unallocated request0.
     # With <=4 rows per real request, every live pending-ring slot is unique.
     npu_unique_live_ring_writes: bool = False
+    # Request row bounds live for one ordinary prefill. Each layer has its own keys.
+    npu_prefill_row_ranges: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -158,6 +163,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         layer_id: int,
         positions: torch.Tensor,
         query_sequence_ids: Optional[torch.Tensor] = None,
+        *,
+        use_prepared_ranges: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gather packed compressed K and ragged ranges for prefill MQA.
 
@@ -173,6 +180,7 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         if sequence_lengths_list is None:
             sequence_lengths_list = sequence_lengths.tolist()
         complete_blocks = [int(length) // ratio for length in sequence_lengths_list]
+        ranges = self.npu_prefill_row_ranges if use_prepared_ranges and query_sequence_ids is None else None
         if query_sequence_ids is None:
             query_sequence_ids = self.token_to_batch_idx
         num_valid_tokens = query_sequence_ids.numel()
@@ -182,12 +190,12 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
                 f"positions={positions.numel()}, mapping={num_valid_tokens}"
             )
         positions = positions[:num_valid_tokens]
-        row_starts, row_ends, compressed_cu_seqlens = build_qsa_row_ranges(
-            sequence_lengths,
-            positions.to(sequence_lengths.device),
-            query_sequence_ids.to(sequence_lengths.device),
-            self.compress_ratio,
-        )
+        if ranges is None:
+            ranges = build_qsa_row_ranges(
+                sequence_lengths, positions.to(sequence_lengths.device),
+                query_sequence_ids.to(sequence_lengths.device), self.compress_ratio,
+            )
+        row_starts, row_ends, compressed_cu_seqlens = ranges
         compressed_keys = gather_qsa_compressed_keys(
             compressed_buffer,
             self.token_slot_table,
@@ -259,14 +267,16 @@ def build_pending_ring_slots(
     logical_positions: torch.Tensor,
     compress_ratio: int,
     is_extend: bool,
+    ring_stride: int | None = None,
 ) -> torch.Tensor:
-    """Pending-ring slot ``req_pool_idx * ratio + position % ratio`` per token.
+    """Pending-ring slot ``req_pool_idx * stride + position % stride`` per token.
     On extend, tokens before the pending tail dump into rows [0, ratio),
     which no request owns (request slot 0 is never allocated); CUDA-graph safe."""
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
-    slots = requests * compress_ratio + positions % compress_ratio
+    stride = compress_ratio if ring_stride is None else ring_stride
+    slots = requests * stride + positions % stride
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
@@ -280,6 +290,7 @@ def build_group_ring_slots(
     group_end_positions: torch.Tensor,
     sequence_ids: torch.Tensor,
     compress_ratio: int,
+    ring_stride: int | None = None,
 ) -> torch.Tensor:
     """Ring slots of a planned group's members, oldest first."""
     requests = req_pool_indices.long()[sequence_ids]
@@ -291,7 +302,8 @@ def build_group_ring_slots(
         dtype=torch.long,
     )
     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
-    return requests[:, None] * compress_ratio + positions % compress_ratio
+    stride = compress_ratio if ring_stride is None else ring_stride
+    return requests[:, None] * stride + positions % stride
 
 
 def build_rope_position_matrix(
