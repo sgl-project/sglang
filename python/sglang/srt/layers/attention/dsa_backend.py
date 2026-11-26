@@ -1092,7 +1092,7 @@ class DeepseekSparseAttnBackend(
                     max_rows,
                     self.dsa_index_topk,
                     self.physical_page_size,
-                    model_runner.model_config.context_len,
+                    self.max_kv_len,
                 )
 
         if _is_xpu:

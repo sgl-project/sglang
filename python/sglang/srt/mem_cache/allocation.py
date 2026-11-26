@@ -866,7 +866,7 @@ def alloc_for_spec_decode(
     # Nothing clamps the write below to the row: an allocation past it lands in
     # the next request's row.
     nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
-    req_to_token_row_width = req_to_token_pool.req_to_token.shape[1]
+    req_to_token_row_width = req_to_token_pool.row_width
     max_nxt_kv_len = max(nxt_kv_lens_list, default=0)
     if max_nxt_kv_len > req_to_token_row_width:
         raise RuntimeError(

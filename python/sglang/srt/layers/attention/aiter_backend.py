@@ -6093,7 +6093,7 @@ class AiterIndicesUpdaterPrefill:
                 kv_indptr,
                 kv_start_idx,
                 kv_indices,
-                self.req_to_token.shape[1],
+                self.req_to_token.stride(0),
             )
 
             # Pad past the real total kv_indptr[bs] (seq_lens_sum may be an upper bound)

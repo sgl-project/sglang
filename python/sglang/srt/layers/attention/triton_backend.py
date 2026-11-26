@@ -88,12 +88,12 @@ _MLA_DECODE_MIN_BLOCK_KV = 32
 
 
 def _mla_decode_kv_splits_cap(
-    base_max_kv_splits: int, sm_count: int, max_context_len: int
+    base_max_kv_splits: int, sm_count: int, max_kv_len: int
 ) -> int:
     if sm_count <= 0:
         return base_max_kv_splits
     sm_cap = next_power_of_2(sm_count)
-    ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
+    ctx_cap = next_power_of_2(triton.cdiv(max_kv_len, _MLA_DECODE_MIN_BLOCK_KV))
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
