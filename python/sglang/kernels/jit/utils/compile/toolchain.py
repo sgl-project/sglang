@@ -61,9 +61,16 @@ def cuda_stubs_dir() -> str:
     A module that calls the driver API links `-lcuda` against this stub; the
     real `libcuda.so.1` is supplied by the installed driver at load time. Only
     the stub ships with the toolkit, so this path -- not a plain `-lcuda` -- is
-    what makes the link resolve.
+    what makes the link resolve. A toolkit keeps it under ``lib64/stubs``; the
+    pip CUDA wheels (nvidia/cu13) have no ``lib64/``, so ``lib/stubs`` is tried too.
     """
-    return os.path.join(cuda_home(), "lib64", "stubs")
+    cuda_root = cuda_home()
+    for lib_dir in ("lib64", "lib"):
+        stubs = os.path.join(cuda_root, lib_dir, "stubs")
+        if os.path.exists(os.path.join(stubs, "libcuda.so")):
+            return stubs
+    # Neither layout found: keep the toolkit path, so the linker names what is missing.
+    return os.path.join(cuda_root, "lib64", "stubs")
 
 
 @cache_once

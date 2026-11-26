@@ -519,6 +519,25 @@ def test_cuda_toolkit_link_flags_are_unchanged(tmp_path, monkeypatch):
     assert "-l:" not in ldflags
 
 
+def _stubs_dir(monkeypatch, cuda_root: pathlib.Path) -> str:
+    monkeypatch.setattr(toolchain, "cuda_home", lambda: str(cuda_root))
+    return toolchain.cuda_stubs_dir.__wrapped__()
+
+
+def test_pip_cuda_toolkit_finds_the_driver_stub_under_lib(tmp_path, monkeypatch):
+    """`-lcuda` must resolve against the pip CUDA wheels' `lib/stubs` (no `lib64/`)."""
+    _write(tmp_path / "lib" / "stubs" / "libcuda.so", "")
+    assert _stubs_dir(monkeypatch, tmp_path) == str(tmp_path / "lib" / "stubs")
+
+
+def test_cuda_toolkit_stubs_dir_is_unchanged(tmp_path, monkeypatch):
+    """A toolkit keeps `lib64/stubs`, and stays the fallback when neither has the stub."""
+    assert _stubs_dir(monkeypatch, tmp_path) == str(tmp_path / "lib64" / "stubs")
+    _write(tmp_path / "lib64" / "stubs" / "libcuda.so", "")
+    _write(tmp_path / "lib" / "stubs" / "libcuda.so", "")
+    assert _stubs_dir(monkeypatch, tmp_path) == str(tmp_path / "lib64" / "stubs")
+
+
 def test_generated_ninja_is_deterministic():
     spec = _spec(cuda_wrappers=(("run", "K::run"),))
     assert ninja.generate(spec) == ninja.generate(spec)
