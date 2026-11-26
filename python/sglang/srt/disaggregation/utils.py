@@ -357,9 +357,12 @@ def lacks_decode_peer(
     )
 
 
-def is_prefill_only(req: Req) -> bool:
+def answered_by_prefill(req: Req) -> bool:
     """Whether the prefill server answers this admitted request by itself: it
-    has no decode peer, and asks for no more than the token prefill samples."""
+    has no decode peer, and asks for no more than the token prefill samples.
+
+    Distinct from ``Req.is_prefill_only`` (max_new_tokens == 0, no sampling):
+    this is true for a one-token request as well."""
     if not lacks_decode_peer(req):
         return False
     assert req.sampling_params.max_new_tokens in (0, 1), (

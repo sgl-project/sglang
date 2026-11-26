@@ -172,6 +172,15 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
         self._patches = [
             patch.object(utils, "_all_reduce_polls", lambda polls, group: polls),
             patch.object(prefill_module, "prepare_abort", _classify),
+            # The release path asks whether prefill answered the request alone.
+            patch.object(
+                utils,
+                "get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="mooncake",
+                ),
+            ),
         ]
         for p in self._patches:
             p.start()
