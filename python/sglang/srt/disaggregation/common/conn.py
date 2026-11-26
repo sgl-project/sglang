@@ -2729,9 +2729,17 @@ class CommonKVSender(BaseKVSender):
             status = self.kv_mgr.request_status.get(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if isinstance(self.kv_mgr.request_status, PPConsensusStore):
-            self.kv_mgr.request_status.pop(_pp_held_key(self.bootstrap_room), None)
+        # Serialized with update_status and, under PP, the staging counter's _sync
+        # (same lock order), so neither writes the room back after the pop.
+        with self.kv_mgr._status_lock:
+            if isinstance(self.kv_mgr.request_status, PPConsensusStore):
+                with self.kv_mgr._staging_outstanding._lock:
+                    self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+                    self.kv_mgr.request_status.pop(
+                        _pp_held_key(self.bootstrap_room), None
+                    )
+            else:
+                self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self._retire_sends()
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
@@ -3267,7 +3275,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self.conclude_state = (
                 status if status in (KVPoll.Success, KVPoll.Failed) else KVPoll.Failed
             )
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr._status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
