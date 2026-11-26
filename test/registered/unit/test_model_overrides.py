@@ -1352,6 +1352,54 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         loop = "Inkling2LoopForConditionalGeneration"
         self.assertEqual(backend(arch=loop), ("megamoe", True))
 
+    def test_inkling2_rejects_non_fa4_attention_backend(self):
+        """Inkling2 attention runs only on FA4, so another attention backend is
+        rejected before launch instead of failing in CUDA-graph capture."""
+        from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
+
+        hf = SimpleNamespace(
+            architectures=["Inkling2ForConditionalGeneration"],
+            get_text_config=lambda: SimpleNamespace(
+                hidden_size=4608, intermediate_size=2304
+            ),
+        )
+
+        def run(**backends):
+            args = SimpleNamespace(
+                tool_call_parser="inkling2",
+                reasoning_parser="inkling",
+                tp_size=1,
+                moe_dp_size=1,
+                ep_size=1,
+                attn_dp_size=1,
+                moe_a2a_backend="none",
+                encoder_only=False,
+                enable_two_batch_overlap=False,
+                enable_single_batch_overlap=False,
+                swa_full_tokens_ratio=0.1,
+                mamba_full_memory_ratio=0.1,
+                mamba_radix_cache_strategy="extra_buffer",
+                disable_radix_cache=False,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                _model_config=SimpleNamespace(quantization=None),
+            )
+            for name, value in backends.items():
+                setattr(args, name, value)
+            with override_platform(is_cuda=True, device_sm=90, is_sm120=False):
+                return _inkling_overrides(args, hf)
+
+        run()
+        run(attention_backend="fa4", decode_attention_backend="fa4")
+        for backends in (
+            {"attention_backend": "triton"},
+            {"decode_attention_backend": "triton"},
+            {"prefill_attention_backend": "fa4", "decode_attention_backend": "triton"},
+        ):
+            with self.assertRaisesRegex(ValueError, "Inkling2 requires FA4 attention"):
+                run(**backends)
+
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.

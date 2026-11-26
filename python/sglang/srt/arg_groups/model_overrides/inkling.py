@@ -54,6 +54,23 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
     inkling2 = any(arch in INKLING2_ARCHS for arch in hf_config.architectures)
     if inkling2:
+        # Inkling2 attention runs only on FA4 (inkling2_attn.py asserts it). Reject
+        # other backends here: otherwise prefill CUDA-graph capture or the first
+        # forward fails with an unrelated error.
+        non_fa4 = [
+            f"--{name.replace('_', '-')} {value}"
+            for name in (
+                "attention_backend",
+                "prefill_attention_backend",
+                "decode_attention_backend",
+            )
+            if (value := getattr(cfg, name, None)) is not None and value != "fa4"
+        ]
+        if non_fa4:
+            raise ValueError(
+                f"Inkling2 requires FA4 attention, got {', '.join(non_fa4)}. "
+                "Use fa4 or leave the attention backends unset."
+            )
         if cfg.tool_call_parser is None:
             overrides["tool_call_parser"] = "inkling2"
         if cfg.reasoning_parser is None:
