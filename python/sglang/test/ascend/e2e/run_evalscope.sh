@@ -52,18 +52,20 @@ install_python_via_conda() {
         return 0
     fi
     local installer=/tmp/miniconda.sh
-    echo "No Python >= ${EVALSCOPE_MIN_PYTHON} found; installing Miniconda from ${CONDA_INSTALLER_URL}"
+    # Diagnostics must go to stderr: this function's stdout is captured as the
+    # interpreter path by the caller.
+    echo "No Python >= ${EVALSCOPE_MIN_PYTHON} found; installing Miniconda from ${CONDA_INSTALLER_URL}" >&2
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 3 --connect-timeout 15 -o "${installer}" "${CONDA_INSTALLER_URL}" || return 1
+        curl -fsSL --retry 3 --connect-timeout 15 -o "${installer}" "${CONDA_INSTALLER_URL}" >&2 || return 1
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "${installer}" "${CONDA_INSTALLER_URL}" || return 1
+        wget -q -O "${installer}" "${CONDA_INSTALLER_URL}" >&2 || return 1
     else
         echo "Neither curl nor wget is available to download Miniconda" >&2
         return 1
     fi
-    bash "${installer}" -b -p "${CONDA_HOME}" >/dev/null || return 1
+    bash "${installer}" -b -p "${CONDA_HOME}" >/dev/null 2>&1 || return 1
     "${CONDA_HOME}/bin/conda" create -y --override-channels -c "${CONDA_CHANNEL}" \
-        -p "${CONDA_PREFIX}" "python=${EVALSCOPE_MIN_PYTHON}" >/dev/null || return 1
+        -p "${CONDA_PREFIX}" "python=${EVALSCOPE_MIN_PYTHON}" >/dev/null 2>&1 || return 1
     if [ -x "${CONDA_PREFIX}/bin/python" ] && py_ge_min "${CONDA_PREFIX}/bin/python"; then
         echo "${CONDA_PREFIX}/bin/python"
         return 0
@@ -138,6 +140,10 @@ if [ "${EVALSCOPE_WITH_PIER}" = "1" ]; then
         echo "Using conda python ${BASE_PYTHON} (>= ${EVALSCOPE_MIN_PYTHON})"
     else
         echo "ERROR: datacurve-pier requires Python >= ${EVALSCOPE_MIN_PYTHON} and none could be provisioned." >&2
+        exit 1
+    fi
+    if ! printf '%s' "${BASE_PYTHON}" | grep -Eq '^[^[:space:]]+$'; then
+        echo "ERROR: failed to resolve a single Python interpreter (got '${BASE_PYTHON}')" >&2
         exit 1
     fi
 fi
