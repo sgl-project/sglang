@@ -47,6 +47,10 @@ class _StubProcessor(BaseMultimodalProcessor):
         raise NotImplementedError
 
 
+class _StubGpuProcessor(_StubProcessor):
+    gpu_image_decode = True
+
+
 def _png_bytes(mode: str = "RGB", size=(8, 8)) -> bytes:
     arr = (np.random.RandomState(0).rand(size[1], size[0], 3) * 255).astype("uint8")
     img = Image.fromarray(arr, "RGB").convert(mode)
@@ -59,6 +63,12 @@ def _jpeg_bytes(size=(8, 8)) -> bytes:
     arr = (np.random.RandomState(0).rand(size[1], size[0], 3) * 255).astype("uint8")
     buf = io.BytesIO()
     Image.fromarray(arr, "RGB").save(buf, format="JPEG", quality=90, subsampling=2)
+    return buf.getvalue()
+
+
+def _jpeg_bytes_in_mode(mode: str, color) -> bytes:
+    buf = io.BytesIO()
+    Image.new(mode, (8, 8), color).save(buf, format="JPEG")
     return buf.getvalue()
 
 
@@ -161,6 +171,50 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         self.assertIsInstance(image, Image.Image)
         reference = Image.open(io.BytesIO(data))
         np.testing.assert_array_equal(np.asarray(image), np.asarray(reference))
+
+    def test_gpu_jpeg_decode_returns_rgb_for_gray_and_cmyk(self):
+        """A grayscale or CMYK JPEG decoded on the GPU must come back as 3-channel RGB.
+        The tensor skips the PIL convert("RGB") guard; a 1-channel tensor crashed the
+        Gemma 4 vision encoder inside the scheduler and took the server down."""
+        from torchvision.io import decode_jpeg as cpu_decode_jpeg
+
+        def decode_on_cpu(data, device=None, **kwargs):
+            # CPU stand-in for nvJPEG: same decode_jpeg API, honours `mode`.
+            return cpu_decode_jpeg(data, **kwargs)
+
+        cases = {
+            "L": (128, (128, 128, 128)),
+            "CMYK": ((0, 0, 0, 128), (127, 127, 127)),
+        }
+        for mode, (color, rgb) in cases.items():
+            with self.subTest(mode=mode):
+                with (
+                    patch.object(media_io, "is_cuda", return_value=True),
+                    patch("torchvision.io.decode_jpeg", side_effect=decode_on_cpu),
+                ):
+                    image, _ = media_io.load_image(_jpeg_bytes_in_mode(mode, color))
+
+                self.assertIsInstance(image, torch.Tensor)
+                self.assertEqual(tuple(image.shape), (3, 8, 8))
+                np.testing.assert_allclose(
+                    image[:, 4, 4].numpy(), rgb, atol=2, err_msg=mode
+                )
+
+    def test_gpu_jpeg_decode_non_rgb_result_falls_back_to_pil(self):
+        """If the GPU decoder still returns a non-RGB tensor, the image is decoded
+        by PIL and converted to RGB instead of reaching the model."""
+        data = _jpeg_bytes_in_mode("L", 128)
+        with (
+            patch.object(media_io, "is_cuda", return_value=True),
+            patch(
+                "torchvision.io.decode_jpeg",
+                return_value=torch.zeros((1, 8, 8), dtype=torch.uint8),
+            ),
+        ):
+            img = _StubGpuProcessor._load_single_item(data, Modality.IMAGE)
+
+        self.assertIsInstance(img, Image.Image)
+        self.assertEqual(img.mode, "RGB")
 
     def test_high_fidelity_decoder_uses_fancy_planar_rgb_and_reuses_pool(self):
         expected = torch.zeros((3, 8, 8), dtype=torch.uint8)

@@ -574,10 +574,19 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
-            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+            # lazy: ~1 s of torch._dynamo
+            from torchvision.io import ImageReadMode, decode_jpeg
 
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            # The tensor skips the PIL convert("RGB") guard, so gray (1 channel)
+            # and CMYK (4 channels) JPEG must come out as RGB here.
+            image_tensor = decode_jpeg(
+                encoded_image, device="cuda", mode=ImageReadMode.RGB
+            )
+            if image_tensor.ndim != 3 or image_tensor.shape[0] != 3:
+                raise ValueError(
+                    f"nvJPEG returned shape {tuple(image_tensor.shape)}, expected RGB"
+                )
             return image_tensor
         except Exception as e:
             if gpu_image_decode == "nvjpeg_fancy":
