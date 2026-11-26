@@ -31,6 +31,9 @@ use crate::multi_modality::encoded::MmModality;
 use crate::multi_modality::payload::io_sources;
 use crate::multi_modality::worker::{MediaError, MmProcessor};
 
+#[cfg(target_os = "linux")]
+mod mapped_file;
+
 /// Global bound on concurrent blocking media fetches across all in-flight
 /// requests; excess acquisitions queue on the semaphore without holding a
 /// thread.
@@ -192,13 +195,13 @@ async fn fetch_ordered(
                     }
                 }
                 let fetched = if src.starts_with('/') || src.starts_with("file://") {
-                    fetch_local_file_budgeted(&src, &budget)
+                    fetch_local_media(&src, &budget)
                 } else if src.starts_with("http://") || src.starts_with("https://") {
-                    fetch_bytes_budgeted(&src, &budget)
+                    fetch_bytes_budgeted(&src, &budget).map(Bytes::from)
                 } else {
                     Err(format!("media fetch: unsupported URI: {src}"))
                 };
-                let bytes = fetched.map(Bytes::from).map_err(MediaError::Client)?;
+                let bytes = fetched.map_err(MediaError::Client)?;
                 Ok(Fetched {
                     bytes,
                     by_processor: None,
@@ -219,6 +222,14 @@ async fn fetch_ordered(
         }
     }))
     .await
+}
+
+fn fetch_local_media(src: &str, budget: &ByteBudget) -> Result<Bytes, String> {
+    #[cfg(target_os = "linux")]
+    if mapped_file::enabled() {
+        return mapped_file::fetch(src, budget);
+    }
+    fetch_local_file_budgeted(src, budget).map(Bytes::from)
 }
 
 /// A fetch waiting for a slot since its instant. The wait is observed when

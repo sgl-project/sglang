@@ -73,6 +73,15 @@ pub fn fetch_bytes(src: &str) -> Result<Vec<u8>, String> {
 pub fn fetch_local_file_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
     let path = src.strip_prefix("file://").unwrap_or(src);
     let file = std::fs::File::open(path).map_err(|e| format!("media fetch: {path}: {e}"))?;
+    read_local_file_budgeted(file, path, budget)
+}
+
+/// Read an already opened local file using the same validation and size limits.
+pub fn read_local_file_budgeted(
+    file: std::fs::File,
+    path: &str,
+    budget: &ByteBudget,
+) -> Result<Vec<u8>, String> {
     let metadata = file
         .metadata()
         .map_err(|e| format!("media fetch: stat {path}: {e}"))?;
