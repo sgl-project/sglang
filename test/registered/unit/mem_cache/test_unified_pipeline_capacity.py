@@ -162,7 +162,7 @@ def _build_storage(cfg):
             head_num=1,
             head_dim=8,
             model_context_len=cfg.model_config.context_len,
-            extra_max_context_len=4,
+            req_to_token_headroom=4,
             state_cache_params=NS(layers=cfg._unified_plan.sub_pool("mamba").layer_ids),
         ),
     )
