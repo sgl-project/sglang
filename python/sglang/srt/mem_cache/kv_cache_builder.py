@@ -213,7 +213,7 @@ BACKUP_ONLY_HICACHE_RATIO = 0.2
 
 def decode_retraction_max_tokens(req_to_token_pool, kv_cache) -> int:
     return ceil_align(
-        min(req_to_token_pool.max_context_len - 1, kv_cache.size), kv_cache.page_size
+        min(req_to_token_pool.row_width - 1, kv_cache.size), kv_cache.page_size
     )
 
 
