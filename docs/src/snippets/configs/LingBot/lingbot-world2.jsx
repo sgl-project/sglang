@@ -4,26 +4,34 @@ export const config = (() => {
       default: "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
     })[s.checkpoint || "default"];
   const plan = (s) => {
+    const xeon = s.hw === "xeon";
     const flags = [
       "--model-path " + modelOf(s),
       ...[
         "--pipeline-class-name LingBotWorldCausalDMDPipeline",
-        "--num-gpus 8",
-        "--ulysses-degree 8",
-        "--dit-cpu-offload false",
-        "--text-encoder-cpu-offload false",
-        "--vae-config.use-parallel-decode true",
-        "--vae-config.parallel-decode-mode spatial",
-        "--enable-torch-compile false",
+        ...(xeon
+          ? []
+          : [
+              "--num-gpus 8",
+              "--ulysses-degree 8",
+              "--dit-cpu-offload false",
+              "--text-encoder-cpu-offload false",
+              "--vae-config.use-parallel-decode true",
+              "--vae-config.parallel-decode-mode spatial",
+              "--enable-torch-compile false",
+            ]),
       ],
     ];
-    let gpus = 8;
+    let gpus = xeon ? 1 : 8;
     let t = { tp_size: 1, ulysses_degree: 1, ring_degree: 1 };
     const env = [];
     const warnings = [];
     const errors = [];
-    t.ulysses_degree = 8;
-    env.push("SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES=60", "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW=true");
+    if (xeon) env.push("SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu");
+    else {
+      t.ulysses_degree = 8;
+      env.push("SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES=60", "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW=true");
+    }
     return { flags, gpus, topology: t, env, warnings, errors };
   };
   const defaults = {
@@ -37,16 +45,22 @@ export const config = (() => {
   };
   const config = {
     modelName: "LingBot World 2.0",
-    supportedHardware: ["cuda"],
-    hardware: [{ id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" }],
+    supportedHardware: ["cuda", "xeon"],
+    hardware: [
+      { id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+    ],
     groupHardware: false,
     matchDims: [],
     overlayDims: [],
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 8 } },
-        verifiedRecipes: ["cuda"].map((hw) => {
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 8, disabledWhen: (s) => s.hw === "xeon", disabledValue: 1 },
+        },
+        verifiedRecipes: ["cuda", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {
