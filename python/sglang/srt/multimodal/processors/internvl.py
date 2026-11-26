@@ -11,6 +11,7 @@ from PIL import Image
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.interns1 import InternS1ForConditionalGeneration
 from sglang.srt.models.internvl import InternVLChatModel
+from sglang.srt.multimodal.media_io import validate_dynamic_patch_limit
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -391,6 +392,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             or self.IMAGE_MAX_NUM
         )
         img_max_num = max(1, int(img_max_num))
+        validate_dynamic_patch_limit(img_max_num, "image_max_dynamic_patch")
 
         vid_max_num = (
             getattr(request_obj, "video_max_dynamic_patch", None)
@@ -400,6 +402,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             or self.VIDEO_MAX_NUM
         )
         vid_max_num = max(1, int(vid_max_num))
+        validate_dynamic_patch_limit(vid_max_num, "video_max_dynamic_patch")
 
         # Qwen/Qwen3 branch: OpenAI-style placeholders <image>/<video>
         prompt = input_text or ""

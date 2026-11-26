@@ -64,7 +64,11 @@ from sglang.srt.managers.req_types import (
     SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
-from sglang.srt.multimodal.media_io import ImageData, VideoData
+from sglang.srt.multimodal.media_io import (
+    ImageData,
+    VideoData,
+    validate_dynamic_patch_limit,
+)
 from sglang.srt.multimodal.mm_utils import batch_single_media_input, has_valid_data
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
@@ -546,6 +550,14 @@ class GenerateReqInput:
             raise ValueError(
                 "return_flat_raw_sampling_mask_b64 requires return_flat_raw_sampling_mask."
             )
+        validate_dynamic_patch_limit(self.max_dynamic_patch, "max_dynamic_patch")
+        validate_dynamic_patch_limit(self.min_dynamic_patch, "min_dynamic_patch")
+        validate_dynamic_patch_limit(
+            self.image_max_dynamic_patch, "image_max_dynamic_patch"
+        )
+        validate_dynamic_patch_limit(
+            self.video_max_dynamic_patch, "video_max_dynamic_patch"
+        )
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""

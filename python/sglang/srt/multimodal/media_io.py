@@ -448,6 +448,23 @@ def load_audio(
     return audio
 
 
+# Dynamic tiling enumerates aspect-ratio candidates in a triple loop whose
+# cost grows quadratically with the requested patch cap, so request-supplied
+# caps are bounded well above every in-tree default (InternVL uses 12).
+MAX_DYNAMIC_PATCH_LIMIT = 128
+
+
+def validate_dynamic_patch_limit(value, field_name: str) -> None:
+    """Reject a request-supplied dynamic-tiling cap above the server limit."""
+    if value is None:
+        return
+    if int(value) > MAX_DYNAMIC_PATCH_LIMIT:
+        raise ValueError(
+            f"{field_name}={value} exceeds the maximum of "
+            f"{MAX_DYNAMIC_PATCH_LIMIT} dynamic patches"
+        )
+
+
 @dataclass
 class ImageData:
     url: str
