@@ -1764,6 +1764,36 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
+    def test_clear_and_destroy_retry_failed_transfer_fence(self):
+        full, swa = _build_unified_host_pair(_build_unified_swa_pool())
+        self.addCleanup(full.destroy)
+        self.addCleanup(swa.destroy)
+        backing = full.shared_allocation_domain
+        self.assertIsNotNone(full.alloc(full.page_size))
+        available = full.available_size()
+        event = MagicMock()
+        event.query.return_value = False
+        event.synchronize.side_effect = [
+            RuntimeError("wait"),
+            RuntimeError("wait"),
+            None,
+        ]
+        backing.acquire_layout()
+        backing.release_layout(finish_event=event)
+
+        with self.assertRaisesRegex(RuntimeError, "wait"):
+            full.clear()
+        self.assertEqual(full.available_size(), available)
+        swa.destroy()
+        with self.assertRaisesRegex(RuntimeError, "wait"):
+            full.destroy()
+        self.assertIsNotNone(backing.raw)
+
+        full.destroy()
+        full.destroy()
+        self.assertIsNone(backing.raw)
+        self.assertEqual(event.synchronize.call_count, 3)
+
     def test_shared_hosts_use_one_captured_description_per_device_pool(self):
         """Shared backing and both hosts must consume the same captured views."""
         bundle = _build_unified_swa_pool()
