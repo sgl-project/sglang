@@ -355,21 +355,18 @@ class SchedulerWeightUpdaterManager:
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter=parameter)
 
-    def _assert_weight_cache_inactive(self, op: str) -> None:
-        """Reject freeing/restoring model weights while the CUDA IPC weight
-        cache is active: the weights are shared with the daemon via CUDA IPC, so
-        freeing them would leave the daemon and every peer pointing at released
-        memory.
-        """
+    def _weight_cache_offload_error(self, op: str) -> Optional[str]:
+        """Check whether the CUDA IPC weight cache owns the model weights."""
         mode = get_model().weight_cache_mode
-        if mode != "off":
-            raise RuntimeError(
-                f"[weight_cache] {op} of model weights is not supported while the "
-                f"weight cache is active (--weight-cache-mode {mode}): the weights "
-                f"are shared with the daemon via CUDA IPC, so freeing them would "
-                f"corrupt the daemon's master copy and every co-attached engine. "
-                f"Restart with --weight-cache-mode off to use this operation."
-            )
+        if mode == "off":
+            return None
+        return (
+            f"[weight_cache] {op} of model weights is not supported while the "
+            f"weight cache is active (--weight-cache-mode {mode}): the weights "
+            f"are shared with the daemon via CUDA IPC, so freeing them would "
+            f"corrupt the daemon's master copy and every co-attached engine. "
+            f"Restart with --weight-cache-mode off to use this operation."
+        )
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
@@ -530,6 +527,11 @@ class SchedulerWeightUpdaterManager:
         # Only tags not yet released; each is recorded once its own release succeeds.
         tags = set(tags) - self.offload_tags
 
+        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            error = self._weight_cache_offload_error("release_memory_occupation")
+            if error is not None:
+                return ReleaseMemoryOccupationReqOutput(success=False, message=error)
+
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
                 # Held requests keep no KV and wait out the release.
@@ -548,7 +550,6 @@ class SchedulerWeightUpdaterManager:
             self.offload_tags.add(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
-            self._assert_weight_cache_inactive("release_memory_occupation")
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
@@ -580,7 +581,9 @@ class SchedulerWeightUpdaterManager:
             self.offload_tags.discard(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
-            self._assert_weight_cache_inactive("resume_memory_occupation")
+            error = self._weight_cache_offload_error("resume_memory_occupation")
+            if error is not None:
+                raise RuntimeError(error)
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             control_request_barrier()
             _import_static_state(
