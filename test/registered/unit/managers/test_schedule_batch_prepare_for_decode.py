@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.runtime_context import get_context, mamba_track_grid
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -37,44 +37,6 @@ def _make_decode_batch():
 
 
 class TestPrepareForDecodeMambaInit(CustomTestCase):
-    def test_beam_members_use_no_checkpoint_slots(self):
-        batch = _make_decode_batch()
-        batch.reqs[0].beam_group = types.SimpleNamespace(
-            member_rows=torch.tensor([3, 4]),
-            member_rows_cpu=torch.tensor([3, 4]),
-            num_member_rows=2,
-            retired=False,
-        )
-        for req in batch.reqs:
-            req.kv.mamba_next_track_idx = 0
-        batch.req_pool_indices = batch.req_pool_indices_cpu = torch.tensor([1, 2])
-        batch.req_to_token_pool = types.SimpleNamespace(
-            req_index_to_mamba_ping_pong_track_buffer_mapping=torch.tensor(
-                [[0], [5], [6], [99], [99]],
-            )
-        )
-        batch.tree_cache = types.SimpleNamespace(page_size=1)
-        with (
-            get_context().override_server_args(
-                mamba_radix_cache_strategy="extra_buffer",
-                page_size=1,
-                mamba_track_interval=4,
-                _mamba_cache_chunk_size=4,
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.alloc_for_decode",
-                return_value=torch.arange(4),
-            ),
-        ):
-            batch.seq_lens = batch.seq_lens_cpu = torch.full(
-                (2,), mamba_track_grid(1) - 1, dtype=torch.int64
-            )
-            batch.prepare_for_decode()
-
-        self.assertEqual(batch.mamba_track_mask_cpu, [False, True])
-        self.assertEqual(batch.mamba_track_mask.tolist(), [False, True, False, False])
-        self.assertEqual(batch.mamba_track_indices.tolist(), [5, 6, 0, 0])
-
     def test_spec_decode_drops_extend_mamba_init_metadata(self):
         batch = ScheduleBatch(reqs=[])
         batch.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)

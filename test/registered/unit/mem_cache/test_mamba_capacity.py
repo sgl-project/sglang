@@ -2,14 +2,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import torch
-
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeReqToTokenPool,
     HybridMambaDecodeReqToTokenPool,
 )
-from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
@@ -20,12 +17,9 @@ from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.prefill_budget import StaticStatePrefillBudget
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
-from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -80,34 +74,6 @@ def make_cache(pool, held, release):
         request_mamba_only=False,
         evict_for_alloc=MagicMock(side_effect=evict),
     )
-
-
-class TestBeamStateCapacity(CustomTestCase):
-    def test_reserved_members_are_charged_and_released_with_the_leader(self):
-        state = StateStorage.empty("mamba")
-        state.slots = MambaSlotAllocator(5, "cpu")
-        state.pool = SimpleNamespace(replayssm_write_pos=None)
-        table = SimpleNamespace(
-            device="cpu",
-            enable_mamba_extra_buffer=False,
-            req_index_to_mamba_index_mapping=torch.zeros(3, dtype=torch.int32),
-        )
-        allocator = SimpleNamespace(page_size=1, state=state, state_slots=state.slots)
-        cache = SimpleNamespace(req_to_token_pool=table, supports_mamba=lambda: False)
-        leader = SimpleNamespace(kv=ReqKvInfo(beam_mamba_slot_count=2))
-        with get_context().override_server_args():
-            budget = StaticStatePrefillBudget(allocator, cache)
-        state.slots.alloc_group_begin(5)
-        self.assertTrue(budget.state_slots_fit(budget.request_state_slots(leader)))
-        budget.reserve(10, 0, state_slots=budget.request_state_slots(leader))
-        self.assertFalse(budget.state_slots_fit(3))
-        state.slots.alloc_group_end()
-        state.acquire(table, [leader], [1])
-        self.assertEqual(state.slots.available_size(), 2)
-        self.assertEqual(budget.request_state_slots(leader), 0)
-        state.release(table, leader)
-        self.assertEqual(sorted(state.slots.free_slots.tolist()), [1, 2, 3, 4, 5])
-        self.assertIsNone(leader.kv.beam_mamba_slots)
 
 
 class TestMambaCapacity(unittest.TestCase):

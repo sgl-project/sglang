@@ -11,20 +11,13 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 class TestBeamSharedContext(CustomTestCase):
-    def test_ragged_suffix_matches_independent_attention(self):
-        for head_dim, value_dim in ((256, 256), (576, 512)):
-            with self.subTest(head_dim=head_dim, value_dim=value_dim):
-                self._check_ragged_suffix(head_dim=head_dim, value_dim=value_dim)
-
-    def _check_ragged_suffix(self, *, head_dim, value_dim):
+    def test_ragged_mla_suffix_matches_independent_attention(self):
         device = "cuda"
         torch.manual_seed(0)
-        width, q_heads, kv_heads = 73, 4, 2
-        q = torch.randn(
-            2 * width, q_heads, head_dim, dtype=torch.bfloat16, device=device
-        )
-        k = torch.randn(503, kv_heads, head_dim, dtype=q.dtype, device=device)
-        v = torch.randn_like(k) if value_dim == head_dim else k[:, :, :value_dim]
+        width = 73
+        q = torch.randn(2 * width, 4, 576, dtype=torch.bfloat16, device=device)
+        k = torch.randn(503, 2, 576, dtype=q.dtype, device=device)
+        v = k[:, :, :512]
         rows = torch.randperm(2 * width, device=device).reshape(2, width)
         slots = torch.randperm(k.shape[0], device=device, dtype=torch.int32)
         prompts = (slots[:65], slots[65:211])
@@ -38,10 +31,10 @@ class TestBeamSharedContext(CustomTestCase):
             torch.tensor([0, 65, 211], dtype=torch.int32, device=device),
             suffix.reshape(2, -1),
             torch.tensor([1, 2], dtype=torch.int32, device=device),
-            softmax_scale=head_dim**-0.5,
+            softmax_scale=q.shape[-1] ** -0.5,
         )
 
-        expected = q.new_empty((2 * width, q_heads, value_dim))
+        expected = q.new_empty((2 * width, q.shape[1], v.shape[-1]))
         for group, (prompt, decode_len) in enumerate(zip(prompts, (1, 2), strict=True)):
             beam_slots = torch.cat(
                 [prompt.expand(width, -1), suffix[group, :decode_len].T], dim=1

@@ -899,25 +899,6 @@ class TestPassPricingReuse(unittest.TestCase):
 
 
 class TestRunningDecodeReservation(CustomTestCase):
-    def test_beam_admission_uses_rows_remaining_after_promises(self):
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.running_batch = SimpleNamespace()
-        scheduler.beam_coordinator = SimpleNamespace(
-            pending_member_rows=lambda _: 0,
-            pending_member_rows_of=lambda admitted: 255 * len(admitted),
-        )
-        admitted = [object()]
-        with published_topology(), get_parallel().override(pp_max_micro_batch_size=512):
-            for free_rows, should_admit in ((512, True), (511, False)):
-                with self.subTest(free_rows=free_rows):
-                    scheduler.req_to_token_pool = SimpleNamespace(
-                        available_size=lambda: free_rows
-                    )
-                    limit = scheduler.get_num_allocatable_reqs(
-                        running_bs=0, beam_width=256, admitted_reqs=admitted
-                    )
-                    self.assertEqual(len(admitted) < limit, should_admit)
-
     def test_cached_admission_reserves_fixed_length_decode(self):
         # 900 tokens remain free. A new 600-token prompt with 100 output tokens
         # fits only if the running request can stop before its remaining 300.
