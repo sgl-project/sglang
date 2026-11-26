@@ -380,7 +380,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             ret = manager._send_kvcache_generic(
-                mooncake_session_id="session",
+                peer=manager._peers["session"],
                 item_lens=[100, 100, 100],
                 prefill_data_indices=np.array([1, 2], dtype=np.int32),
                 dst_data_indices=np.array([7, 8], dtype=np.int32),
@@ -427,9 +427,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         # path -- pin that explicitly rather than leaning on the default.
         with get_context().override_server_args(enable_unified_memory=False):
             manager.send_kvcache(
-                "session",
+                manager._peers["session"],
                 np.array([1], dtype=np.int32),
-                [10000, 20000, 30000],
                 np.array([7], dtype=np.int32),
                 executor,
                 dst_device_kv_indices=np.array([21], dtype=np.int32),

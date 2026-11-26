@@ -73,6 +73,27 @@ class BufferKeys(msgspec.Struct, frozen=True):
             ),
         )
 
+    def flat(self) -> List[MooncakeBufferKey]:
+        """Every key, in registration message order."""
+        keys = list(self.kv) + list(self.aux)
+        for state_keys in self.state:
+            keys += state_keys
+        return keys
+
+    def unflatten(
+        self, values: Sequence[int]
+    ) -> Tuple[List[int], List[int], List[List[int]]]:
+        """Split values given in flat() order back into the KV, aux and state
+        layout."""
+        values = list(values)
+        kv, values = values[: len(self.kv)], values[len(self.kv) :]
+        aux, values = values[: len(self.aux)], values[len(self.aux) :]
+        state = []
+        for state_keys in self.state:
+            state.append(values[: len(state_keys)])
+            values = values[len(state_keys) :]
+        return kv, aux, state
+
     def pair(
         self,
         kv_data_ptrs: Sequence[int],

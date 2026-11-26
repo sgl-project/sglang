@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -115,25 +116,25 @@ class TestMooncakeAbortNotification(
         manager.pp_size = manager.attn_cp_size = 1
         manager._staging_outstanding = defaultdict(int)
         manager.session_lock = threading.Lock()
-        manager.session_failures = defaultdict(int)
-        manager.failed_session_probes = {}
-        manager.failed_sessions = set()
-        manager.state_layout_rejections = {}
+        manager.peer_failures = defaultdict(int)
+        manager.failed_peer_probes = {}
+        manager.failed_peers = set()
+        manager.fan_in_rejections = {}
         manager.req_to_decode_prefix_len = {}
         manager.kv_args = MagicMock(
             kv_data_ptrs=[0x1000], aux_data_ptrs=[0] * 8, aux_item_lens=[64] * 8
         )
         manager._get_dsa_cache_transfer_skip_flags = lambda info: (False, False)
-        manager.decode_kv_args_table = {}
+        peers = attach_mooncake_transport(
+            manager,
+            MagicMock(),
+            peer_aux=[0] * 8,
+            sessions=tuple(f"decode-session-{i}" for i in range(num_dsts)),
+        )
         manager.transfer_infos = {ROOM: {}}
         for i in range(num_dsts):
             session = f"decode-session-{i}"
-            manager.decode_kv_args_table[session] = MagicMock(
-                requires_dcp_relayout=False,
-                dst_aux_ptrs=[0] * 8,
-                dst_aux_item_lens=None,
-            )
-            manager.transfer_infos[ROOM][(DECODE_IP, DECODE_PORT + i)] = TransferInfo(
+            manager.transfer_infos[ROOM][peers[session]] = TransferInfo(
                 room=ROOM,
                 endpoint=DECODE_IP,
                 dst_port=DECODE_PORT + i,
@@ -232,7 +233,7 @@ class TestMooncakeAbortNotification(
                     manager.send_aux.side_effect = self._abort_on_call(manager)
                 else:
                     manager.send_aux.return_value = -1
-                    manager.failed_sessions.add("decode-session-1")
+                    manager.failed_peers.add(manager._peers["decode-session-1"])
 
                 self._run_worker(manager, _last_chunk())
                 self._dispatch_abort(manager)

@@ -25,10 +25,10 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
 from sglang.srt.disaggregation.mooncake.conn import (
-    KVArgsRegisterInfo as MooncakeKVArgsRegisterInfo,
-)
-from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
+)
+from sglang.srt.disaggregation.mooncake.peer import (
+    KVArgsRegisterInfo as MooncakeKVArgsRegisterInfo,
 )
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo as NixlKVArgsRegisterInfo,
@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.nixl.conn import (
 from sglang.srt.disaggregation.nixl.conn import (
     NixlKVManager,
 )
+from sglang.test.mooncake_utils import attach_mooncake_transport
 from sglang.test.mori_stub import mori_stub
 from sglang.test.test_utils import CustomTestCase
 
@@ -199,6 +200,18 @@ class TestReceiverControlMessages(CustomTestCase):
             engine_desc_blob=b"engine-desc",
             mem_desc_blobs=lambda keys: [mori_descs[key.kind] for key in keys],
         )
+        if backend == "mooncake":
+            attach_mooncake_transport(
+                manager,
+                SimpleNamespace(
+                    batch_register=lambda ptrs, lengths: 0,
+                    get_session_id=lambda: "mooncake-peer",
+                ),
+                kv=manager.kv_args.kv_data_ptrs,
+                aux=manager.kv_args.aux_data_ptrs,
+                state=manager.kv_args.state_data_ptrs,
+                sessions=(),
+            )
         receiver = CommonKVReceiver(manager, "prefill:8998", 17)
         receiver.required_dst_info_num = 3
         receiver.bootstrap_infos = [
@@ -324,11 +337,9 @@ class TestReceiverControlMessages(CustomTestCase):
                     continue
                 frames = sent[0][1]
                 if backend == "nixl":
-                    frames = frames[1:]
-                    registration_type = NixlKVArgsRegisterInfo
+                    info = NixlKVArgsRegisterInfo.from_zmq(frames[1:])
                 else:
-                    registration_type = MooncakeKVArgsRegisterInfo
-                info = registration_type.from_zmq(frames)
+                    info = MooncakeKVArgsRegisterInfo.from_zmq(frames).layout
                 self.assertEqual(info.dst_aux_item_lens, [64] if exchange else None)
                 self.assertEqual(info.dst_kv_item_lens, [16])
                 self.assertEqual(info.dst_state_item_lens, [[32]])
@@ -336,10 +347,12 @@ class TestReceiverControlMessages(CustomTestCase):
                 if backend == "mooncake":
                     self.assertEqual(info.num_draft_entries, 0)
                     # A peer that predates the draft-count field parses None.
-                    legacy = registration_type.from_zmq(frames[:-2])
+                    legacy = MooncakeKVArgsRegisterInfo.from_zmq(frames[:-2]).layout
                     self.assertIsNone(legacy.num_draft_entries)
                     self.assertEqual(legacy.dst_kv_item_lens, [16])
-                    with_draft = registration_type.from_zmq(frames[:-2] + [b"1"])
+                    with_draft = MooncakeKVArgsRegisterInfo.from_zmq(
+                        frames[:-2] + [b"1"]
+                    ).layout
                     self.assertEqual(with_draft.num_draft_entries, 1)
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])

@@ -19,7 +19,11 @@ from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
     TransferIntent,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
+from sglang.test.mooncake_utils import (
+    attach_mooncake_transport,
+    engine_writes,
+    peer_layout,
+)
 from sglang.test.test_utils import CustomTestCase
 
 FOREGROUND = TransferIntent.FOREGROUND
@@ -63,7 +67,7 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             return MooncakeKVManager._send_kvcache_generic(
                 manager,
-                mooncake_session_id="session",
+                peer=manager._peers["session"],
                 item_lens=[10, 20],
                 prefill_data_indices=np.array([0, 1, 2, 3, 4], dtype=np.int32),
                 dst_data_indices=np.array([10, 11, 12, 13, 14], dtype=np.int32),
@@ -115,7 +119,9 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             ranges=np.array([[0, 0, 10]], dtype=np.uint64),
         )
 
-        ret = MooncakeKVManager._transfer_copies(manager, "session", [copy])
+        ret = MooncakeKVManager._transfer_copies(
+            manager, manager._peers["session"], [copy]
+        )
 
         self.assertEqual(ret, -1)
 
@@ -181,31 +187,27 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                         state_dim_per_tensor=[[]],
                         state_layer_ids=[[]],
                     )
-                    attach_mooncake_transport(
+                    peers = attach_mooncake_transport(
                         manager,
                         engine_writes(copy_bytes),
                         state=[[src.ctypes.data]],
                         peer_state=[[dst.ctypes.data]],
                         sessions=("cpu",),
+                        layout=peer_layout(
+                            dst_state_item_lens=[[dst.itemsize]],
+                            dst_state_dim_per_tensor=[[]],
+                            dst_state_layer_ids=[[]],
+                        ),
                     )
                     manager.pp_size = manager.attn_tp_size = 1
                     manager.is_mla_backend = manager.is_hybrid_mla_backend = False
                     manager.enable_custom_mem_pool = False
                     manager.max_transfer_batch_indices = 0
-                    peer = SimpleNamespace(
-                        dst_state_data_ptrs=[[dst.ctypes.data]],
-                        dst_state_item_lens=[[dst.itemsize]],
-                        dst_state_dim_per_tensor=[[]],
-                        dst_state_layer_ids=[[]],
-                        dst_attn_tp_size=1,
-                    )
                     kwargs = dict(
-                        req=SimpleNamespace(
-                            mooncake_session_id="cpu", dst_state_indices=[dst_pages]
-                        ),
+                        req=SimpleNamespace(dst_state_indices=[dst_pages]),
                         prefill_state_indices=[src_pages],
                         executor=None,
-                        target_rank_registration_info=peer,
+                        peer=peers["cpu"],
                     )
                     if state == StateType.MINIMAX_DENSE_KV and len(src_pages) != len(
                         dst_pages
@@ -225,7 +227,7 @@ class TestMiniMaxStateTransfer(CustomTestCase):
             ctypes.memmove(dst, src, length)
         return 0
 
-    def _pp_stage_manager(self, state, src_layers, src_layer_ids, dst_layers):
+    def _pp_stage_manager(self, state, src_layers, src_layer_ids, dst_layers, layout):
         src_ptrs = [layer.ctypes.data for layer in src_layers]
         dst_ptrs = [layer.ctypes.data for layer in dst_layers]
         manager = MooncakeKVManager.__new__(MooncakeKVManager)
@@ -242,6 +244,7 @@ class TestMiniMaxStateTransfer(CustomTestCase):
             state=[src_ptrs],
             peer_state=[dst_ptrs],
             sessions=("cpu",),
+            layout=layout,
         )
         manager.pp_size = 2
         manager.attn_tp_size = 1
@@ -265,21 +268,22 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                     for i in range(len(src_ids))
                 ]
                 dst_layers = [np.full(4, -1, dtype=np.int32) for _ in dst_ids]
-                manager = self._pp_stage_manager(state, src_layers, src_ids, dst_layers)
-                peer = SimpleNamespace(
-                    dst_state_data_ptrs=[[layer.ctypes.data for layer in dst_layers]],
-                    dst_state_item_lens=[[dst_layers[0].itemsize] * len(dst_ids)],
-                    dst_state_dim_per_tensor=[[]],
-                    dst_state_layer_ids=[dst_ids],
-                    dst_attn_tp_size=1,
+                manager = self._pp_stage_manager(
+                    state,
+                    src_layers,
+                    src_ids,
+                    dst_layers,
+                    peer_layout(
+                        dst_state_item_lens=[[dst_layers[0].itemsize] * len(dst_ids)],
+                        dst_state_dim_per_tensor=[[]],
+                        dst_state_layer_ids=[dst_ids],
+                    ),
                 )
                 ret = manager.maybe_send_extra(
-                    req=SimpleNamespace(
-                        mooncake_session_id="cpu", dst_state_indices=[[0, 3]]
-                    ),
+                    req=SimpleNamespace(dst_state_indices=[[0, 3]]),
                     prefill_state_indices=[[1, 2]],
                     executor=None,
-                    target_rank_registration_info=peer,
+                    peer=manager._peers["cpu"],
                 )
                 self.assertEqual(ret, 0)
                 expected = [np.full(4, -1, dtype=np.int32) for _ in dst_ids]
@@ -295,21 +299,22 @@ class TestMiniMaxStateTransfer(CustomTestCase):
         src_layers = [np.zeros(2, dtype=np.int32) for _ in range(2)]
         dst_layers = [np.full(2, -1, dtype=np.int32) for _ in range(4)]
         manager = self._pp_stage_manager(
-            StateType.MINIMAX_INDEX_K, src_layers, [2, 3], dst_layers
-        )
-        peer = SimpleNamespace(
-            dst_state_data_ptrs=[[layer.ctypes.data for layer in dst_layers]],
-            dst_state_item_lens=[[4] * 4],
-            dst_state_dim_per_tensor=[[]],
-            dst_state_layer_ids=[[]],
-            dst_attn_tp_size=1,
+            StateType.MINIMAX_INDEX_K,
+            src_layers,
+            [2, 3],
+            dst_layers,
+            peer_layout(
+                dst_state_item_lens=[[4] * 4],
+                dst_state_dim_per_tensor=[[]],
+                dst_state_layer_ids=[[]],
+            ),
         )
         with self.assertRaisesRegex(RuntimeError, "Layer metadata"):
             manager.maybe_send_extra(
-                req=SimpleNamespace(mooncake_session_id="cpu", dst_state_indices=[[0]]),
+                req=SimpleNamespace(dst_state_indices=[[0]]),
                 prefill_state_indices=[[1]],
                 executor=None,
-                target_rank_registration_info=peer,
+                peer=manager._peers["cpu"],
             )
         for layer in dst_layers:
             np.testing.assert_array_equal(layer, [-1, -1])
@@ -417,27 +422,15 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                         f.result() for f in futures
                     ),
                 )
-                attach_mooncake_transport(
+                peers = attach_mooncake_transport(
                     manager,
                     engine_writes(transfer),
                     kv=[10000, 100000, 200000],
                     peer_kv=[1000000, 2000000, 3000000, 4000000],
-                )
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    result = MooncakeKVManager.send_kvcache_dcp(
-                        manager,
-                        "session",
-                        src_pages,
-                        [1000000, 2000000, 3000000, 4000000],
-                        np.array([2], dtype=np.int32),
-                        dcp_token_item_lens=[8, src_width, src_width],
+                    layout=peer_layout(
                         dst_dcp_size=dst_tp,
                         dst_dcp_rank=dst_rank,
-                        src_page_offset=0,
-                        decode_prefix_len=0,
-                        num_kv_tokens=tokens,
-                        executor=executor,
-                        dst_layer_ids=[3, 47, 93, 93],
+                        dst_kv_layer_ids=[3, 47, 93, 93],
                         dst_kv_item_lens=[
                             page_size * 8,
                             page_size * 8,
@@ -446,6 +439,19 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                         ],
                         dst_tp_rank=dst_rank,
                         dst_attn_tp_size=dst_tp,
+                    ),
+                    dcp_token_item_lens=[8, src_width, src_width],
+                )
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    result = MooncakeKVManager.send_kvcache_dcp(
+                        manager,
+                        peers["session"],
+                        src_pages,
+                        np.array([2], dtype=np.int32),
+                        src_page_offset=0,
+                        decode_prefix_len=0,
+                        num_kv_tokens=tokens,
+                        executor=executor,
                     )
                 if fail_draft:
                     self.assertEqual(result, -1)
@@ -531,12 +537,18 @@ class TestDcpCollapsedDraftPack(CustomTestCase):
             get_mla_kv_ptrs_with_pp=lambda src, dst, *_: (src, dst, len(src)),
         )
         # The pack buffer is registered as staging at 500000.
-        attach_mooncake_transport(
+        peers = attach_mooncake_transport(
             manager,
             engine_writes(transfer),
             kv=[10000, 20000],
             staging=[500000],
             peer_kv=[1000000, 2000000],
+            layout=peer_layout(
+                dst_dcp_size=dcp,
+                dst_dcp_rank=1,
+                dst_draft_rows_dcp_collapsed=True,
+            ),
+            dcp_token_item_lens=[width, width],
         )
         with (
             patch(
@@ -547,20 +559,14 @@ class TestDcpCollapsedDraftPack(CustomTestCase):
         ):
             result = MooncakeKVManager.send_kvcache_dcp(
                 manager,
-                "session",
+                peers["session"],
                 src_pages,
-                [1000000, 2000000],
                 np.array([2], dtype=np.int32),
-                dcp_token_item_lens=[width, width],
-                dst_dcp_size=dcp,
-                dst_dcp_rank=1,
                 src_page_offset=0,
                 decode_prefix_len=0,
                 num_kv_tokens=tokens,
                 executor=executor,
-                dst_layer_ids=[],
                 pack_buffer=SimpleNamespace(get_ptr=lambda: 500000),
-                draft_rows_collapsed=True,
             )
         self.assertEqual(result, 0)
         owned = np.arange(1, tokens, dcp)
@@ -638,36 +644,31 @@ class TestDcpDsaIndexKTransfer(unittest.TestCase):
                     enable_custom_mem_pool=False,
                     get_mla_kv_ptrs_with_pp=lambda src, dst, *_: (src, dst, len(src)),
                 )
-                attach_mooncake_transport(
+                peer = attach_mooncake_transport(
                     manager,
                     engine_writes(transfer),
                     kv=[10000],
                     state=[[500000, 600000]],
                     peer_kv=[1000000],
                     peer_state=[[5000000, 6000000]],
-                )
-                index_k = manager.dsa_index_k_dcp_entries(
-                    SimpleNamespace(
-                        mooncake_session_id="session",
-                        dst_state_data_ptrs=[[5000000, 6000000]],
+                    layout=peer_layout(
                         dst_state_item_lens=[[page_bytes, page_bytes]],
-                    )
-                )
+                        dst_dcp_size=dcp,
+                        dst_dcp_rank=dst_rank,
+                    ),
+                    dcp_token_item_lens=[8],
+                )["session"]
+                index_k = manager.dsa_index_k_dcp_entries(peer)
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     result = MooncakeKVManager.send_kvcache_dcp(
                         manager,
-                        "session",
+                        peer,
                         src_pages,
-                        [1000000],
                         np.array([2], dtype=np.int32),
-                        dcp_token_item_lens=[8],
-                        dst_dcp_size=dcp,
-                        dst_dcp_rank=dst_rank,
                         src_page_offset=0,
                         decode_prefix_len=0,
                         num_kv_tokens=tokens,
                         executor=executor,
-                        dst_layer_ids=[],
                         dsa_index_k=index_k,
                     )
                 self.assertEqual(result, 0)
@@ -705,18 +706,13 @@ class TestDcpPackLifetime(CustomTestCase):
         def send(executor):
             result = MooncakeKVManager.send_kvcache_dcp(
                 manager,
-                "session",
+                manager._peers["session"],
                 np.array([0, 1], dtype=np.int32),
-                [5000, 6000],
                 np.array([0], dtype=np.int32),
-                dcp_token_item_lens=[1, 1],
-                dst_dcp_size=2,
-                dst_dcp_rank=0,
                 src_page_offset=0,
                 decode_prefix_len=0,
                 num_kv_tokens=2,
                 executor=executor,
-                dst_layer_ids=[],
                 pack_buffer=SimpleNamespace(get_ptr=lambda: 1000),
             )
             source[0] = 22
@@ -730,6 +726,8 @@ class TestDcpPackLifetime(CustomTestCase):
             kv=[1000, 2000],
             staging=[1000],
             peer_kv=[5000, 6000],
+            layout=peer_layout(dst_dcp_size=2, dst_dcp_rank=0),
+            dcp_token_item_lens=[1, 1],
         )
         with (
             patch(
@@ -792,11 +790,14 @@ class TestMooncakeEarlySend(CustomTestCase):
             disaggregation_mode=DisaggregationMode.PREFILL,
             request_status={1: KVPoll.WaitingForInput},
             check_status=lambda room: KVPoll.WaitingForInput,
-            transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
             send_record=MagicMock(),
             note_send_enqueued=MagicMock(),
         )
+        peers = attach_mooncake_transport(
+            manager, MagicMock(), sessions=("127.0.0.1:80",)
+        )
+        manager.transfer_infos = {1: {peers["127.0.0.1:80"]: object()}}
         indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
             manager,
@@ -820,21 +821,11 @@ class TestMooncakeEarlySend(CustomTestCase):
         queue = SimpleQueue()
         queue.put(chunk)
         queue.put(None)
-        peer = SimpleNamespace(
+        req = SimpleNamespace(
             is_dummy=False,
             mooncake_session_id="peer",
             dst_device_kv_indices=None,
             dst_kv_indices=[10],
-        )
-        registration = SimpleNamespace(
-            requires_dcp_relayout=False,
-            dst_kv_ptrs=[1000],
-            dst_kv_layer_ids=[0],
-            dst_kv_item_len=16,
-            dst_attn_tp_size=1,
-            dst_aux_ptrs=[2000],
-            dst_aux_item_lens=[16],
-            num_draft_entries=None,
         )
         manager = SimpleNamespace(
             enable_trace=False,
@@ -842,24 +833,35 @@ class TestMooncakeEarlySend(CustomTestCase):
             enable_deferred_decode_kv_release=True,
             _staging_outstanding=defaultdict(int),
             request_status={1: KVPoll.WaitingForInput},
-            transfer_infos={1: {"peer": peer}},
             _prefill_unique_rank=lambda: 0,
             session_lock=Lock(),
-            failed_sessions=set(),
-            # Read under session_lock alongside failed_sessions on every
+            failed_peers=set(),
+            # Read under session_lock alongside failed_peers on every
             # non-dummy req, and invoked by the worker's except path.
-            state_layout_rejections={},
+            fan_in_rejections={},
             poison_deferred_ack_room=MagicMock(),
-            decode_kv_args_table={"peer": registration},
             _get_dsa_cache_transfer_skip_flags=lambda reg: (False, False),
             kv_args=SimpleNamespace(kv_data_ptrs=[1]),
             is_mla_backend=True,
             send_kvcache=MagicMock(return_value=0),
             _maybe_ack_drained_abort=MagicMock(),
-            validate_aux_buffers=MagicMock(),
+            validate_aux_buffers_by_count=MagicMock(),
             bootstrap_port=8998,
             note_send_finished=MagicMock(),
         )
+        peers = attach_mooncake_transport(
+            manager,
+            MagicMock(),
+            peer_kv=[1000],
+            peer_aux=[2000],
+            sessions=("peer",),
+            layout=peer_layout(
+                dst_kv_layer_ids=[0],
+                dst_kv_item_len=16,
+                dst_aux_item_lens=[16],
+            ),
+        )
+        manager.transfer_infos = {1: {peers["peer"]: req}}
         manager.check_status = lambda room: manager.request_status[room]
         return manager, queue
 
@@ -887,7 +889,7 @@ class TestMooncakeEarlySend(CustomTestCase):
         queue.put(None)
         sent_indices = []
 
-        def transfer(session, indices, *args, **kwargs):
+        def transfer(peer, indices, *args, **kwargs):
             self.assertIsInstance(indices, np.ndarray)
             sent_indices.extend(indices.tolist())
             return 0

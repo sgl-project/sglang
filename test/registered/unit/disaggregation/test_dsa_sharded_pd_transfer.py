@@ -14,7 +14,11 @@ import numpy as np
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric, StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
+from sglang.test.mooncake_utils import (
+    attach_mooncake_transport,
+    engine_writes,
+    peer_layout,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -32,7 +36,6 @@ def _manager(rank, size, sources, destinations):
     mgr.is_hybrid_mla_backend = False
     mgr.enable_custom_mem_pool = False
     mgr.max_transfer_batch_indices = 0
-    mgr.state_strides_validated = set()
     mgr.request_status = {_ROOM: KVPoll.Transferring}
     mgr.kv_args = SimpleNamespace(
         state_types=[StateType.DSA],
@@ -50,24 +53,22 @@ def _manager(rank, size, sources, destinations):
             ctypes.memmove(dst, src, length)
         return 0
 
-    attach_mooncake_transport(
-        mgr,
-        engine_writes(copy_blocks),
-        state=mgr.kv_args.state_data_ptrs,
-        peer_state=[[x.ctypes.data for x in destinations]],
-        sessions=("cpu",),
-    )
-    peer = SimpleNamespace(
-        dst_state_data_ptrs=[[x.ctypes.data for x in destinations]],
+    layout = peer_layout(
         dst_state_item_lens=[
             [_INDEX_PAGE_BYTES if len(x) else 0 for x in destinations]
         ],
         dst_state_dim_per_tensor=[[]],
         dst_state_layer_ids=[[]],
-        dst_attn_tp_size=1,
-        requires_dcp_relayout=False,
     )
-    return mgr, peer
+    peers = attach_mooncake_transport(
+        mgr,
+        engine_writes(copy_blocks),
+        state=mgr.kv_args.state_data_ptrs,
+        peer_state=[[x.ctypes.data for x in destinations]],
+        sessions=("cpu",),
+        layout=layout,
+    )
+    return mgr, peers["cpu"]
 
 
 def _send_state(mgr, peer, src_pages, dst_pages):
@@ -83,7 +84,7 @@ def _send_state(mgr, peer, src_pages, dst_pages):
             ),
             [src_pages],
             executor=None,
-            target_rank_registration_info=peer,
+            peer=peer,
         )
 
 
@@ -132,7 +133,8 @@ class TestDSAShardedPDTransfer(CustomTestCase):
                         ),
                     ):
                         self.assertEqual(
-                            mgr._get_dsa_cache_transfer_skip_flags(peer), (False, False)
+                            mgr._get_dsa_cache_transfer_skip_flags(peer.layout),
+                            (False, False),
                         )
                     self.assertEqual(
                         _send_state(mgr, peer, logical_pages, dst_pages), 0

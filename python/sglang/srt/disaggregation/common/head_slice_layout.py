@@ -125,6 +125,29 @@ def token_major_head_segments(
     ]
 
 
+def paged_segment_ranges(
+    *,
+    src_page_indices: npt.NDArray,
+    dst_page_indices: npt.NDArray,
+    src_page_bytes: int,
+    dst_page_bytes: int,
+    segments: List[HeadSliceSegment],
+) -> npt.NDArray[np.uint64]:
+    """(N, 3) rows of (src_offset, dst_offset, length) into the paged buffers,
+    page by page."""
+    ranges = np.empty((len(src_page_indices), len(segments), 3), dtype=np.uint64)
+    src_pages = src_page_indices.astype(np.uint64).reshape(-1, 1)
+    dst_pages = dst_page_indices.astype(np.uint64).reshape(-1, 1)
+    ranges[:, :, 0] = src_pages * np.uint64(src_page_bytes) + np.array(
+        [s.src_offset for s in segments], dtype=np.uint64
+    )
+    ranges[:, :, 1] = dst_pages * np.uint64(dst_page_bytes) + np.array(
+        [s.dst_offset for s in segments], dtype=np.uint64
+    )
+    ranges[:, :, 2] = np.array([s.num_bytes for s in segments], dtype=np.uint64)
+    return ranges.reshape(-1, 3)
+
+
 def paged_segment_addresses(
     *,
     src_base_ptr: int,
@@ -136,18 +159,18 @@ def paged_segment_addresses(
     segments: List[HeadSliceSegment],
 ) -> Tuple[List[int], List[int], List[int]]:
     """Source addresses, destination addresses and lengths, page by page."""
-    src_offsets = np.array([s.src_offset for s in segments], dtype=np.int64)
-    dst_offsets = np.array([s.dst_offset for s in segments], dtype=np.int64)
-    lengths = np.array([s.num_bytes for s in segments], dtype=np.int64)
-    src_pages = src_page_indices.astype(np.int64).reshape(-1, 1)
-    dst_pages = dst_page_indices.astype(np.int64).reshape(-1, 1)
-    src = src_base_ptr + src_pages * src_page_bytes + src_offsets.reshape(1, -1)
-    dst = dst_base_ptr + dst_pages * dst_page_bytes + dst_offsets.reshape(1, -1)
-    length = np.broadcast_to(lengths.reshape(1, -1), src.shape)
+    ranges = paged_segment_ranges(
+        src_page_indices=src_page_indices,
+        dst_page_indices=dst_page_indices,
+        src_page_bytes=src_page_bytes,
+        dst_page_bytes=dst_page_bytes,
+        segments=segments,
+    )
+    # uint64 bases: device pointers can set bit 63.
     return (
-        src.reshape(-1).tolist(),
-        dst.reshape(-1).tolist(),
-        length.reshape(-1).tolist(),
+        (np.uint64(src_base_ptr) + ranges[:, 0]).tolist(),
+        (np.uint64(dst_base_ptr) + ranges[:, 1]).tolist(),
+        ranges[:, 2].tolist(),
     )
 
 

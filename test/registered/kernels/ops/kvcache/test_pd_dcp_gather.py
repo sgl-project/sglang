@@ -9,7 +9,11 @@ from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
+from sglang.test.mooncake_utils import (
+    attach_mooncake_transport,
+    engine_writes,
+    peer_layout,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
@@ -138,36 +142,37 @@ class TestPdDcpGather(CustomTestCase):
                     enable_custom_mem_pool=custom_pool,
                     enable_deferred_decode_kv_release=False,
                 )
-                attach_mooncake_transport(
+                peers = attach_mooncake_transport(
                     manager,
                     engine_writes(transfer),
                     kv=[x.data_ptr() for x in sources],
                     staging=[pack.get_ptr()],
                     peer_kv=[x.data_ptr() for x in destinations],
-                )
-                for start in range(0, tokens, chunk):
-                    count = min(chunk, tokens - start)
-                    result = MooncakeKVManager.send_kvcache_dcp(
-                        manager,
-                        "session",
-                        src_pages[start // page : (start + count + page - 1) // page],
-                        [x.data_ptr() for x in destinations],
-                        dst_pages,
-                        dcp_token_item_lens=[x.shape[1] for x in sources],
+                    layout=peer_layout(
                         dst_dcp_size=4,
                         dst_dcp_rank=rank,
-                        src_page_offset=start // page,
-                        decode_prefix_len=256,
-                        num_kv_tokens=count,
-                        executor=executor,
-                        dst_layer_ids=layers,
-                        pack_buffer=pack,
+                        dst_kv_layer_ids=layers,
                         dst_kv_item_lens=[
                             page * w * (4 if e >= 4 else 1)
                             for e, w in enumerate(widths)
                         ],
                         dst_tp_rank=rank,
                         dst_attn_tp_size=4,
+                    ),
+                    dcp_token_item_lens=[x.shape[1] for x in sources],
+                )
+                for start in range(0, tokens, chunk):
+                    count = min(chunk, tokens - start)
+                    result = MooncakeKVManager.send_kvcache_dcp(
+                        manager,
+                        peers["session"],
+                        src_pages[start // page : (start + count + page - 1) // page],
+                        dst_pages,
+                        src_page_offset=start // page,
+                        decode_prefix_len=256,
+                        num_kv_tokens=count,
+                        executor=executor,
+                        pack_buffer=pack,
                     )
                     self.assertEqual(result, 0)
                 for entry in entries:

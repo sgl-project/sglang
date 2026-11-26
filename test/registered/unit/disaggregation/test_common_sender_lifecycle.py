@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.mori_stub import mori_stub
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -23,7 +24,13 @@ def make_sender(manager_type, room=42, *, sender_type=CommonKVSender):
     manager = object.__new__(manager_type)
     manager.disaggregation_mode = DisaggregationMode.PREFILL
     manager.request_status = {}
-    manager.transfer_infos = {room: {"127.0.0.1:1234": SimpleNamespace(dst_port=1234)}}
+    peer = "127.0.0.1:1234"
+    if manager_type is MooncakeKVManager:
+        # Mooncake keys a room's decodes by MooncakePeer, not by session name.
+        peer = attach_mooncake_transport(
+            manager, engine_writes(lambda session, blocks: 0), sessions=(peer,)
+        )[peer]
+    manager.transfer_infos = {room: {peer: SimpleNamespace(dst_port=1234)}}
     manager.is_dummy_cp_rank = False
     manager.enable_all_cp_ranks_for_transfer = False
     manager.attn_cp_size = 1

@@ -188,6 +188,75 @@ class TestPageRowHeadSlice(CustomTestCase):
         # Two heads: 2 x (16 KiB payload + 2 KiB scale); one head: half of that.
         self.assertEqual((src_row, dst_row), (36864, 18432))
 
+    def test_send_lands_each_head_through_the_transport(self):
+        """send_kvcache_page_row_slice writes by buffer key and offset; a wrong
+        key, base or page offset puts the rows in another buffer or page."""
+        import concurrent.futures
+        import ctypes
+        import threading
+
+        from sglang.srt.disaggregation.base.conn import KVArgs
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+        from sglang.test.mooncake_utils import (
+            attach_mooncake_transport,
+            engine_writes,
+            peer_layout,
+        )
+
+        def copy(_session, blocks):
+            for src_addr, dst_addr, length in blocks:
+                ctypes.memmove(dst_addr, src_addr, length)
+            return 0
+
+        src_tp, dst_tp = 2, 4
+        src_row, src_fill = self._layout(src_tp)
+        dst_row, dst_fill = self._layout(dst_tp)
+        # Decode keeps prefill page i at dst_pages[i].
+        dst_pages = np.array([2, 0, 1], dtype=np.int32)
+        for dst_rank in range(dst_tp):
+            src_rank = dst_rank // (dst_tp // src_tp)
+            src = src_fill(src_rank)
+            dst = np.zeros((self.PAGES, dst_row), dtype=np.uint8)
+
+            kv_args = KVArgs()
+            kv_args.engine_rank = src_rank
+            kv_args.page_size = self.PAGE
+            kv_args.total_kv_head_num = self.KV_HEADS
+            kv_args.main_kv_page_row = True
+            kv_args.main_kv_head_dim = self.HEAD_DIM
+            kv_args.draft_kv_head_num = 0
+            kv_args.kv_data_ptrs = [src.ctypes.data]
+            kv_args.kv_item_lens = [src_row]
+            kv_args.num_draft_entries = 0
+            kv_args.kv_layer_ids = [0]
+            manager = object.__new__(MooncakeKVManager)
+            manager.kv_args = kv_args
+            manager.attn_tp_size = src_tp
+            manager.draft_kv_tensors = None
+            manager._draft_head_packer = None
+            manager._draft_head_packer_lock = threading.Lock()
+            peers = attach_mooncake_transport(
+                manager,
+                engine_writes(copy),
+                kv=kv_args.kv_data_ptrs,
+                peer_kv=[dst.ctypes.data],
+                layout=peer_layout(
+                    dst_kv_item_lens=[dst_row],
+                    dst_kv_layer_ids=[0],
+                    dst_tp_rank=dst_rank,
+                    dst_attn_tp_size=dst_tp,
+                ),
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                ret = manager.send_kvcache_page_row_slice(
+                    peer=peers["session"],
+                    prefill_kv_indices=np.arange(self.PAGES, dtype=np.int32),
+                    dst_kv_indices=dst_pages,
+                    executor=executor,
+                )
+            self.assertEqual(ret, 0)
+            np.testing.assert_array_equal(dst[dst_pages], dst_fill(dst_rank))
+
     def test_rejects_replicated_heads(self):
         with self.assertRaises(ValueError):
             page_row_head_segments(
@@ -325,6 +394,7 @@ class TestPageRowSliceSendPackerFailure(CustomTestCase):
 
         from sglang.srt.disaggregation.base.conn import KVArgs
         from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+        from sglang.test.mooncake_utils import attach_mooncake_transport, peer_layout
 
         src_tp, dst_tp = 1, 2
         _, src_row, dst_row = page_row_head_segments(
@@ -361,14 +431,24 @@ class TestPageRowSliceSendPackerFailure(CustomTestCase):
         manager._draft_head_packer_lock = threading.Lock()
         manager.engine = mock.Mock()
         manager.engine.batch_transfer_sync.return_value = 0
-        peer = dict(
-            dst_kv_ptrs=[0x10000, 0x20000, 0x30000],
-            dst_kv_item_lens=[dst_row, dst_draft_item, dst_draft_item],
-            dst_layer_ids=[0, 100, 100],
-            dst_tp_rank=0,
-            dst_attn_tp_size=dst_tp,
+        peers = attach_mooncake_transport(
+            manager,
+            manager.engine,
+            kv=kv_args.kv_data_ptrs,
+            peer_kv=[0x10000, 0x20000, 0x30000],
+            sessions=("decode:1",),
+            layout=peer_layout(
+                dst_kv_item_lens=[dst_row, dst_draft_item, dst_draft_item],
+                dst_kv_layer_ids=[0, 100, 100],
+                dst_tp_rank=0,
+                dst_attn_tp_size=dst_tp,
+            ),
         )
-        return manager, peer, concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        return (
+            manager,
+            peers["decode:1"],
+            concurrent.futures.ThreadPoolExecutor(max_workers=2),
+        )
 
     def test_packer_construction_failure_returns_minus_one(self):
         from unittest import mock
@@ -384,14 +464,47 @@ class TestPageRowSliceSendPackerFailure(CustomTestCase):
             executor,
         ):
             ret = manager.send_kvcache_page_row_slice(
-                mooncake_session_id="decode:1",
                 prefill_kv_indices=np.array([3, 4], dtype=np.int32),
                 dst_kv_indices=np.array([7, 8], dtype=np.int32),
                 executor=executor,
-                **peer,
+                peer=peer,
             )
         self.assertEqual(ret, -1)
         manager.engine.batch_transfer_sync.assert_not_called()
+
+
+class TestDraftStagingRegistration(CustomTestCase):
+    """The draft head packer registers its staging on the transfer worker and is
+    rebuilt after a rejected batch. The rejected batch must leave no key behind,
+    and the retry must get fresh keys that name its own buffers: a key shared
+    with another buffer sends that buffer's bytes with no error."""
+
+    def test_retry_after_a_rejected_batch(self):
+        import itertools
+        from unittest import mock
+
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+        from sglang.srt.disaggregation.mooncake.transport import MooncakeTransport
+
+        engine = mock.Mock()
+        engine.batch_register.side_effect = [RuntimeError("rejected"), None]
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(gpu_id=0)
+        manager._staging_key_indices = itertools.count()
+        manager.transport = MooncakeTransport(engine=engine)
+
+        with self.assertRaises(RuntimeError):
+            manager._register_draft_staging([(0x1000, 64), (0x2000, 64)])
+        # The allocator hands the freed first buffer back to the retry.
+        keys = manager._register_draft_staging([(0x1000, 64), (0x3000, 64)])
+
+        self.assertEqual(len(set(keys)), 2)
+        self.assertEqual(
+            list(manager.transport.export_buffers(keys).bases), [0x1000, 0x3000]
+        )
+        manager.transport.close()
+        (deregistered,), _ = engine.batch_deregister.call_args
+        self.assertEqual(sorted(deregistered), [0x1000, 0x3000])
 
 
 class TestDraftHeadPackerOutOfMemory(CustomTestCase):

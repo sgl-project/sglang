@@ -219,7 +219,7 @@ def test_pd_transfer_sends_the_suffix_with_all_scales(length, prefix):
         assert (
             MooncakeKVManager._send_kvcache_generic(
                 manager,
-                mooncake_session_id="cpu-test",
+                peer=manager._peers["cpu-test"],
                 item_lens=si,
                 prefill_data_indices=source_pages,
                 dst_data_indices=destination_pages,

@@ -46,6 +46,7 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.scheduler_test_utils import (
     FakeReq,
     decode_queue,
@@ -773,19 +774,14 @@ class TestAllocationIntegration(CustomTestCase):
         mgr = self.prefill
         mgr._staging_outstanding = defaultdict(int)
         mgr.session_lock = threading.Lock()
-        mgr.failed_sessions = set()
-        mgr.state_layout_rejections = {}
-        mgr.state_strides_validated = set()
+        mgr.failed_peers = set()
+        mgr.fan_in_rejections = {}
         mgr.enable_deferred_decode_kv_release = True
-        mgr.decode_kv_args_table = {
-            "session": SimpleNamespace(
-                requires_dcp_relayout=False, dst_aux_ptrs=[], dst_aux_item_lens=None
-            )
-        }
+        peers = attach_mooncake_transport(mgr, engine_writes(lambda session, blocks: 0))
         mgr._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
         mgr.send_aux = Mock(return_value=0)
         mgr.transfer_infos[1] = {
-            "session": SimpleNamespace(
+            peers["session"]: SimpleNamespace(
                 is_dummy=False,
                 mooncake_session_id="session",
                 dst_kv_indices=[],
@@ -1109,19 +1105,14 @@ class TestAllocationIntegration(CustomTestCase):
         mgr = self.prefill
         mgr._staging_outstanding = defaultdict(int)
         mgr.session_lock = threading.Lock()
-        mgr.failed_sessions = set()
-        mgr.state_layout_rejections = {}
-        mgr.state_strides_validated = set()
+        mgr.failed_peers = set()
+        mgr.fan_in_rejections = {}
         mgr.enable_deferred_decode_kv_release = True
-        mgr.decode_kv_args_table = {
-            "session": SimpleNamespace(
-                requires_dcp_relayout=False, dst_aux_ptrs=[], dst_aux_item_lens=None
-            )
-        }
+        peers = attach_mooncake_transport(mgr, engine_writes(lambda session, blocks: 0))
         mgr._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
         mgr.send_aux = Mock(return_value=0)
         mgr.transfer_infos[1] = {
-            "session": SimpleNamespace(
+            peers["session"]: SimpleNamespace(
                 is_dummy=False,
                 mooncake_session_id="session",
                 dst_kv_indices=[],
