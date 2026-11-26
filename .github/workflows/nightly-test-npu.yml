@@ -467,6 +467,9 @@ jobs:
       # gsm8k/gpqa override is injected.
       accuracy_dataset: ''
       sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
+      # TEMPORARY: run only the DeepSWE eval-environment check (no NPU
+      # deployment). Set to 'false' or '' to run the real case.
+      deepswe_env_check: 'true'
 
   # Multi-node accuracy suites: one suite list per parity, chosen by the Beijing-date
 #   # parity resolved in set-image-config (odd day runs the odd-day suites, even day

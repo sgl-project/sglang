@@ -89,14 +89,38 @@ on:
         type: string
         default: ''
         description: "sgl-router-build's aarch64 artifact for the router pod; empty uses the image's sgl-router."
+      deepswe_env_check:
+        required: false
+        type: string
+        default: ''
+        description: "If 'true', only run the DeepSWE eval-environment check (no NPU deployment) and skip the e2e job."
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
   cancel-in-progress: true
 
 jobs:
+  # Fast, deployment-free check of the DeepSWE eval environment (Miniconda
+  # Python >=3.12 + evalscope + datacurve-pier). Enabled via deepswe_env_check.
+  deepswe-env-check:
+    name: deepswe-env-check
+    if: ${{ inputs.deepswe_env_check == 'true' }}
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main-x86
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: DeepSWE eval environment check
+        timeout-minutes: 60
+        run: |
+          bash python/sglang/test/ascend/e2e/run_deepswe_env_check.sh
+
   e2e:
     name: ${{ inputs.test_config_name }}
+    if: ${{ inputs.deepswe_env_check != 'true' }}
     runs-on: ${{ inputs.runner }}
     container:
       image: swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main-x86
