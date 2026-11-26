@@ -2027,7 +2027,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             elif batch.seq_lens_cpu is not None:
                 seq_lens_sum = int(batch.seq_lens_cpu.sum())
             else:
-                seq_lens_sum = bs * attn_backend.max_context_len
+                seq_lens_sum = (
+                    bs * self._target_worker.model_runner.req_to_token_pool.row_width
+                )
             custom_mask = torch.ones(seq_lens_sum + bs, dtype=torch.bool, device=device)
 
         positions = batch.seq_lens.to(torch.int64)
