@@ -24,7 +24,7 @@ from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 logger = logging.getLogger(__name__)
 
 
-_provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
+_provider_spec = import_module("sglang.kernels.plugin_kernels.megakernel.spec")
 _provider_vocab_shard = getattr(_provider_spec, "VocabShardView", None)
 if _provider_vocab_shard is None:
 

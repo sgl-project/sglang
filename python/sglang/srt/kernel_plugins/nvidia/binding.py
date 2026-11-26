@@ -27,11 +27,8 @@ import msgspec
 import torch
 import torch.distributed as dist
 
-from sglang.kernels.plugin_kernels.nvidia.spec import (
+from sglang.kernels.plugin_kernels.megakernel.spec import (
     ENTRIES,
-    ENTRY_POINT,
-    FLAG,
-    FLAG_SETS_ENV,
     GRAPH_VARIANT_RUNNERS,
     BuildContext,
     BuiltMegakernel,
@@ -47,6 +44,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     registered_architectures,
     spec_registered,
 )
+from sglang.kernels.plugin_kernels.nvidia.spec import ENTRY_POINT, FLAG, FLAG_SETS_ENV
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.amd.binding import msa_serves
@@ -1311,11 +1309,12 @@ def _find_spec_on_every_rank(
     """The spec every rank found; for a draft model, None when no rank has one
     registered; else raise on every rank."""
     archs = hf_config.architectures
-    spec, why = find_spec(architectures=archs, isa=device_isa())
+    isa = device_isa()
+    spec, why = find_spec(architectures=archs, isa=isa)
     # Ranks branch together; one skipping the collectives below would hang its peers.
     lookups = _gather_tp(
         (
-            spec_registered(archs),
+            spec_registered(archs, target=isa) or spec_registered(archs),
             why,
             None if spec is None else (spec.name, spec.api_version),
         )
