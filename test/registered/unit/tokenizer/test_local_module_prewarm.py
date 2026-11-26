@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -8,11 +9,13 @@ from unittest.mock import patch
 from transformers import (
     BertTokenizer,
     CLIPImageProcessor,
+    LlamaConfig,
     LlavaConfig,
     LlavaProcessor,
     dynamic_module_utils,
 )
 
+from sglang.srt.hf_transformers import processor
 from sglang.srt.hf_transformers.processor import (
     load_scheduler_tokenizer,
     maybe_prewarm_scheduler_tokenizer,
@@ -22,16 +25,18 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 class TestLocalModulePrewarm(CustomTestCase):
     def test_prewarm_failure_preserves_scheduler_launch(self):
         from sglang.srt.entrypoints.engine import Engine
-        from sglang.srt.hf_transformers import processor
 
         self.addCleanup(reset_context)
-        with tempfile.TemporaryDirectory() as model:
+        with (
+            tempfile.TemporaryDirectory() as model,
+            patch.object(dynamic_module_utils, "HF_MODULES_CACHE", model),
+        ):
             args = ServerArgs(
                 model_path="dummy",
                 tokenizer_path=model,
@@ -40,14 +45,12 @@ class TestLocalModulePrewarm(CustomTestCase):
                 trust_remote_code=True,
             )
             publish(args, role="tokenizer")
-            for failing_step in ("get_serving", "load_scheduler_tokenizer"):
+            for failing_step in ("get_serving", "tempfile.TemporaryDirectory"):
                 for launch_error in (None, OSError("scheduler startup failed")):
                     with (
                         self.subTest(step=failing_step, launch_error=launch_error),
-                        patch.object(processor, "process_model_config"),
-                        patch.object(
-                            processor,
-                            failing_step,
+                        patch(
+                            f"{processor.__name__}.{failing_step}",
                             side_effect=ValueError("prewarm failed"),
                         ) as step,
                         self.assertLogs(processor.logger, level="WARNING") as logs,
@@ -70,12 +73,16 @@ class TestLocalModulePrewarm(CustomTestCase):
 
     def test_prewarm_only_for_concurrent_local_custom_code(self):
         self.addCleanup(reset_context)
-        with tempfile.TemporaryDirectory() as model:
+        with (
+            tempfile.TemporaryDirectory() as model,
+            patch.object(
+                dynamic_module_utils, "HF_MODULES_CACHE", str(Path(model) / "modules")
+            ),
+        ):
             for overrides in (
                 {"trust_remote_code": False},
                 {"skip_tokenizer_init": True},
-                {"tp_size": 1},
-                {"nnodes": 2},  # One scheduler per node.
+                {"nnodes": 2, "node_rank": 1},  # A single reader on a follower.
                 {"tokenizer_path": "org/remote-tokenizer"},
             ):
                 with self.subTest(overrides=overrides):
@@ -87,13 +94,10 @@ class TestLocalModulePrewarm(CustomTestCase):
                         trust_remote_code=True,
                     )
                     publish(ServerArgs(**(options | overrides)), role="tokenizer")
-                    with patch(
-                        "sglang.srt.hf_transformers.processor.process_model_config"
-                    ) as model_config:
-                        maybe_prewarm_scheduler_tokenizer()
-                        model_config.assert_not_called()
+                    maybe_prewarm_scheduler_tokenizer()
+                    self.assertFalse((Path(model) / "modules").exists())
 
-    def test_worker_loads_custom_tokenizer_without_recopying(self):
+    def test_tp1_worker_loads_custom_tokenizer_without_recopying(self):
         from sglang.srt.entrypoints.engine import Engine
 
         self.addCleanup(reset_context)
@@ -127,20 +131,13 @@ class TestLocalModulePrewarm(CustomTestCase):
 
             with (
                 patch.object(dynamic_module_utils, "HF_MODULES_CACHE", str(cache)),
-                patch.object(
-                    dynamic_module_utils,
-                    "TRANSFORMERS_DYNAMIC_MODULE_NAME",
-                    Path(root).name,
-                ),
                 patch.object(sys, "path", sys.path.copy()),
             ):
                 args = ServerArgs(
                     model_path=str(model),
                     trust_remote_code=True,
                     device="cpu",
-                    tp_size=4,
-                    nnodes=2,
-                    node_rank=1,
+                    tp_size=1,
                 )
                 publish(args, role="tokenizer")
 
@@ -158,7 +155,51 @@ class TestLocalModulePrewarm(CustomTestCase):
                     "multiprocessing.Process.start", side_effect=check_at_spawn
                 ) as start:
                     Engine._launch_scheduler_processes(args, None, None)
-                    self.assertEqual(start.call_count, 2)
+                    self.assertEqual(start.call_count, 1)
+
+    def test_failed_custom_import_leaves_launcher_and_cache_clean(self):
+        """A failed warmup must leave the real worker to report its own error."""
+        self.addCleanup(reset_context)
+        with tempfile.TemporaryDirectory() as root:
+            model = Path(root) / "broken"
+            cache = Path(root) / "modules"
+            LlamaConfig(architectures=["LlamaForCausalLM"]).save_pretrained(model)
+            BertTokenizer().save_pretrained(model)
+            config_path = model / "tokenizer_config.json"
+            config = json.loads(config_path.read_text())
+            config["auto_map"] = {"AutoTokenizer": [None, "broken.LocalTokenizer"]}
+            config_path.write_text(json.dumps(config))
+            (model / "broken.py").write_text(
+                "import os\n"
+                "os.environ['SGLANG_TEST_PREWARM_PID'] = str(os.getpid())\n"
+                "raise RuntimeError('custom tokenizer import failed')\n"
+            )
+            args = ServerArgs(
+                model_path=str(model),
+                device="cpu",
+                trust_remote_code=True,
+                tp_size=4,
+                nnodes=2,
+                node_rank=1,
+            )
+            publish(args, role="tokenizer")
+            with (
+                patch.dict(os.environ),
+                patch.object(dynamic_module_utils, "HF_MODULES_CACHE", str(cache)),
+                patch.object(sys, "path", sys.path.copy()),
+            ):
+                os.environ.pop("SGLANG_TEST_PREWARM_PID", None)
+                with self.assertLogs(processor.logger, level="WARNING"):
+                    maybe_prewarm_scheduler_tokenizer()
+                self.assertIsNone(os.environ.get("SGLANG_TEST_PREWARM_PID"))
+                self.assertEqual(list(cache.rglob("*.py")), [])
+                with self.assertRaisesRegex(
+                    RuntimeError, "custom tokenizer import failed"
+                ):
+                    load_scheduler_tokenizer(is_multimodal=False)
+                self.assertEqual(
+                    os.environ["SGLANG_TEST_PREWARM_PID"], str(os.getpid())
+                )
 
 
 if __name__ == "__main__":

@@ -13,7 +13,10 @@
 # ==============================================================================
 """Processor loading utilities."""
 
+import filecmp
 import json
+import multiprocessing
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -22,16 +25,20 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizerBase,
+    dynamic_module_utils,
 )
 from transformers.utils import cached_file
 
+from sglang.srt.environ import envs
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.runtime_context import (
     get_mm,
     get_model,
     get_parallel,
+    get_server_args,
     get_serving,
     process_model_config,
+    publish,
 )
 from sglang.srt.utils import logger
 
@@ -87,22 +94,64 @@ def load_scheduler_tokenizer(*, is_multimodal: bool):
     return get_tokenizer(serving.tokenizer_path, **kwargs), None
 
 
+def _prewarm_in_subprocess(server_args, staging_dir):
+    # Tokenizer backends (e.g. fastokens) and custom modules can patch the
+    # interpreter. Only the completed Python sources should reach the launcher.
+    dynamic_module_utils.HF_MODULES_CACHE = staging_dir
+    publish(server_args, role="tokenizer")
+    load_scheduler_tokenizer(is_multimodal=process_model_config().is_multimodal)
+
+
 def maybe_prewarm_scheduler_tokenizer():
-    """Best-effort cache warmup before concurrent scheduler loads."""
+    """Populate the shared HF modules cache before local tokenizer readers start."""
     try:
         serving = get_serving()
         parallel = get_parallel()
+        python_frontend = parallel.node_rank == 0 and not envs.SGLANG_RUST_SERVER.get()
         if (
             serving.skip_tokenizer_init
             or not get_model().trust_remote_code
-            or parallel.tp_size * parallel.pp_size * parallel.dp_size <= parallel.nnodes
             or not Path(serving.tokenizer_path).is_dir()
+            or (
+                not python_frontend
+                and parallel.tp_size * parallel.pp_size * parallel.dp_size
+                <= parallel.nnodes
+            )
         ):
             return
 
-        # huggingface/transformers#50843: a late copier can truncate a module
-        # another scheduler is importing. Populate the cache before spawning either.
-        load_scheduler_tokenizer(is_multimodal=process_model_config().is_multimodal)
+        # huggingface/transformers#50843: even at TP=1 the Python frontend
+        # and scheduler can race to copy/import the same local module.
+        cache = Path(dynamic_module_utils.HF_MODULES_CACHE)
+        cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache) as staging:
+            proc = multiprocessing.get_context("spawn").Process(
+                target=_prewarm_in_subprocess, args=(get_server_args(), staging)
+            )
+            proc.start()
+            try:
+                proc.join()
+                if proc.exitcode != 0:
+                    raise RuntimeError(
+                        f"Tokenizer prewarm process exited with {proc.exitcode}"
+                    )
+            finally:
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join()
+                proc.close()
+
+            # Stage on the same filesystem so readers see only complete files.
+            # HF creates empty package initializers without replacing existing ones.
+            for source in Path(staging).rglob("*.py"):
+                target = cache / source.relative_to(staging)
+                if target.exists() and (
+                    (source.name == "__init__.py" and source.stat().st_size == 0)
+                    or filecmp.cmp(source, target, shallow=False)
+                ):
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source.replace(target)
     except Exception:
         logger.warning(
             "Could not prewarm the HF modules cache. Continuing with scheduler startup.",
