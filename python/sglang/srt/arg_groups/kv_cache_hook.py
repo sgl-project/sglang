@@ -15,7 +15,9 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
 from sglang.srt.mem_cache.platform_kv_cache_dtype import (
     registered_kv_cache_storage_dtype,
 )
@@ -103,9 +105,6 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
     """MXFP8 KV cache runs on SM100+ (Blackwell) and, for Inkling 2, on SM90
     through a BF16 copy of the cache for prefill."""
-    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
-    from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
-
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "mxfp8":
         return
