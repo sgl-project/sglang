@@ -352,6 +352,18 @@ class SRTPlatform(DeviceMixin):
         pass
 
     # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
+
+    def on_destroy_model_parallel(self) -> None:
+        """Platform teardown that must run before the model-parallel groups die.
+
+        Release platform-owned resources (e.g. symmetric communicator buffers)
+        that are tied to those groups.
+        """
+        pass
+
+    # ------------------------------------------------------------------
     # BaseFusedOp integration
     # ------------------------------------------------------------------
 

@@ -16,7 +16,6 @@
 import logging
 import re
 from array import array
-from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -30,7 +29,6 @@ from transformers import (
 )
 
 from sglang.srt.environ import envs
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -67,8 +65,6 @@ logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Gemma4MultimodalEmbedder(nn.Module):
@@ -158,10 +154,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         "gate_up_proj",
         "down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = True
 
     def __init__(
         self,
@@ -640,15 +632,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self, input_ids: torch.LongTensor
     ) -> Optional[torch.Tensor]:
         return self.language_model.get_per_layer_inputs(input_ids)
-
-    def project_per_layer_inputs(
-        self,
-        inputs_embeds: torch.Tensor,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.language_model.project_per_layer_inputs(
-            inputs_embeds, per_layer_inputs
-        )
 
     @torch.no_grad()
     def forward(
@@ -1153,9 +1136,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return self.config.intermediate_size[0], self.config.hidden_size
         else:
             raise NotImplementedError()
-
-    def get_embed(self):
-        return self.language_model.embed_tokens.weight
 
     def get_embed_and_head(self):
         if self.pp_group.world_size > 1:

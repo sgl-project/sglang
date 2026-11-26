@@ -379,17 +379,20 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_full_oneshot_kernel(
     const uint32_t num_items) {
   using namespace device;
   using Trait = InklingAllReduceTrait<DType, kNumGPU>;
-  static_assert(std::is_same_v<DType, bf16_t>, "multimem.add path is bf16-only");
-  constexpr uint32_t kElemsPerVec = Trait::kElemsPerVec;  // 8 bf16 = 16 B
+  constexpr bool kF32 = std::is_same_v<DType, fp32_t>;
+  static_assert(kF32 || std::is_same_v<DType, bf16_t>, "multimem.add path is bf16 / fp32 only");
+  constexpr uint32_t kElemsPerVec = Trait::kElemsPerVec;  // 16 B
   const uint32_t total_vec = num_items / kElemsPerVec;
   PDLWaitPrimary<true>();
 
-  if (shared != nullptr) {
-    // Fold into this rank's (double-buffered) input region; the publishing
-    // entry barrier then orders it for every peer's ld_reduce. v4 fires only
-    // for 1-2 rows, so the extra local pass is negligible next to the
-    // torch.add launch it replaces.
-    fold_shared_local<DType, kNumGPU>(local_in_ptr, shared, num_items);
+  if constexpr (!kF32) {
+    if (shared != nullptr) {
+      // Fold into this rank's (double-buffered) input region; the publishing
+      // entry barrier then orders it for every peer's ld_reduce. v4 fires only
+      // for 1-2 rows, so the extra local pass is negligible next to the
+      // torch.add launch it replaces.
+      fold_shared_local<DType, kNumGPU>(local_in_ptr, shared, num_items);
+    }
   }
   inkling_ar::grid_system_barrier<kNumGPU>(
       state, flag_ptrs, rank, 0, /*publish_writes=*/shared != nullptr);  // ENTRY only (single barrier)
@@ -398,9 +401,15 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_full_oneshot_kernel(
   for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < total_vec; v += stride) {
     DType* in = mc_ptr + v * kElemsPerVec;
     uint32_t r0, r1, r2, r3;
-    asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                 : "l"(in));
+    if constexpr (kF32) {
+      asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                   : "l"(in));
+    } else {
+      asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                   : "l"(in));
+    }
     // <-- EPILOGUE SEAM (norm / sconv / bias on {r0..r3} before the local store)
     *reinterpret_cast<uint4*>(out_ptr + v * kElemsPerVec) = make_uint4(r0, r1, r2, r3);
   }

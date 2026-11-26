@@ -84,7 +84,7 @@ class SparseKVCacheManager:
         # Include the padding row because real request IDs can equal the
         # configured capacity when row 0 is reserved for graph padding.
         self.size = int(req_to_token_pool.req_to_token.shape[0])
-        self.max_context_len = req_to_token_pool.max_context_len
+        self.req_to_token_row_width = req_to_token_pool.row_width
         self.sparse_context_len = int(sparse_context_len)
         if self.sparse_context_len <= 0:
             raise ValueError(
@@ -123,7 +123,7 @@ class SparseKVCacheManager:
         # device KV buffer
         try:
             with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                # [bs, ctx_len, head_num, head_dim] for each layer
+                # [bs, sparse_context_len, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.device_kv_buffer: list[torch.Tensor] = [
                     torch.empty(
@@ -144,13 +144,13 @@ class SparseKVCacheManager:
         try:
             with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 # Reserve the last row for padded requests and ensure token index
-                # `max_context_len` is a valid sentinel column for masked writes.
+                # `req_to_token_row_width` is a valid sentinel column for masked writes.
                 # The row width is also aligned to eight int32 values (32 bytes).
                 self.device_slot_map: list[torch.Tensor] = [
                     torch.full(
                         (
                             self.size + 1,
-                            (self.max_context_len // 8 + 1) * 8,
+                            (self.req_to_token_row_width // 8 + 1) * 8,
                         ),
                         -1,
                         dtype=torch.int32,
@@ -167,7 +167,7 @@ class SparseKVCacheManager:
             self._raise_buffer_allocation_error("device_slot_map", e)
 
         # Host KV buffer
-        # [bs, ctx_len, head_num, head_dim] for each layer
+        # [bs, req_to_token_row_width, head_num, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.host_kv_buffer: list[torch.Tensor] = []
         self.host_ptr_list: list[int] = []
@@ -175,7 +175,7 @@ class SparseKVCacheManager:
 
         host_kv_shape = (
             self.size,
-            self.max_context_len,
+            self.req_to_token_row_width,
             self.head_num,
             self.head_dim,
         )
@@ -196,7 +196,7 @@ class SparseKVCacheManager:
         except Exception as e:
             self._raise_buffer_allocation_error("host_kv_buffer", e)
         self.host_kv_ctx_len = torch.zeros(
-            (self.size, self.max_context_len), dtype=torch.int32, device="cpu"
+            (self.size, self.req_to_token_row_width), dtype=torch.int32, device="cpu"
         )
         self.topk_indices_cpu = None
         self.token_on_device_cpu = None
@@ -206,7 +206,7 @@ class SparseKVCacheManager:
         self._device_cache_slot_ids = torch.arange(
             self.sparse_context_len, dtype=torch.long, device=self.device
         )
-        self._slot_map_width = (self.max_context_len // 8 + 1) * 8
+        self._slot_map_width = (self.req_to_token_row_width // 8 + 1) * 8
 
         self._install_req_alloc_hook(req_to_token_pool)
 
@@ -218,7 +218,7 @@ class SparseKVCacheManager:
         raise RuntimeError(
             "Failed to allocate sparse KV buffer "
             f"{buffer_name}: req_capacity={self.size}, "
-            f"max_context_len={self.max_context_len}, "
+            f"req_to_token_row_width={self.req_to_token_row_width}, "
             f"sparse_context_len={self.sparse_context_len}. "
             "The sparse KV request capacity may be too large; set a smaller "
             "--max-running-requests for sparse KV offload."
@@ -283,7 +283,7 @@ class SparseKVCacheManager:
             token_pos = (forward_batch.seq_lens - 1).to(torch.long)
 
             dst_token_indices = (
-                req_ids * self.max_context_len + token_pos
+                req_ids * self.req_to_token_row_width + token_pos
             ).contiguous()
 
             # Existing graph decode convention:
@@ -336,7 +336,7 @@ class SparseKVCacheManager:
             dst_pos_2d = extend_prefix_lens.unsqueeze(1) + local_offsets
 
             dst_token_indices = (
-                (req_ids_2d * self.max_context_len + dst_pos_2d)
+                (req_ids_2d * self.req_to_token_row_width + dst_pos_2d)
                 .reshape(-1)
                 .contiguous()
             )
@@ -362,7 +362,7 @@ class SparseKVCacheManager:
                 dst_token_indices,
                 valid_mask,
                 1,  # kv_device: [token_slot, nhead, 2*dim]
-                2,  # host_kv_buffer: [num_req, max_context_len, nhead, 2*dim]
+                2,  # host_kv_buffer: [num_req, req_to_token_row_width, nhead, 2*dim]
                 block_dim=48,
                 dst_ptr=self.dev_ptr_list[layer_idx],
             )
@@ -416,13 +416,13 @@ class SparseKVCacheManager:
                     f"{num_src_rows}."
                 )
 
-            dst_index = (req_ids * self.max_context_len + token_pos).contiguous()
+            dst_index = (req_ids * self.req_to_token_row_width + token_pos).contiguous()
             valid_mask = (
                 (forward_batch.seq_lens != 1)
                 & (cache_loc >= 0)
                 & (req_ids >= 0)
                 & (token_pos >= 0)
-                & (token_pos < self.max_context_len)
+                & (token_pos < self.req_to_token_row_width)
             ).contiguous()
         else:
             if (
@@ -493,12 +493,12 @@ class SparseKVCacheManager:
                     - flat_seq_starts
                 )
                 dst_index = (
-                    flat_req_ids * self.max_context_len + token_pos
+                    flat_req_ids * self.req_to_token_row_width + token_pos
                 ).contiguous()
                 valid_mask = (
                     (flat_req_ids >= 0)
                     & (token_pos >= 0)
-                    & (token_pos < self.max_context_len)
+                    & (token_pos < self.req_to_token_row_width)
                 )
             else:
                 if num_src_rows % batch_size != 0:
@@ -523,7 +523,7 @@ class SparseKVCacheManager:
                 token_pos_2d = extend_prefix_lens.unsqueeze(1) + local_offsets
 
                 dst_index = (
-                    (req_ids_2d * self.max_context_len + token_pos_2d)
+                    (req_ids_2d * self.req_to_token_row_width + token_pos_2d)
                     .reshape(-1)
                     .contiguous()
                 )
@@ -531,7 +531,7 @@ class SparseKVCacheManager:
                     (local_offsets < extend_seq_lens.unsqueeze(1))
                     & (req_ids_2d >= 0)
                     & (token_pos_2d >= 0)
-                    & (token_pos_2d < self.max_context_len)
+                    & (token_pos_2d < self.req_to_token_row_width)
                 ).reshape(-1)
 
             if (
@@ -555,7 +555,7 @@ class SparseKVCacheManager:
                 dst_index,
                 valid_mask,
                 1,  # src_tensor: [num_new_tokens, nhead, head_dim]
-                2,  # dst_tensor: [num_req, max_context_len, nhead, head_dim]
+                2,  # dst_tensor: [num_req, req_to_token_row_width, nhead, head_dim]
                 block_dim=48,
                 dst_ptr=self.dev_ptr_list[layer_idx],
             )
@@ -629,10 +629,9 @@ class SparseKVCacheManager:
             raise RuntimeError(
                 f"get_forward_kv got req id outside sparse pool size {self.size}."
             )
-        if bool((seq_lens > self.max_context_len).any().item()):
+        if bool((seq_lens > self.req_to_token_row_width).any().item()):
             raise RuntimeError(
-                "get_forward_kv got seq_len larger than max_context_len "
-                f"{self.max_context_len}."
+                f"get_forward_kv got seq_len larger than req_to_token_row_width {self.req_to_token_row_width}."
             )
 
         total_tokens = int(seq_lens.sum().item())
@@ -652,7 +651,7 @@ class SparseKVCacheManager:
         token_pos = (
             torch.arange(total_tokens, device=device, dtype=torch.long) - src_seq_starts
         )
-        src_index = (src_req_ids * self.max_context_len + token_pos).contiguous()
+        src_index = (src_req_ids * self.req_to_token_row_width + token_pos).contiguous()
         dst_index = torch.arange(total_tokens, device=device, dtype=torch.long)
         valid_mask = torch.ones(total_tokens, device=device, dtype=torch.bool)
 
@@ -664,7 +663,7 @@ class SparseKVCacheManager:
                 src_index,
                 dst_index,
                 valid_mask,
-                2,  # host_kv_buffer: [num_req, max_context_len, nhead, head_dim]
+                2,  # host_kv_buffer: [num_req, req_to_token_row_width, nhead, head_dim]
                 1,  # kv_cat: [total_tokens, nhead, head_dim]
                 block_dim=48,
                 src_ptr=self.dev_ptr_list[layer_idx],
@@ -713,7 +712,7 @@ class SparseKVCacheManager:
                 )
             valid_topk_mask = (
                 (topk_indices >= 0)
-                & (topk_indices < self.max_context_len)
+                & (topk_indices < self.req_to_token_row_width)
                 & valid_req_mask.unsqueeze(1)
             )
 
@@ -743,7 +742,7 @@ class SparseKVCacheManager:
                 host_miss_mask,
                 topk_indices,
                 device_cache_row_indices,
-                self.max_context_len,
+                self.req_to_token_row_width,
             )
 
             cache_slot_ids = self._device_cache_slot_ids[:topk_len]
@@ -812,7 +811,7 @@ class SparseKVCacheManager:
             _record_stream_event(self._materialize_refill_stream, self.refill_done)
 
         # Replace the slot-map row with the current top-k mapping. Invalid
-        # entries use the max_context_len sentinel column to preserve shape.
+        # entries use the req_to_token_row_width sentinel column to preserve shape.
         with torch.npu.stream(self._materialize_slot_map_stream):
             _wait_stream_event(self._materialize_slot_map_stream, copy_ready)
             self.device_slot_map[layer_idx].copy_(self._device_slot_map_minus_one)
@@ -820,7 +819,9 @@ class SparseKVCacheManager:
             slot_map_token_indices = torch.where(
                 valid_topk_mask,
                 topk_indices.to(torch.long),
-                torch.full_like(topk_indices, self.max_context_len, dtype=torch.long),
+                torch.full_like(
+                    topk_indices, self.req_to_token_row_width, dtype=torch.long
+                ),
             )
             slot_map_slot_values = torch.where(
                 valid_topk_mask,
@@ -927,7 +928,7 @@ def _build_miss_src_dst_index(
     token_from_host: torch.Tensor,
     topk_indices: torch.Tensor,
     current_req_indices: torch.Tensor,
-    max_context_len: int,
+    req_to_token_row_width: int,
 ):
     if token_from_host.dim() != 2 or topk_indices.dim() != 2:
         raise RuntimeError(
@@ -952,7 +953,9 @@ def _build_miss_src_dst_index(
     bs, topk = token_from_host.shape
     device = token_from_host.device
 
-    valid_2d = token_from_host & (topk_indices >= 0) & (topk_indices < max_context_len)
+    valid_2d = (
+        token_from_host & (topk_indices >= 0) & (topk_indices < req_to_token_row_width)
+    )
     valid_mask = valid_2d.reshape(-1).contiguous()
 
     flat_dst_index_all = torch.arange(
@@ -961,7 +964,9 @@ def _build_miss_src_dst_index(
         dtype=torch.int64,
     )
 
-    req_offsets = current_req_indices.to(torch.int64).unsqueeze(1) * max_context_len
+    req_offsets = (
+        current_req_indices.to(torch.int64).unsqueeze(1) * req_to_token_row_width
+    )
     src_index_2d = req_offsets + topk_indices.to(torch.int64)
     flat_src_index_all = src_index_2d.reshape(-1).contiguous()
 
