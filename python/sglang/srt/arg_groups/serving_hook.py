@@ -35,6 +35,17 @@ def handle_admin_api_key_env(server_args: Any) -> None:
         )
 
 
+def handle_api_key_env(server_args: Any) -> None:
+    """`--api-key` wins; without it the server takes `SGLANG_API_KEY`.
+
+    Passing the secret via the environment keeps it out of the process
+    command line, which is world-readable via /proc/<pid>/cmdline.
+    """
+    env_key = envs.SGLANG_API_KEY.get()
+    if resolving_view(server_args).api_key is None and env_key:
+        declare_resolution(server_args, "_handle_api_key_env", api_key=env_key)
+
+
 def handle_watermark_config(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.watermark_config is None:

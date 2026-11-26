@@ -154,7 +154,9 @@ class Serving(msgspec.Struct):
     # -------------------------------------------------------------------------
     api_key: A[
         Optional[str],
-        "Set API key of the server. It is also used in the OpenAI API compatible server.",
+        "Set API key of the server. It is also used in the OpenAI API "
+        "compatible server. Falls back to SGLANG_API_KEY when the flag is "
+        "absent, so the secret need not appear in the process command line.",
     ] = None
     admin_api_key: A[
         Optional[str],
