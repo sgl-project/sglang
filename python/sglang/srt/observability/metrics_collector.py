@@ -2769,6 +2769,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def init_linker_metrics(self) -> None:
         """Create the external cache linker series; only caches with a linker call this."""
+        # The cache and its collectors outlive individual linker attachments.
+        if getattr(self, "_linker_metrics_initialized", False):
+            return
         from prometheus_client import Counter as _PromCounter
         from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
@@ -2859,6 +2862,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self._linker_metrics_initialized = True
 
     def increment_linker_lookup_tokens(
         self, lookup_tokens: int, hit_tokens: int

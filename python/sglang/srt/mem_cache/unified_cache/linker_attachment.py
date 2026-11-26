@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _LinkerRollbackError(RuntimeError):
+    """An incomplete rollback must stop the scheduler on every rank."""
+
+
 class LinkerAttachment:
     """Attach / detach the external linker of one ``UnifiedRadixCache``."""
 
@@ -50,6 +54,8 @@ class LinkerAttachment:
             return True, self.detach()
         try:
             return True, self.attach()
+        except _LinkerRollbackError:
+            raise
         except Exception as e:
             logger.exception("Failed to attach the external linker.")
             return False, str(e)
@@ -57,25 +63,46 @@ class LinkerAttachment:
     def attach(self) -> str:
         if self._cache.linker is not None:
             return "External linker is already attached."
+        threshold = self._cache.write_through_threshold
         cache_linker, error = None, None
         try:
             cache_linker = self._build_linker()
         except Exception as e:
             error = e
         # The linker hooks run collectives, so every rank links or none does.
-        if not self._all_ranks_succeeded(error is None):
+        if self._all_ranks_succeeded(error is None):
+            try:
+                filled = self._cache.tree_core.backfill_missing_hash_values()
+                self._link(cache_linker)
+            except Exception as e:
+                error = e
+            if self._all_ranks_succeeded(error is None):
+                logger.info(
+                    "Attached the external linker; hashed %d existing radix nodes.",
+                    filled,
+                )
+                return "External linker attached."
+
+        # No requests run during attachment, so the new backend has no queued
+        # transfers. Close it even if wrapper construction failed before assignment.
+        rollback_error = None
+        try:
             if cache_linker is not None:
                 cache_linker.close()
-            raise RuntimeError(
-                "Failed to attach the external linker: "
-                f"{error or 'failed on another rank'}"
-            ) from error
-        filled = self._cache.tree_core.backfill_missing_hash_values()
-        self._link(cache_linker)
-        logger.info(
-            "Attached the external linker; hashed %d existing radix nodes.", filled
-        )
-        return "External linker attached."
+            self._cache.linker = None
+            self._cache.tree_core.enable_external_cache_linker = False
+            self._cache.write_through_threshold = threshold
+            self._publish_linker(None)
+        except Exception as e:
+            rollback_error = e
+        if not self._all_ranks_succeeded(rollback_error is None):
+            raise _LinkerRollbackError(
+                "External linker attach rollback failed; scheduler must stop: "
+                f"{rollback_error or 'failed on another rank'}"
+            ) from rollback_error
+        raise RuntimeError(
+            f"Failed to attach the external linker: {error or 'failed on another rank'}"
+        ) from error
 
     def detach(self) -> str:
         cache = self._cache

@@ -53,6 +53,7 @@ class TestUnifiedCacheLinkerRuntimeAttach(CustomTestCase):
                     "--max-running-requests",
                     "1",
                     "--enable-cache-report",
+                    "--enable-metrics",
                     "--enable-unified-cache-external-linker",
                     "--unified-cache-external-linker-config",
                     EXTRA_CONFIG,
@@ -110,23 +111,25 @@ class TestUnifiedCacheLinkerRuntimeAttach(CustomTestCase):
         self._loaded_tokens(stored_ids)
         self.assertGreaterEqual(self._loaded_tokens(stored_ids), min_loaded)
 
-        response = self._request("DELETE", "/unified-cache/external-linker")
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(self._loaded_tokens(stored_ids), 0)
-        self._loaded_tokens(detached_ids)
+        for cycle in range(2):
+            with self.subTest(cycle=cycle):
+                response = self._request("DELETE", "/unified-cache/external-linker")
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(self._loaded_tokens(stored_ids), 0)
+                self._loaded_tokens(detached_ids)
 
-        response = self._request(
-            "PUT",
-            "/hicache/storage-backend",
-            {"hicache_storage_backend": "mooncake"},
-        )
-        self.assertEqual(response.status_code, 400, response.text)
-        response = self._request("PUT", "/unified-cache/external-linker")
-        self.assertEqual(response.status_code, 200, response.text)
+                response = self._request(
+                    "PUT",
+                    "/hicache/storage-backend",
+                    {"hicache_storage_backend": "mooncake"},
+                )
+                self.assertEqual(response.status_code, 400, response.text)
+                response = self._request("PUT", "/unified-cache/external-linker")
+                self.assertEqual(response.status_code, 200, response.text)
 
-        self._loaded_tokens(detached_ids + stored_ids[:PAGE_SIZE], flush=False)
-        self.assertGreaterEqual(self._loaded_tokens(detached_ids), min_loaded)
-        self.assertGreaterEqual(self._loaded_tokens(stored_ids), min_loaded)
+                self._loaded_tokens(detached_ids + stored_ids[:PAGE_SIZE], flush=False)
+                self.assertGreaterEqual(self._loaded_tokens(detached_ids), min_loaded)
+                self.assertGreaterEqual(self._loaded_tokens(stored_ids), min_loaded)
 
 
 if __name__ == "__main__":
