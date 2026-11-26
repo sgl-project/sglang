@@ -865,7 +865,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             is_pd_decode_worker=self._is_fused_sparse_offload_pd_decode_worker,
         )
         if self._is_fused_sparse_offload_pd_decode_worker:
-            return get_sparse_kv_budget(**options, pd_available_bytes=pool_bytes)
+            return get_sparse_kv_budget(
+                **options,
+                pd_available_bytes=pool_bytes,
+                native_kv_bytes_per_token=self._cell_size,
+            )
 
         budget = get_sparse_kv_budget(**options)
         if budget.prefill_workspace_tokens:
@@ -905,6 +909,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             + budget.managed_hbm_bytes
             + native_kv_bytes,
             native_kv_bytes=native_kv_bytes,
+            full_context_bytes_per_request=budget.full_context_bytes_per_request(
+                self._cell_size
+            ),
         )
 
 

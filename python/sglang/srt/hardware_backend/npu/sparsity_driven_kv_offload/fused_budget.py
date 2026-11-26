@@ -43,6 +43,7 @@ class SparseKVHBMSizing(msgspec.Struct, frozen=True, kw_only=True):
     available_bytes: int
     planned_bytes: int
     native_kv_bytes: int
+    full_context_bytes_per_request: int
 
 
 class BudgetPlan:
@@ -174,13 +175,14 @@ class BudgetPlan:
             + self.adapter_bytes
         )
 
-    @property
-    def full_context_bytes_per_request(self) -> int:
+    def full_context_bytes_per_request(self, native_kv_bytes_per_token: int) -> int:
         return get_sparse_kv_full_context_bytes_per_request(
-            self.cache_tokens,
-            self.context_len,
-            self.num_layers,
-            self.kv_cache_dim * self.kv_dtype.itemsize,
+            cache_tokens=self.cache_tokens,
+            context_len=self.context_len,
+            resident_kv_bytes_per_token=(
+                self.num_layers * self.kv_cache_dim * self.kv_dtype.itemsize
+            ),
+            native_kv_bytes_per_token=native_kv_bytes_per_token,
         )
 
     @property
@@ -300,10 +302,17 @@ def get_sparse_kv_cache_tokens(
 
 
 def get_sparse_kv_full_context_bytes_per_request(
-    cache_tokens: int, context_len: int, num_layers: int, kv_bytes_per_token: int
+    *,
+    cache_tokens: int,
+    context_len: int,
+    resident_kv_bytes_per_token: int,
+    native_kv_bytes_per_token: int,
 ) -> int:
-    """Charge the resident window and the full context at the MLA KV rate."""
-    return (cache_tokens + context_len) * num_layers * kv_bytes_per_token
+    """Price the resident window and native context at their respective rates."""
+    return (
+        cache_tokens * resident_kv_bytes_per_token
+        + context_len * native_kv_bytes_per_token
+    )
 
 
 def fit_pd_sparse_running_requests(
@@ -314,10 +323,14 @@ def fit_pd_sparse_running_requests(
     context_len: int,
     num_layers: int,
     kv_bytes_per_token: int,
+    native_kv_bytes_per_token: int,
 ) -> int:
     """Return the P/D Decode concurrency that fits the full-context budget."""
     bytes_per_request = get_sparse_kv_full_context_bytes_per_request(
-        cache_tokens, context_len, num_layers, kv_bytes_per_token
+        cache_tokens=cache_tokens,
+        context_len=context_len,
+        resident_kv_bytes_per_token=num_layers * kv_bytes_per_token,
+        native_kv_bytes_per_token=native_kv_bytes_per_token,
     )
     fitting_rows = min(requested_rows, available_bytes // bytes_per_request)
     if fitting_rows < 1:

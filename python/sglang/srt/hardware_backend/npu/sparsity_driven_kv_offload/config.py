@@ -255,6 +255,7 @@ def get_sparse_kv_budget(
     resident_rows: Optional[int] = None,
     kv_dtype: torch.dtype = torch.bfloat16,
     pd_available_bytes: int | None = None,
+    native_kv_bytes_per_token: int | None = None,
 ) -> BudgetPlan:
     resident_rows = request_rows if resident_rows is None else resident_rows
     schedule = get_schedule()
@@ -269,6 +270,8 @@ def get_sparse_kv_budget(
     )
     prefill_rows = 0
     if pd_available_bytes is not None:
+        if native_kv_bytes_per_token is None:
+            raise ValueError("P/D sparse KV sizing requires native KV bytes per token.")
         running_rows = fit_pd_sparse_running_requests(
             resident_rows - 1,
             pd_available_bytes,
@@ -276,6 +279,7 @@ def get_sparse_kv_budget(
             context_len=aligned_context,
             num_layers=num_layers,
             kv_bytes_per_token=kv_bytes_per_token,
+            native_kv_bytes_per_token=native_kv_bytes_per_token,
         )
         extra_rows = request_rows - resident_rows
         resident_rows = running_rows + 1

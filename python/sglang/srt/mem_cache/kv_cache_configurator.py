@@ -978,7 +978,7 @@ class KVCacheConfigurator:
                     budget.cache_tokens,
                     budget.context_len,
                     self.model_config.context_len,
-                    budget.full_context_bytes_per_request,
+                    sparse_kv_hbm_sizing.full_context_bytes_per_request,
                 )
 
         if self.kv_shard_rank is not None:

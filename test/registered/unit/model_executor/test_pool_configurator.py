@@ -1433,12 +1433,14 @@ class TestEagleConfigurator(CustomTestCase):
                 mr.model_config.context_len + get_req_to_token_extra_context_len()
             )
             aligned_context_len = (context_len + page_size - 1) // page_size * page_size
-            request_bytes = (cache_tokens + aligned_context_len) * 4 * 576 * 2
+            request_bytes = (
+                cache_tokens * 4 * 576 * 2
+                + aligned_context_len * native_bytes_per_token
+            )
 
             # A cap that aligns to one page limits admission independently of residency.
             native_bs_limit = page_size // 2
             for available, cap, resident_bs, bs in (
-                (request_bytes, None, 1, 1),
                 (2 * request_bytes - 1, None, 1, 1),
                 (2 * request_bytes, None, 2, 2),
                 (3 * request_bytes, token_limit, 3, 3),
@@ -1480,6 +1482,9 @@ class TestEagleConfigurator(CustomTestCase):
                     self.assertEqual(sizes.max_total_num_tokens, tokens)
                     native_bytes = tokens * native_bytes_per_token
                     planned_bytes = plan.managed_hbm_bytes + native_bytes
+                    self.assertEqual(
+                        sizing.full_context_bytes_per_request, request_bytes
+                    )
                     self.assertEqual(sizing.available_bytes, available)
                     self.assertEqual(sizing.planned_bytes, planned_bytes)
                     self.assertEqual(sizing.native_kv_bytes, native_bytes)
@@ -1497,13 +1502,19 @@ class TestEagleConfigurator(CustomTestCase):
                         plan.adapter_buffers["last_prefix"].shape[0], resident_bs + 2
                     )
 
-            mr.sparse_kv_budget_plan = None
-            mr._profile_available_bytes.return_value = request_bytes - 1
-            with self.assertRaisesRegex(RuntimeError, "one sparse KV resident row"):
-                KVCacheConfigurator._resolve_memory_pool_config(
-                    mr, pre_model_load_memory=0
-                )
-            self.assertIsNone(mr.sparse_kv_budget_plan)
+            # The estimate excludes the dummy C row and manager metadata.
+            for available, error in (
+                (request_bytes - 1, "one sparse KV resident row"),
+                (request_bytes, "Not enough memory"),
+            ):
+                with self.subTest(available=available):
+                    mr.sparse_kv_budget_plan = None
+                    mr._profile_available_bytes.return_value = available
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        KVCacheConfigurator._resolve_memory_pool_config(
+                            mr, pre_model_load_memory=0
+                        )
+                    self.assertIsNone(mr.sparse_kv_budget_plan)
 
     def test_eagle_does_not_exceed_budget(self):
         """Total memory (target + draft KV cache) must not exceed available."""
