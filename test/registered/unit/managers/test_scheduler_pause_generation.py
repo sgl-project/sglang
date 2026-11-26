@@ -57,6 +57,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
@@ -158,6 +159,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.beam_coordinator = MagicMock()
         scheduler.output_streamer = MagicMock()
         scheduler.send_abort_output = MagicMock()
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         return scheduler
 
@@ -394,6 +396,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_unified_cache_external_linker = False
         scheduler.draft_worker = None
         scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+        object.__setattr__(scheduler.request_receiver, "input_blocker", None)
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
@@ -497,6 +500,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.hisparse_coordinator.ack_staging_queue = IndexedReqList(
             ListKind.HISPARSE_STAGING
         )
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         last_req = self._make_req("last")
         last_req.kv.req_pool_idx = 0
@@ -545,6 +549,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             req.hisparse_staging = True
             move([HiSparseAct(None, MagicMock(), req)], coordinator.ack_staging_queue)
         scheduler.hisparse_coordinator = coordinator
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
         prefill = self._make_batch(
@@ -885,6 +890,32 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler.pause_state.paused)
 
+    def test_continue_generation_empties_the_cache_of_the_platform_in_use(self):
+        """torch_empty_cache must release the device cache through the platform;
+        calling CUDA directly frees nothing on NPU, XPU or MPS."""
+
+        class _Platform:
+            empty_cache_calls = 0
+
+            def empty_cache(self):
+                self.empty_cache_calls += 1
+
+        scheduler = self._new_scheduler()
+        scheduler.pause_state.pause()
+        platform = _Platform()
+        with patch("sglang.srt.managers.scheduler.current_platform", platform):
+            scheduler.continue_generation(
+                ContinueGenerationReqInput(torch_empty_cache=True)
+            )
+            self.assertEqual(platform.empty_cache_calls, 1)
+            scheduler.pause_state.pause()
+            scheduler.continue_generation(
+                ContinueGenerationReqInput(torch_empty_cache=False)
+            )
+
+        self.assertEqual(platform.empty_cache_calls, 1)
+        self.assertFalse(scheduler.pause_state.paused)
+
     def test_pd_decode_abort_finishes_a_held_rebootstrap(self):
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
@@ -906,6 +937,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.send_abort_output = MagicMock()
         scheduler.beam_coordinator = MagicMock()
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         scheduler.enable_continuous_input_polling = False
         scheduler.pause_state = PauseState()
@@ -934,6 +966,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.send_abort_output = MagicMock()
         scheduler.beam_coordinator = MagicMock()
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         prealloc_queue.scheduler = scheduler

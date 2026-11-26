@@ -10,12 +10,13 @@ import logging
 import math
 from copy import copy
 from functools import lru_cache
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -56,7 +57,13 @@ from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
-from sglang.srt.utils import is_hip, is_npu, is_sm100_supported, is_sm120
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_sm100_supported,
+    is_sm120,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +105,29 @@ def _npu_sparse_attention(
     return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
 
 
+def _extend_token_to_batch_idx(
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_cpu: Optional[List[int]],
+    batch_size: int,
+    device,
+) -> torch.Tensor:
+    """repeat_interleave(arange(batch_size), extend_seq_lens), sized from the host lens
+    when they line up; without them it reads the size back (a stream sync)."""
+    output_size = None
+    if (
+        extend_seq_lens_cpu is not None
+        and len(extend_seq_lens_cpu) == batch_size
+        and extend_seq_lens.dim() == 1
+        and extend_seq_lens.shape[0] == batch_size
+    ):
+        output_size = sum(int(x) for x in extend_seq_lens_cpu)
+    return torch.repeat_interleave(
+        torch.arange(batch_size, device=device, dtype=torch.int32),
+        extend_seq_lens.to(torch.long),
+        output_size=output_size,
+    )
+
+
 @lru_cache(maxsize=1)
 def _resolve_trtllm_sparse_decode():
     """FlashInfer paged decode for the post-gather sparse attention;
@@ -112,6 +142,22 @@ def _resolve_trtllm_sparse_decode():
     except ImportError:
         return None
     return trtllm_batch_decode_with_kv_cache
+
+
+@lru_cache(maxsize=1)
+def _resolve_flydsl_sparse_decode():
+    """The fused gfx950 FlyDSL decode module, or None when off or unavailable."""
+    if not (envs.SGLANG_USE_AITER.get() and is_gfx95_supported()):
+        return None
+    try:
+        from aiter.ops.flydsl import qsa_sparse_decode as qsa_flydsl
+    except ImportError:
+        logger.warning(
+            "QSA FlyDSL decode requested but aiter.ops.flydsl.qsa_sparse_decode "
+            "is unavailable"
+        )
+        return None
+    return qsa_flydsl
 
 
 @lru_cache(maxsize=1)
@@ -308,13 +354,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         if config is None:
             config = getattr(model_config, "hf_config", None)
         self.qsa_profile = parse_qsa_profile(config)
-        self.max_context_len = int(getattr(model_config, "context_len", 0))
+        req_pool = getattr(runner, "req_to_token_pool", None)
         self.compress_ratio = (
             self.qsa_profile.compress_ratio
             if self.qsa_profile is not None
             else int(getattr(config, "indexer_compress_ratio", 4))
         )
-        req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
@@ -342,6 +387,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
         self._trtllm_counters = {}
+        self._flydsl_decode_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._verify_mask = None
@@ -673,8 +719,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         if self.device is None:
             self.device = forward_batch.seq_lens.device
-        if not self.max_context_len:
-            self.max_context_len = self.req_to_token.shape[1]
         if forward_batch.forward_mode.is_idle() or forward_batch.seq_lens.numel() == 0:
             # DP idle forwards reach metadata init even though layers skip attention;
             # so do the zero-row DECODE steps the MTP wrapper makes of them.
@@ -743,13 +787,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
-                token_to_batch_idx = torch.repeat_interleave(
-                    torch.arange(
-                        batch_size,
-                        device=sequence_lengths.device,
-                        dtype=torch.int32,
-                    ),
-                    extend_seq_lens.to(torch.long),
+                token_to_batch_idx = _extend_token_to_batch_idx(
+                    extend_seq_lens=extend_seq_lens,
+                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    batch_size=batch_size,
+                    device=sequence_lengths.device,
                 )
                 # More mapped rows than physical would index past them;
                 # fewer is fine (DP MAX_LEN padding is trimmed downstream).
@@ -927,13 +969,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             is_draft_runner=self.runner is not None and self.runner.is_draft_worker,
             skip_prefill=False,
             max_bs=max_bs,
-            max_context_len=self.max_context_len,
+            max_context_len=self.req_to_token_pool.row_width,
             num_draft_tokens=get_spec().speculative_num_draft_tokens,
             device=self.device,
             is_read=False,
         )
         self._cuda_graph_max_tokens = max_num_tokens
-        max_blocks = math.ceil(self.max_context_len / self.compress_ratio)
+        max_blocks = math.ceil(self.req_to_token_pool.row_width / self.compress_ratio)
         max_pages = max(
             1,
             math.ceil(max_blocks / self.token_to_kv_pool.qsa_compressed_page_size),
@@ -1357,17 +1399,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         if metadata.req_pool_indices is None or metadata.req_pool_indices.numel() == 0:
             return
         state = self._mtp_shared_sparse_indices
-        row_to_req = metadata.get_token_to_batch_idx().long()
-        row_req_pool_indices = metadata.req_pool_indices[
-            row_to_req[: topk_indices.shape[0]]
-        ]
-        is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
-        if row_req_pool_indices.numel() > 1:
-            is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
-        anchor_rows = is_last.nonzero().flatten()
-        req_rows = row_req_pool_indices[anchor_rows]
+        num_rows = topk_indices.shape[0]
+        row_to_req = metadata.get_token_to_batch_idx()[:num_rows].long()
+        # Each request's last row by scatter-max: nonzero() would read its size back
+        # (a stream sync); requests with no rows write the trash row.
+        last_row = torch.full_like(metadata.req_pool_indices, -1, dtype=torch.long)
+        rows = torch.arange(row_to_req.numel(), device=row_to_req.device)
+        last_row.scatter_reduce_(0, row_to_req, rows, "amax")
+        anchor_rows = last_row.clamp(min=0)
+        req_rows = torch.where(
+            last_row >= 0, metadata.req_pool_indices.long(), state.trash_row
+        )
         captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
-        state.capture(topk_indices[anchor_rows], req_rows, captured_lens, layer_id)
+        state.capture(
+            topk_indices.index_select(0, anchor_rows), req_rows, captured_lens, layer_id
+        )
 
     @staticmethod
     def _capture_extend_seq_lens(forward_batch) -> torch.Tensor:
@@ -2039,6 +2085,75 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
+    def _forward_flydsl_fused_sparse(
+        self,
+        flydsl_decode,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        layer,
+        forward_batch,
+        metadata,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """gfx950 sparse decode straight from the pool: no gather, KV split across CTAs.
+
+        Each query row is its own length-one sequence, so speculative verify rows
+        need nothing extra.
+        """
+        batch, topk = topk_indices.shape
+        num_kv_heads = k_buffer.shape[1]
+        num_splits = flydsl_decode.recommended_num_splits(
+            batch, num_kv_heads, topk, q.device
+        )
+        workspace = self._get_flydsl_decode_workspace(
+            flydsl_decode,
+            batch * q.shape[1] * num_splits,
+            q.shape[1],
+            num_kv_heads,
+            k_buffer.shape[2],
+            topk,
+            q.device,
+        )
+        output = flydsl_decode.flydsl_qsa_sparse_decode(
+            q.contiguous(),
+            k_buffer,
+            v_buffer,
+            self.req_to_token_pool.req_to_token,
+            (
+                metadata.row_req_pool_indices
+                if metadata.row_req_pool_indices is not None
+                else forward_batch.req_pool_indices
+            ),
+            topk_indices,
+            metadata.sequence_lengths,
+            layer.scaling,
+            num_splits=num_splits,
+            workspace=workspace,
+        )
+        return output.reshape(q.shape[0], -1)
+
+    def _get_flydsl_decode_workspace(
+        self, flydsl_decode, partials, num_q_heads, num_kv_heads, head_dim, topk, device
+    ):
+        # Sized once for every captured batch: graphs keep raw pointers to it, so
+        # it is never reallocated. A larger eager batch gets a per-call workspace.
+        if self._flydsl_decode_workspace is None:
+            capacity = max(
+                partials,
+                flydsl_decode.workspace_partials(
+                    self._cuda_graph_max_tokens, num_q_heads, num_kv_heads, topk, device
+                ),
+            )
+            self._flydsl_decode_workspace = (
+                torch.empty(capacity, dtype=torch.float32, device=device),
+                torch.empty(capacity, dtype=torch.float32, device=device),
+                torch.empty(capacity * head_dim, dtype=torch.float32, device=device),
+            )
+        if self._flydsl_decode_workspace[0].numel() < partials:
+            return None
+        return self._flydsl_decode_workspace
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2097,6 +2212,21 @@ class QwenSparseAttnBackend(AttentionBackend):
                 metadata,
                 topk_indices,
                 trtllm_decode,
+            )
+
+        flydsl_decode = _resolve_flydsl_sparse_decode()
+        if flydsl_decode is not None and flydsl_decode.can_use_flydsl_qsa_sparse_decode(
+            q, k_buffer, v_buffer
+        ):
+            return self._forward_flydsl_fused_sparse(
+                flydsl_decode,
+                q,
+                k_buffer,
+                v_buffer,
+                layer,
+                forward_batch,
+                metadata,
+                topk_indices,
             )
 
         batch, topk = topk_indices.shape

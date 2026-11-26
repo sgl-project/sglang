@@ -1387,6 +1387,12 @@ establish model-quality parity; inspect generated outputs for your workload.
 
 `STA_INFERENCE` also reads the per-layer STA parameters from the file named by the `SGLANG_DIFFUSION_ATTENTION_CONFIG` environment variable.
 
+`STA_SEARCHING` writes one opaque sample name per submitted request; its positive
+and negative loss files share that name in separate directories. Repeating the
+same prompt adds a sample rather than overwriting the previous one. Existing
+calibration JSON remains readable. Use a private calibration directory; older
+files are not renamed or removed.
+
 ```bash
 # Pass the mask strategy file path via config
 SGLANG_DIFFUSION_ATTENTION_CONFIG=/abs/path/to/sta_config.json \

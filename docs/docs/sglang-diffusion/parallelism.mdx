@@ -121,7 +121,7 @@ identical to the NCCL path.
 | --- | --- | --- |
 | `SGLANG_DIFFUSION_IPC_A2A` | `1` | set `0` to disable the dedicated two-rank IPC path |
 | `SGLANG_DIFFUSION_IPC_A2A_MULTI` | unset (automatic) | for the plain exchange only: `0` uses the collective; `1` tries the copy engine regardless of payload size, falling back when unavailable |
-| `SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS` | `10000` | deadlock backstop for the peer wait; on expiry the transport retires on every rank and the request fails rather than returning incomplete data |
+| `SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS` | `10000` | deadlock backstop for the peer waits, not a per-step budget. On expiry in the copy-engine all-to-all or the pipelined exchange, the request fails after its denoising stage rather than returning incomplete data, and `/health` reports the server unhealthy until it is restarted; on the two-rank IPC path the transport retires on both ranks and the next request fails |
 | `SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS` | `16` | staging pairs kept alive; raise for many-resolution serving |
 | `SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS` | `-1` | head groups for the pipelined exchange below; `0` keeps the sequential exchange, `N >= 2` forces `N` groups |
 

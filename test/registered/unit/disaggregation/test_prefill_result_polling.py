@@ -139,9 +139,11 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
+    _start_pause_window = Scheduler._start_pause_window
     _retract_batches = Scheduler._retract_batches
     _publish_paused_state = Scheduler._publish_paused_state
     continue_generation = Scheduler.continue_generation
+    _resume_pause = Scheduler._resume_pause
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
     _on_step_processed = Scheduler._on_step_processed
     _release_mm_inputs = Scheduler._release_mm_inputs
@@ -234,6 +236,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
                 "log_batch_result_stats",
                 "update_device_timer",
                 "record_scheduler_active",
+                "prefill_busy_clock",
             ]
         )
         self.metrics_reporter.current_scheduler_metrics_enabled = False
@@ -552,7 +555,7 @@ def _rank_consensus_worker(rank, rendezvous):
 def _hicache_scheduler(scheduler, storage):
     scheduler.enable_hierarchical_cache = True
     scheduler.enable_hicache_storage = storage
-    scheduler.tree_cache = Mock(spec=UnifiedRadixCache)
+    scheduler.tree_cache = Mock(spec=UnifiedRadixCache, buffer_pipeline=None)
 
 
 def _attention_dp_worker(rank, rendezvous, attn_tp_size):
@@ -647,6 +650,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     return radix_cache.match_prefix(params)
 
                 scheduler.tree_cache = SimpleNamespace(
+                    buffer_pipeline=None,
                     check_hicache_events=Mock(),
                     flush_pending_backups=Mock(),
                     storage_prefetch_retries=retries,

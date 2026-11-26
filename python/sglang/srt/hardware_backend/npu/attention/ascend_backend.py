@@ -27,6 +27,11 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
+    NPUDecodeContextParallelMetadata,
+    build_dcp_extend_gather_plan,
+)
+from sglang.srt.hardware_backend.npu.kv_capability import DSA_KV_QUANT_BLOCK_SIZE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -418,7 +423,6 @@ class AscendAttnBackend(AttentionBackend):
                 self.use_native_sdpa = True
         self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
-        self.max_context_len = model_runner.model_config.context_len
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -434,6 +438,7 @@ class AscendAttnBackend(AttentionBackend):
                 kv_quant_sparse_flash_attention,
             )
 
+            # The DCP read (dsa_dcp) passes no tile_size.
             self.dcp_fp8_sparse_attention = kv_quant_sparse_flash_attention
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
@@ -575,6 +580,13 @@ class AscendAttnBackend(AttentionBackend):
             return False
         mode = forward_batch.forward_mode
         if self.use_dsa:
+            dcp_metadata = forward_batch.attn_dcp_metadata
+            if (
+                isinstance(dcp_metadata, NPUDecodeContextParallelMetadata)
+                and dcp_metadata.extend_gather_plan is not None
+            ):
+                # This extend gathered the prefix KV; not a partial decode.
+                return False
             return not dsa_use_prefill_cp(forward_batch) and not mode.is_idle()
         return self.use_mla and (mode.is_decode() or mode.is_target_verify())
 
@@ -885,6 +897,18 @@ class AscendAttnBackend(AttentionBackend):
                         device=self.device, dtype=torch.int32
                     )
                 )
+            dcp_metadata = forward_batch.attn_dcp_metadata
+            # Here, not in the model's prepare: deciding needs the forward mode
+            # and extend_seq_lens_cpu, which prepare is not given. Dense MLA
+            # DCP (main) takes no gather; planning for it would plan unread.
+            if self.use_dsa and isinstance(
+                dcp_metadata, NPUDecodeContextParallelMetadata
+            ):
+                dcp_metadata.extend_gather_plan = build_dcp_extend_gather_plan(
+                    forward_batch,
+                    interleave_size=self.page_size,
+                    device=self.device,
+                )
 
         if (
             self.use_mla
@@ -1027,12 +1051,12 @@ class AscendAttnBackend(AttentionBackend):
         metadata.fa_metadata.copy_(schedule)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        total_context_len = self.max_context_len + self.page_size - 1
+        total_context_len = self.req_to_token_pool.row_width + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
         graph_num_pages = total_context_len // self.page_size
         if self.dense_mla_dcp_target:
-            max_kv_len = self.max_context_len
+            max_kv_len = self.req_to_token_pool.row_width
             if self.speculative_num_draft_tokens is not None:
                 max_kv_len += self.speculative_num_draft_tokens
             dcp_cycle_size = self.page_size * self.dcp_size
@@ -1334,6 +1358,10 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 # draft-extend (and any other spec mode) sees base + draft block
                 max_len = max_seq_len_host + self.speculative_num_draft_tokens
+            # The hint is already an allocated length, so the offsets can push
+            # max_len past the row; the slice below is cut at the row width, so
+            # clamp max_len to it or the copy shapes diverge.
+            max_len = min(max_len, self.req_to_token_pool.row_width)
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             metadata.block_tables[:bs, :max_seq_pages].copy_(
                 self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
@@ -1478,6 +1506,57 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = True
 
+    def _forward_sparse_dcp_gathered(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        topk_indices: Optional[torch.Tensor],
+        layer: RadixAttention,
+        actual_seq_qlen: torch.Tensor,
+        dcp_metadata: NPUDecodeContextParallelMetadata,
+    ) -> torch.Tensor:
+        """DCP extend over the context the model gathered, one contiguous run
+        per request: TND keys, cumulative lengths, no block table.
+
+        Relative indices, cumulative lengths. Three of the four conventions
+        return plausible garbage: re-probe before changing.
+        """
+        if self.kv_cache_dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(
+                f"KV cache dtype {self.kv_cache_dtype} with decode context "
+                "parallelism is not supported: the gathered extend path is "
+                "bf16/fp16 only."
+            )
+        key_nope, key_rope = dcp_metadata.extend_kv
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+        seq_lengths_kv = dcp_metadata.dcp_kv_indptr[1:]
+        attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+            query=q_nope,
+            key=key_nope,
+            value=key_nope,
+            query_rope=q_pe,
+            key_rope=key_rope,
+            sparse_indices=_expand_dsa_sparse_indices(topk_indices),
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=seq_lengths_kv.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            sparse_block_size=1,
+            layout_query="TND",
+            # layout_kv must equal layout_query unless it is PA_BSND. The block
+            # table is omitted, not passed as None: to a tiling function the two
+            # are not always the same thing.
+            layout_kv="TND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
+        )
+        return attn_out
+
     def _prepare_paged_mtp_metadata(
         self,
         metadata: ForwardMetadata,
@@ -1519,7 +1598,7 @@ class AscendAttnBackend(AttentionBackend):
             head_dim=layer.qk_head_dim,
             gamma=width,
             softmax_scale=layer.scaling,
-            max_kv_len=self.max_context_len + width,
+            max_kv_len=self.req_to_token_pool.row_width + width,
             causal=layer.attn_type != AttentionType.ENCODER_ONLY,
         ).view(-1, layer.tp_q_head_num * layer.v_head_dim)
         if output.shape[0] < padded_tokens:
@@ -1933,11 +2012,11 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv,
     ):
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-        packed = packed_kv.view(torch.float8_e4m3fn)
+        # A packed pool hands back its K buffer in the record's one-byte dtype.
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
-            key=packed,
-            value=packed,
+            key=packed_kv,
+            value=packed_kv,
             sparse_indices=topk_indices,
             scale_value=layer.scaling,
             key_quant_mode=2,
@@ -1957,7 +2036,10 @@ class AscendAttnBackend(AttentionBackend):
             sparse_mode=3,
             attention_mode=2,
             quant_scale_repo_mode=1,
-            tile_size=128,
+            # The pool's record tile, with a fallback for pool objects
+            # that do not carry the attribute.
+            tile_size=getattr(self.token_to_kv_pool, "quant_block_size", None)
+            or DSA_KV_QUANT_BLOCK_SIZE,
             rope_head_dim=self.qk_rope_head_dim,
         )
 
@@ -2153,6 +2235,21 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            # extend_kv is set by the model only for a DCP extend that gathered the KV.
+            dcp_metadata = forward_batch.attn_dcp_metadata
+            if (
+                isinstance(dcp_metadata, NPUDecodeContextParallelMetadata)
+                and dcp_metadata.extend_kv is not None
+            ):
+                return self._forward_sparse_dcp_gathered(
+                    q_nope,
+                    q_pe,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    dcp_metadata,
+                )
+
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
@@ -2170,7 +2267,8 @@ class AscendAttnBackend(AttentionBackend):
                     scaling=layer.scaling,
                     fp8_attention=self.dcp_fp8_sparse_attention,
                 )
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
+            # The pool decides the layout: k_nope is then the packed record.
+            if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
                 attn_out = self._forward_fp8_sparse(
                     q_nope,
                     q_pe,

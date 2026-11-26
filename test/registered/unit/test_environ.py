@@ -1,5 +1,6 @@
 """Unit tests for sglang.srt.environ: EnvField semantics and the deprecated-env registry."""
 
+import json
 import os
 import re
 import subprocess
@@ -9,10 +10,10 @@ import warnings
 from contextlib import ExitStack
 from unittest.mock import patch
 
-from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
+from sglang.srt.environ import EnvField, _DeprecatedEnv, envs, validate_env_values
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 
 NV_MEGA_RUNTIME_CHILDREN = (
@@ -130,12 +131,34 @@ class TestEnvField(unittest.TestCase):
             if envs.SGLANG_TEST_RETRACT or (1 == 1):
                 pass
 
-    def test_invalid_value_warns_and_returns_default(self):
-        os.environ["SGLANG_TEST_RETRACT"] = "not-a-bool"
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
-        self.assertIn("Invalid value", str(caught[0].message))
+    def test_invalid_value_raises_naming_variable_and_type(self):
+        for field, value, kind in (
+            (envs.SGLANG_TEST_RETRACT, "not-a-bool", "boolean"),
+            (envs.SGLANG_PORT, "not-a-port", "integer"),
+            (envs.SGLANG_WARMUP_TIMEOUT, "not-a-float", "float"),
+            (envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG, "{invalid-json", "JSON"),
+        ):
+            with self.subTest(name=field.name), field.override(value):
+                with self.assertRaisesRegex(
+                    ValueError, f"Invalid value for {field.name}: .*{kind}"
+                ):
+                    field.get()
+
+    def test_empty_value_reads_as_unset_except_for_strings(self):
+        for field in (
+            envs.SGLANG_TEST_RETRACT,
+            envs.SGLANG_PORT,
+            envs.SGLANG_WARMUP_TIMEOUT,
+            envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG,
+        ):
+            with self.subTest(name=field.name), field.override(""):
+                self.assertFalse(field.is_set())
+                self.assertEqual(field.get(), field.default)
+                validate_env_values()
+
+        for field in (envs.SGLANG_ROLE_NAMESPACES, envs.SGLANG_DISABLED_MODEL_ARCHS):
+            with self.subTest(name=field.name), field.override(""):
+                self.assertTrue(field.is_set())
 
     def test_mega_runtime_defaults_and_registry_scope(self):
         with ExitStack() as stack:
@@ -242,9 +265,45 @@ class TestDocumentedBooleanKnobs(unittest.TestCase):
                     ("1", True),
                     ("false", False),
                     ("0", False),
+                    ("On", True),
+                    ("off", False),
                 ):
                     os.environ[name] = value
                     self.assertIs(field.get(), expected)
+
+
+class TestImportTimeBooleanKnobs(unittest.TestCase):
+    """Modules that freeze a boolean at import must read it through the
+    registry: a second parser at the read site accepted fewer spellings than
+    the declaration, so `yes` set the knob for some readers and not for others."""
+
+    def test_frozen_module_flags_follow_the_registry(self):
+        deepgemm = "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM"
+        script = (
+            "import json\n"
+            "from sglang.srt.batch_invariant_ops import batch_invariant_ops as ops\n"
+            "from sglang.srt.batch_overlap import two_batch_overlap as tbo\n"
+            "print(json.dumps([ops._ENABLE_MM_DEEPGEMM, "
+            "ops._ENABLE_MM_FALLBACK_VARIANT, ops._ENABLE_MM_COMPARISON_TEST, "
+            "tbo._tbo_debug]))\n"
+        )
+        overrides = {
+            # The kill switch registered tests launch servers with.
+            deepgemm: "0",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "yes",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST": "1",
+            "SGLANG_TBO_DEBUG": "yes",
+        }
+        # One interpreter: the flags are read once, when the modules load.
+        out = subprocess.check_output(
+            [sys.executable, "-c", script], env={**os.environ, **overrides}, text=True
+        )
+        self.assertEqual(
+            json.loads(out.strip().splitlines()[-1]), [False, True, True, True]
+        )
+        with patch.dict(os.environ):
+            os.environ.pop(deepgemm, None)
+            self.assertIs(vars(type(envs))[deepgemm].get(), True)
 
 
 if __name__ == "__main__":
