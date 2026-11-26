@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
-use crate::message::request::{GenerateRequest, Request, RequestKind, SchedulerRequest};
+use crate::message::request::{
+    GenerateRequest, MmCancellation, Request, RequestKind, SchedulerRequest,
+};
 use crate::message::response::ResponseItem;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
@@ -40,6 +42,8 @@ pub struct Intake {
     mm: MmDispatch,
     /// Track request states when intake does not hold it.
     request_states: HashMap<Rid, RequestState>,
+    /// The cancellation of each request the MM pool holds, for its abort.
+    mm_cancellations: HashMap<Rid, MmCancellation>,
     shutdown: flume::Receiver<()>,
 }
 
@@ -61,6 +65,7 @@ impl Intake {
             limits,
             mm,
             request_states: HashMap::new(),
+            mm_cancellations: HashMap::new(),
             shutdown,
         }
     }
@@ -164,6 +169,7 @@ impl Intake {
     /// Each arm acts and advances the FSM; the loop re-dispatches. The arms
     /// are the design table's states, `Failed` the single reject path.
     fn drive(&mut self, mut req: Request) {
+        self.mm_cancellations.remove(&req.rid);
         // A pool return whose client left while it was out: the sink is already
         // deregistered and the scheduler never saw the rid, so nothing is
         // pushed or failed. Dropping the request releases any shm it carries.
@@ -278,19 +284,25 @@ impl Intake {
                 // an `Encoded` event (PreSendValidating with the expanded ids and
                 // feature buffers set -- or Failed on error). Doesn't loop. The
                 // request is out of reach while there; an abort in that window
-                // is recorded in `request_states` and honored when it returns.
+                // is recorded in `request_states` and honored when it returns,
+                // and cancels the request's `MmCancellation` at once.
                 RequestState::Encoding => {
                     let rid = req.rid.clone();
+                    let mut cancellation = None;
                     if let RequestKind::Generate(g) = &mut req.kind
                         && let Some(mm) = g.mm.as_mut()
                     {
                         mm.admission.queued_at = Some(std::time::Instant::now());
+                        cancellation = Some(mm.cancellation.clone());
                     }
                     // Full = the pool can't keep up, so back-pressure like a full
                     // to_scheduler channel. Disconnected = pool gone. Either way
                     // flume hands the request back.
                     match self.mm.tx.try_send(req) {
                         Ok(()) => {
+                            if let Some(cancellation) = cancellation {
+                                self.mm_cancellations.insert(rid.clone(), cancellation);
+                            }
                             self.request_states.insert(rid, state);
                         }
                         Err(e) => {
@@ -526,7 +538,8 @@ impl Intake {
     /// retired.
     ///
     /// A request out in a pool never reached the scheduler, so there is nothing to
-    /// abort there yet: it is marked `Aborted` and dropped when it returns.
+    /// abort there yet: it is marked `Aborted` and dropped when it returns. One
+    /// in the MM pool also has its [`MmCancellation`] cancelled.
     ///
     /// An `/abort_request` ([`AbortSource::Request`]) for a request the
     /// scheduler has keeps its sink, so the scheduler's terminal output still
@@ -549,6 +562,9 @@ impl Intake {
             .send(DetokMsg::Deregister { rid: rid.clone() });
         if let Some(state) = self.request_states.get_mut(&rid) {
             *state = RequestState::Aborted;
+            if let Some(cancellation) = self.mm_cancellations.remove(&rid) {
+                cancellation.cancel();
+            }
             tracing::debug!(rid = %rid, "abort recorded for request");
             return;
         }

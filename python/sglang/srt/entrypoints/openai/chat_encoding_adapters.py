@@ -382,6 +382,8 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
       model_path, revision: checkpoint files.
       default_chat_template_kwargs: the workers' --default-chat-template-kwargs
         (deepseek-recipe validates the default effort at startup).
+      inkling2_tool_call_author_name_mode: --inkling2-tool-call-author-name-mode
+        (the tool-call header Inkling prompts render); None defers to the checkpoint.
       backend: selects the builder; every spec has a "builtin" one.
     """
 
@@ -394,6 +396,7 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     model_path: str
     revision: Optional[str]
     default_chat_template_kwargs: Optional[dict[str, Any]] = None
+    inkling2_tool_call_author_name_mode: Optional[str] = None
     backend: EncodingBackend = "builtin"
 
     def require(self, field: str) -> Any:
@@ -415,7 +418,21 @@ def _build_inkling(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
         tool_call_parser=ctx.tool_call_parser,
         chat_hooks=ctx.chat_hooks,
         spec=ctx.chat_encoding_spec,
+        tool_call_author_name_mode=_inkling_tool_call_author_name_mode(ctx),
     )
+
+
+def _inkling_tool_call_author_name_mode(ctx: ChatEncodingAdapterContext) -> str:
+    """--inkling2-tool-call-author-name-mode, else the checkpoint's
+    config.json text_config.tool_call_author_name_mode, else "tool_name"."""
+    if ctx.inkling2_tool_call_author_name_mode is not None:
+        return ctx.inkling2_tool_call_author_name_mode
+    from transformers import PretrainedConfig
+
+    text_config = getattr(ctx.hf_config, "text_config", ctx.hf_config)
+    if not isinstance(text_config, PretrainedConfig):
+        return "tool_name"
+    return getattr(text_config, "tool_call_author_name_mode", "tool_name")
 
 
 def _build_kimi_k3(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
