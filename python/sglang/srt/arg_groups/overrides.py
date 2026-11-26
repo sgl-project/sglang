@@ -53,6 +53,7 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
+from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.configs.quant_utils import (
     LOADER_RESOLVED_QUANT_METHODS,
     get_quantization_config,
@@ -443,7 +444,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
-        "Inkling2ForConditionalGeneration",
+        *INKLING2_ARCHS,
     }
 )
 
