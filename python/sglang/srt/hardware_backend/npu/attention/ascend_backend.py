@@ -790,7 +790,7 @@ class AscendAttnBackend(AttentionBackend):
             _is_ngram_verify(forward_batch.spec_info)
             and forward_batch.forward_mode.is_target_verify()
         ):
-            from sgl_kernel_npu.attention.ngram_attention import (
+            from sgl_kernel_npu.operators.attention import (
                 build_ngram_attention_mask,
             )
 
@@ -1548,7 +1548,7 @@ class AscendAttnBackend(AttentionBackend):
                     kv_lens = device_kv_lens[:bs]
                 metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
         if _is_ngram_verify(spec_info):
-            from sgl_kernel_npu.attention.ngram_attention import (
+            from sgl_kernel_npu.operators.attention import (
                 build_ngram_attention_mask,
             )
 

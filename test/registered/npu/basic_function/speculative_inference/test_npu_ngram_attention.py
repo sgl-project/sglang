@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 import torch_npu  # noqa: F401
-from sgl_kernel_npu.attention.ngram_attention import build_ngram_attention_mask
+from sgl_kernel_npu.operators.attention import build_ngram_attention_mask
 
 from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (

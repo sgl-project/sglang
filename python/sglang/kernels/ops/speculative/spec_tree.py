@@ -525,7 +525,7 @@ def verify_tree_greedy_func(
 
     elif _is_npu:
         if is_ngram:
-            from sgl_kernel_npu.sample.verify_ngram_tree_greedy import (
+            from sgl_kernel_npu.operators.speculative import (
                 verify_ngram_tree_greedy as verify_tree_greedy,
             )
         else:

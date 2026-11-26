@@ -47,9 +47,7 @@ _is_xpu = is_xpu()
 if is_cuda() or is_hip():
     from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
 elif is_npu():
-    from sgl_kernel_npu.speculative import (
-        reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
-    )
+    from sgl_kernel_npu.operators.speculative import reconstruct_indices_from_tree_mask
 elif not _is_xpu:
     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 

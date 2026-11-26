@@ -299,7 +299,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         if tgt_loc.numel() == 0:
             return
         if self._hicache_k_buffer.dtype in (torch.float16, torch.bfloat16):
-            from sgl_kernel_npu.mem_cache.kv_cache_move import move_kv_cache_rows
+            from sgl_kernel_npu.operators.mem_cache import move_kv_cache_rows
 
             move_kv_cache_rows(
                 self._hicache_k_buffer, self._hicache_v_buffer, tgt_loc, src_loc
@@ -757,7 +757,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             torch.float16,
             torch.bfloat16,
         ):
-            from sgl_kernel_npu.mem_cache.mla_cache_move import move_mla_kv_cache
+            from sgl_kernel_npu.operators.mem_cache import move_mla_kv_cache
 
             move_mla_kv_cache(
                 self.k_buffer,
