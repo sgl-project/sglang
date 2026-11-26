@@ -269,6 +269,52 @@ def test_processors_outside_the_worker_pool_are_declared():
     )
 
 
+def test_lfm2_vl_text_only_request_returns_typed_output():
+    import torch
+
+    from sglang.srt.managers.req_types import MultimodalProcessorOutput
+    from sglang.srt.multimodal.processors.lfm2_vl import Lfm2VlImageProcessor
+
+    processor = object.__new__(Lfm2VlImageProcessor)
+    processor.IMAGE_TOKEN_ID = 396
+    processor._tokenizer = lambda text, **kwargs: SimpleNamespace(
+        input_ids=torch.tensor([[5, 6, 7]])
+    )
+
+    output = asyncio.run(
+        processor.process_mm_data_async(
+            image_data=None,
+            audio_data=None,
+            input_text="Hello.",
+            request_obj=None,
+        )
+    )
+
+    assert isinstance(output, MultimodalProcessorOutput)
+    assert output.input_ids == [5, 6, 7]
+    assert output.mm_items == []
+    assert output.im_token_id == 396
+
+
+@pytest.mark.parametrize("image_data", [None, ["image.png"]])
+@pytest.mark.parametrize(
+    "audio_data, video_data", [(["clip.wav"], None), (None, ["clip.mp4"])]
+)
+def test_lfm2_vl_rejects_unsupported_media(image_data, audio_data, video_data):
+    from sglang.srt.multimodal.processors.lfm2_vl import Lfm2VlImageProcessor
+
+    processor = object.__new__(Lfm2VlImageProcessor)
+    with pytest.raises(ValueError, match="only supports image"):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=image_data,
+                audio_data=audio_data,
+                input_text="Describe the clip.",
+                request_obj=SimpleNamespace(video_data=video_data),
+            )
+        )
+
+
 def test_the_scan_actually_finds_call_sites():
     """Guard against the scan silently matching nothing after a rename."""
     assert len(list(_call_sites())) > 20
