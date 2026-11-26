@@ -50,6 +50,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
@@ -1440,7 +1442,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    pin = is_pin_memory_available(batch.device)
+    pin = _is_npu and is_pin_memory_available(batch.device)
     cur_kv_lens_cpu = torch.tensor(
         cur_kv_lens, dtype=torch.int32, device="cpu", pin_memory=pin
     )
