@@ -23,6 +23,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
     META_FORCED_TOKENS,
     DocReuse,
     forced_len,
+    validate_reuse_request,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.overlap_release import (
     DeferredOverlapRelease,
@@ -113,6 +114,9 @@ class UocrSchedulerRuntime:
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return self._prefetch.request_lists()
+
+    def validate_request(self, req: Req) -> Optional[str]:
+        return validate_reuse_request(req)
 
     def on_req_dropped(self, req: Req) -> None:
         """Release reuse and prefetch state of a dropped or aborted request."""
@@ -235,17 +239,14 @@ class UocrSchedulerRuntime:
         req: Req,
         *,
         is_retracted: bool,
-        src: Optional[ReqList] = None,
     ) -> bool:
-        """queue a follow-up in reuse order, or keep it parked until its source
-        finishes; one `src` holds moves out of it"""
+        """queue a follow-up in reuse order, or keep it parked until its source finishes"""
         if is_retracted:
             self._reuse.on_retracted(req)
-        if not is_retracted and self._prefetch.park(req, src=src):
+        if not is_retracted and self._prefetch.park(req):
             return False
         move(
             [req],
-            src,
             waiting_queue,
             at=self._reuse.queue_position(waiting_queue, req),
         )

@@ -106,7 +106,6 @@ def _decode_queue(sched):
         scheduler=sched,
         token_to_kv_pool_allocator=MagicMock(),
         retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
-        pending_reqs=[],
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),
         _create_receiver_and_enqueue=MagicMock(
             return_value=SimpleNamespace(kv_receiver=MagicMock())
@@ -164,10 +163,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     q = _decode_queue(sched)
                     _admit_decode(q, req)
                     q._create_receiver_and_enqueue.assert_not_called()
-                    self.assertEqual(q.pending_reqs, [])
-                sched.request_retirer.retire_unadmitted.assert_called_once_with(
-                    req, src=None
-                )
+                sched.request_retirer.retire_unadmitted.assert_called_once_with(req)
 
     def test_reentering_prefill_request_is_not_retired(self):
         """A preempted prefill requeue must reach its queue, which owns release.
@@ -259,7 +255,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         _admit_decode(q, req, is_retracted=True)
 
         self.assertEqual(list(q.retracted_queue), [])
-        sched.request_retirer.retire_unadmitted.assert_called_once_with(req, src=None)
+        sched.request_retirer.retire_unadmitted.assert_called_once_with(req)
         tree_cache = sched.request_retirer.tree_cache
         tree_cache.discard_kv_cache_backup.assert_called_once_with(backup)
         self.assertIsNone(req.kv.retraction_backup)

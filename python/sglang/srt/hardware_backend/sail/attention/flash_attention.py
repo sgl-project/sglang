@@ -1,7 +1,7 @@
 """SAIL flash attention operations.
 
 Wraps the SAIL flash-attention library (flash_attn_interface) to provide
-the same call interface as sgl_kernel.flash_attn so that the rest of SGLang
+the same call interface as sgl_fa3 (the CUDA FA3 wheel) so that the rest of SGLang
 can use SAIL flash attention transparently.
 """
 

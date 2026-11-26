@@ -38,6 +38,7 @@ class TestSamplingMaskValidation(CustomTestCase):
         processor,
         return_sampling_mask=True,
         sampling_logprobs_mode=None,
+        return_flat_raw_sampling_mask=False,
     ):
         req = GenerateReqInput(
             input_ids=[1, 2, 3],
@@ -45,12 +46,14 @@ class TestSamplingMaskValidation(CustomTestCase):
             custom_logit_processor=processor,
             return_sampling_mask=return_sampling_mask,
             sampling_logprobs_mode=sampling_logprobs_mode,
+            return_flat_raw_sampling_mask=return_flat_raw_sampling_mask,
         )
         self.manager._validate_one_request(req, req.input_ids)
 
     def test_top_logprobs_num_must_be_a_valid_count_when_logprobs_requested(self):
         """A malformed or oversized candidate count must not reach the scheduler."""
         self.manager.model_config.vocab_size = 32
+        self.manager.model_config.token_id_vocab_size = 32
         for top_logprobs_num, return_logprob, accepted in (
             (None, True, True),
             (0, True, True),
@@ -73,12 +76,57 @@ class TestSamplingMaskValidation(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, "top_logprobs"):
                         self.manager._validate_one_request(req, req.input_ids)
 
+    def test_token_indices_to_pool_must_be_prompt_positions(self):
+        prompt_only = {"max_new_tokens": 0}
+        for indices, sampling_params, accepted in (
+            ([0, 2], prompt_only, True),
+            ([], prompt_only, False),
+            ([3], prompt_only, False),
+            ([0], {}, False),
+        ):
+            with self.subTest(indices=indices, sampling_params=sampling_params):
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3],
+                    sampling_params=sampling_params,
+                    token_indices_to_pool=indices,
+                )
+                if accepted:
+                    self.manager._validate_one_request(req, req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "token_indices_to_pool"):
+                        self.manager._validate_one_request(req, req.input_ids)
+
+    def test_logprob_start_len_must_be_at_least_minus_one(self):
+        for logprob_start_len, return_logprob, accepted in (
+            (None, True, True),
+            (-1, True, True),
+            (0, True, True),
+            (2, True, True),
+            (-2, True, False),
+            (-5, True, False),
+            ([0], True, False),
+            (-5, False, True),
+        ):
+            with self.subTest(logprob_start_len=logprob_start_len, rl=return_logprob):
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3],
+                    sampling_params={},
+                    return_logprob=return_logprob,
+                    logprob_start_len=logprob_start_len,
+                )
+                if accepted:
+                    self.manager._validate_one_request(req, req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "logprob_start_len"):
+                        self.manager._validate_one_request(req, req.input_ids)
+
     def test_mixed_batch_forwards_zero_count_for_logprob_disabled_items(self):
         """Disabled items must not contribute their raw count to a shared topk.
 
         Each enabled item keeps its own count.
         """
         self.manager.model_config.vocab_size = 32
+        self.manager.model_config.token_id_vocab_size = 32
         self.manager.preferred_sampling_params = None
         self.manager.sampling_params_class = SamplingParams
         self.manager.tokenizer = None
@@ -148,6 +196,15 @@ class TestSamplingMaskValidation(CustomTestCase):
         for mode in (None, "selected", "support"):
             with self.subTest(mode=mode):
                 self._validate(None, sampling_logprobs_mode=mode)
+
+    def test_flat_raw_sampling_mask_requires_sampling_mask(self):
+        self._validate(None, return_flat_raw_sampling_mask=True)
+        with self.assertRaisesRegex(
+            ValueError, "return_flat_raw_sampling_mask can only be set when"
+        ):
+            self._validate(
+                None, return_sampling_mask=False, return_flat_raw_sampling_mask=True
+            )
 
 
 if __name__ == "__main__":

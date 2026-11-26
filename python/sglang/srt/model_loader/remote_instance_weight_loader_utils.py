@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
-import importlib
-import importlib.util
 import logging
 import time
 from typing import List
 
 import requests
 
+from sglang.srt.runtime_context import get_serving
+from sglang.srt.utils.auth import bearer_auth_headers
+
 logger = logging.getLogger(__name__)
+
+
+def _seed_admin_headers() -> dict:
+    # The seed instance's weight-send endpoints take its admin key; a deployment shares one.
+    return bearer_auth_headers(get_serving().admin_api_key)
 
 
 class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
@@ -45,7 +51,8 @@ def trigger_init_weights_send_group_for_remote_instance_request(
                 "group_name": f"send_weights_{remote_instance_weight_loader_client_id}",
                 "backend": "nccl",
             },
-        )
+            headers=_seed_admin_headers(),
+        ).raise_for_status()
     except Exception as e:
         logger.error(
             f"Failed to trigger init_weights_send_group_for_remote_instance_request to seed instance {seed_instance_service_url}: {e}."
@@ -73,7 +80,8 @@ def trigger_transferring_weights_request(
                 ),
                 "group_name": f"send_weights_{remote_instance_weight_loader_client_id}",
             },
-        )
+            headers=_seed_admin_headers(),
+        ).raise_for_status()
     except Exception as e:
         logger.error(f"Failed to trigger send weights to remote instance request: {e}")
         raise
@@ -82,10 +90,11 @@ def trigger_transferring_weights_request(
 def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
     try:
         response = requests.get(
-            f"{seed_url}/get_remote_instance_transfer_engine_info",
+            f"{seed_url}/remote_instance_transfer_engine_info",
             params={
                 "rank": rank,
             },
+            headers=_seed_admin_headers(),
         )
 
         if response.status_code == 200:
@@ -107,36 +116,6 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
 
 
 def register_memory_region(model, transfer_engine):
-    if importlib.util.find_spec("torch") is None:
-        return register_memory_region_v1(model, transfer_engine)
-    else:
-        return register_memory_region_v2(model, transfer_engine)
-
-
-def register_memory_region_v1(model, transfer_engine):
-    start_tic = time.time()
-
-    weight_mr_dict = {}
-    for name, weight in model.named_parameters():
-        ret = transfer_engine.register_memory(
-            weight.data_ptr(), weight.numel() * weight.element_size()
-        )
-        if ret != 0:
-            raise RuntimeError(
-                f"register memory failed for weight {name}, error: {ret}"
-            )
-        weight_mr_dict[name] = (
-            weight.data_ptr(),
-            weight.numel(),
-            weight.element_size(),
-        )
-
-    end_tic = time.time()
-    logger.debug(f"Register memory region time: {(end_tic - start_tic):.4f}s")
-    return weight_mr_dict
-
-
-def register_memory_region_v2(model, transfer_engine):
     start_tic = time.time()
 
     weight_mr_dict = {}
