@@ -393,7 +393,14 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
                 tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
             ).release_state_slot(req)
         return
+    req_pool_idx = req.kv.req_pool_idx
     if tree_cache.claim_kv_row(req):
+        # A streaming session can keep its logical row between decode turns.
+        release_resident_row = getattr(
+            tree_cache.req_to_token_pool, "release_sparse_resident_row", None
+        )
+        if release_resident_row is not None:
+            release_resident_row(req_pool_idx)
         # A streaming session detached the kv record to keep the row; the
         # request's network transfers end here as they would with the row.
         assert not req.kv.holds_kv

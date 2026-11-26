@@ -86,7 +86,9 @@ def maybe_create_ascend_config_store(transfer_backend: TransferBackend) -> None:
     try:
         from memfabric_hybrid import create_config_store
 
-        ascend_url = os.getenv("ASCEND_MF_STORE_URL")
+        ascend_url = os.getenv("MF_CONFIG_STORE_URL") or os.getenv(
+            "ASCEND_MF_STORE_URL"
+        )
         create_config_store(ascend_url)
     except Exception as e:
         raise RuntimeError(

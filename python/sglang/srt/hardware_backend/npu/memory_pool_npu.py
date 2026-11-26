@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
@@ -795,7 +795,33 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+            and not (
+                envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+                and (is_draft_worker or get_disagg().disaggregation_mode == "prefill")
+            )
         )
+        if (
+            self.enable_sparsity_driven_kv_offload
+            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+            and get_disagg().disaggregation_mode == "decode"
+            and (
+                (kv_lora_rank, qk_rope_head_dim, page_size) != (512, 64, 128)
+                or not (
+                    dtype == torch.bfloat16
+                    or (
+                        dtype == torch.float8_e4m3fn
+                        and kv_cache_dim == 656
+                        and index_head_dim == 128
+                    )
+                )
+                or modelslim_cache_layout is not None
+                or self.use_fia_nz
+            )
+        ):
+            raise ValueError(
+                "Ascend PD sparse KV requires row-major MLA with 512/64 "
+                "features, page size 128, and BF16 or packed C8 FP8 storage."
+            )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
         if index_head_dim is None:
@@ -1146,6 +1172,38 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
         return kv_size_bytes
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Mirror accepted-token moves only for the packed Ascend950 pool."""
+        manager = getattr(self, "sparse_kv_manager", None)
+        if not getattr(manager, "packed_c8", False):
+            return super().move_kv_cache(tgt_loc, src_loc)
+
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+        if tgt_loc.numel() == 0:
+            return
+        target = tgt_loc.view(-1).long()
+        source = src_loc.view(-1).long()
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+            move_packed_kv,
+        )
+
+        move_packed_kv(manager, target, source)
+        # Packed attention bytes live in registered host memory, while LI keys
+        # and their real FP32 scales remain in the native device pool.
+        for buffers, raw_bytes in (
+            (getattr(self, "index_k_buffer", None), True),
+            (getattr(self, "index_k_scale_buffer", None), False),
+        ):
+            if buffers is None:
+                continue
+            for buffer in buffers:
+                flat = buffer.flatten(0, 1)
+                if raw_bytes:
+                    flat = flat.view(torch.uint8)
+                flat[target] = flat[source]
+
     def _raise_if_native_kv_cache_disabled(self):
         if (
             getattr(self, "k_buffer", None) is None
@@ -1308,23 +1366,35 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots, layer_id) entries in PD transfer order."""
-        self._raise_if_native_kv_cache_disabled()
-        global_kv = self.is_draft_worker
         kv_layer_ids = self._kv_buffer_layer_ids()
-        if self.use_combined_kv_buffer:
-            return [
-                (buffer, global_kv, layer_id)
-                for buffer, layer_id in zip(self.kv_buffer, kv_layer_ids, strict=True)
+        host_pool = getattr(getattr(self, "sparse_kv_manager", None), "host_pool", None)
+        if host_pool is not None:
+            entries = [
+                (buffer, True, layer_id)
+                for component in host_pool.buffers
+                for buffer, layer_id in zip(component, kv_layer_ids, strict=True)
             ]
-        entries = [
-            (buffer, global_kv, layer_id)
-            for buffer, layer_id in zip(self.k_buffer, kv_layer_ids, strict=True)
-        ]
-        if not self.dsa_kv_cache_store_c8:
-            entries += [
+        else:
+            self._raise_if_native_kv_cache_disabled()
+            global_kv = self.is_draft_worker
+            if self.use_combined_kv_buffer:
+                return [
+                    (buffer, global_kv, layer_id)
+                    for buffer, layer_id in zip(
+                        self.kv_buffer, kv_layer_ids, strict=True
+                    )
+                ]
+            entries = [
                 (buffer, global_kv, layer_id)
-                for buffer, layer_id in zip(self.v_buffer, kv_layer_ids, strict=True)
+                for buffer, layer_id in zip(self.k_buffer, kv_layer_ids, strict=True)
             ]
+            if not self.dsa_kv_cache_store_c8:
+                entries += [
+                    (buffer, global_kv, layer_id)
+                    for buffer, layer_id in zip(
+                        self.v_buffer, kv_layer_ids, strict=True
+                    )
+                ]
         if self.index_head_dim is not None:
             entries += [
                 (buffer, True, layer_id)
@@ -1697,6 +1767,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 buf.copy_(saved)  # H2D copy once
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        manager = getattr(self, "sparse_kv_manager", None)
+        if getattr(manager, "packed_c8", False):
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+                snapshot_packed_kv,
+            )
+
+            return snapshot_packed_kv(self, indices)
         torch.npu.synchronize()
         snapshot = {
             "kv": self._get_kv_cache_cpu_copy(indices),
@@ -1710,6 +1787,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        manager = getattr(self, "sparse_kv_manager", None)
+        if getattr(manager, "packed_c8", False):
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+                restore_packed_kv,
+            )
+
+            return restore_packed_kv(self, kv_cache_cpu, indices, req_pool_index)
         torch.npu.synchronize()
         self._load_kv_cache_cpu_copy(kv_cache_cpu["kv"], indices)
         self._load_index_cache_cpu_copy(kv_cache_cpu["index"], indices)

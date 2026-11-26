@@ -1,0 +1,175 @@
+"""Native LIM plans shared by fused short, sparse and chain-MTP attention."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from sglang.kernels.ops.attention.npu_lim import (
+    fused_lightning_indexer_manage,
+    load_fused_lim_operator,
+)
+
+
+def sparse_query_width(forward_batch):
+    """Decode has one query per request; verify uses its chain width."""
+    if forward_batch.forward_mode.is_decode():
+        return 1
+    return forward_batch.spec_info.num_tokens_per_req
+
+
+@dataclass
+class LIMSelection:
+    source_ids: torch.Tensor
+    device_slots: torch.Tensor
+    topk_misses: torch.Tensor
+    miss_sources: torch.Tensor
+    miss_slots: torch.Tensor
+    miss_counts: torch.Tensor
+    sparse_rows: torch.Tensor
+    valid_rows: torch.Tensor
+    request_safe_slots: torch.Tensor
+    resident_safe_slots: torch.Tensor
+    query_width: int = 1
+
+
+class LIMDecodeAdapter:
+    def __init__(self, manager):
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_input_metadata import (
+            fused_prepare_lim_metadata,
+        )
+
+        self.capacity = manager.cache_capacity
+        self.rows = manager.size
+        self.batch_capacity = manager.batch_capacity
+        self.max_query_width = manager.max_query_width
+        self.operator = self._load_operator()
+        self._fused_prepare_lim_metadata = fused_prepare_lim_metadata
+        self._prepared_batch = None
+        device = manager.device
+        for name, spec in manager.budget.adapter_buffers.items():
+            if name == "query_ends":
+                value = (
+                    torch.arange(
+                        1, self.max_query_width + 1, dtype=spec.dtype, device=device
+                    )[:, None]
+                    * torch.arange(
+                        1, self.batch_capacity + 1, dtype=spec.dtype, device=device
+                    )[None, :]
+                )
+            elif name == "last_prefix":
+                value = spec.allocate(device, fill_value=-1)
+            else:
+                value = spec.allocate(device)
+            setattr(self, name, value)
+
+    def reset_requests(self, request_slots):
+        self.last_prefix.index_fill_(0, request_slots, -1)
+
+    @staticmethod
+    def _load_operator():
+        return load_fused_lim_operator()
+
+    def _prepare_forward(self, manager, block_table, forward_batch, width):
+        batch = forward_batch.batch_size
+        self._fused_prepare_lim_metadata(
+            seq_lens=forward_batch.seq_lens[:batch],
+            positions=forward_batch.positions[: batch * width],
+            request_slots=forward_batch.req_pool_indices,
+            last_prefix=self.last_prefix,
+            block_table=block_table,
+            out_block_table=self.block_table[:batch],
+            safe_slots=self.request_safe_slots[:batch],
+            lengths=self._pre_lengths[:batch],
+            sparse_rows=self._pre_sparse[:batch],
+            valid_rows=self._pre_valid[:batch],
+            request_states=self._pre_states[:batch],
+            next_prefixes=self._pre_next_prefix[:batch],
+            cache_sizes=self._pre_cache_sizes[:batch],
+            capacity=self.capacity,
+            request_rows=self.rows,
+            query_width=width,
+            resident_safe_slots=self.resident_safe_slots[:batch],
+            request_to_resident=manager.request_to_resident,
+            resident_rows=manager.budget.resident_rows,
+        )
+        self._prepared_batch = forward_batch
+
+    def select(
+        self,
+        manager,
+        *,
+        query,
+        weights,
+        key,
+        block_table,
+        forward_batch,
+        layer_id,
+        reuse_metadata=False,
+        **operator_kwargs,
+    ):
+        batch = forward_batch.batch_size
+        width = sparse_query_width(forward_batch)
+        rows = batch * width
+        layer_index = layer_id - manager.start_layer
+        # Interleaved batches share the adapter scratch. Rebuild it when a
+        # different batch has used it since this batch's preceding owner.
+        if not reuse_metadata or self._prepared_batch is not forward_batch:
+            self._prepare_forward(manager, block_table, forward_batch, width)
+        self._run_operator(
+            manager,
+            layer_index,
+            batch,
+            width,
+            query=query,
+            weights=weights,
+            key=key,
+            **operator_kwargs,
+        )
+        plan = LIMSelection(
+            self.source_ids[:rows],
+            self.device_slots[:rows],
+            self.topk_misses[:rows],
+            self.miss_sources[:batch],
+            self.miss_slots[:batch],
+            self.miss_counts[:batch],
+            self._pre_sparse[:batch],
+            self._pre_valid[:batch],
+            self.request_safe_slots[:batch],
+            self.resident_safe_slots[:batch],
+            width,
+        )
+        manager.prepare_copy_sfa_plan(plan)
+        return plan
+
+    def _run_operator(self, manager, layer_index, batch, width, *, query, weights, key):
+        rows = batch * width
+        fused_lightning_indexer_manage(
+            weights=weights[:rows].contiguous(),
+            query=query[:rows].contiguous(),
+            key=key,
+            block_table=self.block_table[:batch],
+            query_ends=self.query_ends[width - 1, :batch],
+            seq_lens=self._pre_lengths[:batch],
+            prefix_lens=self._pre_lengths[:batch],
+            cache_sizes=self._pre_cache_sizes[:batch],
+            request_state=self._pre_states[:batch],
+            request_slots=self.resident_safe_slots[:batch],
+            slot_pool=manager.device_slot_map[layer_index],
+            source_ids=self.source_ids[:rows],
+            device_slots=self.device_slots[:rows],
+            topk_misses=self.topk_misses[:rows],
+            miss_sources=self.miss_sources[:batch],
+            miss_slots=self.miss_slots[:batch],
+            miss_counts=self.miss_counts[:batch],
+            operator=self.operator,
+            full_visible=True,
+        )
+
+    def commit_forward(self, batch: int) -> None:
+        """Publish the visible lengths after the last layer has copied its KV."""
+        self.last_prefix.index_copy_(
+            0, self.resident_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
+        )
+        self._prepared_batch = None
