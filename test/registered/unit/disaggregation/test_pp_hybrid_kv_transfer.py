@@ -339,7 +339,7 @@ def _npu_mla_pool(
     pool = NPUMLATokenToKVPool.__new__(NPUMLATokenToKVPool)
     pool.start_layer, pool.layer_num = start_layer, layer_num
     pool.use_combined_kv_buffer = combined
-    pool.dsa_kv_cache_store_fp8 = fp8
+    pool.dsa_kv_cache_store_c8 = fp8
     pool.is_draft_worker, pool.dcp_size = False, 1
     pool.index_head_dim = 128 if indexer_layer_ids else None
     pool.indexer_layer_ids = tuple(indexer_layer_ids)
@@ -438,8 +438,8 @@ class TestNpuMlaLayerMetadata(CustomTestCase):
                         for start, count in (source, destination)
                     ]
                     src, dst = pools
-                    src_buffers = [b for b, _ in src._get_disagg_buffer_entries()]
-                    dst_buffers = [b for b, _ in dst._get_disagg_buffer_entries()]
+                    src_buffers = [b for b, _, _ in src._get_disagg_buffer_entries()]
+                    dst_buffers = [b for b, _, _ in dst._get_disagg_buffer_entries()]
                     pairs = build_transfer_entry_pairs(
                         self._ids(src),
                         self._ids(dst),

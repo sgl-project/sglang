@@ -1087,7 +1087,8 @@ class ExecMoe(msgspec.Struct):
         (
             "Configuration for the ascend_ops MoE backend used by the main "
             "model and/or speculative draft as a JSON object, "
-            'for example {"prefill":"alltoallv","decode":"low_latency"}.'
+            'for example {"prefill":"alltoallv","decode":"fused_op"}. '
+            "Either phase can select fused_op to use MegaMoE."
         ),
     ] = None
     elastic_ep_backend: A[
