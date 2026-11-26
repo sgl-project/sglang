@@ -5,6 +5,7 @@ import logging
 import math
 import tempfile
 import time
+import types
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Tuple, Union
@@ -118,6 +119,75 @@ def _prefill_attention_pairs(batch: ScheduleBatch) -> int:
             batch.prefix_lens, batch.extend_lens, strict=True
         )
     )
+
+
+def _prefill_mm_encoder_terms(
+    batch: ScheduleBatch,
+    vit_linear_flops_per_patch: float,
+    vit_attn_dot_flops_coeff: float,
+    vit_weight_read_bytes_once: float,
+    audio_encoder_flops_per_item: float,
+    audio_encoder_weight_read_bytes_once: float,
+) -> Tuple[float, float]:
+    """Additive vision/audio encoder FLOPs and one-time weight-read bytes for this
+    prefill chunk. Each multimodal item is charged exactly once, in whichever
+    chunk's [prefix_len, prefix_len + extend_len) window contains its first
+    token (via item.offsets) -- req.multimodal_inputs persists unchanged across
+    a request's later chunks under chunked prefill, so a naive per-chunk scan
+    would otherwise recharge the same item's encoder cost more than once."""
+    if (
+        vit_linear_flops_per_patch == 0.0
+        and vit_attn_dot_flops_coeff == 0.0
+        and vit_weight_read_bytes_once == 0.0
+        and audio_encoder_flops_per_item == 0.0
+        and audio_encoder_weight_read_bytes_once == 0.0
+    ):
+        return 0.0, 0.0
+
+    vit_linear_patches = 0.0
+    vit_attn_pairs = 0.0
+    audio_item_count = 0
+    has_vision_item = False
+    has_audio_item = False
+
+    for req, prefix_len, extend_len in zip(
+        getattr(batch, "reqs", None) or [], batch.prefix_lens, batch.extend_lens
+    ):
+        mm_inputs = getattr(req, "multimodal_inputs", None)
+        if mm_inputs is None:
+            continue
+        for item in mm_inputs.mm_items:
+            offsets = getattr(item, "offsets", None)
+            if offsets and not (
+                prefix_len <= offsets[0][0] < prefix_len + extend_len
+            ):
+                continue
+            if item.is_audio():
+                audio_item_count += 1
+                has_audio_item = True
+            elif item.is_image() or item.is_video():
+                grid_thw = getattr(
+                    item,
+                    "image_grid_thw" if item.is_image() else "video_grid_thw",
+                    None,
+                )
+                if grid_thw is None:
+                    continue
+                has_vision_item = True
+                for row in grid_thw:
+                    t, h, w = (int(x) for x in row)
+                    vit_linear_patches += t * h * w
+                    vit_attn_pairs += t * (h * w) ** 2
+
+    flops = (
+        vit_linear_patches * vit_linear_flops_per_patch
+        + vit_attn_pairs * vit_attn_dot_flops_coeff
+        + audio_item_count * audio_encoder_flops_per_item
+    )
+    read_bytes = (
+        vit_weight_read_bytes_once if has_vision_item else 0.0
+    ) + (audio_encoder_weight_read_bytes_once if has_audio_item else 0.0)
+    return flops, read_bytes
 
 
 @dataclasses.dataclass
@@ -882,6 +952,165 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_attn_layers
         )
 
+        self._init_estimated_mm_encoder_perf_constants(w_bytes)
+
+    def _init_estimated_mm_encoder_perf_constants(self, w_bytes: float) -> None:
+        """Vision/audio encoder FLOPs/bytes constants, additive to the text-decoder
+        constants above. Narrowly scoped to the Qwen2-VL/2.5-VL/3-VL vision-tower
+        family (also reused unmodified by sarashina2_vision/points_v15_chat) and
+        Qwen2-Audio's audio encoder -- see SGLANGT-2104. Zero for every other model.
+        """
+        model_config = self.scheduler.model_config
+        hf_config = getattr(model_config, "hf_config", None)
+        vision_config = getattr(hf_config, "vision_config", None)
+        audio_config = getattr(hf_config, "audio_config", None)
+        model_architectures = getattr(hf_config, "architectures", None) or []
+
+        self._vit_linear_flops_per_patch = 0.0
+        self._vit_attn_dot_flops_coeff = 0.0
+        self._vit_weight_read_bytes_once = 0.0
+        if vision_config is None:
+            logger.debug(
+                "model %s has no vision_config on hf_config; estimated MFU/MBU "
+                "will not account for a vision encoder tower, which is expected "
+                "for non-multimodal models.",
+                getattr(model_config, "model_path", type(model_config).__name__),
+            )
+        else:
+            # Qwen2-VL (and its direct reuses, sarashina2_vision/points_v15_chat)
+            # size vision blocks off embed_dim, using hidden_size only as the
+            # patch-merger's output width. Qwen2.5-VL/Qwen3-VL have no embed_dim
+            # and size blocks off hidden_size directly.
+            vit_hidden_size = getattr(vision_config, "embed_dim", None)
+            if vit_hidden_size is None:
+                vit_hidden_size = getattr(vision_config, "hidden_size", 0)
+            vit_hidden_size = float(vit_hidden_size or 0)
+            vit_num_heads = float(getattr(vision_config, "num_heads", 0) or 0)
+            vit_depth = float(getattr(vision_config, "depth", 0) or 0)
+            vit_intermediate_size = getattr(vision_config, "intermediate_size", None)
+            if vit_intermediate_size is None:
+                # Qwen2-VL has no intermediate_size field; derive it from mlp_ratio.
+                mlp_ratio = float(getattr(vision_config, "mlp_ratio", 4.0) or 4.0)
+                vit_intermediate_size = vit_hidden_size * mlp_ratio
+            vit_intermediate_size = float(vit_intermediate_size or 0)
+
+            if vit_hidden_size > 0 and vit_num_heads > 0 and vit_depth > 0:
+                vit_head_dim = vit_hidden_size / vit_num_heads
+
+                # Qwen2.5-VL's vision MLP is gated SwiGLU (gate_proj/up_proj/
+                # down_proj); the rest of the family is plain 2-matrix (fc1/fc2).
+                _GATED_VISION_MLP_ARCHITECTURES = {
+                    "Qwen2_5_VLForConditionalGeneration"
+                }
+                is_vision_mlp_gated = any(
+                    arch in _GATED_VISION_MLP_ARCHITECTURES
+                    for arch in model_architectures
+                )
+                vit_mlp_flop_mult = 6.0 if is_vision_mlp_gated else 4.0
+                vit_mlp_weight_mult = 3.0 if is_vision_mlp_gated else 2.0
+
+                # Full MHA throughout this vision-tower family (no GQA reduction).
+                vit_attn_linear_flops_per_layer = (
+                    8.0 * vit_hidden_size * vit_hidden_size
+                )
+                vit_attn_linear_weight_elems_per_layer = (
+                    4.0 * vit_hidden_size * vit_hidden_size
+                )
+                vit_mlp_flops_per_layer = (
+                    vit_mlp_flop_mult * vit_hidden_size * vit_intermediate_size
+                )
+                vit_mlp_weight_elems_per_layer = (
+                    vit_mlp_weight_mult * vit_hidden_size * vit_intermediate_size
+                )
+
+                self._vit_linear_flops_per_patch = vit_depth * (
+                    vit_attn_linear_flops_per_layer + vit_mlp_flops_per_layer
+                )
+                # Caller sums t * (h*w)**2 across grid rows (not (t*h*w)**2 for
+                # the whole item): each temporal frame attends only within itself,
+                # not across frames (see utils.py's compute_cu_seqlens_from_grid_numpy).
+                # Exact for images (t=1); for multi-frame video this also ignores
+                # Qwen2.5-VL's windowed-attention layers, treating every layer as
+                # full per-frame attention -- a documented approximation, since
+                # this file has no existing sliding-window-attention modeling.
+                self._vit_attn_dot_flops_coeff = vit_depth * (
+                    4.0 * vit_num_heads * vit_head_dim
+                )
+                self._vit_weight_read_bytes_once = (
+                    vit_depth
+                    * (
+                        vit_attn_linear_weight_elems_per_layer
+                        + vit_mlp_weight_elems_per_layer
+                    )
+                    * w_bytes
+                )
+
+        self._audio_encoder_flops_per_item = 0.0
+        self._audio_encoder_weight_read_bytes_once = 0.0
+        if (
+            audio_config is None
+            and "Qwen2AudioForConditionalGeneration" in model_architectures
+        ):
+            # Mirror qwen2_audio.py's own HF-default fallback construction, so a
+            # partially-populated config doesn't silently zero out this term.
+            audio_config = types.SimpleNamespace(
+                num_mel_bins=128,
+                num_hidden_layers=32,
+                hidden_size=1280,
+                num_attention_heads=20,
+                intermediate_size=5120,
+                max_source_positions=1500,
+            )
+        if audio_config is not None:
+            audio_hidden = float(getattr(audio_config, "hidden_size", 0) or 0)
+            audio_heads = float(
+                getattr(audio_config, "num_attention_heads", 0) or 0
+            )
+            audio_intermediate = float(
+                getattr(audio_config, "intermediate_size", 0) or 0
+            )
+            audio_layers = float(getattr(audio_config, "num_hidden_layers", 0) or 0)
+            audio_positions = float(
+                getattr(audio_config, "max_source_positions", 1500) or 1500
+            )
+            audio_mel_bins = float(getattr(audio_config, "num_mel_bins", 128) or 128)
+
+            if audio_hidden > 0 and audio_heads > 0 and audio_layers > 0:
+                audio_head_dim = audio_hidden / audio_heads
+                # Qwen2-Audio force-pads/truncates every clip to a fixed 30s mel
+                # window. conv1 stride=1, conv2 stride=2 are Qwen2AudioEncoder
+                # architecture constants, not config fields.
+                mel_frames = 2.0 * audio_positions
+
+                conv1_flops = 2.0 * mel_frames * 3.0 * audio_mel_bins * audio_hidden
+                conv2_flops = 2.0 * audio_positions * 3.0 * audio_hidden * audio_hidden
+                audio_attn_linear_flops_per_layer = 8.0 * audio_hidden * audio_hidden
+                audio_attn_linear_weight_elems_per_layer = (
+                    4.0 * audio_hidden * audio_hidden
+                )
+                # Non-gated (fc1/fc2) MLP; bidirectional (no causal mask) full MHA.
+                audio_mlp_flops_per_layer = 4.0 * audio_hidden * audio_intermediate
+                audio_mlp_weight_elems_per_layer = 2.0 * audio_hidden * audio_intermediate
+
+                self._audio_encoder_flops_per_item = (
+                    conv1_flops
+                    + conv2_flops
+                    + audio_layers
+                    * (audio_attn_linear_flops_per_layer + audio_mlp_flops_per_layer)
+                    * audio_positions
+                    + audio_layers
+                    * (4.0 * audio_heads * audio_head_dim)
+                    * (audio_positions**2)
+                )
+                self._audio_encoder_weight_read_bytes_once = (
+                    audio_layers
+                    * (
+                        audio_attn_linear_weight_elems_per_layer
+                        + audio_mlp_weight_elems_per_layer
+                    )
+                    * w_bytes
+                )
+
     def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
         if batch is None or batch.extend_lens is None:
             return 0.0, 0.0, 0.0
@@ -890,9 +1119,18 @@ class SchedulerMetricsReporter:
             return 0.0, 0.0, 0.0
 
         context_product = float(_prefill_attention_pairs(batch))
+        mm_flops, mm_read_bytes = _prefill_mm_encoder_terms(
+            batch,
+            self._vit_linear_flops_per_patch,
+            self._vit_attn_dot_flops_coeff,
+            self._vit_weight_read_bytes_once,
+            self._audio_encoder_flops_per_item,
+            self._audio_encoder_weight_read_bytes_once,
+        )
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * context_product
+            + mm_flops
         )
 
         # The chunk's queries share one pass over the cached prefix, so charge the
@@ -903,6 +1141,7 @@ class SchedulerMetricsReporter:
             + tokens * self._qkv_act_bytes_per_token
             + tokens * self._prefill_attn_act_read_per_token
             + prefix_kv_tokens * self._kv_cache_bytes_per_token
+            + mm_read_bytes
         )
         write_bytes = (
             tokens * self._kv_cache_bytes_per_token

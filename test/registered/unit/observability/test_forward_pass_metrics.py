@@ -20,6 +20,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -35,6 +36,7 @@ from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.forward_pass_metrics import (
     ForwardPassMetrics,
     FpmTiming,
@@ -363,10 +365,12 @@ class _FakeReq:
         self,
         prompt_len: int,
         output_len: int = 0,
+        multimodal_inputs=None,
     ):
         self.origin_input_ids = list(range(prompt_len))
         self.output_ids = list(range(output_len))
         self.seqlen = prompt_len + output_len
+        self.multimodal_inputs = multimodal_inputs
 
 
 class _FakeForwardMode:
@@ -1531,6 +1535,11 @@ class TestEstimatedPrefillPerf(CustomTestCase):
         self.reporter._prefill_attn_act_read_per_token = 0.0
         self.reporter._kv_cache_bytes_per_token = 0.0
         self.reporter._ffn_act_bytes_per_token = 0.0
+        self.reporter._vit_linear_flops_per_patch = 0.0
+        self.reporter._vit_attn_dot_flops_coeff = 0.0
+        self.reporter._vit_weight_read_bytes_once = 0.0
+        self.reporter._audio_encoder_flops_per_item = 0.0
+        self.reporter._audio_encoder_weight_read_bytes_once = 0.0
 
     def _pair_count(self, extend_lens, prefix_lens):
         batch = types.SimpleNamespace(extend_lens=extend_lens, prefix_lens=prefix_lens)
@@ -1572,6 +1581,119 @@ class TestEstimatedPrefillPerf(CustomTestCase):
         )
         self.assertEqual(read_bytes_small, 500.0)
         self.assertEqual(read_bytes_large, 500.0)
+
+
+class TestEstimatedPrefillPerfMultimodal(CustomTestCase):
+    """Vision/audio encoder terms added to _estimate_prefill_perf (SGLANGT-2104)."""
+
+    def setUp(self):
+        self.scheduler = types.SimpleNamespace()
+        self.scheduler.waiting_queue = []
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.reporter = _make_reporter(self, self.scheduler)
+        self.reporter._linear_flops_per_token = 0.0
+        self.reporter._attn_dot_flops_coeff = 0.0
+        self.reporter._weight_read_bytes_per_token = 0.0
+        self.reporter._qkv_act_bytes_per_token = 0.0
+        self.reporter._prefill_attn_act_read_per_token = 0.0
+        self.reporter._kv_cache_bytes_per_token = 0.0
+        self.reporter._ffn_act_bytes_per_token = 0.0
+        self.reporter._vit_linear_flops_per_patch = 0.0
+        self.reporter._vit_attn_dot_flops_coeff = 0.0
+        self.reporter._vit_weight_read_bytes_once = 0.0
+        self.reporter._audio_encoder_flops_per_item = 0.0
+        self.reporter._audio_encoder_weight_read_bytes_once = 0.0
+
+    def _image_item(self, grid_thw, offsets=None):
+        item = MultimodalDataItem(modality=Modality.IMAGE)
+        item.image_grid_thw = grid_thw
+        item.offsets = offsets
+        return item
+
+    def _video_item(self, grid_thw, offsets=None):
+        item = MultimodalDataItem(modality=Modality.VIDEO)
+        item.video_grid_thw = grid_thw
+        item.offsets = offsets
+        return item
+
+    def _audio_item(self, offsets=None):
+        item = MultimodalDataItem(modality=Modality.AUDIO)
+        item.offsets = offsets
+        return item
+
+    def test_vision_attention_pairs_summed_per_image_not_per_batch_total(self):
+        self.reporter._vit_attn_dot_flops_coeff = 1.0
+        items = [self._image_item([[1, 4, 4]]), self._image_item([[1, 8, 8]])]
+        req = _FakeReq(100, multimodal_inputs=MultimodalInputs(mm_items=items))
+        batch = types.SimpleNamespace(
+            extend_lens=[100], prefix_lens=[0], reqs=[req]
+        )
+        flops, _, _ = self.reporter._estimate_prefill_perf(batch)
+        # Not (16 + 64) ** 2 -- each image's pairs are summed independently.
+        self.assertEqual(flops, (4 * 4) ** 2 + (8 * 8) ** 2)
+
+    def test_video_multiframe_attention_pairs_use_per_frame_not_whole_clip(self):
+        self.reporter._vit_attn_dot_flops_coeff = 1.0
+        item = self._video_item([[3, 4, 4]])
+        req = _FakeReq(100, multimodal_inputs=MultimodalInputs(mm_items=[item]))
+        batch = types.SimpleNamespace(
+            extend_lens=[100], prefix_lens=[0], reqs=[req]
+        )
+        flops, _, _ = self.reporter._estimate_prefill_perf(batch)
+        # Not (3 * 4 * 4) ** 2 -- frames don't attend to each other.
+        self.assertEqual(flops, 3 * (4 * 4) ** 2)
+
+    def test_audio_item_count_multiplies_fixed_per_item_constant(self):
+        self.reporter._audio_encoder_flops_per_item = 5.0
+        reqs = [
+            _FakeReq(1, multimodal_inputs=MultimodalInputs(mm_items=[self._audio_item()]))
+            for _ in range(3)
+        ]
+        batch = types.SimpleNamespace(
+            extend_lens=[1, 1, 1], prefix_lens=[0, 0, 0], reqs=reqs
+        )
+        flops, _, _ = self.reporter._estimate_prefill_perf(batch)
+        self.assertEqual(flops, 15.0)
+
+    def test_chunked_prefill_charges_vision_item_only_in_its_starting_chunk(self):
+        self.reporter._vit_linear_flops_per_patch = 1.0
+        item = self._image_item([[1, 4, 4]], offsets=[(2, 9)])
+        req = _FakeReq(60, multimodal_inputs=MultimodalInputs(mm_items=[item]))
+
+        # Chunk 1 covers tokens [0, 10): the item's offset (2) starts here.
+        chunk1 = types.SimpleNamespace(extend_lens=[10], prefix_lens=[0], reqs=[req])
+        flops1, _, _ = self.reporter._estimate_prefill_perf(chunk1)
+        self.assertEqual(flops1, 1.0 * 4 * 4)
+
+        # Chunk 2 covers tokens [10, 60): req.multimodal_inputs is unchanged
+        # (same mm_items list), but the item's offset falls outside this
+        # chunk's window, so it must not be recharged.
+        chunk2 = types.SimpleNamespace(extend_lens=[50], prefix_lens=[10], reqs=[req])
+        flops2, _, _ = self.reporter._estimate_prefill_perf(chunk2)
+        self.assertEqual(flops2, 0.0)
+
+    def test_mixed_batch_some_reqs_multimodal_some_not(self):
+        self.reporter._vit_linear_flops_per_patch = 1.0
+        text_req = _FakeReq(50)
+        mm_req = _FakeReq(
+            50,
+            multimodal_inputs=MultimodalInputs(
+                mm_items=[self._image_item([[1, 2, 2]])]
+            ),
+        )
+        batch = types.SimpleNamespace(
+            extend_lens=[50, 50], prefix_lens=[0, 0], reqs=[text_req, mm_req]
+        )
+        flops, _, _ = self.reporter._estimate_prefill_perf(batch)
+        self.assertEqual(flops, 1.0 * 2 * 2)
+
+    def test_vision_weight_read_bytes_charged_once_regardless_of_image_count(self):
+        self.reporter._vit_weight_read_bytes_once = 1000.0
+        items = [self._image_item([[1, 2, 2]]), self._image_item([[1, 3, 3]])]
+        req = _FakeReq(50, multimodal_inputs=MultimodalInputs(mm_items=items))
+        batch = types.SimpleNamespace(extend_lens=[50], prefix_lens=[0], reqs=[req])
+        _, read_bytes, _ = self.reporter._estimate_prefill_perf(batch)
+        self.assertEqual(read_bytes, 1000.0)
 
 
 class TestEstimatedDecodePerf(CustomTestCase):
@@ -1619,6 +1741,19 @@ class TestEstimatedDecodePerf(CustomTestCase):
             self._batch([10, 20]), num_tokens=2
         )
         self.assertEqual(read_bytes, 2.0 * 30)
+
+    def test_decode_perf_unaffected_by_vision_or_audio_encoder_constants(self):
+        # Vision/audio encoder towers only run once per request during
+        # prefill/extend; decode must not reference these constants at all.
+        self.reporter._vit_linear_flops_per_patch = 1e9
+        self.reporter._vit_attn_dot_flops_coeff = 1e9
+        self.reporter._vit_weight_read_bytes_once = 1e9
+        self.reporter._audio_encoder_flops_per_item = 1e9
+        self.reporter._audio_encoder_weight_read_bytes_once = 1e9
+        flops, read_bytes, write_bytes = self.reporter._estimate_decode_perf(
+            self._batch([10]), num_tokens=1
+        )
+        self.assertEqual((flops, read_bytes, write_bytes), (0.0, 0.0, 0.0))
 
 
 def _fake_model_config(
@@ -2669,6 +2804,185 @@ class TestEstimatedPerfConstants(CustomTestCase):
         self.assertEqual(self.reporter._linear_flops_per_token, 0.0)
         self.assertEqual(self.reporter._weight_read_bytes_per_token, 0.0)
         self.assertEqual(self.reporter._ffn_act_bytes_per_token, 0.0)
+
+    def test_vision_tower_uses_embed_dim_not_hidden_size_for_qwen2vl(self):
+        # Qwen2-VL (and its direct reuses, sarashina2_vision/points_v15_chat)
+        # size vision blocks off embed_dim; hidden_size there is only the
+        # patch merger's output width and must not be used for block FLOPs.
+        config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen2VLForConditionalGeneration"],
+                vision_config=types.SimpleNamespace(
+                    embed_dim=1280,
+                    hidden_size=3584,
+                    depth=2,
+                    num_heads=16,
+                    mlp_ratio=4.0,
+                ),
+            ),
+        )
+        self._init(config)
+        vit_intermediate = 1280 * 4.0
+        expected_linear = 2 * (8.0 * 1280 * 1280 + 4.0 * 1280 * vit_intermediate)
+        expected_attn_dot = 2 * (4.0 * 16 * (1280 / 16))
+        self.assertEqual(self.reporter._vit_linear_flops_per_patch, expected_linear)
+        self.assertEqual(self.reporter._vit_attn_dot_flops_coeff, expected_attn_dot)
+
+    def test_vision_tower_uses_hidden_size_directly_for_qwen3vl(self):
+        # Qwen2.5-VL/Qwen3-VL have no embed_dim field; blocks are sized off
+        # hidden_size directly.
+        config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen3VLForConditionalGeneration"],
+                vision_config=types.SimpleNamespace(
+                    hidden_size=1152,
+                    depth=2,
+                    num_heads=16,
+                    intermediate_size=4304,
+                ),
+            ),
+        )
+        self._init(config)
+        expected_linear = 2 * (8.0 * 1152 * 1152 + 4.0 * 1152 * 4304)
+        expected_attn_dot = 2 * (4.0 * 16 * (1152 / 16))
+        self.assertEqual(self.reporter._vit_linear_flops_per_patch, expected_linear)
+        self.assertEqual(self.reporter._vit_attn_dot_flops_coeff, expected_attn_dot)
+
+    def test_vision_mlp_gating_matches_architecture(self):
+        # Qwen2.5-VL's vision MLP is gated SwiGLU (6x/3x multipliers); the
+        # rest of the family is plain 2-matrix (4x/2x) -- same vision_config,
+        # different architecture name, must produce different FLOPs.
+        vision_config = types.SimpleNamespace(
+            hidden_size=1280, depth=1, num_heads=16, intermediate_size=3420
+        )
+        gated_config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen2_5_VLForConditionalGeneration"],
+                vision_config=vision_config,
+            ),
+        )
+        self._init(gated_config)
+        gated_linear = self.reporter._vit_linear_flops_per_patch
+
+        non_gated_config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen2VLForConditionalGeneration"],
+                vision_config=vision_config,
+            ),
+        )
+        self._init(non_gated_config)
+        non_gated_linear = self.reporter._vit_linear_flops_per_patch
+
+        attn_linear = 8.0 * 1280 * 1280
+        self.assertEqual(gated_linear, attn_linear + 6.0 * 1280 * 3420)
+        self.assertEqual(non_gated_linear, attn_linear + 4.0 * 1280 * 3420)
+
+    def test_no_vision_or_audio_config_yields_zero_contribution(self):
+        # Critical regression guard: a non-multimodal model must see zero
+        # vision/audio contribution AND unchanged text-decoder constants.
+        hidden, head_dim, heads, kv_heads, layers = 4096, 128, 32, 8, 8
+        config = _fake_model_config(
+            hidden_size=hidden,
+            head_dim=head_dim,
+            num_attn_heads=heads,
+            num_kv_heads=kv_heads,
+            num_attention_layers=layers,
+        )
+        self._init(config)
+        self.assertEqual(self.reporter._vit_linear_flops_per_patch, 0.0)
+        self.assertEqual(self.reporter._vit_attn_dot_flops_coeff, 0.0)
+        self.assertEqual(self.reporter._vit_weight_read_bytes_once, 0.0)
+        self.assertEqual(self.reporter._audio_encoder_flops_per_item, 0.0)
+        self.assertEqual(self.reporter._audio_encoder_weight_read_bytes_once, 0.0)
+
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        mlp_flops = 6.0 * hidden * 14336
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+        self.assertEqual(
+            self.reporter._attn_dot_flops_coeff, 4.0 * heads * head_dim * layers
+        )
+
+    def test_audio_encoder_fixed_window_flops(self):
+        hidden, heads, intermediate, layers, positions, mel_bins = (
+            64.0,
+            4.0,
+            128.0,
+            2.0,
+            10.0,
+            8.0,
+        )
+        config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen2AudioForConditionalGeneration"],
+                audio_config=types.SimpleNamespace(
+                    hidden_size=hidden,
+                    num_attention_heads=heads,
+                    intermediate_size=intermediate,
+                    num_hidden_layers=layers,
+                    max_source_positions=positions,
+                    num_mel_bins=mel_bins,
+                ),
+            ),
+        )
+        self._init(config)
+        head_dim = hidden / heads
+        # conv1 stride=1, conv2 stride=2 -> every clip is force-padded to a
+        # fixed 2x max_source_positions mel window.
+        mel_frames = 2.0 * positions
+        conv1_flops = 2.0 * mel_frames * 3.0 * mel_bins * hidden
+        conv2_flops = 2.0 * positions * 3.0 * hidden * hidden
+        per_layer_linear = 8.0 * hidden * hidden + 4.0 * hidden * intermediate
+        per_layer_attn_dot = 4.0 * heads * head_dim  # bidirectional, no causal mask
+        expected_flops = (
+            conv1_flops
+            + conv2_flops
+            + layers * per_layer_linear * positions
+            + layers * per_layer_attn_dot * (positions**2)
+        )
+        self.assertEqual(self.reporter._audio_encoder_flops_per_item, expected_flops)
+
+        per_layer_weight_elems = 4.0 * hidden * hidden + 2.0 * hidden * intermediate
+        expected_weight_bytes = layers * per_layer_weight_elems * 2.0  # bf16
+        self.assertEqual(
+            self.reporter._audio_encoder_weight_read_bytes_once, expected_weight_bytes
+        )
+
+    def test_audio_encoder_missing_config_falls_back_to_hf_default(self):
+        # qwen2_audio.py itself constructs a default Qwen2AudioEncoderConfig()
+        # when audio_config is absent; mirror that here instead of zeroing out.
+        config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen2AudioForConditionalGeneration"],
+            ),
+        )
+        self._init(config)
+        hidden, heads, intermediate, layers, positions, mel_bins = (
+            1280.0,
+            20.0,
+            5120.0,
+            32.0,
+            1500.0,
+            128.0,
+        )
+        head_dim = hidden / heads
+        mel_frames = 2.0 * positions
+        conv1_flops = 2.0 * mel_frames * 3.0 * mel_bins * hidden
+        conv2_flops = 2.0 * positions * 3.0 * hidden * hidden
+        per_layer_linear = 8.0 * hidden * hidden + 4.0 * hidden * intermediate
+        per_layer_attn_dot = 4.0 * heads * head_dim
+        expected_flops = (
+            conv1_flops
+            + conv2_flops
+            + layers * per_layer_linear * positions
+            + layers * per_layer_attn_dot * (positions**2)
+        )
+        self.assertEqual(self.reporter._audio_encoder_flops_per_item, expected_flops)
 
 
 class TestPrefillSolDeviceTimer(CustomTestCase):
