@@ -225,8 +225,8 @@ def build_msa_v1_page_table(
     columns = torch.arange(
         max_pages, device=req_to_token.device, dtype=torch.long
     ).mul_(_PAGE_SIZE)
-    # One 2-D gather: indexing the rows first would copy each request's whole
-    # req_to_token row (context-length wide) before picking the page columns.
+    # One 2-D gather: req_to_token[rows][:, columns] would first copy whole
+    # context-length rows (64 GiB for the 1M-context extend-autotune batch).
     slots = req_to_token[req_pool_indices.long()[:, None], columns[None, :]]
     return (
         torch.div(slots, _PAGE_SIZE, rounding_mode="floor").to(torch.int32).contiguous()
