@@ -126,6 +126,50 @@ def _convert_kohya_minimax_h3(
     return out
 
 
+# DiffSynth-Studio trains MiniMax-H3 on the raw checkpoint, whose fused QKV rows
+# are interleaved per head ([h0: q k v, h1: q k v, ...]), and exports PEFT keys
+# with the `.default` slot on native names. Native H3 and every other producer
+# use [q_all; k_all; v_all] (see MiniMaxH3 `_install_qkv_weight_loader`), so the
+# B rows must be regrouped, as Diffusers'
+# `_convert_non_diffusers_minimax_h3_lora_to_diffusers` does.
+_DIFFSYNTH_H3_QKV_B_KEY = re.compile(
+    r"^(?:diffusion_model\.)?(?:token_refiner\.)?blocks\.\d+\.attn\.qkv_proj"
+    r"\.lora_B\.default\.weight$"
+)
+_MINIMAX_H3_HEAD_DIM = 128
+
+
+def _deinterleave_diffsynth_minimax_h3_qkv(
+    state_dict: Mapping[str, torch.Tensor],
+    log: logging.Logger,
+) -> Mapping[str, torch.Tensor]:
+    keys = [k for k in state_dict if _DIFFSYNTH_H3_QKV_B_KEY.match(k)]
+    if not keys:
+        return state_dict
+
+    out = dict(state_dict)
+    for key in keys:
+        lora_b = state_dict[key]
+        rows = lora_b.shape[0]
+        if rows % (3 * _MINIMAX_H3_HEAD_DIM) != 0:
+            raise ValueError(
+                f"{key} has {rows} rows, not a per-head-interleaved MiniMax-H3 "
+                f"QKV projection with head_dim {_MINIMAX_H3_HEAD_DIM}"
+            )
+        num_heads = rows // (3 * _MINIMAX_H3_HEAD_DIM)
+        out[key] = (
+            lora_b.reshape(num_heads, 3, _MINIMAX_H3_HEAD_DIM, *lora_b.shape[1:])
+            .transpose(0, 1)
+            .reshape(lora_b.shape)
+        )
+    log.info(
+        "[LoRAFormatAdapter] regrouped %d DiffSynth MiniMax-H3 qkv_proj lora_B "
+        "tensors from per-head to [q; k; v] rows",
+        len(keys),
+    )
+    return out
+
+
 def _looks_like_kohya_flux(state_dict: Mapping[str, torch.Tensor]) -> bool:
     """Kohya FLUX LoRA (flux_lora.py) under lora_unet_double/single_blocks_ prefixes."""
     if not state_dict:
@@ -633,6 +677,8 @@ def normalize_lora_state_dict(
     """Normalize any supported LoRA format into a single canonical layout."""
     log = logger or globals()["logger"]
 
+    # Must run before normalize_peft_keys drops the `.default` slot it keys on.
+    state_dict = _deinterleave_diffsynth_minimax_h3_qkv(state_dict, log)
     state_dict = normalize_peft_keys(state_dict)
     keys = list(state_dict.keys())
     log.info(
