@@ -23,7 +23,7 @@ The following table summarizes the settings configured by the script. For parame
 
 | Area | Configuration in the script |
 |------|------------------------------|
-| Hardware | Huawei Ascend 950PR/DT Series (A5), 8 NPUs per node |
+| Hardware | Ascend 950PR/DT Series (A5), 8 NPUs per node |
 | Attention | `--attention-backend dsv4` |
 | Tensor parallelism | `--tp-size "$TP_SIZE"` (`TP_SIZE` is set from the total NPU count) |
 | Attention data parallelism | `--attn-dp-size "$DP_SIZE"` (`DP_SIZE` is set from the total NPU count) |
@@ -36,7 +36,7 @@ The following table summarizes the settings configured by the script. For parame
 
 ### Environment
 
-Prepare a Huawei Ascend 950PR/DT Series (A5) host with eight NPUs. Install a compatible Ascend driver, CANN, TorchNPU,
+Prepare a Ascend 950PR/DT Series (A5) host with eight NPUs. Install a compatible Ascend driver, CANN, TorchNPU,
 ATB, and custom operators, then run the setup and launch commands inside the prepared Ascend environment. Use an SGLang
 checkout that supports DeepSeek-V4.1-Flash and the `dsv4` NPU attention backend. Keep the same SGLang revision and model
 checkpoint available at the same paths on every node.
@@ -61,64 +61,77 @@ The dependencies required for the NPU runtime environment are integrated into pl
   <Tab title="A3 Series">
 
 ```bash
-A3_IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-dsv41-1"
-docker pull "$A3_IMAGE"
+name=$1
+image="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-dsv41-1"
 
-docker run -itd --shm-size=16g --name ${NAME} \
-  --privileged=true --net=host \
-  -v /var/queue_schedule:/var/queue_schedule \
-  -v /etc/ascend_install.info:/etc/ascend_install.info \
-  -v /usr/local/sbin:/usr/local/sbin \
-  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-  -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
-  --device=/dev/davinci0:/dev/davinci0 \
-  --device=/dev/davinci1:/dev/davinci1 \
-  --device=/dev/davinci2:/dev/davinci2 \
-  --device=/dev/davinci3:/dev/davinci3 \
-  --device=/dev/davinci4:/dev/davinci4 \
-  --device=/dev/davinci5:/dev/davinci5 \
-  --device=/dev/davinci6:/dev/davinci6 \
-  --device=/dev/davinci7:/dev/davinci7 \
-  --device=/dev/davinci8:/dev/davinci8 \
-  --device=/dev/davinci9:/dev/davinci9 \
-  --device=/dev/davinci10:/dev/davinci10 \
-  --device=/dev/davinci11:/dev/davinci11 \
-  --device=/dev/davinci12:/dev/davinci12 \
-  --device=/dev/davinci13:/dev/davinci13 \
-  --device=/dev/davinci14:/dev/davinci14 \
-  --device=/dev/davinci15:/dev/davinci15 \
-  --device=/dev/davinci_manager:/dev/davinci_manager \
-  --device=/dev/hisi_hdc:/dev/hisi_hdc \
-  --entrypoint=bash \
-  "$A3_IMAGE"
+docker run -it --shm-size=16g --name "${name}" \
+    --privileged=true --net=host \
+    -v /mnt:/mnt \
+    -v /home:/home \
+    -v /data:/data \
+    -v /var/queue_schedule:/var/queue_schedule \
+    -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --device=/dev/davinci0:/dev/davinci0 \
+    --device=/dev/davinci1:/dev/davinci1 \
+    --device=/dev/davinci2:/dev/davinci2 \
+    --device=/dev/davinci3:/dev/davinci3 \
+    --device=/dev/davinci4:/dev/davinci4 \
+    --device=/dev/davinci5:/dev/davinci5 \
+    --device=/dev/davinci6:/dev/davinci6 \
+    --device=/dev/davinci7:/dev/davinci7 \
+    --device=/dev/davinci8:/dev/davinci8 \
+    --device=/dev/davinci9:/dev/davinci9 \
+    --device=/dev/davinci10:/dev/davinci10 \
+    --device=/dev/davinci11:/dev/davinci11 \
+    --device=/dev/davinci12:/dev/davinci12 \
+    --device=/dev/davinci13:/dev/davinci13 \
+    --device=/dev/davinci14:/dev/davinci14 \
+    --device=/dev/davinci15:/dev/davinci15 \
+    --device=/dev/davinci_manager:/dev/davinci_manager \
+    --device=/dev/hisi_hdc:/dev/hisi_hdc \
+    --entrypoint=bash \
+    $image
 ```
 
   </Tab>
   <Tab title="950PR/DT Series">
 
 ```bash
-A5_IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B032"
-docker pull "$A5_IMAGE"
+name=$1
+image="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B032"
 
-docker run -itd --shm-size=16g --name ${NAME} \
-  --privileged=true --net=host \
-  -v /var/queue_schedule:/var/queue_schedule \
-  -v /etc/ascend_install.info:/etc/ascend_install.info \
-  -v /usr/local/sbin:/usr/local/sbin \
-  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-  -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
-  --device=/dev/davinci0:/dev/davinci0 \
-  --device=/dev/davinci1:/dev/davinci1 \
-  --device=/dev/davinci2:/dev/davinci2 \
-  --device=/dev/davinci3:/dev/davinci3 \
-  --device=/dev/davinci4:/dev/davinci4 \
-  --device=/dev/davinci5:/dev/davinci5 \
-  --device=/dev/davinci6:/dev/davinci6 \
-  --device=/dev/davinci7:/dev/davinci7 \
-  --device=/dev/davinci_manager:/dev/davinci_manager \
-  --device=/dev/hisi_hdc:/dev/hisi_hdc \
-  --entrypoint=bash \
-  "$A5_IMAGE"
+docker run --runtime=runc -u root -it -d --name ${name} --net=host --privileged=true --shm-size=2g \
+    --device=/dev/davinci_manager --device=/dev/hisi_hdc --device=/dev/ummu --device=/dev/uburma \
+    --device=/dev/davinci0 \
+    --device=/dev/davinci1 \
+    --device=/dev/davinci2 \
+    --device=/dev/davinci3 \
+    --device=/dev/davinci4 \
+    --device=/dev/davinci5 \
+    --device=/dev/davinci6 \
+    --device=/dev/davinci7 \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    -v /root/host:/root/host  \
+    -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /var/log/npu/:/usr/slog \
+    -v /mnt:/mnt \
+    -v /data:/data \
+    -v /etc/hccl_rootinfo.json:/etc/hccl_rootinfo.json  \
+    -v /usr/lib64:/usr/lib64   \
+    -v /lib64:/lib64 \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
+    -v /home/:/home/ \
+    -v /etc/hixlep:/etc/hixlep \
+    -w /workspace \
+    --entrypoint=/bin/bash \
+    $image 
 ```
 
   </Tab>
