@@ -1943,6 +1943,32 @@ def setup_state_kv_args(
         )
 
 
+def setup_page_row_kv_args(
+    kv_args: KVArgs,
+    *,
+    token_to_kv_pool,
+    transfer_backend: TransferBackend,
+    draft_token_to_kv_pool=None,
+    draft_window_pages: int = 0,
+) -> None:
+    """Flags peers read to admit a prefill with another attention TP size:
+    only the Mooncake sender slices NVFP4 page rows by head, so the other
+    backends keep sending whole rows. ``draft_window_pages`` bounds the draft
+    KV tail a sliding-window-only draft reads (0 sends every draft page)."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+    kv_args.main_kv_page_row = (
+        isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+        and transfer_backend == TransferBackend.MOONCAKE
+    )
+    if kv_args.main_kv_page_row:
+        kv_args.main_kv_head_dim = token_to_kv_pool.head_dim
+    if isinstance(draft_token_to_kv_pool, MHATokenToKVPool):
+        kv_args.draft_kv_head_num = draft_token_to_kv_pool.head_num
+        kv_args.draft_window_pages = draft_window_pages
+
+
 def _token_kv_view(token_to_kv_pool):
     """The pool's token KV view, as the target's owner view is read: the view
     a pool wrapping one beside recurrent state (a hybrid draft) holds its
