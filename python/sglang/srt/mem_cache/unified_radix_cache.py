@@ -1654,9 +1654,35 @@ class UnifiedRadixCache(BasePrefixCache):
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
         is_finished = req.finished()
+        previous_prefix_len = req.kv.cache_protected_len
         self._checkpoint_into_tree(req, up_to=up_to, **kwargs)
         if is_finished:
+            if previous_prefix_len and self.is_swa_enabled and self.is_mamba_enabled:
+                self._touch_prompt_checkpoint(req, previous_prefix_len)
             self._release_request_mamba(req)
+
+    def _touch_prompt_checkpoint(self, req: Req, checkpoint_len: int) -> None:
+        # A follow-up needs the window at the prefill checkpoint, even when
+        # decode finishes before it has another state to insert.
+        prompt = RadixKey(
+            req.origin_input_ids,
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+        prompt_len = len(prompt)
+        if checkpoint_len < req.kv.cache_protected_len <= prompt_len:
+            # The final insert already refreshed a later checkpoint in the prompt.
+            return
+        if checkpoint_len > prompt_len:
+            # Re-prefill after retraction can include output. Walk back to an
+            # existing boundary so touching the prompt cannot split a node.
+            (path,) = self.tree_core.collect_path_info([req.last_node])
+            checkpoint_len = max(
+                (n.path_end for n in path if n.path_end <= prompt_len), default=0
+            )
+        if checkpoint_len:
+            self.touch_prefix(prompt[:checkpoint_len])
 
     def _checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         # A finished request hands its component state (mamba) to the tree
