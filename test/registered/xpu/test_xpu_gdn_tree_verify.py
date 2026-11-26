@@ -4,7 +4,12 @@ per-node intermediate recurrent states the commit step reads back."""
 
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.kernels.gdn_xpu import XpuGDNKernel

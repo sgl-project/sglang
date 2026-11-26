@@ -3,6 +3,13 @@ where the ring and its cursors live in the arena's request sub-pool."""
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from test_qwen35_fp4_mtp import MTP_BASE_ARGS, QWEN35_FP4_MODEL, _run_mtp_gsm8k
 
 from sglang.srt.utils import kill_process_tree

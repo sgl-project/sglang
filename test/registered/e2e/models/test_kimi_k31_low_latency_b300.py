@@ -3,6 +3,13 @@ adds DCP8 and runs mem fraction 0.92 and 72 running requests, not 0.85 and 64.""
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import MMMUProMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin

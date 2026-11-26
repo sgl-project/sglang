@@ -4,7 +4,12 @@ python3 -m unittest test_moe_ep_drop_sentinel.py
 
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from sgl_kernel import fused_experts
 
 from sglang.srt.layers.moe.utils import route_dropped_experts_to_local
