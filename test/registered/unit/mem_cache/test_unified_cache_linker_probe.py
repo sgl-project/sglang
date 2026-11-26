@@ -2,7 +2,7 @@
 external store answers them from the request's last lookup while its key and device
 hit are unchanged, and they leave no hit marker. Every other match can be followed by
 a load, so it looks the store up again and leaves the marker init_load_back loads,
-whether or not the model has Mamba state."""
+whether or not the model has Mamba state, and drops the request's last lookup."""
 
 import unittest
 from array import array
@@ -85,6 +85,16 @@ class _ProbeReuse:
         self.assertTrue(self.cache.linker.has_hit(req.rid))
         self.assertEqual(self._load(req, match), 8)
         self.assertIn(req.rid, self.store.queued_loads)
+
+    def test_admission_drops_the_last_lookup(self):
+        # An admitted request ends without release_request.
+        req = self._cache()
+        self._match(req, TOKENS, True)
+        self._match(req, TOKENS, False)
+        self.assertNotIn(req.rid, self.cache.linker._last_lookups)
+        # A request admission turned away probes the store again.
+        self._match(req, TOKENS, True)
+        self.assertEqual(len(self.store.lookup_calls), 3)
 
     def test_probe_looks_up_again_when_the_key_grows(self):
         req = self._cache()

@@ -378,8 +378,10 @@ class UnifiedCacheLinkerWrapper:
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # rid -> ((key length, device hit), store hit) of the request's last
-        # lookup, which a probe reuses while both are unchanged. A lookup is a
-        # collective, so whether to reuse depends only on state all ranks share.
+        # probe lookup, which a probe reuses while both are unchanged. A lookup
+        # is a collective, so whether to reuse depends only on state all ranks
+        # share. Any other match drops it: an admitted request ends without
+        # release_request, so nothing else would.
         self._last_lookups: dict[str, tuple[tuple[int, int], Optional[_StoreHit]]] = {}
         self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
         # Requests loading in the batch being built, then its counter index once
@@ -412,9 +414,9 @@ class UnifiedCacheLinkerWrapper:
         self, key: RadixKey, req: Req, result: MatchResult, *, probe: bool = False
     ) -> MatchResult:
         """``probe``: the match only orders the waiting queue. It reuses the
-        request's last lookup while the key and the device hit are unchanged,
-        and leaves no hit marker. Any other match can be followed by a load, so
-        it looks the store up again."""
+        request's last probe lookup while the key and the device hit are
+        unchanged, and leaves no hit marker. Any other match can be followed by a load, so
+        it looks the store up again and drops the request's last lookup."""
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         device_hit_len = result.device_prefix_len
@@ -424,6 +426,7 @@ class UnifiedCacheLinkerWrapper:
         if not probe:
             # The next init_load_back loads what this match finds, or nothing.
             self.hit_markers.pop(req.rid, None)
+            self._last_lookups.pop(req.rid, None)
         if device_hit_len >= len(key):
             return result
 
@@ -435,7 +438,8 @@ class UnifiedCacheLinkerWrapper:
                 self.metrics.increment_linker_probe_reuses()
         else:
             hit = self._lookup(key, req, result, device_hit_len)
-            self._last_lookups[req.rid] = (shape, hit)
+            if probe:
+                self._last_lookups[req.rid] = (shape, hit)
         if hit is None:
             return result
         if not probe:
