@@ -65,6 +65,7 @@ class BudgetPlan:
         batch_capacity: int,
         cache_tokens: int,
         page_size: int,
+        kv_head_num: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         index_head_dim: int,
@@ -85,18 +86,19 @@ class BudgetPlan:
         self.batch_capacity = batch_capacity
         self.cache_tokens = cache_tokens
         self.page_size = page_size
+        self.kv_head_num = kv_head_num
         self.index_head_dim = index_head_dim
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
         self.prefill_workspace_tokens = prefill_workspace_tokens
         metadata_dtype = torch.int32
         self.resident_buffers = {
             "device_k_buffer": BufferSpec(
-                (resident_rows, cache_tokens, 1, kv_lora_rank),
+                (resident_rows, cache_tokens, kv_head_num, kv_lora_rank),
                 kv_dtype,
                 num_layers,
             ),
             "device_v_buffer": BufferSpec(
-                (resident_rows, cache_tokens, 1, qk_rope_head_dim),
+                (resident_rows, cache_tokens, kv_head_num, qk_rope_head_dim),
                 kv_dtype,
                 num_layers,
             ),
@@ -122,10 +124,10 @@ class BudgetPlan:
         if prefill_workspace_tokens:
             self.manager_buffers.update(
                 prefill_nope=BufferSpec(
-                    (prefill_workspace_tokens, 1, kv_lora_rank), kv_dtype
+                    (prefill_workspace_tokens, kv_head_num, kv_lora_rank), kv_dtype
                 ),
                 prefill_rope=BufferSpec(
-                    (prefill_workspace_tokens, 1, qk_rope_head_dim), kv_dtype
+                    (prefill_workspace_tokens, kv_head_num, qk_rope_head_dim), kv_dtype
                 ),
             )
         self.adapter_buffers = {
@@ -190,7 +192,10 @@ class BudgetPlan:
             cache_tokens=self.cache_tokens,
             context_len=self.context_len,
             resident_kv_bytes_per_token=(
-                self.num_layers * self.kv_cache_dim * self.kv_dtype.itemsize
+                self.num_layers
+                * self.kv_head_num
+                * self.kv_cache_dim
+                * self.kv_dtype.itemsize
             ),
             index_k_and_draft_bytes_per_token=index_k_and_draft_bytes_per_token,
             slot_map_bytes_per_request=_slot_map_row_bytes(
@@ -219,10 +224,6 @@ class BudgetPlan:
 
     def bind_index_k_pool(self, index_k_pool) -> BudgetPlan:
         """Bind the Host KV layout to the physical Indexer K pool."""
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-            MLA_KV_HEAD_NUM,
-        )
-
         indexer_layer_ids = getattr(
             index_k_pool, "indexer_layer_ids", (index_k_pool.start_layer,)
         )
@@ -242,7 +243,7 @@ class BudgetPlan:
         host_token_capacity = key.shape[0] * self.page_size
         self.host_token_capacity = host_token_capacity
         self.host_kv_spec = BufferSpec(
-            (self.host_token_capacity, MLA_KV_HEAD_NUM, self.kv_cache_dim),
+            (self.host_token_capacity, self.kv_head_num, self.kv_cache_dim),
             self.kv_dtype,
             self.num_layers,
         )
@@ -267,6 +268,7 @@ def resolve_sparse_kv_budget(
     resident_rows: int | None = None,
 ) -> BudgetPlan:
     """Resolve and validate native persistent allocations before pool sizing."""
+    kv_head_num = model_config.mla_kv_head_num
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     index_head_dim = model_config.index_head_dim
@@ -278,7 +280,8 @@ def resolve_sparse_kv_budget(
         raise ValueError("Invalid native LIM query geometry.")
     if (
         kv_dtype != torch.bfloat16
-        or kv_bytes_per_token != (kv_lora_rank + qk_rope_head_dim) * kv_dtype.itemsize
+        or kv_bytes_per_token
+        != kv_head_num * (kv_lora_rank + qk_rope_head_dim) * kv_dtype.itemsize
     ):
         raise ValueError("Native LIM requires BF16 MLA KV storage.")
     if not cache_tokens:
@@ -304,6 +307,7 @@ def resolve_sparse_kv_budget(
         batch_capacity=max(resident_rows, graph_batch_capacity),
         cache_tokens=cache_tokens,
         page_size=page_size,
+        kv_head_num=kv_head_num,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         index_head_dim=index_head_dim,

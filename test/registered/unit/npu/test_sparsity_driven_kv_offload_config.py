@@ -32,6 +32,7 @@ def _make_glm51_model_config():
     return SimpleNamespace(
         hf_config=hf_config,
         index_head_dim=128,
+        mla_kv_head_num=1,
     )
 
 
@@ -240,6 +241,7 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             plan = get_sparse_kv_budget(
                 model_config=SimpleNamespace(
                     num_attention_heads=128,
+                    mla_kv_head_num=1,
                     kv_lora_rank=512,
                     qk_rope_head_dim=64,
                     index_head_dim=128,
@@ -295,6 +297,7 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                 plan = get_sparse_kv_budget(
                     model_config=SimpleNamespace(
                         num_attention_heads=8,
+                        mla_kv_head_num=1,
                         kv_lora_rank=512,
                         qk_rope_head_dim=64,
                         index_head_dim=128,

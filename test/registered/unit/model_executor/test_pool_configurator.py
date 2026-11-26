@@ -117,6 +117,7 @@ def _make_model_runner(
     mc = SimpleNamespace()
     mc.head_dim = head_dim
     mc.num_attention_heads = 128
+    mc.mla_kv_head_num = 1
     mc.v_head_dim = v_head_dim
     mc.kv_lora_rank = kv_lora_rank
     mc.qk_rope_head_dim = qk_rope_head_dim

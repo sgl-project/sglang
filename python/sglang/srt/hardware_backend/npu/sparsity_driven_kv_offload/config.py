@@ -39,10 +39,6 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
-# MLA stores one compressed latent KV head, independently of query-head count.
-MLA_KV_HEAD_NUM = 1
-
-
 def use_fused_sparse_kv_offload() -> bool:
     return envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
 
@@ -236,7 +232,8 @@ def build_sparse_kv_budget_options(
         top_k=get_sparsity_driven_kv_offload_sparse_context_len(
             model_config=model_config
         ),
-        kv_bytes_per_token=(model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+        kv_bytes_per_token=model_config.mla_kv_head_num
+        * (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
         * torch._utils._element_size(kv_dtype),
         num_layers=num_layers,
         kv_dtype=kv_dtype,

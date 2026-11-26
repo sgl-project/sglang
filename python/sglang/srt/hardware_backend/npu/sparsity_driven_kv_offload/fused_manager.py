@@ -11,9 +11,6 @@ from sglang.kernels.ops.attention.npu_copy_sfa import (
     fused_scatter_copy_sparse_flash_attention,
     load_copy_sfa_operator,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    MLA_KV_HEAD_NUM,
-)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (
     make_fused_prefill_plan,
     prepare_prefill_gather_rows,
@@ -51,13 +48,13 @@ class FusedSparseKVCacheManager:
         self.device = req_to_token_pool.device
         self.start_layer = index_k_pool.start_layer
         # MLA params
-        self.head_num = MLA_KV_HEAD_NUM
         self.page_size = index_k_pool.page_size
         self.kv_lora_rank = index_k_pool.kv_lora_rank
         self.qk_rope_head_dim = index_k_pool.qk_rope_head_dim
         self.store_dtype = index_k_pool.store_dtype
         self.layer_num = index_k_pool.layer_num
         self.budget = index_k_pool.sparse_kv_budget_plan
+        self.head_num = self.budget.kv_head_num
         self.size = self.budget.request_rows
         self.max_context_len = self.budget.context_len
         self.host_token_capacity = self.budget.host_token_capacity

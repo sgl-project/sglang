@@ -1889,6 +1889,13 @@ class ModelConfig:
         total_num_attention_heads = self.num_attention_heads or 0
         return max(1, total_num_attention_heads // tensor_parallel_size)
 
+    @property
+    def mla_kv_head_num(self) -> int:
+        """Number of compressed KV heads stored per token by MLA."""
+        if self.attention_arch != AttentionArch.MLA:
+            raise ValueError("Compressed MLA KV heads require an MLA model.")
+        return 1
+
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
         """Returns the total number of KV heads."""

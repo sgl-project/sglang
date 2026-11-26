@@ -74,6 +74,7 @@ def test_prefill_attention_and_short_residency():
     pool.req_to_token[1:3] = mapping.to("npu")
     budget = resolve_sparse_kv_budget(
         model_config=SimpleNamespace(
+            mla_kv_head_num=1,
             kv_lora_rank=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
@@ -232,6 +233,7 @@ def test_short_sparse_graph_lifecycle(
     index_pool = _IndexPool(key)
     budget = resolve_sparse_kv_budget(
         model_config=SimpleNamespace(
+            mla_kv_head_num=1,
             kv_lora_rank=512,
             qk_rope_head_dim=64,
             index_head_dim=128,

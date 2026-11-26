@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     resolve_sparse_kv_budget,
 )
@@ -34,18 +35,20 @@ class TestLIMState(CustomTestCase):
                 self.assertEqual(tensor.dtype, spec.dtype)
 
     def options(self, **kwargs):
+        model_config = object.__new__(ModelConfig)
+        model_config.attention_arch = AttentionArch.MLA
+        model_config.num_key_value_heads = 64
+        model_config.kv_lora_rank = 512
+        model_config.qk_rope_head_dim = 64
+        model_config.index_head_dim = 128
+        model_config.hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_head_dim=128,
+            index_n_heads=64,
+            index_topk=2048,
+        )
         return dict(
-            model_config=SimpleNamespace(
-                kv_lora_rank=512,
-                qk_rope_head_dim=64,
-                index_head_dim=128,
-                hf_config=SimpleNamespace(
-                    architectures=["GlmMoeDsaForCausalLM"],
-                    index_head_dim=128,
-                    index_n_heads=64,
-                    index_topk=2048,
-                ),
-            ),
+            model_config=model_config,
             page_size=128,
             copy_sfa_query_heads=128,
             request_rows=3,
@@ -114,6 +117,12 @@ class TestLIMState(CustomTestCase):
         plan = resolve_sparse_kv_budget(**self.options(prefill_workspace_tokens=129))
         self.assertEqual(base.prefill_workspace_tokens, 0)
         self.assertEqual(plan.prefill_workspace_tokens, 129)
+        self.assertEqual(plan.kv_head_num, 1)
+        for name, width in (("device_k_buffer", 512), ("device_v_buffer", 64)):
+            self.assertEqual(
+                plan.resident_buffers[name].shape,
+                (plan.resident_rows, plan.cache_tokens, plan.kv_head_num, width),
+            )
         self.assertNotIn("prefill_packed", plan.manager_buffers)
         for name, width in (
             ("prefill_nope", 512),

@@ -129,6 +129,7 @@ def _run_manager_lifecycle(
     index_pool = _IndexPool(keys, num_layers)
     budget = resolve_sparse_kv_budget(
         model_config=SimpleNamespace(
+            mla_kv_head_num=1,
             kv_lora_rank=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
