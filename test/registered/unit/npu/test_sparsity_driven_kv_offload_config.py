@@ -78,6 +78,12 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             for backend in ("ascend", "mooncake"):
                 disagg.disaggregation_transfer_backend = backend
                 self.assertTrue(enabled())
+            with (
+                patch.object(disagg, "disaggregation_mode", "null"),
+                patch.object(disagg, "enable_pd_role_switch", True),
+                self.assertRaisesRegex(ValueError, "role switching"),
+            ):
+                enabled()
             for obj, attribute, value, message in (
                 (disagg, "disaggregation_transfer_backend", "fake", "transfer backend"),
                 (
@@ -266,22 +272,20 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
         from sglang.srt.environ import envs
 
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."
-        for mode, switch, cap, rows in (
-            ("null", False, None, 1),
-            ("null", False, 8, 8),
-            ("null", False, 0, 0),
-            ("decode", False, 8, 0),
-            ("null", True, 1, 1),
+        for mode, cap, rows in (
+            ("null", None, 1),
+            ("null", 8, 8),
+            ("null", 0, 0),
+            ("decode", 8, 0),
         ):
             with (
-                self.subTest(mode=mode, switch=switch, cap=cap),
+                self.subTest(mode=mode, cap=cap),
                 envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
                 envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
                 patch(
                     prefix + "get_disagg",
                     return_value=SimpleNamespace(
                         disaggregation_mode=mode,
-                        enable_pd_role_switch=switch,
                         disaggregation_decode_extra_slots=3,
                     ),
                 ),
@@ -316,10 +320,8 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     top_k=2048,
                     kv_bytes_per_token=1152,
                 )
-                self.assertEqual(plan.resident_rows, 6 if switch else 3)
-                self.assertEqual(
-                    plan.request_rows, 6 if mode == "decode" or switch else 3
-                )
+                self.assertEqual(plan.resident_rows, 3)
+                self.assertEqual(plan.request_rows, 6 if mode == "decode" else 3)
                 self.assertEqual(plan.prefill_workspace_tokens, rows * 256)
 
     def test_sparse_offload_cell_size_matches_compact_owner_count(self):
@@ -455,42 +457,47 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
     def test_missing_request_capacity_uses_fused_hbm_fit(self):
         from sglang.srt.environ import envs
 
+        prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."
+        disagg = SimpleNamespace(
+            disaggregation_mode="null",
+            enable_pd_role_switch=False,
+            disaggregation_transfer_backend="ascend",
+            disaggregation_decode_host_receive_threshold=1,
+        )
+        args = dict(model_config=_make_glm51_model_config(), use_mla_backend=True)
         with (
-            patch.dict(
-                os.environ,
-                {"SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1"},
-            ),
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            patch(prefix + "is_npu", return_value=True),
+            patch(prefix + "attention_backends", return_value=("ascend", "ascend")),
+            patch(prefix + "get_disagg", return_value=disagg),
             patch(
-                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.attention_backends",
-                return_value=("ascend", "ascend"),
-            ),
-            patch(
-                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_schedule",
+                prefix + "get_schedule",
                 return_value=SimpleNamespace(max_running_requests=None),
             ),
+            patch(
+                prefix + "get_parallel",
+                return_value=SimpleNamespace(
+                    pp_size=1, attn_cp_size=1, dcp_enabled=False
+                ),
+            ),
+            patch(
+                prefix + "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="NONE"),
+            ),
         ):
-            model = _make_glm51_model_config()
             with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(False):
                 with self.assertRaisesRegex(ValueError, "max_running_requests"):
-                    is_sparsity_driven_kv_offload_enabled(
-                        model_config=model, use_mla_backend=True
-                    )
-            with (
-                envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
-                patch(
-                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_disagg",
-                    return_value=SimpleNamespace(disaggregation_mode="null"),
-                ),
-            ):
-                self.assertTrue(
-                    is_sparsity_driven_kv_offload_enabled(
-                        model_config=model, use_mla_backend=True
-                    )
-                )
+                    get_sparse_kv_offload_mode(**args)
+            with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True):
+                with self.assertRaisesRegex(ValueError, "max_running_requests"):
+                    is_sparsity_driven_kv_offload_enabled(**args)
+                for mode in ("null", "decode"):
+                    with self.subTest(mode=mode):
+                        disagg.disaggregation_mode = mode
+                        self.assertEqual(get_sparse_kv_offload_mode(**args), "fused")
+                disagg.disaggregation_mode = "prefill"
+                with self.assertRaisesRegex(ValueError, "max_running_requests"):
+                    get_sparse_kv_offload_mode(**args)
 
 
 def _import_manager_module():

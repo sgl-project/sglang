@@ -38,7 +38,7 @@ def use_fused_sparse_kv_offload() -> bool:
     return envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
 
 
-def is_sparsity_driven_kv_offload_enabled(
+def _sparse_kv_offload_enabled_for_model(
     *,
     model_config: ModelConfig,
     use_mla_backend: bool,
@@ -60,14 +60,27 @@ def is_sparsity_driven_kv_offload_enabled(
             "(for example DeepSeek V3.2 or GLM-5.x) using the Ascend MLA "
             "attention backend."
         )
-    if get_schedule().max_running_requests is None and (
-        not use_fused_sparse_kv_offload()
-        or get_disagg().disaggregation_mode == "prefill"
-    ):
+    return True
+
+
+def _require_sparse_kv_request_limit() -> None:
+    if get_schedule().max_running_requests is None:
         raise ValueError(
             "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD requires max_running_requests "
             "to be set to bound the per-process host KV allocation."
         )
+
+
+def is_sparsity_driven_kv_offload_enabled(
+    *,
+    model_config: ModelConfig,
+    use_mla_backend: bool,
+) -> bool:
+    if not _sparse_kv_offload_enabled_for_model(
+        model_config=model_config, use_mla_backend=use_mla_backend
+    ):
+        return False
+    _require_sparse_kv_request_limit()
     return True
 
 
@@ -81,16 +94,18 @@ def is_fused_sparse_kv_offload_enabled(
     # Draft attention keeps its full KV pool even when it inherits the flags.
     if not use_fused_sparse_kv_offload() or is_draft_worker:
         return False
-    if not is_sparsity_driven_kv_offload_enabled(
-        model_config=model_config,
-        use_mla_backend=use_mla_backend,
+    if not _sparse_kv_offload_enabled_for_model(
+        model_config=model_config, use_mla_backend=use_mla_backend
     ):
         return False
 
     disagg = get_disagg()
     if disagg.disaggregation_mode == "prefill":
         # Prefill publishes full KV pages to the decode worker.
+        _require_sparse_kv_request_limit()
         return False
+    if disagg.enable_pd_role_switch:
+        raise ValueError("Fused sparse KV offload does not support PD role switching.")
     parallel = get_parallel()
     if parallel.pp_size != 1 or parallel.dcp_enabled:
         raise ValueError(
@@ -99,8 +114,6 @@ def is_fused_sparse_kv_offload_enabled(
     if disagg.disaggregation_mode == "decode":
         if parallel.attn_cp_size != 1:
             raise ValueError("PD split KV requires context parallelism disabled.")
-        if disagg.enable_pd_role_switch:
-            raise ValueError("PD split KV does not support PD role switching.")
         if disagg.disaggregation_transfer_backend not in ("ascend", "mooncake"):
             raise ValueError(
                 "PD split KV requires the Ascend or Mooncake transfer backend."
@@ -263,17 +276,12 @@ def get_sparse_kv_budget(
         running_rows = min(
             running_rows, max(1, schedule.max_running_requests // attn_dp_size)
         )
-    extra_rows = (
-        disagg.disaggregation_decode_extra_slots or 0
-        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch
-        else 0
-    )
-    request_rows = running_rows + extra_rows + 1
-    resident_rows = (
-        running_rows + 1 if disagg.disaggregation_mode == "decode" else request_rows
-    )
-    prefill_rows = 0
-    if disagg.disaggregation_mode != "decode":
+    resident_rows = running_rows + 1
+    if disagg.disaggregation_mode == "decode":
+        request_rows = resident_rows + (disagg.disaggregation_decode_extra_slots or 0)
+        prefill_rows = 0
+    else:
+        request_rows = resident_rows
         prefill_rows = schedule.prefill_max_requests
         if prefill_rows is None:
             prefill_rows = 1

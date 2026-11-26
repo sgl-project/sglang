@@ -122,7 +122,11 @@ def test_sparse_kv_offload_mode(monkeypatch, offload, fused, draft, expected_mod
         config, "get_spec", lambda: SimpleNamespace(speculative_algorithm="NONE")
     )
     monkeypatch.setattr(
-        config, "get_disagg", lambda: SimpleNamespace(disaggregation_mode="null")
+        config,
+        "get_disagg",
+        lambda: SimpleNamespace(
+            disaggregation_mode="null", enable_pd_role_switch=False
+        ),
     )
     with (
         envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(offload),
