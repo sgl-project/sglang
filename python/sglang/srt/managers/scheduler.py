@@ -642,7 +642,6 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
-        # Finish DSV4 warmup before the cache builder can register L3 host memory.
         self.maybe_init_hccl_dp_prewarm()
 
         # Init cache and memory pool
