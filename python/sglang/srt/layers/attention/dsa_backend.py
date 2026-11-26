@@ -895,6 +895,12 @@ class DeepseekSparseAttnBackend(
         ) and self._kv_shard_pool is None
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        self._is_hy4_flash_ada = (
+            self.dsa_prefill_impl == self.dsa_decode_impl == "triton_sparse_mla"
+            and hf_config.architectures[0] == "HYV4FlashForConditionalGeneration"
+            and _is_cuda
+            and torch.cuda.get_device_capability() == (8, 9)
+        )
         if (
             not _is_hip
             and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
@@ -1134,18 +1140,18 @@ class DeepseekSparseAttnBackend(
         )
 
         if self.dsa_prefill_impl == "triton_sparse_mla":
+            num_q_heads = self.num_q_heads
+            if self._is_hy4_flash_ada:
+                swa_heads = (
+                    model_runner.model_config.hf_text_config.swa_num_attention_heads
+                )
+                num_q_heads = max(num_q_heads, swa_heads // get_parallel().attn_tp_size)
             _validate_triton_sparse_mla_backend(
                 device_sm_major=self.device_sm_major,
-                num_q_heads=self.num_q_heads,
+                num_q_heads=num_q_heads,
                 union=self.dsa_triton_union,
                 index_kpool=self.dsa_index_kpool,
-                allow_sm89=(
-                    self.dsa_decode_impl == "triton_sparse_mla"
-                    and hf_config.architectures[0]
-                    == "HYV4FlashForConditionalGeneration"
-                    and _is_cuda
-                    and torch.cuda.get_device_capability() == (8, 9)
-                ),
+                allow_sm89=self._is_hy4_flash_ada,
             )
 
         # Q8KV8 per-call device-tensor caches, populated lazily on the first
@@ -1459,7 +1465,9 @@ class DeepseekSparseAttnBackend(
         # / draft-extend, and packed PAGED extend, whose expanded row count is what
         # v2 sees -- otherwise the helper's plan-present assertion fires. None only
         # when the SGL v2 path is disabled; such metadata is never dispatched to v2.
-        if not self.dsa_topk_backend.should_use_topk_v2():
+        # The custom Hy4-flash indexers do not consume a generic DSA top-k
+        # plan or paged MQA schedule. Avoid those kernels on the Ada path.
+        if self._is_hy4_flash_ada or not self.dsa_topk_backend.should_use_topk_v2():
             return None
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
@@ -1904,10 +1912,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and not self._is_hy4_flash_ada
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -2095,6 +2107,7 @@ class DeepseekSparseAttnBackend(
         self.dsa_drop_wide_page_table = (
             is_cuda()
             and not _is_hip
+            and not self._is_hy4_flash_ada
             and self.physical_page_size > 1
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
@@ -2317,10 +2330,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and not self._is_hy4_flash_ada
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
@@ -2608,10 +2625,14 @@ class DeepseekSparseAttnBackend(
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and not self._is_hy4_flash_ada
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
         ):
             if forward_mode.is_draft_extend_v2():
                 schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
@@ -2712,7 +2733,7 @@ class DeepseekSparseAttnBackend(
 
         # Refresh the schedule because stale shape decomposition can deadlock
         # DeepGEMM paged MQA.
-        if is_cuda():
+        if is_cuda() and not self._is_hy4_flash_ada:
             if forward_mode.is_decode_or_idle():
                 seqlens_32_2d = self._dcp_local_ctx_lens(
                     _to_2d_context_lens(metadata.cache_seqlens_int32, bs)

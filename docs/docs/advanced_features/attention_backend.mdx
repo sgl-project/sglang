@@ -400,7 +400,7 @@ DSA (DeepSeek Sparse Attention) is a native sparse attention mechanism used by [
 
 Internally, the DSA backend dispatches to different sub-backends for prefill and decode phases. You can override these with `--dsa-prefill-backend` and `--dsa-decode-backend`:
 
-For Hy4-flash on NVIDIA Ada (SM89), opt in with `--dsa-prefill-backend triton_sparse_mla --kv-cache-dtype bfloat16`. This selects the sink-aware per-token Triton kernel for both prefill and compatibility decode. Set `SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1` for SM89-compatible DSA schedule metadata. For eager validation, use `--dsa-topk-backend flashinfer` and disable both CUDA graph phases. The opt-in does not support speculative decoding or `--dsa-triton-union`. Checkpoint fit and Engram placement are separate from attention backend selection.
+For Hy4-flash on NVIDIA Ada (SM89), opt in with `--dsa-prefill-backend triton_sparse_mla --kv-cache-dtype bfloat16`. Both phases use the sink-aware per-token Triton kernel. The Hy4-flash indexers do not need the generic DSA plans. Disable both CUDA graph phases for an eager run. The opt-in does not support speculative decoding or `--dsa-triton-union`. Checkpoint fit and Engram placement are separate from attention backend selection.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
