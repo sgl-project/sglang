@@ -11,6 +11,7 @@ import torch
 
 from sglang.api.v1.api_types import GenerateMetaInfo
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskOutput,
@@ -732,6 +733,30 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
             (3, 2, 1),
         )
         self.assertIsNone(stats.time_stats)
+
+    def test_raw_embedding_pickle_carries_only_its_rows(self):
+        source = torch.arange(64 * 1024, dtype=torch.bfloat16).reshape(64, 1024)
+        owned = source[0].clone()
+        reqs = []
+        for row in (source[3], owned, [0.5]):
+            req = _metered_req()
+            req.embedding = row
+            req.finished_reason = FINISH_LENGTH(length=1)
+            reqs.append(req)
+
+        for use_pickle in (True, False):
+            outputs = []
+            with envs.SGLANG_USE_PICKLE_IPC.override(use_pickle):
+                _streamer(outputs, is_generation=False).stream_output(reqs, False)
+            view_out, owned_out, absent = outputs[0].tensor_embeddings
+            torch.testing.assert_close(view_out, source[3])
+            self.assertIs(owned_out, owned)
+            self.assertIsNone(absent)
+            self.assertEqual(outputs[0].embeddings[2], [0.5])
+            if use_pickle:
+                self.assertEqual(view_out.untyped_storage().nbytes(), view_out.nbytes)
+            else:
+                self.assertIs(view_out, reqs[0].embedding)
 
     def test_finished_output_carries_current_request_stats(self):
         """A finished output carries the request's current stats even when a
