@@ -203,3 +203,89 @@ def test_joy_image_mlp_quality_restore_and_dynamic_lora():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# -------------------------------------------------------------------------
+# Joy -- strided image QK RMSNorm+RoPE dispatch
+# -------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_joy_qk_rope_admits_only_measured_arches(monkeypatch):
+    """The strided out-of-place kernel is enabled on the arches it was measured
+    on, and stays off on the rest -- notably SM100 and pre-Ampere parts."""
+    from sglang.multimodal_gen.runtime.models.dits import joy_image
+
+    device = torch.device("cuda", 0)
+    for capability, expected in (
+        ((9, 0), True),
+        ((10, 3), True),
+        ((12, 0), True),
+        ((10, 0), False),
+        ((9, 4), False),
+        ((8, 6), False),
+    ):
+        with patch.object(
+            torch.cuda, "get_device_capability", lambda device, c=capability: c
+        ):
+            measured = joy_image._joy_qk_rope_arches_measured(device)
+        assert measured is expected, capability
+
+
+@torch.no_grad()
+def test_joy_image_qk_rope_reads_the_packed_stride_bit_exactly():
+    """The fused branch must fire on the packed image stride and reproduce the
+    contiguous reference bit for bit, leaving the packed q/k/v untouched."""
+    from sglang.multimodal_gen.runtime.layers.layernorm import (
+        RMSNorm,
+        apply_qk_norm_with_optional_rope,
+    )
+    from sglang.multimodal_gen.runtime.models.dits import joy_image
+
+    heads, head_dim, tokens = 32, 128, 4096
+    torch.manual_seed(0)
+    packed = torch.randn(
+        1, tokens, 3 * heads * head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    img_q, img_k, _ = (
+        view.unflatten(-1, (heads, head_dim))
+        for view in packed.split([heads * head_dim] * 3, dim=-1)
+    )
+    assert img_q.stride() == (
+        tokens * 3 * heads * head_dim,
+        3 * heads * head_dim,
+        head_dim,
+        1,
+    )
+    assert img_q.numel() >= 16 * 1024 * 1024
+
+    q_norm, k_norm = (
+        RMSNorm(head_dim, eps=1e-6).to("cuda", torch.bfloat16) for _ in range(2)
+    )
+    q_norm.weight.data.normal_()
+    k_norm.weight.data.normal_()
+    angles = torch.randn(tokens + 64, 64, device="cuda")
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1).contiguous()
+
+    pristine = packed.clone()
+    reference = apply_qk_norm_with_optional_rope(
+        q=img_q.contiguous(),
+        k=img_k.contiguous(),
+        q_norm=q_norm,
+        k_norm=k_norm,
+        head_dim=head_dim,
+        cos_sin_cache=cache,
+        freqs_complex=None,
+        is_neox=False,
+        allow_inplace=True,
+    )
+    fused = joy_image._joy_image_qk_rope(img_q, img_k, q_norm, k_norm, cache, None)
+
+    gate = joy_image._JOY_IMAGE_QK_ROPE
+    sig = (img_q.device, tuple(img_q.shape), tuple(img_q.stride()), 1e-6)
+    assert not gate.disabled
+    assert sig in gate.verified_sigs, "the fused branch did not run for this layout"
+    for actual, expected in zip(fused, reference, strict=True):
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    # The out-of-place kernel must not have written into the packed projection.
+    assert torch.equal(packed, pristine)
