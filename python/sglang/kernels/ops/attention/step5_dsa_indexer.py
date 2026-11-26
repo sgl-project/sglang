@@ -754,7 +754,7 @@ def _score_blocks(
         tl.store(Out + row * BLOCKS + num_blocks, score, num_blocks < BLOCKS)
 
 
-def step5_dsa_indexer_logits(
+def _indexer_logits(
     q: torch.Tensor,
     weights: torch.Tensor,
     *,
@@ -918,7 +918,7 @@ def deepselect_score_width(score_width: int) -> int:
     return (score_width + align - 1) // align * align
 
 
-def step5_dsa_topk_blocks_deepselect(
+def _topk_blocks_deepselect(
     scores: torch.Tensor,
     *,
     positions: torch.Tensor,
@@ -931,7 +931,7 @@ def step5_dsa_topk_blocks_deepselect(
     packed: torch.Tensor,
     causal_lengths: torch.Tensor,
 ) -> None:
-    """SM10x ``step5_dsa_topk_blocks`` that also writes the packed attention addresses.
+    """SM10x ``_topk_blocks`` that also writes the packed attention addresses.
 
     ``history_lengths`` is int32 positions // 8 per row, zero for padding rows.
     """
@@ -955,7 +955,7 @@ def step5_dsa_topk_blocks_deepselect(
     )
 
 
-def step5_dsa_topk_blocks(
+def _topk_blocks(
     scores: torch.Tensor,
     *,
     positions: torch.Tensor,
@@ -1036,7 +1036,7 @@ def _pack_decode_blocks(
     tl.store(Lengths + row, tl.where(live, position + 1, 0))
 
 
-def step5_dsa_pack_blocks(
+def _pack_selected_blocks(
     block_indices: torch.Tensor,
     counts: torch.Tensor,
     *,
@@ -1068,3 +1068,65 @@ def step5_dsa_pack_blocks(
         packed_blocks.shape[1],
         num_warps=4,
     )
+
+
+def step5_dsa_select_blocks(
+    *,
+    index_q: torch.Tensor,
+    index_weights: torch.Tensor,
+    compressed_index_keys: torch.Tensor,
+    req_to_token: torch.Tensor,
+    row_to_req: torch.Tensor,
+    positions: torch.Tensor,
+    tiles: tuple[tuple[int, int], ...],
+    indexer_logits: torch.Tensor,
+    ids: torch.Tensor,
+    packed: torch.Tensor,
+    counts: torch.Tensor,
+    lengths: torch.Tensor,
+    use_deepselect: bool,
+    topk_lengths: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+) -> None:
+    for start, end in tiles:
+        tile_scores = indexer_logits[: end - start]
+        tile_ids = ids[: end - start]
+        _indexer_logits(
+            q=index_q[start:end],
+            weights=index_weights[start:end],
+            compressed_index_keys=compressed_index_keys,
+            req_to_token=req_to_token,
+            row_to_req=row_to_req[start:end],
+            positions=positions[start:end],
+            out=tile_scores,
+        )
+        if use_deepselect:
+            _topk_blocks_deepselect(
+                tile_scores,
+                positions=positions[start:end],
+                row_to_req=row_to_req[start:end],
+                history_lengths=topk_lengths[start:end],
+                req_to_token=req_to_token,
+                topk_ids=topk_ids[: end - start],
+                block_indices=tile_ids,
+                counts=counts[start:end],
+                packed=packed[start:end],
+                causal_lengths=lengths[start:end],
+            )
+        else:
+            _topk_blocks(
+                tile_scores,
+                positions=positions[start:end],
+                row_to_req=row_to_req[start:end],
+                block_indices=tile_ids,
+                counts=counts[start:end],
+            )
+            _pack_selected_blocks(
+                tile_ids,
+                counts[start:end],
+                req_to_token=req_to_token,
+                row_to_req=row_to_req[start:end],
+                positions=positions[start:end],
+                packed_blocks=packed[start:end],
+                causal_lengths=lengths[start:end],
+            )

@@ -19,11 +19,8 @@ from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
 )
 from sglang.kernels.ops.attention.step5_dsa_indexer import (
     step5_dsa_append_ring,
-    step5_dsa_indexer_logits,
     step5_dsa_indexer_norm_rope,
-    step5_dsa_pack_blocks,
-    step5_dsa_topk_blocks,
-    step5_dsa_topk_blocks_deepselect,
+    step5_dsa_select_blocks,
 )
 from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
     gemma_rmsnorm as mixed_dtype_gemma_rmsnorm,
@@ -34,7 +31,6 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.step5_backend import (
     Step5IndexerMetadata,
     Step5RadixAttention,
-    Step5SelectionWorkspace,
 )
 from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -224,71 +220,25 @@ class Step5Indexer(nn.Module):
             ring_positions=state.index_positions,
             compressed_index_keys=state.compressed_index_keys,
         )
-        return _topk_blocks(
+        workspace = metadata.selection_workspace
+        step5_dsa_select_blocks(
             index_q=index_q,
             index_weights=index_weights,
             compressed_index_keys=state.compressed_index_keys,
             req_to_token=metadata.req_to_token,
             row_to_req=metadata.query_request_slots,
             positions=metadata.query_positions,
-            workspace=metadata.selection_workspace,
+            tiles=workspace.tiles,
+            indexer_logits=workspace.indexer_logits,
+            ids=workspace.ids,
+            packed=workspace.packed,
+            counts=workspace.counts,
+            lengths=workspace.lengths,
+            use_deepselect=workspace.use_deepselect,
+            topk_lengths=workspace.topk_lengths,
+            topk_ids=workspace.topk_ids,
         )
-
-
-def _topk_blocks(
-    *,
-    index_q: torch.Tensor,
-    index_weights: torch.Tensor,
-    compressed_index_keys: torch.Tensor,
-    req_to_token: torch.Tensor,
-    row_to_req: torch.Tensor,
-    positions: torch.Tensor,
-    workspace: Step5SelectionWorkspace,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    packed, counts, lengths = workspace.packed, workspace.counts, workspace.lengths
-    for start, end in workspace.tiles:
-        tile_scores = workspace.indexer_logits[: end - start]
-        tile_ids = workspace.ids[: end - start]
-        step5_dsa_indexer_logits(
-            q=index_q[start:end],
-            weights=index_weights[start:end],
-            compressed_index_keys=compressed_index_keys,
-            req_to_token=req_to_token,
-            row_to_req=row_to_req[start:end],
-            positions=positions[start:end],
-            out=tile_scores,
-        )
-        if workspace.use_deepselect:
-            step5_dsa_topk_blocks_deepselect(
-                tile_scores,
-                positions=positions[start:end],
-                row_to_req=row_to_req[start:end],
-                history_lengths=workspace.topk_lengths[start:end],
-                req_to_token=req_to_token,
-                topk_ids=workspace.topk_ids[: end - start],
-                block_indices=tile_ids,
-                counts=counts[start:end],
-                packed=packed[start:end],
-                causal_lengths=lengths[start:end],
-            )
-        else:
-            step5_dsa_topk_blocks(
-                tile_scores,
-                positions=positions[start:end],
-                row_to_req=row_to_req[start:end],
-                block_indices=tile_ids,
-                counts=counts[start:end],
-            )
-            step5_dsa_pack_blocks(
-                tile_ids,
-                counts[start:end],
-                req_to_token=req_to_token,
-                row_to_req=row_to_req[start:end],
-                positions=positions[start:end],
-                packed_blocks=packed[start:end],
-                causal_lengths=lengths[start:end],
-            )
-    return packed, counts, lengths
+        return workspace.packed, workspace.counts, workspace.lengths
 
 
 class Step5MLP(nn.Module):
