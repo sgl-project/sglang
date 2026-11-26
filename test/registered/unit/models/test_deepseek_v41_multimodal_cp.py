@@ -11,7 +11,11 @@ from sglang.srt.layers.cp.bcg.dsv4_bcg import DSV4CPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
 from sglang.srt.layers.cp.zigzag import ZigzagContextParallelMetadata
-from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE, MultimodalInputs
+from sglang.srt.managers.req_types import (
+    MM_PAD_SHIFT_VALUE,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_interfaces import LanguageModelInputPreparation
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
@@ -22,6 +26,7 @@ from sglang.srt.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
     _v41_vision_a2a_supported,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -109,12 +114,13 @@ class _PreparedModel(NS, LanguageModelInputPreparation):
 
 
 class TestDSV41MultimodalCP(CustomTestCase):
-    def test_cp_bcg_defers_image_batches_to_eager_vision_path(self):
+    def test_cp_bcg_defers_chunks_with_image_tokens(self):
         runner = NS(
             max_context_size=None,
             max_seq_len=None,
             enable_lora=False,
             enable_cp_bcg_capture=True,
+            is_dsv41_model=True,
             model_runner=NS(model=NS(vision=object())),
             can_replay_locally=Mock(return_value=True),
             _has_inactive_dp_rank=Mock(return_value=False),
@@ -124,23 +130,33 @@ class TestDSV41MultimodalCP(CustomTestCase):
         )
         batch = NS(
             global_num_tokens_cpu=None,
-            batch_size=1,
+            batch_size=2,
             input_ids=torch.arange(8),
             input_embeds=None,
             replace_embeds=None,
-            extend_prefix_lens_cpu=[0],
-            extend_seq_lens_cpu=[8],
+            extend_prefix_lens_cpu=[0, 0],
+            extend_seq_lens_cpu=[4, 4],
             forward_mode=ForwardMode.EXTEND,
             global_forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=None,
             return_logprob=False,
-            mm_inputs=[MultimodalInputs(mm_items=[])],
+            mm_inputs=[None, None],
         )
         batch.contains_mm_inputs = lambda: any(x is not None for x in batch.mm_inputs)
         with patch(PREFILL_GRAPH + ".is_cp_active", return_value=True):
-            self.assertFalse(PrefillCudaGraphRunner.can_run_graph(runner, batch))
-            batch.mm_inputs = [None]
             self.assertTrue(PrefillCudaGraphRunner.can_run_graph(runner, batch))
+            image = MultimodalDataItem(modality=Modality.IMAGE, offsets=[(4, 9)])
+            batch.mm_inputs[1] = MultimodalInputs(mm_items=[image])
+            for prefix, expected in ((0, True), (1, False), (9, False), (10, True)):
+                with self.subTest(prefix=prefix):
+                    batch.extend_prefix_lens_cpu[1] = prefix
+                    self.assertEqual(
+                        PrefillCudaGraphRunner.can_run_graph(runner, batch), expected
+                    )
+            image.offsets = None
+            self.assertFalse(PrefillCudaGraphRunner.can_run_graph(runner, batch))
+            batch.mm_inputs[1].mm_items.clear()
+            self.assertFalse(PrefillCudaGraphRunner.can_run_graph(runner, batch))
 
     def test_vision_megamoe_prefill_is_admitted(self):
         for backend_name, expected in (
