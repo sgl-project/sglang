@@ -325,6 +325,7 @@ class TokenSpaceSGLangProcessor:
     def clear_preprocess_cache(self) -> None:
         # Weights do not change preprocessing, and other processes share the disk cache.
         self._mm_preprocess_cache.clear()
+        self._core.reset_item_feature_flights()
 
     def shutdown(self) -> None:
         self.hash_executor.shutdown()

@@ -150,6 +150,12 @@ class MultimodalPreprocessCache(Generic[K, V]):
         """Whether values can be retained; zero bytes is the cache kill switch."""
         return self.max_size_bytes > 0
 
+    @property
+    def generation(self) -> int:
+        """Bumped by ``clear()``; ``put(..., _generation=g)`` drops a value from before it."""
+        with self._lock:
+            return self._generation
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._entries)
