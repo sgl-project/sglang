@@ -74,6 +74,7 @@ from sglang.srt.managers.io_struct import (
     RpcReqInput,
     RpcReqOutput,
     ScaleElasticEPReqOutput,
+    SchedulerIdleReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -153,6 +154,7 @@ _COMMUNICATOR_SPECS = [
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
     ("rpc", RpcReqOutput),
+    ("scheduler_idle", SchedulerIdleReqOutput),
 ]
 
 
