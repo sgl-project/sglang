@@ -71,6 +71,16 @@ if TYPE_CHECKING:
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
+        from sglang.srt.kernel_plugins.megakernel import (
+            oot_megakernel_dispatch,
+            prepare_oot_megakernel,
+        )
+
+        self._megakernel_dispatch = oot_megakernel_dispatch(model_runner.model)
+        if self._megakernel_dispatch is not None:
+            self._eager_registry = None
+            prepare_oot_megakernel(model_runner)
+            return
         mr = model_runner
         sa = mr.server_args
         # Built first so the cg runners coalesce onto its buffers via the shared
@@ -172,7 +182,10 @@ class EagerRunner(BaseRunner):
         """Copy the live batch into the fixed-max eager static buffers (sliced to
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
+        if (
+            self._megakernel_dispatch is not None
+            or envs.SGLANG_EAGER_INPUT_NO_COPY.get()
+        ):
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:
@@ -200,6 +213,19 @@ class EagerRunner(BaseRunner):
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
     ) -> Any:
         with self.model_context():
+            if self._megakernel_dispatch is not None:
+                runner = self.model_runner
+                batch = self.load_batch(forward_batch, pp_proxy_tensors)
+                with (
+                    device_timer_ctx(runner.device_timer, "megakernel"),
+                    forward_context(get_forward_context(), forward_batch=batch),
+                ):
+                    return self._megakernel_dispatch(
+                        batch.input_ids,
+                        batch.positions,
+                        batch,
+                        **runner._pp_kwargs(pp_proxy_tensors),
+                    )
             mode = forward_batch.forward_mode
             if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
                 # A mixed batch is extend-shaped (decode tails are 1-token

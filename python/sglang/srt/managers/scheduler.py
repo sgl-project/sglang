@@ -2774,6 +2774,16 @@ class Scheduler(
         )
 
     def init_dp_attn_adapter(self) -> None:
+        from sglang.srt.kernel_plugins.megakernel import (
+            oot_megakernel_needs_mlp_sync_cohort,
+        )
+
+        if (
+            get_parallel().num_dp_ranks > 1
+            and oot_megakernel_needs_mlp_sync_cohort(self.tp_worker.model_runner.model)
+            and not self.require_mlp_sync
+        ):
+            raise ValueError("the megakernel requires attention-DP MLP sync")
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
             model_runner=self.tp_worker.model_runner,
             req_to_token_pool=self.req_to_token_pool,

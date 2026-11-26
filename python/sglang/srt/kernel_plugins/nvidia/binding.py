@@ -27,11 +27,8 @@ import msgspec
 import torch
 import torch.distributed as dist
 
-from sglang.kernels.plugin_kernels.nvidia.spec import (
+from sglang.kernels.plugin_kernels.megakernel.spec import (
     ENTRIES,
-    ENTRY_POINT,
-    FLAG,
-    FLAG_SETS_ENV,
     GRAPH_VARIANT_RUNNERS,
     BuildContext,
     BuiltMegakernel,
@@ -47,6 +44,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     registered_architectures,
     spec_registered,
 )
+from sglang.kernels.plugin_kernels.nvidia.spec import ENTRY_POINT, FLAG, FLAG_SETS_ENV
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.amd.binding import msa_serves
@@ -837,6 +835,15 @@ def megakernel_disable_reasons(
         )
     if spec is None:
         return None, [why]
+    return spec, megakernel_config_disable_reasons(
+        spec=spec, cfg=cfg, hf_config=hf_config
+    )
+
+
+def megakernel_config_disable_reasons(
+    *, spec: MegakernelSpec, cfg: Any, hf_config: Any, model_config: Any = None
+) -> list[str]:
+    """Validate a resolved provider configuration without querying the device."""
     req = spec.requires
     reasons = [
         f"{f.value} is in use and {spec.name} does not accept it"
@@ -873,7 +880,9 @@ def megakernel_disable_reasons(
         )
     if spec.config_disable_reasons is not None:
         reasons += spec.config_disable_reasons(cfg, hf_config)
-    return spec, reasons
+    if model_config is not None:
+        reasons += _dtype_reasons(spec, model_config)
+    return reasons
 
 
 def _dtype_reasons(spec: Optional[MegakernelSpec], model_config: Any) -> list[str]:
@@ -1311,11 +1320,12 @@ def _find_spec_on_every_rank(
     """The spec every rank found; for a draft model, None when no rank has one
     registered; else raise on every rank."""
     archs = hf_config.architectures
-    spec, why = find_spec(architectures=archs, isa=device_isa())
+    isa = device_isa()
+    spec, why = find_spec(architectures=archs, isa=isa)
     # Ranks branch together; one skipping the collectives below would hang its peers.
     lookups = _gather_tp(
         (
-            spec_registered(archs),
+            spec_registered(archs, target=isa) or spec_registered(archs),
             why,
             None if spec is None else (spec.name, spec.api_version),
         )

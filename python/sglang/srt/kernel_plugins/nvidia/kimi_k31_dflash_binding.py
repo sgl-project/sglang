@@ -26,7 +26,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Optional, Protocol
 import msgspec
 import torch
 
-from sglang.kernels.plugin_kernels.nvidia.spec import FLAG, SupportsDFlashRuntime
+from sglang.kernels.plugin_kernels.megakernel.spec import SupportsDFlashRuntime
+from sglang.kernels.plugin_kernels.nvidia.spec import FLAG
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import (

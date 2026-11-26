@@ -151,6 +151,7 @@ from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
+    MambaPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, kv_storage_of
@@ -355,6 +356,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
+        mamba_pool_cls: type[MambaPool] | None = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -394,6 +396,8 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         else:
             effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
+        if mamba_pool_cls is not None:
+            self.mamba_pool_cls = mamba_pool_cls
         self._init_mamba_pool(
             mamba_size=effective_mamba_size,
             mamba_spec_state_size=size + pre_alloc_size,

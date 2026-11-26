@@ -10,6 +10,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.megakernel import oot_megakernel_needs_mlp_sync_cohort
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import (
     dp_gather_width,
@@ -38,6 +39,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.mlp_sync_metadata import MLPSyncBatchMetadata
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
@@ -175,6 +177,8 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    # Requests, decoding requests, and longest cached prefix for this replica.
+    local_cohort: tuple[int, int, int] | None = None
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -204,7 +208,8 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
-            ],
+            ]
+            + ([] if self.local_cohort is None else list(self.local_cohort)),
             device=device,
             dtype=dtype,
         )
@@ -225,7 +230,8 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
-            ],
+            ]
+            + ([] if self.local_cohort is None else [0, 0, 0]),
             device=device,
             dtype=dtype,
         )
@@ -329,6 +335,11 @@ def _update_gather_batch(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     skip_global_metadata=False,
 ):
+    batch.mlp_sync_batch_metadata = (
+        MLPSyncBatchMetadata.from_exchange(mlp_sync_info.tp0_info_cpu)
+        if mlp_sync_info.local_cohort is not None
+        else None
+    )
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
@@ -583,6 +594,29 @@ class DPShutdownVoteSent:
         self.value = False
 
 
+def _local_cohort(batch: ScheduleBatch | None) -> tuple[int, int, int]:
+    if batch is None:
+        return (0, 0, 0)
+    requests = batch.batch_size()
+    mode = batch.forward_mode
+    if mode.is_decode():
+        lens = batch.seq_lens_cpu
+        if lens is None:
+            lens = batch.seq_lens
+        return (
+            requests,
+            requests,
+            int(lens.max()) + 1 if lens is not None and len(lens) else 0,
+        )
+    decode = len(batch.decoding_reqs or ()) if mode.is_mixed() else 0
+    prefix = (
+        max(batch.prefix_lens or (), default=0)
+        if mode.is_extend() or mode.is_mixed()
+        else 0
+    )
+    return requests, decode, prefix
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -693,6 +727,11 @@ def prepare_mlp_sync_batch_raw(
             local_forward_mode=local_forward_mode,
         )
     skip_all_gather = should_skip_scheduler_all_gather(num_dp_ranks)
+    needs_cohort = oot_megakernel_needs_mlp_sync_cohort(
+        getattr(model_runner, "model", None)
+    )
+    if needs_cohort and num_dp_ranks > 1 and skip_all_gather:
+        raise ValueError("the megakernel requires the attention-DP MLP sync exchange")
 
     mlp_sync_info = MLPSyncBatchInfo(
         num_dp_ranks=num_dp_ranks,
@@ -713,6 +752,7 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        local_cohort=_local_cohort(local_batch) if needs_cohort else None,
     )
 
     if num_dp_ranks == 1:

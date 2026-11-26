@@ -1697,6 +1697,7 @@ class KVCacheConfigurator:
         )
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
+            mamba_pool_cls=self._megakernel_state_pool_cls(),
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + req_to_token_headroom,
             device=self.device,
@@ -1761,6 +1762,7 @@ class KVCacheConfigurator:
         req_to_token_headroom: int,
     ) -> ReqToTokenPool:
         req_to_token_pool = HybridReqToTokenPool(
+            mamba_pool_cls=self._megakernel_state_pool_cls(),
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
@@ -1800,6 +1802,20 @@ class KVCacheConfigurator:
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
         return req_to_token_pool
+
+    def _megakernel_state_pool_cls(self) -> type | None:
+        from sglang.srt.kernel_plugins.megakernel import oot_megakernel_pool_layout
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+
+        layout = oot_megakernel_pool_layout(self.model)
+        if layout is None:
+            return None
+        cls = current_platform.get_megakernel_state_pool_cls(pool_layout=layout)
+        if cls is not None and not (
+            isinstance(cls, type) and issubclass(cls, MambaPool)
+        ):
+            raise TypeError(f"megakernel state pool must subclass MambaPool: {cls!r}")
+        return cls
 
     def _build_default_req_pool(
         self,
@@ -1852,15 +1868,20 @@ class KVCacheConfigurator:
         enable_page_major = self._page_major_enabled()
         mha_pool_class = self._resolve_kv_pool_class(
             kind="mha",
+            used=not self.use_mla_backend,
             default=(
                 PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
             ),
         )
         mla_pool_class = self._resolve_kv_pool_class(
-            kind="mla", default=MLATokenToKVPool
+            kind="mla",
+            default=MLATokenToKVPool,
+            used=self.use_mla_backend and (not is_dsa_model or self.is_hybrid_swa),
         )
         dsa_pool_class = self._resolve_kv_pool_class(
-            kind="dsa", default=DSATokenToKVPool
+            kind="dsa",
+            default=DSATokenToKVPool,
+            used=self.use_mla_backend and is_dsa_model,
         )
         if (
             is_float4_e2m1fn_x2(self.kv_cache_dtype)
@@ -2262,8 +2283,22 @@ class KVCacheConfigurator:
             enable_page_major = False
         return enable_page_major
 
-    def _resolve_kv_pool_class(self, *, kind: KVPoolKind, default: type) -> type:
-        pool_cls = current_platform.get_kv_pool_cls(kind=kind)
+    def _resolve_kv_pool_class(
+        self, *, kind: KVPoolKind, default: type, used: bool = True
+    ) -> type:
+        from sglang.srt.kernel_plugins.megakernel import oot_megakernel_pool_layout
+
+        layout = oot_megakernel_pool_layout(self.model)
+        if layout is not None:
+            if not used:
+                return default
+            pool_cls = current_platform.get_megakernel_kv_pool_cls(
+                kind=kind, pool_layout=layout
+            )
+            if pool_cls is None:
+                raise TypeError(f"megakernel pool layout requires a {kind} class")
+        else:
+            pool_cls = current_platform.get_kv_pool_cls(kind=kind)
         if pool_cls is None:
             if registered_kv_cache_storage_dtype(self.kv_cache_dtype_str) is None:
                 return default

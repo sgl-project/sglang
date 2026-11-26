@@ -742,6 +742,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.maybe_init_router_registration()
 
     def init_model_config(self):
+        from sglang.srt.kernel_plugins.megakernel import (
+            make_oot_megakernel_request_validator,
+        )
+
         server_args = self.server_args
         model_config_class = getattr(self, "model_config_class", ModelConfig)
 
@@ -749,6 +753,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_path = get_model().model_path
         self.served_model_name = get_serving().served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
+        self._megakernel_request_validator = make_oot_megakernel_request_validator(
+            server_args
+        )
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.max_req_input_len = None  # Will be set later in engine.py
@@ -1960,6 +1967,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 decision_layout=obj.decision_layout,
             )
 
+        validator = getattr(self, "_megakernel_request_validator", None)
+        if validator is not None:
+            validator(tokenized_obj)
+
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
@@ -2498,6 +2509,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
+                requests = (obj[i] for i in range(batch_size))
+                validated = None
+                if getattr(self, "_megakernel_request_validator", None) is not None:
+                    # Validate every item before the scheduler sees any member.
+                    requests = list(requests)
+                    validated = [
+                        await self._tokenize_one_request(req) for req in requests
+                    ]
                 with (
                     input_blocker_guard_region(
                         dispatch_to_scheduler=self._dispatch_to_scheduler,
@@ -2505,9 +2524,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if envs.SGLANG_ENABLE_COLOCATED_BATCH_GEN.get()
                     else nullcontext()
                 ):
-                    for i in range(batch_size):
-                        tmp_obj = obj[i]
-                        tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                    for i, tmp_obj in enumerate(requests):
+                        tokenized_obj = (
+                            await self._tokenize_one_request(tmp_obj)
+                            if validated is None
+                            else validated[i]
+                        )
                         state = self.rid_to_state[tmp_obj.rid]
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)

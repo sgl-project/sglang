@@ -13,9 +13,10 @@ device.
 The code is split at the kernel/runtime boundary.
 
 ```
-kernels/plugin_kernels/      # what a plugin implements; imports nothing from srt
-  <hardware>/spec.py         #   registration, API version, requirements,
-                             #   capabilities and widths, build/forward contract
+kernels/plugin_kernels/      # provider contracts and registration
+  megakernel/spec.py         #   shared megakernel contract and target-aware registry
+  nvidia/spec.py             #   NVIDIA settings and compatibility imports
+  amd/spec.py                #   AMD monokernel contract and registry
   <hardware>/<model>/        #   thin wrappers around the library's kernels
 srt/kernel_plugins/          # SGLang's integration
   <hardware>/binding.py      #   startup checks, weight observation, TP agreement,
@@ -39,10 +40,33 @@ With its server flag set, `srt/kernel_plugins/<hardware>/binding.py`:
 - replaces that model's forward for the steps the spec covers; every other step
   runs the model's own forward.
 
-The kernels stay in their libraries, which import the contract from
-`sglang.kernels.plugin_kernels.<hardware>` and, in their tests, the integration
-from `sglang.srt.kernel_plugins.<hardware>`. Unit tests are in
+The kernels stay in their libraries. Megakernel providers import the shared
+contract from `sglang.kernels.plugin_kernels.megakernel.spec`. Existing NVIDIA
+providers can keep importing `sglang.kernels.plugin_kernels.nvidia.spec`. AMD
+monokernel providers import `sglang.kernels.plugin_kernels.amd.spec`. The
+runtime integrations live in `sglang.srt.kernel_plugins.<hardware>`. Unit tests are in
 `test/registered/unit/kernel_plugins/<hardware>/`.
+
+### Out-of-tree platform selection
+
+An out-of-tree platform can opt in with `PlatformCapabilities.supports_megakernel`
+and return its device target from `get_megakernel_target()`. The method must
+return the same target in the launcher, tokenizer, and workers without
+initializing the device runtime. A general plugin registers an exact entry
+with `register(architecture=..., target=..., path=...)`. Platform defaults
+can use `find_target_registration()` to consult registration metadata before
+loading a provider.
+
+Exact matches are selected automatically and checked against the resolved
+launch settings. A platform can implement `requires_megakernel()` for
+checkpoints or launch modes that need a provider even when no entry registered.
+A platform that sets `accepts_legacy_megakernel_flag` accepts the existing
+NVIDIA flag as a deprecated explicit request. The launcher records the selection
+for the tokenizer and model workers to verify. After loading weights, SGLang
+builds the provider and asks the platform for its whole-step dispatch. An
+optional model-scoped layout selects KV and recurrent-state pool classes before
+allocation. The dispatch can prepare once those pools and attention backends
+exist. It owns input staging when called from the eager runner.
 
 ## Operators
 

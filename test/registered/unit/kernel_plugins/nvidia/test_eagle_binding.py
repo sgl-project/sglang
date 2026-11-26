@@ -13,8 +13,8 @@ from unittest.mock import MagicMock, call, patch
 import msgspec
 import torch
 
-from sglang.kernels.plugin_kernels.nvidia import spec
-from sglang.kernels.plugin_kernels.nvidia.spec import Step
+from sglang.kernels.plugin_kernels.megakernel import spec
+from sglang.kernels.plugin_kernels.megakernel.spec import Step
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding as runtime
 from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb

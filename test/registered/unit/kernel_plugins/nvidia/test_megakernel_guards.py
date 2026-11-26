@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.kernels.plugin_kernels.megakernel import spec as registry
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding
 from sglang.srt.kernel_plugins.nvidia.binding import (
@@ -114,7 +114,7 @@ class TestFlagSetsEnv(CustomTestCase):
         self.assertNotIn("SGLANG_DSA_TOPK_BROADCAST", os.environ)
 
     def test_the_flag_sets_only_variables_read_when_a_model_is_built(self):
-        self.assertEqual(registry.FLAG_SETS_ENV, {REPLICATION})
+        self.assertEqual(binding.FLAG_SETS_ENV, {REPLICATION})
 
 
 if __name__ == "__main__":
