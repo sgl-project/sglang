@@ -1309,6 +1309,10 @@ class Envs:
     # Ascend NPU
     # ===================================================================
     SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
+    # True means an unrotated dense DSpark draft needs correction for a GLM DSA
+    # ModelSlim QuaRot target: use checkpoint-local vocab and fold Q into the FC
+    # weights at load time. False preserves the existing loading behavior.
+    SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps

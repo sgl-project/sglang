@@ -81,6 +81,7 @@ def _graph_backend(req_to_token, runner_ids, *, drop_wide, bs):
         token_to_kv_pool=SimpleNamespace(index_page_size=PAGE),
         dsa_topk_backend=DSATopKBackend.TORCH,
         req_to_token=req_to_token,
+        max_kv_len=req_to_token.shape[1],
         runner_ids=runner_ids,
         _arange_buf=torch.arange(bs + 1, device="cuda", dtype=torch.int32),
         _is_in_breakable_cuda_graph=lambda: False,
