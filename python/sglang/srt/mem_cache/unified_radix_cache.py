@@ -483,9 +483,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         if cache_linker.load_mode == "prefetch":
-            memory = get_memory()
             self.prefetch_stop_policy = cache_linker.prefetch_policy
-            config = memory.unified_cache_external_linker_config
             (
                 _,
                 _,
@@ -493,9 +491,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 timeout_per_ki_token,
                 _,
             ) = HybridCacheController.parse_storage_backend_extra_config(
-                json.dumps(config)
-                if config is not None
-                else memory.hicache_storage_backend_extra_config
+                json.dumps(get_memory().unified_cache_external_linker_config)
             )
             self.prefetch_timeout_per_page = (
                 self.page_size / 1024 * timeout_per_ki_token
