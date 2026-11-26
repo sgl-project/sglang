@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Optional, Union, cast
 
 import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
@@ -28,7 +28,6 @@ if TYPE_CHECKING:
         HostKVPool,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.managers.schedule_batch import Req
 
 
 class FusedSparseKVCacheManager:
@@ -218,19 +217,7 @@ class FusedSparseKVCacheManager:
     def _install_req_alloc_hook(
         self, req_to_token_pool: ReqToTokenPool | DecodeReqToTokenPool
     ) -> None:
-        # Preserve the target manager's hook when adding the draft manager.
-        original_alloc = req_to_token_pool.alloc
-
-        def alloc_with_sparse_reset(reqs: list[Req]) -> Optional[List[int]]:
-            new_req_indices = [i for i, req in enumerate(reqs) if not req.kv.holds_kv]
-            req_pool_indices = original_alloc(reqs)
-            if req_pool_indices is not None and new_req_indices:
-                self.resident_pool.reset_rows(
-                    [req_pool_indices[i] for i in new_req_indices]
-                )
-            return req_pool_indices
-
-        setattr(req_to_token_pool, "alloc", alloc_with_sparse_reset)
+        req_to_token_pool.register_on_alloc_rows(self.resident_pool.reset_rows)
 
     def prepare_offload_rows(
         self, tokens: int, forward_batch: ForwardBatch

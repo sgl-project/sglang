@@ -3,64 +3,97 @@
 import ast
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock
 
 import pytest
 
 
-def make_manager(pool):
-    source = (
-        Path(__file__).resolve().parents[3]
-        / "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/fused_manager.py"
-    )
+def load_class(path, class_name, *methods):
+    source = Path(__file__).resolve().parents[3] / "python/sglang/srt" / path
     module = ast.parse(source.read_text(encoding="utf-8"))
-    manager = next(node for node in module.body if isinstance(node, ast.ClassDef))
-    method = next(
+    cls = next(
         node
-        for node in manager.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_install_req_alloc_hook"
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
     )
-    module.body = [
-        ast.ImportFrom(
-            module="__future__", names=[ast.alias(name="annotations")], level=0
-        ),
-        method,
+    cls.body = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name in methods
     ]
+    module.body = ast.parse("from __future__ import annotations").body + [cls]
     scope = {}
-    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
-    manager = SimpleNamespace(resident_pool=SimpleNamespace(reset_rows=Mock()))
-    scope["_install_req_alloc_hook"](manager, pool)
-    return manager
+    exec(compile(module, str(source), "exec"), scope)
+    return scope[class_name]
+
+
+class ResidentRows:
+    def __init__(self):
+        self.dirty_rows = {2, 3}
+
+    def reset_rows(self, rows):
+        self.dirty_rows.difference_update(rows)
+
+
+@pytest.fixture(
+    params=[
+        ("mem_cache/memory_pool.py", "ReqToTokenPool", ("alloc_rows",)),
+        ("disaggregation/decode.py", "DecodeReqToTokenPool", ()),
+    ],
+    ids=["req-to-token", "decode-req-to-token"],
+)
+def request_pool(request):
+    path, class_name, extra_methods = request.param
+    pool_type = load_class(
+        path, class_name, "alloc", "register_on_alloc_rows", *extra_methods
+    )
+    pool = pool_type()
+    pool._on_alloc_rows = None
+    pool.req_generation = MagicMock()
+
+    manager_type = load_class(
+        "hardware_backend/npu/sparsity_driven_kv_offload/fused_manager.py",
+        "FusedSparseKVCacheManager",
+        "_install_req_alloc_hook",
+    )
+    manager = manager_type()
+    manager.resident_pool = ResidentRows()
+    original_alloc = pool.alloc
+    manager._install_req_alloc_hook(pool)
+    assert pool.alloc == original_alloc
+    assert pool._on_alloc_rows == manager.resident_pool.reset_rows
+    return pool, manager.resident_pool
 
 
 @pytest.mark.parametrize(
-    "holds_kv,indices,expected",
-    [([False], [2], [2]), ([True], [2], []), ([True, False], [2, 3], [3])],
+    "existing_rows,indices,new_rows",
+    [([None], [2], [2]), ([2], [2], []), ([2, None], [2, 3], [3])],
 )
-def test_only_new_request_rows_are_reset(holds_kv, indices, expected):
-    requests = [SimpleNamespace(kv=SimpleNamespace(holds_kv=held)) for held in holds_kv]
-
-    def allocate(reqs):
-        for req in reqs:
-            req.kv.holds_kv = True
-        return indices
-
-    original = Mock(side_effect=allocate)
-    pool = SimpleNamespace(alloc=original)
-    manager = make_manager(pool)
+def test_only_new_request_rows_are_reset(
+    request_pool, existing_rows, indices, new_rows
+):
+    pool, resident = request_pool
+    pool.free_slots = new_rows.copy()
+    requests = [
+        SimpleNamespace(
+            kv=SimpleNamespace(
+                req_pool_idx=row,
+                holds_kv=row is not None,
+                kv_allocated_len=0 if row is None else 1,
+            )
+        )
+        for row in existing_rows
+    ]
 
     assert pool.alloc(requests) == indices
-    original.assert_called_once_with(requests)
-    if expected:
-        manager.resident_pool.reset_rows.assert_called_once_with(expected)
-    else:
-        manager.resident_pool.reset_rows.assert_not_called()
+    assert not pool.free_slots
+    assert resident.dirty_rows == {2, 3}.difference(new_rows)
 
 
-def test_failed_allocation_preserves_residency():
-    pool = SimpleNamespace(alloc=Mock(return_value=None))
-    manager = make_manager(pool)
-    request = SimpleNamespace(kv=SimpleNamespace(holds_kv=False))
-
+def test_failed_allocation_preserves_residency(request_pool):
+    pool, resident = request_pool
+    pool.free_slots = []
+    request = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=None, holds_kv=False))
     assert pool.alloc([request]) is None
-    manager.resident_pool.reset_rows.assert_not_called()
+    assert request.kv.req_pool_idx is None
+    assert resident.dirty_rows == {2, 3}
