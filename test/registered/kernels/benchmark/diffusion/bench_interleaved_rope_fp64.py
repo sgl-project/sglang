@@ -52,7 +52,7 @@ FN_MAP = {
 
 
 @marker.parametrize("case_name", list(CASES), ci_vals=["sana_video_480p"])
-@marker.benchmark("impl", ["eager", "jit"], unit="ms")
+@marker.benchmark("impl", ["eager", "jit"], unit="ms", gate=["jit"])
 def benchmark(case_name: str, impl: str) -> marker.BenchResult:
     case = CASES[case_name]
     generator = torch.Generator(device="cuda").manual_seed(42)

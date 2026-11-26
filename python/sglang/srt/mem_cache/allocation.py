@@ -863,6 +863,19 @@ def alloc_for_spec_decode(
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
+    # Nothing clamps the write below to the row: an allocation past it lands in
+    # the next request's row.
+    nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
+    row_width = req_to_token_pool.req_to_token.shape[1]
+    max_nxt_kv_len = max(nxt_kv_lens_list, default=0)
+    if max_nxt_kv_len > row_width:
+        raise RuntimeError(
+            f"Speculative decode allocation ({max_nxt_kv_len}) exceeds the "
+            f"req_to_token row width ({row_width}); the row headroom "
+            "(get_req_to_token_headroom) must cover the decode reserve "
+            "(get_decode_reserve) and its page rounding."
+        )
+
     if num_needed_tokens > 0:
         if tree_cache.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
@@ -916,6 +929,5 @@ def alloc_for_spec_decode(
             len(reqs),
         )
 
-    nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
     for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):
         req.kv.allocate_spec_decode(nxt_kv_len)

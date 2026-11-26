@@ -43,7 +43,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        cann_version: ["9.1.0"]
+        cann_version: ["9.2.0"]
         device_type: ["a3", "950"]
         platform: ["amd64", "arm64"]
         include:
@@ -106,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        cann_version: ["9.1.0"]
+        cann_version: ["9.2.0"]
         device_type: ["a3", "950"]
     steps:
       - name: Set up Docker Buildx
