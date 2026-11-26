@@ -39,6 +39,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
@@ -1069,6 +1070,184 @@ class TestMlaPrefixFia(unittest.TestCase):
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 self._check_prefix([3, 1], [16, 32], dtype, 0, 4, page_size=16)
+
+
+class TestEncoderOnlyForwardExtend(unittest.TestCase):
+    def _make_inputs(self, attn_type, *, use_fia=False, use_fa=False, can_use_tnd=True):
+        seq_lens = [3, 5]
+        tokens = sum(seq_lens)
+        heads, dim, page_size = 2, 64, 16
+        k_cache = torch.randn(2, page_size, heads * dim, dtype=torch.bfloat16)
+        v_cache = torch.randn(2, page_size, heads * dim, dtype=torch.bfloat16)
+
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = False
+        backend.use_dsa = False
+        backend.is_dllm_model = False
+        backend.use_quant_flash_attn = False
+        backend.attn_cp_size = 1
+        backend.page_size = page_size
+        backend.use_fia = use_fia
+        backend.use_fa = use_fa
+        backend.use_alibi = False
+        backend.fia_mask = torch.ones(32, 32, dtype=torch.bool).triu(1)
+        backend.mask = torch.ones(32, 32, dtype=torch.bfloat16).triu(1)
+        backend._is_swa_layer = lambda _: False
+        backend._can_use_tnd = lambda _: can_use_tnd
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: k_cache,
+            get_value_buffer=lambda _: v_cache,
+        )
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(32, dtype=torch.int32).reshape(2, 16)
+        )
+        backend.native_attn = MagicMock()
+        backend.native_attn.run_sdpa_forward_extend.side_effect = (
+            lambda q_, o_, *args, **kwargs: torch.zeros_like(o_)
+        )
+        backend.forward_metadata = ForwardMetadata(
+            block_tables=torch.tensor([[0], [1]], dtype=torch.int32),
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+            seq_lens_cpu_int=torch.tensor(seq_lens, dtype=torch.int32),
+            seq_lens_list_cumsum=[3, 8],
+            extend_seq_lens_cpu_int=torch.tensor(seq_lens, dtype=torch.int32),
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            attn_type=attn_type,
+            is_cross_attention=False,
+            tp_q_head_num=heads,
+            tp_k_head_num=heads,
+            tp_v_head_num=heads,
+            qk_head_dim=dim,
+            v_head_dim=dim,
+            scaling=dim**-0.5,
+            sliding_window_size=-1,
+            logit_cap=0.0,
+            logit_capping_method="tanh",
+        )
+        batch = SimpleNamespace(
+            global_num_token_non_padded_cpu=tokens,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+            extend_seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+            extend_seq_lens_cpu=seq_lens,
+            extend_prefix_lens=torch.zeros(len(seq_lens), dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+            encoder_lens=None,
+            attn_cp_metadata=None,
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
+                is_draft_extend_v2=lambda: False,
+                is_context_parallel_extend=lambda: False,
+            ),
+        )
+        q = torch.randn(tokens, heads * dim, dtype=torch.bfloat16)
+        k = torch.randn(tokens, heads * dim, dtype=torch.bfloat16)
+        v = torch.randn(tokens, heads * dim, dtype=torch.bfloat16)
+        return backend, q, k, v, layer, batch
+
+    def test_fia_tnd_disables_causal_mask_for_encoder_only(self):
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        for attn_type, exp_sparse, exp_masked in (
+            (AttentionType.ENCODER_ONLY, 0, False),
+            (AttentionType.DECODER, 3, True),
+        ):
+            with self.subTest(attn_type=attn_type):
+                backend, q, k, v, layer, batch = self._make_inputs(
+                    attn_type, use_fia=True, can_use_tnd=True
+                )
+                fia_out = torch.zeros(
+                    q.shape[0], layer.tp_q_head_num, layer.v_head_dim, dtype=q.dtype
+                )
+                with (
+                    patch(f"{module}.is_mla_preprocess_enabled", return_value=False),
+                    patch(
+                        f"{module}.torch_npu.npu_fused_infer_attention_score",
+                        return_value=(fia_out, None),
+                    ) as fia_mock,
+                ):
+                    out = backend.forward_extend(
+                        q, k, v, layer, batch, save_kv_cache=False
+                    )
+                self.assertEqual(out.shape, q.shape)
+                kwargs = fia_mock.call_args.kwargs
+                self.assertEqual(kwargs["sparse_mode"], exp_sparse)
+                if exp_masked:
+                    self.assertIs(kwargs["atten_mask"], backend.fia_mask)
+                else:
+                    self.assertIsNone(kwargs["atten_mask"])
+
+    def test_fia_bsnd_disables_causal_mask_for_encoder_only(self):
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        for attn_type, exp_sparse, exp_masked in (
+            (AttentionType.ENCODER_ONLY, 0, False),
+            (AttentionType.DECODER, 3, True),
+        ):
+            with self.subTest(attn_type=attn_type):
+                backend, q, k, v, layer, batch = self._make_inputs(
+                    attn_type, use_fia=True, can_use_tnd=False
+                )
+                with (
+                    patch(f"{module}.is_mla_preprocess_enabled", return_value=False),
+                    patch(
+                        f"{module}.torch_npu.npu_fused_infer_attention_score_v2",
+                        side_effect=lambda **kw: (
+                            torch.zeros_like(kw["query"]),
+                            None,
+                        ),
+                    ) as fia_v2_mock,
+                ):
+                    out = backend.forward_extend(
+                        q, k, v, layer, batch, save_kv_cache=False
+                    )
+                self.assertEqual(out.shape, q.shape)
+                self.assertEqual(fia_v2_mock.call_count, 2)
+                for call in fia_v2_mock.call_args_list:
+                    self.assertEqual(call.kwargs["sparse_mode"], exp_sparse)
+                    if exp_masked:
+                        self.assertIsNotNone(call.kwargs["atten_mask"])
+                    else:
+                        self.assertIsNone(call.kwargs["atten_mask"])
+
+    def test_fa_and_fallback_honor_encoder_only_directionality(self):
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        for attn_type, exp_causal in (
+            (AttentionType.ENCODER_ONLY, False),
+            (AttentionType.DECODER, True),
+        ):
+            with self.subTest(path="fa", attn_type=attn_type):
+                backend, q, k, v, layer, batch = self._make_inputs(
+                    attn_type, use_fa=True
+                )
+                fa_mock = MagicMock(
+                    return_value=torch.zeros(
+                        q.shape[0], layer.tp_q_head_num, layer.v_head_dim, dtype=q.dtype
+                    )
+                )
+                fake_fa_mod = SimpleNamespace(flash_attn_with_kvcache=fa_mock)
+                with (
+                    patch(f"{module}.is_mla_preprocess_enabled", return_value=False),
+                    patch.dict(sys.modules, {"flash_attn_npu_v3": fake_fa_mod}),
+                    patch.object(
+                        torch.Tensor, "npu", lambda t, *a, **kw: t, create=True
+                    ),
+                ):
+                    backend.forward_extend(q, k, v, layer, batch, save_kv_cache=False)
+                self.assertEqual(fa_mock.call_args.kwargs["causal"], exp_causal)
+
+        backend, q, k, v, layer, batch = self._make_inputs(
+            AttentionType.ENCODER_ONLY, use_fia=False, use_fa=False
+        )
+        with (
+            patch(f"{module}.is_mla_preprocess_enabled", return_value=False),
+            patch(f"{module}.torch_npu._npu_flash_attention_qlens") as qlens_mock,
+        ):
+            backend.forward_extend(q, k, v, layer, batch, save_kv_cache=False)
+        qlens_mock.assert_not_called()
+        backend.native_attn.run_sdpa_forward_extend.assert_called_once()
+        self.assertFalse(
+            backend.native_attn.run_sdpa_forward_extend.call_args.kwargs["causal"]
+        )
 
 
 if __name__ == "__main__":
