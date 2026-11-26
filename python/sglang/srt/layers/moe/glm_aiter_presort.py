@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
 from sglang.kernels.ops.moe import glm_route_sort
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.aiter_presort import _registrar
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -26,6 +25,18 @@ logger = logging.getLogger(__name__)
 # The output buffer the last route_and_register zeroed, until the runner takes it.
 _pending_output: Optional[torch.Tensor] = None
 _announced = False
+
+
+@functools.cache
+def _registrar() -> Optional[Callable[[Optional[dict]], None]]:
+    # An AITER whose fused_moe cannot match a plain-layout sort (ROCm/aiter#8045)
+    # still has register_presorted_moe, but would drop every registration.
+    try:
+        from aiter.fused_moe import register_presorted_moe
+        from aiter.presorted_moe import match_plain_presorted_moe  # noqa: F401
+    except ImportError:
+        return None
+    return register_presorted_moe
 
 
 def kernel_ready(router_logits: torch.Tensor, correction_bias: torch.Tensor) -> bool:
