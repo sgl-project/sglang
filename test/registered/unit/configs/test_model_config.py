@@ -2,6 +2,7 @@
 
 import json
 import os
+import string
 import unittest
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -357,11 +358,41 @@ class TestReasoningTokenFields(CustomTestCase):
 
 
 class TestDecisionCheckpointConfig(CustomTestCase):
+    @staticmethod
+    def _answer_codes(count: int = 255):
+        return (
+            list(string.ascii_uppercase)
+            + [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase]
+        )[:count]
+
     def _checkpoint(self, directory, **decision):
         Qwen3_5Config(architectures=["Qwen3_5Model"]).save_pretrained(directory)
-        decision = {"format_version": 1, "codes": ["A"], "token_ids": [32], **decision}
+        decision = dict(decision)
+        format_version = decision.setdefault("format_version", 1)
+        if format_version == 2:
+            decision.setdefault("codes", self._answer_codes())
+            decision.setdefault("token_ids", list(range(32, 32 + 255)))
+        else:
+            decision.setdefault("codes", ["A"])
+            decision.setdefault("token_ids", [32])
+        decision.setdefault("temperature", 1.0)
         with open(os.path.join(directory, "decision_config.json"), "w") as f:
             json.dump(decision, f)
+
+    def _joint_config(self, directory, **updates):
+        protocol = {
+            "version": 4,
+            "template": "joint-chunked-readout-v1",
+            "marker": "<|fim_suffix|>",
+            "separator": "<|fim_middle|>",
+            "readout_offset": 0,
+            "max_questions": None,
+            "max_length": None,
+            "usage": "nonpadding_joint_sequence_including_template_and_image_positions",
+            **updates,
+        }
+        with open(os.path.join(directory, "joint_config.json"), "w") as f:
+            json.dump(protocol, f)
 
     def test_attention_mode_reaches_the_text_config(self):
         """A noncausal decision checkpoint must not be served with causal full attention."""
@@ -387,6 +418,50 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                 self._checkpoint(checkpoint, **decision)
                 with self.assertRaisesRegex(ValueError, "is not supported"):
                     load_decision_config(checkpoint, None)
+
+    def test_joint_protocol_makes_a_v2_checkpoint_non_causal(self):
+        """The marker-readout format is served only with its declared protocol."""
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(
+                checkpoint,
+                format_version=2,
+                attention_mode="noncausal_full_attention",
+            )
+            self._joint_config(checkpoint)
+            config = ModelConfig(model_path=checkpoint)
+        self.assertIs(config.hf_text_config.is_causal, False)
+
+    def test_v2_checkpoint_requires_a_supported_joint_protocol(self):
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(
+                checkpoint,
+                format_version=2,
+                attention_mode="noncausal_full_attention",
+            )
+            with self.assertRaisesRegex(ValueError, "requires joint_config.json"):
+                load_decision_config(checkpoint, None)
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(
+                checkpoint,
+                format_version=2,
+                attention_mode="noncausal_full_attention",
+            )
+            self._joint_config(checkpoint, marker="<|wrong|>")
+            with self.assertRaisesRegex(ValueError, "protocol-v4 declaration"):
+                load_decision_config(checkpoint, None)
+
+    def test_v2_checkpoint_requires_exactly_255_codes(self):
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(
+                checkpoint,
+                format_version=2,
+                attention_mode="noncausal_full_attention",
+                codes=self._answer_codes(254),
+                token_ids=list(range(32, 32 + 254)),
+            )
+            self._joint_config(checkpoint)
+            with self.assertRaisesRegex(ValueError, "requires 255 unique"):
+                load_decision_config(checkpoint, None)
 
 
 class TestAudioUnderstandableFlag(CustomTestCase):
