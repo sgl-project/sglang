@@ -231,6 +231,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
     get_spec,
+    get_stream,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -352,12 +353,14 @@ class DeepseekV2MLP(nn.Module):
         forward_batch=None,
         gemm_output_zero_allocator: BumpAllocator = None,
         gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        defer_down_proj: bool = False,
     ):
         if self.is_replicated and x.shape[0] == 0:
             return x
 
         if (
-            getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
+            not defer_down_proj
+            and getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
             and self.swiglu_limit is None
             and not isinstance(x, tuple)
         ):
@@ -404,7 +407,8 @@ class DeepseekV2MLP(nn.Module):
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
         if (
-            self.swiglu_limit is not None
+            not defer_down_proj
+            and self.swiglu_limit is not None
             and self.allow_fused_down
             and getattr(self.down_proj, "weight", None) is not None
             and self.down_proj.weight.dtype == torch.uint8
@@ -499,6 +503,8 @@ class DeepseekV2MLP(nn.Module):
                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
+        if defer_down_proj:
+            return x
         x, _ = self.down_proj(x)
         return x
 
@@ -667,6 +673,8 @@ def _scale_routed_and_add_shared(
 
 
 class DeepseekV2MoE(nn.Module):
+    _npu_shared_down_stream = None
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1025,6 +1033,22 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_ops()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        if (
+            _is_npu
+            and envs.SGLANG_NPU_ENABLE_SHARED_DOWN_COMBINE_OVERLAP.get()
+            and (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
+            )
+            and self._shared_expert_tp1
+            and not self._fuse_shared_experts_inside_sbo
+            and not is_tbo_enabled()
+        ):
+            self._npu_shared_down_stream = (
+                alt_stream
+                if alt_stream is not None
+                else get_stream("npu_moe_shared_down")
+            )
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
@@ -1586,6 +1610,32 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = post_experts_all_reduce(final_hidden_states)
         return final_hidden_states
 
+    def _run_experts_with_shared_down(self, hidden_states, topk_output, down_input):
+        main_stream = torch.cuda.current_stream()
+        shared_stream = self._npu_shared_down_stream
+        shared_output = None
+
+        def launch_shared_down(_dispatcher, _combine_input):
+            nonlocal shared_output
+            # Wait for the routed GEMMs. Combine is enqueued after this fork,
+            # so it can run while the shared down projection uses the side stream.
+            shared_stream.wait_stream(main_stream)
+            with torch.cuda.stream(shared_stream):
+                shared_output, _ = self.shared_experts.down_proj(down_input)
+
+        hook = self.experts.dispatcher.register_pre_combine_hook(launch_shared_down)
+        try:
+            routed_output = self.experts(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
+        finally:
+            hook.remove()
+
+        assert shared_output is not None
+        main_stream.wait_stream(shared_stream)
+        shared_output.record_stream(main_stream)
+        return routed_output, shared_output
+
     def forward_deepep(
         self,
         hidden_states: torch.Tensor,
@@ -1593,6 +1643,18 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        shared_event = None
+        defer_shared_down = (
+            self._npu_shared_down_stream is not None
+            and hidden_states.shape[0] > 0
+            and forward_batch is not None
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and not is_in_breakable_cuda_graph()
+            and not is_in_tc_piecewise_cuda_graph()
+        )
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1604,7 +1666,15 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
+            if defer_shared_down:
+                shared_stream = self._npu_shared_down_stream
+                shared_stream.wait_stream(torch.cuda.current_stream())
+                hidden_states.record_stream(shared_stream)
+                with torch.cuda.stream(shared_stream):
+                    down_input = self.shared_experts(
+                        hidden_states, defer_down_proj=True
+                    )
+            elif not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
@@ -1780,18 +1850,17 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+        if defer_shared_down:
+            final_hidden_states, shared_output = self._run_experts_with_shared_down(
+                hidden_states, topk_output, down_input
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
-        if (
-            hidden_states.shape[0] > 0
-            and not sbo_enabled_flag
-            and self.num_fused_shared_experts == 0
-            and self.alt_stream is not None
-            and not is_in_breakable_cuda_graph()
-        ):
+        if shared_event is not None and not is_in_breakable_cuda_graph():
             torch.cuda.current_stream().wait_event(shared_event)
 
         return _scale_routed_and_add_shared(
