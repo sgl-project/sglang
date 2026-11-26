@@ -483,6 +483,30 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(joined._radix_eviction_policy_explicitly_set)
         self.assertTrue(configured._radix_eviction_policy_explicitly_set)
 
+    def test_elastic_ep_backend_none_leaves_elastic_ep_off(self):
+        """`--elastic-ep-backend none` is the documented off choice: it must
+        resolve to None, which is what every reader tests, on the command line
+        and in a config file."""
+        cases = (
+            (None, [], None),
+            (None, ["--elastic-ep-backend", "none"], None),
+            (None, ["--elastic-ep-backend=none"], None),
+            ("elastic-ep-backend: none\n", [], None),
+            (None, ["--elastic-ep-backend", "nixl"], "nixl"),
+            ("elastic-ep-backend: mooncake\n", [], "mooncake"),
+        )
+        for config, cli, expected in cases:
+            with self.subTest(config=config, cli=cli):
+                argv = ["--model-path", "dummy", *cli]
+                if config is not None:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".yaml", delete=False
+                    ) as f:
+                        f.write(config)
+                    self.addCleanup(os.unlink, f.name)
+                    argv += ["--config", f.name]
+                self.assertEqual(prepare_server_args(argv).elastic_ep_backend, expected)
+
     def test_monokernel_flags_in_config_and_cli(self):
         """--enable-amd-monokernel and --enable-nvidia-megakernel parse the same
         from the command line and from a config file."""
@@ -933,6 +957,19 @@ class TestPrepareServerArgs(CustomTestCase):
             ):
                 ServerArgs(model_path="dummy", **fields).resolve_once()
             self.assertEqual(str(raised.exception), message)
+
+    def test_malformed_env_value_stops_startup(self):
+        """A registered environment variable whose value does not parse stops
+        startup, even when only a later code path would read it."""
+        with (
+            envs.SGLANG_EXA_NUM_RESULTS.override("ten"),
+            self.assertRaisesRegex(
+                ValueError,
+                'Invalid value for SGLANG_EXA_NUM_RESULTS: "ten" is not a valid '
+                "integer value",
+            ),
+        ):
+            ServerArgs(model_path="dummy").resolve_once()
 
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
@@ -5479,6 +5516,48 @@ class TestRustServerPrefillReplicaDp(CustomTestCase):
                 envs.SGLANG_RUST_SERVER.override(rust_server),
             ):
                 args(**kwargs).check_server_args()
+
+
+class TestShortestPrefillLoadScalingArgs(CustomTestCase):
+    def check(self, **kwargs):
+        ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            page_size=1,
+            chunked_prefill_size=4096,
+            **kwargs,
+        ).check_server_args()
+
+    def test_each_invalid_combination_is_rejected(self):
+        on = dict(
+            schedule_policy="shortest-prefill-first",
+            shortest_prefill_boundary_halving_chunks=1.0,
+        )
+        for kwargs in (
+            dict(on, shortest_prefill_budget_min_ratio=-0.1),
+            dict(on, shortest_prefill_boundary_decay_start_chunks=float("inf")),
+            dict(shortest_prefill_boundary_decay_start_chunks=1.0),
+            dict(on, shortest_prefill_budget_min_ratio=1.5),
+            dict(on, shortest_prefill_budget_doubling_chunks=0.0),
+            dict(
+                on,
+                shortest_prefill_budget_min_ratio=0.0,
+                shortest_prefill_budget_doubling_chunks=1.0,
+            ),
+            dict(shortest_prefill_boundary_halving_chunks=1.0),
+            dict(on, shortest_prefill_aging_factor=0.5),
+            dict(on, dllm_algorithm="LowConfidence"),
+        ):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                self.check(**kwargs)
+
+    def test_explicit_zeros_are_accepted(self):
+        self.check(
+            schedule_policy="shortest-prefill-first",
+            shortest_prefill_boundary_halving_chunks=1.0,
+            shortest_prefill_boundary_decay_start_chunks=0.0,
+            shortest_prefill_budget_min_ratio=0.0,
+        )
 
 
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
