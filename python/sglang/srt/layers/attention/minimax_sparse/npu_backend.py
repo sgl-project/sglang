@@ -188,7 +188,7 @@ class MiniMaxNPUSparseAttnBackend(MiniMaxSparseBaseBackend):
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
-            self._max_seqlen_k = self.max_context_len
+            self._max_seqlen_k = self.req_to_token_pool.row_width
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
 

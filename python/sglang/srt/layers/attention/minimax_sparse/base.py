@@ -53,7 +53,6 @@ class MiniMaxSparseBaseBackend(AttentionBackend):
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
         self.req_to_token_pool = runner.req_to_token_pool  # pool obj for TboAttnBackend
         self.req_to_token = runner.req_to_token_pool.req_to_token
-        self.max_context_len = int(runner.model_config.context_len)
         self.page_size = self.kv_pool.page_size
 
         self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(

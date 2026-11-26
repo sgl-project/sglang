@@ -41,7 +41,6 @@ class _DummyDenseBackend(AttentionBackend):
         self.token_to_kv_pool = None
         self.req_to_token_pool = None
         self.needs_cpu_seq_lens = False
-        self.max_context_len = 128
 
 
 class TestMiniMaxSparseSubpackageDispatch(CustomTestCase):
@@ -99,7 +98,9 @@ class TestMiniMaxSparseSubpackageDispatch(CustomTestCase):
             runner = SimpleNamespace(
                 token_to_kv_pool=pool,
                 hisparse_coordinator=None,
-                req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(1, 128)),
+                req_to_token_pool=SimpleNamespace(
+                    row_width=1024, req_to_token=torch.zeros(1, 128)
+                ),
                 model_config=SimpleNamespace(
                     context_len=1024,
                     num_attention_heads=64,

@@ -621,7 +621,9 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
         )
         runner = SimpleNamespace(
             token_to_kv_pool=pool,
-            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(1, 128)),
+            req_to_token_pool=SimpleNamespace(
+                row_width=128, req_to_token=torch.zeros(1, 128)
+            ),
             model_config=SimpleNamespace(
                 context_len=128, hf_config=config, hf_text_config=config
             ),

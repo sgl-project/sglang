@@ -23,7 +23,7 @@ Select **Docker** in the command panel to launch the image on the host. The **Py
 Pick your hardware to generate the launch command. Each GPU has one tensor-parallel layout: TP2 on B200, TP4 on GB300, B300, H200 and H20-3e, and TP8 on H100 and H800.
 
 - **Spec Decode → Off** — the default. Standard decoding.
-- **Spec Decode → MTP (NEXTN)** — speculative decoding with the MTP layer built into the checkpoint, on the same layout. On the measured GPUs it is slower than standard decoding; see [MTP (NEXTN)](#mtp-nextn).
+- **Spec Decode → MTP (NEXTN)** — speculative decoding with the MTP layer built into the checkpoint, on the same layout. On GB300 it raised output throughput over standard decoding; see [MTP (NEXTN)](#mtp-nextn).
 
 The B200 and GB300 recipes ran on the release weights through full 1319-question GSM8K, text, reasoning, tool-call, image and video probes, and speed benchmarks; the MTP recipes also passed long-context retrieval. The other GPUs use the model card's layouts and are not verified.
 
@@ -119,9 +119,10 @@ import { Playground } from "/src/snippets/_playground.jsx";
 Standard decoding is the default recipe; MTP is an option.
 
 - `--speculative-algorithm NEXTN` loads the draft layer from the same checkpoint and defaults to 3 steps, top-k 1, and 4 draft tokens; no draft model path is needed.
-- Measured accept length was 2.81 on B200 TP2 and 2.79 on GB300 TP4 over full GSM8K, and 2.49 on GB300 TP4 over ShareGPT prompts (tokens per verify step, including the target's bonus token). Full GSM8K accuracy with MTP was within 0.4 points of standard decoding on the same GPU.
+- On Blackwell GPUs, SGLang runs the MTP draft on the `trtllm_mla` attention backend with `--page-size 64` unless either is set, so every draft forward runs in a CUDA graph.
+- Measured accept length on GB300 TP4 was 2.86 over full GSM8K and 2.48 over ShareGPT prompts (tokens per verify step, including the target's bonus token). Full GSM8K accuracy with MTP was within 0.4 points of standard decoding on the same GPU.
 - With MTP, SGLang caps concurrent requests at 48 unless `--max-running-requests` is set; the measured recipes use this default. Set it for your target concurrency, within the KV-pool capacity.
-- MTP had lower output throughput and higher TTFT and TPOT than standard decoding, both in the random-prompt benchmarks on the cards and on real ShareGPT prompts:
+- On GB300, MTP had higher output throughput and lower TPOT than standard decoding, both in the random-prompt benchmarks on the cards and on real ShareGPT prompts.
 
 <table style={{width: "100%", borderCollapse: "collapse", fontSize: "14px"}}>
   <colgroup>
@@ -151,9 +152,9 @@ Standard decoding is the default recipe; MTP is an option.
     <tr style={{borderBottom: "1px solid rgba(127,127,127,0.2)"}}>
       <td style={{textAlign: "left", padding: "6px 8px"}}>MTP (NEXTN)</td>
       <td style={{textAlign: "right", padding: "6px 8px"}}>1</td>
-      <td style={{textAlign: "right", padding: "6px 8px"}}>169.1</td>
-      <td style={{textAlign: "right", padding: "6px 8px"}}>161</td>
-      <td style={{textAlign: "right", padding: "6px 8px"}}>5.60</td>
+      <td style={{textAlign: "right", padding: "6px 8px"}}>355.2</td>
+      <td style={{textAlign: "right", padding: "6px 8px"}}>41</td>
+      <td style={{textAlign: "right", padding: "6px 8px"}}>2.72</td>
     </tr>
     <tr style={{borderBottom: "1px solid rgba(127,127,127,0.2)"}}>
       <td style={{textAlign: "left", padding: "6px 8px"}}>Standard</td>
@@ -165,9 +166,9 @@ Standard decoding is the default recipe; MTP is an option.
     <tr>
       <td style={{textAlign: "left", padding: "6px 8px"}}>MTP (NEXTN)</td>
       <td style={{textAlign: "right", padding: "6px 8px"}}>16</td>
-      <td style={{textAlign: "right", padding: "6px 8px"}}>1356.1</td>
-      <td style={{textAlign: "right", padding: "6px 8px"}}>179</td>
-      <td style={{textAlign: "right", padding: "6px 8px"}}>11.30</td>
+      <td style={{textAlign: "right", padding: "6px 8px"}}>2327.7</td>
+      <td style={{textAlign: "right", padding: "6px 8px"}}>59</td>
+      <td style={{textAlign: "right", padding: "6px 8px"}}>6.57</td>
     </tr>
   </tbody>
 </table>
