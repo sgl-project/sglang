@@ -233,6 +233,8 @@ class RayEngine(Engine):
         # Set before super().__init__(): it launches the subprocesses, which need
         # the group to schedule the scheduler actors onto.
         self._placement_group = kwargs.pop("placement_group", None)
+        # Tokenizers and schedulers must agree on the transport for Ray workers.
+        kwargs["use_ray"] = True
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
         # Schedulers are separate Ray actors; default to the Ray-backed

@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import time
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -68,6 +69,24 @@ _PROMPTS = [
     "Write a haiku about programming:",
     "What is 2 + 2?",
 ]
+
+
+@unittest.skipUnless(_has_ray, "Ray is required")
+class TestRayEngineTransport(unittest.TestCase):
+    def test_direct_engine_uses_cross_host_transport_without_flag(self):
+        from sglang.srt.entrypoints.engine import Engine
+        from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+        from sglang.srt.ray.engine import RayEngine
+        from sglang.srt.runtime_context import create_context, use_context
+
+        with patch.object(Engine, "__init__", return_value=None) as engine_init:
+            RayEngine(model_path="dummy", nnodes=2, pp_size=2)
+
+        server_args = engine_init.call_args.kwargs["server_args"]
+        for role in ("tokenizer", "scheduler"):
+            with self.subTest(role=role):
+                with use_context(create_context(server_args, role=role)):
+                    self.assertEqual(determine_tensor_transport_mode(), "default")
 
 
 # ---------------------------------------------------------------------------

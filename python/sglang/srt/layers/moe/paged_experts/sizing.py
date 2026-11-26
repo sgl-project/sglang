@@ -15,14 +15,40 @@ import torch
 
 from sglang.srt.runtime_context import (
     get_context,
+    get_exec,
     get_mm,
     get_model,
+    get_parallel,
     get_schedule,
 )
 
 logger = logging.getLogger(__name__)
 
 _GIB = 1 << 30
+
+
+def check_tp_sizing(model) -> None:
+    """Fail on every TP rank before graph capture if the final slot/capture plans differ."""
+    from sglang.srt.layers.moe.paged_experts.method import PagedExpertsMoEMethod
+
+    parallel = get_parallel()
+    if parallel.tp_size == 1:
+        return
+    ks = [
+        m.quant_method.num_resident
+        for m in model.modules()
+        if isinstance(getattr(m, "quant_method", None), PagedExpertsMoEMethod)
+    ]
+    decode = get_exec().graph.cuda_graph_config.decode
+    plan = (ks, list(decode.bs or ()), decode.max_bs)
+    # Object gather also detects different layer/capture counts, without a collective
+    # over tensors of different lengths. This runs once at startup, never per step.
+    plans = parallel.tp_group.all_gather_object(plan)
+    if any(other != plans[0] for other in plans[1:]):
+        raise RuntimeError(
+            "Paged experts: K or decode CUDA graph capture sizes differ across TP ranks "
+            f"(K, capture sizes, max batch size): {plans}"
+        )
 
 
 @dataclass
@@ -73,7 +99,13 @@ def static_budget_bytes(kv_configurator, pre_model_load_memory: float) -> int:
     from sglang.srt.utils.device import get_available_gpu_memory
 
     gc.collect()
-    free_gb = get_available_gpu_memory(kv_configurator.device, kv_configurator.gpu_id)
+    tp_group = get_parallel().tp_group
+    free_gb = get_available_gpu_memory(
+        device=kv_configurator.device,
+        gpu_id=kv_configurator.gpu_id,
+        distributed=tp_group.world_size > 1,
+        cpu_group=tp_group.cpu_group,
+    )
     slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
     mm_gb = mm_runtime_reservation_gb(
         is_multimodal=kv_configurator.model_config.is_multimodal,

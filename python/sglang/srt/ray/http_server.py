@@ -15,6 +15,8 @@
 
 from typing import Callable, Optional
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.entrypoints.engine import init_tokenizer_manager
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -42,6 +44,9 @@ def launch_server(
 
     if execute_warmup_func is None:
         execute_warmup_func = _execute_server_warmup
+
+    if not resolving_view(server_args).use_ray:
+        declare_resolution(server_args, "ray.http_server", use_ray=True)
 
     reserved_socket = _reserve_http_socket(server_args)
     try:
