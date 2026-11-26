@@ -277,14 +277,14 @@ class TestNpuMhcSeam(unittest.TestCase):
             rows * self.MULT * self.HIDDEN, dtype=torch.float32
         ).reshape(rows, self.MULT, self.HIDDEN)
 
-    def test_a3_combine_folds_the_previous_premix_and_stashes_the_triplet(self):
+    def test_a3_combine_calls_v2_with_previous_premix_and_stashes_the_triplet(self):
         hc = self._sub_layer()
         x = self._residual()
         pre_prev = torch.full((2, self.MULT), 0.25)
         state = mhc.HcState(x, pre_prev)
         seen = {}
 
-        def fake_pre_dpskv4(*args, **kwargs):
+        def fake_pre_sinkhorn_v2(*args, **kwargs):
             seen["args"] = args
             seen["kwargs"] = kwargs
             return (
@@ -295,7 +295,7 @@ class TestNpuMhcSeam(unittest.TestCase):
             )
 
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_pre_dpskv4 = fake_pre_dpskv4
+        stub.mhc_pre_sinkhorn_v2 = fake_pre_sinkhorn_v2
         with (
             patch.object(mhc, "_is_npu", True),
             patch.object(mhc, "is_npu_arch35", return_value=False),
@@ -316,23 +316,22 @@ class TestNpuMhcSeam(unittest.TestCase):
         self.assertEqual(args[5], 20)
         self.assertEqual(args[6], 1e-6)
         self.assertEqual(args[7], 1e-6)
-        # The previous pre-mix is folded in and the pre-mix is requested back.
+        # V2 receives the previous pre-mix and returns the current triplet.
+        self.assertEqual(set(seen["kwargs"]), {"pre_mix"})
         self.assertIs(seen["kwargs"]["pre_mix"], pre_prev)
-        self.assertIs(seen["kwargs"]["return_pre"], True)
-        self.assertEqual(seen["kwargs"]["impl"], "cann_ops_transformers_cann920_v2")
         # ``mix_stats`` is skipped: the post reads the stashed coefficients.
         pre, post_mix, comb = state.stats
         torch.testing.assert_close(pre, torch.full((2, self.MULT), 0.5))
         torch.testing.assert_close(post_mix, torch.ones(2, self.MULT))
         torch.testing.assert_close(comb, torch.ones(2, self.MULT, self.MULT))
 
-    def test_npu_first_sublayer_seeds_the_identity_one_hot(self):
+    def test_a5_first_sublayer_calls_v2_with_stream_zero_one_hot(self):
         hc = self._sub_layer()
         x = self._residual()
         state = mhc.HcState(x)  # no previous pre-mix
         seen = {}
 
-        def fake_pre_dpskv4(*args, **kwargs):
+        def fake_pre_sinkhorn_v2(*args, **kwargs):
             seen["args"] = args
             seen["kwargs"] = kwargs
             return (
@@ -343,7 +342,7 @@ class TestNpuMhcSeam(unittest.TestCase):
             )
 
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_pre_dpskv4 = fake_pre_dpskv4
+        stub.mhc_pre_sinkhorn_v2 = fake_pre_sinkhorn_v2
         with (
             patch.object(mhc, "_is_npu", True),
             patch.object(mhc, "is_npu_arch35", return_value=True),
@@ -352,14 +351,14 @@ class TestNpuMhcSeam(unittest.TestCase):
             out = mhc.combine(hc, state)
 
         torch.testing.assert_close(out, x[:, 0, :])
-        # Recipes seeds the first sublayer with the identity one-hot, i.e. the
+        # V2 receives the identity one-hot, i.e. the
         # plain ``norm(x[:, 0, :])`` of the device-agnostic path.
         expected = torch.zeros(2, self.MULT)
         expected[:, 0] = 1.0
         pre_mix = seen["kwargs"]["pre_mix"]
         self.assertEqual(pre_mix.dtype, torch.float32)
         torch.testing.assert_close(pre_mix, expected)
-        self.assertEqual(seen["kwargs"]["impl"], "cann_recipes_infer_cann920")
+        self.assertEqual(set(seen["kwargs"]), {"pre_mix"})
 
     def test_npu_empty_batch_skips_the_kernel(self):
         hc = self._sub_layer()
@@ -370,7 +369,7 @@ class TestNpuMhcSeam(unittest.TestCase):
             raise AssertionError("the kernel must not run without rows")
 
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_pre_dpskv4 = boom
+        stub.mhc_pre_sinkhorn_v2 = boom
         with (
             patch.object(mhc, "_is_npu", True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),

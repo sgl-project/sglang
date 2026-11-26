@@ -367,7 +367,7 @@ def mix_stats_from_state(
 ) -> HcTriplet:
     """``mix_stats``, unless the combine already stashed the triplet.
 
-    The NPU combine (``mhc_pre_dpskv4``, see ``_npu_combine_premix``) predicts
+    The NPU combine (``mhc_pre_sinkhorn_v2``, see ``_npu_combine_premix``) predicts
     this sublayer's ``(pre, post, comb)`` as a by-product and parks it on
     ``state.stats``.  This consumes the fused operator's coefficients exactly
     like the target model does (``precomputed=state.stats`` through
@@ -550,18 +550,7 @@ def _npu_combine_premix(
     x: torch.Tensor,
     apply_pre: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Single-pass NPU mHC pre-mix and coefficient prediction.
-
-    ``combine`` collapses the streams and ``mix_stats`` predicts the triplet in
-    two steps elsewhere; the AscendC kernel does both in one launch -- it folds
-    the residual with the *previous* sublayer's pre-mix and returns this
-    sublayer's own ``(pre, post, comb)``. Those coefficients are stashed on
-    ``state.stats``, which ``_compute_triplet`` prefers over re-predicting, so the
-    post that follows consumes them.
-
-    Recipes: models/deepseek_v4_1/models/modules/op_impls/mhc.py L57-L71
-    (``hc_pre_ascendc``) and modeling_deepseek.py L1621-L1624 / L1638-L1640.
-    """
+    """Fold the previous pre-mix and cache the current triplet in one NPU call."""
     cfg = hc.cfg
     if x.shape[0] == 0:
         # Idle / DP-padding rank: nothing to mix, and the coefficient writers
@@ -577,9 +566,9 @@ def _npu_combine_premix(
         # one-hot (stream 0 on its own).
         apply_pre = x.new_zeros((x.shape[0], cfg.mult), dtype=torch.float32)
         apply_pre[:, 0] = 1.0
-    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn_v2
 
-    y, post_mix, comb, pre = mhc_pre_dpskv4(
+    y, post_mix, comb, pre = mhc_pre_sinkhorn_v2(
         x,
         hc.fn,
         hc.scale,
@@ -589,12 +578,6 @@ def _npu_combine_premix(
         cfg.eps,
         cfg.rms_eps,
         pre_mix=apply_pre,
-        return_pre=True,
-        impl=(
-            "cann_recipes_infer_cann920"
-            if is_npu_arch35()
-            else "cann_ops_transformers_cann920_v2"
-        ),
     )
     state.stats = (pre, post_mix, comb)
     return hc.norm(y)
