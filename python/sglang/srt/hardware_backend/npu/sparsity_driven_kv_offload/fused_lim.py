@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.npu_lim import (
@@ -25,8 +25,7 @@ def sparse_query_width(forward_batch):
     return forward_batch.spec_info.num_tokens_per_req
 
 
-@dataclass
-class LIMSelection:
+class LIMSelection(msgspec.Struct):
     source_ids: torch.Tensor
     device_slots: torch.Tensor
     topk_misses: torch.Tensor

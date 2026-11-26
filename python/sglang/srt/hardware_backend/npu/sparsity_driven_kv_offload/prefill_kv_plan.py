@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
+import msgspec
 import torch
 
 
@@ -22,8 +21,7 @@ def prepare_prefill_gather_rows(
     return keep, int(lengths.sum())
 
 
-@dataclass
-class FusedPrefillPlan:
+class FusedPrefillPlan(msgspec.Struct):
     """Forward-local physical mapping and borrowed same-stream workspace."""
 
     total_tokens: int
