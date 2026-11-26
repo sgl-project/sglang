@@ -4610,6 +4610,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
         return comp._mamba_host_only_checkpoint()
 
+    def _anchor_lacks_mamba_state(self, node_id: NodeId) -> bool:
+        return (
+            self._mamba_host_only_checkpoint()
+            and not self.tree_core.is_root(node_id)
+            and self.tree_core.get_component_device_value(node_id, ComponentType.MAMBA)
+            is None
+        )
+
     # ---- HiCache: Scheduler Entry Points ----
 
     @rank_consensus(same_params=["params.host_hit_length"])
@@ -4618,7 +4626,8 @@ class UnifiedRadixCache(BasePrefixCache):
         params: InitLoadBackParams,
     ) -> Optional[tuple[int, NodeId]]:
         """None means admission retries without committing a load: buffer
-        mode, or a host-only anchor whose previous load-back is still in flight."""
+        mode, a host-only anchor whose previous load-back is still in flight,
+        or a refused load-back whose device anchor has no state to extend from."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -4649,6 +4658,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 return None
             if self.load_back(best_match_node_id, mem_quota, req=req):
+                req.load_back_refusals = 0
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )
@@ -4661,6 +4671,13 @@ class UnifiedRadixCache(BasePrefixCache):
                     best_match_node_id,
                 )
                 return len(new_indices), best_match_node_id
+            # A refused load-back falls back to the device anchor and extends from
+            # its device Mamba state. A non-root anchor without one (host-only
+            # checkpoints) would extend from zeros, so admission retries instead;
+            # past LOAD_BACK_REFUSAL_LIMIT the request matches from root.
+            if self._anchor_lacks_mamba_state(last_best_match_device_node_id):
+                req.load_back_refusals += 1
+                return None
 
         return 0, last_best_match_device_node_id
 

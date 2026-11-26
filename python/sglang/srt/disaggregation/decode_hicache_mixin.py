@@ -252,7 +252,7 @@ class DecodeHiCacheTransferMixin:
         owned_node = dr.req.last_node
         try:
             dr.req.last_node = rematch.last_device_node
-            loaded_len, restored_node = self.tree_cache.init_load_back(
+            load_back = self.tree_cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=rematch.best_match_node,
                     host_hit_length=rematch.host_hit_length,
@@ -261,8 +261,13 @@ class DecodeHiCacheTransferMixin:
             )
         finally:
             dr.req.last_node = owned_node
+        # None: the load-back was refused or is still in flight, so nothing loads.
+        loaded_len, restored_node = load_back or (0, None)
         # Failback: total coverage < required prefix means device alloc likely failed.
-        if rematch.device_prefix_len + loaded_len < pm.decode_prefix_len:
+        if (
+            load_back is None
+            or rematch.device_prefix_len + loaded_len < pm.decode_prefix_len
+        ):
             logger.warning(
                 "HiCache load_back failed for rid=%s: device_indices=%d, "
                 "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",

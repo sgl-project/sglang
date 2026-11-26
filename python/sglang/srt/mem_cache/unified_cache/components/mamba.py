@@ -1219,11 +1219,28 @@ class MambaComponent(TreeComponent):
     def finalize_load_back(
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
     ) -> None:
-        # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
-        if not success and prep.allocated_mamba_slot is not None:
+        if success or req is None:
+            return
+        # A refused load-back leaves req at its device anchor (req.last_node), which
+        # holds a device state unless it is the root (init_load_back retries a
+        # non-root anchor without one): extend from that state.
+        anchor_state = self.tree_core.get_component_device_value(
+            req.last_node, self.component_type
+        )
+        if anchor_state is not None:
+            # The deferred CoW fills prepare's slot, or the one allocated at admission.
+            req.kv.mamba_cow_src_index = anchor_state
+            req.kv.mamba_needs_clear = False
+            return
+        req.kv.mamba_cow_src_index = None
+        # The H->D copy never ran: return the slot prepare allocated; a slot the
+        # request already held starts cleared, as a prefix at the root does.
+        if prep.allocated_mamba_slot is not None:
             storage, sub_pool = self._state()
             storage.free_state_slots(sub_pool, prep.allocated_mamba_slot)
             req.kv.mamba_pool_idx = None
+        elif req.kv.holds_mamba:
+            req.kv.mamba_needs_clear = True
 
     def prepare_buffer_load_back(
         self, req: Req, staged: list[PoolTransfer]
