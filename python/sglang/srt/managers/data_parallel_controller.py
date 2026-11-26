@@ -69,6 +69,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_serving,
+    is_control_broadcast_local,
     publish,
 )
 from sglang.srt.server_args import (
@@ -248,8 +249,9 @@ class DataParallelController:
             # within its own attn_tp_group instead of the full tp_group.
             # Otherwise fall back to the original behaviour: send to only the
             # first leader, which then broadcasts over the full tp_group.
-            local_ctrl = get_parallel().enable_dp_attention_local_control_broadcast
-            self.control_message_step = 1 if local_ctrl else get_parallel().tp_size
+            self.control_message_step = (
+                1 if is_control_broadcast_local() else get_parallel().tp_size
+            )
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
@@ -889,10 +891,11 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        assert req.bootstrap_room is not None, (
-            "req.bootstrap_room should not be None. Do not send requests directly to "
-            "prefill or decode instances; send to the router instead."
-        )
+        if req.bootstrap_room is None:
+            # No decode looks it up by room (the Rust frontend assigns none to a
+            # request sent straight to a PD server); the scheduler answers or rejects it.
+            self.round_robin_scheduler(req)
+            return
         target_rank = req.bootstrap_room % len(self.workers)
         sock_send(self.workers[target_rank], req)
 

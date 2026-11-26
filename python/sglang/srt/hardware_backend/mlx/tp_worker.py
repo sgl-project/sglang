@@ -41,6 +41,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_schedule,
 )
+from sglang.srt.sampling.grammar_mask import build_grammar_mask
 
 logger = logging.getLogger(__name__)
 
@@ -246,12 +247,6 @@ class MlxTpModelWorker(TpModelWorker):
         if not self._sampling_active(batch):
             return None
         sinfo = batch.sampling_info
-        # Mirror ForwardBatch.init_new's grammars population — the MLX paths
-        # never build a ForwardBatch, so without this the list stays None
-        # even when requests carry live grammar objects.
-        sinfo.grammars = (
-            [req.grammar for req in batch.reqs] if batch.has_grammar else None
-        )
         has_grammar = bool(sinfo.grammars)
         if not has_grammar and sinfo.logit_bias is None:
             return None
@@ -265,16 +260,13 @@ class MlxTpModelWorker(TpModelWorker):
             combined = torch.zeros(
                 len(batch.reqs), sinfo.vocab_size, dtype=torch.float32
             )
-            sinfo.update_regex_vocab_mask()
-            if sinfo.grammar_mask is not None:
-                grammar_mask = sinfo.grammar_mask
-                grammar_mask.grammar.apply_vocab_mask(
-                    logits=combined,
-                    vocab_mask=grammar_mask.vocab_mask.to("cpu"),
-                )
-                # Release promptly; mirrors the VRAM-leak note in the CUDA
-                # ModelRunner._preprocess_logits.
-                sinfo.grammar_mask = None
+            grammar_mask = build_grammar_mask(
+                sinfo.grammars, vocab_size=sinfo.vocab_size, device=sinfo.device
+            )
+            grammar_mask.grammar.apply_vocab_mask(
+                logits=combined,
+                vocab_mask=grammar_mask.vocab_mask.to("cpu"),
+            )
             if sinfo.logit_bias is not None:
                 combined += sinfo.logit_bias.to("cpu")
         rows = mx.array(combined.numpy())
@@ -323,7 +315,9 @@ class MlxTpModelWorker(TpModelWorker):
         sinfo = batch.sampling_info
 
         def hook(logits_np):
-            from sglang.srt.layers.sampler import apply_custom_logit_processor
+            from sglang.srt.sampling.custom_logit_processor import (
+                apply_custom_logit_processor,
+            )
 
             # torch.from_numpy shares memory with logits_np, so the
             # processors' in-place edits land in the returned array.

@@ -159,6 +159,8 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
                 matched_prefix_tokens,
                 pool_transfers,
                 assume_stored=False,
+                *,
+                storage_read_metadata=None,
             ):
                 self.prefetch_args = (
                     handle,
@@ -810,6 +812,78 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.sanity_check()
         cons.sanity_check()
 
+    def _storage_hit_after_cold_sibling(
+        self, storage_dir, shared, tail_pages, unpublished
+    ) -> int:
+        """A stored prompt, then two cold engines whose prompts leave it at
+        ``shared``: the first recomputes and stores its own prompt, and the
+        second's storage hit is returned. The first finishes in its prefill
+        step, or, ``unpublished``, keeps its chunks private until it completes."""
+        self._produce_buffer_l3(
+            storage_dir, shared + self._make_seq(20_000, tail_pages)
+        )
+
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
+        cons.tree_core.write_through_threshold = 1
+        prompt = shared + self._make_seq(30_000, tail_pages)
+        req, _ = self._make_inflight_req(
+            cons, cons_alloc, cons_rtp, prompt, allocated=True
+        )
+        handle = CacheRequestHandle(req.rid, 0)
+        cons.prefetch_from_storage(
+            handle, cons.root_node_handle(), array("q", prompt), None, None
+        )
+        self._run_prefetch_to_completion(cons, handle)
+        # Storage holds the shared Full KV, but no window ends inside it.
+        self.assertFalse(cons.buffer_pipeline.has_staged(handle))
+        match = cons.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prompt)), req=req)
+        )
+        self.assertEqual(match.device_prefix_len, 0)
+        req.swa_branching_seqlen = match.swa_branching_seqlen
+        # The branch ends a node at ``shared``; the whole prompt is cached either way.
+        if unpublished:
+            cons.advance_unpublished_req(req)
+        finish_req(cons, req, len(prompt))
+        self.assertEqual(match_prefix(cons, prompt).device_prefix_len, len(prompt))
+        self._drain_buffer_writes(cons)
+        cons.sanity_check()
+
+        late, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+        late_prompt = shared + self._make_seq(40_000, tail_pages)
+        late_handle = CacheRequestHandle("late", 0)
+        late.prefetch_from_storage(
+            late_handle, late.root_node_handle(), array("q", late_prompt), None, None
+        )
+        self._run_prefetch_to_completion(late, late_handle)
+        late.sanity_check()
+        return match_prefix(late, late_prompt).device_prefix_len
+
+    @requires_hicache
+    @requires_swa
+    def test_buffer_only_storage_swa_gap_stores_missing_window(self):
+        """A prompt leaving a stored prompt mid-node finds its Full KV in
+        storage with no SWA window at that point. The engine that recomputes
+        it stores the window, so the next such prompt restores the shared prefix."""
+        page = self.cfg.page_size
+        sw_pages = (self.cfg.sliding_window_size + page - 1) // page
+        shared_pages = 2 * sw_pages
+        # Longer than two windows, so no stored window reaches the shared end.
+        tail_pages = 2 * sw_pages + 2
+        if 2 * (shared_pages + tail_pages) * page > self.cfg.kv_size:
+            self.skipTest("prompts do not fit the device pool")
+        shared = self._make_seq(1, shared_pages)
+
+        for unpublished in (False, True):
+            with (
+                self.subTest(unpublished=unpublished),
+                envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.override(True),
+            ):
+                hit = self._storage_hit_after_cold_sibling(
+                    self._make_storage_dir(), shared, tail_pages, unpublished
+                )
+                self.assertEqual(hit, len(shared))
+
     @requires_hicache
     def test_buffer_only_write_path_roundtrip(self):
         """Write path end to end: admission -> D2H staging -> storage write
@@ -1013,6 +1087,34 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                 )
             )
             self.assertEqual(self._host_avail_sizes(cache), avail0)
+        cache.sanity_check()
+
+    @requires_hicache
+    def test_buffer_only_reattach_backs_up_to_the_new_backend(self):
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            self._make_storage_dir()
+        )
+        seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+        self._buffer_backup_and_wait(cache, leaf)
+
+        detached, message = cache.detach_storage_backend()
+        self.assertTrue(detached, message)
+        with envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(
+            self._make_storage_dir()
+        ):
+            attached, message = cache.attach_storage_backend("file")
+        self.assertTrue(attached, message)
+
+        page_hashes = self._all_page_hashes(cache, leaf)
+        transfers = aux_storage_key_transfers(cache, leaf)
+        self.assertEqual(self._storage_exists_count(cache, page_hashes, transfers), 0)
+        self._buffer_backup_and_wait(cache, leaf)
+        self.assertEqual(
+            self._storage_exists_count(cache, page_hashes, transfers),
+            len(page_hashes),
+        )
         cache.sanity_check()
 
     @requires_hicache

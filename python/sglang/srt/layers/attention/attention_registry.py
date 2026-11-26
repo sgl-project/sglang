@@ -1,5 +1,4 @@
 import logging
-import warnings
 from typing import TYPE_CHECKING
 
 import torch
@@ -87,13 +86,6 @@ def create_flashinfer_backend(runner):
             FlashInferAttnBackend,
         )
 
-        # Init streams
-        if get_spec().speculative_algorithm == "EAGLE":
-            if (
-                not hasattr(runner, "plan_stream_for_flashinfer")
-                or not runner.plan_stream_for_flashinfer
-            ):
-                runner.plan_stream_for_flashinfer = torch.cuda.Stream()
         return flashinfer_backend_cls(FlashInferAttnBackend)(
             runner, init_new_workspace=runner.init_new_workspace
         )
@@ -205,17 +197,6 @@ def create_qsa_backend(runner):
     )
 
     return QwenSparseAttnBackend(runner)
-
-
-@register_attention_backend("nsa")
-def _create_nsa_compat(runner):
-    warnings.warn(
-        "attention-backend='nsa' is deprecated; use 'dsa' instead. "
-        "The alias will be removed in a future release.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return create_dsa_backend(runner)
 
 
 @register_attention_backend("dsv4")
@@ -679,3 +660,16 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("mlu")
+def create_mlu_backend(runner):
+    if runner.use_mla_backend:
+        from sglang.srt.hardware_backend.mlu.attention.mla_backend import (
+            MLUMLABackend,
+        )
+
+        return MLUMLABackend(runner)
+    from sglang.srt.hardware_backend.mlu.attention.mha_backend import MLUMHABackend
+
+    return MLUMHABackend(runner)

@@ -24,6 +24,7 @@ from copy import copy
 from dataclasses import fields, replace
 from typing import Any
 
+from sglang.multimodal_gen.configs.sample.nomas import NomasSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     align_num_frames_for_num_gpus,
@@ -353,10 +354,12 @@ def lighten_warmup_req(server_args: ServerArgs, req: Req) -> Req | None:
     if params is None:
         return None
 
-    num_frames = params.num_frames or 1
-    lighter_frames = _lighter_valid_num_frames(server_args, num_frames)
-    if lighter_frames < num_frames:
-        return _replace_warmup_workload(req, num_frames=lighter_frames)
+    # Explicit Nomas events must span exactly num_frames.
+    if not (isinstance(params, NomasSamplingParams) and params.segments is not None):
+        num_frames = params.num_frames or 1
+        lighter_frames = _lighter_valid_num_frames(server_args, num_frames)
+        if lighter_frames < num_frames:
+            return _replace_warmup_workload(req, num_frames=lighter_frames)
 
     width = params.width
     height = params.height
@@ -580,11 +583,20 @@ def supports_synthetic_warmup(server_args: ServerArgs) -> bool:
     return task_type.is_visual_gen() or task_type.is_mesh_gen()
 
 
+def should_include_warmup_audio(server_args: ServerArgs) -> bool:
+    """Whether server warmup needs a synthetic audio input: only audio-conditioned
+    models (Wan2.2-S2V) do, and get a silent WAV."""
+    if not supports_synthetic_warmup(server_args):
+        return False
+    return server_args.pipeline_config.task_type.requires_audio_input()
+
+
 def build_warmup_reqs(
     server_args: ServerArgs,
     *,
     warmup_resolutions: list[str] | None,
     warmup_input_path: str | None = None,
+    warmup_audio_path: str | None = None,
     return_warmup_result: bool = False,
     server_based_warmup: bool = False,
 ) -> list[Req]:
@@ -662,6 +674,11 @@ def build_warmup_reqs(
             prompt=warmup_prompt,
         )
         req_kwargs["sampling_params"] = copy(sampling_defaults)
+        # Synthetic requests skip SamplingParams._adjust, which resolves this for real ones;
+        # unset, SP shards latents along time instead of tokens, a path no real request takes.
+        req_kwargs["sampling_params"].enable_sequence_shard = resolve_sequence_shard(
+            server_args.pipeline_config, sampling_defaults.enable_sequence_shard
+        )
         req_kwargs.update(
             negative_prompt=negative_prompt,
             guidance_scale=sampling_defaults.guidance_scale,
@@ -689,6 +706,12 @@ def build_warmup_reqs(
                 else 1
             )
             req_kwargs["image_path"] = [warmup_input_path] * max(1, image_count)
+        if task_type.requires_audio_input():
+            if warmup_audio_path is None:
+                raise RuntimeError(
+                    "Warmup audio path is required for audio-input model"
+                )
+            req_kwargs["audio_path"] = warmup_audio_path
         if server_args.enable_cfg_parallel:
             if not req_kwargs.get("negative_prompt"):
                 req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT

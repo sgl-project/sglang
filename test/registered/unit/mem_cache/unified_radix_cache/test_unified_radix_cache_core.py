@@ -115,7 +115,7 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
         params = CacheInitParams(
             req_to_token_pool=ReqToTokenPool(
                 size=2,
-                max_context_len=8,
+                row_width=8,
                 device="cpu",
                 enable_memory_saver=False,
             ),
@@ -265,7 +265,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
                     with (
                         mock.patch.object(cache, "cache_controller", mock.Mock()),
                         mock.patch.object(
-                            cache, "_execute_and_commit_kv_backup", return_value=0
+                            cache, "_execute_and_commit_kv_backup", return_value=None
                         ) as backup,
                     ):
                         cache._evict_components({ComponentType.FULL: 0, ct: 2}, tracker)
