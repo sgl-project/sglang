@@ -118,21 +118,30 @@ class TestNemotron3Embedding(CustomTestCase):
                 assert_close=assert_close,
             )
 
+    def _assert_bf16_close(self, actual, expected):
+        self.assertAlmostEqual(actual.norm().item(), 1.0, places=5)
+        cosine = F.cosine_similarity(actual, expected, dim=0).item()
+        self.assertGreaterEqual(cosine, 0.999)
+
     @unittest.skipUnless(
         is_npu() or (torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
         "requires a BF16 GPU or an Ascend NPU",
     )
     def test_bf16_default_backend_matches_hf(self):
-        def assert_close(actual, expected):
-            self.assertAlmostEqual(actual.norm().item(), 1.0, places=5)
-            cosine = F.cosine_similarity(actual, expected, dim=0).item()
-            self.assertGreaterEqual(cosine, 0.999)
-
         self._check(
             dtype="bfloat16",
             engine_kwargs={"max_total_tokens": 2048},
-            assert_close=assert_close,
+            assert_close=self._assert_bf16_close,
         )
+
+    @unittest.skipUnless(is_npu(), "requires an Ascend NPU")
+    def test_bf16_fia_backend_matches_hf(self):
+        with patch.dict(os.environ, {"ASCEND_USE_FIA": "1"}):
+            self._check(
+                dtype="bfloat16",
+                engine_kwargs={"max_total_tokens": 2048},
+                assert_close=self._assert_bf16_close,
+            )
 
     @unittest.skipUnless(is_npu(), "requires an Ascend NPU")
     def test_fp32_mean_pooling_on_npu(self):
