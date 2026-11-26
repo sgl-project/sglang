@@ -1197,10 +1197,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Row-split fc and KV GEMMs up to a chunk, largest first so every output
         # reuses the first one's allocator block; then the target's own eager GEMMs.
         n = max(get_schedule().chunked_prefill_size or 0, rows)
-        x, h = (
-            w.new_zeros(-(-n // get_parallel().tp_group.world_size), w.shape[1]),
-            w.new_zeros(n, w.shape[0]),
-        )
+        x = w.new_zeros(-(-n // get_parallel().tp_group.world_size), w.shape[1])
+        # The KV GEMM reads draft hidden rows; a TP-split fc weight holds only its columns.
+        h = w.new_zeros(n, kv.flat_kv_weight.shape[1]) if kv else None
         for t in range(n, 0, -1):
             if t <= x.shape[0]:
                 torch.mm(x[:t], w.t())
