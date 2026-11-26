@@ -468,6 +468,10 @@ class AscendAttnBackend(AttentionBackend):
                 model_config=model_runner.model_config
             )
             if self.use_fused_sparse_kv:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
+                    forward_fused_sparse_kv_offload as sparse_kv_attention,
+                )
+
                 self.sparse_kv_manager = getattr(
                     self.token_to_kv_pool, "sparse_kv_manager", None
                 )
@@ -483,6 +487,9 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     self.token_to_kv_pool.sparse_kv_manager = self.sparse_kv_manager
             else:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+                    forward_sparsity_driven_kv_offload as sparse_kv_attention,
+                )
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                     SparseKVCacheManager,
                 )
@@ -492,6 +499,7 @@ class AscendAttnBackend(AttentionBackend):
                     model_runner.token_to_kv_pool_allocator,
                     sparse_topk,
                 )
+            self.sparse_kv_attention = sparse_kv_attention
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
                 "Sparsity-driven KV offload is enabled with manager %s.",
@@ -500,6 +508,12 @@ class AscendAttnBackend(AttentionBackend):
         else:
             self.sparse_kv_manager = None
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        if self.use_fa and not (
+            self.use_mla or self.use_fia or self.use_quant_flash_attn
+        ):
+            from flash_attn_npu_v3 import flash_attn_with_kvcache
+
+            self.flash_attn_with_kvcache = flash_attn_with_kvcache
         self.use_fias_v2_bsnd = (
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
@@ -695,12 +709,6 @@ class AscendAttnBackend(AttentionBackend):
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         )
-
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        if self.use_fused_sparse_kv:
-            # Each warmup and capture records fresh sparse-KV metadata producers.
-            self.forward_metadata.sparse_kv_lim_plan = None
-            self.forward_metadata.sparse_kv_offload_rows = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -2437,16 +2445,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         if topk_indices is not None:
             if self.enable_sparsity_driven_kv_offload:
-                if self.use_fused_sparse_kv:
-                    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
-                        forward_fused_sparse_kv_offload as sparse_kv_attention,
-                    )
-                else:
-                    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
-                        forward_sparsity_driven_kv_offload as sparse_kv_attention,
-                    )
-
-                return sparse_kv_attention(
+                return self.sparse_kv_attention(
                     self,
                     q,
                     k,
@@ -2831,8 +2830,6 @@ class AscendAttnBackend(AttentionBackend):
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
             elif self.use_fa:
-                from flash_attn_npu_v3 import flash_attn_with_kvcache
-
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 k = k_cache.view(
                     -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
@@ -2848,7 +2845,7 @@ class AscendAttnBackend(AttentionBackend):
                     ]
                 )
                 max_seqlen_q = extend_seq_lens.max().item()
-                attn_output = flash_attn_with_kvcache(
+                attn_output = self.flash_attn_with_kvcache(
                     q,
                     k,
                     v,
@@ -4322,16 +4319,7 @@ class AscendAttnBackend(AttentionBackend):
                 save_kv_cache = False
         if topk_indices is not None:
             if self.enable_sparsity_driven_kv_offload:
-                if self.use_fused_sparse_kv:
-                    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
-                        forward_fused_sparse_kv_offload as sparse_kv_attention,
-                    )
-                else:
-                    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
-                        forward_sparsity_driven_kv_offload as sparse_kv_attention,
-                    )
-
-                return sparse_kv_attention(
+                return self.sparse_kv_attention(
                     self,
                     q,
                     k,
@@ -4568,8 +4556,6 @@ class AscendAttnBackend(AttentionBackend):
                         dim=0,
                     )
             elif self.use_fa:
-                from flash_attn_npu_v3 import flash_attn_with_kvcache
-
                 q = q.view(
                     forward_batch.batch_size, -1, layer.tp_q_head_num, layer.qk_head_dim
                 )
@@ -4579,7 +4565,7 @@ class AscendAttnBackend(AttentionBackend):
                 v = v_cache.view(
                     -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
-                attn_output = flash_attn_with_kvcache(
+                attn_output = self.flash_attn_with_kvcache(
                     q,
                     k,
                     v,
