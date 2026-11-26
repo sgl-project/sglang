@@ -4,8 +4,7 @@ import os
 import tempfile
 import unittest
 
-from test_npu_lora_load_from_tensor import (
-    HAVE_MODEL,
+from sglang.test.ascend.npu_rl_lora_fixture import (
     MODEL,
     PROMPTS,
     SERVER_ARGS,
@@ -13,7 +12,6 @@ from test_npu_lora_load_from_tensor import (
     adapter_tensors,
     write_adapter,
 )
-
 from sglang.test.ascend.test_npu_rl_utils import (
     assert_logprob_signature_equal,
     load_lora_adapter,
@@ -28,6 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=600, suite="extra-b-test-2-npu-a3")
 register_npu_ci(est_time=600, suite="nightly-test-2-npu-a3", nightly=True)
 
+HAVE_MODEL = os.path.isfile(os.path.join(MODEL, "config.json"))
 TP_SIZE = 2
 
 
