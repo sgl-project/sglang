@@ -292,6 +292,13 @@ class XPUAttentionBackend(AttentionBackend):
             lens = forward_batch.seq_lens
         return int(lens.max().item())
 
+    @staticmethod
+    def _host_lens(lens_cpu, lens) -> list:
+        """Per-request lengths on the host: the scheduler's copy when it kept one
+        (with the XPU monokernel it does not: needs_cpu_seq_lens), else read back
+        from the device (an eager step only)."""
+        return list(lens_cpu) if lens_cpu is not None else lens.tolist()
+
     def _assert_dcp_supported(self):
         if self.has_swa:
             raise ValueError(_DCP_SWA_MSG)
@@ -662,9 +669,16 @@ class XPUAttentionBackend(AttentionBackend):
                     and forward_batch.spec_info.is_draft_input()
                 )
             )
-            if any(forward_batch.extend_prefix_lens_cpu) or is_draft_extend:
+            if is_draft_extend or any(
+                self._host_lens(
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_prefix_lens,
+                )
+            ):
                 extend_seq_lens = forward_batch.extend_seq_lens
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                metadata.max_seq_len_q = max(
+                    self._host_lens(forward_batch.extend_seq_lens_cpu, extend_seq_lens)
+                )
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )

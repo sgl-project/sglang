@@ -49,6 +49,18 @@ class TestXpuBackendHostSeqLens(unittest.TestCase):
         batch = SimpleNamespace(seq_lens_cpu=None, seq_lens=torch.tensor([5, 9, 7]))
         self.assertEqual(XPUAttentionBackend._max_seq_len(batch), 9)
 
+    def test_extend_lengths_come_from_the_host_copy_when_there_is_one(self):
+        # a device read would give 100: it must not happen
+        lens = XPUAttentionBackend._host_lens([3, 1], torch.tensor([100, 100]))
+        self.assertEqual(lens, [3, 1])
+
+    def test_an_eager_draft_extend_without_the_host_copy_reads_the_lengths_back(self):
+        """A draft extend not replayed from a graph (graphs off, or more requests than
+        the captured batch sizes) has no host copy of the extend lengths with the
+        monokernel: they are read back instead of iterating None."""
+        lens = XPUAttentionBackend._host_lens(None, torch.tensor([4, 2, 3]))
+        self.assertEqual(lens, [4, 2, 3])
+
     def test_graph_replay_metadata_needs_no_device_read(self):
         """Without the host copy, a replay bounds the key length by what the static
         page table holds (its width is in pages) instead of reading seq_lens back: the
