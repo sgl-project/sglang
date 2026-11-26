@@ -3,6 +3,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 _CUDA_TYPES = {torch.float32: "float", torch.bfloat16: "__nv_bfloat16"}
 # safe_idx, cache_mask, cu, si, track mask, track indices, src2dst
@@ -311,6 +314,8 @@ def _cuda_sconv(
     """_sconv_kernel in CUDA; False when an operand layout or dtype is unsupported.
     FP32 x only in the routed epilogue, and with top-k rows only under round_bf16
     (the CUDA gather rounds the sum to bf16)."""
+    if _is_hip:
+        return False
     rows, d = (attention if attention is not None else x).shape
     ints = (
         metadata["safe_idx"],
