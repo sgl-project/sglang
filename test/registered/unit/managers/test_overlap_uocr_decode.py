@@ -11,9 +11,11 @@ from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -26,7 +28,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, idle_penalty_status_pool
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -39,10 +41,10 @@ def _decode_batch():
     sampling = Mock()
     sampling.is_all_greedy = True
     sampling.logit_bias = None
-    sampling.grammar_mask = None
+    sampling.grammars = None
     sampling.has_custom_logit_processor = False
-    sampling.penalizer_orchestrator = None
-    sampling.has_watermark_candidates = False
+    sampling.step_penalties = None
+    sampling.watermark = None
     batch = Mock()
     batch.forward_mode.is_decode.return_value = True
     batch.forward_mode.is_extend.return_value = False
@@ -101,9 +103,12 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
         sampling.logit_bias = torch.ones(1)
         self.assertFalse(graph_io.can_defer(batch))
         sampling.logit_bias = None
-        sampling.has_watermark_candidates = True
+        sampling.watermark = object()
         self.assertFalse(graph_io.can_defer(batch))
-        sampling.has_watermark_candidates = False
+        sampling.watermark = None
+        sampling.grammars = [object()]
+        self.assertFalse(graph_io.can_defer(batch))
+        sampling.grammars = None
         batch.return_logprob = True
         self.assertFalse(graph_io.can_defer(batch))
 
@@ -127,7 +132,7 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
 
         # watermarking samples after graph argmax; relay the actual sampled ids
         batch.sampling_info.is_all_greedy = True
-        batch.sampling_info.has_watermark_candidates = True
+        batch.sampling_info.watermark = object()
         result.next_token_ids = torch.tensor([59, 61])
         graph_io.relay_result(batch, result, indices)
         self.assertEqual(graph_io.relay[indices].tolist(), [59, 61])
@@ -219,14 +224,23 @@ class TestUocrGreedyGraph(CustomTestCase):
         logits = Mock(next_token_logits=torch.zeros(2, 5))
         replayed = _decode_batch()
         graph.before_forward(replayed, replays_graph=True, decode_graph_runner=None)
-        ids = graph.recorded_ids(logits, replayed, watermark_state=None)
+        ids = graph.recorded_ids(logits, replayed)
         self.assertEqual(ids.tolist(), [7, 8])
         self.assertEqual(ids.dtype, torch.int32)
 
         eager = _decode_batch()
         graph.before_forward(eager, replays_graph=False, decode_graph_runner=None)
-        self.assertIsNone(graph.recorded_ids(logits, eager, watermark_state=None))
-        self.assertIsNone(graph.recorded_ids(logits, replayed, watermark_state=None))
+        self.assertIsNone(graph.recorded_ids(logits, eager))
+        self.assertIsNone(graph.recorded_ids(logits, replayed))
+
+    def test_a_grammar_step_samples_instead_of_taking_the_graph_argmax(self):
+        """The in-graph argmax ran before the grammar mask, so it cannot stand in."""
+        graph = UocrGreedyGraph(max_bs=4, device="cpu")
+        logits = Mock(next_token_logits=torch.zeros(2, 5))
+        batch = _decode_batch()
+        batch.sampling_info.grammars = [object(), None]
+        graph.before_forward(batch, replays_graph=True, decode_graph_runner=None)
+        self.assertIsNone(graph.recorded_ids(logits, batch))
 
 
 def _scheduler_for(architecture, training_stage):
@@ -310,7 +324,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         hooks._reuse.sources[1] = object()
         self.assertTrue(hooks.blocks_flush(ignore_waiting=True))
         hooks._reuse.sources.clear()
-        hooks._prefetch._parked.join([FakeReq(rid="w1")])
+        move([FakeReq(rid="w1")], hooks._prefetch._parked)
         self.assertTrue(hooks.blocks_flush(ignore_waiting=False))
         self.assertFalse(hooks.blocks_flush(ignore_waiting=True))
 
@@ -319,12 +333,12 @@ class TestFlushWithDocumentState(CustomTestCase):
         forgotten before the clear returns their KV to the pools."""
         hooks, _ = self._hooks()
         held = FakeReq(rid="w1")
-        hooks._prefetch._parked.join([held])
+        move([held], hooks._prefetch._parked)
         hooks._reuse.docs["doc"] = object()
         seen = []
         scheduler = object.__new__(Scheduler)
         scheduler.uocr_runtime = hooks
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler.is_fully_idle = lambda **kw: True
         scheduler.tree_cache = Mock()
         scheduler.tree_cache.reset.side_effect = lambda: seen.append(
@@ -336,6 +350,7 @@ class TestFlushWithDocumentState(CustomTestCase):
             "grammar_manager",
             "metrics_reporter",
             "invariant_checker",
+            "gc_freezer",
         ):
             setattr(scheduler, name, Mock())
         scheduler.draft_worker = None
@@ -351,9 +366,15 @@ class TestFlushWithDocumentState(CustomTestCase):
         held = Req("w1", "", [1], SamplingParams())
         scheduler = object.__new__(Scheduler)
         scheduler.rust_server = Mock()
-        for name in ("tree_cache", "beam_coordinator", "uocr_runtime"):
+        for name in (
+            "tree_cache",
+            "beam_coordinator",
+            "uocr_runtime",
+            "output_streamer",
+        ):
             setattr(scheduler, name, Mock())
         scheduler.hisparse_coordinator = None
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
 
         with patch("sglang.srt.managers.utils.get_serving"):

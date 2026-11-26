@@ -103,7 +103,6 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
 
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
-    from sglang.srt.runtime_context import get_parallel
 
     # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
     # don't participate in the EP all-reduce (would deadlock under DP-
@@ -168,6 +167,9 @@ def check_quantized_moe_compatibility(
             not envs.SGLANG_SHARED_EXPERT_TP1.get()
             and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
             and not _use_aiter
+            # Fp8MoEMethod refines such shards or rejects them at weight creation,
+            # before any weight is loaded; this check only runs after loading.
+            and quantization_config.get("quant_method") != "fp8"
         ):
             raise ValueError(
                 f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "

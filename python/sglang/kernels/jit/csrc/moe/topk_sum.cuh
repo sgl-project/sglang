@@ -1,8 +1,10 @@
-// Top-k expert-output sum: out[M, K] = sum_j in[M, topk, K].
+// Top-k expert-output sum: out[M, K] = sum_j in[M, topk, K] * scale.
 //
 // Replaces sgl_kernel's moe_sum_reduce_kernel_general (~5.7us at decode
 // shapes [1, 16, 3584]) with a straightforward vectorized pass (~1.5us):
 // one thread per 8-element vector of K, looping the topk rows in fp32.
+// At [8, 10, 2560] a block of 64 threads (40 CTAs) is the sweet spot; 32 (80
+// CTAs) is no faster and 128/256 are slower.
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
@@ -22,6 +24,7 @@ struct TopkSumParams {
   bf16_t* __restrict__ out;       // [M, K] contiguous
   uint32_t K;
   uint32_t topk;
+  float scale;
 };
 
 template <int kThreads, bool kUsePDL>
@@ -45,6 +48,8 @@ __global__ void topk_sum_kernel(const TopkSumParams __grid_constant__ params) {
   for (int i = 0; i < kVecN; ++i) {
     acc[i] = 0.0f;
   }
+  // 4 rows in flight: at decode (topk=10) the dependent vector load was the whole cost.
+#pragma unroll 4
   for (uint32_t j = 0; j < params.topk; ++j) {
     vec_bf16_t x;
     x.load(base + static_cast<int64_t>(j) * params.K, v);
@@ -57,7 +62,7 @@ __global__ void topk_sum_kernel(const TopkSumParams __grid_constant__ params) {
   vec_bf16_t o;
 #pragma unroll
   for (int i = 0; i < kVecN; ++i) {
-    o[i] = cast<bf16_t>(acc[i]);
+    o[i] = cast<bf16_t>(acc[i] * params.scale);
   }
   o.store(params.out + static_cast<int64_t>(m) * params.K, v);
 
@@ -68,7 +73,7 @@ template <int kThreads, bool kUsePDL>
 struct TopkSumKernel {
   static constexpr auto kernel = topk_sum_kernel<kThreads, kUsePDL>;
 
-  static void run(const tvm::ffi::TensorView in, const tvm::ffi::TensorView out) {
+  static void run(const tvm::ffi::TensorView in, const tvm::ffi::TensorView out, float scale) {
     using namespace host;
 
     auto M_ = SymbolicSize{"num_tokens"};
@@ -92,6 +97,7 @@ struct TopkSumKernel {
         .out = static_cast<bf16_t*>(out.data_ptr()),
         .K = K,
         .topk = topk,
+        .scale = scale,
     };
 
     const uint32_t n_vecs = K / 8;

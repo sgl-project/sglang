@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
     Derived,
 )
+from sglang.srt.arg_groups.argparse_actions import NoneChoiceAction
 from sglang.srt.arg_groups.choices import (
     ATTENTION_BACKEND_CHOICES,
     FP4_GEMM_RUNNER_BACKEND_CHOICES,
@@ -27,6 +28,8 @@ from sglang.srt.arg_groups.choices import (
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     RL_ON_POLICY_TARGET_CHOICES,
+    WATERMARK_ALGORITHM_CHOICES,
+    reject_removed_choice,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -87,13 +90,23 @@ class ExecFeatures(msgspec.Struct):
     ] = False
     enable_watermark: A[
         bool,
-        "Enable Aaronson-Gumbel text watermarking.",
+        "Enable text watermarking with the algorithm --watermark-algorithm selects.",
     ] = False
+    watermark_algorithm: A[
+        str,
+        Arg(
+            help="The text watermarking algorithm: gumbel (Aaronson-Gumbel) or "
+            "synthid (SynthID Text).",
+            choices=WATERMARK_ALGORITHM_CHOICES,
+        ),
+    ] = "gumbel"
     watermark_config: A[
         Optional[str],
         "Watermark settings as a JSON file path or an inline JSON object with "
-        "optional key, key_b, context_window, mixing_probability, max_probability, "
-        "default_enabled, and enforce_all fields.",
+        "optional default_enabled and enforce_all fields; gumbel reads key, key_b, "
+        "context_window, mixing_probability, and max_probability; synthid reads "
+        "keys, ngram_len, num_candidates, context_history_size, and "
+        "skip_first_ngram_calls.",
     ] = None
     watermark_key: A[
         Optional[str],
@@ -123,6 +136,26 @@ class ExecFeatures(msgspec.Struct):
         bool,
         Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = False
+    watermark_keys: A[
+        Optional[List[int]],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_ngram_len: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_num_candidates: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_context_history_size: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_skip_first_ngram_calls: A[
+        Optional[bool],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "
@@ -170,7 +203,10 @@ class ExecFeatures(msgspec.Struct):
         "EAGLE3 defaults to the model's EAGLE3 layers.",
     ] = None
     enable_return_routed_experts: A[
-        bool, "Enable returning routed experts of each layer with responses."
+        bool,
+        "Enable returning routed experts of each layer with responses. With "
+        "pipeline parallelism each hop also carries the routed experts of the "
+        "layers run so far, up to num_layers * top-k int32 ids per token.",
     ] = False
     enable_return_indexer_topk: A[
         bool,
@@ -204,10 +240,6 @@ class ExecFeatures(msgspec.Struct):
         "Use the same value on disaggregated prefill and decode nodes; clients "
         "should set top_k below the limit to leave headroom for cutoff ties.",
     ] = 4096
-    disable_outlines_disk_cache: A[
-        bool,
-        "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
-    ] = False
     enable_mis: A[
         bool,
         "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
@@ -227,6 +259,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for attention layers.",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=reject_removed_choice("attention_backend"),
             resolvable=True,
         ),
     ] = None
@@ -235,6 +268,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=reject_removed_choice("decode_attention_backend"),
             resolvable=True,
         ),
     ] = None
@@ -255,6 +289,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=reject_removed_choice("prefill_attention_backend"),
             resolvable=True,
         ),
     ] = None
@@ -309,7 +344,7 @@ class ExecKernel(msgspec.Struct):
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; M <= 32 uses FlashInfer's autotuned mm_bf16 (off with --disable-flashinfer-autotune; SM107 uses allowlisted warp Split-K instead), other shapes dispatch between the CuTe DSL kernel and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; on SM12x without deterministic inference, BF16 projections of at most 32 rows with at least 2048 output columns, the FP32-output LM head and the DSpark draft vocab projection at up to 32 rows use the SM12x GEMVs; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; bias-free M <= 16 uses FlashInfer's autotuned CuTe DSL mm_bf16 except on SM107 or with --disable-flashinfer-autotune, other shapes dispatch between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=["auto", "cutedsl", "gemv", "torch"],
         ),
@@ -317,7 +352,8 @@ class ExecKernel(msgspec.Struct):
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -330,8 +366,22 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "prims_ts",
                 "intel_xpu",
             ],
+            resolvable=True,
+        ),
+    ] = None
+    enable_flashmla_prefill_token_packing: A[
+        Optional[bool],
+        Arg(
+            help="Pack adjacent Kimi-K3.1 prefill tokens into one FlashMLA query tile. "
+            "Requires SM100/SM103, FP8 V32 KV cache and at most 32 heads per TP rank. "
+            "Supports DCP prefill after KV gathering, without separate prefill CP. "
+            "Disabled during deterministic inference. On by default for Kimi-K3.1 "
+            "(it only reorders the sparse-key sum); use "
+            "--no-enable-flashmla-prefill-token-packing to disable.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
         ),
     ] = None
@@ -367,7 +417,8 @@ class ExecKernel(msgspec.Struct):
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -379,6 +430,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "prims_ts",
                 "intel_xpu",
             ],
             resolvable=True,
@@ -431,11 +483,6 @@ class ExecKernel(msgspec.Struct):
             nargs="+",
         ),
     ] = None
-    triton_attention_reduce_in_fp32: A[
-        bool,
-        "Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
-        "This only affects Triton attention kernels.",
-    ] = False
     triton_attention_num_kv_splits: A[
         int,
         "The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
@@ -451,7 +498,8 @@ class ExecKernel(msgspec.Struct):
         Optional[bool],
         Arg(
             help="Fuse q/k normalization and rope rotary embedding into one "
-            "kernel. By default this is enabled on XPU and disabled elsewhere. "
+            "kernel. By default this is enabled on XPU and for Qwen3 attention "
+            "on ROCm, and disabled elsewhere. "
             "Pass --enable-fused-qk-norm-rope or --no-enable-fused-qk-norm-rope "
             "to force it either way.",
             action=argparse.BooleanOptionalAction,
@@ -469,6 +517,12 @@ class ExecKernel(msgspec.Struct):
     enable_fp4_indexer: A[
         bool,
         "Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100. DeepSeek V4's C4 indexer has its own switch, --enable-deepseek-v4-fp4-indexer. Default keeps the FP8 indexer.",
+    ] = False
+    enable_dsa_fp4_indexer: A[
+        bool,
+        "Store the DSA indexer keys in MXFP4 and score them with AITER's FP4 MQA-logits kernels "
+        "(Kimi-K3.1 on gfx950 with DCP): the row-group kernel in decode and target verify, the "
+        "prefill kernel over the DCP-gathered keys in prefill.",
     ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],
@@ -506,9 +560,19 @@ class ExecMamba(msgspec.Struct):
         doc="Whether the hybrid-mamba radix cache keeps its extra state "
         "buffer: the radix cache is on and the strategy asks for one.",
     )
+    decode_state_free_radix = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.decode_state_free_radix_of",
+        doc="Whether a PD decode server's radix cache holds FULL KV only and "
+        "each request keeps its own single Mamba state slot.",
+    )
     enable_mamba_extra_buffer_lazy = Derived(
         fn="sglang.srt.arg_groups.overrides.mamba_extra_buffer_lazy_of",
         doc="The lazy variant: the strategy is `extra_buffer_lazy` exactly.",
+    )
+    mamba_path_state_cap = Derived(
+        fn="sglang.srt.arg_groups.overrides.mamba_path_state_cap_of",
+        doc="Mamba states kept per root-to-tail path (-1 is unlimited): an "
+        "explicit --mamba-max-states-per-path, else 1 below checkpoint level 3.",
     )
     mamba_backend: A[
         str,
@@ -524,13 +588,31 @@ class ExecMamba(msgspec.Struct):
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    # Deprecated spelling; `--hybrid-cache-checkpoints-level 2` replaces it.
+    # Its only command-line entry is the deprecated registration in server_args.
     mamba_max_states_per_path: A[
+        Optional[int],
+        Arg(
+            help="Maximum number of cached Mamba states retained per root-to-tail "
+            "path (-1 means unlimited). When enabled, after each insert the "
+            "shallowest eligible interior states beyond the cap are removed while "
+            "their full KV remains. Tail, fork, and locked nodes are preserved. "
+            "Must be -1 or a positive integer.",
+            no_cli=True,
+        ),
+    ] = None
+    hybrid_cache_checkpoints_level: A[
         int,
-        "Maximum number of cached Mamba states retained per root-to-tail path "
-        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
-        "interior states beyond the cap are removed while their full KV remains. "
-        "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
-    ] = -1
+        Arg(
+            help="Where a hybrid model's prefix cache checkpoints recurrent "
+            "state. 2: branching points and request ends only (a PD prefill worker's "
+            "end is its complete prompt), with a soft cap of one state per path. "
+            "Host and storage tiers receive published states; models that also have "
+            "sliding-window layers still checkpoint every chunk. 3: every "
+            "prefill chunk and decode tracking boundary.",
+            choices=[2, 3],
+        ),
+    ] = 2
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
@@ -553,6 +635,15 @@ class ExecMamba(msgspec.Struct):
             help="(Derived) whether the model routes through the hybrid-mamba "
             "radix cache handling; resolved from the model architecture, no "
             "CLI surface.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
+    decode_state_free_radix_default: A[
+        bool,
+        Arg(
+            help="(Resolved) the model's default for SGLANG_DECODE_STATE_FREE_RADIX; "
+            "set by model overrides, no CLI surface.",
             no_cli=True,
             resolvable=True,
         ),
@@ -593,8 +684,8 @@ class ExecMamba(msgspec.Struct):
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends.",
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
+            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends. aiter (ROCm, GDN only) runs linear-chain verify on aiter's FlyDSL kernels.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl", "aiter"],
         ),
     ] = None
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
@@ -611,14 +702,15 @@ class ExecMamba(msgspec.Struct):
     ] = False
     linear_replayssm_cache_len: A[
         int,
-        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
+        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps. With --enable-linear-replayssm-spec on GDN models it is also the spec-verify ring length, which must be a power of two, at least 16 and at least the number of draft tokens.",
     ] = 16
     # ReplaySSM spec-verify (Part B of RFC #28511): linear-attn target-verify via
     # fold-every-commit instead of per-draft full-state snapshots -- the verify
     # stores each draft step's raw inputs into a per-slot window and the commit
-    # replays the accepted prefix into the fp32 checkpoint. GDN sizes the window
-    # to the draft maximum; KDA folds a (raw v, pre-norm k, gate, beta) ring of
-    # length --linear-replayssm-cache-len. Linear-chain (topk <= 1) only.
+    # replays the accepted prefix into the fp32 checkpoint. GDN keeps a ring of
+    # length --linear-replayssm-cache-len (a power of two, at least 16, that
+    # holds the draft window); KDA folds a (raw v, pre-norm k, gate, beta) ring
+    # of the same length. Linear-chain (topk <= 1) only.
     enable_linear_replayssm_spec: A[
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
@@ -706,9 +798,20 @@ class ExecGraph(msgspec.Struct):
         bool,
         "Enable profiling of cuda graph capture.",
     ] = False
+    cuda_graph_persistence: A[
+        Optional[Literal["save", "load"]],
+        Arg(
+            help="Persist the CUDA graphs across restarts with Foundry (optional dependency sglang[foundry]). 'save' captures as usual and writes the graphs and the memory layout they reference to an archive; 'load' rebuilds the graphs from that archive instead of capturing. SAVE and LOAD must use the same model, flags and GPUs. Decode graphs use the full backend; prefill graphs are 'full' or 'disabled' (default disabled).",
+            choices=["save", "load"],
+        ),
+    ] = None
+    cuda_graph_persistence_config: A[
+        Optional[str],
+        "Foundry TOML for --cuda-graph-persistence (workspace_root, base_addr, region_size, scratch_space_size, ...). Its 'mode' key is ignored: the flag's mode wins. Defaults: archive in ./foundry_archive.",
+    ] = None
     enable_cudagraph_gc: A[
         bool,
-        "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
+        "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen and paused during capture, which speeds it up and keeps a collection from invalidating the graph.",
     ] = False
     debug_cuda_graph: A[
         bool,
@@ -792,7 +895,6 @@ class ExecComm(msgspec.Struct):
         Optional[bool],
         "Enable INT8 quantization of TP communications (limited support).",
     ] = False
-    enable_flashinfer_allreduce_fusion: A[bool, Arg(no_cli=True)] = False
     enforce_disable_flashinfer_allreduce_fusion: A[
         bool,
         "Enforce disable FlashInfer allreduce fusion.",
@@ -871,7 +973,7 @@ class ExecMoe(msgspec.Struct):
             "nixl",
             "mori",
             "ascend_fuseep",
-            "flashinfer",
+            "flashinfer_nvlink_one_sided",
             "megamoe",
             "deepep_v2",
             "ascend_ops",
@@ -879,7 +981,9 @@ class ExecMoe(msgspec.Struct):
             "flashinfer_megamoe",
         ],
         Arg(
-            help="Choose the backend for MoE A2A.",
+            help="Choose the backend for MoE A2A. 'flashinfer_nvlink_one_sided' is "
+            "FlashInfer's NVLink one-sided all-to-all.",
+            type_parser=reject_removed_choice("moe_a2a_backend"),
             choices=[
                 "none",
                 "deepep",
@@ -887,7 +991,7 @@ class ExecMoe(msgspec.Struct):
                 "nixl",
                 "mori",
                 "ascend_fuseep",
-                "flashinfer",
+                "flashinfer_nvlink_one_sided",
                 "megamoe",
                 "deepep_v2",
                 "pplx",
@@ -983,14 +1087,16 @@ class ExecMoe(msgspec.Struct):
         (
             "Configuration for the ascend_ops MoE backend used by the main "
             "model and/or speculative draft as a JSON object, "
-            'for example {"prefill":"alltoallv","decode":"low_latency"}.'
+            'for example {"prefill":"alltoallv","decode":"fused_op"}. '
+            "Either phase can select fused_op to use MegaMoE."
         ),
     ] = None
     elastic_ep_backend: A[
         Literal[None, "mooncake", "nixl"],
         Arg(
             help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
-            choices=["none", "mooncake", "nixl"],
+            action=NoneChoiceAction,
+            action_kwargs={"choices": ["none", "mooncake", "nixl"]},
         ),
     ] = None
     enable_elastic_expert_backup: A[
@@ -1052,6 +1158,23 @@ class ExecMoe(msgspec.Struct):
             "least one.",
             type_parser=_paged_experts_num_resident,
         ),
+    ] = None
+    paged_experts_enable_disk: A[
+        bool,
+        "Let Paged Experts write to disk under $SGLANG_CACHE_DIR/paged_experts: each MoE "
+        "layer's experts are kept there (about the size of the experts), so that later starts "
+        "read them instead of loading and repacking them, and experts that do not fit the "
+        "host budget (--paged-experts-host-memory-gb) are served from there. Requires "
+        "--enable-paged-experts.",
+    ] = False
+    paged_experts_host_memory_gb: A[
+        Optional[float],
+        "Pinned host memory (GiB) for the experts of all MoE layers with --enable-paged-experts. "
+        "When not every expert fits, each layer keeps only some experts in pinned memory and "
+        "reads the others from its file under $SGLANG_CACHE_DIR/paged_experts, which needs "
+        "--paged-experts-enable-disk. Unset: every expert is pinned; with "
+        "--paged-experts-enable-disk, the experts that do not fit what is available at "
+        "startup within the container's memory limit go to disk, keeping 10 GiB free.",
     ] = None
 
     # -------------------------------------------------------------------------
@@ -1164,9 +1287,10 @@ class ExecOffload(msgspec.Struct):
         Optional[Dict[str, Any]],
         Arg(
             help="Where the DeepSeek-V4.1 Engram tables live, as JSON: "
-            "'placement' gpu|cpu, 'replication' none|per_node, 'lookup' "
+            "'placement' gpu|cpu, 'replication' none|per_node|group_shards, 'lookup' "
             "auto|all_reduce|reduce_scatter|all_to_all|peer_read; an omitted key "
-            "takes the first value. "
+            "takes the first value. 'group_shards' also takes 'group_size' and "
+            "'group_store'. "
             "See docs/advanced_features/engram.",
             type_parser=json.loads,
         ),

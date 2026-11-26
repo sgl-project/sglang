@@ -90,8 +90,6 @@ def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"
 
     compressed-tensors NVFP4 is not supported at this time.
     """
-    from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
-
     quant_method = config.get("quant_method", "")
     quant_algo = (config.get("quant_algo") or "").upper()
 
@@ -284,6 +282,8 @@ def _build_excluded_fp8_config(config: Dict[str, Any]) -> Optional["Fp8Config"]:
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
+
 _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES: tuple[str, ...] = (
     "model.layers.0",
     "model.language_model.layers.0",
@@ -392,9 +392,6 @@ class QuarkConfig(QuantizationConfig):
         )
         return layer_types, len(self._online_quantized_layers)
 
-    def get_linear_method(self) -> "QuarkLinearMethod":
-        return QuarkLinearMethod(self)
-
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.float16, torch.bfloat16]
@@ -454,11 +451,19 @@ class QuarkConfig(QuantizationConfig):
         ):
             return None
 
+        # Quark's [1, 32] float8_e8m0fnu scales are uint8 e8m0, not fp32, so they load as
+        # MXFP8; ROCm only, so CUDA keeps its earlier handling of these checkpoints
+        use_mxfp8 = (
+            _is_hip
+            and block_size == [1, 32]
+            and "e8m0" in str(weight_config.get("scale_type") or "")
+        )
         return Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
             weight_block_size=block_size,
             packed_modules_mapping=packed_modules_mapping,
+            use_mxfp8=use_mxfp8,
         )
 
     def is_linear_unquantized(self, prefix: str) -> bool:
@@ -581,6 +586,12 @@ class QuarkConfig(QuantizationConfig):
                     dequantization_config=Nvfp4SourceConfig(),
                     excluded_fp8_config=excluded_fp8_config,
                 )
+
+            from sglang.srt.layers.quantization.quark import mxfp8_base
+
+            # ROCm only: CUDA keeps raising for this source below
+            if _is_hip and mxfp8_base.is_mxfp8_base_nvfp4_moe_source(config):
+                return mxfp8_base.QuarkMxfp8BaseConfig.from_source(config, hf_config)
 
             nvfp4_src = _detect_nvfp4_source(config)
             if nvfp4_src is not None:
@@ -782,24 +793,24 @@ class QuarkConfig(QuantizationConfig):
         }
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
-        capability_tuple = get_device_capability()
-
-        if capability_tuple is not None:
-            assert 0 <= capability_tuple[1] < 10
-            capability = capability_tuple[0] * 10 + capability_tuple[1]
-
-            supported = capability >= min_capability
-            if error and not supported:
-                # Pass a single joined message; RuntimeError stringifies
-                # multiple positional args as a tuple repr.
-                raise RuntimeError(
-                    "Quantization scheme is not supported for "
-                    f"the current GPU. Min capability: {min_capability}. "
-                    f"Current capability: {capability}."
-                )
-            return supported
-        else:
+        major, minor = get_device_capability()
+        # (None, None): the device reports no compute capability.
+        if major is None:
             return False
+
+        assert 0 <= minor < 10
+        capability = major * 10 + minor
+
+        supported = capability >= min_capability
+        if error and not supported:
+            # Pass a single joined message; RuntimeError stringifies
+            # multiple positional args as a tuple repr.
+            raise RuntimeError(
+                "Quantization scheme is not supported for "
+                f"the current GPU. Min capability: {min_capability}. "
+                f"Current capability: {capability}."
+            )
+        return supported
 
     def _is_fp8_w8a8(
         self,

@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 use sglang_mm::pipeline::{Tensor, TensorData};
-use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -47,9 +46,17 @@ pub enum MmMetaValue {
 pub struct MmEncodedItem {
     pub modality: MmModality,
     pub feature: Tensor,
-    /// Legacy source/routing hint. Cache equality uses the worker-computed
-    /// full output identity, never this scalar (which callers may override).
+    /// Legacy source/routing hint. Cache equality uses the full output
+    /// identity, never this scalar (which callers may override).
     pub hash: u64,
+    /// The item's [`hash_identity`](Self::hash_identity), when its processor
+    /// already computed it over this exact feature, e.g. for a feature served
+    /// from its own cache, or from a [`feature_digest`] it computed anyway
+    /// (see [`identity_from_digest`](Self::identity_from_digest)). `None`
+    /// leaves it to the worker, which fills it in after all processor hooks,
+    /// so a request hashes each feature at most once. Caller `mm_hashes`
+    /// never touch it.
+    pub identity: Option<[u8; 32]>,
     /// Inclusive token spans in the expanded prompt.
     pub offsets: Vec<(u32, u32)>,
     pub model_specific_data: BTreeMap<String, MmMetaValue>,
@@ -102,6 +109,23 @@ impl MmEncodedEntry {
         }
         Ok(())
     }
+
+    /// Fill in each item's identity, hashing only the features whose
+    /// processor left it unset.
+    pub(super) fn resolve_identities(&mut self) -> Result<(), String> {
+        for item in &mut self.items {
+            let identity = item.cache_identity()?;
+            if cfg!(debug_assertions) && item.identity.is_some() {
+                assert_eq!(
+                    Ok(identity),
+                    item.identity_from_digest(&feature_digest(&item.feature.data)),
+                    "a processor-supplied identity must match the item's feature"
+                );
+            }
+            item.identity = Some(identity);
+        }
+        Ok(())
+    }
 }
 
 /// The `mm.meta` sidecar, msgpack-encoded with named maps so Python decodes it
@@ -150,14 +174,43 @@ impl<'a> MmMeta<'a> {
     }
 }
 
+/// The BLAKE3 digest of a feature's bytes: the one pass over them that an
+/// item's identity needs. A processor that hashes its feature anyway can
+/// compute this however it likes (e.g. `blake3::Hasher::update_rayon`) and
+/// derive the identity with [`MmEncodedItem::identity_from_digest`].
+pub fn feature_digest(data: &TensorData) -> [u8; 32] {
+    blake3::hash(feature_bytes(data)).into()
+}
+
+fn feature_bytes(data: &TensorData) -> &[u8] {
+    match data {
+        TensorData::F32(values) => bytemuck::cast_slice(values),
+        TensorData::I64(values) => bytemuck::cast_slice(values),
+        TensorData::Bf16(values) => bytemuck::cast_slice(values),
+    }
+}
+
 impl MmEncodedItem {
-    /// Hash on the worker, after all processor hooks and before publication.
-    /// All model families get typed content/geometry identity by default.
-    fn cache_identity(&self) -> Result<[u8; 32], String> {
-        let (dtype, data): (&str, &[u8]) = match &self.feature.data {
-            TensorData::F32(values) => ("f32", bytemuck::cast_slice(values)),
-            TensorData::I64(values) => ("i64", bytemuck::cast_slice(values)),
-            TensorData::Bf16(values) => ("bf16", bytemuck::cast_slice(values)),
+    /// The item's full output identity: the precomputed one when set, else
+    /// [`hash_identity`](Self::hash_identity).
+    pub fn cache_identity(&self) -> Result<[u8; 32], String> {
+        self.identity.map_or_else(|| self.hash_identity(), Ok)
+    }
+
+    /// Hash the typed content/geometry identity of the actual feature. The
+    /// worker does this after all processor hooks and before publication,
+    /// unless the processor supplied [`identity`](Self::identity).
+    pub fn hash_identity(&self) -> Result<[u8; 32], String> {
+        self.identity_from_digest(&feature_digest(&self.feature.data))
+    }
+
+    /// [`hash_identity`](Self::hash_identity) from the feature's
+    /// [`feature_digest`], without reading the feature bytes again.
+    pub fn identity_from_digest(&self, digest: &[u8; 32]) -> Result<[u8; 32], String> {
+        let dtype = match &self.feature.data {
+            TensorData::F32(_) => "f32",
+            TensorData::I64(_) => "i64",
+            TensorData::Bf16(_) => "bf16",
         };
         // A path-specific domain keeps different preprocessing implementations
         // separate; the raw bytes are never copied into the metadata buffer.
@@ -169,12 +222,13 @@ impl MmEncodedItem {
             &self.model_specific_data,
         ))
         .map_err(|e| format!("mm identity encode: {e}"))?;
-        let mut hash = Sha256::new();
-        hash.update(b"sglang-rust-mm-output-v1");
-        hash.update((metadata.len() as u64).to_be_bytes());
-        hash.update(metadata);
-        hash.update((data.len() as u64).to_be_bytes());
-        hash.update(data);
+        let data_len = feature_bytes(&self.feature.data).len();
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"sglang-rust-mm-output-v2");
+        hash.update(&(metadata.len() as u64).to_be_bytes());
+        hash.update(&metadata);
+        hash.update(&(data_len as u64).to_be_bytes());
+        hash.update(digest);
         Ok(hash.finalize().into())
     }
 }
@@ -191,6 +245,7 @@ mod tests {
                 data: TensorData::F32(vec![1.0, 2.0, 3.0, 4.0]),
             },
             hash: 7,
+            identity: None,
             offsets: vec![(1, 4)],
             model_specific_data: BTreeMap::from([(
                 "image_grid_thw".into(),
@@ -201,44 +256,84 @@ mod tests {
 
     #[test]
     fn identity_covers_actual_features_and_semantics_not_caller_hash() {
-        let original = item().cache_identity().unwrap();
+        let original = item().hash_identity().unwrap();
         let mut changed = item();
         changed.hash = 123;
         changed.offsets = vec![(10, 13)];
-        assert_eq!(original, changed.cache_identity().unwrap());
+        assert_eq!(original, changed.hash_identity().unwrap());
         changed.feature.data = TensorData::F32(vec![1.0, 2.0, 3.0, 5.0]);
-        assert_ne!(original, changed.cache_identity().unwrap());
+        assert_ne!(original, changed.hash_identity().unwrap());
 
         let mut changed = item();
         changed.feature.shape = vec![1, 4];
-        assert_ne!(original, changed.cache_identity().unwrap());
+        assert_ne!(original, changed.hash_identity().unwrap());
         let mut changed = item();
         changed.modality = MmModality::Video;
-        assert_ne!(original, changed.cache_identity().unwrap());
+        assert_ne!(original, changed.hash_identity().unwrap());
         let mut changed = item();
         changed
             .model_specific_data
             .insert("image_grid_thw".into(), MmMetaValue::Ints(vec![1, 1, 4]));
-        assert_ne!(original, changed.cache_identity().unwrap());
+        assert_ne!(original, changed.hash_identity().unwrap());
         let mut changed = item();
         // Same bytes and shape, but a different element type.
         changed.feature.data = TensorData::I64(vec![0, 0, 0, 0]);
-        let first = changed.cache_identity().unwrap();
+        let first = changed.hash_identity().unwrap();
         changed.feature.data = TensorData::F32(vec![0.0; 8]);
-        assert_ne!(first, changed.cache_identity().unwrap());
+        assert_ne!(first, changed.hash_identity().unwrap());
+
+        // A processor holding the feature's digest derives the same identity
+        // without reading the feature again, and the digest is load-bearing.
+        let digest = feature_digest(&item().feature.data);
+        assert_eq!(item().identity_from_digest(&digest), Ok(original));
+        assert_ne!(item().identity_from_digest(&[0; 32]), Ok(original));
     }
 
     #[test]
     fn metadata_exports_all_digest_bytes() {
         let first = item();
-        let expected = first.cache_identity().unwrap();
-        let entry = MmEncodedEntry {
+        let expected = first.hash_identity().unwrap();
+        let mut entry = MmEncodedEntry {
             items: vec![first],
             token_ids: None,
             mrope: None,
         };
-        let encoded = MmMeta::of(&entry).unwrap().encode().unwrap();
-        let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
-        assert_eq!(decoded["items"][0]["identity"], serde_json::json!(expected));
+        let exported = |entry: &MmEncodedEntry| {
+            let encoded = MmMeta::of(entry).unwrap().encode().unwrap();
+            let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
+            decoded["items"][0]["identity"].clone()
+        };
+        assert_eq!(exported(&entry), serde_json::json!(expected));
+        entry.resolve_identities().unwrap();
+        assert_eq!(entry.items[0].identity, Some(expected));
+        assert_eq!(exported(&entry), serde_json::json!(expected));
+        // A resolved identity is read, not hashed again.
+        entry.items[0].identity = Some([7; 32]);
+        assert_eq!(exported(&entry), serde_json::json!([7u8; 32].as_slice()));
+    }
+
+    /// A processor-supplied identity is used as is, so a feature it already
+    /// hashed is not hashed again; a wrong one fails loud in debug builds.
+    #[test]
+    fn resolve_keeps_a_supplied_identity() {
+        let mut supplied = item();
+        supplied.identity = Some(supplied.hash_identity().unwrap());
+        let mut entry = MmEncodedEntry {
+            items: vec![supplied, item()],
+            token_ids: None,
+            mrope: None,
+        };
+        entry.resolve_identities().unwrap();
+        let expected = item().hash_identity().unwrap();
+        assert_eq!(entry.items[0].identity, Some(expected));
+        assert_eq!(entry.items[1].identity, Some(expected));
+
+        if cfg!(debug_assertions) {
+            entry.items[0].identity = Some([0; 32]);
+            let stale = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                entry.resolve_identities()
+            }));
+            assert!(stale.is_err(), "a stale supplied identity must not pass");
+        }
     }
 }

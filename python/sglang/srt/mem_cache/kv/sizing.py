@@ -4,7 +4,11 @@ from typing import Optional, Sequence, Tuple
 
 import msgspec
 
-from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
+from sglang.srt.mem_cache.kv.decl import (
+    RequestLifetime,
+    StateLifetime,
+    WindowLifetime,
+)
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
 from sglang.srt.mem_cache.kv.state_policy import StateSlotStrategy
 
@@ -45,7 +49,8 @@ class KVSizingInputs(msgspec.Struct, frozen=True, kw_only=True):
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     pre_alloc_rows: int = 0
-    extra_context_len: int = 0
+    # The request table's req_to_token row width.
+    req_to_token_row_width: int
     alignment: int = 4096
 
 
@@ -63,6 +68,8 @@ class SizedKVStorage(msgspec.Struct, frozen=True, kw_only=True):
     max_running_requests: int
     scratch_rows: int
     request_rows: int
+    # The request table's req_to_token row width.
+    req_to_token_row_width: int
     fixed: Tuple[FixedAllocation, ...]
     full_cap_tokens: Optional[int] = None
     bs1_floor_terms: Tuple[Tuple[str, int], ...] = ()
@@ -95,7 +102,7 @@ def _request_estimate(plan, inp):
 def _fixed_terms(plan, inp, running, strategy):
     scratch_rows = running + 1
     request_rows = scratch_rows + inp.pre_alloc_rows
-    row_bytes = 4 * ((inp.context_len or 0) + inp.extra_context_len)
+    row_bytes = 4 * inp.req_to_token_row_width
     row_bytes += sum(
         4 + 8 * strategy.tracking_slots
         for s in plan.sub_pools
@@ -105,10 +112,6 @@ def _fixed_terms(plan, inp, running, strategy):
     terms.extend(
         FixedAllocation(name=d.part.name, bytes=d.part.row_bytes * scratch_rows)
         for d in plan.scratch
-    )
-    terms.extend(
-        FixedAllocation(name=d.part.name, bytes=d.part.row_bytes * request_rows)
-        for d in plan.request_parts
     )
     return tuple(terms)
 
@@ -174,8 +177,7 @@ def _bs1_floor_terms(plan, context_len, floor_window, strategy):
         if isinstance(sub_pool.lifetime, WindowLifetime):
             window = (
                 floor_window
-                if floor_window is not None
-                and sub_pool is plan.of_lifetime(WindowLifetime)
+                if floor_window is not None and sub_pool is plan.primary_window()
                 else sub_pool.lifetime.window
             )
             tokens = (
@@ -194,6 +196,8 @@ def _bs1_floor_terms(plan, context_len, floor_window, strategy):
                     strategy.slots_per_request() * sub_pool.spec.entry_bytes(),
                 )
             )
+        elif isinstance(sub_pool.lifetime, RequestLifetime):
+            terms.append((f"{sub_pool.name}_bs1_unit", sub_pool.spec.entry_bytes()))
     terms.append(("sink", plan.sink_bytes()))
     return tuple(terms)
 
@@ -218,6 +222,12 @@ def _state_targets(plan, inp, chain, running, states, frozen, strategy):
         if frozen is not None:
             count = min(count, frozen.units(sub_pool.name))
         units[sub_pool.name] = count
+    # A request sub-pool holds a unit per running request.
+    for sub_pool in plan.requests():
+        count = running
+        if frozen is not None:
+            count = min(count, frozen.units(sub_pool.name))
+        units[sub_pool.name] = count
     return units
 
 
@@ -225,7 +235,7 @@ def _token_targets(plan, inp, chain, running, states, windows, units, frozen):
     tokens_budget = (
         chain
         - plan.sink_bytes()
-        - sum(units[s.name] * s.spec.entry_bytes() for s in states)
+        - sum(units[s.name] * s.spec.entry_bytes() for s in (*states, *plan.requests()))
     )
     owner = plan.owner()
     page = plan.page_size
@@ -288,9 +298,10 @@ def size_plan(
 ) -> SizedKVStorage:
     """Solve all declared storage against one unsubtracted byte budget.
 
-    State units are boot targets. The arena may give state more slots at runtime,
-    and FULL may grow into the whole arena: ``max_total_tokens`` sizes the FULL
-    target, it does not cap allocation. Captured fixed extents never grow.
+    State and request units are boot targets. The arena may give state more
+    slots at runtime, and FULL may grow into the whole arena:
+    ``max_total_tokens`` sizes the FULL target, it does not cap allocation.
+    Captured fixed extents never grow.
     """
     if inp.alignment <= 0 or not 0 <= inp.state_share < 1:
         raise ValueError("invalid sizing alignment or state share")
@@ -307,6 +318,7 @@ def size_plan(
         chain = inp.full_tokens * plan.owner().spec.entry_bytes() + plan.sink_bytes()
         chain += sum((inp.window_tokens or 0) * s.spec.entry_bytes() for s in windows)
         chain += sum((inp.state_slots or 0) * s.spec.entry_bytes() for s in states)
+        chain += sum(running * s.spec.entry_bytes() for s in plan.requests())
         explicit_chain = chain // inp.alignment * inp.alignment
         budget = chain + sum(t.bytes for t in (*fixed, *_derived_terms(plan, chain)))
     terms = (
@@ -358,8 +370,10 @@ def size_plan(
         if explicit_chain is not None:
             budget = chain + sum(t.bytes for t in fixed)
         scratch_rows, request_rows = running + 1, running + inp.pre_alloc_rows + 1
+        req_to_token_row_width = inp.req_to_token_row_width
     else:
         scratch_rows, request_rows = frozen.scratch_rows, frozen.request_rows
+        req_to_token_row_width = frozen.req_to_token_row_width
     check_bs1_floor(total_bytes=chain, floor_terms=terms, where="size_plan")
     if full <= 0 or running <= 0:
         raise RuntimeError("the declared storage budget cannot serve one request")
@@ -372,6 +386,7 @@ def size_plan(
         max_running_requests=running,
         scratch_rows=scratch_rows,
         request_rows=request_rows,
+        req_to_token_row_width=req_to_token_row_width,
         fixed=fixed,
         bs1_floor_terms=terms,
         state_strategy=strategy,

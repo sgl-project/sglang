@@ -475,9 +475,7 @@ def _is_minicpm5(ctx):
 
 
 def _is_lfm2(ctx):
-    return (
-        ctx.has_text("<|tool_call_start|>") or ctx.has_vocab("<|tool_call_start|>")
-    ) and (ctx.has_text("<|tool_call_end|>") or ctx.has_vocab("<|tool_call_end|>"))
+    return ctx.has_text("<|tool_call_start|>") and ctx.has_text("<|tool_call_end|>")
 
 
 def _is_step3p5(ctx):
@@ -606,17 +604,20 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
     DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
+    DetectionRule(name="glm45", value="glm", predicate=_is_glm_family),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
     DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
-    DetectionRule(
-        name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
-    ),
+    DetectionRule(name="xml_kv_tool_call", value="glm", predicate=_is_xml_kv_tool_call),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
+    DetectionRule(
+        name="granite_toolcall_parser",
+        value="granite_toolcall_parser",
+        predicate=lambda ctx: _is_granite_thinking_parser(ctx) and _is_qwen3_coder(ctx),
+    ),
     DetectionRule(name="qwen3_coder", value="qwen3_coder", predicate=_is_qwen3_coder),
     DetectionRule(name="qwen", value="qwen", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v3", value="deepseekv3", predicate=_is_deepseek_v3),
@@ -899,12 +900,12 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
 
 def _architecture_parser_defaults(server_args) -> Dict[str, str]:
-    """Parser defaults implied by an architecture when the caller omitted them."""
+    """Parser settings implied by an architecture for omitted or auto fields."""
     cfg = resolving_view(server_args)
     missing = tuple(
         attr
         for attr in ("reasoning_parser", "tool_call_parser")
-        if getattr(cfg, attr) is None
+        if getattr(cfg, attr) in (None, "auto")
     )
     if not missing:
         return {}
@@ -915,10 +916,14 @@ def _architecture_parser_defaults(server_args) -> Dict[str, str]:
     config = model_config.hf_config
     architectures = getattr(config, "architectures", None) or []
     arch = architectures[0] if architectures else ""
-    if arch != "MuseSparkForConditionalGeneration":
+    if arch == "MuseSparkForConditionalGeneration":
+        parser, unresolved = "muse", None
+    elif arch in ("GigaChat4ForCausalLM", "GigaChat4ForCausalLMNextN"):
+        parser, unresolved = "gigachat4", "auto"
+    else:
         return {}
 
-    defaults = {attr: "muse" for attr in missing}
+    defaults = {attr: parser for attr in missing if getattr(cfg, attr) == unresolved}
     for attr, value in defaults.items():
         logger.info(
             "Defaulting --%s to '%s' for model architecture '%s'",

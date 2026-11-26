@@ -17,7 +17,7 @@ import copy
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, Qwen3Config
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
@@ -29,6 +29,9 @@ from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
     register_model_config_parser,
+)
+from sglang.srt.configs.speculators import (
+    normalize_speculators_qwen3_dense_dspark_config,
 )
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, lru_cache_frozenset
@@ -158,10 +161,21 @@ _LONGCAT_ARCHS = {
 }
 
 
-def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
-    config_dict, _ = PretrainedConfig.get_config_dict(
-        model, revision=revision, **kwargs
-    )
+def _try_load_speculators_qwen3_dense_config(model, config_dict, unused_kwargs):
+    normalized = normalize_speculators_qwen3_dense_dspark_config(config_dict)
+    if normalized is None:
+        return None
+
+    # The export's auto_map is not an HF AutoConfig entry. Construct the
+    # supported decoder locally while preserving the DSpark architecture.
+    config = Qwen3Config.from_dict(normalized, **unused_kwargs)
+    config._name_or_path = str(model)
+    return config
+
+
+def _try_load_longcat_config(
+    model, revision: Optional[str], config_dict: dict, **kwargs
+):
     architectures = config_dict.get("architectures") or []
     if not any(arch in _LONGCAT_ARCHS for arch in architectures):
         return None
@@ -221,7 +235,16 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config_dict, unused_kwargs = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
+        config = _try_load_speculators_qwen3_dense_config(
+            model, config_dict, unused_kwargs
+        )
+        if config is None:
+            config = _try_load_longcat_config(
+                model, revision, config_dict=config_dict, **kwargs
+            )
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
@@ -271,13 +294,23 @@ class HfModelConfigParser(ModelConfigParserBase):
         is_ocr2 = _is_deepseek_ocr2_model(config)
 
         if is_ocr2:
-            _override_v_head_dim_if_zero(config)
-            config.model_type = "deepseek-ocr"
-            _set_architectures(config, "DeepseekOCRForCausalLM")
             config = DeepseekVLV2Config.from_pretrained(model, revision=revision)
             _apply_deepseek_ocr_overrides(config, model)
         elif isinstance(config, DeepseekV41Config):
             config._name_or_path = model
+        elif config.model_type in ("lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni"):
+            from sglang.srt.configs.lfm3 import Lfm3Config
+            from sglang.srt.configs.lfm3_audio import Lfm3AudioConfig
+            from sglang.srt.configs.lfm3_omni import Lfm3OmniConfig
+            from sglang.srt.configs.lfm3_vl import Lfm3VlConfig
+
+            config_class = {
+                "lfm3": Lfm3Config,
+                "lfm3_vl": Lfm3VlConfig,
+                "lfm3_audio": Lfm3AudioConfig,
+                "lfm3_omni": Lfm3OmniConfig,
+            }[config.model_type]
+            config = config_class.from_hf_config(config)
         elif config.model_type in _CONFIG_REGISTRY:
             model_type = config.model_type
             if model_type == "deepseek_vl_v2" and is_ocr:

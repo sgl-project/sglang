@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CUDA fast path for the MiniMax-H3 video VAE decoder (ViT3DDecoder).
+"""CUDA fast path for the MiniMax-H3 image and video ViT VAE decoders.
 
 Installed once at VAE load and dispatched on one decode-scoped
 :class:`VaeFastPathGate`: ``quality="lossless"`` and ``"high"`` take the fast
@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention im
     _sdpa_attention,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_vit import (
+    ViT2DDecoder,
     ViT3DDecoder,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils import (
@@ -158,7 +159,7 @@ def _fast_attention_modules(decoder: nn.Module) -> list[nn.Module]:
     """The decoder attention blocks to rebind; empty when any block is
     non-standard or the fp32 QK norm is disabled, since a partial install would
     change numerics between blocks."""
-    if type(decoder) is not ViT3DDecoder:
+    if type(decoder) not in (ViT2DDecoder, ViT3DDecoder):
         return []
     if not envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM:
         logger.info(
@@ -178,8 +179,13 @@ def _fast_attention_modules(decoder: nn.Module) -> list[nn.Module]:
     return eligible
 
 
-def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
-    """Install the quality-gated CUDA MiniMax-H3 VAE decoder fast path."""
+def maybe_optimize_minimax_h3_vae(
+    vae: nn.Module, *, fast_attention: bool = True
+) -> nn.Module:
+    """Install the quality-gated MiniMax-H3 VAE decoder fast path.
+
+    ``fast_attention=False`` (ROCm) keeps the attention blocks' own forward:
+    the cuDNN SDPA and the CUDA QK RMSNorm+RoPE fusion do not apply there."""
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
 
     if not isinstance(vae, MiniMaxH3VideoVAE):
@@ -193,7 +199,7 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
     register_vae_fast_path_gate(vae, gate)
     if isinstance(vae.decoder, ViT3DDecoder):
         vae.decoder._sgl_gate = gate
-    attention_modules = _fast_attention_modules(vae.decoder)
+    attention_modules = _fast_attention_modules(vae.decoder) if fast_attention else []
     _install_fast_attention(attention_modules, gate)
     logger.info(
         "MiniMax-H3 VAE: installed quality-gated fast path (%s; %s tiles and %s "

@@ -7,7 +7,7 @@ import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel, get_spec
 
@@ -31,7 +31,6 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
         self.use_mla = model_runner.use_mla_backend
-        self.max_context_len = model_runner.model_config.context_len
 
         # full->SWA translated out_cache_loc, computed once per forward (the only
         # set_kv_buffer is in eager forward_extend; decode writes KV in-kernel).
@@ -159,8 +158,9 @@ class IntelAMXAttnBackend(AttentionBackend):
     def _is_swa_layer(self, layer_id: int) -> bool:
         return (
             self.use_sliding_window_kv_pool
-            and self.token_to_kv_pool.layer_router.route(layer_id).sub_pool
-            == IdSpaceKind.SLIDING_WINDOW
+            and self.token_to_kv_pool.layer_router.plays(
+                layer_id, IdSpaceKind.SLIDING_WINDOW
+            )
         )
 
     def _swa_kv_indices(
@@ -252,7 +252,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             # Cross-attention never writes to the SWA pool, so only thread the
             # full->SWA location for non-cross-attention layers.
             swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
-            write_loc = KVWriteLoc(cache_loc, swa_loc)
+            write_loc = KVWriteLoc(
+                cache_loc, window_locs=window_write_locs(self.runner_ids, swa_loc)
+            )
             if not self.use_mla and key_buffer.dtype == torch.float8_e4m3fn:
                 self.kv_layers.layer(layer.layer_id).store(
                     layer,
@@ -365,7 +367,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
             self.kv_layers.layer(layer.layer_id).store(
                 layer,
-                KVWriteLoc(cache_loc, swa_loc),
+                KVWriteLoc(
+                    cache_loc, window_locs=window_write_locs(self.runner_ids, swa_loc)
+                ),
                 k,
                 v,
                 k_scale=layer.k_scale_float,
@@ -419,9 +423,6 @@ class IntelAMXAttnBackend(AttentionBackend):
             self._attn_logits_buffers[key] = buffer
         return buffer[:num_seqs]
 
-    def support_triton(self):
-        return False
-
 
 class IntelAMXMultiStepDraftBackend:
     """
@@ -444,7 +445,6 @@ class IntelAMXMultiStepDraftBackend:
         for _ in range(self.speculative_num_steps - 1):
             self.attn_backends.append(IntelAMXAttnBackend(model_runner))
         self.device = model_runner.device
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         num_seqs = forward_batch.batch_size
@@ -453,7 +453,6 @@ class IntelAMXMultiStepDraftBackend:
         num_steps = self.speculative_num_steps
         req_to_token = self.attn_backends[0].req_to_token_pool.req_to_token
         seq_lens = forward_batch.seq_lens
-        pool_len = self.pool_len
         num_head = self.attn_backends[0].num_head
         v_head_dim = self.attn_backends[0].v_head_dim
         device = self.device
@@ -465,7 +464,7 @@ class IntelAMXMultiStepDraftBackend:
             seq_lens,
             topk,
             num_steps,
-            pool_len,
+            self.attn_backends[0].req_to_token_pool.row_width,
         )
 
         req_pool_indices_expanded = torch.arange(bs, dtype=torch.int64, device=device)

@@ -32,6 +32,7 @@ using RouteQuantTraitT = QuantTrait<
     fp8_e4m3_t,
     /*kGroupSize=*/32,
     /*kUe8m0=*/true,
+    /*kPackedScale=*/true,
     /*kRowMajor=*/true,
     /*kAligned=*/true,
     /*kFuseSiluAndMul=*/false>;

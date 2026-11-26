@@ -60,6 +60,8 @@ def _manager(manager_class=CommonKVManager):
     manager._deferred_ack_poisoned_rooms = set()
     manager.enable_staging = False
     manager.customized_info_enabled = False
+    manager.exchange_aux_item_lens = False
+    manager.decode_enable_radix_cache = False
     return manager
 
 
@@ -176,17 +178,27 @@ class TestReceiverControlMessages(CustomTestCase):
             state_layer_ids=[[7]],
             engine_rank=0,
             gpu_id=0,
+            draft_rows_dcp_collapsed=True,
+            num_draft_entries=0,
         )
         manager.agent = SimpleNamespace(
             name="nixl-peer", get_agent_metadata=lambda: b"agent-desc"
         )
-        manager.engine_desc = SimpleNamespace(
-            key="mori-peer", pack=lambda: b"engine-desc"
+        # The mori package imports conn.py, so this needs the stub of setUpClass.
+        from sglang.srt.disaggregation.mori.buffers import BufferKeys, BufferKind
+
+        manager._local_keys = BufferKeys.for_buffers([0x1000], [0x2000], [[0x3000]])
+        mori_descs = {
+            BufferKind.KV: b"kv-desc",
+            BufferKind.AUX: b"aux-desc",
+            BufferKind.STATE: b"state-desc",
+        }
+        manager.transport = SimpleNamespace(
+            session_id="mooncake-peer",
+            engine_key="mori-peer",
+            engine_desc_blob=b"engine-desc",
+            mem_desc_blobs=lambda keys: [mori_descs[key.kind] for key in keys],
         )
-        manager.kv_mem_descs = [SimpleNamespace(pack=lambda: b"kv-desc")]
-        manager.aux_mem_descs = [SimpleNamespace(pack=lambda: b"aux-desc")]
-        manager.state_mem_descs = [[SimpleNamespace(pack=lambda: b"state-desc")]]
-        manager.engine = SimpleNamespace(get_session_id=lambda: "mooncake-peer")
         receiver = CommonKVReceiver(manager, "prefill:8998", 17)
         receiver.required_dst_info_num = 3
         receiver.bootstrap_infos = [
@@ -235,6 +247,9 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"0",
                 b"",
                 struct.pack("Q", 16),
+                b"1",
+                b"0",
+                b"0",
             ],
             "nixl": [
                 b"NixlMsgGuard",
@@ -262,6 +277,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"1",
                 b"0",
                 struct.pack("<IIQ", 1, 8, 512),
+                b"1",
             ],
             "mori": [
                 b"MoriMsgGuard",
@@ -284,16 +300,21 @@ class TestReceiverControlMessages(CustomTestCase):
                 layer,
             ],
         }
-        for backend, enabled in product(self.backends, (False, True)):
-            with self.subTest(backend=backend, customized_info=enabled):
+        for backend, (enabled, exchange) in product(
+            self.backends, ((False, False), (True, True), (False, True))
+        ):
+            with self.subTest(
+                backend=backend, customized_info=enabled, exchange=exchange
+            ):
                 receiver, sent = self._make_receiver(backend)
                 receiver.kv_mgr.customized_info_enabled = enabled
+                receiver.kv_mgr.exchange_aux_item_lens = exchange
                 expected_frames = list(expected[backend])
                 if backend != "mori":
                     # aux_item_lens follows aux_ptrs; empty when disabled.
                     expected_frames.insert(
                         expected_frames.index(aux) + 1,
-                        struct.pack("Q", 64) if enabled else b"",
+                        struct.pack("Q", 64) if exchange else b"",
                     )
                 self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
@@ -308,9 +329,18 @@ class TestReceiverControlMessages(CustomTestCase):
                 else:
                     registration_type = MooncakeKVArgsRegisterInfo
                 info = registration_type.from_zmq(frames)
-                self.assertEqual(info.dst_aux_item_lens, [64] if enabled else None)
+                self.assertEqual(info.dst_aux_item_lens, [64] if exchange else None)
                 self.assertEqual(info.dst_kv_item_lens, [16])
                 self.assertEqual(info.dst_state_item_lens, [[32]])
+                self.assertTrue(info.dst_draft_rows_dcp_collapsed)
+                if backend == "mooncake":
+                    self.assertEqual(info.num_draft_entries, 0)
+                    # A peer that predates the draft-count field parses None.
+                    legacy = registration_type.from_zmq(frames[:-2])
+                    self.assertIsNone(legacy.num_draft_entries)
+                    self.assertEqual(legacy.dst_kv_item_lens, [16])
+                    with_draft = registration_type.from_zmq(frames[:-2] + [b"1"])
+                    self.assertEqual(with_draft.num_draft_entries, 1)
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])
 
