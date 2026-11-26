@@ -15,7 +15,6 @@ from sglang.srt.models.sarvam_moe import (
     SarvamMoEMLAAttention,
     SarvamMoEMLADecoderLayer,
     SarvamMoESparseMoeBlock,
-    _trtllm_bypass_torch_compile_forward,
     get_attn_forward_method,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -292,21 +291,18 @@ class TestSarvamDSpark(CustomTestCase):
         nn.Module.__init__(block)
         hidden_states = torch.randn(2, 4)
         router_logits = torch.randn(2, 8)
-        block.use_flashinfer_trtllm_bypass = True
-        block.topk = SimpleNamespace(topk_config=object())
+        topk_output = object()
+        block.topk = Mock(return_value=topk_output)
         block.experts = nn.Module()
         block.experts.forward = Mock(return_value=hidden_states)
         block.experts.forward_impl = Mock(return_value=hidden_states)
         block._router_logits = Mock(return_value=router_logits)
 
-        with patch(
-            "sglang.srt.models.sarvam_moe.is_in_tc_piecewise_cuda_graph",
-            return_value=True,
-        ):
-            actual = block._forward_router_experts(hidden_states)
+        actual = block._forward_router_experts(hidden_states)
 
         self.assertIs(actual, hidden_states)
-        block.experts.forward.assert_called_once()
+        block.topk.assert_called_once_with(hidden_states, router_logits)
+        block.experts.forward.assert_called_once_with(hidden_states, topk_output)
         block.experts.forward_impl.assert_not_called()
 
     def test_sparse_moe_declares_deepseek_v3_routing_contract(self):
@@ -319,6 +315,7 @@ class TestSarvamDSpark(CustomTestCase):
             num_shared_experts=0,
         )
         captured_expert_kwargs = {}
+        captured_topk_kwargs = {}
 
         class FakeExperts(nn.Module):
             def __init__(self, **kwargs):
@@ -335,6 +332,10 @@ class TestSarvamDSpark(CustomTestCase):
                 )
                 self.quant_method = None
 
+        def make_fake_topk(**kwargs):
+            captured_topk_kwargs.update(kwargs)
+            return _FakeTopK(TopKOutputFormat.BYPASSED)
+
         runtime = SimpleNamespace(moe=SimpleNamespace(ep_num_redundant_experts=0))
         with (
             patch(
@@ -348,7 +349,7 @@ class TestSarvamDSpark(CustomTestCase):
             ),
             patch(
                 "sglang.srt.models.sarvam_moe.TopK",
-                side_effect=lambda **_kwargs: _FakeTopK(TopKOutputFormat.BYPASSED),
+                side_effect=make_fake_topk,
             ),
         ):
             block = SarvamMoESparseMoeBlock(config, layer_id=1)
@@ -357,77 +358,20 @@ class TestSarvamDSpark(CustomTestCase):
             captured_expert_kwargs["routing_method_type"],
             RoutingMethodType.DeepSeekV3,
         )
-        self.assertEqual(block.experts.moe_runner_config.routed_scaling_factor, 2.5)
-        self.assertTrue(block.fuse_routed_scaling_in_moe)
+        self.assertIsNone(captured_expert_kwargs["routed_scaling_factor"])
+        self.assertIsNone(captured_topk_kwargs["routed_scaling_factor"])
+        self.assertFalse(captured_topk_kwargs["apply_routed_scaling_factor_on_output"])
+        self.assertIsNone(block.experts.moe_runner_config.routed_scaling_factor)
+        self.assertIs(
+            block.topk.topk_config.runner_backend,
+            block.experts.runner_backend,
+        )
+        self.assertEqual(
+            block.topk.topk_config.routing_method_type,
+            RoutingMethodType.DeepSeekV3,
+        )
         self.assertEqual(block.gate.weight.dtype, torch.bfloat16)
         self.assertTrue(block.router_logits_fp32)
-
-    def test_flashinfer_bypass_disables_bs1_compile_swap(self):
-        config = SimpleNamespace(
-            hidden_size=16,
-            hidden_act="silu",
-            moe_intermediate_size=32,
-            num_experts=8,
-            num_experts_per_tok=2,
-            num_shared_experts=0,
-        )
-        runtime = SimpleNamespace(moe=SimpleNamespace(ep_num_redundant_experts=0))
-
-        for trtllm, output_format in (
-            (True, TopKOutputFormat.BYPASSED),
-            (True, TopKOutputFormat.STANDARD),
-            (False, TopKOutputFormat.STANDARD),
-        ):
-
-            class FakeExperts(nn.Module):
-                def __init__(self, **kwargs):
-                    super().__init__()
-                    self.runner_backend = SimpleNamespace(
-                        is_flashinfer_trtllm=lambda trtllm=trtllm: trtllm,
-                        is_flashinfer_trtllm_routed=lambda: False,
-                    )
-                    self.routing_method_type = kwargs["routing_method_type"]
-                    self.moe_runner_config = SimpleNamespace(
-                        routed_scaling_factor=kwargs["routed_scaling_factor"]
-                    )
-                    self.quant_method = SimpleNamespace(
-                        _torch_compile_forward=lambda num_tokens: "native-swap"
-                    )
-
-            with (
-                patch(
-                    "sglang.srt.models.sarvam_moe.get_parallel",
-                    return_value=SimpleNamespace(tp_size=1),
-                ),
-                patch(
-                    "sglang.srt.models.sarvam_moe.get_exec",
-                    return_value=runtime,
-                ),
-                patch(
-                    "sglang.srt.models.sarvam_moe.get_moe_impl_class",
-                    return_value=FakeExperts,
-                ),
-                patch(
-                    "sglang.srt.models.sarvam_moe.TopK",
-                    side_effect=lambda **_kwargs: _FakeTopK(output_format),
-                ),
-            ):
-                block = SarvamMoESparseMoeBlock(config, layer_id=1)
-
-            expect_bypass = trtllm and output_format == TopKOutputFormat.BYPASSED
-            self.assertEqual(block.use_flashinfer_trtllm_bypass, expect_bypass)
-            self.assertEqual(block.fuse_routed_scaling_in_moe, expect_bypass)
-            self.assertEqual(
-                block.experts.moe_runner_config.routed_scaling_factor,
-                2.5 if expect_bypass else None,
-            )
-            hook = block.experts.quant_method._torch_compile_forward
-            if expect_bypass:
-                self.assertIs(hook, _trtllm_bypass_torch_compile_forward)
-                self.assertIsNone(hook(num_tokens=1))
-                self.assertIsNone(hook(num_tokens=4))
-            else:
-                self.assertEqual(hook(num_tokens=1), "native-swap")
 
 
 if __name__ == "__main__":

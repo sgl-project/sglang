@@ -1753,7 +1753,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
         # torch.compile on this layer only pays off at bs=1; keep the
         # optimized dispatch otherwise.
-        if num_tokens == 1:
+        if num_tokens == 1 and not self.use_flashinfer_trtllm_moe:
             from sglang.srt.layers.moe.fused_moe_native import (
                 fused_moe_forward_native,
             )
