@@ -1444,7 +1444,14 @@ class LogitsProcessor(nn.Module):
             if use_mm_out_dtype and (
                 self.use_fp32_lm_head or self.use_fp32_lm_head_output
             ):
-                if out is None and _gfx1250_lmhead_applies(
+                from sglang.srt.layers.quantization.unquant import (
+                    sm12x_fp32_lm_head,
+                    sm12x_fp32_lm_head_applies,
+                )
+
+                if sm12x_fp32_lm_head_applies(hidden_states, lm_head.weight, out):
+                    logits = sm12x_fp32_lm_head(hidden_states, lm_head.weight, out)
+                elif out is None and _gfx1250_lmhead_applies(
                     hidden_states, lm_head.weight
                 ):
                     # gfx1250: hipBLASLt's FP32-output pick is slow at decode
