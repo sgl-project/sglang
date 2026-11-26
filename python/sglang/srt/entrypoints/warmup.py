@@ -201,6 +201,8 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
     num_reserved_tokens: int
     # Smallest full-attention KV pool over DP ranks, in tokens.
     kv_pool_tokens: int
+    # Any sliding-window or per-request ring pool besides the full one.
+    has_window_pool: bool = False
     page_size: int
     serves_input_logprobs: bool
 
@@ -246,6 +248,11 @@ def concurrent_prefill_limits(
         kv_pool_tokens=min(
             s["memory_usage"]["token_capacity"] for s in internal_states
         ),
+        has_window_pool=any(
+            s["memory_usage"]["token_capacity_swa"] is not None
+            or bool(s["memory_usage"]["token_capacity_window"])
+            for s in internal_states
+        ),
         page_size=state["page_size"] or 1,
         # UNO refuses logprob requests; the MLX sampling path refuses prompt logprobs.
         serves_input_logprobs=not (
@@ -280,12 +287,13 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
         - 2 * page,
     )
     skip_reason = None
-    if chunk is None:
-        # Without chunking a prompt must fit every pool (sliding-window ones
-        # too) in one piece.
-        skip_reason = "chunked prefill is off"
-    elif not limits.even_dp_dispatch:
-        skip_reason = "DP dispatch is load based, so a rank's share is unknown"
+    if chunk is None and limits.has_window_pool:
+        # Without chunking a prompt must fit every pool in one piece; a
+        # full-attention-only model is covered by max_prompt.
+        skip_reason = "chunked prefill is off and the model has sliding-window pools"
+    elif not limits.even_dp_dispatch and queue is not None:
+        # Without a queue limit an uneven share only waits in the queue.
+        skip_reason = "DP dispatch is load based, so a rank's queue share is unknown"
     elif queue is not None and limits.tokenizer_workers > 1:
         # The workers' requests interleave, so no worker can bound what one
         # rank's waiting queue receives.
@@ -303,7 +311,7 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     if queue is not None:
         # A rank's share of a round can arrive in one scheduler poll.
         slots = min(slots, queue)
-    budget = max(_CONCURRENT_PREFILL_TOKENS, 2 * chunk)
+    budget = max(_CONCURRENT_PREFILL_TOKENS, 2 * (chunk or 0))
     rounds = []
     for n in sorted({1, slots // 8 or 1, slots}):
         share = max(1, budget // n)

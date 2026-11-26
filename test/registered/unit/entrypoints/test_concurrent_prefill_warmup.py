@@ -182,6 +182,14 @@ class TestConcurrentPrefillPlan(CustomTestCase):
 
         for method in ("total_tokens", "total_requests"):
             self.assertEqual(round_sizes(method), [], method)
+        # Without a queue limit an uneven share only waits: the warmup runs.
+        states = [_internal_state(load_balance_method="total_tokens")] * 4
+        limits = concurrent_prefill_limits(
+            states, context_len=131072, max_req_input_len=131066, num_reserved_tokens=0
+        )
+        self.assertEqual(
+            [len(r) for r in concurrent_prefill_plan(limits).rounds], [4, 16, 128]
+        )
         self.assertEqual(round_sizes("round_robin"), [4, 16, 128])
         # Consecutive bootstrap rooms spread evenly on a PD prefill server.
         self.assertEqual(
@@ -291,6 +299,15 @@ class TestConcurrentPrefillRequests(CustomTestCase):
         )
         asyncio.run(concurrent_prefill("null", tm))
         self.assertEqual(tm.requests, [])
+
+    def test_full_attention_model_without_chunking_runs_bounded(self):
+        """With chunking off but only the full KV pool, every prompt fits it in
+        one piece, so the rounds and the logprob probes still run."""
+        tm = _RecordingTokenizerManager(effective_chunked_prefill_size=None)
+        asyncio.run(concurrent_prefill("null", tm))
+        lens = [len(r.input_ids) for r in tm.requests]
+        self.assertTrue(lens)
+        self.assertLessEqual(max(lens), _RecordingTokenizerManager.max_req_input_len)
 
     def test_decode_server_sends_nothing(self):
         tm = _RecordingTokenizerManager()
