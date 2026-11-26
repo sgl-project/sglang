@@ -1082,6 +1082,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--enable-strict-thinking"
             )
 
+        if (
+            isinstance(obj, GenerateReqInput)
+            and getattr(obj, "parallel_sample_num", 1) > 1
+            and self.disaggregation_mode
+            in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE)
+        ):
+            # The fan-out below gives every sample the same bootstrap_room, so
+            # on a PD instance n samples would share one handshake room.
+            raise ValueError(
+                "Parallel sampling (n > 1) is not supported under PD "
+                "disaggregation; send n separate requests instead."
+            )
+
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             num_dp_ranks = self.elastic_worker_count
             if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
