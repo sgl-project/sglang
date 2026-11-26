@@ -81,6 +81,7 @@ class WaveAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
 
         max_bs = model_runner.req_to_token_pool.size
 
@@ -116,8 +117,6 @@ class WaveAttnBackend(AttentionBackend):
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 
         self.forward_metadata: ForwardMetadata = None
-
-        self.max_context_len = model_runner.req_to_token_pool.max_context_len
 
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
@@ -364,7 +363,7 @@ class WaveAttnBackend(AttentionBackend):
         )
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_bs * self.max_kv_len),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -373,7 +372,7 @@ class WaveAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_bs * self.max_kv_len),
                 dtype=torch.uint8,
                 device=self.device,
             )
