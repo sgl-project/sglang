@@ -22,6 +22,7 @@ from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
+from sglang.srt.configs.speculators_dspark import is_speculators_wrapper_config
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
@@ -51,6 +52,9 @@ from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -324,6 +328,9 @@ def _is_pow2_above_one(n: int) -> bool:
     return n > 1 and n & (n - 1) == 0
 
 
+_DFLASH_BIDIRECTIONAL_SWA_BACKENDS = ("fa3", "fa4")
+
+
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
     """Honor explicit causality while preserving legacy layer defaults."""
     text_config = config.get_text_config()
@@ -460,6 +467,24 @@ class DFlashAttention(nn.Module):
         self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
+        if (
+            self.sliding_window_size > -1
+            and self.attn_type != AttentionType.DECODER
+            and is_speculators_wrapper_config(config)
+        ):
+            from sglang.srt.speculative.draft_worker_common import (
+                resolve_draft_worker_attention_backend,
+            )
+
+            draft_attention_backend = resolve_draft_worker_attention_backend(
+                algo_label=None
+            )
+            if draft_attention_backend not in _DFLASH_BIDIRECTIONAL_SWA_BACKENDS:
+                raise ValueError(
+                    f"{draft_attention_backend} does not support bidirectional "
+                    "sliding-window DFLASH draft attention; use "
+                    "--speculative-draft-attention-backend fa3 or fa4."
+                )
         draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
         self.v_scale: Optional[float] = draft_cfg.attention_value_scale
         self.attention_sink_bias = None
@@ -1150,6 +1175,11 @@ class DFlashDraftModel(nn.Module):
 
     draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
 
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
     # project_target_hidden may split the plain (unquantized) fc over the TP ranks, which
@@ -1190,7 +1220,14 @@ class DFlashDraftModel(nn.Module):
         self.candidate_selector: Optional[nn.Module] = None
         self.lilicorr: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
-        self.quantizable = self.supports_quantization or self.is_nemotron_35_draft
+        self.quantizable = (
+            self.supports_quantization
+            or self.is_nemotron_35_draft
+            or (
+                quant_config is not None
+                and resolve_checkpoint_quant_spec(config) is not None
+            )
+        )
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.is_nemotron_35_draft:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
@@ -1527,7 +1564,7 @@ class DFlashDraftModel(nn.Module):
                     continue
                 param = params_dict[resolved_name]
                 if resolved_name.endswith("fc.weight"):
-                    if self.is_nemotron_35_draft:
+                    if self.quantizable:
                         expected_shape = (
                             int(self.config.hidden_size),
                             int(self.num_context_features * self.config.hidden_size),
@@ -1678,9 +1715,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return layer.input_layernorm(ctx_hidden)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
@@ -1692,7 +1727,9 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         num_slices = int(self.num_context_features)
         slice_size = int(target_hidden.shape[-1]) // num_slices
         slices = target_hidden.view(target_hidden.shape[0], num_slices, slice_size)
-        compute_dtype = self.fc.weight.dtype
+        compute_dtype = (
+            self.fc.params_dtype if self.quantizable else self.fc.weight.dtype
+        )
         if slices.dtype != compute_dtype:
             slices = slices.to(compute_dtype)
         normed = torch.empty_like(slices)
@@ -1700,7 +1737,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
         projected = self.fc(fused)
-        if self.is_nemotron_35_draft:
+        if self.quantizable:
             projected = projected[0]
         return self.hidden_norm(projected)
 
