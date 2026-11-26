@@ -133,6 +133,11 @@ def can_approve(gh_repo, user_login, user_perms):
     )
 
 
+def author_may_approve(gh_repo, author):
+    """True if the PR's author passes can_approve: then `run-ci` alone runs CI at every push."""
+    return can_approve(gh_repo, author, load_permissions(author))[0]
+
+
 def head_seen_by(gh_repo, pr, sha, seen_at):
     """True if sha was already the PR's head at seen_at: no pr-test.yml run at sha is newer.
     False while no such run exists yet."""
@@ -161,7 +166,7 @@ def is_approved(gh_repo, sha, labels, author):
     """
     if APPROVAL_LABEL not in labels:
         return False
-    if can_approve(gh_repo, author, load_permissions(author))[0]:
+    if author_may_approve(gh_repo, author):
         return True
     return any(
         status.context == APPROVAL_CONTEXT
@@ -253,7 +258,8 @@ def rerun_gated_runs(gh_repo, pr, head_sha, workflow_files):
                 results[path] = (
                     False,
                     f"Not re-running {link}: the PR head moved from {head_sha[:8]} "
-                    f"to {current_head[:8]}, which needs its own approval.",
+                    f"to {current_head[:8]}, which needs its own run (and approval, unless "
+                    "its author may approve).",
                 )
                 continue
             try:

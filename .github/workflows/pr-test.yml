@@ -104,13 +104,6 @@ jobs:
 
   call-pr-test-extra:
     if: github.event_name == 'schedule' || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true
-    # actions: write for pr-test-extra.yml's notify-pr-states job.
-    permissions:
-      actions: write
-      contents: read
-      issues: read
-      pull-requests: read
-      statuses: read
     uses: ./.github/workflows/pr-test-extra.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}
@@ -542,31 +535,5 @@ jobs:
       - name: Require that tests ran
         if: needs.call-gate.outputs.opted-in == 'false'
         run: |
-          echo "::error::Tests were skipped: the PR is a draft, lacks the 'run-ci' label, or its head commit has no run-ci approval. Mark the PR ready, then have a maintainer comment /tag-and-rerun-ci to approve this commit; adding 'run-ci' in the UI, /rerun-failed-ci and 'Re-run all jobs' approve nothing."
+          echo "::error::Tests were skipped: the PR is a draft, lacks the 'run-ci' label, or its head commit has no run-ci approval. Mark the PR ready, then have a maintainer comment /tag-and-rerun-ci to approve this commit (/approve-ci if the PR already has 'run-ci'); adding 'run-ci' in the UI, /rerun-failed-ci and 'Re-run all jobs' approve nothing."
           exit 1
-
-  # =============================================== notify pr-states ====================================================
-  # Dispatches pr-states.yml after every attempt (initial + every rerun).
-  # workflow_run.completed only fires on the initial completion (one
-  # workflow_run record across attempts), so we explicitly dispatch —
-  # workflow_dispatch is the only event GITHUB_TOKEN can cascade-create.
-  #
-  # Fork PRs included: a pull_request_target token is not forced read-only.
-  notify-pr-states:
-    needs: [pr-test-finish]
-    if: |
-      always() &&
-      github.event_name == 'pull_request_target'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write # gh workflow run
-    steps:
-      - name: Dispatch pr-states refresh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          gh workflow run pr-states.yml \
-            --repo ${{ github.repository }} \
-            --ref main \
-            -f pr_number="$PR_NUMBER"

@@ -403,7 +403,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: npu-metrics-${{ inputs.test_config_name }}-attempt-${{ github.run_attempt }}
-          path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
+          path: |
+            /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/${{ steps.run_test.outputs.name }}
+            /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/commit_id
           if-no-files-found: ignore
           retention-days: 7
           compression-level: 9
