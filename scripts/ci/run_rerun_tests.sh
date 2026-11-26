@@ -12,9 +12,6 @@ partition=$2
 
 case "$mode" in
   cuda)
-    if [[ "$RUNNER_LABELS" == "1-gpu-5090" ]]; then
-      source /etc/profile.d/sglang-ci.sh
-    fi
     ;;
   multimodal_gen)
     # Run through the multimodal-gen CI's pytest runner so a rerun gets the
