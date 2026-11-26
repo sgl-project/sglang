@@ -777,7 +777,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
                         )
                         yield f"data: {chunk_resp.model_dump_json()}\n\n"
 
-            # Send final stop
+            # The final prefix supersedes token caps on provisional prefixes.
             chunk_resp = TranscriptionStreamResponse(
                 id=request_id,
                 created=created_time,
@@ -785,7 +785,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
                 choices=[
                     TranscriptionStreamChoice(
                         delta=DeltaMessage(),
-                        finish_reason="stop",
+                        finish_reason=(
+                            "length" if state.final_output_truncated else "stop"
+                        ),
                     )
                 ],
             )
