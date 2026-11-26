@@ -32,7 +32,6 @@
 # and each token row's FP32 accumulator is stored to its own output row.
 
 import functools
-import os
 from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -1777,13 +1776,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         return tile_sched_params, grid
 
 
-# Experimental: generic callers retain the original tile unless the model
-# supplies a proven upper bound on the routed rows of every expert.
-TOKEN_TILE = int(os.environ.get("INKLING2_NVFP4_TOKEN_TILE", "128"))
-if TOKEN_TILE not in (32, 64, 128):
-    raise ValueError("INKLING2_NVFP4_TOKEN_TILE must be 32, 64, or 128")
-
-
 class _RoutedSwapGemm:
     def __init__(
         self, experts: int, n: int, k: int, sm_version: str, token_tile: int = 128
@@ -1901,8 +1893,8 @@ def routed_swap_matmul(
     # reads are needed, including during CUDA graph capture. Larger/unknown
     # groups retain the original schedule and compute tile.
     token_tile = (
-        TOKEN_TILE
-        if max_expert_rows is not None and 0 < max_expert_rows <= min(TOKEN_TILE, 32)
+        32
+        if max_expert_rows is not None and 0 < max_expert_rows <= 32
         else 128
     )
     _compile(experts, n, k, token_tile)(
