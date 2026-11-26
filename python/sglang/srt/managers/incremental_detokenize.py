@@ -122,16 +122,9 @@ def _clamp_decode_ids(ids: List[int], vocab_size: Optional[int]) -> List[int]:
 class DetokenizeState(msgspec.Struct):
     """Store the status of incremental decoding."""
 
-    # ----- | --------- read_ids -------|
-    # ----- |   surr_ids  |
-    # xxxxx | xxxxxxxxxxx | xxxxxxxxxxx |
-    # ----- ^ ----------- ^ ----------- ^
-    # ----- 1 ----------- 2 ----------- 3
-    # 1: surr_offset
-    # 2: read_offset
-    # 3: last token
+    # The surrogate context is followed by uncommitted tokens. read_offset
+    # marks the boundary between them.
     decode_ids: List[int]
-    surr_offset: int
     read_offset: int
     header: DetokenizeHeader
     # Output ids received so far; a non-beam row's completion_tokens is this
@@ -149,7 +142,6 @@ class DetokenizeState(msgspec.Struct):
     ) -> DetokenizeState:
         return cls(
             decode_ids=_clamp_decode_ids(header.prompt_tail_ids, vocab_size),
-            surr_offset=0,
             read_offset=len(header.prompt_tail_ids),
             header=header,
         )
@@ -197,11 +189,11 @@ class DetokenizeState(msgspec.Struct):
     ) -> Tuple[List[int], List[int]]:
         """The (read_ids, surr_ids) this row decodes."""
         read_ids = trim_matched_stop(
-            self.decode_ids[self.surr_offset :],
+            self.decode_ids.copy(),
             finished_reason,
             self.header.no_stop_trim,
         )
-        surr_ids = self.decode_ids[self.surr_offset : self.read_offset]
+        surr_ids = self.decode_ids[: self.read_offset]
         return read_ids, surr_ids
 
     def step(
@@ -221,9 +213,9 @@ class DetokenizeState(msgspec.Struct):
             # emission so we don't double-send.
             pending = self.sent_offset - self.decoded_text_len
             if new_text and not new_text.endswith("�"):
-                # Clean text: commit to decoded_text and advance offsets.
+                # Newly committed tokens become the next surrogate context.
                 self.append_decoded_text(new_text)
-                self.surr_offset = self.read_offset
+                del self.decode_ids[: self.read_offset]
                 self.read_offset = len(self.decode_ids)
                 self.sent_offset = self.decoded_text_len
                 return new_text[pending:] if pending else new_text
