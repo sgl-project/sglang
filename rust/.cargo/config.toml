@@ -1,0 +1,5 @@
+# Workspace-local cargo aliases.
+[alias]
+# Regenerate the API types (Rust + Python) from proto/sglang; see
+# sglang-api-codegen/src/main.rs.
+gen-api = "run -p sglang-api-codegen"

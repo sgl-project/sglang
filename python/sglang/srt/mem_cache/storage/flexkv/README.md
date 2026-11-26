@@ -299,7 +299,7 @@ Supported:
   `TransferManagerOnRemote` via the same ZMQ channel used for GPU
   registration.
 * **CP** (`attn_cp_size > 1`) — sync handled symmetrically with TP.
-* **DP attention** (`enable_dp_attention=True`) — the inner
+* **DP attention** (`--attn-dp-size` > 1) — the inner
   `attn_tp_size` is what FlexKV uses for register-side routing.
 
 ---

@@ -19,7 +19,10 @@ import json
 import os
 import random
 import re
+import threading
 import time
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
@@ -37,13 +40,14 @@ from sglang.benchmark.stream_metrics import (
     SteadyStateWindow,
     validate_finish_reason,
 )
-from sglang.benchmark.utils import get_processor, get_tokenizer
+from sglang.benchmark.utils import dp_listener_urls, get_processor, get_tokenizer
 from sglang.profiler import run_profile
-from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.test.nightly_bench_utils import save_results_as_pydantic_models
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
@@ -59,6 +63,12 @@ def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
     Get cached_tokens_total and prompt_tokens_total from Prometheus /metrics endpoint.
     Returns (cached_tokens_total, prompt_tokens_total) or None if metrics are not available.
     """
+    return _read_cache_tokens(url)
+
+
+def _read_cache_tokens(url: str) -> Optional[tuple]:
+    """`get_cache_tokens_from_metrics`, for reads that are not the before/after
+    snapshots of a batch (a caller may wrap that function to see just those)."""
     try:
         response = requests.get(url + "/metrics", timeout=5)
         try:
@@ -110,6 +120,33 @@ def calculate_cache_hit_rate(
     return None
 
 
+def _get_cache_tokens_once_counted(
+    url: str, prompt_tokens: Optional[float], timeout_s: float = 30.0
+) -> Optional[tuple]:
+    """`get_cache_tokens_from_metrics` once /metrics counts at least
+    `prompt_tokens` prompt tokens (None: read right away).
+
+    A server with one listener per DP rank serves /metrics from one of them,
+    which sees the other listeners' counters only after a delay; waiting for
+    the prompt tokens this client sent keeps a before/after delta exact.
+    """
+    if prompt_tokens is not None:
+        deadline = time.perf_counter() + timeout_s
+    while prompt_tokens is not None:
+        metrics = _read_cache_tokens(url)
+        if metrics is None or metrics[1] >= prompt_tokens:
+            break
+        if time.perf_counter() >= deadline:
+            print(
+                f"WARNING: /metrics counted {metrics[1]:.0f} prompt tokens after "
+                f"{timeout_s:.0f} s, short of the {prompt_tokens:.0f} sent; the "
+                f"cache hit rate may be off."
+            )
+            break
+        time.sleep(0.1)
+    return get_cache_tokens_from_metrics(url)
+
+
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
@@ -121,6 +158,7 @@ class BenchArgs:
     return_logprob: bool = False
     client_stream_interval: int = 1
     input_len_step_percentage: float = 0.0
+    input_len_list: str = ""
     base_url: str = ""
     local_tokenizer_path: str = ""
     skip_warmup: bool = False
@@ -196,6 +234,14 @@ class BenchArgs:
             "--input-len-step-percentage",
             type=float,
             default=BenchArgs.input_len_step_percentage,
+        )
+        parser.add_argument(
+            "--input-len-list",
+            type=str,
+            default=BenchArgs.input_len_list,
+            help="Comma-separated per-request input lengths for random/random-ids "
+            "batches: request i gets entry i modulo the list length, and the "
+            "reported input_len is the batch's mean.",
         )
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
         parser.add_argument(
@@ -400,7 +446,7 @@ class BenchArgs:
             action="store_true",
             help=(
                 "Allow --batch-size to exceed the server's "
-                "effective_max_running_requests_per_dp * dp_size. The surplus "
+                "effective_max_running_requests_per_dp * num_dp_ranks. The surplus "
                 "requests are queued by the scheduler and promoted as slots "
                 "free, so the batch is served as multiple sequential batches "
                 "at the running-batch cap. Useful for stabilizing throughput "
@@ -474,6 +520,15 @@ class BenchOneCaseResult(BaseModel):
             fout.write(json.dumps(res) + "\n")
 
 
+def _http_session(trust_env: bool) -> requests.Session:
+    """A session for one request; `trust_env=False` skips the environment's
+    proxy. Requests to DP rank listeners do: the server publishes them at its
+    own address, which a proxy bypass list covering only loopback misses."""
+    session = requests.Session()
+    session.trust_env = trust_env
+    return session
+
+
 def _warmup_cache(
     url: str,
     input_ids: List[List[int]],
@@ -483,6 +538,7 @@ def _warmup_cache(
     image_data: Optional[List] = None,
     backend: str = "sglang",
     model_name: Optional[str] = None,
+    trust_env: bool = True,
 ):
     """Warm up the cache by sending prefix tokens to populate the radix/prefix cache.
 
@@ -495,6 +551,7 @@ def _warmup_cache(
         image_data: Optional image data for VLM models
         backend: Backend server type ("sglang" or "vllm")
         model_name: Model name (required for vllm backend)
+        trust_env: False to skip the environment's proxy (see `_http_session`)
     """
     cached_token_len = int(input_len * cache_hit_rate)
     if cached_token_len <= 0:
@@ -531,20 +588,26 @@ def _warmup_cache(
             cache_warmup_payload["image_data"] = image_data
         gen_url = url + "/generate"
 
-    warmup_response = requests.post(
-        gen_url,
-        json=cache_warmup_payload,
-        timeout=DEFAULT_TIMEOUT,
-    )
+    with _http_session(trust_env) as session:
+        warmup_response = session.post(
+            gen_url,
+            json=cache_warmup_payload,
+            timeout=DEFAULT_TIMEOUT,
+        )
     warmup_response.raise_for_status()
     print("Cache warmup completed")
 
 
-def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
+def _flush_cache_with_retry(
+    url: str, endpoint: str, max_retries: int = 3, admin_api_key: Optional[str] = None
+):
     """Post to a cache flush endpoint with retries on failure."""
+    headers = admin_auth_headers(admin_api_key)
     for attempt in range(max_retries):
         try:
-            response = requests.post(url + endpoint, timeout=DEFAULT_TIMEOUT)
+            response = requests.post(
+                url + endpoint, headers=headers, timeout=DEFAULT_TIMEOUT
+            )
             if response.status_code == 200:
                 return
             if attempt >= max_retries - 1:
@@ -555,6 +618,131 @@ def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
         time.sleep(2)
 
 
+# /generate fields holding one entry per prompt of a batch.
+_PER_PROMPT_FIELDS = ("input_ids", "image_data", "lora_path")
+
+
+def _round_robin_parts(batch_size: int, num_parts: int) -> List[List[int]]:
+    """Batch indices per part, prompt i in part i % num_parts (as the DP
+    controller places a batch's prompts on ranks); empty parts are dropped."""
+    parts = [list(range(part, batch_size, num_parts)) for part in range(num_parts)]
+    return [indices for indices in parts if indices]
+
+
+def _sub_batch_payload(payload: dict, indices: List[int]) -> dict:
+    """`payload` restricted to the prompts at `indices`; shared fields as is."""
+    sub_payload = dict(payload)
+    for field in _PER_PROMPT_FIELDS:
+        if isinstance(payload.get(field), list):
+            sub_payload[field] = [payload[field][i] for i in indices]
+    return sub_payload
+
+
+def _stream_sub_batch(
+    gen_url: str,
+    payload: dict,
+    indices: List[int],
+    recorder: BatchStreamRecorder,
+    ignore_eos: bool,
+    trust_env: bool,
+    lock,
+    stop: Optional[threading.Event],
+) -> None:
+    """Stream one batched /generate into `recorder`, its chunk index i
+    recorded as batch index indices[i]. Returns early once `stop` is set."""
+    with (
+        _http_session(trust_env) as session,
+        session.post(
+            gen_url,
+            json=payload,
+            stream=True,
+            timeout=DEFAULT_TIMEOUT,
+        ) as response,
+    ):
+        response.raise_for_status()
+        for chunk in response.iter_lines(decode_unicode=False):
+            if stop is not None and stop.is_set():
+                return
+            chunk = chunk.decode("utf-8")
+            if chunk and chunk.startswith("data:"):
+                if chunk == "data: [DONE]":
+                    break
+                data = json.loads(chunk[5:].strip("\n"))
+                if "error" in data:
+                    raise RuntimeError(f"Request has failed. {data}.")
+
+                finish_reason = data["meta_info"]["finish_reason"]
+                if finish_reason is not None:
+                    validate_finish_reason(finish_reason, ignore_eos=ignore_eos)
+                # Chunk times are taken under the lock, so the recorder sees
+                # them in order across concurrent sub-batches.
+                with lock:
+                    recorder.record_chunk(
+                        index=indices[data["index"]],
+                        completion_tokens=data["meta_info"]["completion_tokens"],
+                        finish_type=(
+                            finish_reason["type"] if finish_reason is not None else None
+                        ),
+                        now=time.perf_counter(),
+                    )
+
+
+def _stream_batch(
+    gen_urls: List[str],
+    payload: dict,
+    recorder: BatchStreamRecorder,
+    ignore_eos: bool,
+    trust_env: bool,
+) -> None:
+    """Stream a batched /generate into `recorder`, split over `gen_urls`.
+
+    With several URLs (one per DP rank listener), prompt i goes to URL
+    i % len(gen_urls); the sub-batches stream concurrently into the one
+    recorder under their batch indices, so its timings and token counts cover
+    the whole batch. A failed sub-batch fails the call and stops the rest.
+    """
+    parts = _round_robin_parts(len(payload["input_ids"]), len(gen_urls))
+    if len(parts) == 1:
+        _stream_sub_batch(
+            gen_urls[0],
+            payload,
+            parts[0],
+            recorder,
+            ignore_eos,
+            trust_env,
+            nullcontext(),
+            None,
+        )
+        return
+
+    lock = threading.Lock()
+    stop = threading.Event()
+    failed = None
+    with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+        futures = [
+            pool.submit(
+                _stream_sub_batch,
+                gen_url,
+                _sub_batch_payload(payload, indices),
+                indices,
+                recorder,
+                ignore_eos,
+                trust_env,
+                lock,
+                stop,
+            )
+            for gen_url, indices in zip(gen_urls, parts)
+        ]
+        done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+        failed = next((f for f in done if f.exception() is not None), None)
+        if failed is not None:
+            # The other streams return at their next chunk, closing their
+            # connections; leaving the pool waits for them.
+            stop.set()
+    if failed is not None:
+        failed.result()
+
+
 @lru_cache(maxsize=None)
 def _load_hf_config(name_or_path: str):
     if not name_or_path:
@@ -562,6 +750,9 @@ def _load_hf_config(name_or_path: str):
 
     from transformers import AutoConfig
 
+    from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
+
+    apply_all_hf_patches()
     try:
         return AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
     except Exception as e:
@@ -616,6 +807,7 @@ def run_one_case(
     profile_by_stage: bool = False,
     profile_prefix: Optional[str] = BenchArgs.profile_prefix,
     profile_output_dir: Optional[str] = BenchArgs.profile_output_dir,
+    admin_api_key: Optional[str] = None,
     dataset_name: str = BenchArgs.dataset_name,
     dataset_path: str = BenchArgs.dataset_path,
     parallel_batch: bool = False,
@@ -633,16 +825,26 @@ def run_one_case(
     fixed_prompt_file: str = "",
     apply_chat_template: bool = False,
     flush_hicache_storage: bool = False,
+    input_len_list: str = "",
+    listener_urls: Optional[List[str]] = None,
 ):
+    """Run one batch against `url`. With `listener_urls` (every DP rank's
+    listener, see `dp_listener_urls`), the batch's /generate and its cache
+    warmup are spread over them; control and metrics requests still go to
+    `url`, whose server fans them out to every rank."""
+    # Where the batch's prompts go; item i goes to gen_bases[i % len(gen_bases)].
+    gen_bases = listener_urls or [url]
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
         _flush_cache_with_retry(url, "/reset_prefix_cache")
     else:
-        _flush_cache_with_retry(url, "/flush_cache")
+        _flush_cache_with_retry(url, "/flush_cache", admin_api_key=admin_api_key)
         # /flush_cache resets the radix tree and the host tier; a storage tier
         # persists across it and would serve the same prompts on the next case.
         if flush_hicache_storage:
-            _flush_cache_with_retry(url, "/hicache/storage-backend/clear")
+            _flush_cache_with_retry(
+                url, "/hicache/storage-backend/clear", admin_api_key=admin_api_key
+            )
 
     if fixed_prompt_file:
         tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
@@ -733,6 +935,12 @@ def run_one_case(
         else:
             input_ids = [req.prompt for req in input_requests]
             image_data = None
+            if input_len_list:
+                lens = _batch_input_lens(input_len_list, batch_size)
+                input_ids = [
+                    (ids * (n // len(ids) + 1))[:n] for ids, n in zip(input_ids, lens)
+                ]
+                input_len = sum(lens) // batch_size
 
     # Build payload based on backend
     if backend == "vllm":
@@ -748,26 +956,11 @@ def run_one_case(
             payload["logprobs"] = 1
         gen_url = url + "/v1/completions"
     else:
-        # Load sampling parameters
-        use_structured_outputs = False
-        if use_structured_outputs:
-            texts = []
-            for _ in range(batch_size):
-                texts.append(
-                    "Human: What is the capital city of france? can you give as many trivial information as possible about that city? answer in json.\n"
-                    * 50
-                    + "Assistant:"
-                )
-            json_schema = "$$ANY$$"
-        else:
-            json_schema = None
-
         payload = {
             "sampling_params": {
                 "temperature": temperature,
                 "max_new_tokens": output_len,
                 "ignore_eos": ignore_eos,
-                "json_schema": json_schema,
                 "stream_interval": stream_interval,
             },
             "return_logprob": return_logprob,
@@ -805,20 +998,38 @@ def run_one_case(
                     f"Unexpected lora_request_distribution: "
                     f"{lora_request_distribution!r}"
                 )
-        gen_url = url + "/generate"
 
-    # Warm up cache if cache_hit_rate > 0.0
+    # Over several listeners, /metrics catches up with the requests sent through
+    # the others only after a delay: count the prompt tokens sent from here on,
+    # and read /metrics once it has counted them (when the server serves it).
+    prompt_tokens_sent = None
+    if len(gen_bases) > 1:
+        baseline = _read_cache_tokens(url)
+        if baseline is not None:
+            prompt_tokens_sent = baseline[1]
+
+    # Warm up cache if cache_hit_rate > 0.0, each prefix on the listener (DP
+    # rank) that serves its prompt below.
     if cache_hit_rate > 0.0:
-        _warmup_cache(
-            url=url,
-            input_ids=input_ids,
-            input_len=input_len,
-            cache_hit_rate=cache_hit_rate,
-            dataset_name=dataset_name,
-            image_data=image_data,
-            backend=backend,
-            model_name=model_name,
-        )
+        if prompt_tokens_sent is not None:
+            cached_token_len = int(input_len * cache_hit_rate)
+            prompt_tokens_sent += sum(len(ids[:cached_token_len]) for ids in input_ids)
+        for gen_base, indices in zip(
+            gen_bases, _round_robin_parts(len(input_ids), len(gen_bases))
+        ):
+            _warmup_cache(
+                url=gen_base,
+                input_ids=[input_ids[i] for i in indices],
+                input_len=input_len,
+                cache_hit_rate=cache_hit_rate,
+                dataset_name=dataset_name,
+                image_data=(
+                    [image_data[i] for i in indices] if image_data is not None else None
+                ),
+                backend=backend,
+                model_name=model_name,
+                trust_env=not listener_urls,
+            )
 
     # Turn on profiler
     profile_link = None
@@ -831,25 +1042,26 @@ def run_one_case(
             profile_by_stage=profile_by_stage,
             profile_prefix=profile_prefix,
             start_step=profile_start_step,
+            admin_api_key=admin_api_key,
         )
 
     # Get metrics before the request (for cache hit rate calculation)
-    metrics_before = get_cache_tokens_from_metrics(url)
+    metrics_before = _get_cache_tokens_once_counted(url, prompt_tokens_sent)
 
     # Run the request
     recorder: Optional[BatchStreamRecorder] = None
     tic = time.perf_counter()
-    with requests.post(
-        gen_url,
-        json=payload,
-        stream=True,
-        timeout=DEFAULT_TIMEOUT,
-    ) as response:
-        response.raise_for_status()
+    if backend == "vllm":
+        with requests.post(
+            gen_url,
+            json=payload,
+            stream=True,
+            timeout=DEFAULT_TIMEOUT,
+        ) as response:
+            response.raise_for_status()
 
-        # Get the TTFT of the last request in the batch
-        last_ttft = 0.0
-        if backend == "vllm":
+            # Get the TTFT of the last request in the batch
+            last_ttft = 0.0
             # Parse OpenAI-compatible streaming format from vLLM
             first_token_indices = set()
             for chunk in response.iter_lines(decode_unicode=False):
@@ -867,35 +1079,22 @@ def run_one_case(
                             first_token_indices.add(idx)
                             if len(first_token_indices) == batch_size:
                                 last_ttft = time.perf_counter() - tic
-        else:
-            # mmmu can silently return fewer prompts than requested.
-            recorder = BatchStreamRecorder(batch_size=len(input_ids))
-            for chunk in response.iter_lines(decode_unicode=False):
-                chunk = chunk.decode("utf-8")
-                if chunk and chunk.startswith("data:"):
-                    if chunk == "data: [DONE]":
-                        break
-                    data = json.loads(chunk[5:].strip("\n"))
-                    if "error" in data:
-                        raise RuntimeError(f"Request has failed. {data}.")
-
-                    finish_reason = data["meta_info"]["finish_reason"]
-                    if finish_reason is not None:
-                        validate_finish_reason(finish_reason, ignore_eos=ignore_eos)
-                    recorder.record_chunk(
-                        index=data["index"],
-                        completion_tokens=data["meta_info"]["completion_tokens"],
-                        finish_type=(
-                            finish_reason["type"] if finish_reason is not None else None
-                        ),
-                        now=time.perf_counter(),
-                    )
-            missing = recorder.missing_indices()
-            if missing:
-                raise RuntimeError(
-                    f"No stream chunk received for request indices {missing}."
-                )
-            last_ttft = recorder.all_started_time - tic
+    else:
+        # mmmu can silently return fewer prompts than requested.
+        recorder = BatchStreamRecorder(batch_size=len(input_ids))
+        _stream_batch(
+            [gen_base + "/generate" for gen_base in gen_bases],
+            payload,
+            recorder,
+            ignore_eos,
+            trust_env=not listener_urls,
+        )
+        missing = recorder.missing_indices()
+        if missing:
+            raise RuntimeError(
+                f"No stream chunk received for request indices {missing}."
+            )
+        last_ttft = recorder.all_started_time - tic
 
     # Compute metrics
     latency = time.perf_counter() - tic
@@ -961,7 +1160,9 @@ def run_one_case(
                 last_gen_throughput = val_thr
 
     # Calculate cache hit rate from before/after metrics delta
-    metrics_after = get_cache_tokens_from_metrics(url)
+    if prompt_tokens_sent is not None:
+        prompt_tokens_sent += sum(len(ids) for ids in input_ids)
+    metrics_after = _get_cache_tokens_once_counted(url, prompt_tokens_sent)
     metrics_cache_hit_rate = calculate_cache_hit_rate(metrics_before, metrics_after)
 
     # Print results
@@ -1027,13 +1228,51 @@ def run_one_case(
     return result
 
 
+def _parse_input_len_list(input_len_list: str) -> List[int]:
+    entries = [entry.strip() for entry in input_len_list.split(",")]
+    if not all(entry.isdecimal() and int(entry) > 0 for entry in entries):
+        raise ValueError(
+            "--input-len-list must be comma-separated positive integers, "
+            f"got {input_len_list!r}"
+        )
+    return [int(entry) for entry in entries]
+
+
+def _batch_input_lens(input_len_list: str, batch_size: int) -> List[int]:
+    """Per-request input lengths of a batch: --input-len-list cycled to its size."""
+    lens = _parse_input_len_list(input_len_list)
+    return [lens[i % len(lens)] for i in range(batch_size)]
+
+
 def should_skip_due_to_token_capacity(
-    batch_size, input_len, output_len, skip_token_capacity_threshold
+    batch_size,
+    input_len,
+    output_len,
+    skip_token_capacity_threshold,
+    input_len_list="",
+    num_dp_ranks=1,
 ):
-    if batch_size * (input_len + output_len) > skip_token_capacity_threshold:
+    input_tokens = (
+        sum(_batch_input_lens(input_len_list, batch_size))
+        if input_len_list
+        else batch_size * input_len
+    )
+    resident_tokens = input_tokens + batch_size * output_len
+    if input_len_list and num_dp_ranks > 1:
+        # Requests land on DP rank i % num_dp_ranks (the DP controller's
+        # round-robin, or the client's split over per-rank listeners), so a
+        # ragged batch fills its heaviest rank first; the
+        # requests past that rank's share of the pool would queue.
+        lens = _batch_input_lens(input_len_list, batch_size)
+        heaviest = max(
+            sum(n + output_len for n in lens[rank::num_dp_ranks])
+            for rank in range(num_dp_ranks)
+        )
+        resident_tokens = max(resident_tokens, heaviest * num_dp_ranks)
+    if resident_tokens > skip_token_capacity_threshold:
         print(
             "=" * 8
-            + f"Skip benchmark {batch_size=} * ({input_len=} + {output_len=}) = {batch_size * (input_len + output_len)} > {skip_token_capacity_threshold=} due to kv cache limit."
+            + f"Skip benchmark {batch_size=} {input_len=} {output_len=}: {resident_tokens=} > {skip_token_capacity_threshold=} due to kv cache limit."
             + "=" * 8
         )
         return True
@@ -1172,6 +1411,19 @@ def run_benchmark_internal(
                 "request."
             )
 
+    if bench_args.input_len_list:
+        _parse_input_len_list(bench_args.input_len_list)
+    if bench_args.input_len_list and (
+        bench_args.dataset_name not in ("random", "random-ids")
+        or bench_args.fixed_prompt_file
+        or len(bench_args.input_len) > 1
+    ):
+        raise ValueError(
+            "--input-len-list sizes random/random-ids prompts and replaces "
+            "--input-len: use one of those datasets, one --input-len value and "
+            "no --fixed-prompt-file."
+        )
+
     if bench_args.dataset_name in REPLAY_TEXT_DATASETS:
         if bench_args.backend == "vllm":
             raise ValueError(
@@ -1232,6 +1484,8 @@ def run_benchmark_internal(
         # vLLM does not expose token capacity or max running requests via API
         skip_token_capacity_threshold = float("inf")
         skip_max_running_requests_threshold = float("inf")
+        num_dp_ranks = 1
+        listener_urls = []
     else:
         model_name = None
         response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
@@ -1251,7 +1505,18 @@ def run_benchmark_internal(
 
         internal_states = server_info.get("internal_states", [])
         internal_state = internal_states[0] if internal_states else {}
-        dp_size = internal_state.get("dp_size", None) or 1
+        # Replicas times attention-DP groups, as in `num_dp_ranks_of`.
+        num_dp_ranks = (internal_state.get("dp_size", None) or 1) * (
+            internal_state.get("attn_dp_size", None) or 1
+        )
+        # A server whose DP ranks each have their own listener lists them;
+        # spread every batch over them, as the DP controller would behind one
+        # URL. Empty otherwise, and the batch goes to base_url as one request.
+        listener_urls = dp_listener_urls(server_info)
+        if listener_urls:
+            print(f"Spreading each batch over the DP rank listeners {listener_urls}")
+            # Such a server's internal states may not carry the DP sizes.
+            num_dp_ranks = max(num_dp_ranks, len(listener_urls))
 
         # Get effective max running requests
         max_running_requests_per_dp = internal_state.get(
@@ -1283,10 +1548,12 @@ def run_benchmark_internal(
             assert max_running_requests_per_dp > 0, (
                 f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
             )
-            skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
+            skip_max_running_requests_threshold = (
+                max_running_requests_per_dp * num_dp_ranks
+            )
 
         print(f"{max_running_requests_per_dp=}")
-        print(f"{dp_size=}")
+        print(f"{num_dp_ranks=}")
         print(f"{skip_max_running_requests_threshold=}")
         print(f"{skip_token_capacity_threshold=}")
 
@@ -1367,6 +1634,7 @@ def run_benchmark_internal(
                 run_name="",
                 result_filename="",
                 tokenizer=tokenizer,
+                admin_api_key=server_args.admin_api_key,
                 dataset_name=bench_args.dataset_name,
                 dataset_path=bench_args.dataset_path,
                 parallel_batch=bench_args.parallel_batch,
@@ -1379,6 +1647,7 @@ def run_benchmark_internal(
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
                 fixed_prompt_file=bench_args.fixed_prompt_file,
                 apply_chat_template=bench_args.apply_chat_template,
+                listener_urls=listener_urls,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1396,7 +1665,12 @@ def run_benchmark_internal(
             if should_skip_due_to_max_running_requests(
                 bs, skip_max_running_requests_threshold
             ) or should_skip_due_to_token_capacity(
-                kv_footprint_bs, il, ol, skip_token_capacity_threshold
+                kv_footprint_bs,
+                il,
+                ol,
+                skip_token_capacity_threshold,
+                bench_args.input_len_list,
+                num_dp_ranks,
             ):
                 continue
             results.append(
@@ -1413,6 +1687,7 @@ def run_benchmark_internal(
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
+                    admin_api_key=server_args.admin_api_key,
                     dataset_name=bench_args.dataset_name,
                     dataset_path=bench_args.dataset_path,
                     parallel_batch=bench_args.parallel_batch,
@@ -1426,6 +1701,8 @@ def run_benchmark_internal(
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
                     fixed_prompt_file=bench_args.fixed_prompt_file,
                     apply_chat_template=bench_args.apply_chat_template,
+                    input_len_list=bench_args.input_len_list,
+                    listener_urls=listener_urls,
                     **gsp_kwargs,
                 )
             )
@@ -1444,7 +1721,12 @@ def run_benchmark_internal(
                     if should_skip_due_to_max_running_requests(
                         bs, skip_max_running_requests_threshold
                     ) or should_skip_due_to_token_capacity(
-                        kv_footprint_bs, il, ol, skip_token_capacity_threshold
+                        kv_footprint_bs,
+                        il,
+                        ol,
+                        skip_token_capacity_threshold,
+                        bench_args.input_len_list,
+                        num_dp_ranks,
                     ):
                         continue
                     profile_prefix = (
@@ -1475,6 +1757,7 @@ def run_benchmark_internal(
                             profile_by_stage=bench_args.profile_by_stage,
                             profile_prefix=profile_prefix,
                             profile_output_dir=bench_args.profile_output_dir,
+                            admin_api_key=server_args.admin_api_key,
                             backend=bench_args.backend,
                             model_name=model_name,
                             fake_prefill=bench_args.fake_prefill,
@@ -1484,6 +1767,8 @@ def run_benchmark_internal(
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
                             fixed_prompt_file=bench_args.fixed_prompt_file,
                             apply_chat_template=bench_args.apply_chat_template,
+                            input_len_list=bench_args.input_len_list,
+                            listener_urls=listener_urls,
                             **gsp_kwargs,
                         )
                     )

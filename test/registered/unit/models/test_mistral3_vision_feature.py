@@ -6,6 +6,8 @@ final-layer case takes the cheap path and that both paths agree, for each
 adaptor that reads the Pixtral tower this way.
 """
 
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 
@@ -103,6 +105,110 @@ class TestPixtralAdaptorVisionFeature(unittest.TestCase):
             with self.subTest(adaptor=name):
                 out = get_image_feature(_model(-1), _items(3))
                 self.assertEqual(out.shape, (3 * TOKENS, HIDDEN))
+
+
+def _bare_mistral3():
+    # Skip LlavaForConditionalGeneration.__init__, which builds the language and
+    # vision models from an HF config.
+    model = Mistral3ForConditionalGeneration.__new__(Mistral3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    return model
+
+
+class RecordingLoader(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.loaded = []
+
+    def load_weights(self, weights):
+        self.loaded.extend(name for name, _ in weights)
+
+
+class RecordingProjector(torch.nn.Module):
+    # Mistral3's projector takes image_sizes; Llava's takes the feature alone.
+    def __init__(self):
+        super().__init__()
+        self.image_sizes = []
+
+    def forward(self, feature, image_sizes):
+        self.image_sizes.append(image_sizes)
+        return feature
+
+
+class TestMistral3ModelSurvivesEval(unittest.TestCase):
+    def test_eval_keeps_the_mistral3_model(self):
+        """Loaders keep what ``model.eval()`` returns, so it must be the model the
+        loader built: same ``shared_experts_config``, children in eval mode, and
+        Mistral3's image-feature path."""
+        model = _bare_mistral3()
+        sentinel = object()
+        model.shared_experts_config = sentinel
+        model.vision_tower = RecordingTower()
+        model.vision_feature_layer = -1
+        model.vision_feature_select_strategy = "full"
+        model.multi_modal_projector = RecordingProjector()
+
+        loaded = model.eval()
+
+        self.assertIs(loaded, model)
+        self.assertIs(loaded.shared_experts_config, sentinel)
+        self.assertFalse(loaded.multi_modal_projector.training)
+        loaded.get_image_feature(_items(1))
+        self.assertEqual(loaded.multi_modal_projector.image_sizes, [[(4, 4)]])
+
+    def test_v5_checkpoint_names_load_the_same_before_and_after_eval(self):
+        """Weight updates call ``load_weights`` on the model kept after ``eval()``,
+        so transformers v5 checkpoint names must reach the same destinations as
+        the initial load."""
+        model = _bare_mistral3()
+        model.vision_feature_select_strategy = "full"
+        model.language_model = RecordingLoader()
+        model.vision_tower = RecordingLoader()
+        model.multi_modal_projector = torch.nn.Linear(2, 2, bias=False)
+        projector_weight = torch.ones(2, 2)
+        v5_weights = [
+            ("model.language_model.embed_tokens.weight", torch.zeros(1)),
+            ("lm_head.weight", torch.zeros(1)),
+            ("model.vision_tower.patch_conv.weight", torch.zeros(1)),
+            ("model.multi_modal_projector.weight", projector_weight),
+        ]
+
+        def load_into(target):
+            model.language_model.loaded.clear()
+            model.vision_tower.loaded.clear()
+            torch.nn.init.zeros_(model.multi_modal_projector.weight)
+            target.load_weights(v5_weights)
+            return (
+                list(model.language_model.loaded),
+                list(model.vision_tower.loaded),
+                torch.equal(model.multi_modal_projector.weight, projector_weight),
+            )
+
+        expected = (
+            ["model.embed_tokens.weight", "lm_head.weight"],
+            ["patch_conv.weight"],
+            True,
+        )
+        self.assertEqual(load_into(model), expected)
+        self.assertEqual(load_into(model.eval()), expected)
+
+
+class TestMistralLlavaImportOrder(unittest.TestCase):
+    def test_either_module_can_be_imported_first(self):
+        """mistral.py subclasses LlavaForConditionalGeneration and llava.py builds
+        MistralForCausalLM, so neither module may depend on import order."""
+        for first, second in (("mistral", "llava"), ("llava", "mistral")):
+            with self.subTest(first=first):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        f"import sglang.srt.models.{first}, sglang.srt.models.{second}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

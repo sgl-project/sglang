@@ -13,16 +13,16 @@ import unittest
 
 import requests
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    kill_process_tree,
     popen_launch_server,
 )
 
-register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=600, suite="extra-test-1-gpu-xpu")
 
 # Small Mamba-1 (state-spaces) checkpoint; exercises MambaMixer1 on XPU.
 MODEL = "state-spaces/mamba-130m-hf"

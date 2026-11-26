@@ -28,6 +28,9 @@ from sglang.srt.function_call.utils import (
 
 logger = logging.getLogger(__name__)
 
+# A call takes a few steps; the bound only stops a detector that never idles.
+_MAX_STEPS_PER_CHUNK = 1024
+
 
 class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
@@ -343,6 +346,46 @@ class BaseFormatDetector(ABC):
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult()
 
+    def parse_streaming_segments(
+        self, new_text: str, tools: List[Tool]
+    ) -> List[StreamingParseResult]:
+        """Parse a streamed chunk, stepping until a step makes no progress.
+
+        A step of parse_streaming_increment can emit as little as one name or
+        one argument diff, while a chunk can hold whole calls (batched
+        detokenization, stream_interval > 1, speculative decoding).
+
+        A result is sent text first, then calls, so text that follows calls
+        opens a new result; the results are in generation order.
+        """
+        results = [StreamingParseResult()]
+        for i in range(_MAX_STEPS_PER_CHUNK):
+            text = new_text if i == 0 else ""
+            held = self._buffer + text
+            step = self.parse_streaming_increment(text, tools)
+            if (
+                not step.calls
+                and self._buffer == held
+                and not (text and step.normal_text)
+            ):
+                # The step consumed nothing, so the next step would repeat it:
+                # send nothing, or resend the buffer as several detectors'
+                # error paths do. A detector that keeps its text outside
+                # _buffer must send it in one step.
+                break
+            if step.normal_text and results[-1].calls:
+                results.append(StreamingParseResult())
+            results[-1].normal_text += step.normal_text
+            results[-1].calls.extend(step.calls)
+        else:
+            logger.error(
+                "%s still makes progress after %d steps on one chunk; the rest "
+                "of the chunk waits for the next one",
+                type(self).__name__,
+                _MAX_STEPS_PER_CHUNK,
+            )
+        return results
+
     @abstractmethod
     def has_tool_call(self, text: str) -> bool:
         """
@@ -366,6 +409,15 @@ class BaseFormatDetector(ABC):
         """Return True if ``tool_choice="required"`` must skip grammar
         constraints and parse the model's native output format instead."""
         return False
+
+    @classmethod
+    def parses_without_tools(cls) -> bool:
+        """Return True if tool-call markup is parsed even when a request
+        declares no tools, so a call to an undeclared tool is not left in content."""
+        return False
+
+    def get_required_tool_parser(self, tool_choice):
+        return None
 
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:

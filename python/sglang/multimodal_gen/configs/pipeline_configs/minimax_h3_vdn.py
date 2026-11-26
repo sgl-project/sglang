@@ -23,8 +23,12 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
             "4xH200 deployment; the VDN-H3 8-step hybrid checkpoint has no "
-            'audited high-quality deployment. Use quality="lossless".'
+            'audited high-quality deployment. Use quality="exact".'
         )
+
+    def extra_dit_components(self, server_args) -> tuple[str, ...]:
+        # one partition; validate_server_args rejects --model-variant
+        return ()
 
     def validate_server_args(self, server_args) -> None:
         if server_args.model_variant is not None:

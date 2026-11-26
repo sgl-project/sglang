@@ -293,30 +293,59 @@ bool is_valid_config(
   return cache_size + kSharedMemoryValidityMargin <= max_shared_mem;
 }
 
+// Matches one kernel instantiation, including its scale type: FP8 group-32 weights
+// take either E8M0 (MXFP8) or BF16/FP16 scales, which share every other key.
+#define _GET_IF_S(                                                                                                    \
+    W_TYPE,                                                                                                           \
+    S_TYPE,                                                                                                           \
+    THREAD_M_BLOCKS,                                                                                                  \
+    THREAD_N_BLOCKS,                                                                                                  \
+    THREAD_K_BLOCKS,                                                                                                  \
+    M_BLOCK_SIZE_8,                                                                                                   \
+    GROUP_BLOCKS,                                                                                                     \
+    NUM_THREADS,                                                                                                      \
+    IS_ZP_FLOAT)                                                                                                      \
+  else if (                                                                                                           \
+      q_type == W_TYPE && s_type == S_TYPE && thread_m_blocks == THREAD_M_BLOCKS &&                                   \
+      thread_n_blocks == THREAD_N_BLOCKS && thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8 && \
+      group_blocks == GROUP_BLOCKS && num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT) {                     \
+    constexpr auto kSType = S_TYPE;                                                                                   \
+    kernel = Marlin<                                                                                                  \
+        scalar_t,                                                                                                     \
+        W_TYPE.id(),                                                                                                  \
+        kSType.id(),                                                                                                  \
+        NUM_THREADS,                                                                                                  \
+        THREAD_M_BLOCKS,                                                                                              \
+        THREAD_N_BLOCKS,                                                                                              \
+        THREAD_K_BLOCKS,                                                                                              \
+        M_BLOCK_SIZE_8,                                                                                               \
+        pipe_stages,                                                                                                  \
+        GROUP_BLOCKS,                                                                                                 \
+        IS_ZP_FLOAT,                                                                                                  \
+        kIsEP,                                                                                                        \
+        kHasBias,                                                                                                     \
+        kExpertIdsAreSorted,                                                                                          \
+        kZeroInactiveOutput,                                                                                          \
+        kHasInactivePrefixCount>;                                                                                     \
+  }
+
+// Default scale type per weight type (the upstream rule).
+#define _DEFAULT_S_TYPE(W_TYPE, GROUP_BLOCKS)                                       \
+  (W_TYPE == host::kFE2M1f ? (GROUP_BLOCKS == 1 ? host::kFE4M3fn : host::kFE8M0fnu) \
+                           : (std::is_same<scalar_t, half>::value ? host::kFloat16 : host::kBFloat16))
+
 #define _GET_IF(                                                                                                       \
     W_TYPE, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8, GROUP_BLOCKS, NUM_THREADS, IS_ZP_FLOAT) \
-  else if (                                                                                                            \
-      q_type == W_TYPE && thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS &&                  \
-      thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8 && group_blocks == GROUP_BLOCKS &&        \
-      num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT) {                                                      \
-    constexpr auto S_TYPE = W_TYPE == host::kFE2M1f                                                                    \
-                                ? (GROUP_BLOCKS == 1 ? host::kFE4M3fn : host::kFE8M0fnu)                               \
-                                : (std::is_same<scalar_t, half>::value ? host::kFloat16 : host::kBFloat16);            \
-    kernel = Marlin<                                                                                                   \
-        scalar_t,                                                                                                      \
-        W_TYPE.id(),                                                                                                   \
-        S_TYPE.id(),                                                                                                   \
-        NUM_THREADS,                                                                                                   \
-        THREAD_M_BLOCKS,                                                                                               \
-        THREAD_N_BLOCKS,                                                                                               \
-        THREAD_K_BLOCKS,                                                                                               \
-        M_BLOCK_SIZE_8,                                                                                                \
-        pipe_stages,                                                                                                   \
-        GROUP_BLOCKS,                                                                                                  \
-        IS_ZP_FLOAT,                                                                                                   \
-        kIsEP,                                                                                                         \
-        kHasBias>;                                                                                                     \
-  }
+  _GET_IF_S(                                                                                                           \
+      W_TYPE,                                                                                                          \
+      _DEFAULT_S_TYPE(W_TYPE, GROUP_BLOCKS),                                                                           \
+      THREAD_M_BLOCKS,                                                                                                 \
+      THREAD_N_BLOCKS,                                                                                                 \
+      THREAD_K_BLOCKS,                                                                                                 \
+      M_BLOCK_SIZE_8,                                                                                                  \
+      GROUP_BLOCKS,                                                                                                    \
+      NUM_THREADS,                                                                                                     \
+      IS_ZP_FLOAT)
 
 // COMMON: cases for (group_blocks in [-1, 2, 4, 8] and is_zp_float == false)
 //         this is the most common cases
@@ -325,6 +354,8 @@ bool is_valid_config(
 // ACT: cases for act order case (group_blocks == 0)
 // NVFP4: cases for nvfp4(e2m1) (group_blocks == 1)
 // MXFP4: cases for mxfp4(e2m1) (group_blocks == 2)
+// FP8G32: cases for fp8(e4m3) with BF16/FP16 scales (group_blocks == 2)
+// MXFP8: cases for fp8(e4m3) with E8M0 scales (group_blocks == 2)
 #define COMMON_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false)   \
@@ -377,6 +408,21 @@ bool is_valid_config(
   BIGGROUP_GET_IF_M234(W_TYPE, 16, 4, 256) \
   BIGGROUP_GET_IF_M234(W_TYPE, 8, 4, 128)
 
+#define FP8G32_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define FP8G32_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)    \
+  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define FP8G32_GET_IF(W_TYPE)            \
+  FP8G32_GET_IF_M1(W_TYPE, 8, 8, 256)    \
+  FP8G32_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+  FP8G32_GET_IF_M234(W_TYPE, 16, 4, 256) \
+  FP8G32_GET_IF_M234(W_TYPE, 8, 4, 128)
+
 #define NVFP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 1, NUM_THREADS, false) \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false)
@@ -404,8 +450,25 @@ bool is_valid_config(
 #define MXFP4_GET_IF(W_TYPE)            \
   MXFP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
   MXFP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+  MXFP4_GET_IF_M1(W_TYPE, 4, 8, 128)    \
   MXFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
   MXFP4_GET_IF_M234(W_TYPE, 8, 4, 128)
+
+#define MXFP8_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)                         \
+  _GET_IF_S(W_TYPE, host::kFE8M0fnu, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false) \
+  _GET_IF_S(W_TYPE, host::kFE8M0fnu, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define MXFP8_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)                        \
+  _GET_IF_S(W_TYPE, host::kFE8M0fnu, 2, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF_S(W_TYPE, host::kFE8M0fnu, 3, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF_S(W_TYPE, host::kFE8M0fnu, 4, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define MXFP8_GET_IF(W_TYPE)            \
+  MXFP8_GET_IF_M1(W_TYPE, 8, 8, 256)    \
+  MXFP8_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+  MXFP8_GET_IF_M1(W_TYPE, 4, 8, 128)    \
+  MXFP8_GET_IF_M234(W_TYPE, 16, 4, 256) \
+  MXFP8_GET_IF_M234(W_TYPE, 8, 4, 128)
 
 // We currently have 4-bit models only with group_blocks == 4
 #define FZP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
@@ -439,9 +502,16 @@ bool is_valid_config(
   ACT_GET_IF_M234(W_TYPE, 16, 4, 256) \
   ACT_GET_IF_M234(W_TYPE, 8, 4, 128)
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <
+    typename scalar_t,
+    bool kIsEP,
+    bool kHasBias,
+    bool kExpertIdsAreSorted,
+    bool kZeroInactiveOutput,
+    bool kHasInactivePrefixCount>
 MarlinFuncPtr get_marlin_kernel(
     const host::ScalarType q_type,
+    const host::ScalarType s_type,
     int thread_m_blocks,
     int thread_n_blocks,
     int thread_k_blocks,
@@ -463,6 +533,7 @@ MarlinFuncPtr get_marlin_kernel(
   NVFP4_GET_IF(host::kFE2M1f)
 
   BIGGROUP_GET_IF(host::kFE4M3fn)
+  FP8G32_GET_IF(host::kFE4M3fn)
 
   ACT_GET_IF(host::kU4B8)
   ACT_GET_IF(host::kU8B128)
@@ -470,14 +541,22 @@ MarlinFuncPtr get_marlin_kernel(
     if (false) {
     }
     MXFP4_GET_IF(host::kFE2M1f)
+    MXFP8_GET_IF(host::kFE4M3fn)
   }
 
   return kernel;
 }
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <
+    typename scalar_t,
+    bool kIsEP,
+    bool kHasBias,
+    bool kExpertIdsAreSorted,
+    bool kZeroInactiveOutput,
+    bool kHasInactivePrefixCount>
 exec_config_t determine_exec_config(
     const host::ScalarType& q_type,
+    const host::ScalarType& s_type,
     int prob_m,
     int prob_n,
     int prob_k,
@@ -492,6 +571,16 @@ exec_config_t determine_exec_config(
     bool is_zp_float,
     int max_shared_mem,
     int sms) {
+#if SGL_CUDA_ARCH == 900
+  if constexpr (std::is_same_v<scalar_t, __nv_bfloat16> && !kIsEP && !kHasBias) {
+    // H200 TP8 DeepSeek-V4.1 gate/up: six sparse expert rows need a narrower
+    // N tile and fewer persistent blocks than the occupancy-only heuristic.
+    if (q_type == host::kFE2M1f && group_size == 32 && prob_m == 1 && prob_n == 640 && prob_k == 5120 && top_k == 6 &&
+        thread_m_blocks == 1 && m_block_size_8 && !has_act_order && !has_zp) {
+      return exec_config_t{2, thread_config_t{128, 64, 128}};
+    }
+  }
+#endif
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
   int thread_configs_size = thread_m_blocks > 1 ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
@@ -538,17 +627,19 @@ exec_config_t determine_exec_config(
       group_blocks = group_size == -1 ? -1 : (group_size / 16);
     }
 
-    auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias>(
-        q_type,
-        thread_m_blocks,
-        th_config.thread_n / 16,
-        th_config.thread_k / 16,
-        m_block_size_8,
-        has_act_order,
-        has_zp,
-        group_blocks,
-        th_config.num_threads,
-        is_zp_float);
+    auto kernel =
+        get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput, kHasInactivePrefixCount>(
+            q_type,
+            s_type,
+            thread_m_blocks,
+            th_config.thread_n / 16,
+            th_config.thread_k / 16,
+            m_block_size_8,
+            has_act_order,
+            has_zp,
+            group_blocks,
+            th_config.num_threads,
+            is_zp_float);
 
     if (kernel == MarlinDefault) continue;
 
@@ -576,7 +667,13 @@ exec_config_t determine_exec_config(
   return exec_cfg;
 }
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <
+    typename scalar_t,
+    bool kIsEP,
+    bool kHasBias,
+    bool kExpertIdsAreSorted,
+    bool kZeroInactiveOutput,
+    bool kHasInactivePrefixCount>
 void marlin_mm(
     const void* A,
     const void* B,
@@ -602,6 +699,7 @@ void marlin_mm(
     int prob_k,
     void* workspace,
     host::ScalarType const& q_type,
+    host::ScalarType const& s_type,
     bool has_bias,
     bool has_act_order,
     bool is_k_full,
@@ -716,8 +814,15 @@ void marlin_mm(
     host::RuntimeCheck(prob_k % thread_k == 0, "prob_k = ", prob_k, " is not divisible by thread_k = ", thread_k);
   } else {
     // Auto config
-    exec_cfg = determine_exec_config<scalar_t, kIsEP, kHasBias>(
+    exec_cfg = determine_exec_config<
+        scalar_t,
+        kIsEP,
+        kHasBias,
+        kExpertIdsAreSorted,
+        kZeroInactiveOutput,
+        kHasInactivePrefixCount>(
         q_type,
+        s_type,
         prob_m,
         prob_n,
         prob_k,
@@ -788,17 +893,19 @@ void marlin_mm(
       ", max_shared_mem = ",
       max_shared_mem);
 
-  auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias>(
-      q_type,
-      thread_m_blocks,
-      thread_n_blocks,
-      thread_k_blocks,
-      m_block_size_8,
-      has_act_order,
-      has_zp,
-      group_blocks,
-      num_threads,
-      is_zp_float);
+  auto kernel =
+      get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput, kHasInactivePrefixCount>(
+          q_type,
+          s_type,
+          thread_m_blocks,
+          thread_n_blocks,
+          thread_k_blocks,
+          m_block_size_8,
+          has_act_order,
+          has_zp,
+          group_blocks,
+          num_threads,
+          is_zp_float);
 
   if (kernel == MarlinDefault) {
     host::Panic(
@@ -839,7 +946,13 @@ void marlin_mm(
 
 }  // namespace device::marlin_moe
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <
+    typename scalar_t,
+    bool kIsEP,
+    bool kHasBias,
+    bool kExpertIdsAreSorted,
+    bool kZeroInactiveOutput,
+    bool kHasInactivePrefixCount>
 void moe_wna16_marlin_gemm(
     tvm::ffi::TensorView a,
     tvm::ffi::TensorView c,
@@ -876,6 +989,8 @@ void moe_wna16_marlin_gemm(
     bool is_zp_float) {
   using namespace host;
 
+  static_assert(!kIsEP || !kExpertIdsAreSorted, "Sorted block IDs are specialized only without EP");
+  static_assert(!kHasInactivePrefixCount || (kExpertIdsAreSorted && !kIsEP));
   RuntimeCheck(is_ep == kIsEP, "is_ep does not match the compiled Marlin MoE specialization");
   RuntimeCheck(has_bias == kHasBias, "has_bias does not match the compiled Marlin MoE specialization");
 
@@ -919,6 +1034,9 @@ void moe_wna16_marlin_gemm(
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
   TensorMatcher({-1, -1}).with_dtype<scalar_t>().with_device(device).verify(a);
+  if constexpr (kHasInactivePrefixCount) {
+    TensorMatcher({2}).with_dtype<int32_t>().with_device(device).ensure_alignment(8).verify(num_tokens_post_padded);
+  }
 
   device.verify(b_q_weight.device());
   RuntimeCheck(b_q_weight.is_contiguous(), "b_q_weight is not contiguous");
@@ -1035,6 +1153,28 @@ void moe_wna16_marlin_gemm(
         "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 activations.");
   }
 
+  // FP4 scale types follow the group size. FP8 group-32 weights take either E8M0 scales
+  // (MXFP8) or BF16/FP16 scales with the FP8 exponent bias folded in; the scale tensor's
+  // width tells them apart. Every other weight type uses activation-dtype scales.
+  ScalarType const b_s_type = [&]() -> ScalarType {
+    if (b_q_type == kFE2M1f) return group_size == 16 ? kFE4M3fn : kFE8M0fnu;
+    if (b_scales.dtype().bits == 8) {
+      RuntimeCheck(
+          b_q_type == kFE4M3fn && group_size == 32,
+          "8-bit (E8M0) scales are only supported for float8_e4m3fn weights with group_size == 32. Got ",
+          b_q_type.str(),
+          " with group_size = ",
+          group_size);
+      RuntimeCheck(
+          std::is_same<scalar_t, nv_bfloat16>::value,
+          "MXFP8 Marlin with E8M0 scales is only instantiated for bfloat16 activations.");
+      return kFE8M0fnu;
+    }
+    RuntimeCheck(
+        b_scales.dtype().bits == 16, "b_scales must be 16-bit or E8M0. Got bits = ", int(b_scales.dtype().bits));
+    return std::is_same<scalar_t, half>::value ? kFloat16 : kBFloat16;
+  }();
+
   // Verify b_zeros
   if (has_zp) {
     RuntimeCheck(b_zeros.dim() == 3, "b_zeros rank = ", b_zeros.dim(), " is not 3");
@@ -1076,45 +1216,47 @@ void moe_wna16_marlin_gemm(
   // Early return for zero-size M (moved after all validation)
   if (size_m == 0) return;
 
-  device::marlin_moe::marlin_mm<scalar_t, kIsEP, kHasBias>(
-      a.data_ptr(),
-      b_q_weight.data_ptr(),
-      c.data_ptr(),
-      c_tmp.data_ptr(),
-      b_bias.data_ptr(),
-      b_scales.data_ptr(),
-      global_scale.data_ptr(),
-      b_zeros.data_ptr(),
-      g_idx.data_ptr(),
-      perm.data_ptr(),
-      a_tmp.data_ptr(),
-      sorted_token_ids.data_ptr(),
-      expert_ids.data_ptr(),
-      num_tokens_post_padded.data_ptr(),
-      topk_weights.data_ptr(),
-      static_cast<int>(moe_block_size),
-      static_cast<int>(top_k),
-      mul_topk_weights,
-      is_ep,
-      static_cast<int>(size_m),
-      static_cast<int>(size_n),
-      static_cast<int>(size_k),
-      workspace.data_ptr(),
-      b_q_type,
-      has_bias,
-      has_act_order,
-      is_k_full,
-      has_zp,
-      static_cast<int>(num_groups),
-      static_cast<int>(group_size),
-      dev,
-      stream,
-      thread_k,
-      thread_n,
-      sms,
-      use_atomic_add,
-      use_fp32_reduce,
-      is_zp_float);
+  device::marlin_moe::
+      marlin_mm<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput, kHasInactivePrefixCount>(
+          a.data_ptr(),
+          b_q_weight.data_ptr(),
+          c.data_ptr(),
+          c_tmp.data_ptr(),
+          b_bias.data_ptr(),
+          b_scales.data_ptr(),
+          global_scale.data_ptr(),
+          b_zeros.data_ptr(),
+          g_idx.data_ptr(),
+          perm.data_ptr(),
+          a_tmp.data_ptr(),
+          sorted_token_ids.data_ptr(),
+          expert_ids.data_ptr(),
+          num_tokens_post_padded.data_ptr(),
+          topk_weights.data_ptr(),
+          static_cast<int>(moe_block_size),
+          static_cast<int>(top_k),
+          mul_topk_weights,
+          is_ep,
+          static_cast<int>(size_m),
+          static_cast<int>(size_n),
+          static_cast<int>(size_k),
+          workspace.data_ptr(),
+          b_q_type,
+          b_s_type,
+          has_bias,
+          has_act_order,
+          is_k_full,
+          has_zp,
+          static_cast<int>(num_groups),
+          static_cast<int>(group_size),
+          dev,
+          stream,
+          thread_k,
+          thread_n,
+          sms,
+          use_atomic_add,
+          use_fp32_reduce,
+          is_zp_float);
 }
 
 }  // namespace sglang

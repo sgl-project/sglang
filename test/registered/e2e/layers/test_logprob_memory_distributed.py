@@ -15,7 +15,7 @@ from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.srt.model_executor.runner_utils import pool
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="2-gpu-large")
 
 
 def _run_rank(rank, rendezvous):
@@ -43,6 +43,7 @@ def _run_rank(rank, rendezvous):
             extend_return_top_logprob=False,
             extend_token_ids_logprob=False,
             top_logprobs_nums=None,
+            input_candidate_selectors=None,
             extend_logprob_pruned_lens_cpu=[rows // 2, rows // 2],
             extend_input_logprob_token_ids_gpu=token_ids,
             token_ids_logprobs=None,

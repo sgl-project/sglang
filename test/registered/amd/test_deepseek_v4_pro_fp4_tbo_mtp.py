@@ -3,7 +3,7 @@
 End-to-end accuracy test for DeepSeek-V4-Pro (1.6T) FP4 with the non-EP DP
 two-batch-overlap path on MI35x ROCm 7.2.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-mtp suite
 """
 
 import os
@@ -22,7 +22,9 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=14400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp", nightly=True
+    est_time=14400,
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-mtp",
+    nightly=True,
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
@@ -70,9 +72,8 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             "8",
             # DP attention + TBO: non-EP DP TP-MoE two-batch-overlap. DP TBO is
             # selected because moe_a2a_backend stays 'none'; no opt-in env needed.
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--enable-prefill-delayer",
             "--enable-two-batch-overlap",
             "--disable-radix-cache",
@@ -101,7 +102,7 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             "0.90",
             "--swa-full-tokens-ratio",
             "0.15",
-            # global chunk; DP-attention divides by dp_size=8 -> 8192/rank.
+            # global chunk; DP-attention divides by attn_dp_size=8 -> 8192/rank.
             "--chunked-prefill-size",
             "65536",
             "--disable-shared-experts-fusion",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, TypeGuard
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
 import torch
 
@@ -15,11 +15,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.runtime_context import get_forward
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner.triton import (
-        TritonRunnerCore,
-        TritonRunnerInput,
-        TritonRunnerOutput,
-    )
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         CombineInputFormat,
@@ -47,12 +42,18 @@ class MoeRunnerConfig:
     params_dtype: Optional[torch.dtype] = None
     routing_method_type: Optional[RoutingMethodType] = None
 
+    # None denotes a direct kernel with standard TopK and local expert IDs.
+    runner_backend: Optional[MoeRunnerBackendLike] = None
+
     # Runner configuration
     activation: str = "silu"
     is_gated: bool = True
     apply_router_weight_on_input: bool = False
     inplace: bool = True
     no_combine: bool = False
+    # With no_combine: still apply the router weight, leaving only the top-k sum to
+    # the caller (triton and marlin runners).
+    no_combine_keep_router_weight: bool = False
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_beta: Optional[float] = None
@@ -68,6 +69,35 @@ class MoeRunnerConfig:
     # False preserves backend defaults, including their existing FP32 paths.
     silu_mul_keep_fp32: bool = False
 
+    # The MoE placement a fused func needs is the layer's own, not the
+    # deployment's: DWDP's `FusedMoE.bind_full_expert_weights` collapses a
+    # layer's EP view after load. Read it off the layer so there is one
+    # address to keep correct.
+    @property
+    def moe_tp_size(self) -> int:
+        return self._layer_placement("moe_tp_size")
+
+    @property
+    def moe_tp_rank(self) -> int:
+        return self._layer_placement("moe_tp_rank")
+
+    @property
+    def moe_ep_size(self) -> int:
+        return self._layer_placement("moe_ep_size")
+
+    @property
+    def moe_ep_rank(self) -> int:
+        return self._layer_placement("moe_ep_rank")
+
+    def _layer_placement(self, name: str) -> int:
+        if self.layer is None:
+            raise AttributeError(
+                f"{name} is the layer's MoE placement, but this runner config "
+                "has no layer. A layer that runs fused MoE funcs states itself "
+                "on its runner config."
+            )
+        return getattr(self.layer, name)
+
 
 @dataclass
 class RunnerInput(ABC):
@@ -75,17 +105,11 @@ class RunnerInput(ABC):
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
 
-    def runner_backend_is_triton(self) -> TypeGuard[TritonRunnerInput]:
-        return self.runner_backend == MoeRunnerBackend.TRITON
-
 
 class RunnerOutput(ABC):
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
-
-    def runner_backend_is_triton(self) -> TypeGuard[TritonRunnerOutput]:
-        return self.runner_backend == MoeRunnerBackend.TRITON
 
 
 @dataclass
@@ -112,9 +136,6 @@ class MoeRunnerCore(ABC):
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
-
-    def runner_backend_is_triton(self) -> TypeGuard[TritonRunnerCore]:
-        return self.runner_backend == MoeRunnerBackend.TRITON
 
 
 class DispatchMoeRunnerCore(ABC):

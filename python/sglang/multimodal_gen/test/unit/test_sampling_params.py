@@ -1,9 +1,13 @@
 import argparse
+import dataclasses
+import importlib
 import math
+import pkgutil
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.multimodal_gen.configs import sample as sample_configs
 from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
     GlmImagePipelineConfig,
 )
@@ -16,7 +20,6 @@ from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.flux import (
-    Flux2KleinSamplingParams,
     Flux2SamplingParams,
     FluxSamplingParams,
 )
@@ -29,8 +32,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     QUALITY_LEVELS,
     SamplingParams,
     SkipSoftmaxParams,
-    _json_safe,
-    quality_allows_kernel_fusions,
+    normalize_quality,
+    quality_allows,
     resolve_skip_softmax_params,
 )
 from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
@@ -42,6 +45,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 
 
 class TestSamplingParamsValidate(unittest.TestCase):
@@ -54,17 +58,30 @@ class TestSamplingParamsValidate(unittest.TestCase):
             SamplingParams(num_outputs_per_prompt=0)
 
     def test_quality_defaults_to_lossless(self):
+        # The default runs every fast path that keeps the reference math;
+        # "exact" is the opt-in for bit-identical output.
         self.assertEqual(SamplingParams().quality, "lossless")
 
     def test_quality_levels_are_cumulative(self):
-        self.assertEqual(QUALITY_LEVELS, ("lossless", "extra-high", "high"))
+        self.assertEqual(QUALITY_LEVELS, ("exact", "lossless", "high"))
         for quality in QUALITY_LEVELS:
             with self.subTest(quality=quality):
                 self.assertEqual(SamplingParams(quality=quality).quality, quality)
 
-        self.assertFalse(quality_allows_kernel_fusions("lossless"))
-        self.assertTrue(quality_allows_kernel_fusions("extra-high"))
-        self.assertTrue(quality_allows_kernel_fusions("high"))
+        # A request admits the fast paths of its own tier and of every
+        # stricter one, so the levels stay cumulative.
+        for request, admits in (
+            ("exact", {"exact"}),
+            ("lossless", {"exact", "lossless"}),
+            ("high", {"exact", "lossless", "high"}),
+        ):
+            for tier in QUALITY_LEVELS:
+                with self.subTest(request=request, tier=tier):
+                    self.assertEqual(quality_allows(request, tier), tier in admits)
+
+    def test_extra_high_is_accepted_as_the_former_name_of_lossless(self):
+        self.assertEqual(SamplingParams(quality="extra-high").quality, "lossless")
+        self.assertEqual(normalize_quality("extra-high"), "lossless")
 
     def test_quality_rejects_invalid_values(self):
         for bad in ("ultra", "draft", "fast", "", True, 1):
@@ -132,6 +149,22 @@ class TestSamplingParamsValidate(unittest.TestCase):
             SamplingParams(boundary_ratio=1.5)
         with self.assertRaisesRegex(ValueError, r"boundary_ratio"):
             SamplingParams(boundary_ratio=math.nan)
+
+    def test_postprocess_scale_ranges(self):
+        """Out-of-range upscaling/interpolation scales must not reach the kernels."""
+        for field, value in [
+            ("frame_interpolation_scale", 0.0),
+            ("frame_interpolation_scale", math.nan),
+            ("frame_interpolation_scale", 100.0),
+            ("upscaling_scale", 0),
+            ("upscaling_scale", 1000),
+            ("upscaling_scale", True),
+        ]:
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValueError, field):
+                    SamplingParams(**{field: value})
+        SamplingParams(frame_interpolation_scale=0.25, upscaling_scale=1)
+        SamplingParams(frame_interpolation_scale=4.0, upscaling_scale=8)
 
     def test_teacache_and_spectrum_are_mutually_exclusive(self):
         with self.assertRaisesRegex(
@@ -226,6 +259,11 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
         mock_warning.assert_not_called()
 
+    def test_glm_image_defaults_to_an_empty_negative_prompt(self):
+        """A GLM-Image request without a negative prompt must not carry the video
+        default of the base class in its batching key and saved request."""
+        self.assertEqual(GlmImageSamplingParams().negative_prompt, "")
+
     def test_flux_defaults_resolution_when_not_provided(self):
         params = FluxSamplingParams()
 
@@ -238,11 +276,6 @@ class TestSamplingParamsSubclass(unittest.TestCase):
         self.assertEqual(params.height, 640)
         self.assertEqual(params.width, 768)
 
-    def test_flux_guidance_defaults_match_model_defaults(self):
-        self.assertEqual(FluxSamplingParams().guidance_scale, 3.5)
-        self.assertEqual(Flux2SamplingParams().guidance_scale, 4.0)
-        self.assertEqual(Flux2KleinSamplingParams().guidance_scale, 1.0)
-
     def test_diffusers_generic_calls_base_post_init(self):
         with self.assertRaises(AssertionError):
             DiffusersGenericSamplingParams(num_frames=0)
@@ -253,7 +286,7 @@ class TestSamplingParamsSubclass(unittest.TestCase):
         self.assertEqual((params.width, params.height), (832, 480))
         self.assertIn((params.width, params.height), params.supported_resolutions)
 
-    def test_output_file_name_supports_callable_teacache_params(self):
+    def test_auto_output_file_name_is_opaque_and_stable_once_selected(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:
             return [1.0, 2.0, 3.0, 4.0, 5.0]
 
@@ -266,11 +299,18 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
         params._set_output_file_name()
 
-        self.assertTrue(params.output_file_name.endswith(".mp4"))
-        self.assertIn(
-            "test_sampling_params.TestSamplingParamsSubclass.test_output_file_name_supports_callable_teacache_params",
-            _json_safe(coefficients_callback),
-        )
+        first = params.output_file_name
+        self.assertRegex(first, r"^output_[0-9a-f]{32}\.mp4$")
+        params._set_output_file_name()
+        self.assertEqual(params.output_file_name, first)
+        params.output_file_name = None
+        params._set_output_file_name()
+        self.assertNotEqual(params.output_file_name, first)
+
+    def test_explicit_output_file_name_is_preserved(self):
+        params = SamplingParams(output_file_name="my sample.mp4")
+        params._set_output_file_name()
+        self.assertEqual(params.output_file_name, "my_sample.mp4")
 
     def test_teacache_callback_takes_precedence_over_static_coefficients(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:
@@ -283,26 +323,21 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
         self.assertEqual(params.get_coefficients(), [9.0, 8.0, 7.0, 6.0, 5.0])
 
-    def test_wan_teacache_boundaries_match_legacy_behavior(self):
-        legacy_equivalent_cases = [
-            (WanT2V_1_3B_SamplingParams().teacache_params, False, (5, 50)),
-            (WanT2V_1_3B_SamplingParams().teacache_params, True, (10, 100)),
-            (WanT2V_14B_SamplingParams().teacache_params, False, (1, 49)),
-            (WanT2V_14B_SamplingParams().teacache_params, True, (2, 98)),
-            (WanI2V_14B_480P_SamplingParam().teacache_params, False, (5, 50)),
-            (WanI2V_14B_480P_SamplingParam().teacache_params, True, (10, 100)),
-            (WanI2V_14B_720P_SamplingParam().teacache_params, False, (5, 50)),
-            (WanI2V_14B_720P_SamplingParam().teacache_params, True, (10, 100)),
+    def test_wan_teacache_skip_step_ranges(self):
+        cases = [
+            (WanT2V_1_3B_SamplingParams().teacache_params, (5, 50)),
+            (WanT2V_14B_SamplingParams().teacache_params, (1, 49)),
+            (WanI2V_14B_480P_SamplingParam().teacache_params, (5, 50)),
+            (WanI2V_14B_720P_SamplingParam().teacache_params, (5, 50)),
         ]
 
-        for teacache_params, do_cfg, expected in legacy_equivalent_cases:
+        for teacache_params, expected in cases:
             with self.subTest(
                 use_ret_steps=teacache_params.use_ret_steps,
-                do_cfg=do_cfg,
                 expected=expected,
             ):
                 self.assertEqual(
-                    teacache_params.get_skip_boundaries(50, do_cfg),
+                    teacache_params.get_skip_step_range(50),
                     expected,
                 )
 
@@ -362,6 +397,43 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
         self.assertTrue(kwargs["save_output"])
 
+    def test_cli_accepts_url_postprocess_model_paths(self):
+        """URL weights stay supported outside HTTP; only network entry points reject them."""
+        url = "https://example.com/weights.pth"
+        params = SamplingParams(
+            **self._parse_cli_kwargs(
+                ["--upscaling-model-path", url, "--frame-interpolation-model-path", url]
+            )
+        )
+        self.assertEqual(params.upscaling_model_path, url)
+        self.assertEqual(params.frame_interpolation_model_path, url)
+
+    def test_every_cli_flag_reaches_the_request(self):
+        """A flag whose dest no SamplingParams class declares and get_cli_args does
+        not translate is parsed and then dropped without a word."""
+        for module in pkgutil.iter_modules(sample_configs.__path__):
+            importlib.import_module(f"{sample_configs.__name__}.{module.name}")
+        classes, pending = set(), [SamplingParams]
+        while pending:
+            cls = pending.pop()
+            classes.add(cls)
+            pending.extend(cls.__subclasses__())
+        fields = {f.name for cls in classes for f in dataclasses.fields(cls)}
+
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        dropped = []
+        for action in parser._actions:
+            if action.dest in fields or isinstance(
+                action, (DeprecatedAction, argparse._HelpAction)
+            ):
+                continue
+            flag = action.option_strings[0]
+            argv = [flag] if action.nargs == 0 else [flag, "1"]
+            if not SamplingParams.get_cli_args(parser.parse_args(argv)):
+                dropped.append(flag)
+        self.assertEqual(dropped, [])
+
     def test_get_cli_args_accepts_seed_list(self):
         self.assertEqual(self._parse_cli_kwargs(["--seed", "7"])["seed"], 7)
         self.assertEqual(
@@ -371,7 +443,7 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
 
     def test_quality_is_request_scoped_cli_arg(self):
         self.assertNotIn("quality", self._parse_cli_kwargs([]))
-        for quality in ("extra-high", "high"):
+        for quality in ("exact", "lossless", "high", "extra-high"):
             with self.subTest(quality=quality):
                 self.assertEqual(
                     self._parse_cli_kwargs(["--quality", quality])["quality"], quality

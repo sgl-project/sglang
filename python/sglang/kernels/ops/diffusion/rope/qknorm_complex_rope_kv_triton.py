@@ -8,7 +8,7 @@ import triton.language as tl
 from sglang.kernels.ops.diffusion.rope.complex_rope_triton import _fuse_real_sin
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     _qknorm_complex_rope_rows,
-    can_use_qknorm_complex_rope,
+    _validate_qknorm_complex_rope,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -54,22 +54,6 @@ def _qknorm_complex_rope_kv_kernel(
         tl.store(vout_ptr + prefix_index, prefix_value, prefix_mask)
 
 
-def can_use_qknorm_complex_rope_kv(k, weight, rope, v, k_prefix, v_prefix):
-    return (
-        can_use_qknorm_complex_rope(k, weight, rope)
-        and v.shape == k.shape
-        and k_prefix.ndim == 4
-        and k_prefix.shape[0] == k.shape[0]
-        and k_prefix.shape[1] > 0
-        and k_prefix.shape[2:] == k.shape[2:]
-        and v_prefix.shape == k_prefix.shape
-        and all(
-            x.device == k.device and x.dtype == k.dtype and x.is_contiguous()
-            for x in (v, k_prefix, v_prefix)
-        )
-    )
-
-
 def _fake_qknorm_complex_rope_kv(k, weight, rope, v, k_prefix, v_prefix, eps):
     shape = (k.shape[0], k_prefix.shape[1] + k.shape[1], *k.shape[2:])
     return k.new_empty(shape), v.new_empty(shape)
@@ -89,7 +73,21 @@ def qknorm_complex_rope_kv(
     v_prefix: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    assert can_use_qknorm_complex_rope_kv(k, weight, rope, v, k_prefix, v_prefix)
+    k, v = k.contiguous(), v.contiguous()
+    _validate_qknorm_complex_rope(k, weight, rope)
+    if not (
+        v.shape == k.shape
+        and k_prefix.ndim == 4
+        and k_prefix.shape[0] == k.shape[0]
+        and k_prefix.shape[1] > 0
+        and k_prefix.shape[2:] == k.shape[2:]
+        and v_prefix.shape == k_prefix.shape
+        and all(
+            x.device == k.device and x.dtype == k.dtype and x.is_contiguous()
+            for x in (v, k_prefix, v_prefix)
+        )
+    ):
+        raise RuntimeError("invalid input for qknorm_complex_rope_kv")
     kout, vout = _fake_qknorm_complex_rope_kv(
         k, weight, rope, v, k_prefix, v_prefix, eps
     )

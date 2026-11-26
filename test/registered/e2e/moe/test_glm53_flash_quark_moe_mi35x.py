@@ -21,7 +21,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=180, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(
@@ -49,7 +49,9 @@ class TestGLM53FlashQuarkMoE(CustomTestCase):
             SimpleNamespace(
                 no_combine=False,
                 activation="silu",
+                is_gated=True,
                 gemm1_alpha=None,
+                gemm1_beta=None,
                 gemm1_clamp_limit=None,
             )
         )

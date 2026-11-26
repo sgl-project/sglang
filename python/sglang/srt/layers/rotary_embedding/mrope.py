@@ -22,19 +22,16 @@ from sglang.srt.layers.rotary_embedding.yarn import (
 from sglang.srt.runtime_context import attention_backends
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    is_cuda,
+    is_hip,
     is_npu,
     is_xpu,
     support_triton,
 )
 
-_is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
-
-if _is_cuda:
-    from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _is_npu:
     import torch_npu
@@ -170,11 +167,18 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
-        if (
-            self.cos_sin_cache.device != query.device
-            or self.cos_sin_cache.dtype != query.dtype
-        ):
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+        if _is_hip:
+            # On HIP, keep fp32 for the fused QSA indexer JIT kernel.
+            if self.cos_sin_cache.device != query.device:
+                self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+        else:
+            if (
+                self.cos_sin_cache.device != query.device
+                or self.cos_sin_cache.dtype != query.dtype
+            ):
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
 
     def forward_native(
         self,
@@ -291,6 +295,13 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert fused_set_kv_buffer_arg is None, (
             "fused_set_kv_buffer_arg is not supported for npu implementation"
         )
+        assert positions.ndim == 1 or positions.ndim == 2
+        if query.shape[0] == 0:
+            return query, key
+        self._match_cos_sin_cache_dtype(query)
+        if positions.ndim == 2 and self.mrope_section:
+            return self.forward_triton(positions, query, key)
+        # 1-D text: the fused CANN op; an all-zero section means plain RoPE.
         if query.shape[1] > 4096:
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"
@@ -350,7 +361,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         second_per_grid_ts=None,
         **kwargs,
     ):
-        from sglang.srt.layers.rotary_embedding.mrope_rope_index import get_rope_index
+        from sglang.srt.multimodal.mrope_rope_index import get_rope_index
 
         return get_rope_index(
             spatial_merge_size,
@@ -379,7 +390,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         second_per_grid_ts=None,
         **kwargs,
     ):
-        from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
+        from sglang.srt.multimodal.mrope_rope_index import (
             get_rope_index_qwen3_omni,
         )
 
@@ -400,7 +411,7 @@ class MRotaryEmbedding(RotaryEmbedding):
     def get_rope_index_glm4v(
         input_ids, hf_config, image_grid_thw, video_grid_thw, attention_mask, **kwargs
     ):
-        from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
+        from sglang.srt.multimodal.mrope_rope_index import (
             get_rope_index_glm4v,
         )
 
@@ -417,7 +428,7 @@ class MRotaryEmbedding(RotaryEmbedding):
     def get_rope_index_ernie45(
         input_ids, hf_config, image_grid_thw, video_grid_thw, **kwargs
     ):
-        from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
+        from sglang.srt.multimodal.mrope_rope_index import (
             get_rope_index_ernie45,
         )
 
@@ -612,17 +623,6 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
                 head_size=self.head_size,
                 rotary_dim=self.rotary_dim,
                 is_neox_style=self.is_neox_style,
-            )
-            return query, key
-
-        if _is_cuda and (apply_rope_with_cos_sin_cache_inplace is not None):
-            apply_rope_with_cos_sin_cache_inplace(
-                positions=positions,
-                query=query,
-                key=key,
-                head_size=self.head_size,
-                cos_sin_cache=self.cos_sin_cache,
-                is_neox=self.is_neox_style,
             )
             return query, key
 

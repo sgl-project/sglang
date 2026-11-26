@@ -54,9 +54,8 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
                 "--enable-multimodal",
                 "--tp",
                 "8",
-                "--dp",
+                "--attn-dp-size",
                 "2",
-                "--enable-dp-attention",
                 "--mm-enable-dp-encoder",
                 "--attention-backend",
                 "fa3",
@@ -88,10 +87,11 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
                 "kernel",
                 "--hicache-mem-layout",
                 "page_first",
+                "--mm-feature-transport",
+                "cuda_ipc",
             ],
             env={
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
-                "SGLANG_USE_CUDA_IPC_TRANSPORT": "1",
             },
         )
 

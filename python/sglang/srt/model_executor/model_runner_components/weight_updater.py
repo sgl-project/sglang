@@ -14,9 +14,12 @@ from sglang.srt.model_loader.loader import (
     post_load_weights,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_pp_stage_load_group,
+)
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -42,14 +45,18 @@ def _unsupported_derived_weight_cache_error(
 ) -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
-    The HPC-Ops bf16xfp32 GEMM caches the fp32 weight split; in-place loader
-    writes are invisible to it, so an update would silently keep serving the
-    old weights. The check is startup-determined and rank-uniform, so an
-    update never proceeds on some workers while rejected on others.
+    Compensated mHC projections and HPC-Ops bf16xfp32 GEMM retain derived
+    weight splits that in-place loader writes do not refresh. Model-owned
+    caches can also declare this constraint via ``_derived_weight_cache_error``.
+    Reject before writing weights to avoid serving stale cached values,
+    including references retained by captured CUDA graphs. These constraints
+    must be startup-determined and rank-uniform so all workers reject together.
     """
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None
+        or getattr(module, "_hc_attn_bf16_parts", None) is not None
+        or getattr(module, "_hc_ffn_bf16_parts", None) is not None
         for module in model.modules()
     ):
         return (
@@ -74,6 +81,16 @@ def _unsupported_derived_weight_cache_error(
             "bf16xfp32 GEMM optimization is enabled: the cached weight "
             "split would keep serving the old weights."
         )
+    return None
+
+
+def _direct_weight_update_error(model: torch.nn.Module) -> Optional[str]:
+    """Direct updates skip the model's ``load_weights`` and ``post_load_weights``,
+    so buffers those hooks rebuild in place would keep serving the old weights."""
+    for module in model.modules():
+        reason = getattr(module, "_direct_weight_update_error", None)
+        if reason is not None:
+            return reason
     return None
 
 
@@ -164,6 +181,18 @@ class WeightUpdater:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
+    def load_rejection(self: WeightUpdater, op: str) -> Optional[str]:
+        """Why ``op`` may not write this runner's weights, or None.
+
+        Startup-determined and rank-uniform: the CUDA IPC weight cache, and
+        derived-weight caches that in-place writes would leave stale.
+        """
+        try:
+            self._assert_weight_cache_inactive(op)
+        except RuntimeError as e:
+            return str(e)
+        return _unsupported_derived_weight_cache_error(self.get_model())
+
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,
@@ -184,7 +213,10 @@ class WeightUpdater:
 
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
+        # PP stages handle disk updates sequentially, unlike cold startup.
+        load_config = LoadConfig(
+            load_format=load_format, load_group=get_pp_stage_load_group()
+        )
 
         # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config, self.model_config)
@@ -204,6 +236,11 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
+            # A half held by an earlier load (a failed one, say) must not pair
+            # with this load's other half.
+            _discard_pending_weight_halves(model)
+            # Expert loaders may copy in parallel; restore before any thread writes.
+            DefaultModelLoader.restore_weights_before_loading(model, target_device)
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
@@ -237,7 +274,7 @@ class WeightUpdater:
             or self.device == "musa"
             or (
                 current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
+                and current_platform.capabilities.graph_capture
             )
         ):
             self.recapture_cuda_graph()
@@ -260,27 +297,36 @@ class WeightUpdater:
             "Please call `init_weights_update_group` first."
         )
 
+        if not len(names) == len(dtypes) == len(shapes):
+            raise ValueError(
+                "Weight update metadata must have equal lengths: "
+                f"names={len(names)}, dtypes={len(dtypes)}, shapes={len(shapes)}"
+            )
+
         if load_format == "flattened_bucket":
             return self._receive_bucketed_weights_from_distributed(
                 names=names, dtypes=dtypes, shapes=shapes, group_name=group_name
             )
 
         weights = []
-        handles = []
+        # Prepare every buffer before posting any receives. An invalid later
+        # dtype/shape or an allocation failure must not strand an earlier
+        # asynchronous broadcast, and zip must not silently truncate a round.
         for name, dtype, shape in zip(names, dtypes, shapes):
             target_dtype = (
                 dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
             )
             weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-            handles.append(
-                torch.distributed.broadcast(
-                    weight,
-                    src=0,
-                    group=self._model_update_group[group_name],
-                    async_op=True,
-                )
-            )
             weights.append((name, weight))
+        handles = [
+            torch.distributed.broadcast(
+                weight,
+                src=0,
+                group=self._model_update_group[group_name],
+                async_op=True,
+            )
+            for _, weight in weights
+        ]
         for handle in handles:
             handle.wait()
         return weights
@@ -288,15 +334,7 @@ class WeightUpdater:
     def _receive_bucketed_weights_from_distributed(
         self: WeightUpdater, *, names, dtypes, shapes, group_name
     ):
-        named_tensors = []
-        for name, dtype, shape in zip(names, dtypes, shapes):
-            target_dtype = (
-                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-            )
-            named_tensors.append(
-                (name, torch.empty(shape, dtype=target_dtype, device=self.device))
-            )
-        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        bucket = FlattenedTensorBucket.empty(names, dtypes, shapes, self.device)
         flattened_tensor = bucket.get_flattened_tensor()
         torch.distributed.broadcast(
             flattened_tensor,
@@ -306,16 +344,21 @@ class WeightUpdater:
         return bucket.reconstruct_tensors()
 
     def begin_weight_update(self: WeightUpdater) -> None:
+        model = self.get_model()
         DefaultModelLoader.restore_weights_before_loading(
-            self.get_model(), torch.device(self.device)
+            model, torch.device(self.device)
         )
+        # A load outside a session (startup, update from disk) may have left a
+        # half that would otherwise pair with this session's other half.
+        _discard_pending_weight_halves(model)
 
-    def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
+    def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> Optional[str]:
+        """Finish the session; return why the update is incomplete, or None."""
+        model = self.get_model()
         if run_post_load:
-            post_load_weights(self.get_model())
-        DefaultModelLoader.postprocess_weights(
-            self.get_model(), torch.device(self.device)
-        )
+            post_load_weights(model)
+        DefaultModelLoader.postprocess_weights(model, torch.device(self.device))
+        return _unpaired_weight_halves_error(model)
 
     def load_weights_from_distributed(
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]
@@ -342,6 +385,8 @@ class WeightUpdater:
         load_format: Optional[str] = None,
     ):
         error = _unsupported_derived_weight_cache_error(self.get_model())
+        if error is None and load_format == "direct":
+            error = _direct_weight_update_error(self.get_model())
         if error is not None:
             return False, error
 
@@ -357,8 +402,12 @@ class WeightUpdater:
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
+        # The payload lists one entry per deployment TP rank. An
+        # attention-owning draft records its narrowed rank at init, so read the
+        # deployment rank here, on the scheduler thread outside any draft scope.
+        tp_rank = get_parallel().tp_rank
         named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
+            (name, _unwrap_tensor(tensor, tp_rank=tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
         if load_format == "direct":
@@ -416,15 +465,46 @@ class WeightUpdater:
                 SGLangCheckpointEngineWorkerExtensionImpl,
             )
 
+            # An IPC update loads its buckets in several load_weights calls with
+            # no session around them: drop halves held from before, and log any
+            # left after.
+            _discard_pending_weight_halves(self.get_model())
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
             worker.update_weights_from_ipc(recv_req.zmq_handles)
+            error = _unpaired_weight_halves_error(self.get_model())
+            if error is not None:
+                logger.error(error)
             return True, "IPC weight update completed successfully"
         except ImportError as e:
             return False, f"IPC weight update failed: ImportError {e}"
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
+
+
+def _discard_pending_weight_halves(model: torch.nn.Module) -> List[str]:
+    """Loaders that fuse several checkpoint tensors into one param hold a half
+    until its pair arrives, possibly in a later load_weights call. A wrapper
+    model (a VLM, say) holds such a loader as a submodule."""
+    return [
+        name
+        for module in model.modules()
+        if hasattr(module, "discard_pending_weight_halves")
+        for name in module.discard_pending_weight_halves()
+    ]
+
+
+def _unpaired_weight_halves_error(model: torch.nn.Module) -> Optional[str]:
+    """Drop the halves still waiting for their pair; say which, if any."""
+    pending = _discard_pending_weight_halves(model)
+    if not pending:
+        return None
+    shown = ", ".join(pending[:8]) + (", ..." if len(pending) > 8 else "")
+    return (
+        f"The update sent only one half of {len(pending)} fused weights, "
+        f"so their params keep the old values: {shown}"
+    )
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
@@ -437,6 +517,18 @@ def _unwrap_tensor(tensor, tp_rank, device):
     if isinstance(tensor, LocalSerializedTensor):
         tensor = tensor.get(tp_rank)
     return tensor.to(device)
+
+
+def unwrap_local_serialized_tensors(named_tensors, device: str):
+    if not any(isinstance(t, LocalSerializedTensor) for _, t in named_tensors):
+        return named_tensors
+    monkey_patch_torch_reductions()
+    tp_rank = get_parallel().tp_rank
+    current_device = torch.get_device_module(device).current_device()
+    return [
+        (name, _unwrap_tensor(tensor, tp_rank=tp_rank, device=current_device))
+        for name, tensor in named_tensors
+    ]
 
 
 @dataclass

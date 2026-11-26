@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
+from sglang.srt.arg_groups.choices import (
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
+)
 from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     is_deepseek_dsa,
@@ -15,7 +18,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -111,4 +113,21 @@ def resolve_pp_proxy_dspark_hidden_size(
         return 0
     if isinstance(model, _SupportsDSparkPPProxy):
         return model.get_pp_proxy_dspark_hidden_size()
+    return 0
+
+
+@runtime_checkable
+class _SupportsPackedAuxHiddenStates(Protocol):
+    def get_aux_hidden_states_width(self) -> int: ...
+
+
+def resolve_aux_hidden_states_width(
+    *, model: Any, spec_algorithm: Any, is_draft_worker: bool
+) -> int:
+    # Sharing needs the spec worker to consume target hidden states before
+    # the next target forward overwrites them; the DFlash family does.
+    if not spec_algorithm.is_dflash_family() or is_draft_worker:
+        return 0
+    if isinstance(model, _SupportsPackedAuxHiddenStates):
+        return model.get_aux_hidden_states_width()
     return 0

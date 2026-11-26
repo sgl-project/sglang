@@ -1,6 +1,7 @@
 import bisect
 import ctypes
 import ctypes.util
+import gc
 import math
 import mmap
 import os
@@ -11,7 +12,7 @@ import threading
 import time
 import weakref
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from time import perf_counter
 from typing import (
     Any,
@@ -160,6 +161,14 @@ def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
             # A sharded table is already divided by the world size, and its
             # output feeds an all-reduce that expects a device tensor.
             if getattr(table, "tp_size", 1) != 1:
+                continue
+            # A tied output head shares this weight and needs it on the device.
+            if any(
+                param is weight
+                for other in model.modules()
+                if other is not table
+                for param in other.parameters(recurse=False)
+            ):
                 continue
             if weight.numel() * weight.element_size() < HOST_RESIDENT_TABLE_MIN_BYTES:
                 continue
@@ -1138,6 +1147,7 @@ class LayerwiseOffloadManager:
         self._courier_inflight: Set[int] = set()
         # layer_idx -> torch.get_device_module().Event for fine-grained sync, to make sure the weight is resident in pre-hook
         self._prefetch_events: Dict[int, torch.get_device_module().Event] = {}
+        self._graph_capture_keepalive: list[Any] | None = None
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
@@ -1405,6 +1415,10 @@ class LayerwiseOffloadManager:
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None or layer_idx >= self.num_layers:
                 continue
+            # Prepared-kernel caches retain their weight tensors. A streamed
+            # parameter must opt out or every prefetched layer remains alive
+            # after its post-hook releases it.
+            setattr(tensor, "_sglang_layerwise_offloaded", True)
             self._has_dtensor_weights = self._has_dtensor_weights or isinstance(
                 tensor, DTensor
             )
@@ -1486,7 +1500,7 @@ class LayerwiseOffloadManager:
     def _initialize_host_stores(
         self, layer_groups: Dict, layer_hosting: Dict[int, str]
     ) -> Iterator[torch.UntypedStorage]:
-        """Yield each pinned allocation before copying weights to transfer its lease."""
+        """Yield each pinned allocation to transfer its lease."""
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
@@ -1580,21 +1594,23 @@ class LayerwiseOffloadManager:
 
                 total_numel = current_offset
 
-                # create concatenated CPU buffer (in pinned memory)
-                if pin_this_layer:
-                    cpu_buffer = _pinned_empty(total_numel, dtype=dtype)
-                else:
-                    cpu_buffer = torch.empty(total_numel, dtype=dtype)
+                cpu_buffer, populated = self._prepare_host_buffer(
+                    contiguous_weights,
+                    aligned_offsets,
+                    total_numel,
+                    dtype,
+                    pin_this_layer,
+                )
                 if pin_this_layer:
                     yield cpu_buffer.untyped_storage()
 
-                # offload weights to the buffer
                 for name, weight, local_weight in contiguous_weights:
                     current_offset = aligned_offsets[name]
                     numel = local_weight.numel()
-                    cpu_buffer[current_offset : current_offset + numel].copy_(
-                        local_weight.flatten()
-                    )
+                    if not populated:
+                        cpu_buffer[current_offset : current_offset + numel].copy_(
+                            local_weight.flatten()
+                        )
                     self._weight_metadata[layer_idx][name] = {
                         "dtype": dtype,
                         "offset": current_offset,
@@ -1611,6 +1627,45 @@ class LayerwiseOffloadManager:
                     current_offset += numel
 
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
+
+    @staticmethod
+    def _prepare_host_buffer(
+        weights: List[Tuple[str, torch.Tensor, torch.Tensor]],
+        offsets: Dict[str, int],
+        total_numel: int,
+        dtype: torch.dtype,
+        pin: bool,
+    ) -> Tuple[torch.Tensor, bool]:
+        """Return a host buffer and whether CPU weights already populate it."""
+        nbytes = total_numel * dtype.itemsize
+        if (
+            pin
+            and nbytes >= _REGISTER_MIN_BYTES
+            and all(local.device.type == "cpu" for _, _, local in weights)
+        ):
+            storage = _shared_storage(nbytes)
+            if storage is not None:
+                buffer = torch.empty(0, dtype=dtype).set_(
+                    storage, 0, (total_numel,), (1,)
+                )
+                # CPU copies populate pages in parallel before registration;
+                # GPU copies must keep their pinned destination to avoid staging
+                for name, _, local in weights:
+                    offset = offsets[name]
+                    buffer[offset : offset + local.numel()].copy_(local.flatten())
+                if _pin_in_place(buffer):
+                    return buffer, True
+                # retain the originals until registration succeeds so fallback
+                # does not hold an extra full-size populated allocation
+                del buffer, storage
+
+        buffer = (
+            _pinned_empty(total_numel, dtype=dtype)
+            if pin
+            else torch.empty(total_numel, dtype=dtype)
+        )
+        # the caller must attach the pin lease before a fallible pinned copy
+        return buffer, False
 
     def _finalize_initialization(self) -> None:
         # prefetch the head of the stream for warm-up. Under `forward` residency
@@ -1682,6 +1737,8 @@ class LayerwiseOffloadManager:
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
+        if getattr(self, "_graph_capture_keepalive", None) is not None:
+            non_blocking = True
         self._last_forwarded_layer = None
         self._release_unneeded_streamed_layers(keep=set(self._head_of_stream()))
 
@@ -1978,6 +2035,9 @@ class LayerwiseOffloadManager:
         """
         if not self.enabled or self.device is None:
             return
+        capture_keepalive = getattr(self, "_graph_capture_keepalive", None)
+        if capture_keepalive is not None:
+            non_blocking = True
         if layer_idx < 0 or layer_idx >= self.num_layers:
             return
         finish_offload_writeback()
@@ -2112,7 +2172,11 @@ class LayerwiseOffloadManager:
 
         if self.copy_stream is not None:
             # record after all copies so the consumer waits for every weight copy
-            event = torch.get_device_module().Event()
+            event = torch.get_device_module().Event(
+                **({"external": True} if capture_keepalive is not None else {})
+            )
+            if capture_keepalive is not None:
+                capture_keepalive.append(event)
             event.record(self.copy_stream)
             self._prefetch_events[layer_idx] = event
 
@@ -2204,7 +2268,6 @@ class LayerwiseOffloadManager:
             )
             self._mapped_courier = None
             self._courier_retired = True
-            self._mapped_bytes = self._mapped_bytes  # unchanged; direct path
         return self._mapped_courier
 
     def _collect_mapped_layer(self, layer_idx: int) -> None:
@@ -2669,6 +2732,9 @@ class LayerwiseOffloadManager:
                     for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
                         layer_to_prefetch = j % self.num_layers
                         self.prefetch_layer(layer_to_prefetch, non_blocking=True)
+                successor = getattr(self.model, "layerwise_prefetch_successor", None)
+                if successor is not None:
+                    successor(self, i)
 
             return hook
 
@@ -2716,6 +2782,9 @@ class LayerwiseOffloadableModuleMixin:
     # transfer per request and is worth it only when device memory is the
     # binding constraint, so it follows --performance-mode memory.
     park_non_layer_weights_between_uses: bool = False
+    # Pin those host copies. Default off: page-locked RAM cannot be reclaimed
+    # (H3 12GB decode is tight). Models that restore on the request tail opt in.
+    pin_parked_non_layer_weights: bool = False
 
     def _managed_layer_parameter_names(self) -> set:
         """Managed parameter names, including ``*.base_layer.weight`` aliases."""
@@ -2726,7 +2795,7 @@ class LayerwiseOffloadableModuleMixin:
                     names.update(offload_param_name_aliases(name))
         return names
 
-    def park_non_layer_weights(self) -> None:
+    def park_non_layer_weights(self, *, force: bool = False) -> None:
         """Move the parameters no manager streams back to the host.
 
         A layerwise component holds its non-layer parameters on the device for
@@ -2740,8 +2809,10 @@ class LayerwiseOffloadableModuleMixin:
         Buffers are left where they are. Layerwise offload keeps them resident
         on purpose, because a shared buffer such as a RoPE cache is referenced
         by many layers.
+
+        ``force=True`` parks even when headroom looks large (e.g. after release_all).
         """
-        if not self.park_non_layer_weights_between_uses:
+        if not force and not self.park_non_layer_weights_between_uses:
             return
         if current_platform.is_mps():
             # MPS parks its own non-layer weights, scoped to subphases
@@ -2753,7 +2824,7 @@ class LayerwiseOffloadableModuleMixin:
             if name not in managed and parameter.device.type != "cpu"
         ]
         holds = sum(p.numel() * p.element_size() for _, p in resident)
-        if holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
+        if not force and holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
             # There is room. Give back any host copies rather than hold them.
             # Restore any parameters still bound to placeholders first so we
             # do not leave weights as (1,) tensors after clearing the copies.
@@ -2765,8 +2836,34 @@ class LayerwiseOffloadableModuleMixin:
         with torch.inference_mode(False), torch.no_grad():
             for name, parameter in resident:
                 if name not in parked:
-                    parked[name] = parameter.detach().to("cpu", copy=True)
+                    parked[name] = self._host_park_copy(parameter)
                 parameter.data = self._park_placeholder(parameter)
+
+    def _should_pin_parked_weights(self) -> bool:
+        if (
+            not self.pin_parked_non_layer_weights
+            or current_platform.is_mps()
+            or not torch.cuda.is_available()
+        ):
+            return False
+        return any(
+            manager.pin_cpu_memory for manager in self.layerwise_offload_managers
+        )
+
+    def _host_park_copy(self, parameter: torch.Tensor) -> torch.Tensor:
+        host = parameter.detach().to("cpu", copy=True)
+        if not self._should_pin_parked_weights():
+            return host
+        if host.is_pinned:
+            return host
+        try:
+            return host.pin_memory()
+        except RuntimeError as exc:
+            logger.warning(
+                "Could not pin parked non-layer weights (%s); restore stays synchronous",
+                exc,
+            )
+            return host
 
     def _device_headroom_bytes(self) -> int:
         """What an allocation could get without the allocator growing its pool.
@@ -2803,17 +2900,28 @@ class LayerwiseOffloadableModuleMixin:
             return
         device = current_platform.get_local_torch_device()
         parameters = dict(self.named_parameters())
+        if all(
+            (parameter := parameters.get(name)) is not None
+            and parameter.device == device
+            and parameter.shape == host_tensor.shape
+            for name, host_tensor in parked.items()
+        ):
+            return
+        issued_async = False
         with torch.inference_mode(False), torch.no_grad():
             for name, host_tensor in parked.items():
                 parameter = parameters.get(name)
                 if parameter is None:
                     continue
-                # The parked copy is pageable, so this transfer stages through
-                # the driver's own pinned buffer and is synchronous whatever is
-                # asked for. Pinning it instead would make the copy async, at
-                # the price of host memory the kernel can never reclaim -- the
-                # wrong trade on the hosts this path exists for.
-                parameter.data = host_tensor.to(device)
+                # Pinned host copies DMA directly. Pageable copies still stage
+                # through the driver's bounce buffer and stay synchronous.
+                if host_tensor.is_pinned:
+                    parameter.data = host_tensor.to(device, non_blocking=True)
+                    issued_async = True
+                else:
+                    parameter.data = host_tensor.to(device)
+        if issued_async and torch.cuda.is_available():
+            torch.cuda.current_stream(device).synchronize()
 
     def _capture_mps_cpu_non_layer_weights(self) -> None:
         managed_names = {
@@ -3081,11 +3189,34 @@ class LayerwiseOffloadableModuleMixin:
             policies,
         )
 
+    def should_prefetch_layerwise_manager(
+        self, manager: LayerwiseOffloadManager
+    ) -> bool:
+        """Whether ``prepare_for_next_req`` should stream this manager's head."""
+        return manager.enabled
+
     def prepare_for_next_req(self):
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
+            if not self.should_prefetch_layerwise_manager(manager):
+                continue
             manager.prepare_for_next_req(non_blocking=True)
+
+    def prefetch_layerwise_attr(
+        self, layers_attr: str, layer_idx: int, *, non_blocking: bool = True
+    ) -> None:
+        """Prefetch one layer of the named manager, if that stack is active."""
+        managers = self.layerwise_offload_managers
+        if not managers:
+            return
+        for manager in managers:
+            if not manager.enabled or manager.layers_attr_str != layers_attr:
+                continue
+            if not self.should_prefetch_layerwise_manager(manager):
+                return
+            manager.prefetch_layer(layer_idx, non_blocking=non_blocking)
+            return
 
     def disable_offload(self) -> None:
         """Disable layerwise offload: load all layers to GPU and remove hooks.
@@ -3116,6 +3247,68 @@ class LayerwiseOffloadableModuleMixin:
                 manager.sync_all_layers_to_cpu()
                 manager.release_all()
                 manager.register_forward_hooks()
+
+
+@contextmanager
+def capture_layerwise_offload(model: torch.nn.Module, stream):
+    """Capture pinned weight copies and retain their graph-owned lifetimes."""
+    if not isinstance(model, torch.nn.Module):
+        yield []
+        return
+    managers = list(
+        dict.fromkeys(
+            manager
+            for module in model.modules()
+            for manager in getattr(module, "layerwise_offload_managers", ()) or ()
+            if manager.enabled
+        )
+    )
+    keepalive = []
+    if not managers:
+        yield keepalive
+        return
+    for manager in managers:
+        stores = (
+            manager._consolidated_cpu_weights,
+            manager._strided_cpu_weights,
+            manager._mapped_cpu_weights,
+        )
+        sources = [
+            tensor
+            for store in stores
+            for layer in store.values()
+            for tensor in layer.values()
+        ]
+        if manager.device.type != "cuda" or any(
+            tensor.numel() and not tensor.is_pinned() for tensor in sources
+        ):
+            raise ValueError(
+                "Layerwise graph capture requires pinned CUDA weight sources"
+            )
+        keepalive.extend(sources)
+
+    previous = []
+    try:
+        for manager in managers:
+            # Include the first layer's copy in every replay; a prefetch from
+            # the eager warmup must not become an uncaptured dependency.
+            manager.release_all()
+            previous.append((manager, manager.copy_stream))
+            manager.copy_stream = stream
+            manager._graph_capture_keepalive = keepalive
+        # Component residency may rebind non-layer weights after capture.
+        # Keep the original storage alive until the graph itself is dropped.
+        keepalive.extend(
+            tensor.detach()
+            for tensor in (*model.parameters(), *model.buffers())
+            if tensor.device.type == "cuda" and tensor.numel()
+        )
+        yield keepalive
+    finally:
+        for manager, copy_stream in reversed(previous):
+            manager.release_all()
+            manager._graph_capture_keepalive = None
+            manager.copy_stream = copy_stream
 
 
 def is_offload_placeholder(tensor: torch.Tensor) -> bool:
@@ -3541,7 +3734,9 @@ def configure_layerwise_offload_modules(
         reverse=True,
     )
     if pin_budget is None:
-        pin_budget = HostPinBudget()
+        pin_budget = HostPinBudget(
+            node_local_ranks=server_args.node_local_gpu_worker_count
+        )
     logger.info("Layerwise offload host memory: %s", describe_host_memory())
 
     for component_name in selected_pipeline_component_names:
@@ -3586,6 +3781,69 @@ def configure_layerwise_offload_modules(
     elif warn_missing:
         logger.debug("No selected pipeline component enabled layerwise offload")
     return configured_component_names
+
+
+def _align_numel_offset(
+    offset: int, dtype: torch.dtype, alignment_bytes: int = 32
+) -> int:
+    element_size = torch.empty((), dtype=dtype).element_size()
+    alignment_numel = max(1, alignment_bytes // element_size)
+    remainder = offset % alignment_numel
+    return offset if remainder == 0 else offset + alignment_numel - remainder
+
+
+def estimate_layer_weight_bytes(
+    layers: torch.nn.ModuleList | torch.nn.Sequential,
+) -> dict[int, int]:
+    """Physical per-layer store sizes using the real manager's packing rules."""
+    grouped: dict[int, dict[torch.dtype, list[torch.Tensor]]] = {}
+    for name, tensor in layers.named_parameters():
+        layer_index_text, separator, _ = name.partition(".")
+        if not separator or not layer_index_text.isdigit():
+            continue
+        layer_index = int(layer_index_text)
+        local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+        grouped.setdefault(layer_index, {}).setdefault(local_tensor.dtype, []).append(
+            local_tensor
+        )
+
+    totals = {layer_index: 0 for layer_index in range(len(layers))}
+    for layer_index, dtype_to_tensors in grouped.items():
+        for dtype, tensors in dtype_to_tensors.items():
+            contiguous_numel = 0
+            for tensor in tensors:
+                if tensor.is_contiguous():
+                    contiguous_numel = _align_numel_offset(contiguous_numel, dtype)
+                    contiguous_numel += tensor.numel()
+                    continue
+                storage_numel = (
+                    0
+                    if tensor.numel() == 0
+                    else 1
+                    + sum(
+                        (size - 1) * abs(stride)
+                        for size, stride in zip(tensor.shape, tensor.stride())
+                    )
+                )
+                totals[layer_index] += storage_numel * tensor.element_size()
+            totals[layer_index] += (
+                contiguous_numel * torch.empty((), dtype=dtype).element_size()
+            )
+    return totals
+
+
+def release_unused_pinned_memory() -> None:
+    """Return unreferenced cached HostPin blocks to the CUDA driver.
+
+    ``torch.cuda.empty_cache()`` only covers device allocations. PyTorch's
+    host caching allocator currently exposes its corresponding operation via
+    this internal binding; keeping the call isolated makes the compatibility
+    boundary explicit until a public API is available.
+    """
+    if not current_platform.is_cuda():
+        return
+    gc.collect()
+    torch._C._host_emptyCache()
 
 
 class LayerwiseUsageTracker:

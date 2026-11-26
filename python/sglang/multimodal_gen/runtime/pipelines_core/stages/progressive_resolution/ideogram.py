@@ -22,6 +22,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from sglang.multimodal_gen.configs.sample.ideogram import IDEOGRAM4_PRESETS
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_dual_transformer,
+    refresh_context_on_transformer,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import build_varlen_mask_meta
@@ -322,6 +323,8 @@ class Ideogram4ProgressiveDenoisingStage(
                 "ideogram4_neg_attn_mask": neg_attn_mask,
                 "ideogram4_neg_attn_mask_meta": build_varlen_mask_meta(neg_attn_mask),
                 "ideogram4_neg_llm_features": neg_llm_features,
+                # the LLM conditioning follows the new sequence length
+                "ideogram4_llm_cond": {},
             }
         )
 
@@ -377,10 +380,8 @@ class Ideogram4ProgressiveDenoisingStage(
         # The text encoder ran at full-res, so batch.prompt_embeds[0] has shape
         # [B, max_text_tokens + full_res_image_tokens, d_llm].  The DiT forward
         # expects llm_features and x=pos_z to share the same sequence length, so
-        # we bilinearly resize the image portion of llm_features to the low-res grid.
-        # ProgressiveDenoisingStage.forward() sets batch.height = init_h_pixel =
-        # (H_lat // downsample) * latent_scale before calling us, so:
-        #   orig_grid_{h,w} = grid_{h,w} * downsample  (downsample = 2^levels)
+        # the image rows are replaced by zeros at the low-res token count and
+        # the text rows are kept (see _adapt_llm_features).
         full_res_llm = batch.prompt_embeds[0]
         batch.prompt_embeds[0] = _adapt_llm_features(
             full_res_llm, max_text_tokens, num_image_tokens
@@ -414,7 +415,7 @@ class Ideogram4ProgressiveDenoisingStage(
         )
 
         # Expose a sigma_NOISE tensor for stage-transition logic (find_transition_steps)
-        # and DWT upsample (sigma_t = sigmas[stage_end]).
+        # and the DCT upsample (sigma_t = sigmas[stage_end]).
         #
         # schedule_values convention: sigma_clean, index 0 = clean end (≈1),
         # index N = noisy end (≈0). Step step_index k uses internal index i = N-1-k,
@@ -452,14 +453,35 @@ class Ideogram4ProgressiveDenoisingStage(
     # ------------------------------------------------------------------
 
     def _refresh_cache_dit_context(
-        self, n_remaining: int, scm_preset: str | None
+        self,
+        n_remaining: int,
+        scm_preset: str | None,
+        ctx: DenoisingContext | None = None,
     ) -> None:
-        """Refresh both conditional and unconditional transformers."""
+        """Refresh active Cache-DiT transformer contexts after a stage transition."""
         # Recompute the full SCM config here so custom compute/cache bins stay
         # active after a progressive-resolution stage transition.
-        _, scm_policy, steps_computation_mask, steps_computation_mask_2 = (
-            self._cache_dit_scm_masks(n_remaining, n_remaining)
+        skip_unconditional = bool(
+            self.unconditional_transformer is None
+            or (
+                ctx is not None and ctx.extra.get("ideogram4_skip_unconditional", False)
+            )
         )
+
+        _, scm_policy, steps_computation_mask, steps_computation_mask_2 = (
+            self._cache_dit_scm_masks(
+                n_remaining, None if skip_unconditional else n_remaining
+            )
+        )
+        if skip_unconditional:
+            refresh_context_on_transformer(
+                self.transformer,
+                n_remaining,
+                steps_computation_mask=steps_computation_mask,
+                steps_computation_policy=scm_policy,
+            )
+            return
+
         refresh_context_on_dual_transformer(
             self.transformer,
             self.unconditional_transformer,

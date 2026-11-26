@@ -8,17 +8,21 @@ from torch.nn import Module
 
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
+from sglang.srt.utils import log_info_on_rank0, round_up
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.moe.utils import RoutingMethodType
 
 logger = logging.getLogger(__name__)
 
 
-def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
-    """Build the Marlin quant_info for an MXFP4 MoE layer.
+def build_marlin_moe_quant_info(
+    layer: Module, weight_bits: int = 4
+) -> MarlinMoeQuantInfo:
+    """Build Marlin quant_info for MXFP4 or MXFP8 MoE experts.
 
     Single source for the runner inputs shared by the marlin path of
     ``Mxfp4MoEMethod.apply`` and :class:`Mxfp4MarlinMoEMethod`, including
@@ -33,7 +37,7 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
         w2_scales=layer.w2_weight_scale,
         w13_g_idx_sort_indices=None,
         w2_g_idx_sort_indices=None,
-        weight_bits=4,
+        weight_bits=weight_bits,
         is_k_full=True,
         w13_bias=getattr(layer, "w13_weight_bias", None),
         w2_bias=getattr(layer, "w2_weight_bias", None),
@@ -56,6 +60,14 @@ class Mxfp4MarlinMoEMethod:
 
         self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return self.runner.runner_backend
+
+    def get_moe_routing_method_type(
+        self, layer: Module, requested_method: RoutingMethodType | None
+    ) -> RoutingMethodType | None:
+        return requested_method
+
     def create_weights(
         self,
         layer: Module,
@@ -71,7 +83,13 @@ class Mxfp4MarlinMoEMethod:
 
         layer._dsv4_mxfp4_backend = None  # set in process_weights_after_loading
         fp4_block_k = 32
-        intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
+        # Hopper repacking pads the loaded gate/up halves and down columns to
+        # the required tile sizes. Keep their logical widths until then: early
+        # padding to 128 turns a TP8 width of 288 into 384 instead of 320.
+        if not get_platform().is_sm90:
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, 128
+            )
         hidden_size = round_up(hidden_size, 256)
         self.hidden_pad = hidden_size - layer.hidden_size
 

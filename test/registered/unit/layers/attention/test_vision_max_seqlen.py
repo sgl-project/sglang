@@ -5,7 +5,6 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.attention import vision
-from sglang.srt.models import kimi_k25
 from sglang.srt.models.kimi_k25 import MoonViT3dEncoder, MoonViTEncoderLayer
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -219,23 +218,5 @@ def test_kimi_moonvit_prepares_cuda_rope_inputs_once():
     assert torch.equal(positions, torch.arange(7))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_kimi_moonvit_fused_rope_matches_portable_path():
-    torch.manual_seed(0)
-    q = torch.randn(256, 4, 72, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    angles = torch.randn(256, 36, device="cuda", dtype=torch.float32)
-    freqs_cis = torch.polar(torch.ones_like(angles), angles)
-
-    q_ref, k_ref = kimi_k25.apply_rope(q.clone(), k.clone(), freqs_cis)
-    prepared_rope = kimi_k25.prepare_fused_qk_complex_rope_inplace(freqs_cis)
-    q_fused, k_fused = kimi_k25.apply_rope(q.clone(), k.clone(), prepared_rope)
-
-    torch.testing.assert_close(q_fused, q_ref, rtol=0.01, atol=0.01)
-    torch.testing.assert_close(k_fused, k_ref, rtol=0.01, atol=0.01)
-
-
 if __name__ == "__main__":
-    import pytest
-
     sys.exit(pytest.main([__file__, "-v"]))

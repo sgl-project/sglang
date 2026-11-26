@@ -11,11 +11,6 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 
 # NOTE: SpectrumMixin lives in runtime.cache.spectrum
 from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
-
-# NOTE: TeaCacheContext and TeaCacheMixin have been moved to
-# sglang.multimodal_gen.runtime.cache.teacache
-# For backwards compatibility, re-export from the new location
-from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext  # noqa: F401
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
@@ -34,6 +29,7 @@ class BaseDiT(nn.Module, ABC):
     _fsdp_forward_methods: tuple[str, ...] = ()
     param_names_mapping: dict
     reverse_param_names_mapping: dict
+    lora_param_names_mapping: dict = {}
     hidden_size: int
     num_attention_heads: int
     num_channels_latents: int
@@ -44,7 +40,9 @@ class BaseDiT(nn.Module, ABC):
         AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
         AttentionBackendEnum.AITER_SAGE,
+        AttentionBackendEnum.AITER_QUANT,
         AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.AMX_ATTN,
         AttentionBackendEnum.VIDEO_SPARSE_ATTN,
         AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
         AttentionBackendEnum.VMOBA_ATTN,
@@ -52,6 +50,7 @@ class BaseDiT(nn.Module, ABC):
         AttentionBackendEnum.LASER_ATTN,
         AttentionBackendEnum.BLOCK_SPARSE_ATTN,
         AttentionBackendEnum.RAIN_FUSION_ATTN,
+        AttentionBackendEnum.ASCEND_SPARSE_ATTN,
     }
 
     def __init_subclass__(cls) -> None:
