@@ -354,13 +354,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         if config is None:
             config = getattr(model_config, "hf_config", None)
         self.qsa_profile = parse_qsa_profile(config)
-        self.max_context_len = int(getattr(model_config, "context_len", 0))
+        req_pool = getattr(runner, "req_to_token_pool", None)
+        self.max_context_len = int(getattr(req_pool, "max_context_len", 0))
         self.compress_ratio = (
             self.qsa_profile.compress_ratio
             if self.qsa_profile is not None
             else int(getattr(config, "indexer_compress_ratio", 4))
         )
-        req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
