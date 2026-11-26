@@ -85,10 +85,14 @@ configs/
 
 ## Adding a New Model
 
+Follow `docs/docs/sglang-diffusion/support_new_models.mdx`; the
+[add-diffusion-model skill](skills/add-diffusion-model/SKILL.md) gives the order
+of work and the checks between steps. In short:
+
 1. Create pipeline in `runtime/pipelines/` extending `ComposedPipelineBase`
-2. Define stages via `create_pipeline_stages()` (TextEncoding → Denoising → Decoding)
+2. Define stages via `create_pipeline_stages()`, reusing native stages before adding model-specific ones
 3. Add config in `configs/pipeline_configs/`
-4. Register in `registry.py` via `register_configs()`
+4. Register with a `register()` function in that config file; it is discovered at startup
 
 ## Multi-GPU
 
