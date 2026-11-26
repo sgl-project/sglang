@@ -30,8 +30,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 ROUTED_SCALING_FACTOR = 2.0
-# Per-row relative L2 error of two NVFP4 / MXFP8 chains (vLLM's bound).
+# Per-row relative L2 error allowed between two NVFP4 / MXFP8 chains that
+# accumulate in different orders: a rounding flip moves a row by under a
+# percent; a wrong expert, scale, clamp or row by far more (the mutation tests).
 TOLERANCE = 0.02
+# Absolute error allowed on a routing weight (a row's four weights sum to
+# ROUTED_SCALING_FACTOR). The front recovers each score as ``biased - bias``
+# in FP32, as the routing policy defines it, so a score carries up to one FP32
+# ulp of ``biased`` (2.4e-7 below 4); stock keeps the sigmoid itself. A small
+# weight then differs by about 1e-6 absolute (up to 1e-3 relative).
+WEIGHT_ATOL = 1e-5
 
 
 @pytest.fixture(scope="module", params=[768, 384], ids=["tp4", "tp8"])
@@ -141,7 +149,7 @@ def _check(result, x, logits, bias, routed, shared):
         weights.sort(-1).values[exact],
         stock_weights.float().reshape(-1, 4)[:rows].sort(-1).values[exact],
         rtol=1e-5,
-        atol=1e-6,
+        atol=WEIGHT_ATOL,
     )
 
     mine = ref.weighted_rows(out, weights, permuted, rows)
@@ -256,8 +264,47 @@ def test_wrong_expert_scale_is_caught(layer, wrong):
     assert float((errors > TOLERANCE).float().mean()) > 0.9, errors
 
 
+@pytest.mark.parametrize("wrong", ["gate_up_order", "down_scale"])
+def test_wrong_shared_operand_is_caught(layer, wrong):
+    """Mutation check of the shared comparison: the shared expert run with its
+    gate and up halves swapped, or with every down block scale taken from the
+    neighboring block, misses the reference by more than ``TOLERANCE`` on
+    (nearly) every row."""
+    from flashinfer import block_scale_interleave
+
+    from sglang.kernels.ops.moe.minimax_m3_low_batch import ffn
+    from sglang.test.kernels import minimax_m3_low_batch_ffn as ref
+
+    _, shared, records = layer
+    generator = torch.Generator(device="cuda").manual_seed(17)
+    x, _, _ = _inputs("random", 16, generator)
+    gate_up, gate_up_scale = shared.gate_up, shared.gate_up_scale
+    down_scale = shared.down_scale
+    if wrong == "gate_up_order":
+        # torch has no FP8 roll: move the E4M3 bytes as uint8.
+        gate_up = gate_up.view(torch.uint8).roll(shared.columns, 0).view(gate_up.dtype)
+        gate_up_scale = gate_up_scale.roll(shared.columns, 0).contiguous()
+    else:
+        down_scale = down_scale.roll(1, 1).contiguous()
+    shared_out = ffn.low_batch_shared_ffn(
+        x,
+        gate_up=gate_up,
+        gate_up_scale=block_scale_interleave(gate_up_scale).contiguous(),
+        down=shared.down,
+        down_scale=block_scale_interleave(down_scale).contiguous(),
+        fc1_records=records[0],
+        fc2_records=records[1],
+        columns=shared.columns,
+    )
+    torch.cuda.synchronize()
+    keep = x.ne(0).any(-1)
+    errors = ref.relative_errors(shared_out, ref.shared_reference(x, shared))[keep]
+    assert float((errors > TOLERANCE).float().mean()) > 0.9, errors
+
+
 def test_bf16_weights_variant(layer):
-    """The vLLM-parity BF16 routing weights round the FP32 ones."""
+    """The BF16 routing weights (``weights_dtype=torch.bfloat16``) round the
+    FP32 ones."""
     from sglang.kernels.ops.moe.minimax_m3_low_batch import ffn
 
     routed, _, _ = layer

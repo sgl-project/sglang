@@ -26,7 +26,7 @@ SwiGLU-OAI, quantization, down GEMM) runs five kernels; its gate_up GEMM puts
 
 Each is built for the rank's intermediate columns: 768 (TP4) or 384 (TP8).
 
-The weights are the MXFP8 linears' tensors as vLLM (and SGLang) prepare them for
+The weights are the MXFP8 linears' tensors as SGLang prepares them for
 FlashInfer (K-major E4M3 values, E8M0 scales in the 128x4 layout), read in
 place. All four kernels use programmatic dependent launch: the GEMMs stream
 their weights while the previous kernel finishes.

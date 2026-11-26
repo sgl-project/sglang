@@ -277,7 +277,11 @@ def _dequant_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 def shared_reference(x: torch.Tensor, shared: SimpleNamespace) -> torch.Tensor:
     """BF16 [rows, 6144]: MXFP8 x, FC1 rounded to BF16, SwiGLU-OAI (gate
-    first), MXFP8 h, FC2 rounded to BF16."""
+    first) rounded to BF16, MXFP8 h, FC2 rounded to BF16. ``h`` goes through
+    BF16 before its MXFP8 quantization, as in the stock chain (BF16 activation
+    output, then ``mxfp8_quantize``) and the kernel; quantizing the FP32 ``h``
+    directly rounds a few percent of the E4M3 codes the other way (double
+    rounding) and moves rows by about 2%."""
     columns = shared.columns
     gate_up = (
         _mxfp8_fake_quant(x.float())
@@ -287,6 +291,7 @@ def shared_reference(x: torch.Tensor, shared: SimpleNamespace) -> torch.Tensor:
     gate = gate_up[:, :columns].clamp(max=SWIGLU_LIMIT)
     up = gate_up[:, columns:].clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
     h = gate * torch.sigmoid(SWIGLU_ALPHA * gate) * (up + 1)
+    h = h.bfloat16().float()
     out = _mxfp8_fake_quant(h) @ _dequant_weight(shared.down, shared.down_scale).t()
     return out.bfloat16()
 

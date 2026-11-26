@@ -78,7 +78,7 @@ from sglang.kernels.ops.moe.minimax_m3_low_batch.shared_cute import (
 WIDTHS = (8, 16, 32)
 # K tile and pipeline stages of the routed GEMMs (shared memory per CTA:
 # 21 KB per stage), their persistent CTAs (None: one per SM), and the shared
-# FC1's stages (36 KB per stage). Measured by vLLM on B300 and B200 (four real
+# FC1's stages (36 KB per stage). Tuned on B300 and B200 (four real
 # layers, 1, 4 and 8 rows) against FC1 4/6 stages, FC2 3/6/8, shared FC1 3-5
 # and 96-128 routed CTAs: FC2 at 4 stages gains 6% at one row; no other
 # setting moves a row count by 3% or more, and fewer routed CTAs slow eight
@@ -97,14 +97,14 @@ ROUTED_CTAS: int | None = None
 FC2_CTA_K = {768: ROUTED_FC2_CTA_K, 384: 128}
 ROUTED_FC2_STAGES_BY_WIDTH = {768: ROUTED_FC2_STAGES, 384: 2 * ROUTED_FC2_STAGES}
 # Above this many rows FC2 starts on each token tile as FC1 completes it;
-# up to it, after the FC1 grid. vLLM, B300, 12 real layers: per tile 1.6-2.2 us
+# up to it, after the FC1 grid. B300, 12 real layers: per tile 1.6-2.2 us
 # faster at 12-32 rows and 1.1-1.3 us slower at 1-3 rows (even at 8).
 OVERLAP_ROWS = 8
 SHARED_FC1_STAGES = 6
 SHARED_FC2_STAGES = {768: 6, 384: 8}
 # Persistent CTAs of the shared expert's GEMMs (144 and 48 work items per row
 # tile), which leave SMs to the routed GEMMs beside them (the critical path).
-# vLLM on B300 at 1, 4 and 8 rows: within 3% of the best of 144/48, 72/48,
+# On B300 at 1, 4 and 8 rows: within 3% of the best of 144/48, 72/48,
 # 48/24 and 24/16; at 1-32 rows within 2% of 48/32 and 72/48 (24/16: 2-5%
 # slower). Not re-tuned on GB300.
 SHARED_FC1_CTAS = 36

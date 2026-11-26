@@ -11,9 +11,9 @@ threads), built for calls of up to 8, 16 or 32 rows (the record's levels):
   sigmoid(logit) + bias`` in FP32 for the 128 experts, the four largest biased
   scores (lowest expert id on exact ties), ``s_k = biased_k - bias_k`` (the
   recovered score, as the routing policy computes it) and the weights ``scale *
-  s_k / (sum(s) + 1e-20)`` in FP32 (BF16 with ``fp32_weights=False``, as
-  vLLM stores them); then the whole CTA builds the routing
-  record (``routed_expert_route_cute.py``) from the selected ids;
+  s_k / (sum(s) + 1e-20)`` in FP32 (BF16 with ``fp32_weights=False``); then
+  the whole CTA builds the routing record (``routed_expert_route_cute.py``)
+  from the selected ids;
 * CTA ``1 + r``: row ``r`` of the BF16 input to per-token NVFP4, eight values
   per thread.
 

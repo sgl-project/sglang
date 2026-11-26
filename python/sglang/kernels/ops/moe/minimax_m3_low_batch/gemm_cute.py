@@ -8,7 +8,7 @@ low-batch MoE (``RoutedExpertGemm`` in its ``routed_expert_gemm_cute.py``):
 128 x 8 output tiles over the (weight tile, token tile) work items of the
 routing record, A at each tile's expert, double-buffered accumulators. Here
 both operands are NVFP4 (E2M1 values, E4M3 scales per 16 values), the
-weights as vLLM (and SGLang) prepare them for the TRT-LLM-gen NVFP4 experts: rows
+weights as SGLang prepares them for the TRT-LLM-gen NVFP4 experts: rows
 shuffled for 128-row epilogue tiles (in each block of 32, shuffled row
 ``s0 + 8 * s1`` holds row ``4 * s0 + s1``), scales in the 128x4 layout, and
 in w13 the up and gate rows interleaved (even rows up, odd rows gate).

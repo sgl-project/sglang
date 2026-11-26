@@ -88,7 +88,7 @@ GEMM1 reads and writes no global memory (its CTAs read the record's tile
 count before triggering, and a release fence precedes the trigger); so a
 kernel that waits for GEMM2 also sees GEMM1's work done.
 
-The weights are those vLLM prepares for the TRT-LLM-gen backend, whose rows are
+The weights are those prepared for the TRT-LLM-gen backend, whose rows are
 shuffled for 128-row epilogue tiles: in each block of 32, shuffled row
 `s0 + 8 * s1` (`s0 < 8`, `s1 < 4`) holds row `4 * s0 + s1`. Their
 scales are in the 128x4 layout the kernel reads for A.
