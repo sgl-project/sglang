@@ -351,8 +351,9 @@ sequence for its own Q heads; DCP turns it on for you.
 
 Sparse-attention (DSA) MLA models such as DeepSeek-V3.2 and GLM-5 are refused:
 their sparse decode returns no softmax LSE, so the merge has nothing to weight
-its partials with. A quantized MLA KV cache is refused for a similar reason, as
-the scaled latent write has no DCP-aware path.
+its partials with. A quantized KV cache is refused for DCP on this backend
+whatever the attention architecture, so `--kv-cache-dtype` has to resolve to
+fp16 or bf16.
 
 With P/D disaggregation, DCP on XPU skips the DCP pack fast path: the pack
 kernel runs only on CUDA, so KV is transferred per token instead.
