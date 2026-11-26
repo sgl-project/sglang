@@ -285,10 +285,10 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             if self._destroyed or self._host_memory_released:
                 return
             self.clear()
+            self._shared_backing.release_memory_occupation(self.pool_label)
             self.kv_buffer = None
             self._host_page_buffer_view = None
             self.fd = None
-            self._shared_backing.release_memory_occupation(self.pool_label)
             self._host_memory_released = True
             logger.info(
                 "Released unified HiCache host pool %s (%.2f GB shared backing).",

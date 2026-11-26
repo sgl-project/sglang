@@ -262,8 +262,8 @@ class _SharedPageEnvelopeHostBacking:
         backing stays mapped because its siblings still address it.
         """
         with self.lock:
-            self._released_users.add(name)
-            if self._released_users != self._users or self.raw is None:
+            if self._users - self._released_users != {name} or self.raw is None:
+                self._released_users.add(name)
                 return
             events = self._begin_compaction()
             try:
@@ -273,6 +273,7 @@ class _SharedPageEnvelopeHostBacking:
                     _cuda_host_unregister(self.raw)
                 self.raw = None
                 self.fd = None
+                self._released_users.add(name)
             finally:
                 self._finish_compaction()
 
