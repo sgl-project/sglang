@@ -89,7 +89,7 @@ class BudgetPlan:
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
         self.prefill_workspace_tokens = prefill_workspace_tokens
         metadata_dtype = torch.int32
-        self.manager_buffers = {
+        self.resident_buffers = {
             "device_k_buffer": BufferSpec(
                 (resident_rows, cache_tokens, 1, kv_lora_rank),
                 kv_dtype,
@@ -108,14 +108,17 @@ class BudgetPlan:
             "short_resident_end": BufferSpec(
                 (num_layers, request_rows), metadata_dtype
             ),
+            "last_prefix": BufferSpec((resident_rows + 1,), metadata_dtype),
+        }
+        if resident_rows < request_rows:
+            self.resident_buffers["request_to_resident"] = BufferSpec(
+                (request_rows,), metadata_dtype
+            )
+        self.manager_buffers = {
             "planner_hbm_block_table": BufferSpec(
                 (batch_capacity, cache_tokens // page_size), metadata_dtype
             ),
         }
-        if resident_rows < request_rows:
-            self.manager_buffers["request_to_resident"] = BufferSpec(
-                (request_rows,), metadata_dtype
-            )
         if prefill_workspace_tokens:
             self.manager_buffers.update(
                 prefill_nope=BufferSpec(
@@ -142,7 +145,6 @@ class BudgetPlan:
             "block_table": BufferSpec(
                 (batch_capacity, context_len // page_size), metadata_dtype
             ),
-            "last_prefix": BufferSpec((resident_rows + 1,), metadata_dtype),
         }
         for name in (
             "request_safe_slots",
@@ -157,10 +159,10 @@ class BudgetPlan:
         for name in ("_pre_sparse", "_pre_valid"):
             self.adapter_buffers[name] = BufferSpec((batch_capacity,), torch.bool)
         self.device_kv_bytes = sum(
-            self.manager_buffers[n].nbytes
+            self.resident_buffers[n].nbytes
             for n in ("device_k_buffer", "device_v_buffer")
         )
-        self.slot_map_bytes = self.manager_buffers["device_slot_map"].nbytes
+        self.slot_map_bytes = self.resident_buffers["device_slot_map"].nbytes
         self.prefill_workspace_bytes = sum(
             s.nbytes
             for n, s in self.manager_buffers.items()
@@ -178,6 +180,7 @@ class BudgetPlan:
             + self.slot_map_bytes
             + self.prefill_workspace_bytes
             + self.adapter_bytes
+            + self.resident_buffers["last_prefix"].nbytes
         )
 
     def full_context_bytes_per_request(self, native_kv_bytes_per_token: int) -> int:

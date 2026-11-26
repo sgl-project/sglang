@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -10,6 +11,11 @@ from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+        BudgetPlan,
+    )
 
 
 def sparse_query_width(forward_batch):
@@ -35,20 +41,29 @@ class LIMSelection:
 
 
 class LIMDecodeAdapter:
-    def __init__(self, manager):
+    def __init__(
+        self,
+        budget: BudgetPlan,
+        *,
+        device: str | torch.device,
+        last_prefix: torch.Tensor,
+        request_to_resident: torch.Tensor | None,
+    ) -> None:
         from sgl_kernel_npu.operators.indexer.fused_prepare_lim_metadata import (
             fused_prepare_lim_metadata,
         )
 
-        self.capacity = manager.cache_capacity
-        self.rows = manager.size
-        self.batch_capacity = manager.batch_capacity
-        self.max_query_width = manager.max_query_width
+        self.capacity = budget.cache_tokens
+        self.rows = budget.request_rows
+        self.resident_rows = budget.resident_rows
+        self.batch_capacity = budget.batch_capacity
+        self.max_query_width = budget.max_query_width
+        self.last_prefix = last_prefix
+        self.request_to_resident = request_to_resident
         self.operator = load_fused_lim_operator()
         self._fused_prepare_lim_metadata = fused_prepare_lim_metadata
         self._prepared_batch = None
-        device = manager.device
-        for name, spec in manager.budget.adapter_buffers.items():
+        for name, spec in budget.adapter_buffers.items():
             if name == "query_ends":
                 value = (
                     torch.arange(
@@ -58,16 +73,11 @@ class LIMDecodeAdapter:
                         1, self.batch_capacity + 1, dtype=spec.dtype, device=device
                     )[None, :]
                 )
-            elif name == "last_prefix":
-                value = spec.allocate(device, fill_value=-1)
             else:
                 value = spec.allocate(device)
             setattr(self, name, value)
 
-    def reset_requests(self, request_slots):
-        self.last_prefix.index_fill_(0, request_slots, -1)
-
-    def _prepare_forward(self, manager, block_table, forward_batch, width):
+    def _prepare_forward(self, block_table, forward_batch, width):
         batch = forward_batch.batch_size
         self._fused_prepare_lim_metadata(
             seq_lens=forward_batch.seq_lens[:batch],
@@ -87,31 +97,29 @@ class LIMDecodeAdapter:
             request_rows=self.rows,
             query_width=width,
             resident_safe_slots=self.resident_safe_slots[:batch],
-            request_to_resident=manager.request_to_resident,
-            resident_rows=manager.budget.resident_rows,
+            request_to_resident=self.request_to_resident,
+            resident_rows=self.resident_rows,
         )
         self._prepared_batch = forward_batch
 
     def select(
         self,
-        manager,
         *,
         query,
         weights,
         key,
         block_table,
         forward_batch,
-        layer_id,
+        slot_pool: torch.Tensor,
         reuse_metadata=False,
     ):
         batch = forward_batch.batch_size
         width = sparse_query_width(forward_batch)
         rows = batch * width
-        layer_index = layer_id - manager.start_layer
         # Interleaved batches share the adapter scratch. Rebuild it when a
         # different batch has used it since this batch's preceding owner.
         if not reuse_metadata or self._prepared_batch is not forward_batch:
-            self._prepare_forward(manager, block_table, forward_batch, width)
+            self._prepare_forward(block_table, forward_batch, width)
         sources = self.source_ids[:rows]
         fused_lightning_indexer_manage(
             weights=weights[:rows].contiguous(),
@@ -124,7 +132,7 @@ class LIMDecodeAdapter:
             cache_sizes=self._pre_cache_sizes[:batch],
             request_state=self._pre_states[:batch],
             request_slots=self.resident_safe_slots[:batch],
-            slot_pool=manager.device_slot_map[layer_index],
+            slot_pool=slot_pool,
             source_ids=sources,
             device_slots=self.device_slots[:rows],
             topk_misses=self.topk_misses[:rows],

@@ -159,7 +159,7 @@ def test_prefill_attention_and_short_residency():
                     tp_q_head_num=heads,
                     scaling=576**-0.5,
                 )
-                manager.short_resident_end[layer_id][1:3] = 1
+                manager.resident_pool.short_resident_end[layer_id][1:3] = 1
                 output = forward_fused_sparse_kv_offload(
                     backend,
                     query,
@@ -195,7 +195,9 @@ def test_prefill_attention_and_short_residency():
                         rtol=0,
                         atol=0,
                     )
-                assert manager.short_resident_end[layer_id][1:3].cpu().tolist() == [
+                assert manager.resident_pool.short_resident_end[layer_id][
+                    1:3
+                ].cpu().tolist() == [
                     -1,
                     -1,
                 ]
@@ -268,8 +270,13 @@ def test_short_sparse_graph_lifecycle(
                 tensor
                 for owner, names in (
                     (
-                        manager,
-                        ("device_k_buffer", "device_v_buffer", "device_slot_map"),
+                        manager.resident_pool,
+                        (
+                            "device_k_buffer",
+                            "device_v_buffer",
+                            "device_slot_map",
+                            "last_prefix",
+                        ),
                     ),
                     (manager.lim_adapter, budget.adapter_buffers),
                 )
@@ -360,13 +367,12 @@ def test_short_sparse_graph_lifecycle(
 
             def run():
                 plan = manager.lim_adapter.select(
-                    manager,
                     query=iq,
                     weights=weights,
                     key=key,
                     block_table=table,
                     forward_batch=inputs,
-                    layer_id=0,
+                    slot_pool=manager.resident_pool.device_slot_map[0],
                 )
                 manager.prepare_copy_sfa_plan(plan)
                 backend.forward_metadata.sparse_kv_lim_plan = plan
@@ -437,7 +443,7 @@ def test_short_sparse_graph_lifecycle(
                 captured = torch.npu.NPUGraph()
                 with torch.npu.graph(captured):
                     plan, outputs = run()
-                manager.reset_requests([1, 2])
+                manager.resident_pool.reset_rows([1, 2])
                 inputs.req_pool_indices.copy_(torch.tensor([1, 2, 0], device="npu"))
                 set_inputs(lengths[0])
                 captured.replay()
@@ -470,7 +476,7 @@ def test_short_sparse_graph_lifecycle(
                 check(plan, outputs)
             # Ragged prefill publishes host KV and invalidates resident extents.
             # The following decode is responsible for restoring its prefix.
-            manager.reset_requests([1, 2])
+            manager.resident_pool.reset_rows([1, 2])
             chunk_counts = [65, 128, 0]
             chunk_prefix = [64, 129, 0]
             chunk_tokens = sum(chunk_counts)
@@ -535,7 +541,9 @@ def test_short_sparse_graph_lifecycle(
                             rtol=0,
                             atol=0,
                         )
-                    assert manager.short_resident_end[layer_id, 1:3].cpu().tolist() == [
+                    assert manager.resident_pool.short_resident_end[
+                        layer_id, 1:3
+                    ].cpu().tolist() == [
                         -1,
                         -1,
                     ]
@@ -564,7 +572,7 @@ def test_short_sparse_graph_lifecycle(
             check(plan, outputs)
 
             # A radix hit attaches a physically shared prefix to a reused row.
-            manager.reset_requests([1])
+            manager.resident_pool.reset_rows([1])
             mapping[0, :128] = mapping[1, :128]
             pool.req_to_token[1, :128] = mapping[0, :128].to("npu")
             table[0, 0] = table[1, 0]

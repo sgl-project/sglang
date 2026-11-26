@@ -36,6 +36,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Protocol,
     Sequence,
     Tuple,
 )
@@ -219,6 +220,18 @@ def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     req.host_hit_length = 0
 
 
+class ResidentRowLifecycle(Protocol):
+    """Device row bindings for requests admitted to a decode batch."""
+
+    def available(self) -> int: ...
+
+    def admit(self, req_ids: List[int]) -> None: ...
+
+    def release(self, req_id: int) -> None: ...
+
+    def clear(self) -> None: ...
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -233,10 +246,7 @@ class DecodeReqToTokenPool:
 
     # Mirrors ReqToTokenPool.register_on_alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
-    available_sparse_resident_rows: Optional[Callable[[], int]] = None
-    admit_sparse_resident_rows: Optional[Callable[[List[int]], None]] = None
-    release_sparse_resident_row: Optional[Callable[[int], None]] = None
-    clear_sparse_resident_rows: Optional[Callable[[], None]] = None
+    resident_row_lifecycle: Optional[ResidentRowLifecycle] = None
     # No recurrent state (`ReqToTokenPool.mamba_pool`, `ReqToTokenPool.state`).
     holds_state_slots = False
     state = None
@@ -321,14 +331,14 @@ class DecodeReqToTokenPool:
 
     def free(self, req: Req):
         assert req.kv.holds_kv, "request must have req_pool_idx"
-        if self.release_sparse_resident_row is not None:
-            self.release_sparse_resident_row(req.kv.req_pool_idx)
+        if self.resident_row_lifecycle is not None:
+            self.resident_row_lifecycle.release(req.kv.req_pool_idx)
         self.free_slots.append(req.kv.req_pool_idx)
         req.kv.req_pool_idx = None
 
     def clear(self):
-        if self.clear_sparse_resident_rows is not None:
-            self.clear_sparse_resident_rows()
+        if self.resident_row_lifecycle is not None:
+            self.resident_row_lifecycle.clear()
         self.free_slots = list(range(1, self._alloc_size))
         # req_generation must stay monotonic; see ReqToTokenPool.clear().
 
@@ -4225,16 +4235,16 @@ class SchedulerDisaggregationDecodeMixin:
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
-                admit_rows = getattr(
-                    self.req_to_token_pool, "admit_sparse_resident_rows", None
+                lifecycle = getattr(
+                    self.req_to_token_pool, "resident_row_lifecycle", None
                 )
-                if admit_rows is not None:
+                if lifecycle is not None:
                     row_ids = [req.kv.req_pool_idx for req in new_prebuilt_batch.reqs]
                     if self.enable_overlap:
                         with self.forward_stream_ctx:
-                            admit_rows(row_ids)
+                            lifecycle.admit(row_ids)
                     else:
-                        admit_rows(row_ids)
+                        lifecycle.admit(row_ids)
                 if running_batch.is_empty():
                     running_batch = new_prebuilt_batch
                     if self.enable_hisparse:
@@ -4423,14 +4433,14 @@ class SchedulerDisaggregationDecodeMixin:
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
-        available_resident_rows = getattr(
-            self.req_to_token_pool, "available_sparse_resident_rows", None
-        )
-        if available_resident_rows is not None:
-            # P/D may finish receiving KV while all resident rows are in use.
-            num_not_used_batch = min(num_not_used_batch, available_resident_rows())
         if num_not_used_batch <= 0:
             return None
+        lifecycle = getattr(self.req_to_token_pool, "resident_row_lifecycle", None)
+        if lifecycle is not None:
+            # P/D may finish receiving KV while all resident rows are in use.
+            num_not_used_batch = min(num_not_used_batch, lifecycle.available())
+            if num_not_used_batch <= 0:
+                return None
 
         # pop req from waiting queue
         can_run_list: List[Req] = []

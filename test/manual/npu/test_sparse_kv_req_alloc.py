@@ -28,7 +28,7 @@ def make_manager(pool):
     ]
     scope = {}
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
-    manager = SimpleNamespace(reset_requests=Mock())
+    manager = SimpleNamespace(resident_pool=SimpleNamespace(reset_rows=Mock()))
     scope["_install_req_alloc_hook"](manager, pool)
     return manager
 
@@ -51,7 +51,10 @@ def test_only_new_request_rows_are_reset(holds_kv, indices, expected):
 
     assert pool.alloc(requests) == indices
     original.assert_called_once_with(requests)
-    manager.reset_requests.assert_called_once_with(expected)
+    if expected:
+        manager.resident_pool.reset_rows.assert_called_once_with(expected)
+    else:
+        manager.resident_pool.reset_rows.assert_not_called()
 
 
 def test_failed_allocation_preserves_residency():
@@ -60,4 +63,4 @@ def test_failed_allocation_preserves_residency():
     request = SimpleNamespace(kv=SimpleNamespace(holds_kv=False))
 
     assert pool.alloc([request]) is None
-    manager.reset_requests.assert_not_called()
+    manager.resident_pool.reset_rows.assert_not_called()

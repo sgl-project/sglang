@@ -96,16 +96,16 @@ class TestLIMState(CustomTestCase):
         plan = resolve_sparse_kv_budget(**options)
         self.assertEqual((plan.request_rows, plan.resident_rows), (103, 3))
         self.assertEqual(plan.batch_capacity, 4)
-        self.assertEqual(plan.manager_buffers["device_k_buffer"].shape[0], 3)
-        self.assertEqual(plan.manager_buffers["device_v_buffer"].shape[0], 3)
-        self.assertEqual(plan.manager_buffers["device_slot_map"].shape[0], 4)
-        self.assertEqual(plan.manager_buffers["short_resident_end"].shape, (2, 103))
-        self.assertEqual(plan.manager_buffers["request_to_resident"].shape, (103,))
-        self.assertEqual(plan.adapter_buffers["last_prefix"].shape, (4,))
+        self.assertEqual(plan.resident_buffers["device_k_buffer"].shape[0], 3)
+        self.assertEqual(plan.resident_buffers["device_v_buffer"].shape[0], 3)
+        self.assertEqual(plan.resident_buffers["device_slot_map"].shape[0], 4)
+        self.assertEqual(plan.resident_buffers["short_resident_end"].shape, (2, 103))
+        self.assertEqual(plan.resident_buffers["request_to_resident"].shape, (103,))
+        self.assertEqual(plan.resident_buffers["last_prefix"].shape, (4,))
         self.assertEqual(plan.adapter_buffers["resident_safe_slots"].shape, (4,))
         options["request_rows"] = 3
         identity = resolve_sparse_kv_budget(**options)
-        self.assertNotIn("request_to_resident", identity.manager_buffers)
+        self.assertNotIn("request_to_resident", identity.resident_buffers)
         self.assertEqual(plan.device_kv_bytes, identity.device_kv_bytes)
         self.assertEqual(plan.batch_capacity, identity.batch_capacity)
 
@@ -233,37 +233,10 @@ class TestLIMState(CustomTestCase):
         ):
             options = self.options(max_query_width=width)
             options["model_config"].hf_config.index_n_heads = indexer_heads
-            manager = SimpleNamespace(
-                budget=resolve_sparse_kv_budget(**options),
-                cache_capacity=width * 2048,
-                size=3,
-                batch_capacity=8,
-                max_query_width=width,
-                sparse_topk=2048,
-                max_context_len=32768,
-                layer_num=2,
-                device="cpu",
-                store_dtype=torch.bfloat16,
-                start_layer=0,
-                paged_kv_cache=SimpleNamespace(
-                    get_index_k_buffer=lambda _: torch.empty(
-                        (256, 128, 1, 128), dtype=torch.bfloat16
-                    )
-                ),
+            budget = resolve_sparse_kv_budget(**options)
+            last_prefix = budget.resident_buffers["last_prefix"].allocate(
+                "cpu", fill_value=-1
             )
-            pool = manager.paged_kv_cache
-            pool.size, pool.page_size, pool.layer_num, pool.start_layer = (
-                32640,
-                128,
-                2,
-                0,
-            )
-            pool.store_dtype, pool.kv_lora_rank, pool.qk_rope_head_dim = (
-                torch.bfloat16,
-                512,
-                64,
-            )
-            manager.budget.bind_native_pool(pool)
             pre = ModuleType("pre")
             pre.fused_prepare_lim_metadata = Mock()
             with (
@@ -275,14 +248,18 @@ class TestLIMState(CustomTestCase):
                     },
                 ),
             ):
-                adapter = LIMDecodeAdapter(manager)
+                adapter = LIMDecodeAdapter(
+                    budget,
+                    device="cpu",
+                    last_prefix=last_prefix,
+                    request_to_resident=None,
+                )
+            self.assertIs(adapter.last_prefix, last_prefix)
             allocated = sum(
-                t.numel() * t.element_size()
-                for t in vars(adapter).values()
-                if isinstance(t, torch.Tensor)
+                getattr(adapter, name).nbytes for name in budget.adapter_buffers
             )
-            self.assertEqual(manager.budget.adapter_bytes, allocated)
-            self.assert_buffers_match(adapter, manager.budget.adapter_buffers)
+            self.assertEqual(budget.adapter_bytes, allocated)
+            self.assert_buffers_match(adapter, budget.adapter_buffers)
             self.assertEqual(
                 adapter.query_ends.tolist(),
                 [[i * j for j in range(1, 9)] for i in range(1, width + 1)],
@@ -422,15 +399,22 @@ class TestLIMState(CustomTestCase):
                 req_pool, 2048, paged_kv_cache=pool
             )
         request_ids = [5, 4] if compact_pd else [1, 2]
+        resident_pool = manager.resident_pool
+        self.assertIs(manager.lim_adapter.last_prefix, resident_pool.last_prefix)
+        mapping = resident_pool.request_to_resident
+        self.assertIs(manager.lim_adapter.request_to_resident, mapping)
         if compact_pd:
-            self.assertEqual(manager.request_to_resident.tolist(), [0] * 6)
-            self.assertEqual(req_pool.available_sparse_resident_rows(), 2)
-            req_pool.admit_sparse_resident_rows(request_ids)
-            self.assertEqual(req_pool.available_sparse_resident_rows(), 0)
-            self.assertEqual(manager.request_to_resident.tolist(), [0, 0, 0, 0, 2, 1])
+            lifecycle = req_pool.resident_row_lifecycle
+            self.assertIs(lifecycle, resident_pool)
+            self.assertEqual(mapping.tolist(), [0] * 6)
+            self.assertEqual(lifecycle.available(), 2)
+            lifecycle.admit(request_ids)
+            self.assertEqual(lifecycle.available(), 0)
+            self.assertEqual(mapping.tolist(), [0, 0, 0, 0, 2, 1])
 
         self.assertIs(manager.budget, plan)
         self.assert_buffers_match(manager, plan.manager_buffers)
+        self.assert_buffers_match(resident_pool, plan.resident_buffers)
         self.assert_buffers_match(manager.lim_adapter, plan.adapter_buffers)
         self.assertEqual(
             [tuple(component[0].shape) for component in manager.host_pool.buffers],
@@ -456,7 +440,13 @@ class TestLIMState(CustomTestCase):
 
         self.assertEqual(
             actual_bytes(
-                manager, ("device_k_buffer", "device_v_buffer", "device_slot_map")
+                resident_pool,
+                (
+                    "device_k_buffer",
+                    "device_v_buffer",
+                    "device_slot_map",
+                    "last_prefix",
+                ),
             )
             + actual_bytes(manager.lim_adapter, plan.adapter_buffers),
             plan.managed_hbm_bytes,
@@ -472,9 +462,9 @@ class TestLIMState(CustomTestCase):
         )
         # Exercise both native boundaries: selecting column zero would silently
         # truncate the plan, while a framework unsqueeze would break CopySFA's ABI.
-        rows = 2 * manager.max_query_width
+        rows = 2 * plan.max_query_width
         source_values = torch.arange(rows * 2048, dtype=torch.int32).view(rows, 2048)
-        slot_values = source_values.remainder(manager.cache_capacity)
+        slot_values = source_values.remainder(plan.cache_tokens)
 
         def native_lim(*tensors, full_visible=False):
             self.assertEqual(tensors[5].data_ptr(), tensors[6].data_ptr())
@@ -499,7 +489,6 @@ class TestLIMState(CustomTestCase):
             {"sgl_kernel_npu.operators.attention.prepare_copy_sfa_metadata": post},
         ):
             selection = adapter.select(
-                manager,
                 query=torch.zeros(rows, 64, 128, dtype=torch.bfloat16),
                 weights=torch.ones(rows, 64, dtype=torch.bfloat16),
                 key=pool.get_index_k_buffer(1),
@@ -507,14 +496,12 @@ class TestLIMState(CustomTestCase):
                 forward_batch=SimpleNamespace(
                     batch_size=2,
                     forward_mode=ForwardMode.TARGET_VERIFY,
-                    spec_info=SimpleNamespace(
-                        num_tokens_per_req=manager.max_query_width
-                    ),
+                    spec_info=SimpleNamespace(num_tokens_per_req=plan.max_query_width),
                     seq_lens=torch.zeros(2, dtype=torch.int32),
                     positions=torch.arange(rows, dtype=torch.int32),
                     req_pool_indices=torch.tensor(request_ids),
                 ),
-                layer_id=0,
+                slot_pool=manager.resident_pool.device_slot_map[0],
             )
             manager.prepare_copy_sfa_plan(selection)
         torch.testing.assert_close(selection.source_ids, source_values)
@@ -524,7 +511,7 @@ class TestLIMState(CustomTestCase):
             selection.device_slots.data_ptr(), adapter.device_slots.data_ptr()
         )
         expected_kv_lens = torch.tensor(
-            [manager.cache_capacity + manager.max_query_width - 1, 100],
+            [plan.cache_tokens + plan.max_query_width - 1, 100],
             dtype=torch.int32,
         )
 
@@ -533,11 +520,11 @@ class TestLIMState(CustomTestCase):
             self.assertEqual(tensors[3].shape[-1], 64)
             torch.testing.assert_close(
                 tensors[4],
-                torch.tensor([manager.max_query_width, rows], dtype=torch.int32),
+                torch.tensor([plan.max_query_width, rows], dtype=torch.int32),
             )
             self.assertEqual(
                 tensors[4].data_ptr(),
-                adapter.query_ends[manager.max_query_width - 1].data_ptr(),
+                adapter.query_ends[plan.max_query_width - 1].data_ptr(),
             )
             self.assertEqual(tensors[6].data_ptr(), adapter._pre_cache_sizes.data_ptr())
             self.assertEqual(
@@ -606,21 +593,26 @@ class TestLIMState(CustomTestCase):
             result, torch.full((rows, 8 * 512), 3, dtype=result.dtype)
         )
         if compact_pd:
-            manager.device_slot_map[0][1].fill_(7)
+            slot_map = resident_pool.device_slot_map[0]
+            slot_map[1].fill_(7)
             adapter.last_prefix[1].fill_(12)
-            manager.short_resident_end[:, 3].fill_(11)
-            req_pool.release_sparse_resident_row(
-                1
-            )  # Transfer aborted before admission.
-            self.assertEqual(req_pool.available_sparse_resident_rows(), 0)
-            req_pool.release_sparse_resident_row(5)
-            self.assertEqual(req_pool.available_sparse_resident_rows(), 1)
-            req_pool.admit_sparse_resident_rows([3])
-            self.assertEqual(req_pool.available_sparse_resident_rows(), 0)
-            self.assertEqual(manager.request_to_resident.tolist(), [0, 0, 0, 1, 2, 0])
-            self.assertTrue(manager.device_slot_map[0][1].eq(-1).all())
+            resident_pool.short_resident_end[:, 3].fill_(11)
+            lifecycle.release(1)  # Transfer aborted before admission.
+            self.assertEqual(lifecycle.available(), 0)
+            lifecycle.admit([5])
+            self.assertIs(resident_pool.device_slot_map[0], slot_map)
+            self.assertTrue(slot_map[1].eq(7).all())
+            self.assertEqual(adapter.last_prefix[1].item(), 12)
+            lifecycle.release(5)
+            self.assertEqual(mapping[5].item(), 1)
+            self.assertEqual(lifecycle.available(), 1)
+            lifecycle.admit([3])
+            self.assertEqual(lifecycle.available(), 0)
+            self.assertIs(resident_pool.request_to_resident, mapping)
+            self.assertEqual(mapping.tolist(), [0, 0, 0, 1, 2, 0])
+            self.assertTrue(slot_map[1].eq(-1).all())
             self.assertTrue(adapter.last_prefix[1].eq(-1).all())
-            self.assertTrue(manager.short_resident_end[:, 3].eq(-1).all())
+            self.assertTrue(resident_pool.short_resident_end[:, 3].eq(-1).all())
         # Use the allocated index pages, including their dummy page, rather
         # than reconstructing the physical capacity from a logical size.
         pool.size = 3968
@@ -654,15 +646,13 @@ class TestLIMState(CustomTestCase):
         adapter.miss_counts = torch.zeros(1, dtype=torch.int32)
         adapter.operator = None
         adapter._prepared_batch = None
-        manager = SimpleNamespace(
-            start_layer=0, device_slot_map=[None, None], prepare_copy_sfa_plan=Mock()
-        )
+        slot_pool = torch.empty((1, 1), dtype=torch.int32)
         batch = SimpleNamespace(
             batch_size=1, forward_mode=ForwardMode.DECODE, seq_lens=torch.tensor([12])
         )
         seen = []
 
-        def prepare(manager, table, current, width):
+        def prepare(table, current, width):
             old = adapter.last_prefix[1].item()
             length = current.seq_lens[0].item()
             adapter._pre_states[0] = -1 if 0 <= old <= length else -2
@@ -678,7 +668,6 @@ class TestLIMState(CustomTestCase):
             )
 
         args = dict(
-            manager=manager,
             query=torch.zeros((1, 1)),
             weights=torch.zeros((1, 1)),
             key=None,
@@ -689,8 +678,8 @@ class TestLIMState(CustomTestCase):
         with patch(module + ".fused_lightning_indexer_manage", side_effect=native):
             for old, length in ((-1, 12), (12, 13), (13, 9)):
                 batch.seq_lens[0] = length
-                adapter.select(**args, layer_id=0)
-                adapter.select(**args, layer_id=1, reuse_metadata=True)
+                adapter.select(**args, slot_pool=slot_pool)
+                adapter.select(**args, slot_pool=slot_pool, reuse_metadata=True)
                 self.assertEqual(adapter.last_prefix[1].item(), old)
                 adapter.commit_forward(1)
                 self.assertEqual(adapter.last_prefix[1].item(), length)
@@ -698,7 +687,6 @@ class TestLIMState(CustomTestCase):
             seen, [(-2, 12), (-2, 12), (-1, 13), (-1, 13), (-2, 9), (-2, 9)]
         )
         self.assertEqual(adapter._prepare_forward.call_count, 3)
-        manager.prepare_copy_sfa_plan.assert_not_called()
 
     def test_host_bytes_are_unavailable_before_physical_pool_binding(self):
         plan = resolve_sparse_kv_budget(**self.options())

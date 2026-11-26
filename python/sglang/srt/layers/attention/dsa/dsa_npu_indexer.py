@@ -648,14 +648,14 @@ class DSANPUIndexerMixin:
             if not is_prefill and getattr(backend, "use_fused_sparse_kv", False):
                 manager = backend.sparse_kv_manager
                 metadata = backend.forward_metadata
+                layer_index = layer_id - manager.start_layer
                 plan = manager.lim_adapter.select(
-                    manager,
                     query=q.view(-1, self.n_heads, self.head_dim),
                     weights=weights,
                     key=past_key_states,
                     block_table=block_table,
                     forward_batch=forward_batch,
-                    layer_id=layer_id,
+                    slot_pool=manager.resident_pool.device_slot_map[layer_index],
                     reuse_metadata=metadata.sparse_kv_lim_plan is not None,
                 )
                 manager.prepare_copy_sfa_plan(plan)

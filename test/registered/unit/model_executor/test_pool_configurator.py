@@ -1495,10 +1495,10 @@ class TestEagleConfigurator(CustomTestCase):
                     self.assertEqual(plan.request_rows, resident_bs + extra_rows + 1)
                     for name in ("device_k_buffer", "device_v_buffer"):
                         self.assertEqual(
-                            plan.manager_buffers[name].shape[0], resident_bs + 1
+                            plan.resident_buffers[name].shape[0], resident_bs + 1
                         )
                     self.assertEqual(
-                        plan.manager_buffers["device_slot_map"].shape[0],
+                        plan.resident_buffers["device_slot_map"].shape[0],
                         resident_bs + 2,
                     )
                     self.assertEqual(
@@ -1506,7 +1506,7 @@ class TestEagleConfigurator(CustomTestCase):
                         (resident_bs + 2) * slot_map_bytes_per_request,
                     )
                     self.assertEqual(
-                        plan.adapter_buffers["last_prefix"].shape[0], resident_bs + 2
+                        plan.resident_buffers["last_prefix"].shape[0], resident_bs + 2
                     )
 
             # The estimate includes two fixed slot-map rows in addition to the

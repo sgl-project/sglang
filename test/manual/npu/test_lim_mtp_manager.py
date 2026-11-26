@@ -208,8 +208,8 @@ def _run_manager_lifecycle(
                 paged_kv_cache=index_pool,
             )
             if compact_pd:
-                pool.admit_sparse_resident_rows([4, 5])
-                assert manager.request_to_resident.cpu().tolist() == [
+                pool.resident_row_lifecycle.admit([4, 5])
+                assert manager.resident_pool.request_to_resident.cpu().tolist() == [
                     0,
                     0,
                     0,
@@ -241,13 +241,14 @@ def _run_manager_lifecycle(
                 for i in range(num_layers):
                     if i % 2 == 0:
                         plan = manager.lim_adapter.select(
-                            manager,
                             query=query,
                             weights=weights,
                             key=keys,
                             block_table=table,
                             forward_batch=inputs,
-                            layer_id=i,
+                            slot_pool=manager.resident_pool.device_slot_map[
+                                i - manager.start_layer
+                            ],
                             reuse_metadata=i > 0,
                         )
                         manager.prepare_copy_sfa_plan(plan)
@@ -305,10 +306,10 @@ def _run_manager_lifecycle(
             assert plan.miss_counts.cpu().tolist() == [Q, Q, 0]
             # Reusing one request row must cold-fill only that row.
             if compact_pd:
-                pool.release_sparse_resident_row(5)
-                pool.admit_sparse_resident_rows([6])
+                pool.resident_row_lifecycle.release(5)
+                pool.resident_row_lifecycle.admit([6])
                 inputs.req_pool_indices[0] = 6
-                assert manager.request_to_resident.cpu().tolist() == [
+                assert manager.resident_pool.request_to_resident.cpu().tolist() == [
                     0,
                     0,
                     0,
@@ -318,7 +319,7 @@ def _run_manager_lifecycle(
                     2,
                 ]
             else:
-                manager.reset_requests([1])
+                manager.resident_pool.reset_rows([1])
             for value in fresh:
                 value.add_(1)
             if graph:

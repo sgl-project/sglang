@@ -1038,9 +1038,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.enable_priority_scheduling = False
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.batch_size.return_value = 0
-        scheduler.req_to_token_pool = MagicMock(
-            size=1, available_sparse_resident_rows=None
-        )
+        scheduler.req_to_token_pool = MagicMock(size=1, resident_row_lifecycle=None)
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.tree_cache = MagicMock()
         scheduler.model_config = MagicMock()
@@ -1098,12 +1096,16 @@ class TestDecodePrebuilt(unittest.TestCase):
     def test_prebuilt_waits_for_a_free_sparse_resident_row(self):
         scheduler = self._new_scheduler(enable_overlap=False)
         scheduler.req_to_token_pool.size = scheduler.max_running_requests = 2
-        first, second = (MagicMock(rid=rid) for rid in ("first", "second"))
+        first, second = (
+            MagicMock(rid=rid, owner_list=None) for rid in ("first", "second")
+        )
         for req in (first, second):
             req.kv.restore_done_event = None
-        scheduler.waiting_queue.join([first, second])
+        move([first, second], scheduler.waiting_queue)
         available = MagicMock(return_value=0)
-        scheduler.req_to_token_pool.available_sparse_resident_rows = available
+        scheduler.req_to_token_pool.resident_row_lifecycle = MagicMock(
+            available=available
+        )
 
         with (
             patch(
@@ -1114,6 +1116,10 @@ class TestDecodePrebuilt(unittest.TestCase):
             ),
         ):
             select = SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch
+            scheduler.running_batch.batch_size.return_value = 2
+            self.assertIsNone(select(scheduler, scheduler.running_batch))
+            available.assert_not_called()
+            scheduler.running_batch.batch_size.return_value = 0
             self.assertIsNone(select(scheduler, scheduler.running_batch))
             self.assertEqual(list(scheduler.waiting_queue), [first, second])
             init_new.assert_not_called()
@@ -1162,7 +1168,7 @@ class TestDecodePrebuilt(unittest.TestCase):
     def test_prebuilt_requests_run_from_their_admission(self):
         """Admission moves the requests from waiting into running."""
         scheduler = self._new_scheduler(enable_overlap=False)
-        scheduler.req_to_token_pool = MagicMock(size=2)
+        scheduler.req_to_token_pool.size = 2
         scheduler.penalty_status_pool = MagicMock()
         scheduler.max_running_requests = 2
         scheduler.kv_checksum_computer = None
