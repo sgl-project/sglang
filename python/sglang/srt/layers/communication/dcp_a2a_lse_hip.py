@@ -22,6 +22,11 @@ if TYPE_CHECKING:
 
 _COMM_CACHE: dict[tuple[str, int, int, int], DcpLlComm | None] = {}
 
+# Rows the fused path takes per head dim. On 8x MI355X (H=96) it beats the RCCL
+# all-to-all + Triton combine up to B=192 at D=128, but at D=512 only up to B=32
+# (0.95x at B=40, 0.78x at B=96), so larger D=512 batches keep the fallback.
+_MAX_ROWS_BY_HEAD_DIM: dict[int, int] = {128: DEFAULT_MAX_ROWS, 512: 32}
+
 
 def init_dcp_ll_comm_hip(
     cp_group: GroupCoordinator,
@@ -53,7 +58,7 @@ def init_dcp_ll_comm_hip(
         world_size=world_size,
         head_dim=head_dim,
         num_local_heads=num_local_heads,
-        max_rows=DEFAULT_MAX_ROWS,
+        max_rows=_MAX_ROWS_BY_HEAD_DIM[head_dim],
     )
     _COMM_CACHE[key] = comm
     return comm
@@ -73,8 +78,8 @@ def maybe_dcp_a2a_lse_reduce_hip(
     b, h, d = cp_attn_out.shape
     if (
         b <= 0
-        or b > DEFAULT_MAX_ROWS
         or d not in SUPPORTED_HEAD_DIMS
+        or b > _MAX_ROWS_BY_HEAD_DIM[d]
         or h % world_size != 0
     ):
         return None
