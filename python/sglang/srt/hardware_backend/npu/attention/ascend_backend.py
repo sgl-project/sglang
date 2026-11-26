@@ -31,6 +31,7 @@ from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     NPUDecodeContextParallelMetadata,
     build_dcp_extend_gather_plan,
 )
+from sglang.srt.hardware_backend.npu.kv_capability import DSA_KV_QUANT_BLOCK_SIZE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -437,6 +438,7 @@ class AscendAttnBackend(AttentionBackend):
                 kv_quant_sparse_flash_attention,
             )
 
+            # The DCP read (dsa_dcp) passes no tile_size.
             self.dcp_fp8_sparse_attention = kv_quant_sparse_flash_attention
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
@@ -2010,11 +2012,11 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv,
     ):
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-        packed = packed_kv.view(torch.float8_e4m3fn)
+        # A packed pool hands back its K buffer in the record's one-byte dtype.
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
-            key=packed,
-            value=packed,
+            key=packed_kv,
+            value=packed_kv,
             sparse_indices=topk_indices,
             scale_value=layer.scaling,
             key_quant_mode=2,
@@ -2034,7 +2036,10 @@ class AscendAttnBackend(AttentionBackend):
             sparse_mode=3,
             attention_mode=2,
             quant_scale_repo_mode=1,
-            tile_size=128,
+            # The pool's record tile, with a fallback for pool objects
+            # that do not carry the attribute.
+            tile_size=getattr(self.token_to_kv_pool, "quant_block_size", None)
+            or DSA_KV_QUANT_BLOCK_SIZE,
             rope_head_dim=self.qk_rope_head_dim,
         )
 
@@ -2262,7 +2267,8 @@ class AscendAttnBackend(AttentionBackend):
                     scaling=layer.scaling,
                     fp8_attention=self.dcp_fp8_sparse_attention,
                 )
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
+            # The pool decides the layout: k_nope is then the packed record.
+            if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
                 attn_out = self._forward_fp8_sparse(
                     q_nope,
                     q_pe,
