@@ -12,10 +12,12 @@ logger = logging.getLogger(__name__)
 
 def try_detect_fp4_experts(model_path: str) -> Optional[bool]:
     """True = mxfp4-packed (U8/I8/F4), False = converted FP8 (F8_E4M3),
-    None when the header isn't readable (HF slug not cached yet, etc.).
+    None when no header is readable (offline and not cached, etc.); for an HF
+    repo not cached yet, one shard header is read remotely instead.
     Caller falls back to user default. Pure read; never mutates env.
     """
     from sglang.srt.model_loader.weight_utils import (
+        probe_remote_routed_expert_weight_dtype,
         probe_routed_expert_weight_dtype,
     )
     from sglang.srt.utils import find_local_repo_dir
@@ -24,14 +26,20 @@ def try_detect_fp4_experts(model_path: str) -> Optional[bool]:
         local_path = model_path
     else:
         local_path = find_local_repo_dir(model_path)
-        if not local_path or not os.path.isdir(local_path):
-            return None
 
-    try:
-        dtype = probe_routed_expert_weight_dtype(local_path)
-    except Exception as e:
-        logger.warning("Failed to probe routed-expert dtype for %s: %s", model_path, e)
-        return None
+    dtype = None
+    if local_path and os.path.isdir(local_path):
+        try:
+            dtype = probe_routed_expert_weight_dtype(local_path)
+        except Exception as e:
+            # A snapshot with config.json but no shards yet lands here.
+            logger.debug(
+                "Local routed-expert dtype probe failed for %s: %s", model_path, e
+            )
+    if dtype is None and not os.path.isdir(model_path):
+        # Must decide before the shards download; an undetected FP8 checkpoint
+        # gets the mxfp4 default and fails in the fused-MoE weight loader.
+        dtype = probe_remote_routed_expert_weight_dtype(model_path)
     if dtype is None:
         return None
     if dtype in ("U8", "I8", "F4"):
