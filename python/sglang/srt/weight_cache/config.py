@@ -81,6 +81,7 @@ def build_load_spec(
         model_arch=architectures[0] if architectures else "",
         hf_config_hash=_hf_config_hash(model_config.hf_config),
         dtype=str(model_config.dtype),
+        role="draft" if model_config.is_draft_model else "target",
         draft_model_idx=draft_model_idx,
         # Quantization config.
         quant_method=quant_method,

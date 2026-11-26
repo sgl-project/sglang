@@ -73,6 +73,7 @@ def _model_config(
     revision=None,
     quantization=None,
     dtype=torch.float32,
+    is_draft_model=False,
 ):
     return SimpleNamespace(
         hf_config=PretrainedConfig() if hf_config is None else hf_config,
@@ -80,6 +81,7 @@ def _model_config(
         revision=revision,
         quantization=quantization,
         dtype=dtype,
+        is_draft_model=is_draft_model,
     )
 
 
@@ -202,7 +204,7 @@ class TestLoadSpec(CustomTestCase):
             (
                 # Model config.
                 *("checkpoint_id", "model_arch", "hf_config_hash", "dtype"),
-                "draft_model_idx",
+                *("role", "draft_model_idx"),
                 # Quantization config.
                 *("quant_method", "quant_config_hash"),
                 # Parallel config: the layout.
@@ -241,10 +243,12 @@ class TestLoadSpec(CustomTestCase):
                 ),
                 dtype=torch.bfloat16,
                 quantization="fp8",
+                is_draft_model=True,
             ),
             checkpoint_id="rev2",
             draft_model_idx=1,
         )
+        self.assertEqual(other.role, "draft")
         self.assertEqual(other.model_arch, "OtherModel")
         self.assertEqual(other.dtype, "torch.bfloat16")
         self.assertEqual(other.quant_method, "fp8")
@@ -287,6 +291,30 @@ class TestLoadSpec(CustomTestCase):
         for revision, expected in ((None, "/m"), ("v2", "/m@v2")):
             with get_context().override_server_args(model_path="/m", revision=revision):
                 self.assertEqual(path_checkpoint_id(), expected)
+
+    def test_a_draft_is_another_load_than_its_target(self):
+        # One checkpoint and one config, as for a standalone draft of the
+        # target's own architecture: the role is the only field that differs.
+        target = _make_load_spec()
+        draft = _make_load_spec(_model_config(is_draft_model=True))
+        self.assertEqual(
+            load_spec_mismatches(
+                msgspec.to_builtins(target), msgspec.to_builtins(draft)
+            ),
+            {"role": ("target", "draft")},
+        )
+        for include_rank in (True, False):
+            self.assertNotEqual(
+                target.digest(include_rank=include_rank),
+                draft.digest(include_rank=include_rank),
+            )
+
+    def test_an_unknown_role_is_refused(self):
+        fields = msgspec.to_builtins(_make_load_spec())
+        with self.assertRaisesRegex(ValueError, "^Unknown model role 'verifier'$"):
+            LoadSpec(**{**fields, "role": "verifier"})
+        with self.assertRaisesRegex(msgspec.ValidationError, "Invalid enum value"):
+            msgspec.convert({**fields, "role": "verifier"}, LoadSpec)
 
     def test_parallel_config_comes_from_the_runtime_context(self):
         spec = _make_load_spec(tp_size=4, tp_rank=3)
@@ -392,7 +420,7 @@ class TestLoadSpecMismatches(CustomTestCase):
 class TestEngineFetchesFromTheDaemon(CustomTestCase):
     """The engine's request and its handling of the reply, over a real socket."""
 
-    def _fetch(self, daemon_config):
+    def _fetch(self, daemon_config, *, model_config=None):
         daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
         daemon.gpu_id = 0
         daemon.config = daemon_config
@@ -417,7 +445,8 @@ class TestEngineFetchesFromTheDaemon(CustomTestCase):
             try:
                 with _runtime_context():
                     return loader._fetch_from_cache(
-                        _model_config(), SimpleNamespace(device=torch.device("cpu"))
+                        model_config or _model_config(),
+                        SimpleNamespace(device=torch.device("cpu")),
                     )
             finally:
                 thread.join(10)
@@ -439,6 +468,13 @@ class TestEngineFetchesFromTheDaemon(CustomTestCase):
             self._fetch(self._daemon_config(tp_rank=1))
         self.assertIn("Daemon config mismatch", str(ctx.exception))
         self.assertIn("'tp_rank': (1, 0)", str(ctx.exception))
+
+    def test_a_daemon_that_loaded_the_target_refuses_a_draft(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._fetch(
+                self._daemon_config(), model_config=_model_config(is_draft_model=True)
+            )
+        self.assertIn("{'role': ('target', 'draft')}", str(ctx.exception))
 
 
 class TestQuantConfigHashing(CustomTestCase):
