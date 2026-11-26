@@ -504,18 +504,61 @@ def score_dspine_transitions(
     logits = base[:, :, None, :] + scale[:, :, None, None] * trans
     if normalize:
         wtx = torch.matmul(x, write)  # [B, S, R]
+        base_square = x.square().sum(-1)[:, :, None]
+        update_square = scale[:, :, None].square() * torch.einsum(
+            "bskr,bskr->bsk",
+            msg,
+            torch.matmul(msg, write.T @ write if write_gram is None else write_gram),
+        )
         sq = (
-            x.square().sum(-1)[:, :, None]
+            base_square
             + 2 * scale[:, :, None] * torch.einsum("bsr,bskr->bsk", wtx, msg)
-            + scale[:, :, None].square()
-            * torch.einsum(
-                "bskr,bskr->bsk",
-                msg,
-                torch.matmul(
-                    msg, write.T @ write if write_gram is None else write_gram
-                ),
-            )
+            + update_square
         )
         denom = torch.sqrt(sq.clamp_min(0) / x.shape[-1] + norm_eps)
-        logits = logits / denom[:, :, :, None]
+        logits = (logits / denom[:, :, :, None]).contiguous()
+        # A small residual relative to its two summands makes the expanded
+        # norm ill-conditioned. Repair both norm and numerator in those rows.
+        repair = (sq <= 1e-3 * (base_square + update_square)).contiguous()
+        if x.is_cuda:
+            import triton
+
+            from sglang.kernels.ops.speculative.dspine import (
+                _repair_transition_scores_kernel,
+            )
+
+            _repair_transition_scores_kernel[(b * s,)](
+                x,
+                scale,
+                msg,
+                write.contiguous(),
+                norm.contiguous(),
+                lm_c,
+                repair,
+                logits,
+                s,
+                k,
+                x.shape[-1],
+                msg.shape[-1],
+                x.stride(0),
+                x.stride(1),
+                x.stride(2),
+                scale.stride(0),
+                scale.stride(1),
+                norm_eps,
+                triton.next_power_of_2(msg.shape[-1]),
+                triton.next_power_of_2(k),
+                64,
+                num_warps=8,
+                enable_fp_fusion=False,
+            )
+        else:
+            for batch, step, sender in repair.nonzero().tolist():
+                refined = x[batch, step] + scale[batch, step] * (
+                    write @ msg[batch, step, sender]
+                )
+                normalized = (
+                    refined * torch.rsqrt(refined.square().mean() + norm_eps) * norm
+                )
+                logits[batch, step, sender] = lm_c[batch, step] @ normalized
     return logits

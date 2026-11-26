@@ -126,3 +126,67 @@ def _feature_finish_kernel(
         # Qwen3RMSNorm casts the normalized activation before affine multiply.
         y = (y.to(tl.float32) * weight.to(tl.float32)).to(Output.dtype.element_ty)
         tl.store(Normed + row * H + k, y, k < H)
+
+
+@triton.jit
+def _repair_transition_scores_kernel(
+    X,
+    Scale,
+    Message,
+    Write,
+    Norm,
+    Head,
+    Mask,
+    Scores,
+    S: tl.constexpr,
+    K: tl.constexpr,
+    H: tl.constexpr,
+    R: tl.constexpr,
+    XB: tl.constexpr,
+    XS: tl.constexpr,
+    XH: tl.constexpr,
+    SB: tl.constexpr,
+    SS: tl.constexpr,
+    EPS: tl.constexpr,
+    WR: tl.constexpr,
+    WK: tl.constexpr,
+    TILE_H: tl.constexpr,
+):
+    """Recompute cancellation-prone rows from explicit FP32 residuals."""
+    slot = tl.program_id(0)
+    lanes = tl.arange(0, WK)
+    needs_repair = tl.load(Mask + slot * K + lanes, lanes < K, 0)
+    if tl.sum(needs_repair.to(tl.int32), axis=0) > 0:
+        for sender in range(K):
+            row = slot * K + sender
+            if tl.load(Mask + row):
+                batch = slot // S
+                step = slot % S
+                rank = tl.arange(0, WR)
+                candidate = tl.arange(0, WK)
+                message = tl.load(Message + row * R + rank, rank < R, 0)
+                scale = tl.load(Scale + batch * SB + step * SS)
+                square_sum = tl.full((), 0, tl.float32)
+                logits = tl.full((WK,), 0, tl.float32)
+                for start in range(tl.cdiv(H, TILE_H)):
+                    hidden = start * TILE_H + tl.arange(0, TILE_H)
+                    weights = tl.load(
+                        Write + hidden[None, :] * R + rank[:, None],
+                        (hidden[None, :] < H) & (rank[:, None] < R),
+                        0,
+                    )
+                    delta = tl.sum(weights * message[:, None], axis=0)
+                    raw = tl.load(
+                        X + batch * XB + step * XS + hidden * XH, hidden < H, 0
+                    )
+                    refined = raw + scale * delta
+                    square_sum += tl.sum(refined * refined, axis=0)
+                    norm = tl.load(Norm + hidden, hidden < H, 0)
+                    head = tl.load(
+                        Head + slot * K * H + candidate[:, None] * H + hidden[None, :],
+                        (candidate[:, None] < K) & (hidden[None, :] < H),
+                        0,
+                    )
+                    logits += tl.sum(head * (refined * norm)[None, :], axis=1)
+                logits *= tl.rsqrt(square_sum / H + EPS)
+                tl.store(Scores + row * K + candidate, logits, candidate < K)

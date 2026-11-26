@@ -16,6 +16,11 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestDSpineFusedBridge(unittest.TestCase):
+    def test_cancellation_repair_and_graph_replay(self):
+        from test.registered.unit.spec.test_dspine import TestDSpineNumerics
+
+        TestDSpineNumerics().test_refinement_with_nearly_cancelled_residual()
+
     def test_fused_eager_and_graph_replay(self):
         torch.manual_seed(42)
         config = SimpleNamespace(

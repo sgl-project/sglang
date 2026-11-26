@@ -290,6 +290,78 @@ class TestDSpineNumerics(unittest.TestCase):
         actual = bridge(changed, None, ids, 0, norm)[1]
         torch.testing.assert_close(actual[4:], original[4:], atol=0, rtol=0)
 
+    def test_refinement_with_nearly_cancelled_residual(self):
+        cases = [
+            (device, hidden_size, rank)
+            for device in ("cpu", "cuda")
+            for hidden_size, rank in ((8, 1), (130, 3), (512, 128))
+        ]
+        for device, hidden_size, rank in cases:
+            if device == "cuda" and not torch.cuda.is_available():
+                continue
+            with self.subTest(device=device, hidden_size=hidden_size, rank=rank):
+                candidates = torch.tensor([0, 1], device=device).expand(2, 3, 2)
+                # Keep a stride between steps, as in the production anchor crop.
+                raw = torch.full((2, 4, hidden_size), 10.0, device=device)[:, 1:]
+                rms = torch.full((2, 4), 10.0, device=device)[:, 1:]
+                write = torch.zeros(hidden_size, rank, device=device)
+                write[:, 0] = -0.9999
+                prev = torch.zeros(rank, 1, device=device)
+                prev[0, 0] = 2.0
+                head = torch.stack(
+                    (
+                        torch.ones(hidden_size, device=device),
+                        -torch.ones(hidden_size, device=device),
+                    )
+                )
+                kwargs = dict(
+                    # The anchor and token 0 need repair; token 1 has no update.
+                    codebook=torch.tensor([[1.0], [0.0]], device=device),
+                    pred_gate=torch.zeros(rank, 1, device=device),
+                    prev=prev,
+                    gate_bias=torch.zeros(rank, device=device),
+                    write=write,
+                    norm=torch.ones(hidden_size, device=device),
+                    lm_head_weight=head,
+                    norm_eps=1e-6,
+                )
+                query = torch.zeros(2, 3, rank, device=device)
+                anchors = torch.zeros(2, dtype=torch.long, device=device)
+
+                def score():
+                    return score_dspine_transitions(
+                        candidates, raw, rms, query, anchors, **kwargs
+                    )
+
+                def reference():
+                    sender_ids = torch.cat(
+                        (anchors[:, None, None].expand(-1, 1, 2), candidates[:, :-1]),
+                        dim=1,
+                    )
+                    delta = kwargs["codebook"][sender_ids] * write[:, 0]
+                    refined = raw[:, :, None, :] + rms[:, :, None, None] * delta
+                    normalized = refined * torch.rsqrt(
+                        refined.square().mean(-1, keepdim=True) + 1e-6
+                    )
+                    return normalized @ head.T
+
+                torch.testing.assert_close(score(), reference(), atol=2e-5, rtol=2e-5)
+                if device == "cuda":
+                    for _ in range(3):
+                        score()
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        captured = score()
+                    # Change the same buffers to a well-conditioned state and
+                    # replay both directions to exercise the device-side branch.
+                    for value in (1.0, 10.0):
+                        raw.fill_(value)
+                        graph.replay()
+                        torch.testing.assert_close(
+                            captured, reference(), atol=2e-5, rtol=2e-5
+                        )
+
     def test_serial_refinement_matches_explicit_hidden_states(self):
         bridge = make_bridge()
         torch.manual_seed(17)

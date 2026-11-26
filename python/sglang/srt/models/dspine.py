@@ -91,6 +91,10 @@ class DSpineSelector(CandidateSelector):
 class DSpineDraftModel(DFlashDraftModel):
     decoder_layer_cls = DSpineDecoderLayer
     requires_draft_sampler_for_graph = True
+    _direct_weight_update_error = (
+        "DSPINE direct weight updates bypass bridge and refinement cache refresh. "
+        "Use a complete checkpoint update through load_weights instead."
+    )
 
     def __init__(self, config, quant_config=None, prefix=""):
         if quant_config is not None:

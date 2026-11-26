@@ -46,6 +46,23 @@ class TestDerivedWeightCache(unittest.TestCase):
             )
         self.assertTrue(torch.equal(model[0].weight, original))
 
+    def test_dspine_direct_update_rejects_before_writing_weights(self):
+        from sglang.srt.models.dspine import DSpineDraftModel
+
+        model = DSpineDraftModel.__new__(DSpineDraftModel)
+        torch.nn.Module.__init__(model)
+        model.projection = torch.nn.Linear(2, 2, bias=False)
+        previous = model.projection.weight.detach().clone()
+        updater = SimpleNamespace(get_model=lambda: model)
+        success, reason = WeightUpdater.update_weights_from_tensor(
+            updater,
+            [("projection.weight", torch.zeros_like(previous))],
+            load_format="direct",
+        )
+        self.assertFalse(success)
+        self.assertIn("DSPINE direct weight updates", reason)
+        torch.testing.assert_close(model.projection.weight, previous, atol=0, rtol=0)
+
     def test_direct_update_error_only_blocks_the_direct_format(self):
         model = torch.nn.Sequential(torch.nn.Module())
         model[0]._direct_weight_update_error = "no direct"
