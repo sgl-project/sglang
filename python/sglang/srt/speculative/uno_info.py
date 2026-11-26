@@ -5,10 +5,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import (
-    get_alloc_reserve_per_decode,
-    page_aligned_decode_alloc_lens,
-)
+from sglang.srt.mem_cache.allocation_sizing import spec_decode_alloc_lens
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
@@ -99,7 +96,6 @@ class UnoDraftInput(SpecInput):
             )
 
         committed_lengths: list[int] = []
-        reserve_width = int(get_alloc_reserve_per_decode())
 
         max_top_k = 1
         uniform_top_k_value = None
@@ -130,20 +126,9 @@ class UnoDraftInput(SpecInput):
         self.max_top_k = max_top_k
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
-        page_size = batch.token_to_kv_pool_allocator.page_size
-        current_lengths, next_lengths, num_needed_tokens = (
-            page_aligned_decode_alloc_lens(
-                batch.reqs,
-                reserve=reserve_width,
-                page_size=page_size,
-            )
+        current_lengths, next_lengths, num_needed_tokens = spec_decode_alloc_lens(
+            batch.reqs, page_size=batch.token_to_kv_pool_allocator.page_size
         )
-        row_width = int(batch.req_to_token_pool.req_to_token.shape[1])
-        if max(next_lengths) > row_width:
-            raise RuntimeError(
-                "UNO allocation exceeds the req_to_token row: "
-                f"needed={max(next_lengths)}, available={row_width}."
-            )
 
         current_cpu = torch.tensor(
             current_lengths,
