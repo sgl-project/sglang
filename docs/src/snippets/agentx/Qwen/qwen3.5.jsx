@@ -44,9 +44,9 @@ export const agentx = {
     "status": "in-progress"
    },
    "5233": {
-    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/45674493813",
-    "sha": "d226eea1b83c894e186ff08a404700f8910e6f43",
-    "status": "verified-pr"
+    "run": null,
+    "sha": "5204cf6413c885c72be360d69be94a74ff6d82ea",
+    "status": "in-progress"
    }
   }
  },
@@ -2453,9 +2453,9 @@ export const agentx = {
    "id": "qwen3.5-fp4-gb300-dynamo-sglang-agentic-pp2-mooncake#0",
    "hw": "gb300",
    "ckpt": "nvidia/Qwen3.5-397B-A17B-NVFP4",
-   "label": "Disagg 1P1D · prefill PP2 · decode TP8 (2 nodes)",
+   "label": "Disagg 2P1D · prefill PP2 · decode TP8 (2 nodes)",
    "detail": "MTP 6-1-7",
-   "gpus": 10,
+   "gpus": 12,
    "configKey": "qwen3.5-fp4-gb300-dynamo-sglang-agentic-pp2-mooncake",
    "image": "lmsysorg/sglang:qwen35-gb300-sub-617bd60@sha256:697bb3b6fca85b8fed6427fd8b090ba2e50b7797a1156ac32a45ada48e19b3c8",
    "imageStatus": "ok",
@@ -2465,7 +2465,7 @@ export const agentx = {
     {
      "kind": "note",
      "script": "Placement",
-     "reason": "The prefill worker runs on GPUs 0,2 (CUDA_VISIBLE_DEVICES), as SemiAnalysis placed it with srt-slurm's gpu_indices: SGLang binds each rank's host memory to its GPU's NUMA node, so the choice of GPUs decides how the ranks' host pools spread across NUMA nodes."
+     "reason": "Workers share nodes: 2 prefill workers on 1 node, 1 decode worker on 2 nodes. LOCAL_WORKER_RANK gives each worker on a node its own GPUs and ports. The GPU count above counts the GPUs the workers use; reserve whole nodes when planning capacity."
     }
    ],
    "disclosures": ["synthetic-acceptance"],
@@ -2476,29 +2476,26 @@ export const agentx = {
      "args": [
       ["--enable-hierarchical-cache"],
       ["--hicache-io-backend", "kernel"],
-      ["--hicache-mem-layout", "page_first"],
-      ["--hicache-size", "100"],
-      ["--hicache-storage-backend", "mooncake"],
-      ["--hicache-storage-prefetch-policy", "timeout"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-size", "128"],
       ["--hicache-write-policy", "write_back"]
      ],
-     "donor": "qwen3.5-fp4-gb300-dynamo-sglang-agentic-pp2-mooncake",
-     "donorHardware": "gb300"
+     "donor": "qwen3.5-fp4-gb300-dynamo-sglang-agentic-agg-pareto",
+     "donorHardware": "gb300",
+     "donorRef": "main"
     }
    },
    "prov": {
-    "sha": "d226eea1b83c894e186ff08a404700f8910e6f43",
+    "sha": "5204cf6413c885c72be360d69be94a74ff6d82ea",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/qwen3.5/sglang/gb300-fp4/agentx/disagg-pp2-mooncake-variants.yaml",
-    "run": "45674493813",
     "pr": "5233",
-    "comment": "7182620455",
-    "status": "verified-pr"
+    "status": "in-progress"
    },
    "points": [
     {
      "concs": [1],
      "item": 0,
-     "override": "override_1p_pp2_1d_tp8_c1b1",
+     "override": "override_2p_pp2_1d_tp8_c1b1",
      "goldenAL": "4.8",
      "kv": "hicache"
     }
@@ -2609,11 +2606,16 @@ export const agentx = {
       {
        "kind": "worker",
        "role": "prefill",
-       "workers": 1,
+       "workers": 2,
        "nodes_per_worker": 1,
+       "gpu_pinning": [
+        ["0,2"],
+        ["1,3"]
+       ],
+       "local_ranks": [0, 1],
+       "preamble": ["# LOCAL_WORKER_RANK is this worker's index on its node (0 or 1).", "case \"$LOCAL_WORKER_RANK\" in 0) export CUDA_VISIBLE_DEVICES=0,2 ;; 1) export CUDA_VISIBLE_DEVICES=1,3 ;; *) echo \"Set LOCAL_WORKER_RANK to 0 or 1\" >&2; exit 1 ;; esac", "PORT=$((30000 + 32 * LOCAL_WORKER_RANK))", "BOOTSTRAP_PORT=$((8998 + LOCAL_WORKER_RANK))"],
        "cmd": "python3 -m dynamo.sglang",
        "env": {
-        "CUDA_VISIBLE_DEVICES": "0,2",
         "DYN_REQUEST_PLANE": "tcp",
         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
         "FLASHINFER_DISABLE_VERSION_CHECK": "1",
@@ -2661,9 +2663,9 @@ export const agentx = {
         ["--model-path", "nvidia/Qwen3.5-397B-A17B-NVFP4"],
         ["--served-model-name", "nvidia/Qwen3.5-397B-A17B-NVFP4"],
         ["--host", "0.0.0.0"],
-        ["--port", "30000"],
+        ["--port", "$PORT"],
         ["--disaggregation-mode", "prefill"],
-        ["--disaggregation-bootstrap-port", "8998"],
+        ["--disaggregation-bootstrap-port", "$BOOTSTRAP_PORT"],
         ["--request-plane", "tcp"],
         ["--attention-backend", "trtllm_mha"],
         ["--chunked-prefill-size", "32768"],
@@ -2923,6 +2925,7 @@ export const agentx = {
        "env": {},
        "args": [
         ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
+        ["--prefill", "http://$PREFILL_1_HEAD_IP:30032", "8999"],
         ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
         ["--pd-disaggregation"],
         ["--host", "0.0.0.0"],
@@ -3819,7 +3822,7 @@ export const agentx = {
     {
      "kind": "note",
      "script": "Placement",
-     "reason": "The prefill worker runs on GPUs 0,2 (CUDA_VISIBLE_DEVICES), as SemiAnalysis placed it with srt-slurm's gpu_indices: SGLang binds each rank's host memory to its GPU's NUMA node, so the choice of GPUs decides how the ranks' host pools spread across NUMA nodes."
+     "reason": "Workers share nodes: 2 prefill workers on 1 node, 1 decode worker on 2 nodes. LOCAL_WORKER_RANK gives each worker on a node its own GPUs and ports. The GPU count above counts the GPUs the workers use; reserve whole nodes when planning capacity."
     }
    ],
    "disclosures": ["synthetic-acceptance"],
@@ -3830,23 +3833,20 @@ export const agentx = {
      "args": [
       ["--enable-hierarchical-cache"],
       ["--hicache-io-backend", "kernel"],
-      ["--hicache-mem-layout", "page_first"],
-      ["--hicache-size", "100"],
-      ["--hicache-storage-backend", "mooncake"],
-      ["--hicache-storage-prefetch-policy", "timeout"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-size", "128"],
       ["--hicache-write-policy", "write_back"]
      ],
-     "donor": "qwen3.5-fp4-gb300-dynamo-sglang-agentic-pp2-mooncake",
-     "donorHardware": "gb300"
+     "donor": "qwen3.5-fp4-gb300-dynamo-sglang-agentic-agg-pareto",
+     "donorHardware": "gb300",
+     "donorRef": "main"
     }
    },
    "prov": {
-    "sha": "d226eea1b83c894e186ff08a404700f8910e6f43",
+    "sha": "5204cf6413c885c72be360d69be94a74ff6d82ea",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/qwen3.5/sglang/gb300-fp4/agentx/disagg-pp2-mooncake-variants.yaml",
-    "run": "45674493813",
     "pr": "5233",
-    "comment": "7182620455",
-    "status": "verified-pr"
+    "status": "in-progress"
    },
    "points": [
     {
@@ -3998,7 +3998,7 @@ export const agentx = {
       {
        "kind": "mooncake-store",
        "placement": "prefill",
-       "count_nodes": 2,
+       "count_nodes": 1,
        "ports": ["50062"],
        "cmd": "numactl --cpunodebind=0 --membind=0 /opt/sglang/bin/mooncake_client",
        "args": [
@@ -4017,7 +4017,7 @@ export const agentx = {
       {
        "kind": "mooncake-store",
        "placement": "prefill",
-       "count_nodes": 2,
+       "count_nodes": 1,
        "ports": ["50063"],
        "cmd": "numactl --cpunodebind=1 --membind=1 /opt/sglang/bin/mooncake_client",
        "args": [
@@ -4034,7 +4034,6 @@ export const agentx = {
        "envRef": 4
       },
       {
-       "workers": 2,
        "diff": {
         "args": {
          "--hicache-mem-layout": ["page_first"],
@@ -4122,7 +4121,7 @@ export const agentx = {
       {
        "kind": "mooncake-store",
        "placement": "prefill",
-       "count_nodes": 2,
+       "count_nodes": 1,
        "ports": ["50062"],
        "cmd": "numactl --cpunodebind=0 --membind=0 /opt/sglang/bin/mooncake_client",
        "args": [
@@ -4141,7 +4140,7 @@ export const agentx = {
       {
        "kind": "mooncake-store",
        "placement": "prefill",
-       "count_nodes": 2,
+       "count_nodes": 1,
        "ports": ["50063"],
        "cmd": "numactl --cpunodebind=1 --membind=1 /opt/sglang/bin/mooncake_client",
        "args": [
@@ -4192,7 +4191,7 @@ export const agentx = {
        "env": {},
        "args": [
         ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
-        ["--prefill", "http://$PREFILL_1_HEAD_IP:30000", "8998"],
+        ["--prefill", "http://$PREFILL_1_HEAD_IP:30032", "8999"],
         ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
         ["--pd-disaggregation"],
         ["--host", "0.0.0.0"],
@@ -4799,9 +4798,9 @@ export const agentx = {
    "id": "qwen3.5-fp4-gb300-dynamo-sglang-agentic-pp2-mooncake#7",
    "hw": "gb300",
    "ckpt": "nvidia/Qwen3.5-397B-A17B-NVFP4",
-   "label": "Disagg 5P2D · prefill PP2 · decode DEP4",
+   "label": "Disagg 6P2D · prefill PP2 · decode DEP4",
    "detail": "MTP 6-1-7",
-   "gpus": 18,
+   "gpus": 20,
    "configKey": "qwen3.5-fp4-gb300-dynamo-sglang-agentic-pp2-mooncake",
    "image": "lmsysorg/sglang:qwen35-gb300-sub-617bd60@sha256:697bb3b6fca85b8fed6427fd8b090ba2e50b7797a1156ac32a45ada48e19b3c8",
    "imageStatus": "ok",
@@ -4811,7 +4810,7 @@ export const agentx = {
     {
      "kind": "note",
      "script": "Placement",
-     "reason": "The prefill worker runs on GPUs 0,2 (CUDA_VISIBLE_DEVICES), as SemiAnalysis placed it with srt-slurm's gpu_indices: SGLang binds each rank's host memory to its GPU's NUMA node, so the choice of GPUs decides how the ranks' host pools spread across NUMA nodes."
+     "reason": "Workers share nodes: 6 prefill workers on 3 nodes, 2 decode workers on 2 nodes. LOCAL_WORKER_RANK gives each worker on a node its own GPUs and ports. The GPU count above counts the GPUs the workers use; reserve whole nodes when planning capacity."
     }
    ],
    "disclosures": ["synthetic-acceptance"],
@@ -4822,29 +4821,26 @@ export const agentx = {
      "args": [
       ["--enable-hierarchical-cache"],
       ["--hicache-io-backend", "kernel"],
-      ["--hicache-mem-layout", "page_first"],
-      ["--hicache-size", "100"],
-      ["--hicache-storage-backend", "mooncake"],
-      ["--hicache-storage-prefetch-policy", "timeout"],
+      ["--hicache-mem-layout", "page_first_direct"],
+      ["--hicache-size", "128"],
       ["--hicache-write-policy", "write_back"]
      ],
-     "donor": "qwen3.5-fp4-gb300-dynamo-sglang-agentic-pp2-mooncake",
-     "donorHardware": "gb300"
+     "donor": "qwen3.5-fp4-gb300-dynamo-sglang-agentic-agg-pareto",
+     "donorHardware": "gb300",
+     "donorRef": "main"
     }
    },
    "prov": {
-    "sha": "d226eea1b83c894e186ff08a404700f8910e6f43",
+    "sha": "5204cf6413c885c72be360d69be94a74ff6d82ea",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/qwen3.5/sglang/gb300-fp4/agentx/disagg-pp2-mooncake-variants.yaml",
-    "run": "45674493813",
     "pr": "5233",
-    "comment": "7182620455",
-    "status": "verified-pr"
+    "status": "in-progress"
    },
    "points": [
     {
      "concs": [890],
      "item": 7,
-     "override": "override_5p_pp2_2d_dep4_c600_n890",
+     "override": "override_6p_pp2_2d_dep4_c890",
      "goldenAL": "4.8",
      "kv": "hicache"
     }
@@ -4953,7 +4949,16 @@ export const agentx = {
        "envRef": 4
       },
       {
-       "workers": 5,
+       "workers": 6,
+       "gpu_pinning": [
+        ["0,2"],
+        ["1,3"],
+        ["0,2"],
+        ["1,3"],
+        ["0,2"],
+        ["1,3"]
+       ],
+       "local_ranks": [0, 1, 0, 1, 0, 1],
        "diff": {
         "args": {
          "--hicache-size": ["200"],
@@ -5111,10 +5116,11 @@ export const agentx = {
        "args": [
         ["--decode", "http://$DECODE_1_HEAD_IP:30000"],
         ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
+        ["--prefill", "http://$PREFILL_5_HEAD_IP:30032", "8999"],
         ["--prefill", "http://$PREFILL_4_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_3_HEAD_IP:30000", "8998"],
+        ["--prefill", "http://$PREFILL_3_HEAD_IP:30032", "8999"],
         ["--prefill", "http://$PREFILL_2_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_1_HEAD_IP:30000", "8998"],
+        ["--prefill", "http://$PREFILL_1_HEAD_IP:30032", "8999"],
         ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
         ["--pd-disaggregation"],
         ["--host", "0.0.0.0"],
