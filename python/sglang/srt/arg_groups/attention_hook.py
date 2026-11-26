@@ -57,6 +57,9 @@ XPU_DECODE_MAX_Q_GROUP_SIZE = 16
 # MAX_HEADS in sgl-kernel-xpu's flash_mla_decode.
 XPU_MLA_DECODE_MAX_HEADS = 128
 
+# Dense architectures served by DeepseekV2AttentionMLA.
+XPU_DCP_MLA_ARCHS = ("DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM")
+
 
 def _check_xpu_dcp_mla(
     view: Any, model_config: Any, attn_tp_size: int, dcp_size: int
@@ -74,6 +77,14 @@ def _check_xpu_dcp_mla(
             "models on Intel XPU: the sparse decode path returns no softmax "
             "LSE, so the cross-rank merge has nothing to weight its partials "
             "with. Dense MLA models are supported."
+        )
+    # Only DeepseekV2AttentionMLA gathers Q and the prefix latent across the DCP
+    # group; other MLA attention classes would attend one rank's shard alone.
+    arch = model_config.hf_config.architectures[0]
+    if arch not in XPU_DCP_MLA_ARCHS:
+        raise ValueError(
+            f"--dcp-size > 1 is not supported for {arch} on Intel XPU: its MLA "
+            "attention has no decode-context-parallel path."
         )
     if view.disable_chunked_prefix_cache:
         raise ValueError(

@@ -355,14 +355,14 @@ class XPUAttentionBackend(AttentionBackend):
         )
 
     def _ensure_mla_workspaces(self, batch_size: int) -> None:
-        # Under DCP the model all-gathers Q over the group, so the decode kernel
-        # sees num_local_heads * dcp_size heads and needs the larger workspace.
+        # Sized for the split count every flash_mla_decode call here pins; the
+        # -1 heuristic would reserve a split buffer nobody reads.
         workspace_kwargs = dict(
             max_seq_len=self.max_kv_len,
             num_batches=batch_size,
             num_heads=self.num_local_heads * self.dcp_size,
             page_size=self.page_size,
-            num_kv_splits=-1,
+            num_kv_splits=1,
         )
         decode_size = flash_mla_decode_get_workspace_size(**workspace_kwargs)
         if (

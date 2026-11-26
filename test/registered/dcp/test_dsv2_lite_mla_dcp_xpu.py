@@ -161,8 +161,8 @@ class TestDeepseekV2LiteMlaDcpXPU(GSM8KMixin, CustomTestCase):
     model = MODEL_PATH
     base_url = DEFAULT_URL_FOR_TEST
 
-    # A smoke gate, not an accuracy-parity bar: a broken merge scores near zero.
-    # Parity against DCP=1 is the class below.
+    # A smoke gate only. Parity against DCP=1 is the class below, and the
+    # zero-key prefix row fix is pinned per PR in test/registered/xpu/test_xpu_dcp.py.
     gsm8k_score_threshold = 0.20
     gsm8k_num_examples = 100 if is_in_ci() else 200
     gsm8k_num_threads = 32

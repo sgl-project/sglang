@@ -282,7 +282,7 @@ class TestMlaDCPMatchesFullAttention(CustomTestCase):
         backend.dcp_group = group
         backend.page_size = self.PAGE_SIZE
         backend.num_local_heads = heads // dcp_size
-        backend.max_context_len = self.MAX_TOKENS
+        backend.max_kv_len = self.MAX_TOKENS
         backend.device = device
         backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         # kv_layers is a property over token_to_kv_pool.layer_router.
@@ -356,6 +356,51 @@ class TestMlaDCPMatchesFullAttention(CustomTestCase):
             with self.subTest(dcp_size=dcp_size, seq_lens=seq_lens):
                 self._assert_matches(dcp_size=dcp_size, seq_lens=seq_lens)
 
+    def test_zero_length_prefix_row_is_neutralized(self):
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+        torch.manual_seed(0)
+        device, heads, head_dim, v_dim = "xpu", 8, 192, 128
+        q_lens, k_lens = [3, 5], [0, 7]
+        q = torch.randn(8, heads, head_dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn(7, heads, head_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn(7, heads, v_dim, device=device, dtype=torch.bfloat16)
+        out, lse, *_ = flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=torch.tensor([0, 3, 8], dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.tensor([0, 0, 7], dtype=torch.int32, device=device),
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=max(k_lens),
+            softmax_scale=head_dim**-0.5,
+            causal=False,
+            return_softmax_lse=True,
+        )
+        batch = SimpleNamespace(
+            prefix_chunk_has_zero_kv=[True],
+            prefix_chunk_seq_lens=torch.tensor(
+                [k_lens], dtype=torch.int32, device=device
+            ),
+            extend_seq_lens=torch.tensor(q_lens, dtype=torch.int32, device=device),
+        )
+        out, lse = XPUAttentionBackend._neutralize_empty_prefix_rows(
+            out, lse.transpose(0, 1).contiguous(), batch, 0
+        )
+
+        self.assertTrue(bool((out[:3] == 0).all()))
+        self.assertTrue(bool(torch.isneginf(lse[:3]).all()))
+        scores = torch.einsum("qhd,khd->hqk", q[3:].float(), k.float())
+        probs = (scores * head_dim**-0.5).softmax(-1)
+        torch.testing.assert_close(
+            out[3:].float(),
+            torch.einsum("hqk,khd->qhd", probs, v.float()),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+
 
 class TestXPUDCPStartupChecks(CustomTestCase):
     @staticmethod
@@ -392,6 +437,9 @@ class TestXPUDCPStartupChecks(CustomTestCase):
         self.assertEqual(
             self._build(model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST).dcp_size, 2
         )
+
+    def test_mla_arch_without_dcp_path_rejected(self):
+        self._assert_rejected("MiniCPM3ForCausalLM", model_path="openbmb/MiniCPM3-4B")
 
     def test_mla_disabled_chunked_prefix_cache_rejected(self):
         self._assert_rejected(

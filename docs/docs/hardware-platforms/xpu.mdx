@@ -334,8 +334,8 @@ KV heads: Qwen3.5 models, or models with at most `tp_size / dcp_size` KV heads.
 Unsupported features are refused at startup. If startup fails with
 `UR_RESULT_ERROR_OUT_OF_RESOURCES`, lower `--mem-fraction-static`.
 
-Dense MLA models work too, with no KV-head restriction, because MLA's single
-latent KV head is replicated on every rank:
+Dense DeepSeek-V2 and DeepSeek-V3 MLA models work too, with no KV-head
+restriction, because MLA's single latent KV head is replicated on every rank:
 
 ```bash
 python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V2-Lite \
@@ -351,7 +351,8 @@ sequence for its own Q heads; DCP turns it on for you.
 
 Sparse-attention (DSA) MLA models such as DeepSeek-V3.2 and GLM-5 are refused:
 their sparse decode returns no softmax LSE, so the merge has nothing to weight
-its partials with. A quantized KV cache is refused for DCP on this backend
+its partials with. Other MLA architectures such as MiniCPM3 are refused too, as
+their attention has no DCP path. A quantized KV cache is refused for DCP on this backend
 whatever the attention architecture, so `--kv-cache-dtype` has to resolve to
 fp16 or bf16.
 
