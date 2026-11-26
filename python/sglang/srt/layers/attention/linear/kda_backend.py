@@ -9,6 +9,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.configs.model_config import is_kimi_k3
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kda_prefill_graph import (
@@ -50,7 +51,9 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_platform,
+    get_serving,
     get_spec,
+    linear_attn_tp_size,
     mamba_cache_chunk_size,
 )
 
@@ -517,6 +520,27 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        if (
+            prefill_backend.is_triton()
+            and is_cuda()
+            and self.state_layer_indices
+            and not get_serving().skip_server_warmup
+            and get_disagg().disaggregation_mode != "decode"
+            and is_kimi_k3(model_runner.model_config.hf_config)
+            and model_runner.model_config.dtype == torch.bfloat16
+            and torch.cuda.get_device_capability(self.device) == (9, 0)
+        ):
+            from sglang.kernels.ops.attention.fla.chunk_intra import (
+                precompile_k3_inter_solve,
+            )
+
+            config = model_runner.model_config.hf_text_config.linear_attn_config
+            with torch.cuda.device(self.device):
+                precompile_k3_inter_solve(
+                    num_heads=config["num_heads"] // linear_attn_tp_size(),
+                    head_dim=config["head_dim"],
+                    safe_gate=config.get("gate_lower_bound") is not None,
+                )
         if prefill_backend.is_flashinfer():
             _validate_flashinfer_kda_prefill(
                 chunk_size=self.mamba_chunk_size,

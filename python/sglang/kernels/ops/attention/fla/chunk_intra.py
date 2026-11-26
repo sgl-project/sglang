@@ -923,6 +923,46 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_s)
 
 
+def precompile_k3_inter_solve(*, num_heads: int, head_dim: int, safe_gate: bool):
+    """Compile packed bf16 K3 prefill candidates without running the autotuner."""
+    from triton.runtime.jit import MockTensor
+
+    bf16 = MockTensor(torch.bfloat16)
+    fp32 = MockTensor(torch.float32)
+    index = MockTensor(torch.int32)
+    # The outer heuristic supplies IS_VARLEN at launch. Use the underlying
+    # autotuner's compile-only API so the first real grid still picks its tactic.
+    autotuner = chunk_kda_fwd_kernel_inter_solve_fused.fn
+    for fused in (True, False):
+        autotuner.warmup(
+            q=bf16,
+            k=bf16,
+            g=fp32,
+            beta=fp32,
+            Aqk=bf16,
+            Akkd=fp32,
+            Akk=bf16,
+            scale=head_dim**-0.5,
+            v_in=bf16,
+            w_out=bf16,
+            u_out=bf16,
+            kg_out=bf16,
+            cu_seqlens=index,
+            chunk_indices=index,
+            T=64,  # T is marked do_not_specialize.
+            H=num_heads,
+            K=head_dim,
+            V=head_dim if fused else 0,
+            BT=64,
+            BC=16,
+            IS_VARLEN=True,
+            USE_SAFE_GATE=safe_gate,
+            FUSE_RECOMPUTE=fused,
+            FUSE_DIAGONAL=fused,
+            grid=(1, num_heads),
+        )
+
+
 def chunk_kda_fwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,
