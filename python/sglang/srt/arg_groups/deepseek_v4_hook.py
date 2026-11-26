@@ -399,6 +399,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     incompatible = (
+        # LoRA's segments cover every row of the extend; the late layers run its tail.
+        ("LoRA", _lora_requested(cfg)),
         (
             "the prefill CUDA graph",
             cfg.cuda_graph_config.prefill.backend
