@@ -146,6 +146,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_req_to_token_pool,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
@@ -4170,8 +4171,8 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
+        prev_pre: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
@@ -4246,7 +4247,7 @@ class DeepseekV4Model(nn.Module):
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
+        state = mhc.HcState(hidden_states, prev_pre)
         fused_step = _is_hip and _hip.fused_boundary_this_step(forward_batch)
         if _is_cuda:
             residual_batch.start(forward_batch)
@@ -4592,6 +4593,121 @@ class DeepseekV4Model(nn.Module):
                 for child in forward_batch.tbo_children:
                     residual_batch.clear(child)
 
+    def _pp_full_page_ids(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        req_to_token = get_req_to_token_pool().req_to_token
+        page_size = get_token_to_kv_pool().page_size
+        pages = [
+            req_to_token[
+                forward_batch.req_pool_indices[index],
+                torch.arange(0, int(length), page_size, device=req_to_token.device),
+            ]
+            // page_size
+            for index, length in enumerate(forward_batch.seq_lens_cpu)
+            if int(length) > 0
+        ]
+        return (
+            torch.cat(pages).to(torch.int64)
+            if pages
+            else torch.empty(0, dtype=torch.int64, device=req_to_token.device)
+        )
+
+    def _export_pp_state(self, tensors: dict, forward_batch: ForwardBatch) -> None:
+        next_layer = self.end_layer
+        ratio = self.config.compress_ratios[next_layer]
+        if ratio not in (1, 2):
+            return
+        pool = get_token_to_kv_pool()
+        source = max(
+            layer
+            for layer in self.config.kv_source_layer_ids
+            if layer <= next_layer and self.config.compress_ratios[layer] == ratio
+        )
+        if source < next_layer:
+            tensors["pp_source_layer"] = source
+            tensors.update(
+                {
+                    f"pp_source_{name}": value
+                    for name, value in pool.export_source_pages(
+                        source, self._pp_full_page_ids(forward_batch)
+                    ).items()
+                }
+            )
+        metadata = get_attn_backend().forward_metadata
+        if next_layer not in self.config.index_source_layer_ids:
+            raw = metadata.core_metadata.sparse_raw_indices(ratio)
+            if raw is not None:
+                tensors[f"pp_raw_indices_{ratio}"] = raw
+        candidate = metadata.candidate_metadata
+        if candidate is not None:
+            tensors["pp_candidate_blocks"] = candidate.blocks
+            from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+                _SparsePrefillTable,
+            )
+
+            if isinstance(candidate, _SparsePrefillTable):
+                tensors["pp_candidate_dtype"] = candidate.q_dtype
+                for name in ("compress_lens", "request_ids", "valid_lens"):
+                    tensors[f"pp_candidate_{name}"] = getattr(candidate, name)
+
+    def _install_pp_state(
+        self, proxy: PPProxyTensors, forward_batch: ForwardBatch
+    ) -> None:
+        tensors = proxy.tensors
+        pool = get_token_to_kv_pool()
+        if "pp_source_layer" in tensors:
+            pool.install_source_pages(
+                tensors["pp_source_layer"],
+                self._pp_full_page_ids(forward_batch),
+                {
+                    name.removeprefix("pp_source_"): value
+                    for name, value in tensors.items()
+                    if name.startswith("pp_source_") and name != "pp_source_layer"
+                },
+            )
+        metadata = get_attn_backend().forward_metadata
+        core = metadata.core_metadata
+        for ratio in (1, 2):
+            raw = tensors.get(f"pp_raw_indices_{ratio}")
+            if raw is None:
+                continue
+            core.sparse_raw_indices(ratio).copy_(raw)
+            slots_per_page = pool.page_size // ratio
+            logical = raw.clamp_min(0).to(torch.int64)
+            pages = core.page_table.gather(1, logical // slots_per_page)
+            physical = pages * slots_per_page + logical % slots_per_page
+            core.sparse_page_indices(ratio).copy_(physical.masked_fill(raw < 0, -1))
+        blocks = tensors.get("pp_candidate_blocks")
+        if blocks is None:
+            return
+        rows_per_request = list(forward_batch.extend_seq_lens_cpu)
+        if "pp_candidate_dtype" in tensors:
+            from sglang.srt.layers.attention.dsv4.metadata import (
+                expand_index_page_table,
+            )
+            from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+                _build_prefill_table,
+            )
+
+            index_page_size = pool.index_pools[1].page_size
+            metadata.candidate_metadata = _build_prefill_table(
+                blocks=blocks,
+                compress_lens=tensors["pp_candidate_compress_lens"],
+                page_table=expand_index_page_table(
+                    core.page_table, pool.page_size, index_page_size
+                ),
+                page_size=index_page_size,
+                request_ids=tensors["pp_candidate_request_ids"],
+                rows_per_request=rows_per_request,
+                q_dtype=tensors["pp_candidate_dtype"],
+                valid_lens=tensors["pp_candidate_valid_lens"],
+            )
+        else:
+            from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+                BlockIds,
+            )
+
+            metadata.candidate_metadata = BlockIds(blocks, rows_per_request)
+
     @torch.no_grad()
     def forward(
         self,
@@ -4640,6 +4756,8 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+            if self.config.model_type == "deepseek_v41":
+                self._install_pp_state(pp_proxy_tensors, forward_batch)
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -4710,6 +4828,11 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                (
+                    pp_proxy_tensors.tensors.get("prev_pre")
+                    if pp_proxy_tensors is not None
+                    else None
+                ),
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4780,7 +4903,12 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            tensors = {"hidden_states": hidden_states.flatten(1)}
+            if last_pre is not None:
+                tensors["prev_pre"] = last_pre
+            if self.config.model_type == "deepseek_v41":
+                self._export_pp_state(tensors, forward_batch)
+            return PPProxyTensors(tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 

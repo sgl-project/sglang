@@ -311,6 +311,33 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
         )
 
 
+def validate_deepseek_v41_pp(cfg) -> None:
+    unsupported = (
+        ("hardware other than CUDA", not get_platform().is_cuda),
+        ("modes other than PD prefill", cfg.disaggregation_mode != "prefill"),
+        ("multimodal inputs", not cfg.language_model_only),
+        (
+            "context parallelism",
+            cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1,
+        ),
+        ("DP attention", attn_dp_enabled_of(cfg)),
+        ("speculative decoding", cfg.speculative_algorithm is not None),
+        (
+            "bounded SWA replay",
+            cfg.enable_encoder_swa_bounded_replay
+            or cfg.enable_decoder_swa_bounded_replay,
+        ),
+        ("prefix caching", not cfg.disable_radix_cache),
+        (
+            "the prefill CUDA graph",
+            cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+        ),
+    )
+    for feature, enabled in unsupported:
+        if enabled:
+            raise ValueError(f"DeepSeek-V4.1 PP prefill does not support {feature}")
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
@@ -323,6 +350,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    if cfg.pp_size > 1:
+        validate_deepseek_v41_pp(cfg)
     if (
         cfg.dsv4_attn_backend == "trtllm"
         and cfg.cuda_graph_config.prefill.backend
@@ -387,7 +416,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
     )
     for feature, enabled in unsupported:
         if enabled:
@@ -452,6 +480,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ),
         ),
     )
+    incompatible += (("pipeline parallelism", cfg.pp_size > 1),)
     if cfg.enable_decoder_swa_bounded_replay:
         for feature, unsupported in incompatible:
             if unsupported:

@@ -876,6 +876,7 @@ class _StaticStateEntries(msgspec.Struct, frozen=True, kw_only=True):
 
 def _static_owner_region(token_to_kv_pool) -> Region:
     """The KV entries a static pool registers."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
@@ -888,7 +889,7 @@ def _static_owner_region(token_to_kv_pool) -> Region:
     layer_ids = (
         token_to_kv_pool.get_kv_layer_ids()
         if token_to_kv_pool.layer_router.wrapped_view() is not None
-        or isinstance(token_to_kv_pool, MiniMaxSparseKVPool)
+        or isinstance(token_to_kv_pool, (MiniMaxSparseKVPool, DeepSeekV4TokenToKVPool))
         else ()
     )
     return Region(
@@ -1023,6 +1024,11 @@ def _static_state_entries(
                 data_lens,
                 item_lens,
                 kv_layout=swa_kv_layout,
+                layer_ids=(
+                    token_to_kv_pool.get_state_layer_ids()
+                    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    else None
+                ),
                 # Read when asked, as the window's view was: not every pool
                 # with window state keeps a window pool of its own.
                 view=lambda: token_to_kv_pool.swa_kv_pool,
@@ -1064,6 +1070,11 @@ def _static_state_entries(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_request_state_layer_ids()
+                            if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                            else None
+                        ),
                     )
         elif router.wrapped_view() is not None:
             dim = (

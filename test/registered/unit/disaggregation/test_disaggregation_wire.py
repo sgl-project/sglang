@@ -3805,6 +3805,7 @@ def _make_dsv4_target(*, unified, mapping=None):
     pool.unified_swa_ring_size = 131
     pool.unified_swa_pages = 524
     pool.get_state_buf_infos = lambda: _buf_infos(11)
+    pool.get_state_layer_ids = lambda: [0]
     pool.get_unified_swa_ring_buf_infos = lambda: (
         _buf_infos(12) if unified else ([], [], [])
     )
