@@ -334,9 +334,10 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dspark():
             from sglang.srt.arg_groups.model_override_base import model_config_of
+            from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 
-            if model_config_of(server_args).hf_config.architectures == [
-                "Inkling2ForConditionalGeneration"
+            if model_config_of(server_args).hf_config.architectures in [
+                [a] for a in INKLING2_ARCHS
             ]:
                 from sglang.srt.speculative.inkling2_mtp_worker import Inkling2MTPWorker
 

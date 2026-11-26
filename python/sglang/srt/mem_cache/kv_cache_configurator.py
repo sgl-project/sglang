@@ -476,6 +476,7 @@ class KVCacheConfigurator:
                 draft_model_config=aux.draft_model_config,
                 draft_num_layers=aux.dflash_draft_num_layers,
                 attn_tp_size=self.draft_attn_tp_size,
+                algo_label="DFLASH" if self.spec_algorithm.is_dflash() else None,
             )
             self.dflash_draft_loc_space_scale = draft_loc_space_scale(
                 hf_config=aux.draft_model_config.hf_config,
@@ -1695,6 +1696,7 @@ class KVCacheConfigurator:
         from sglang.srt.disaggregation.decode import (
             HybridMambaDecodeReqToTokenPool,
         )
+        from sglang.srt.layers.attention.linear.utils import max_verify_batch_size
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
@@ -1728,6 +1730,7 @@ class KVCacheConfigurator:
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
+            max_verify_batch_size=max_verify_batch_size(max_num_reqs),
         )
         return req_to_token_pool
 

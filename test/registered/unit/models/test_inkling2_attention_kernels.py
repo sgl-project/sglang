@@ -394,6 +394,7 @@ def _setup(monkeypatch, page_size, committed, query_lens, mapping, device="cpu")
     backend.use_mla = False
     backend.fa_skip_kv_cache = False
     backend.kv_cache_is_mxfp8 = False
+    backend.mxfp8_via_bf16 = False
     backend.local_attn_builder = None
     backend.use_sliding_window_kv_pool = mapping != "full"
     backend.forward_metadata = metadata
