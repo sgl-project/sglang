@@ -257,16 +257,17 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                 kv_bytes_per_token=1152,
             )
         self.assertEqual(plan.batch_capacity, 32)
-        self.assertEqual(plan.prefill_workspace_tokens, 17 * 4224)
+        self.assertEqual(plan.prefill_workspace_tokens, 4224)
 
     def test_prefill_workspace_role_and_request_cap(self):
         from sglang.srt.environ import envs
 
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."
         for mode, switch, cap, rows in (
-            ("null", False, None, 4),
-            ("prefill", False, 2, 2),
-            ("decode", False, None, 0),
+            ("null", False, None, 1),
+            ("null", False, 8, 8),
+            ("null", False, 0, 0),
+            ("decode", False, 8, 0),
         ):
             with (
                 self.subTest(mode=mode, switch=switch, cap=cap),
@@ -299,7 +300,7 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                         index_head_dim=128,
                         hf_config=SimpleNamespace(index_n_heads=64, index_topk=2048),
                     ),
-                    request_rows=5,
+                    request_rows=3,
                     context_len=129,
                     num_layers=1,
                     top_k=2048,

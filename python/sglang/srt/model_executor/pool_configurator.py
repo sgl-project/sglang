@@ -873,13 +873,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         budget = get_sparse_kv_budget(**options)
         if budget.prefill_workspace_tokens:
-            min_tokens = ceil_align(
-                get_schedule().max_total_tokens
-                or max(budget.context_len, 2 * (budget.request_rows - 1)),
-                page_size,
-            )
-            required_bytes = budget.managed_hbm_bytes + min_tokens * self._cell_size
-            if required_bytes > pool_bytes:
+            min_tokens = max(budget.context_len, 2 * (budget.request_rows - 1))
+            token_cap = get_schedule().max_total_tokens
+            if token_cap is not None:
+                min_tokens = min(min_tokens, token_cap)
+            native_bytes = ceil_align(min_tokens, page_size) * self._cell_size
+            if budget.managed_hbm_bytes + native_bytes > pool_bytes:
                 return budget.without_prefill_workspace()
         return budget
 

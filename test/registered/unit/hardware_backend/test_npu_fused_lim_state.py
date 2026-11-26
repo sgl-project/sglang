@@ -143,7 +143,12 @@ class TestLIMState(CustomTestCase):
     def test_pool_sizing_reserves_native_capacity_before_workspace(self):
         from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 
-        for fits in (True, False):
+        for cap, native_floor, fits in (
+            (65536, 32768, True),
+            (65536, 32768, False),
+            (129, 256, True),
+            (129, 256, False),
+        ):
             plan = resolve_sparse_kv_budget(
                 **self.options(prefill_workspace_tokens=129)
             )
@@ -160,12 +165,14 @@ class TestLIMState(CustomTestCase):
             configurator._cell_size = 8
             configurator._num_layers = 1
             required = (
-                configurator._fixed_overhead_bytes + plan.managed_hbm_bytes + 256 * 8
+                configurator._fixed_overhead_bytes
+                + plan.managed_hbm_bytes
+                + native_floor * configurator._cell_size
             )
             with (
                 patch(
                     "sglang.srt.model_executor.pool_configurator.get_schedule",
-                    return_value=SimpleNamespace(max_total_tokens=129),
+                    return_value=SimpleNamespace(max_total_tokens=cap),
                 ),
                 patch(
                     "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.build_sparse_kv_budget_options",
@@ -186,9 +193,9 @@ class TestLIMState(CustomTestCase):
             self.assertEqual(plan.prefill_workspace_tokens, 129)
             self.assertEqual(selected.prefill_workspace_tokens, 129 if fits else 0)
             if fits:
-                self.assertEqual(result.max_total_num_tokens, 256)
+                self.assertEqual(result.max_total_num_tokens, native_floor)
             else:
-                self.assertGreater(result.max_total_num_tokens, 256)
+                self.assertGreater(result.max_total_num_tokens, native_floor)
             # A later configurator uses the shared finalized decision.
             later = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
             later._kvc = configurator._kvc
