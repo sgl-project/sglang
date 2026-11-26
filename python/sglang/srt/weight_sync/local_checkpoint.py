@@ -63,11 +63,13 @@ def pull(
 ) -> None:
     """Bring the host-local checkpoint up to ``target_version``: seed from the newest full
     version at or below it (v0 is ``base_dir``), then apply the deltas after it in order."""
+    destination = (
+        snapshot_path(local_checkpoint_dir, target_version) if snapshot else None
+    )
     if not snapshot and target_version > 0 and pre_read_hook:
         dynamic_import(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
-        if snapshot:
-            destination = snapshot_path(local_checkpoint_dir, target_version)
+        if destination is not None:
             if os.path.isdir(destination):
                 return
             if target_version > 0 and pre_read_hook:
@@ -90,13 +92,15 @@ def pull(
             start = applied
         for version in range(start + 1, target_version + 1):
             _apply_delta(local_checkpoint_dir, _version_dir(source_dir, version))
-        if snapshot:
+        if destination is not None:
             if _read_applied_version(local_checkpoint_dir) != target_version:
                 raise RuntimeError(f"Checkpoint did not reach version {target_version}")
             _publish_snapshot(local_checkpoint_dir, destination)
 
 
 def snapshot_path(local_checkpoint_dir: str, version: int) -> str:
+    if not os.path.isabs(local_checkpoint_dir):
+        raise ValueError("snapshot requires an absolute local_checkpoint_dir")
     return os.path.join(local_checkpoint_dir, SYNC_DIR, "snapshots", f"v{version:06d}")
 
 

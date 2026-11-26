@@ -228,6 +228,10 @@ class TestLocalCheckpointPull(CustomTestCase):
         self.assertEqual(_read_tensors(second), {"a": b"\x02", "b": b"\x02"})
         self.assertEqual(snapshot(1), first)
 
+    def test_relative_snapshot_path_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "absolute local_checkpoint_dir"):
+            local_checkpoint.snapshot_path("relative", 1)
+
     def test_failed_snapshot_copy_is_not_published_and_can_retry(self):
         self._pull(0)
         final = Path(local_checkpoint.snapshot_path(self.local, 0))

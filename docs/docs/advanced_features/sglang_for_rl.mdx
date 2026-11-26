@@ -342,10 +342,9 @@ stream per directory. A snapshot uses one extra checkpoint's worth of local
 storage per retained version. The caller may remove a snapshot on each host
 after every reader, including any memory mappings, has finished with it.
 
-
 When the trainer publishes each weight version to a shared filesystem, `POST /pull_weights` has every host of the deployment bring its own local checkpoint up to a target version; a following `update_weights_from_disk` with `model_path` set to that local dir then loads it. The pull only touches disk and runs off the scheduler thread, so it can overlap generation.
 
-The trainer writes version `N` as `weight_v{N:06d}/` under `source_dir`. A version is either a full HF checkpoint, which is copied as is, or a delta against version `N-1` (its index metadata carries `delta_encoding`), which is applied in place and checked against per-tensor checksums. Version 0 is the server's own `--model-path`. A pull seeds from the newest full version at or below the target and applies the deltas after it; one that fails midway leaves the host to reseed on its next pull. The local checkpoint only moves forward: pulling a version below it fails.
+The trainer writes version `N` as `weight_v{N:06d}/` under `source_dir`. A version is either a full HF checkpoint, which is copied as is, or a delta against version `N-1` (its index metadata carries `delta_encoding`), which is applied in place and checked against per-tensor checksums. Version 0 is the server's own `--model-path`. A pull seeds from the newest full version at or below the target and applies the deltas after it; one that fails midway leaves the host to reseed on its next pull. The in-place checkpoint only moves forward. A snapshot request for an older version succeeds if that snapshot is still present on every host.
 
 If the shared filesystem lacks cross-host read-after-write consistency (common for object-store mounts), set `--custom-pull-weights-pre-read-hook` to a `hook(source_dir, target_version)` that makes the published files visible before they are read.
 
