@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dsv4 import dsv4_mhc as npu_mhc
 from sglang.srt.models import deepseek_v4
 from sglang.srt.models import deepseek_v4_dspark as dspark
 from sglang.srt.models import deepseek_v4_mhc as mhc
@@ -407,6 +408,43 @@ class TestNpuMhcSeam(unittest.TestCase):
         # Schema mhc_post(x, hRes, hOut, hPost).
         self.assertEqual(seen["args"], (residual, comb, x, post_mix))
         torch.testing.assert_close(out, residual + 1.0)
+
+    def test_npu_v41_a3_post_dispatch(self):
+        cfg = self._sub_layer().cfg
+        x = torch.zeros(2, 128, dtype=torch.bfloat16)
+        residual = torch.zeros(2, 4, 128, dtype=torch.bfloat16)
+        post_mix = torch.ones(2, 4)
+        comb = torch.eye(4).expand(2, -1, -1)
+        cann = Mock(return_value=residual)
+        fallback = Mock(return_value=residual)
+        stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
+        stub.mhc_post_dpskv4 = cann
+        with (
+            patch.object(mhc, "_is_npu", True),
+            patch.object(mhc, "is_npu_arch35", return_value=False),
+            patch.object(npu_mhc, "_is_ascend_a3", return_value=True) as is_a3,
+            patch.object(npu_mhc, "post_torch", fallback),
+            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
+        ):
+            self.assertIs(mhc.post(cfg, x, residual, post_mix, comb), residual)
+            cann.assert_called_once_with(x, residual, post_mix, comb)
+            cann.reset_mock()
+            fallback.assert_not_called()
+
+            invalid_dtype = (x, residual, post_mix.half(), comb)
+            unaligned = (x[:, :8], residual[:, :, :8], post_mix, comb)
+            for args in (invalid_dtype, unaligned):
+                with self.subTest(shape=args[0].shape, dtype=args[2].dtype):
+                    mhc.post(cfg, *args)
+                    fallback.assert_called_once_with(*args)
+                    fallback.reset_mock()
+            empty = mhc.post(cfg, x[:0], residual[:0], post_mix[:0], comb[:0])
+            self.assertEqual(empty.shape, (0, 4, 128))
+            fallback.assert_not_called()
+            is_a3.return_value = False
+            mhc.post(cfg, x, residual, post_mix, comb)
+            fallback.assert_called_once_with(x, residual, post_mix, comb)
+            cann.assert_not_called()
 
     def test_npu_v4_post_delegates_the_kernel_choice_to_sgl_kernel_npu(self):
         # The pre-950 / Ascend 950 (batched) npu_hc_post choice moved into the

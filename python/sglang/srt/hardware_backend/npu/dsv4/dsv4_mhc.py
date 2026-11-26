@@ -1,7 +1,8 @@
-"""A3 DSV4.1 mHC using native Torch operators, without the A5 fused kernels."""
+"""A3 DSV4.1 mHC coefficient and residual mixing."""
 
 from __future__ import annotations
 
+from functools import cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -34,6 +35,35 @@ def mix_stats_torch(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
         comb = comb / (comb.sum(dim=-1, keepdim=True) + cfg.eps)
         comb = comb / (comb.sum(dim=-2, keepdim=True) + cfg.eps)
     return pre, post_mix, comb
+
+
+@cache
+def _is_ascend_a3() -> bool:
+    from torch_npu.npu._backends import get_soc_version
+
+    return get_soc_version() // 10 == 25
+
+
+def post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    hidden = x.shape[-1]
+    if (
+        residual.shape[1] == 4
+        and 0 < hidden <= 100_000
+        and hidden % 128 == 0
+        and x.dtype == residual.dtype
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and post_mix.dtype == comb.dtype == torch.float32
+        and _is_ascend_a3()
+    ):
+        from sgl_kernel_npu.operators.hyper_conn import mhc_post_dpskv4
+
+        return mhc_post_dpskv4(x, residual, post_mix, comb)
+    return post_torch(x, residual, post_mix, comb)
 
 
 def post_torch(
