@@ -25,9 +25,9 @@ from sglang.srt.layers.pooler import (
     pool_hidden_states,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
-from sglang.srt.utils import add_prefix
 
 
 class Qwen2ForRewardModel(nn.Module):
@@ -50,8 +50,6 @@ class Qwen2ForRewardModel(nn.Module):
             nn.Linear(config.hidden_size, self.num_labels),
         )
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
-
-        self.eos_token_id = config.eos_token_id
 
     @torch.no_grad()
     def forward(

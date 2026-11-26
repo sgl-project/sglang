@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pyo3::PyErr;
 use pyo3::Python;
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyPermissionError, PyTypeError, PyValueError};
 use tokio::sync::{Notify, mpsc::Receiver, watch};
 use tokio::time::{Duration, timeout};
 use tokio_stream::Stream;
@@ -17,7 +17,7 @@ use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
     build_text_generate_dict, extract_model_path,
 };
-use sglang_api_types::runtime::v1 as proto;
+use sglang_runtime_v1_types as proto;
 
 pub struct SglangServiceImpl {
     pub bridge: Arc<PyBridge>,
@@ -162,14 +162,21 @@ fn resolve_max_message_size() -> usize {
 ///
 /// `PyValueError` / `PyTypeError` mean the client sent bad input — surface as
 /// `INVALID_ARGUMENT` so callers can distinguish them from server failures.
-/// Everything else (typically `PyRuntimeError`, but also Python tracebacks
-/// from inside the tokenizer manager) maps to `INTERNAL`.
+/// `PyPermissionError` means the runtime handle refuses to serve the RPC at
+/// all: `PERMISSION_DENIED`. Everything else (typically `PyRuntimeError`, but
+/// also Python tracebacks from inside the tokenizer manager) maps to
+/// `INTERNAL`.
 fn pyerr_to_status(err: PyErr, context: &str) -> Status {
-    let is_client_error = Python::attach(|py| {
-        err.is_instance_of::<PyValueError>(py) || err.is_instance_of::<PyTypeError>(py)
+    let (refused, is_client_error) = Python::attach(|py| {
+        (
+            err.is_instance_of::<PyPermissionError>(py),
+            err.is_instance_of::<PyValueError>(py) || err.is_instance_of::<PyTypeError>(py),
+        )
     });
     let msg = format!("{}: {}", context, err);
-    if is_client_error {
+    if refused {
+        Status::permission_denied(msg)
+    } else if is_client_error {
         Status::invalid_argument(msg)
     } else {
         Status::internal(msg)
@@ -396,6 +403,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        let return_text = req.return_text.unwrap_or(false);
 
         let mut receiver = self
             .bridge
@@ -415,6 +423,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                             output_ids: data.output_ids.unwrap_or_default(),
                             meta_info: data.meta_info,
                             finished: false,
+                            text: data.text.filter(|_| return_text),
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
@@ -423,6 +432,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                             output_ids: data.output_ids.unwrap_or_default(),
                             meta_info: data.meta_info,
                             finished: true,
+                            text: data.text.filter(|_| return_text),
                         });
                         break;
                     }
@@ -991,6 +1001,7 @@ impl SglangServiceImpl {
                         yield Ok(proto::OpenAiStreamChunk {
                             json_chunk: data.json_bytes.unwrap_or_default(),
                             finished: false,
+                            status_code: None,
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
@@ -999,6 +1010,10 @@ impl SglangServiceImpl {
                         yield Ok(proto::OpenAiStreamChunk {
                             json_chunk: bytes,
                             finished: true,
+                            status_code: data
+                                .meta_info
+                                .contains_key("status_code")
+                                .then(|| openai_status_code(&data.meta_info, 200)),
                         });
                         break;
                     }

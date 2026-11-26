@@ -12,11 +12,13 @@ from typing import Callable, ContextManager, Iterator, Optional, Union
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dflash import (
+    compute_dflash_correct_drafts_and_bonus,
+)
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     create_block_accept_estimate_recorder,
 )
@@ -193,9 +195,10 @@ class DsparkInfoDumper:
         self._pending: Optional[_PendingStep] = None
         self._prev_stamp: Optional[float] = None
 
-        self._d2h_stream: Optional[torch.cuda.Stream] = None
+        self._device_module = torch.get_device_module(device)
+        self._d2h_stream = None
         if self.enabled and InfoComponent.REQS in self._components:
-            self._d2h_stream = torch.cuda.Stream(device=device)
+            self._d2h_stream = self._device_module.Stream(device=device)
 
         self._current_segments: dict[
             InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]
@@ -303,7 +306,7 @@ class DsparkInfoDumper:
         return False
 
     def _open_segment(self, segment: InfoSegment) -> None:
-        start = torch.cuda.Event(enable_timing=True)
+        start = self._device_module.Event(enable_timing=True)
         start.record()
         self._open_segments[segment] = start
 
@@ -311,7 +314,7 @@ class DsparkInfoDumper:
         start = self._open_segments.pop(segment, None)
         if start is None:
             return
-        end = torch.cuda.Event(enable_timing=True)
+        end = self._device_module.Event(enable_timing=True)
         end.record()
         self._current_segments[segment] = (start, end)
 
@@ -829,6 +832,7 @@ class DsparkStepObservers:
         draft_tokens: torch.Tensor,
         draft_block,
         sampling_info,
+        has_grammar: bool,
         correct_len: torch.Tensor,
         cap_trim_lens: torch.Tensor,
         bonus: torch.Tensor,
@@ -858,7 +862,12 @@ class DsparkStepObservers:
                 forward_ct=forward_ct,
                 rids=[req.rid for req in reqs],
                 draft_tokens=draft_tokens,
-                corrected_logits=draft_block.corrected_logits,
+                # Only rank 0 records, so it cannot gather a sharded vocab.
+                corrected_logits=(
+                    None
+                    if draft_block.vocab_shard is not None
+                    else draft_block.corrected_logits
+                ),
                 draft_temperatures=draft_block.temperatures,
                 greedy_mask=draft_block.greedy_mask,
                 target_logits=target_logits,
@@ -875,7 +884,7 @@ class DsparkStepObservers:
                     else None
                 ),
                 logits_adjustments_are_noop=verify_logits_adjustments_are_noop(
-                    sampling_info
+                    sampling_info, has_grammar=has_grammar
                 ),
                 correct_len=correct_len,
                 cap_trim_lens=cap_trim_lens,

@@ -108,4 +108,5 @@ class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
         graph_capture=True,
         piecewise_graph=True,
         hicache_device_kernels=True,
+        supports_pynccl=True,
     )

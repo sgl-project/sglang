@@ -1,13 +1,19 @@
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
+from sglang.multimodal_gen.runtime.entrypoints.cli.generate import (
+    maybe_dump_performance,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.utils import perf_logger as perf_logger_module
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    MemorySnapshot,
     PerformanceLogger,
     RequestMetrics,
 )
@@ -43,6 +49,36 @@ def test_reader_during_a_dump_sees_the_previous_complete_report(tmp_path, monkey
     assert [json.loads(text)["request_id"] for text in seen_mid_write] == ["first"]
     assert json.loads(path.read_text())["request_id"] == "second"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["perf.json"]
+
+
+def test_cli_perf_dump_keeps_the_host_memory_peak(tmp_path, monkeypatch):
+    """`sglang generate --perf-dump-path` rebuilds the metrics from the worker's
+    dict; the host anonymous-memory peak must survive that round trip."""
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    metrics = RequestMetrics(request_id="request")
+    metrics.record_memory_snapshot(
+        "after_DenoisingStage",
+        MemorySnapshot(
+            allocated_mb=1.0,
+            reserved_mb=2.0,
+            peak_allocated_mb=3.0,
+            peak_reserved_mb=4.0,
+            peak_host_anon_mb=512.5,
+        ),
+    )
+    path = tmp_path / "perf.json"
+
+    maybe_dump_performance(
+        SimpleNamespace(perf_dump_path=str(path)),
+        SimpleNamespace(model_path="model"),
+        "prompt",
+        GenerationResult(metrics=metrics.to_dict()),
+    )
+
+    checkpoint = json.loads(path.read_text())["memory_checkpoints"][
+        "after_DenoisingStage"
+    ]
+    assert checkpoint["peak_host_anon_mb"] == 512.5
 
 
 @pytest.mark.parametrize("is_output_rank", [True, False])
@@ -99,34 +135,43 @@ def test_finalize_preserves_perf_report_ownership(
 
 
 @pytest.mark.parametrize("is_output_rank", [True, False])
+@pytest.mark.parametrize("save_fails", [False, True])
 def test_finalize_preserves_the_output_rank_report_guard(
-    tmp_path, monkeypatch, is_output_rank
+    tmp_path, monkeypatch, is_output_rank, save_fails
 ):
     monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
     worker = GPUWorker.__new__(GPUWorker)
     worker.is_output_rank = is_output_rank
     worker.server_args = SimpleNamespace(model_path="model")
-    worker._materialize_output_transport = Mock()
+    error = (
+        OSError("output storage unavailable") if save_fails and is_output_rank else None
+    )
+    worker._materialize_output_transport = Mock(side_effect=error)
     worker._record_output_peak_memory = Mock()
     worker._record_replica_peak_memory = Mock()
     path = tmp_path / "perf.json"
     metrics = RequestMetrics("request")
 
-    worker._finalize_output_batch(
-        output_batch=OutputBatch(metrics=metrics),
-        req=SimpleNamespace(
-            request_id="request",
-            perf_dump_path=str(path),
-            is_warmup=False,
-            suppress_logs=True,
-            return_raw_frames=True,
-        ),
-        save_output_paths=Mock(),
-        output_metrics=[metrics],
-        deferred=False,
-    )
+    with (
+        pytest.raises(OSError, match="output storage unavailable")
+        if error
+        else nullcontext()
+    ):
+        worker._finalize_output_batch(
+            output_batch=OutputBatch(metrics=metrics),
+            req=SimpleNamespace(
+                request_id="request",
+                perf_dump_path=str(path),
+                is_warmup=False,
+                suppress_logs=True,
+                return_raw_frames=True,
+            ),
+            save_output_paths=Mock(),
+            output_metrics=[metrics],
+            deferred=False,
+        )
 
     worker._record_replica_peak_memory.assert_called_once_with([metrics])
-    assert path.exists() == is_output_rank
-    if is_output_rank:
+    assert path.exists() == (is_output_rank and not save_fails)
+    if path.exists():
         assert json.loads(path.read_text())["request_id"] == "request"

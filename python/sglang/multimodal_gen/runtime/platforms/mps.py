@@ -23,7 +23,6 @@ class MpsPlatform(Platform):
     device_name: str = "mps"
     device_type: str = "mps"
     dispatch_key: str = "MPS"
-    device_control_env_var: str = "MPS_VISIBLE_DEVICES"
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -56,17 +55,6 @@ class MpsPlatform(Platform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
 
         return psutil.virtual_memory().total
-
-    @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable MPS "
-                "graph. Since, enforce-eager is enabled, async output "
-                "processor cannot be used"
-            )
-            return False
-        return True
 
     @classmethod
     def get_current_memory_usage(

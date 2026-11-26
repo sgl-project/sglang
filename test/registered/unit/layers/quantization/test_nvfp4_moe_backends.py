@@ -12,7 +12,7 @@ import torch
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
-from sglang.srt.utils import get_device_sm
+from sglang.srt.utils import get_device_sm, round_up
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import assert_output_close, init_single_process_dist
 from sglang.test.quant_ref_utils import (
@@ -23,7 +23,7 @@ from sglang.test.quant_ref_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 E, H, I, TOPK, M = 8, 1024, 1024, 2, 32
 
@@ -35,7 +35,12 @@ class TestNvFp4MoeBackends(CustomTestCase):
         init_single_process_dist(master_port=29631)
         torch.set_default_device("cuda")
 
-    def _run_backend(self, backend: str):
+    def _run_backend(
+        self,
+        backend: str,
+        intermediate_size: int = I,
+        swiglu_limit: float | None = None,
+    ):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
@@ -58,25 +63,36 @@ class TestNvFp4MoeBackends(CustomTestCase):
             layer = FusedMoE(
                 num_experts=E,
                 hidden_size=H,
-                intermediate_size=I,
+                intermediate_size=intermediate_size,
                 layer_id=0,
                 top_k=TOPK,
                 params_dtype=torch.bfloat16,
                 quant_config=quant_config,
+                swiglu_limit=swiglu_limit,
                 gate_up_interleaved=False,
             ).cuda()
 
             # Checkpoint-format shards through the real weight_loader;
             # gate/up placement stays the loader's job.
             refs = {
-                "w1": torch.zeros(E, I, H, dtype=torch.float32, device="cuda"),
-                "w3": torch.zeros(E, I, H, dtype=torch.float32, device="cuda"),
-                "w2": torch.zeros(E, H, I, dtype=torch.float32, device="cuda"),
+                "w1": torch.zeros(
+                    E, intermediate_size, H, dtype=torch.float32, device="cuda"
+                ),
+                "w3": torch.zeros(
+                    E, intermediate_size, H, dtype=torch.float32, device="cuda"
+                ),
+                "w2": torch.zeros(
+                    E, H, intermediate_size, dtype=torch.float32, device="cuda"
+                ),
             }
             act_scale = 1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
             for e in range(E):
                 for shard_id in ("w1", "w3", "w2"):
-                    rows, cols = (I, H) if shard_id in ("w1", "w3") else (H, I)
+                    rows, cols = (
+                        (intermediate_size, H)
+                        if shard_id in ("w1", "w3")
+                        else (H, intermediate_size)
+                    )
                     w = (
                         torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
                         / 10
@@ -95,7 +111,36 @@ class TestNvFp4MoeBackends(CustomTestCase):
                             param, loaded, name, shard_id=shard_id, expert_id=e
                         )
                     refs[shard_id][e] = w_dequant
+            if backend == "flashinfer_cutedsl":
+                canonical_w13 = layer.w13_weight.clone()
+                swap_ab = get_device_sm() in (100, 103)
+                group_size = 16 if swap_ab else 64
+                expected_w13 = torch.cat(
+                    [
+                        canonical_w13[:, offset + start : offset + start + group_size]
+                        for start in range(0, intermediate_size, group_size)
+                        for offset in (0, intermediate_size)
+                    ],
+                    dim=1,
+                )
             layer.quant_method.process_weights_after_loading(layer)
+            if backend == "flashinfer_cutedsl":
+                torch.testing.assert_close(layer.w13_weight, expected_w13)
+            if backend == "flashinfer_trtllm":
+                expected_intermediate = round_up(intermediate_size, 64)
+                self.assertEqual(
+                    layer.intermediate_size_per_partition, expected_intermediate
+                )
+                self.assertEqual(
+                    layer.moe_runner_config.intermediate_size_per_partition,
+                    expected_intermediate,
+                )
+                self.assertEqual(
+                    layer.w13_weight.shape, (E, 2 * expected_intermediate, H // 2)
+                )
+                self.assertEqual(
+                    layer.w2_weight.shape, (E, H, expected_intermediate // 2)
+                )
 
             x = torch.randn(M, H, dtype=torch.bfloat16, device="cuda") / 10
             router_logits = torch.randn(M, E, dtype=torch.float32, device="cuda")
@@ -108,16 +153,26 @@ class TestNvFp4MoeBackends(CustomTestCase):
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             out = layer.forward(x, topk_output)
+            if backend == "flashinfer_cutedsl":
+                self.assertEqual(layer._cutedsl_wrapper.swap_ab, swap_ab)
             if not isinstance(out, torch.Tensor):
                 out = out[0] if isinstance(out, tuple) else out.hidden_states
 
             ref = self._torch_moe_reference(
-                x, topk_weights, topk_ids, refs["w1"], refs["w3"], refs["w2"]
+                x,
+                topk_weights,
+                topk_ids,
+                refs["w1"],
+                refs["w3"],
+                refs["w2"],
+                swiglu_limit,
             )
             assert_output_close(self, out, ref)
 
     @staticmethod
-    def _torch_moe_reference(x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref):
+    def _torch_moe_reference(
+        x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref, swiglu_limit
+    ):
         from flashinfer import fp4_quantize
 
         def quant_roundtrip(t2d, gs):
@@ -138,6 +193,9 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 e = int(topk_ids[t, j])
                 gate = x_dq[t] @ w1_ref[e].T
                 up = x_dq[t] @ w3_ref[e].T
+                if swiglu_limit is not None:
+                    gate = gate.clamp(max=swiglu_limit)
+                    up = up.clamp(-swiglu_limit, swiglu_limit)
                 act = torch.nn.functional.silu(gate) * up
                 act_dq = quant_roundtrip(act.unsqueeze(0), act_gs)[0]
                 ref[t] += float(topk_weights[t, j]) * (act_dq @ w2_ref[e].T)
@@ -149,8 +207,18 @@ class TestNvFp4MoeBackends(CustomTestCase):
     def test_flashinfer_trtllm(self):
         self._run_backend("flashinfer_trtllm")
 
+    def test_flashinfer_trtllm_intermediate_alignment(self):
+        """Gated NVFP4 keeps 64-aligned expert widths without padding to 128."""
+        for intermediate_size in (160, 192, 256):
+            with self.subTest(intermediate_size=intermediate_size):
+                self._run_backend("flashinfer_trtllm", intermediate_size)
+
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")
+
+    def test_flashinfer_cutedsl_swiglu_limit(self):
+        """The limit sits inside the GEMM1 outputs' spread (std ~0.3), so the clamp binds."""
+        self._run_backend("flashinfer_cutedsl", swiglu_limit=0.1)
 
 
 if __name__ == "__main__":

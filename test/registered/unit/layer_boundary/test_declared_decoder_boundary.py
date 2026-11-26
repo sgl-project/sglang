@@ -20,7 +20,6 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers import layer_boundary as comm
-from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
     TokenAxis,
@@ -39,7 +38,7 @@ from sglang.srt.layers.layer_boundary import layout as comm_layout
 from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.adapters import branch
-from sglang.srt.layers.layer_boundary.construction import BatchVariant
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.allreduce import fused_ffn_input
 from sglang.srt.layers.layer_boundary.ops import (
     attn_cp_reduce_scatter_output,
@@ -59,11 +58,14 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 )
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_forward
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import ForwardFlags, get_forward
 from sglang.test.boundary_fixtures import (
+    Norm,
     finish_exit,
     make_test_stages,
+    parallel_of,
+    planning,
     postprocess_output,
     prepare_input,
 )
@@ -71,135 +73,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import COMMUNICATOR_MODULES, patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 HIDDEN = 4
-
-
-def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
-    fields = dict(
-        tp_size=attn_dp * attn_cp * attn_tp,
-        tp_rank=0,
-        attn_dp_size=attn_dp,
-        attn_tp_size=attn_tp,
-        attn_tp_rank=0,
-        attn_cp_size=attn_cp,
-        attn_cp_rank=0,
-        moe_dense_tp_size=None,
-        enable_prefill_cp=False,
-        moe_ep_size=1,
-        moe_tp_size=attn_dp * attn_cp * attn_tp,
-        moe_dp_size=1,
-        dwdp_size=1,
-        attn_dp_enabled=attn_dp > 1,
-        enable_attn_tp_input_scattered=False,
-        disable_attn_tp_gather=False,
-        tp_group=SimpleNamespace(
-            name="tp", ranks=list(range(attn_dp * attn_cp * attn_tp))
-        ),
-        attn_tp_group=SimpleNamespace(name="attn_tp", ranks=list(range(attn_tp))),
-        attn_cp_group=SimpleNamespace(name="attn_cp", ranks=list(range(attn_cp))),
-    )
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
-
-
-@contextmanager
-def planning(
-    parallel,
-    *,
-    sp=False,
-    a2a=False,
-    dsa_cp=False,
-    boundary_reduction="rs+rsv",
-):
-    """What layer planning and communicator construction read, without the
-    process-wide parallel state. ``parallel`` may be a callable, for a
-    per-thread parallel state. ``dsa_cp``: the prefill CP is DSA's (MLA's is
-    the same to the communicator)."""
-    get_parallel = parallel if callable(parallel) else (lambda: parallel)
-
-    def moe_cp_gathers():
-        return get_parallel().attn_cp_size > get_parallel().moe_dp_size
-
-    with (
-        patch_communicator("get_parallel", get_parallel),
-        patch_communicator("is_dsa_enable_prefill_cp", lambda: dsa_cp),
-        patch_communicator("is_mla_cp_enabled", lambda: False),
-        patch_communicator(
-            "get_moe_cp_size",
-            lambda: get_parallel().attn_cp_size if moe_cp_gathers() else 1,
-        ),
-        patch.object(layernorm_sp, "layernorm_sp_enabled", lambda: sp),
-        patch_communicator(
-            "get_spec", lambda: SimpleNamespace(speculative_algorithm=None)
-        ),
-        patch_communicator(
-            "get_moe_a2a_backend",
-            lambda: SimpleNamespace(is_none=lambda: not a2a),
-        ),
-        patch_communicator("is_moe_input_scattered_across_dp_ranks", lambda: a2a),
-        patch_communicator("is_enable_moe_cp_allgather", moe_cp_gathers),
-        patch_communicator("get_lora", lambda: SimpleNamespace(enable_lora=False)),
-        # A MoE whose EP and TP sums merge: its output's group is the TP group.
-        patch_communicator(
-            "post_experts_reduction_group", lambda: get_parallel().tp_group
-        ),
-        # Planning asks whether a dense layer gathers for two-batch overlap.
-        patch_communicator(
-            "get_exec",
-            lambda: SimpleNamespace(
-                comm=SimpleNamespace(
-                    boundary_reduction=boundary_reduction,
-                    enable_quant_communications=False,
-                ),
-                overlap=SimpleNamespace(enable_two_batch_overlap=False),
-            ),
-        ),
-        # What the MoE predicates an exit's decisions read, in their module.
-        patch.object(moe_utils, "get_parallel", get_parallel),
-        patch.object(
-            moe_utils,
-            "get_moe_a2a_backend",
-            lambda: SimpleNamespace(
-                is_none=lambda: not a2a,
-                is_flashinfer=lambda: False,
-                is_pplx=lambda: False,
-                is_flashinfer_megamoe=lambda: False,
-            ),
-        ),
-        patch.object(moe_utils, "get_lora", lambda: SimpleNamespace(enable_lora=False)),
-        patch.object(
-            moe_utils,
-            "get_exec",
-            lambda: SimpleNamespace(
-                comm=SimpleNamespace(enable_quant_communications=False)
-            ),
-        ),
-        patch.object(
-            moe_utils, "post_experts_reduction_group", lambda: get_parallel().tp_group
-        ),
-        patch.object(
-            moe_utils, "should_use_flashinfer_cutlass_moe_fp4_allgather", lambda: False
-        ),
-        patch.object(
-            moe_utils,
-            "is_dp_attention_enabled",
-            lambda: get_parallel().attn_dp_size > 1,
-        ),
-    ):
-        yield
-
-
-class Norm:
-    """add + norm stand-in: (2 * (h + r), h + r); one input: 2 * h."""
-
-    def __call__(self, x, residual=None, post_residual_addition=None):
-        assert post_residual_addition is None
-        if residual is None:
-            return x * 2
-        s = x + residual
-        return s * 2, s
 
 
 class FusableNorm(Norm):
@@ -327,7 +203,14 @@ class TestStageLayoutSelection(CustomTestCase):
 
 
 def build_mhc(
-    facts, parallel, *, a2a=False, dsa_cp=False, two_batch_overlap=False, **kwargs
+    facts,
+    parallel,
+    *,
+    sp=False,
+    a2a=False,
+    dsa_cp=False,
+    two_batch_overlap=False,
+    **kwargs,
 ):
     overlap = SimpleNamespace(
         comm=SimpleNamespace(
@@ -336,7 +219,7 @@ def build_mhc(
         overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap),
     )
     with (
-        planning(parallel, a2a=a2a, dsa_cp=dsa_cp),
+        planning(parallel, sp=sp, a2a=a2a, dsa_cp=dsa_cp),
         patch_communicator("get_exec", lambda: overlap),
     ):
         mhc = mhc_module.MHCState(
@@ -667,6 +550,18 @@ class TestMhcOnTheDeclarations(CustomTestCase):
             layer_case(1, 3, sparse=True, previous_sparse=True),
             parallel,
         )
+        # CP-TP group sharing (Qwen4-Exp) runs MHC on the MoE-CP gather.
+        parallel = parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=2,
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
+        )
+        build_mhc(
+            layer_case(1, 3, sparse=True, previous_sparse=True),
+            parallel,
+        )
 
 
 class TestTwoBatchOverlap(CustomTestCase):
@@ -890,6 +785,30 @@ class TestTheSequenceParallelRegion(CustomTestCase):
     take the layer's ordinary declared steps."""
 
     SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP: 2}
+
+    def test_an_mhc_stack_leaves_the_row_moves_to_the_layer(self):
+        # GLM-5.3-Flash gathers rows for attention and the FFN itself and points
+        # MLA's cached input at them, so its mHC boundaries must stay on this
+        # rank's rows: no sum or row move, and the default attention input hook.
+        parallel = parallel_of(attn_dp=1, attn_tp=2)
+        for layer_id in range(3):
+            communicator = build_mhc(layer_case(layer_id, 3), parallel, sp=True)
+            for name in ("attn", "ffn"):
+                steps = getattr(communicator, name).plan.paths.get(
+                    BatchVariant.SEQUENCE_PARALLEL
+                )
+                with self.subTest(layer_id=layer_id, stage=name):
+                    step = steps.entry.prepare.keywords["step"]
+                    self.assertIs(step.func, comm_ops._update_read)
+                    self.assertIsNone(step.keywords["pre_move"])
+                    self.assertIsNone(steps.entry.input_move)
+                    if name == "attn":
+                        self.assertIs(
+                            steps.entry.attn_input_adapter,
+                            comm_ops._attn_input_default,
+                        )
+                    else:
+                        self.assertIs(steps.output_move, keep_output)
 
     def test_what_the_ffn_exit_reads_comes_from_the_batch_s_steps(self):
         # Inside the region the FFN output is complete: no sum to move.
@@ -1628,24 +1547,6 @@ class Group:
         return output
 
 
-class Flags:
-    """The per-forward flags an FFN exit publishes, one set per rank."""
-
-    def __init__(self):
-        self.mlp_reduce_scatter = False
-        self.defer_moe_finalize = False
-        self.sp_active = False
-
-    @contextmanager
-    def scoped(self, **flags):
-        saved = {k: getattr(self, k) for k in flags}
-        self.__dict__.update(flags)
-        try:
-            yield
-        finally:
-            self.__dict__.update(saved)
-
-
 def fake_dp_gather(
     global_tokens, local_tokens, forward_batch, cp_shard_counts=None, *, is_partial
 ):
@@ -1846,7 +1747,7 @@ class TestTwoLayers(CustomTestCase):
                         tp_group=tp_group,
                         attn_tp_group=attn_tp_groups[d],
                     ),
-                    flags=Flags(),
+                    flags=ForwardFlags(),
                     calls=[],
                     dp=d,
                     rows=rows[d],
@@ -2060,7 +1961,7 @@ class TestCompleteOutputsOnInputScatteredBatches(CustomTestCase):
                     attn_tp_group=group,
                     enable_attn_tp_input_scattered=True,
                 ),
-                flags=Flags(),
+                flags=ForwardFlags(),
                 calls=[],
                 ops=[],
                 attn_inputs=[],

@@ -9,6 +9,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.sampling.penalties import uses_penalty
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
 
@@ -58,6 +59,13 @@ class DllmAlgorithm:
     @classmethod
     def validate_request(cls, req: Req) -> Optional[str]:
         """Return an error for unsupported request features, if any."""
+        # A dLLM step bypasses the sampler, which keeps the penalty history.
+        if uses_penalty(req.sampling_params):
+            return (
+                "Diffusion LLMs do not support sampling penalties "
+                "(frequency_penalty, presence_penalty, repetition_penalty, "
+                "min_new_tokens)."
+            )
         return None
 
     def prepare_inputs(
@@ -98,9 +106,15 @@ class DllmAlgorithm:
         return self._run_sync(model_runner, forward_batch)
 
     def _block_start_list(self, forward_batch: ForwardBatch) -> List[int]:
+        return self._prompt_mask(forward_batch).sum(dim=1).tolist()
+
+    def _prompt_mask(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        prompt_mask = forward_batch.dllm_prompt_mask
+        if prompt_mask is not None:
+            return prompt_mask
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        return (input_ids != self.mask_id).sum(dim=1).tolist()
+        return input_ids != self.mask_id
 
     def _run_sync(
         self, model_runner: ModelRunner, forward_batch: ForwardBatch

@@ -26,10 +26,8 @@ from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3DiTConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes.flux3_video import Flux3VideoVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 FLUX3_ACTION_POLICY_FILES = (
     "config.json",

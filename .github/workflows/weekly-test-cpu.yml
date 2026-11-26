@@ -12,9 +12,19 @@ on:
   schedule:
     - cron: '0 0 * * 0'  # Sunday 00:00 UTC, alongside the Nvidia weekly run
   workflow_dispatch:
+  # Called by release-branch-cut.yml so a new release branch also runs the
+  # weekly suites. Named git_ref, not ref: the stage reads it back out of
+  # toJson(inputs) as `.git_ref`.
+  workflow_call:
+    inputs:
+      git_ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
-  group: weekly-test-cpu-${{ github.ref }}
+  group: weekly-test-cpu-${{ inputs.git_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -29,6 +39,7 @@ jobs:
   check-changes:
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
+      git_ref: ${{ inputs.git_ref || '' }}
       pr_test_yml: '.github/workflows/weekly-test-cpu.yml'
       run_all_tests: true
       force_continue_on_error: true
