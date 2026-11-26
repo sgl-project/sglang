@@ -460,10 +460,6 @@ class AscendAttnBackend(AttentionBackend):
         self.enable_sparsity_driven_kv_offload = offload_mode is not None
         self.use_fused_sparse_kv = offload_mode == "fused"
         if self.enable_sparsity_driven_kv_offload:
-            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
-                register_sparse_kv_manager,
-            )
-
             sparse_topk = get_sparsity_driven_kv_offload_sparse_context_len(
                 model_config=model_runner.model_config
             )
@@ -481,6 +477,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                     SparseKVCacheManager,
+                    register_sparse_kv_manager,
                 )
 
                 self.sparse_kv_manager = SparseKVCacheManager(
@@ -488,8 +485,8 @@ class AscendAttnBackend(AttentionBackend):
                     model_runner.token_to_kv_pool_allocator,
                     sparse_topk,
                 )
+                register_sparse_kv_manager(self.sparse_kv_manager)
             self.sparse_kv_attention = sparse_kv_attention
-            register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
                 "Sparsity-driven KV offload is enabled with manager %s.",
                 self.sparse_kv_manager,
