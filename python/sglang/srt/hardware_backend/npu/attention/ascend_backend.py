@@ -508,12 +508,6 @@ class AscendAttnBackend(AttentionBackend):
         else:
             self.sparse_kv_manager = None
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        if self.use_fa and not (
-            self.use_mla or self.use_fia or self.use_quant_flash_attn
-        ):
-            from flash_attn_npu_v3 import flash_attn_with_kvcache
-
-            self.flash_attn_with_kvcache = flash_attn_with_kvcache
         self.use_fias_v2_bsnd = (
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
@@ -2830,6 +2824,8 @@ class AscendAttnBackend(AttentionBackend):
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
             elif self.use_fa:
+                from flash_attn_npu_v3 import flash_attn_with_kvcache
+
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 k = k_cache.view(
                     -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
@@ -2845,7 +2841,7 @@ class AscendAttnBackend(AttentionBackend):
                     ]
                 )
                 max_seqlen_q = extend_seq_lens.max().item()
-                attn_output = self.flash_attn_with_kvcache(
+                attn_output = flash_attn_with_kvcache(
                     q,
                     k,
                     v,
@@ -4556,6 +4552,8 @@ class AscendAttnBackend(AttentionBackend):
                         dim=0,
                     )
             elif self.use_fa:
+                from flash_attn_npu_v3 import flash_attn_with_kvcache
+
                 q = q.view(
                     forward_batch.batch_size, -1, layer.tp_q_head_num, layer.qk_head_dim
                 )
@@ -4565,7 +4563,7 @@ class AscendAttnBackend(AttentionBackend):
                 v = v_cache.view(
                     -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
-                attn_output = self.flash_attn_with_kvcache(
+                attn_output = flash_attn_with_kvcache(
                     q,
                     k,
                     v,
