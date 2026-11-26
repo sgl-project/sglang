@@ -476,7 +476,7 @@ class DiffusionServerBase:
             and scenario.min_free_vram_mb is not None
             and current_platform.is_cuda()
         ):
-            summary.min_free_vram_mb = ctx.minimum_free_vram()
+            summary.min_free_vram_by_gpu_mb = ctx.minimum_free_vram()
         self._record_performance_result(case, summary, request_index)
         self._print_performance_log(case, summary, scenario)
 
@@ -581,7 +581,7 @@ class DiffusionServerBase:
             and scenario.min_free_vram_mb is not None
             and current_platform.is_cuda()
         ):
-            summary.min_free_vram_mb = ctx.minimum_free_vram()
+            summary.min_free_vram_by_gpu_mb = ctx.minimum_free_vram()
         self._record_performance_result(case, summary, request_index)
         self._print_performance_log(case, summary, scenario)
         if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
@@ -660,6 +660,7 @@ class DiffusionServerBase:
             "e2e_ms": summary.e2e_ms,
             "load_time_ms": summary.load_time_ms,
             "min_free_vram_mb": summary.min_free_vram_mb,
+            "min_free_vram_by_gpu_mb": summary.min_free_vram_by_gpu_mb,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
             "load_peak_vram_mb": summary.load_peak_vram_mb,
@@ -721,6 +722,9 @@ class DiffusionServerBase:
                 f"runtime={scenario.runtime_peak_vram_mb:.0f}MiB"
             )
         if summary.min_free_vram_mb:
+            lines.append(
+                f"  minimum free memory per GPU (MiB): {summary.min_free_vram_by_gpu_mb}"
+            )
             lines.append(f"  minimum free GPU memory (MiB): {summary.min_free_vram_mb}")
         if summary.stage_metrics:
             stages = ", ".join(

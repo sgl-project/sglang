@@ -43,7 +43,7 @@ class GpuHeadroomSampler:
             env=os.environ | env_vars,
             text=True,
         ).splitlines()
-        self.samples: list[tuple[int, float]] = []
+        self.samples: list[tuple[int, list[float]]] = []
         self.error: Exception | None = None
         self.stop_event = threading.Event()
         pynvml.nvmlInit()
@@ -57,8 +57,10 @@ class GpuHeadroomSampler:
             raise
 
     def _sample(self):
-        free_bytes = min(pynvml.nvmlDeviceGetMemoryInfo(h).free for h in self.handles)
-        self.samples.append((time.monotonic_ns(), free_bytes / (1 << 20)))
+        free_mb = [
+            pynvml.nvmlDeviceGetMemoryInfo(h).free / (1 << 20) for h in self.handles
+        ]
+        self.samples.append((time.monotonic_ns(), free_mb))
 
     def _run(self):
         try:
@@ -72,7 +74,9 @@ class GpuHeadroomSampler:
         self.thread.join()
         pynvml.nvmlShutdown()
 
-    def minima(self, load_finished_ns: int, server_ready_ns: int) -> dict[str, float]:
+    def minima(
+        self, load_finished_ns: int, server_ready_ns: int
+    ) -> dict[str, list[float]]:
         if self.error is not None:
             raise RuntimeError("GPU headroom sampling failed") from self.error
         self._sample()
@@ -84,7 +88,10 @@ class GpuHeadroomSampler:
                 phase = "warmup"
             else:
                 phase = "serving"
-            minima[phase] = min(minima.get(phase, free_mb), free_mb)
+            if phase in minima:
+                minima[phase] = list(map(min, minima[phase], free_mb))
+            else:
+                minima[phase] = free_mb
         return minima
 
 

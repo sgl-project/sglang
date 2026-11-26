@@ -198,7 +198,7 @@ class ServerContext:
     server_ready_ns: int | None = None
     headroom_sampler: GpuHeadroomSampler | None = None
 
-    def minimum_free_vram(self) -> dict[str, float]:
+    def minimum_free_vram(self) -> dict[str, list[float]]:
         assert self.headroom_sampler is not None, "GPU headroom sampler missing"
         assert self.load_finished_ns is not None and self.server_ready_ns is not None
         return self.headroom_sampler.minima(self.load_finished_ns, self.server_ready_ns)
@@ -630,24 +630,30 @@ class PerformanceValidator:
     ) -> None:
         assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
         assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
-        floor = self.scenario.min_free_vram_mb
-        if floor is not None:
-            assert math.isfinite(floor) and floor > 0, "Invalid GPU headroom floor"
-            assert {"load", "serving"} <= summary.min_free_vram_mb.keys(), (
-                "Missing load or serving GPU headroom measurements"
+        floors = self.scenario.min_free_vram_mb
+        if floors is None:
+            self._assert_peak_vram(
+                "Load Peak VRAM",
+                reserved=summary.load_peak_vram_mb,
+                allocated=summary.load_peak_allocated_mb,
+                expected_reserved=expected_load_peak_vram_mb,
+                expected_allocated=expected_load_peak_allocated_mb,
+                tolerance=self.tolerances.load_peak_vram,
             )
-            for phase, free_mb in summary.min_free_vram_mb.items():
-                assert free_mb >= floor, (
-                    f"{phase} minimum free VRAM: {free_mb:.0f} MiB, need {floor:.0f} MiB"
+        else:
+            # auto placement may keep more weights resident to reduce request time
+            assert {"load", "serving"} <= floors.keys(), (
+                "Missing load or serving GPU headroom floor"
+            )
+            minima = summary.min_free_vram_mb
+            for phase, floor in floors.items():
+                assert math.isfinite(floor) and floor > 0, (
+                    f"Invalid {phase} GPU headroom floor"
                 )
-        self._assert_peak_vram(
-            "Load Peak VRAM",
-            reserved=summary.load_peak_vram_mb,
-            allocated=summary.load_peak_allocated_mb,
-            expected_reserved=expected_load_peak_vram_mb,
-            expected_allocated=expected_load_peak_allocated_mb,
-            tolerance=self.tolerances.load_peak_vram,
-        )
+                assert phase in minima, f"Missing {phase} GPU headroom measurement"
+                assert minima[phase] >= floor, (
+                    f"{phase} minimum free VRAM: {minima[phase]:.0f} MiB, need {floor:.0f} MiB"
+                )
         self._assert_peak_vram(
             "Runtime Peak VRAM",
             reserved=summary.runtime_peak_vram_mb,
