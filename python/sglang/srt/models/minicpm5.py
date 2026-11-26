@@ -12,8 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only MiniCPM5 model with gated GQA and routed and shared experts."""
-
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch

@@ -11,16 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Native config for the MiniCPM5 MoE model (model_type="minicpm5_moe")."""
-
 from typing import Optional
 
 from transformers.configuration_utils import PretrainedConfig
 
 
 class MiniCPM5Config(PretrainedConfig):
-    """Configuration with the MiniCPM5-15B-A2.5B defaults."""
-
     model_type = "minicpm5_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 

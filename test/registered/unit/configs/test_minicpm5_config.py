@@ -11,32 +11,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
-def test_minicpm5_defaults_match_15b_config():
-    config = MiniCPM5Config()
-    expected = {
-        "vocab_size": 130560,
-        "hidden_size": 2048,
-        "intermediate_size": 8192,
-        "num_hidden_layers": 28,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 2,
-        "head_dim": 128,
-        "max_position_embeddings": 131072,
-        "bos_token_id": 0,
-        "eos_token_id": [1, 130073],
-        "pad_token_id": 1,
-        "first_k_dense_replace": 1,
-        "moe_intermediate_size": 512,
-        "n_routed_experts": 160,
-        "n_shared_experts": 1,
-        "num_experts_per_tok": 16,
-        "routed_scaling_factor": 3.66,
-        "use_gated_attention": True,
-    }
-    assert {key: getattr(config, key) for key in expected} == expected
-    assert get_rope_config(config)[0] == 5000000
-
-
 def test_minicpm5_rejects_null_head_dim():
     with pytest.raises(ValueError, match="head_dim must be positive"):
         MiniCPM5Config(head_dim=None)

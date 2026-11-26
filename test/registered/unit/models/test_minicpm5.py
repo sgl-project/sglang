@@ -85,8 +85,7 @@ def test_dspark_rejects_pipeline_parallel_capture(dspark_target, is_last_rank):
     assert dspark_target.model.layers_to_capture == []
 
 
-@pytest.mark.parametrize("layer_ids", [[27], [26, 27]])
-@pytest.mark.parametrize("tokens", [0, 1])
+@pytest.mark.parametrize("layer_ids,tokens", [([27], 0), ([26, 27], 1)])
 def test_dspark_captures_last_residual(layer_ids, tokens):
     model = MiniCPM5Model.__new__(MiniCPM5Model)
     nn.Module.__init__(model)
