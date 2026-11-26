@@ -58,7 +58,7 @@ class TestMlxRunnerPoolContract(CustomTestCase):
         runner.forward_stream = None
         runner.req_to_token_pool = ReqToTokenPool(
             size=2,
-            max_context_len=128,
+            row_width=128,
             device="cpu",
             enable_memory_saver=False,
         )
