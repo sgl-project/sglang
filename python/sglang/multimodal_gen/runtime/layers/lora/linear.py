@@ -894,8 +894,13 @@ class BaseLayerWithLoRA(nn.Module):
         weight = self.base_layer.weight
         if isinstance(weight, DTensor):
             weight = weight.to_local()
+        else:
+            # Under layerwise offload the parameter is a (1,) placeholder; the
+            # merged weight lives in the manager's CPU view.
+            weight, _ = self._materialized_weight_src()
         # clone(): to("cpu") may alias storage; we must not mutate this backup.
         self.cpu_weight = weight.detach().to("cpu").clone()
+        self._base_is_view = False
         self.merged = False
         self.disable_lora = True
         self.lora_weights_list = []

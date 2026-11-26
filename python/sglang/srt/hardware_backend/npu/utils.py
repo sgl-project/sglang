@@ -26,15 +26,25 @@ indexer_weight_stream = None
 gva_is_inited = False
 
 
-@functools.lru_cache(maxsize=1)
-def is_npu_arch35() -> bool:
-    """Whether the runtime is on NPU architecture 35."""
+def _is_npu_arch(arch: int) -> bool:
     if not is_npu():
         return False
 
     import acl
 
-    return acl.rt.get_device_info(0, 601) == (3510, 0)
+    return acl.rt.get_device_info(0, 601) == (arch, 0)
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch22() -> bool:
+    """Whether the runtime is on NPU architecture 22 (Atlas A2/A3)."""
+    return _is_npu_arch(2201)
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch35() -> bool:
+    """Whether the runtime is on NPU architecture 35."""
+    return _is_npu_arch(3510)
 
 
 # SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
@@ -245,6 +255,41 @@ def set_default_server_args(args: "ServerArgs"):
             )
 
 
+def _patch_npu_seed_trace_rules():
+    """Keep aliased CUDA/NPU seed functions consistent with Dynamo's RNG rules."""
+    try:
+        from torch._dynamo import trace_rules
+        from torch._dynamo.variables import (
+            SkipFunctionVariable,
+            TorchInGraphFunctionVariable,
+        )
+        from torch_npu.dynamo.trace_rule import (
+            torch_non_c_binding_in_graph_functions_npu as npu_rules,
+        )
+    except ImportError:
+        # Older torch_npu releases do not register aliases through this rule map.
+        return
+
+    changed = False
+    for name in ("manual_seed", "manual_seed_all"):
+        npu_name = f"torch.npu.random.{name}"
+        if npu_rules.get(npu_name) is TorchInGraphFunctionVariable and any(
+            trace_rules.manual_torch_name_rule_map.get(f"{prefix}.{name}")
+            is SkipFunctionVariable
+            and getattr(module, name) is getattr(torch.npu.random, name)
+            for prefix, module in (
+                ("torch.cuda", torch.cuda),
+                ("torch.cuda.random", torch.cuda.random),
+            )
+        ):
+            # CUDA's top-level and random entries may alias different functions.
+            # Patch the source dict to also cover lazy NPU rule registration.
+            npu_rules[npu_name] = SkipFunctionVariable
+            changed = True
+    if changed:
+        trace_rules.clear_lru_cache()
+
+
 @_call_once
 def init_npu_backend():
     """
@@ -258,24 +303,25 @@ def init_npu_backend():
     except ImportError as e:
         logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
 
-    try:
-        # Registers the ds41 (DeepSeek-V4.1) Python operators under the
-        # vendor operator extension's ds41 namespace. Absent for DSV4-only
-        # deployments.
-        import cann_ops_transformer  # noqa: F401
-    except ImportError as e:
-        logger.warning(
-            "Vendor DSv4.1 operator extension unavailable; DeepSeek-V4.1 NPU "
-            "operators will not be registered: %s",
-            e,
-        )
-
     import torch_npu
+
+    def register_dsv41_vendor_ops():
+        if is_npu_arch35():
+            try:
+                import cann_ops_transformer  # noqa: F401
+            except ImportError as e:
+                logger.warning("DeepSeek-V4.1 A5 operator extension unavailable: %s", e)
+
+    # The A3 bundle registers overlapping Torch schemas (e.g. sparse_flash_mla).
+    # Don't register them again through the standalone CANN wheel.
+    torch_npu.npu._lazy_call(register_dsv41_vendor_ops)
 
     # These imports lead to unpredictable behavior in diffusion models
     # and a significant reduction in performance.
     if "sglang.multimodal_gen" not in sys.modules:
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+        _patch_npu_seed_trace_rules()
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False

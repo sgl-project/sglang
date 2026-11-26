@@ -600,6 +600,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             model_config=None,
             enable_overlap=False,
             spec_algorithm=None,
+            sampler_params_pool=SimpleNamespace(write=lambda reqs: None),
             penalty_status_pool=SimpleNamespace(
                 alloc=lambda reqs: None, reset_history=lambda reqs: None
             ),
