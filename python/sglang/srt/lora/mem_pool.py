@@ -1405,29 +1405,21 @@ class LoRAMemoryPool:
                         # contracts over the full padded max_rank, so the tail must be clean.
                         target_buffer[buffer_id, :, lora_rank:].zero_()
 
-        if lora_adapter.embedding_layers:
-            org_vocab_size = self.base_hf_config.vocab_size
-            lora_added_tokens_size = lora_adapter.config.lora_added_tokens_size
-            pinned_embedding_layers = lora_adapter.pinned_embedding_layers
-            pinned_added_tokens_embeddings = lora_adapter.pinned_added_tokens_embeddings
-            # Only when LoRA is applied to the embedding layer will it have the extra-token issue that needs to be resolved.
-            # Load embeddings weights for extra tokens to buffer
-            if (
-                lora_adapter.added_tokens_embeddings
-                and lora_embed_tokens_module is not None
-            ):
-                for name, weights in lora_adapter.added_tokens_embeddings.items():
-                    if "input_embeddings" in name:
-                        buffer_view = self.new_embeddings_buffer["input_embeddings"][
-                            buffer_id, :lora_added_tokens_size
-                        ]
-                        weights = self._get_maybe_cached_weight_for_transfer(
-                            pinned_added_tokens_embeddings,
-                            name,
-                            weights,
-                        )
-                        load_lora_weight_tensor(buffer_view, weights)
+        loaded_embedding_a: set[str] = set()
+        loaded_embedding_b: set[str] = set()
+        loaded_lm_head_a: set[str] = set()
+        loaded_lm_head_b: set[str] = set()
+        loaded_new_embeddings: set[str] = set()
+        # Max-rank-spaced loads start with a cleared slot. The packed
+        # embedding and lm_head kernels mask inactive ranks.
+        clear_unwritten = not self.max_rank_spaced_layout
 
+        if lora_adapter.embedding_layers:
+            vocab_size = (
+                self.base_hf_config.vocab_size
+                + lora_adapter.config.lora_added_tokens_size
+            )
+            pinned_embedding_layers = lora_adapter.pinned_embedding_layers
             # load vocab_emb and lm_head
             for name, weights in lora_adapter.embedding_layers.items():
                 target_module = get_target_module_name(name, self.target_modules)
@@ -1437,17 +1429,17 @@ class LoRAMemoryPool:
                     and "embed_tokens" in name
                     and ("lora_embedding_A" in name or "lora_A" in name)
                 ):
-                    buffer_view = self.embedding_A_buffer[target_module][
-                        buffer_id,
-                        :lora_rank,
-                        : (org_vocab_size + lora_added_tokens_size),
-                    ]
+                    target_buffer = self.embedding_A_buffer[target_module]
+                    buffer_view = target_buffer[buffer_id, :lora_rank, :vocab_size]
                     weights = self._get_maybe_cached_weight_for_transfer(
                         pinned_embedding_layers,
                         name,
                         weights,
                     )
                     load_lora_weight_tensor(buffer_view, weights)
+                    loaded_embedding_a.add(target_module)
+                    if clear_unwritten and vocab_size < target_buffer.shape[-1]:
+                        target_buffer[buffer_id, :, vocab_size:].zero_()
                 elif (
                     target_module == "embed_tokens"
                     and lora_embed_tokens_module is not None
@@ -1467,6 +1459,7 @@ class LoRAMemoryPool:
                         lora_b_weights,
                     )
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
+                    loaded_embedding_b.add(target_module)
 
                 elif (
                     target_module == "lm_head"
@@ -1485,6 +1478,7 @@ class LoRAMemoryPool:
                         weights,
                     )
                     load_lora_weight_tensor(buffer_view, weights)
+                    loaded_lm_head_a.add(target_module)
                 elif (
                     target_module == "lm_head"
                     and lora_lm_head_module is not None
@@ -1502,17 +1496,18 @@ class LoRAMemoryPool:
                     else:
                         cache_key = name
 
-                    buffer_view = self.lm_head_B_buffer[target_module][
-                        buffer_id,
-                        : lora_b_weights.shape[0],
-                        :lora_rank,
-                    ]
+                    target_buffer = self.lm_head_B_buffer[target_module]
+                    vocab_rows = lora_b_weights.shape[0]
+                    buffer_view = target_buffer[buffer_id, :vocab_rows, :lora_rank]
                     lora_b_weights = self._get_maybe_cached_weight_for_transfer(
                         pinned_embedding_layers,
                         cache_key,
                         lora_b_weights,
                     )
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
+                    loaded_lm_head_b.add(target_module)
+                    if clear_unwritten and vocab_rows < target_buffer.shape[1]:
+                        target_buffer[buffer_id, vocab_rows:, :].zero_()
                 elif (
                     target_module == "lm_head"
                     and "lm_head" in name
@@ -1534,22 +1529,42 @@ class LoRAMemoryPool:
                         f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
                     )
                     continue
-        else:
-            # Zero out embedding/lm_head buffers for adapters without embedding LoRA
-            # to avoid using garbage values from uninitialized memory
-            for k in self.embedding_A_buffer.keys():
-                self.embedding_A_buffer[k][buffer_id].zero_()
-            for k in self.embedding_B_buffer.keys():
-                self.embedding_B_buffer[k][buffer_id].zero_()
-            for k in self.lm_head_A_buffer.keys():
-                self.lm_head_A_buffer[k][buffer_id].zero_()
-            for k in self.lm_head_B_buffer.keys():
-                self.lm_head_B_buffer[k][buffer_id].zero_()
+
+        added_tokens_embeddings = getattr(lora_adapter, "added_tokens_embeddings", None)
+        if (
+            added_tokens_embeddings
+            and lora_embed_tokens_module is not None
+            and "input_embeddings" in self.new_embeddings_buffer
+        ):
+            target_buffer = self.new_embeddings_buffer["input_embeddings"]
+            added_tokens_size = lora_adapter.config.lora_added_tokens_size
+            for name, weights in added_tokens_embeddings.items():
+                if "input_embeddings" in name:
+                    weights = self._get_maybe_cached_weight_for_transfer(
+                        lora_adapter.pinned_added_tokens_embeddings, name, weights
+                    )
+                    load_lora_weight_tensor(
+                        target_buffer[buffer_id, :added_tokens_size], weights
+                    )
+                    loaded_new_embeddings.add("input_embeddings")
             if (
-                self.lora_added_tokens_size > 0
-                and "input_embeddings" in self.new_embeddings_buffer
+                loaded_new_embeddings
+                and clear_unwritten
+                and added_tokens_size < target_buffer.shape[1]
             ):
-                self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
+                target_buffer[buffer_id, added_tokens_size:].zero_()
+
+        if clear_unwritten:
+            for buffers, loaded_keys in (
+                (self.embedding_A_buffer, loaded_embedding_a),
+                (self.embedding_B_buffer, loaded_embedding_b),
+                (self.lm_head_A_buffer, loaded_lm_head_a),
+                (self.lm_head_B_buffer, loaded_lm_head_b),
+                (self.new_embeddings_buffer, loaded_new_embeddings),
+            ):
+                for key, tensor in buffers.items():
+                    if key not in loaded_keys:
+                        tensor[buffer_id].zero_()
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType
