@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
@@ -64,6 +66,40 @@ class TestQwen3_5MTPQuantConfig(CustomTestCase):
         quant_config = _FakeQuantConfig("fp8", _MIXED_EXCLUDES)
 
         self.assertIs(_mtp_quant_config(quant_config), quant_config)
+
+    def test_the_loader_reads_the_quant_config_the_mtp_keeps(self):
+        """Before the draft is built, the loader answers with the quant config
+        the MTP head keeps, so its `auto` KV cache dtype can be resolved then:
+        a serialized NVFP4 checkpoint whose KV cache is FP8 ships its MTP head
+        in BF16, so the target keeps FP8 KV and the draft BF16."""
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+        from sglang.srt.model_loader import loader
+
+        checkpoint = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo="FP8",
+            group_size=16,
+            exclude_modules=[],
+        )
+        for model_class, kept in (
+            (Qwen3_5ForCausalLM, checkpoint),
+            (Qwen3_5ForCausalLMMTP, None),
+        ):
+            with (
+                self.subTest(model_class=model_class.__name__),
+                patch.object(
+                    loader, "_get_quantization_config", return_value=checkpoint
+                ),
+                patch.object(
+                    loader,
+                    "get_model_architecture",
+                    return_value=(model_class, model_class.__name__),
+                ),
+            ):
+                built = loader.built_quant_config(
+                    SimpleNamespace(hf_config=None), object()
+                )
+                self.assertIs(built, kept)
 
     def test_mtp_reuses_target_packed_modules_mapping(self):
         self.assertEqual(

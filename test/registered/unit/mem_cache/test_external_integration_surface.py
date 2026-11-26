@@ -33,7 +33,7 @@ class TestExternalIntegrationSurface(CustomTestCase):
             size=4,
             mamba_size=8,
             mamba_spec_state_size=4,
-            max_context_len=32,
+            row_width=32,
             device="cpu",
             enable_memory_saver=False,
             cache_params=Mamba2CacheParams(shape=shape, layers=[0]),

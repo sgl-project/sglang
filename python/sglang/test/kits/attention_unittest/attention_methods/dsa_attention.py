@@ -366,7 +366,7 @@ class DSAMockModelRunner(ModelRunner):
         self.max_running_requests = pool_batch_size
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
         )
@@ -407,6 +407,7 @@ class DSAMockModelRunner(ModelRunner):
             page_size=case.page_size,
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
         self.init_runner_ids()
         self.attention_chunk_size = None
@@ -1391,8 +1392,8 @@ def run_dsa_sparse_fp8_prefill_case(
     *,
     dsa_prefill_backend: str = "flashmla_auto",
 ) -> None:
-    """FP8-KV-cache prefill. With `flashmla_sparse` + EXTEND + non-empty
-    prefix, `get_topk_transform_method` returns `RAGGED` (the only path
+    """FP8-KV-cache prefill. With `flashmla_sparse` + EXTEND or MIXED +
+    non-empty prefix, `get_topk_transform_method` returns `RAGGED` (the only path
     that exercises `dequantize_k_cache_paged_dsa` + the
     `topk_indices_offset` shift). With `flashmla_kv` or `flashmla_auto`
     it stays on `PAGED` topk; the auto resolver picks `flashmla_kv` for

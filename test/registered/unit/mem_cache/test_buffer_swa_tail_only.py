@@ -41,7 +41,7 @@ def _pipeline(*, tail_only: bool, window: int = 2, swa_page_size: int = 2):
     cache.enable_storage = True
     cache.cache_controller.mem_pool_host.entry_map = {
         pool: SimpleNamespace(host_pool=SimpleNamespace(page_size=swa_page_size))
-        for pool in (PoolName.SWA, PoolName.AUXILIARY_SWA)
+        for pool in (PoolName.SWA, "window_16")
     }
     kv_cache = SimpleNamespace(size=128, start_layer=0, layer_num=1)
     kv_cache.layer_router = PlainPoolRouter(kv_cache, IdSpaceKind.FULL)
@@ -61,9 +61,7 @@ def _pipeline(*, tail_only: bool, window: int = 2, swa_page_size: int = 2):
                 pool_name=PoolName.SWA, full_window_pages=window
             ),
             further_window_components=(
-                SimpleNamespace(
-                    pool_name=PoolName.AUXILIARY_SWA, full_window_pages=window + 1
-                ),
+                SimpleNamespace(pool_name="window_16", full_window_pages=window + 1),
             ),
             write_backlog_cap=128,
         )
@@ -116,7 +114,7 @@ class TestSWATailOnlyBackup(unittest.TestCase):
         return intents[pool], swa, sidecar
 
     def test_admission_and_launch_keep_the_node_tail(self):
-        for pool, window in ((PoolName.SWA, 2), (PoolName.AUXILIARY_SWA, 3)):
+        for pool, window in ((PoolName.SWA, 2), ("window_16", 3)):
             with self.subTest(pool=pool):
                 pipeline, cache = _pipeline(tail_only=True)
                 hashes = [f"page-{i}" for i in range(6)]

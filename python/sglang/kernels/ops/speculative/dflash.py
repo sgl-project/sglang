@@ -6,6 +6,57 @@ import triton.language as tl
 
 
 @triton.jit
+def _prepare_dflash_mamba_commit_kernel(
+    prefix_lens,
+    commit_lens,
+    last_steps,
+    track_steps,
+    prefix_stride: tl.constexpr,
+    commit_stride: tl.constexpr,
+    batch_size: tl.constexpr,
+    track_interval: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.arange(0, BLOCK)
+    valid = row < batch_size
+    commit = tl.load(commit_lens + row * commit_stride, valid, 0).to(tl.int64)
+    tl.store(last_steps + row, commit - 1, valid)
+    if HAS_TRACK:
+        prefix = tl.load(prefix_lens + row * prefix_stride, valid, 0).to(tl.int64)
+        post = prefix + commit
+        crossed = prefix // track_interval != post // track_interval
+        step = tl.maximum(post // track_interval * track_interval - prefix - 1, 0)
+        step = tl.where(crossed & (step < commit), step, -1)
+        tl.store(track_steps + row, step, valid)
+
+
+def _prepare_dflash_mamba_commit(
+    prefix_lens: torch.Tensor,
+    commit_lens: torch.Tensor,
+    last_steps_out: torch.Tensor,
+    track_steps_out: torch.Tensor,
+    track_interval: int,
+    has_track: bool,
+) -> None:
+    bs = commit_lens.numel()
+    if bs:
+        _prepare_dflash_mamba_commit_kernel[(1,)](
+            prefix_lens,
+            commit_lens,
+            last_steps_out,
+            track_steps_out,
+            prefix_lens.stride(0),
+            commit_lens.stride(0),
+            bs,
+            track_interval,
+            has_track,
+            triton.next_power_of_2(bs),
+            num_warps=1,
+        )
+
+
+@triton.jit
 def _dflash_accept_bonus_contig_kernel(
     candidates_ptr,
     target_top1_ptr,
@@ -140,6 +191,134 @@ def _compute_dflash_accept_bonus_triton_unchecked(
         BLOCK_SIZE=block,
         num_warps=num_warps,
     )
+
+
+@triton.jit
+def _dflash_commit_block_kernel(
+    candidates_ptr,
+    num_correct_drafts_ptr,
+    bonus_tokens_ptr,
+    prefix_lens_ptr,
+    out_tokens_ptr,
+    num_accept_tokens_out_ptr,
+    new_seq_lens_out_ptr,
+    candidates_row_stride,
+    candidates_col_stride,
+    num_correct_stride,
+    bonus_stride,
+    prefix_lens_stride,
+    out_tokens_row_stride,
+    num_accept_stride,
+    new_seq_lens_stride,
+    block_size,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    num_correct = tl.load(num_correct_drafts_ptr + row * num_correct_stride)
+    bonus_token = tl.load(bonus_tokens_ptr + row * bonus_stride).to(tl.int64)
+    num_accept = num_correct.to(tl.int32) + 1
+    prefix_len = tl.load(prefix_lens_ptr + row * prefix_lens_stride)
+    tl.store(num_accept_tokens_out_ptr + row * num_accept_stride, num_accept)
+    tl.store(new_seq_lens_out_ptr + row * new_seq_lens_stride, prefix_len + num_accept)
+
+    drafts = tl.load(
+        candidates_ptr
+        + row * candidates_row_stride
+        + (cols + 1) * candidates_col_stride,
+        mask=cols < block_size - 1,
+        other=0,
+    ).to(tl.int64)
+    tl.store(
+        out_tokens_ptr + row * out_tokens_row_stride + cols,
+        tl.where(cols == num_correct, bonus_token, drafts),
+        mask=cols < block_size,
+    )
+
+
+def dflash_commit_block(
+    candidates: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    out_tokens: torch.Tensor,
+    num_accept_tokens_out: torch.Tensor,
+    new_seq_lens_out: torch.Tensor,
+) -> None:
+    """The committed block of an accept decided elsewhere, in one launch:
+    ``out_tokens`` [bs, block_size] int64 gets ``candidates[:, 1:]`` with a zero
+    last column and the bonus at ``num_correct_drafts``;
+    ``num_accept_tokens_out = int32(num_correct_drafts) + 1``;
+    ``new_seq_lens_out = prefix_lens + num_accept_tokens_out``.
+    Any batch and block size; inputs may be strided; no host sync."""
+    batch_size, block_size = candidates.shape
+    # Triton rejects an empty grid.
+    if batch_size == 0:
+        return
+    block = triton.next_power_of_2(block_size)
+    _dflash_commit_block_kernel[(batch_size,)](
+        candidates,
+        num_correct_drafts,
+        bonus_tokens,
+        prefix_lens,
+        out_tokens,
+        num_accept_tokens_out,
+        new_seq_lens_out,
+        candidates.stride(0),
+        candidates.stride(1),
+        num_correct_drafts.stride(0),
+        bonus_tokens.stride(0),
+        prefix_lens.stride(0),
+        out_tokens.stride(0),
+        num_accept_tokens_out.stride(0),
+        new_seq_lens_out.stride(0),
+        block_size,
+        BLOCK=block,
+        num_warps=_pick_num_warps(block),
+    )
+
+
+@triton.jit
+def _dflash_chain_accept_indices_kernel(
+    num_accept_tokens_ptr,
+    accept_indices_ptr,
+    num_accept_stride,
+    block_size,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    num_accept = tl.load(num_accept_tokens_ptr + row * num_accept_stride)
+    flat = row * block_size + cols
+    tl.store(
+        accept_indices_ptr + flat,
+        tl.where(cols < num_accept, flat, -1),
+        mask=cols < block_size,
+    )
+
+
+def dflash_chain_accept_indices(
+    num_accept_tokens: torch.Tensor, block_size: int
+) -> torch.Tensor:
+    """[bs, block_size] int64 flat offsets into the verify out_cache_loc of each
+    accepted chain position, -1 past ``num_accept_tokens`` (EAGLE accept_index
+    layout at topk 1). One launch, no host sync."""
+    batch_size = num_accept_tokens.shape[0]
+    accept_indices = torch.empty(
+        (batch_size, block_size), dtype=torch.int64, device=num_accept_tokens.device
+    )
+    # Triton rejects an empty grid.
+    if batch_size:
+        block = triton.next_power_of_2(block_size)
+        _dflash_chain_accept_indices_kernel[(batch_size,)](
+            num_accept_tokens,
+            accept_indices,
+            num_accept_tokens.stride(0),
+            block_size,
+            BLOCK=block,
+            num_warps=_pick_num_warps(block),
+        )
+    return accept_indices
 
 
 @triton.jit
@@ -399,3 +578,87 @@ def compute_dflash_correct_drafts_and_bonus(
     correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
     return correct_len.to(torch.int32), bonus.to(torch.int64)
+
+
+@triton.jit
+def _dflash_grouped_conv_kernel(
+    hidden_ptr,
+    delta_ptr,
+    base_ptr,
+    out_ptr,
+    hidden_size,
+    hidden_row_stride,
+    delta_row_stride,
+    delta_tap_stride,
+    base_tap_stride,
+    out_row_stride,
+    block_size,
+    TAPS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < hidden_size
+    groups = cols // GROUP_SIZE
+    position = row % block_size
+    delta_row = delta_ptr + row * delta_row_stride + groups
+
+    # Same fp32 expression as the compiled reference, rounded once at the store.
+    x = tl.load(hidden_ptr + row * hidden_row_stride + cols, mask=mask)
+    coef = tl.load(base_ptr + cols, mask=mask).to(tl.float32) + tl.load(
+        delta_row, mask=mask
+    ).to(tl.float32)
+    out = coef * x.to(tl.float32)
+    for tap in tl.static_range(1, TAPS):
+        coef = tl.load(base_ptr + tap * base_tap_stride + cols, mask=mask).to(
+            tl.float32
+        ) + tl.load(delta_row + tap * delta_tap_stride, mask=mask).to(tl.float32)
+        shifted = tl.load(
+            hidden_ptr + (row - tap) * hidden_row_stride + cols,
+            mask=mask & (position >= tap),
+            other=0.0,
+        )
+        out = out + coef * shifted.to(tl.float32)
+    tl.store(out_ptr + row * out_row_stride + cols, out, mask=mask)
+
+
+def dflash_grouped_conv(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    group_size: int,
+    taps: int,
+) -> torch.Tensor:
+    """Grouped dynamic depthwise conv of DFlashGroupedConv: hidden_states
+    [tokens, hidden], delta [tokens, taps, hidden // group_size], base [taps,
+    hidden]. Bit-exact with the torch.compile reference in models/dflash.py."""
+    num_tokens, hidden_size = hidden_states.shape
+    assert hidden_states.stride(1) == 1 and delta.stride(2) == 1
+    assert base.stride(1) == 1 and delta.shape[1] == taps
+    out = torch.empty_like(hidden_states)
+    if num_tokens == 0:
+        return out
+    BLOCK = 1024
+    grid = (num_tokens, triton.cdiv(hidden_size, BLOCK))
+    _dflash_grouped_conv_kernel[grid](
+        hidden_states,
+        delta,
+        base,
+        out,
+        hidden_size,
+        hidden_states.stride(0),
+        delta.stride(0),
+        delta.stride(1),
+        base.stride(0),
+        out.stride(0),
+        block_size,
+        TAPS=taps,
+        GROUP_SIZE=group_size,
+        BLOCK=BLOCK,
+        # GB300 sweep over 6..2304 tokens: 4 warps below a few hundred
+        # tokens, 2 warps above (5-10% faster from 384 tokens).
+        num_warps=4 if num_tokens < 256 else 2,
+    )
+    return out

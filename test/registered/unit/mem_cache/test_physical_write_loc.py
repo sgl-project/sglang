@@ -148,7 +148,7 @@ class TestKVWriteLocCarriesTheMark(unittest.TestCase):
         fb = _batch(torch.tensor([1, 2]))
         self.assertFalse(KVWriteLoc.for_batch(fb).physical)
         fb.out_cache_loc_is_physical = True
-        info = KVWriteLoc.for_batch(fb, swa_loc=torch.tensor([9, 9]))
+        info = KVWriteLoc.for_batch(fb, window_locs={"window_8": torch.tensor([9, 9])})
         self.assertIs(info.loc, fb.out_cache_loc)
         self.assertTrue(info.physical)
 
@@ -175,7 +175,7 @@ class TestWriteLocIsDense(unittest.TestCase):
         with self.assertRaises(ValueError):
             KVWriteLoc(strided)
         with self.assertRaises(ValueError):
-            KVWriteLoc(torch.tensor([1, 2]), swa_loc=strided)
+            KVWriteLoc(torch.tensor([1, 2]), window_locs={"window_8": strided})
         with self.assertRaises(ValueError):
             unwrap_write_loc(strided)
 
@@ -254,11 +254,14 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
         pool = b.token_to_kv_pool
         loc = torch.tensor([2, 3], dtype=torch.int64, device=_DEV)
         k, v = self._kv()
+        window = {pool.layer_router.route(1).sub_pool: loc}
         for layer_id in (0, 1):  # a full layer and a swa layer
             layer = SimpleNamespace(layer_id=layer_id)
             with self.assertRaisesRegex(ValueError, "not marked physical"):
-                pool.set_kv_buffer(layer, KVWriteLoc(loc, loc), k, v)
-            pool.set_kv_buffer(layer, KVWriteLoc(loc, loc, physical=True), k, v)
+                pool.set_kv_buffer(layer, KVWriteLoc(loc, window_locs=window), k, v)
+            pool.set_kv_buffer(
+                layer, KVWriteLoc(loc, window_locs=window, physical=True), k, v
+            )
 
 
 # --------------------------------------------------------------------------

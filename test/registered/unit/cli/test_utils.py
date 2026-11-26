@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import subprocess
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,7 +14,7 @@ from huggingface_hub.errors import (
     RepositoryNotFoundError,
 )
 
-from sglang.cli.utils import get_is_diffusion_model
+from sglang.cli.utils import get_git_commit_hash, get_is_diffusion_model
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -76,6 +79,30 @@ class TestDiffusionModelDetection(CustomTestCase):
                 mock_download.side_effect = _hub_error(error_type, 404)
                 self.assertFalse(get_is_diffusion_model("test/llm-model"))
         mock_hf_api.assert_not_called()
+
+
+class TestGitCommitHash(CustomTestCase):
+    def test_does_not_report_the_working_directory_repository(self):
+        """`sglang version` must not print the HEAD of an unrelated repository the
+        shell happens to be in."""
+        get_git_commit_hash.cache_clear()
+        self.addCleanup(get_git_commit_hash.cache_clear)
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as repo, patch.dict(os.environ):
+            os.environ.pop("SGLANG_GIT_COMMIT", None)
+            git = ["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t.io"]
+            subprocess.run(["git", "init", "-q", repo], check=True)
+            subprocess.run(
+                [*git, "commit", "-q", "--allow-empty", "-m", "init"], check=True
+            )
+            unrelated_head = subprocess.check_output(
+                [*git, "rev-parse", "HEAD"], text=True
+            ).strip()
+            os.chdir(repo)
+            try:
+                self.assertNotEqual(get_git_commit_hash(), unrelated_head)
+            finally:
+                os.chdir(original_cwd)
 
 
 if __name__ == "__main__":

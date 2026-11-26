@@ -16,6 +16,10 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
@@ -95,6 +99,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         request_retirer=release_only_retirer(),
         abort_request=lambda *a, **k: None,
         still_in_batch=lambda req: True,
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
     )
 
 
@@ -333,7 +338,10 @@ class TestReasoningTokenAccounting(CustomTestCase):
 class TestFinishedMambaSpecCheckpoint(CustomTestCase):
     def test_finished_checkpoint_boundaries(self):
         processor = replace(
-            _make_processor(), tree_cache=SimpleNamespace(supports_mamba=lambda: True)
+            _make_processor(),
+            tree_cache=SimpleNamespace(
+                supports_mamba=lambda: True, request_mamba_only=False
+            ),
         )
         cases = (
             ("grammar", [4], 1, 1, 0, False),
@@ -385,6 +393,7 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
             batch.mamba_track_mask_cpu = None
             tree = MagicMock()
             tree.supports_mamba.return_value = True
+            tree.request_mamba_only = False
             tree.claim_kv_row.return_value = False
             tree.token_to_kv_pool_allocator.page_size = 1
             tree.logical_page_size = 1
@@ -392,7 +401,8 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
                 _make_processor(),
                 tree_cache=tree,
                 decode_offload_manager=SimpleNamespace(
-                    offload_kv_cache=lambda req: True
+                    offload_kv_cache=lambda req: True,
+                    finalize_release_on_finish=lambda req: None,
                 ),
             )
             tokens = processor._resolve_spec_v2_tokens(result, batch, [True])[0]

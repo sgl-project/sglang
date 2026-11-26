@@ -16,6 +16,7 @@ from sglang.srt.layers.pooler import (
     PoolingType,
     score_and_pool,
 )
+from sglang.srt.runtime_context import get_context, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -173,6 +174,20 @@ class TestScoreAndPool(CustomTestCase):
 
         torch.testing.assert_close(pooled, torch.tensor([[2.0], [9.0]]))
 
+    def test_mean_pooling_short_request_after_long_one_in_half_precision(self):
+        """In fp16/bf16, a short request after a long one pools as it would alone."""
+        torch.manual_seed(0)
+        # Nonzero mean, like real encoder outputs, so the running sum grows large.
+        hidden = torch.randn(2048 + 8, 16) + 3.0
+        fb = _make_forward_batch(extend_seq_lens=[2048, 8])
+        pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=False)
+
+        for dtype in (torch.float16, torch.bfloat16):
+            hidden_lp = hidden.to(dtype)
+            pooled = pooler(hidden_lp, fb).embeddings
+            expected = hidden_lp[2048:].float().mean(dim=0)
+            torch.testing.assert_close(pooled[1].float(), expected, atol=0.05, rtol=0)
+
     def test_empty_delimiter_indices(self):
         """Empty delimiter tensor per request -> returns list with empty tensor."""
         input_ids = torch.arange(6)
@@ -266,6 +281,56 @@ class TestScoreAndPool(CustomTestCase):
         self.assertIsNotNone(out.pooled_hidden_states)
         self.assertEqual(len(out.pooled_hidden_states), 1)
         self.assertEqual(out.pooled_hidden_states[0].shape, (2, self.hidden_dim))
+
+
+class TestDisableNormalizeEmbedding(CustomTestCase):
+    """Pooler reads the flag from a published config, so these tests publish one."""
+
+    def setUp(self):
+        torch.manual_seed(42)
+        self.hidden = torch.randn(4, 8)
+        self.fb = _make_forward_batch(extend_seq_lens=[2, 2])
+
+    def _pooled(self, pooler):
+        return pooler(self.hidden, self.fb).embeddings
+
+    def test_flag_disables_normalization(self):
+        with get_context().override_server_args(disable_normalize_embedding=True):
+            pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+            self.assertFalse(pooler.normalize)
+            pooled = self._pooled(pooler)
+
+        # Un-normalized rows keep the raw hidden-state norms.
+        expected = self.hidden[torch.tensor([1, 3])]
+        torch.testing.assert_close(pooled, expected)
+
+    def test_default_keeps_normalization(self):
+        with get_context().override_server_args(disable_normalize_embedding=False):
+            pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+            self.assertTrue(pooler.normalize)
+            pooled = self._pooled(pooler)
+
+        torch.testing.assert_close(
+            pooled.norm(p=2, dim=-1), torch.ones(pooled.shape[0])
+        )
+
+    def test_flag_does_not_force_enable_normalization(self):
+        """The override is one-way: normalize=False models stay un-normalized."""
+        with get_context().override_server_args(disable_normalize_embedding=True):
+            self.assertFalse(
+                Pooler(pooling_type=PoolingType.LAST, normalize=False).normalize
+            )
+        with get_context().override_server_args(disable_normalize_embedding=False):
+            self.assertFalse(
+                Pooler(pooling_type=PoolingType.LAST, normalize=False).normalize
+            )
+
+    def test_unpublished_context_keeps_normalization(self):
+        """Config bags fail closed before publish, so offline Poolers skip the flag."""
+        self.addCleanup(reset_context)
+        reset_context()
+        pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.assertTrue(pooler.normalize)
 
 
 if __name__ == "__main__":

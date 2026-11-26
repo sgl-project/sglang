@@ -142,6 +142,52 @@ class TestBalancedPacking(CustomTestCase):
         self._check_items_per_pack(pack_index, num_packs, groups_per_pack=2)
         self._check_unique_slots(pack_index, rank_in_pack, num_packs, groups_per_pack=2)
 
+    def test_matches_reference_greedy(self):
+        """Identical to the per-layer Python greedy, ties and integer weights included."""
+        gen = torch.Generator().manual_seed(0)
+        cases = [
+            torch.rand(7, 24, generator=gen),
+            torch.randint(0, 4, (5, 32), generator=gen).float(),  # many ties
+            torch.zeros(3, 16),
+            torch.randint(0, 10_000, (4, 48), generator=gen),  # int64 token counts
+            torch.rand(40, 416, generator=gen) * 1000,  # 40 layers x 416 experts
+        ]
+        for weight in cases:
+            for num_packs in (2, 4, 8):
+                if weight.shape[1] % num_packs:
+                    continue
+                with self.subTest(shape=tuple(weight.shape), num_packs=num_packs):
+                    expected = _reference_balanced_packing(weight, num_packs)
+                    actual = balanced_packing(weight, num_packs)
+                    self.assertTrue(torch.equal(actual[0], expected[0]))
+                    self.assertTrue(torch.equal(actual[1], expected[1]))
+
+
+def _reference_balanced_packing(weight, num_packs):
+    """The original per-layer Python greedy."""
+    num_layers, num_groups = weight.shape
+    groups_per_pack = num_groups // num_packs
+    indices_list = weight.float().sort(-1, descending=True).indices.tolist()
+    weight_list = weight.tolist()
+    pack_index_list = [[-1] * num_groups for _ in range(num_layers)]
+    rank_in_pack_list = [[-1] * num_groups for _ in range(num_layers)]
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices_list[i]:
+            pack = min(
+                (j for j in range(num_packs) if pack_items[j] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            pack_index_list[i][group] = pack
+            rank_in_pack_list[i][group] = pack_items[pack]
+            pack_weights[pack] += weight_list[i][group]
+            pack_items[pack] += 1
+    return (
+        torch.tensor(pack_index_list, dtype=torch.int64),
+        torch.tensor(rank_in_pack_list, dtype=torch.int64),
+    )
+
 
 if __name__ == "__main__":
     unittest.main()

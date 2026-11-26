@@ -157,8 +157,8 @@ blocks. They are alternatives to FSDP in this picker, not additive presets.
 ### Deployment limits
 
 Use monolithic serving. Encoder/denoiser/decoder disaggregation is not supported.
-Breakable CUDA graphs are also not enabled for Kandinsky6: the server disables
-`--enable-breakable-cuda-graph`. Its variable-length text path needs additional
+Breakable CUDA graphs are not validated for Kandinsky6 and stay off by default;
+passing `--enable-breakable-cuda-graph` keeps them on with a warning. Its variable-length text path needs additional
 handling to preserve the unpadded computation; same-shape graph experiments do
 not establish support for arbitrary requests. Keep eager execution for the
 recipes on this page.
@@ -265,10 +265,13 @@ the `transformer.` prefix. Both video and audio branches belong to `transformer`
 an adapter can change both outputs.
 
 Add `--lora-path /path/to/adapter.safetensors` to load an adapter at startup.
-To switch an existing server to dynamic LoRA without restarting:
+To switch an existing server to dynamic LoRA without restarting, launch it with
+`--admin-api-key <key>` (the LoRA endpoints answer 403 without one) and send
+that key:
 
 ```bash
 curl --fail-with-body http://localhost:30000/v1/set_lora \
+  -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "lora_nickname": "kandinsky6",
@@ -286,6 +289,7 @@ model:
 
 ```bash
 curl --fail-with-body http://localhost:30000/v1/unmerge_lora_weights \
+  -H "Authorization: Bearer $SGLANG_ADMIN_API_KEY" \
   -H "Content-Type: application/json" -d '{"target": "transformer"}'
 ```
 

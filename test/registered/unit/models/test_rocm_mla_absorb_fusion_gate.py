@@ -105,6 +105,8 @@ class TestAbsorbBmmConfig(CustomTestCase):
             ((16, 1, 512), (16, 32, 1)),
             ((16, 48, 512), (16, 128, 1)),
             ((16, 200, 512), (32, 128, 2)),
+            # Four waves at this shape aborts LLVM on gfx950 (#46829).
+            ((64, 256, 512), (64, 128, 2)),
         )
         for args, expected in cases:
             with self.subTest(args=args):

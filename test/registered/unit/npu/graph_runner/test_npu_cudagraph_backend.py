@@ -15,7 +15,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=10, suite="base-a-test-npu")
+register_npu_ci(est_time=10, suite="extra-a-test-npu")
 
 
 def _device_module_stub():
@@ -35,7 +35,9 @@ def _make_backend(runner=None):
             device_module=_device_module_stub(), enable_torch_compile=False
         )
     with (
-        get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
+        get_parallel().override(
+            tp_group=SimpleNamespace(world_size=1, barrier=mock.Mock())
+        ),
         mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None),
     ):
         return mod.NPUCudaGraphBackend(runner), runner

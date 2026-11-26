@@ -45,6 +45,8 @@ def k3_planning(parallel, **options):
     code reads (prefill CP, pipeline width)."""
     if not hasattr(parallel, "pp_size"):
         parallel.pp_size = 1
+    if not hasattr(parallel, "cp_strategy"):
+        parallel.cp_strategy = None
     with (
         fixture.planning(parallel, **options),
         patch.object(kimi_k3, "get_parallel", lambda: parallel),
@@ -72,7 +74,9 @@ def moe_layer(*, bank, sp_moe, all_reduce_fusion):
     return layer
 
 
-def declare(layers, *, sp_moe, carries=False, sp_collective=True, config=CONFIG):
+def declare(
+    layers, *, sp_moe, carries=False, sp_collective=True, config=CONFIG, sp=False
+):
     """Declare ``layers`` (index -> layer) in one layer stack, as if the
     stack enabled bank carry (``carries``), using K3's eligibility check.
     The final bank read gathers an SP-MoE layer's rows through the selected
@@ -99,6 +103,7 @@ def declare(layers, *, sp_moe, carries=False, sp_collective=True, config=CONFIG)
             parallel,
             a2a=sp_moe,
             boundary_reduction="ar",
+            sp=sp,
         ),
     ):
         final_read = (
@@ -163,6 +168,30 @@ class TestKimiK3StageKernels(CustomTestCase):
         self.assertIs(entry, comm_ops._reduce_update_read)
         self.assertEqual(fusions, (kimi_k3._k3_all_reduce_add,))
         self.assertIsNone(gather)
+
+
+class TestKimiK3SequenceParallel(CustomTestCase):
+    def test_bank_layers_resolve_a_sequence_parallel_path(self):
+        for sp_moe in (False, True):
+            for kda in (False, True):
+                with self.subTest(sp_moe=sp_moe, kda=kda):
+                    layer = moe_layer(
+                        bank=True, sp_moe=sp_moe, all_reduce_fusion=not sp_moe
+                    )
+                    config = SimpleNamespace(
+                        **{**vars(CONFIG), "is_kda_layer": lambda layer_idx: kda}
+                    )
+                    # KDA heads span the full TP group only without an EP MoE.
+                    with patch.object(
+                        kimi_k3,
+                        "linear_attn_parallel_group",
+                        return_value="attn_tp" if sp_moe else "tp",
+                    ):
+                        declare({1: layer}, sp_moe=sp_moe, config=config, sp=True)
+                    for boundary in (layer.attn_boundary, layer.ffn_boundary):
+                        self.assertIn(
+                            BatchVariant.SEQUENCE_PARALLEL, boundary.plan.paths
+                        )
 
 
 class TestKimiK3BankOnShards(CustomTestCase):

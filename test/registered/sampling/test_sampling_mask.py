@@ -25,6 +25,7 @@ from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
 )
+from sglang.srt.sampling.sampling_pipeline import _adjust_after_watermark
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -222,10 +223,9 @@ class TestSamplingMaskCapture(CustomTestCase):
                             indices=torch.tensor([0], device="cuda"),
                         )
                     },
-                    return_sampling_masks=[True, True],
                     sampling_mask_batch_indices=torch.tensor([0, 1], device="cuda"),
                 )
-                logits = self.sampler._preprocess_logits(logits, info)
+                logits = _adjust_after_watermark(logits, info)
                 with patch(
                     "sglang.srt.layers.sampler.get_exec",
                     return_value=SimpleNamespace(

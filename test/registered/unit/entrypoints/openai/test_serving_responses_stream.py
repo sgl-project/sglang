@@ -743,16 +743,16 @@ class NonHarmonyStreamTestCase(CustomTestCase):
 
         script_iter = iter(scripted)
 
-        def fake_parse_stream_chunk(delta):
+        def fake_parse_stream_segments(delta):
             sp = next(script_iter)
-            return sp.normal_text, sp.calls
+            return [(sp.normal_text, sp.calls)]
 
         with patch(
             "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
         ) as parser_cls:
             parser_cls.return_value.detector.supports_structural_tag.return_value = True
-            parser_cls.return_value.parse_stream_chunk.side_effect = (
-                fake_parse_stream_chunk
+            parser_cls.return_value.parse_stream_segments.side_effect = (
+                fake_parse_stream_segments
             )
             parser_cls.return_value.parse_stream_end.return_value = ("", [])
             fixture = StreamFixture(serving, request)
@@ -929,7 +929,6 @@ class HarmonyStreamLifecycleTestCase(CustomTestCase):
                 context.finish_reason = {"type": "stop"}
                 context.last_tok = None
                 context.encoding = Mock()
-                context.encoding.stop_tokens_for_assistant_actions.return_value = []
 
                 async def generate():
                     for messages, channel, recipient, text in chunks:

@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -20,6 +21,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _mha_device_pool_entry,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -74,6 +76,113 @@ class TestDevicePoolEntry(CustomTestCase):
         self.assertEqual(sizes, [[10], [22], [10], [22]])
         self.assertEqual(offsets, [[6], [14], [6], [14]])
 
+        # One grouped read carries every mapped layer of a component item.
+        pointers, sizes, offsets = pool.get_prepared_layers_range_meta(
+            locations, range(3)
+        )
+        self.assertEqual(
+            pointers,
+            [
+                [k0[0].data_ptr(), k2[0].data_ptr()],
+                [v0[0].data_ptr(), v2[0].data_ptr()],
+                [k0[4].data_ptr(), k2[4].data_ptr()],
+                [v0[4].data_ptr(), v2[4].data_ptr()],
+            ],
+        )
+        self.assertEqual(sizes, [[6, 10], [14, 22]] * 2)
+        self.assertEqual(offsets, [[0, 6], [0, 14]] * 2)
+        self.assertIsNone(pool.get_prepared_layers_range_meta(locations, [1, 3]))
+
+    def test_layer_ranges_preserve_layout_and_row_order(self):
+        buffers = [torch.zeros((6, width), dtype=torch.uint8) for width in (3, 5)]
+        for packed in (True, False):
+            pool = DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[buffers],
+                layer_mapping={0: (0, 1)},
+                page_size=1,
+                rows_are_pages=True,
+                packed=packed,
+            )
+            for rows in ([4, 0, 4], []):
+                ptrs = [[buffer[row].data_ptr() for buffer in buffers] for row in rows]
+                expected = (ptrs, [[3, 5]] * len(rows), [[0, 3]] * len(rows))
+                if not packed:
+                    expected = tuple(
+                        [[value] for row in part for value in row] for part in expected
+                    )
+                for locations in (rows, np.asarray(rows, dtype=np.int64)):
+                    with self.subTest(packed=packed, rows=rows, kind=type(locations)):
+                        self.assertEqual(
+                            pool.get_prepared_layer_range_meta(locations, 0), expected
+                        )
+
+    def test_grouped_ranges_match_per_layer_concatenation(self):
+        def make_buffers(widths):
+            return [torch.zeros((6, width), dtype=torch.uint8) for width in widths]
+
+        cases = {
+            # Layer 2 maps two buffers; layer 3 is a sharer hole.
+            "packed": (
+                [make_buffers((3, 4, 5, 6))],
+                {0: 0, 1: 1, 2: (2, 3), 4: 0},
+                True,
+            ),
+            "unpacked": (
+                [make_buffers((3, 4, 5)), make_buffers((7, 8, 9))],
+                {0: 0, 1: 1, 2: 2},
+                False,
+            ),
+        }
+        for name, (components, layer_mapping, packed) in cases.items():
+            pool = DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=components,
+                layer_mapping=layer_mapping,
+                page_size=1,
+                rows_are_pages=True,
+                packed=packed,
+            )
+            locations = [5, 0, 3, 0]
+            for group in (range(0, 3), range(2, 5), range(3, 4)):
+                expected = None
+                for layer in group:
+                    meta = pool.get_prepared_layer_range_meta(locations, layer)
+                    if meta is None:
+                        continue
+                    if expected is None:
+                        expected = tuple([list(row) for row in rows] for rows in meta)
+                        continue
+                    for merged_rows, rows in zip(expected, meta):
+                        for merged_row, row in zip(merged_rows, rows):
+                            merged_row.extend(row)
+                with self.subTest(name=name, group=group):
+                    self.assertEqual(
+                        pool.get_prepared_layers_range_meta(locations, group),
+                        expected,
+                    )
+
+    def test_grouped_ranges_reject_unpacked_buffer_count_mismatch(self):
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[
+                [torch.zeros((4, width), dtype=torch.uint8) for width in (3, 4, 5)]
+            ],
+            layer_mapping={0: 0, 1: (1, 2)},
+            page_size=1,
+            rows_are_pages=True,
+            packed=False,
+        )
+        self.assertIsNotNone(pool.get_prepared_layers_range_meta([0], [1]))
+        with self.assertRaisesRegex(ValueError, "different number of buffers"):
+            pool.get_prepared_layers_range_meta([0], [0, 1])
+
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):
             DevicePoolEntry(
@@ -104,6 +213,48 @@ class TestDevicePoolEntry(CustomTestCase):
             with self.subTest(indices=indices.tolist()):
                 with self.assertRaisesRegex(ValueError, error):
                     pool.prepare_locations(indices)
+
+    def test_mxfp8_pages_carry_their_scale_blocks(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            MHATokenToKVPoolMXFP8,
+        )
+
+        pool = MHATokenToKVPoolMXFP8.__new__(MHATokenToKVPoolMXFP8)
+        pool.k_buffer = [
+            torch.zeros((8, 1, 3), dtype=torch.float8_e4m3fn) for _ in range(2)
+        ]
+        pool.v_buffer = [
+            torch.zeros((8, 1, 5), dtype=torch.float8_e4m3fn) for _ in range(2)
+        ]
+        pool.k_scale_buffer = [
+            torch.zeros((2, 1, 4, 1, 2), dtype=torch.float8_e8m0fnu) for _ in range(2)
+        ]
+        pool.v_scale_buffer = [
+            torch.zeros((2, 1, 4, 1, 3), dtype=torch.float8_e8m0fnu) for _ in range(2)
+        ]
+        entry = _mha_device_pool_entry(PoolName.KV, pool, {0: 0, 2: 1}, 4)
+
+        self.assertEqual(entry.layer_mapping, {0: (0, 2, 4, 6), 2: (1, 3, 5, 7)})
+        pointers, sizes = entry.get_page_buffer_meta(torch.arange(4, 8))
+        self.assertEqual(
+            pointers,
+            [
+                buffer[index].data_ptr()
+                for buffer, index in zip(
+                    [*pool.k_buffer, *pool.v_buffer, *pool.k_scale_buffer]
+                    + pool.v_scale_buffer,
+                    [4] * 4 + [1] * 4,
+                )
+            ],
+        )
+        self.assertEqual(sizes, [12, 12, 20, 20, 8, 8, 12, 12])
+
+        fp4 = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        fp4.k_buffer, fp4.v_buffer = pool.k_buffer, pool.v_buffer
+        fp4.k_scale_buffer, fp4.native_k_scale_buffer = pool.k_scale_buffer, None
+        with self.assertRaisesRegex(ValueError, "FP4 scaled KV"):
+            _mha_device_pool_entry(PoolName.KV, fp4, {0: 0}, 4)
 
 
 class TestDevicePoolGroup(CustomTestCase):
@@ -841,6 +992,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_mla_mamba_maps_kv_pages_and_state_slots(self):
         from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
         from sglang.srt.mem_cache.memory_pool import (
+            DSATokenToKVPool,
             HybridLinearKVPool,
             MHATokenToKVPool,
             MLATokenToKVPool,
@@ -886,8 +1038,11 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 patch.object(
                     linker_pool_assembler,
                     "get_parallel",
-                    return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+                    return_value=SimpleNamespace(
+                        attn_dcp_size=dcp_size, attn_dcp_rank=1
+                    ),
                 ),
+                patch.object(MLATokenToKVPool, "rows_are_dcp_collapsed", new=True),
             ):
                 return resolve_hybrid_device_pool_group(
                     kvcache=kvcache,
@@ -905,10 +1060,55 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(kv.prepare_locations(torch.tensor([2, 3])), [2])
         self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
         self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
-        self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {0: (0, 1)})
+        self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {3: (0, 1)})
+        self.assertNotIn(PoolName.INDEXER, group.entry_map)
 
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
-            resolve(dcp_size=2)
+        mla = kvcache.full_kv_pool
+        dsa = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        dsa.kv_buffer = mla.kv_buffer
+        dsa.index_key_cache = SimpleNamespace(
+            buffer=[
+                torch.zeros((0, 3), dtype=torch.uint8),
+                torch.zeros((4, 3), dtype=torch.uint8),
+            ]
+        )
+        kvcache.full_kv_pool = dsa
+        group = resolve()
+        indexer = group.entry_map[PoolName.INDEXER]
+        self.assertEqual(group.sources[PoolName.INDEXER], PoolName.KV)
+        self.assertEqual(indexer.layer_mapping, {3: 0})
+        self.assertEqual(indexer.prepare_locations(torch.tensor([2, 3])), [1])
+        self.assertEqual(
+            {name: entry.tp_replicated for name, entry in group.entry_map.items()},
+            {
+                PoolName.KV: True,
+                PoolName.INDEXER: True,
+                PoolName.MAMBA: False,
+                PoolName.DRAFT: False,
+            },
+        )
+        dsa.page_size = dsa.index_page_size = 1
+        group = resolve(dcp_size=2)
+        for name in (PoolName.KV, PoolName.INDEXER):
+            entry = group.entry_map[name]
+            self.assertTrue(entry.dcp_sharded, name)
+            locations = entry.prepare_locations(
+                entry.translate_indices(torch.tensor([4, 5]))
+            )
+            self.assertEqual(locations, [2], name)
+        kvcache.full_kv_pool = mla
+
+        mla_draft = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        mla_draft.page_size, mla_draft.layer_num = 2, 2
+        mla_draft.kv_buffer = [
+            torch.zeros((8, 1, 5), dtype=torch.uint8) for _ in range(2)
+        ]
+        params.sidecar_draft_device_pools = (mla_draft,)
+        draft_entry = resolve().entry_map[PoolName.DRAFT]
+        self.assertEqual(draft_entry.layer_mapping, {2: 0, 3: 1})
+        self.assertEqual(draft_entry.prepare_locations(torch.tensor([2, 3])), [2])
+        params.sidecar_draft_device_pools = (draft,)
+
         params.mtp_draft_device_pools = (object(),)
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()
@@ -916,6 +1116,96 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.full_kv_pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()
+
+    def test_mamba_swa_packs_hybrid_sidecar_draft_kv(self):
+        """A hybrid-SWA sidecar draft rides the target pages: its full layers on
+        KV, its SWA layers on SWA, both after the last target transfer layer."""
+        from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        def mha(rows, layers, width):
+            pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+            pool.page_size, pool.layer_num = 2, layers
+            pool.k_scale_buffer = pool.native_k_scale_buffer = None
+            pool.k_buffer = [torch.zeros((rows, width), dtype=torch.uint8)] * layers
+            pool.v_buffer = [torch.zeros((rows, width), dtype=torch.uint8)] * layers
+            return pool
+
+        def hybrid_draft(full_layers, swa_layers):
+            draft = SWAKVPool.__new__(SWAKVPool)
+            draft.full_kv_pool = mha(8, full_layers, 5)
+            draft.swa_kv_pool = mha(4, swa_layers, 3)
+            draft.swa_uses_full_indices = False
+            return draft
+
+        kvcache = SimpleNamespace(
+            start_layer=0,
+            layers_mapping={0: (0, True), 1: (0, False), 2: (1, True)},
+            full_kv_pool=mha(8, 1, 5),
+            swa_kv_pool=mha(4, 2, 3),
+        )
+        state = SimpleNamespace(
+            pool=SimpleNamespace(
+                num_mamba_layers=2,
+                mamba_cache=SimpleNamespace(
+                    temporal=torch.zeros((2, 4, 0), dtype=torch.uint8),
+                    conv=[torch.zeros((2, 4, 2), dtype=torch.uint8)],
+                ),
+            ),
+            layer_map={0: 0, 2: 1},
+            ckpt_pool=None,
+            short_conv_pool=SimpleNamespace(enabled=False),
+            ngram_pool=SimpleNamespace(enabled=False),
+        )
+
+        def build(drafts):
+            params = SimpleNamespace(
+                mtp_draft_device_pools=(),
+                mtp_draft_mamba_pools=(),
+                sidecar_draft_device_pools=drafts,
+                token_to_kv_pool_allocator=SimpleNamespace(state=state),
+            )
+            with patch.object(
+                linker_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(enable_unified_memory=False),
+            ):
+                return linker_pool_assembler._build_mamba_swa_device_pool_group(
+                    kvcache, params, page_size=2
+                )
+
+        draft = hybrid_draft(full_layers=1, swa_layers=2)
+        group = build((draft,))
+        self.assertTrue(group.restores_sidecar_drafts)
+        self.assertEqual(group.entry_map[PoolName.KV].layer_mapping, {1: (0, 1, 2, 3)})
+        self.assertEqual(
+            group.entry_map[PoolName.SWA].layer_mapping,
+            {0: (0, 2), 2: (1, 3, 4, 5, 6, 7)},
+        )
+
+        def page_ptrs(name):
+            entry = group.entry_map[name]
+            return set(entry.get_page_buffer_meta(torch.tensor([2, 3]))[0])
+
+        kv_ptrs, swa_ptrs = page_ptrs(PoolName.KV), page_ptrs(PoolName.SWA)
+        for buffer in (draft.full_kv_pool.k_buffer[0], draft.full_kv_pool.v_buffer[0]):
+            self.assertIn(buffer[2].data_ptr(), kv_ptrs)
+        for buffer in (draft.swa_kv_pool.k_buffer[0], draft.swa_kv_pool.v_buffer[0]):
+            self.assertIn(buffer[2].data_ptr(), swa_ptrs)
+
+        # A draft layout the linker cannot pack must not claim a restore.
+        self.assertFalse(build((object(),)).restores_sidecar_drafts)
+
+        # A dense draft on the target's SWA ids has SWA-pool rows; copying it
+        # with full-attention page ids reads the wrong rows or past its end.
+        swa_id_draft = mha(4, 1, 3)
+        swa_id_draft.follows_target_swa_ids = True
+        group = build((swa_id_draft,))
+        self.assertEqual(group.entry_map[PoolName.KV].layer_mapping, {1: (0, 1)})
+        self.assertEqual(
+            group.entry_map[PoolName.SWA].layer_mapping, {0: (0, 2), 2: (1, 3, 4, 5)}
+        )
 
     def test_minimax_m31_nvfp4_maps_page_rows_and_draft(self):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -974,7 +1264,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             self.assertEqual(sizes, [[row_bytes]] * 2)
             self.assertEqual(offsets, [[row_bytes]] * 2)
         draft_entry = group.entry_map[PoolName.DRAFT]
-        self.assertEqual(draft_entry.layer_mapping, {0: (0, 1)})
+        self.assertEqual(draft_entry.layer_mapping, {1: (0, 1)})
         self.assertEqual(draft_entry.prepare_locations(indices), [2, 6])
 
         params.mtp_draft_device_pools = (object(),)
@@ -984,6 +1274,227 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.main_pool = page_rows(MHATokenToKVPool, 5)
         with self.assertRaisesRegex(ValueError, "M3.1 NVFP4"):
             resolve()
+
+    def _dspark_m31_nvfp4_group(self, *, target_layers, draft_layers):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
+            MiniMaxM3Nvfp4IndexKPool,
+            MiniMaxM3Nvfp4KVPool,
+            MiniMaxM3Nvfp4MainKVPool,
+        )
+
+        def page_rows(pool_cls):
+            pool = pool_cls.__new__(pool_cls)
+            pool.page_size, pool.layer_num = 2, target_layers
+            pool.rows = [
+                torch.zeros((4, 4), dtype=torch.uint8) for _ in range(target_layers)
+            ]
+            return pool
+
+        kvcache = MiniMaxM3Nvfp4KVPool.__new__(MiniMaxM3Nvfp4KVPool)
+        kvcache.start_layer, kvcache.layer_num = 0, target_layers
+        kvcache.main_pool = page_rows(MiniMaxM3Nvfp4MainKVPool)
+        kvcache.index_k_pool = page_rows(MiniMaxM3Nvfp4IndexKPool)
+        kvcache.index_k_layer_id_mapping = {i: i for i in range(target_layers)}
+        draft = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        draft.page_size, draft.layer_num = 2, draft_layers
+        draft.k_scale_buffer = draft.native_k_scale_buffer = None
+        draft.k_buffer = [
+            torch.zeros((8, 3), dtype=torch.uint8) for _ in range(draft_layers)
+        ]
+        draft.v_buffer = [
+            torch.zeros((8, 3), dtype=torch.uint8) for _ in range(draft_layers)
+        ]
+        return resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=SimpleNamespace(
+                mtp_draft_device_pools=(), sidecar_draft_device_pools=(draft,)
+            ),
+            components={ComponentType.FULL},
+        )
+
+    def test_dspark_sidecar_loads_with_the_last_transfer_layer_groups(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            MooncakeDirectLinker,
+        )
+        from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+            LayerWiseLoadCounter,
+        )
+
+        group = self._dspark_m31_nvfp4_group(target_layers=8, draft_layers=5)
+        calls = []
+
+        def get_ranges(keys, ptrs, sizes, offsets):
+            calls.append((keys[0], sum(map(sum, sizes))))
+            return [sum(item) for item in sizes]
+
+        linker = object.__new__(MooncakeDirectLinker)
+        linker.num_layers = group.num_layers
+        linker.load_layer_group, linker.load_threads = 3, 1
+        linker.load_io_executor = ThreadPoolExecutor(1)
+        self.addCleanup(linker.load_io_executor.shutdown)
+        linker.pools = group.entry_map
+        linker.storage = SimpleNamespace(
+            store=SimpleNamespace(
+                batch_get_session_start=lambda keys: [0] * len(keys),
+                batch_get_session_end=lambda keys: None,
+                batch_get_into_multi_buffer_ranges=get_ranges,
+            ),
+            _get_hybrid_page_component_keys=lambda keys, transfer: (keys, None),
+            _tag_keys=lambda keys: keys,
+        )
+        linker.layer_done_counter = LayerWiseLoadCounter(group.num_layers)
+        index = linker.layer_done_counter.update_producer()
+        linker.load_layer_wise(
+            index,
+            [
+                [
+                    PoolTransfer(
+                        name=name, keys=[name.value], host_indices=torch.arange(2, 4)
+                    )
+                    for name in (PoolName.KV, PoolName.INDEXER, PoolName.DRAFT)
+                ]
+            ],
+        )
+        self.assertTrue(linker.layer_done_counter.finish(index))
+
+        # One read per pool and group of 3 layers. Target layer 0 waits only on
+        # the first group, which carries no draft bytes; all draft KV (5 layers,
+        # K and V, one 2-token page of 3-byte rows) rides the last two groups.
+        kv, indexer, draft = (
+            PoolName.KV.value,
+            PoolName.INDEXER.value,
+            PoolName.DRAFT.value,
+        )
+        self.assertEqual(
+            calls,
+            [
+                (kv, 12),
+                (indexer, 12),
+                (kv, 12),
+                (indexer, 12),
+                (draft, 36),
+                (kv, 8),
+                (indexer, 8),
+                (draft, 24),
+            ],
+        )
+
+    def test_dspark_sidecar_waits_on_the_transfer_layer_carrying_it(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            MooncakeDirectLinker,
+        )
+
+        group = self._dspark_m31_nvfp4_group(target_layers=8, draft_layers=5)
+        linker = object.__new__(MooncakeDirectLinker)
+        linker.pools = group.entry_map
+        waits = []
+        linker.layer_done_counter = SimpleNamespace(wait_until=waits.append)
+        draft_counter = linker.draft_layer_counter()
+        for depth in range(5):
+            draft_counter.wait_until(depth)
+        # Depth i waits on the transfer layer whose ranges hold its K buffer.
+        mapping = group.entry_map[PoolName.DRAFT].layer_mapping
+        self.assertEqual([mapping[layer][0] for layer in waits], list(range(5)))
+
+        with self.assertRaisesRegex(ValueError, "more layers than the target"):
+            self._dspark_m31_nvfp4_group(target_layers=4, draft_layers=5)
+
+    def test_mamba_swa_packs_mtp_draft_kv_and_state(self):
+        from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
+
+        def mha(rows, layers, width):
+            return SimpleNamespace(
+                page_size=2,
+                layer_num=layers,
+                k_scale_buffer=None,
+                native_k_scale_buffer=None,
+                k_buffer=[torch.zeros((rows, width), dtype=torch.uint8)] * layers,
+                v_buffer=[torch.zeros((rows, width), dtype=torch.uint8)] * layers,
+            )
+
+        def mamba(layers):
+            return SimpleNamespace(
+                num_mamba_layers=layers,
+                mamba_cache=SimpleNamespace(
+                    temporal=torch.zeros((layers, 4, 3), dtype=torch.uint8),
+                    conv=[torch.zeros((layers, 4, 2), dtype=torch.uint8)],
+                ),
+            )
+
+        kvcache = SimpleNamespace(
+            start_layer=0,
+            layers_mapping={0: (0, True), 1: (0, False), 2: (1, True)},
+            full_kv_pool=mha(8, 1, 5),
+            swa_kv_pool=mha(4, 2, 3),
+        )
+        drafts = (
+            SimpleNamespace(
+                full_kv_pool=mha(8, 0, 5),
+                swa_kv_pool=mha(8, 1, 7),
+                swa_uses_full_indices=True,
+            ),
+            SimpleNamespace(
+                full_kv_pool=mha(8, 1, 5),
+                swa_kv_pool=mha(4, 0, 3),
+                swa_uses_full_indices=True,
+            ),
+            SimpleNamespace(
+                full_kv_pool=mha(8, 0, 5),
+                swa_kv_pool=mha(4, 1, 3),
+                swa_uses_full_indices=False,
+            ),
+        )
+        draft_mamba = (mamba(1), mamba(1))
+        params = SimpleNamespace(
+            mtp_draft_device_pools=drafts,
+            mtp_draft_mamba_pools=draft_mamba,
+            sidecar_draft_device_pools=(),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state=SimpleNamespace(
+                    pool=mamba(2),
+                    layer_map={0: 0, 2: 1},
+                    ckpt_pool=None,
+                    short_conv_pool=SimpleNamespace(enabled=False),
+                    ngram_pool=SimpleNamespace(enabled=False),
+                )
+            ),
+        )
+        with patch.object(
+            linker_pool_assembler,
+            "get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
+        ):
+            group = linker_pool_assembler._build_mamba_swa_device_pool_group(
+                kvcache, params, page_size=2
+            )
+
+        def page_ptrs(name, indices):
+            return set(group.entry_map[name].get_page_buffer_meta(indices)[0])
+
+        def row_ptr(buffer, row):
+            return buffer[row].data_ptr()
+
+        self.assertEqual(group.num_layers, 3)
+        kv = group.entry_map[PoolName.KV]
+        self.assertEqual(kv.layer_mapping, {1: (0, 1, 2, 3, 4, 5)})
+        kv_ptrs = page_ptrs(PoolName.KV, torch.tensor([2, 3]))
+        for pool in (drafts[0].swa_kv_pool, drafts[1].full_kv_pool):
+            self.assertIn(row_ptr(pool.k_buffer[0], 2), kv_ptrs)
+            self.assertIn(row_ptr(pool.v_buffer[0], 2), kv_ptrs)
+        swa = group.entry_map[PoolName.SWA]
+        self.assertEqual(swa.layer_mapping, {0: (0, 2), 2: (1, 3, 4, 5)})
+        swa_ptrs = page_ptrs(PoolName.SWA, torch.tensor([2, 3]))
+        self.assertIn(row_ptr(drafts[2].swa_kv_pool.k_buffer[0], 2), swa_ptrs)
+        mamba_entry = group.entry_map[PoolName.MAMBA]
+        self.assertEqual(mamba_entry.layer_mapping, {0: 0, 2: (1, 2, 3)})
+        mamba_ptrs = page_ptrs(PoolName.MAMBA, torch.tensor([3]))
+        for pool in draft_mamba:
+            self.assertIn(row_ptr(pool.mamba_cache.temporal[0], 3), mamba_ptrs)
+            self.assertIn(row_ptr(pool.mamba_cache.conv[0][0], 3), mamba_ptrs)
 
     def test_unsupported_strategy_fails_with_context(self):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool

@@ -29,13 +29,13 @@ def _leaf(pool):
     return pool
 
 
-def _windowed(pool):
+def _windowed(pool, full_layers=None, swa_layers=None):
     """Route a fake pool over its full and sliding-window sub-pool views."""
     pool.layer_router = KVLayerRouter.from_layer_maps(
         pool,
         [
-            (IdSpaceKind.FULL, pool.full_kv_pool, {}),
-            (IdSpaceKind.SLIDING_WINDOW, pool.swa_kv_pool, {}),
+            (IdSpaceKind.FULL, pool.full_kv_pool, full_layers or {}),
+            (IdSpaceKind.SLIDING_WINDOW, pool.swa_kv_pool, swa_layers or {}),
         ],
     )
     return pool
@@ -92,6 +92,19 @@ class TestHiCacheAutoSize(CustomTestCase):
                     )
                 ),
                 512,
+            ),
+            # A draft with routed full and SWA layers gets both sidecars.
+            (
+                _windowed(
+                    Mock(
+                        spec=BaseSWAKVPool,
+                        full_kv_pool=draft_mha,
+                        swa_kv_pool=draft_mha,
+                    ),
+                    full_layers={2: 0},
+                    swa_layers={0: 0},
+                ),
+                2048 + 512,
             ),
         ):
             with self.subTest(

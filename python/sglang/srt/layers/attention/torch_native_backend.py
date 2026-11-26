@@ -8,7 +8,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -81,7 +81,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
             k_cache: [max_total_num_tokens, num_heads, head_size]
             v_cache: [max_total_num_tokens, num_heads, head_size]
-            req_to_token: [max_num_reqs, max_context_len]
+            req_to_token: [max_num_reqs, req_to_token_row_width]
             req_pool_indices: [num_seqs]
             encoder_lens: [num_seqs] or None
             seq_lens: [num_seqs]
@@ -194,7 +194,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
             k_cache: [max_total_num_tokens, num_heads, head_size]
             v_cache: [max_total_num_tokens, num_heads, head_size]
-            req_to_token: [max_num_reqs, max_context_len]
+            req_to_token: [max_num_reqs, req_to_token_row_width]
             req_pool_indices: [num_seqs]
             seq_lens: [num_seqs]
             encoder_lens: [num_seqs] or None
@@ -295,7 +295,15 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         if save_kv_cache and k is not None and v is not None:
             self.kv_layers.layer(layer.layer_id).store(
-                layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
+                layer,
+                KVWriteLoc(
+                    cache_loc,
+                    window_locs=window_write_locs(
+                        self.runner_ids, self.swa_out_cache_loc
+                    ),
+                ),
+                k,
+                v,
             )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
@@ -363,7 +371,15 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         if save_kv_cache and k is not None and v is not None:
             self.kv_layers.layer(layer.layer_id).store(
-                layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
+                layer,
+                KVWriteLoc(
+                    cache_loc,
+                    window_locs=window_write_locs(
+                        self.runner_ids, self.swa_out_cache_loc
+                    ),
+                ),
+                k,
+                v,
             )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
@@ -394,6 +410,3 @@ class TorchNativeAttnBackend(AttentionBackend):
         )
 
         return o
-
-    def support_triton(self):
-        return False

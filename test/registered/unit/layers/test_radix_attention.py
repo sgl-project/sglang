@@ -182,7 +182,9 @@ def test_direct_backend_dispatch(sparse):
     batch = make_batch()
     q = torch.zeros(4, 2, 3)
     result = object()
-    backend = SimpleNamespace(forward=lambda *args, **kwargs: result)
+    backend = SimpleNamespace(
+        forward=lambda *args, **kwargs: result, plans_padded_extend_rows=False
+    )
     with (
         attention_scope(batch, backend),
         patch(
@@ -266,9 +268,10 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
 
     graph = bcg.BreakableCUDAGraph()
     capture = SimpleNamespace(
-        cuda_graph=graph,
-        _end_current_segment=lambda: None,
-        _begin_new_segment=lambda: None,
+        end_current_segment=lambda: None,
+        begin_next_segment=lambda: None,
+        register_eager_call=graph._break_fns.append,
+        retain_for_replay=lambda value: value,
     )
     backend = SimpleNamespace(forward=attention)
     with (
@@ -278,12 +281,9 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
             return_value=True,
         ),
     ):
-        token = bcg._current_capture_var.set(capture)
-        try:
+        with bcg.use_breakable_capture_recorder(capture):
             kwargs = {"idx_q": q, "idx_k": q} if sparse else {}
             result = layer(q, q, q, captured_batch, **kwargs)
-        finally:
-            bcg._current_capture_var.reset(token)
     index_output = None
     if sparse:
         index_output, output = result

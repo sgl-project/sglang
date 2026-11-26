@@ -12,6 +12,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.cutedsl_gdn import (
     cutedsl_fused_sigmoid_gating_delta_rule_update,
 )
@@ -21,17 +22,6 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import state_pool_indices
 
 logger = logging.getLogger(__name__)
-
-
-def _is_sm10x() -> bool:
-    """True iff running on SM10x, the only arch with the tcgen05/TMEM the kernel uses.
-
-    SM120 (desktop Blackwell) lacks tcgen05 despite its larger capability number.
-    """
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major == 10
 
 
 class CuteDSLGDNKernel(LinearAttnKernelBase):
@@ -47,7 +37,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
     def __init__(self):
         # The extend kernel uses tcgen05/TMA-bulk-swizzle features that exist
         # only on SM10x. The decode kernel does work on SM90+.
-        self.supports_prefill = _is_sm10x()
+        self.supports_prefill = current_arch().is_sm(10)
 
         # Heavy CuteDSL imports are deferred to extend() so SM90 boxes can
         # still construct the kernel just for decode.
@@ -130,8 +120,6 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         self._ensure_extend_loaded(head_k_dim)
 
         total_seq_len = q.shape[1]
-        num_v_heads = v.shape[2]
-        head_v_dim = v.shape[3]
 
         # L2 norm Q/K outside the kernel (same as flashinfer path).
         q_norm = self._l2norm_fn(q[0].contiguous()).unsqueeze(0)

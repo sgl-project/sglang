@@ -56,7 +56,7 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
             CacheInitParams(
                 disable=False,
                 req_to_token_pool=ReqToTokenPool(
-                    size=8, max_context_len=64, device="cpu", enable_memory_saver=False
+                    size=8, row_width=64, device="cpu", enable_memory_saver=False
                 ),
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,
@@ -101,7 +101,10 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         ]
 
     def test_lru_evicts_the_prefix_furthest_from_admission(self):
-        self.assertEqual(self._run_and_evict_one_prefix("lru"), [4, 0])
+        # state_cost keeps Full KV in recency order, so it takes the same refresh.
+        for policy in ("lru", "state_cost"):
+            with self.subTest(policy=policy):
+                self.assertEqual(self._run_and_evict_one_prefix(policy), [4, 0])
 
     def test_rank_local_clock_does_not_change_eviction(self):
         before_interval = self._run_and_evict_one_prefix("lru", 100.49)

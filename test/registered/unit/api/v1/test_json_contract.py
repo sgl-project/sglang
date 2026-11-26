@@ -228,7 +228,7 @@ class TestFinishReason(CustomTestCase):
             '{"type":"stop","matched":"</s>"}',
             '{"type":"stop","matched":7}',
             '{"type":"stop","matched":[1,2]}',
-            '{"type":"length","length":2}',
+            '{"type":"length","length":2,"ignored_stop":null}',
         ]:
             want = json.loads(text)
             parsed = decode_FinishReason(want)

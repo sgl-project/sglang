@@ -36,6 +36,13 @@ from sglang.kernels.ops.communication.all_reduce import (
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
+    choose_algo,
+)
+from sglang.srt.distributed.device_communicators.ring_simple_all_reduce import (
+    HIER_RING_SIMPLE_BUFFER_SIZE,
+    RING_SIMPLE_BUFFER_SIZE,
+    HierRingSimpleAllReduce,
+    RingSimpleAllReduce,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -73,9 +80,21 @@ TEST_ALGOS = [
     AllReduceAlgo.TWO_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
 ]
+# 2 KB slices per ring channel: every size streams through many FIFO loops
+RING_SMALL_FIFO_BYTES = 4 * 1024
 USE_GRAPH_OPTIONS = [False, True]
 TEST_LAYERS = 4
 TEST_LOOP = 16
+
+# hier_2shot_push in bytes: pair chunks on both sides of the unrolled pair kernel's
+# 2 MB cutoff, one with a partial hunk, and a large one
+HIER_TEST_BYTES = [
+    4 * 1024 * 1024 - 32,
+    4 * 1024 * 1024,
+    4 * 1024 * 1024 + 32,
+    16 * 1024 * 1024,
+]
+HIER_MAX_BYTES = 32 * 1024 * 1024
 
 TEST_SIZES = get_ci_test_range(TEST_SIZES, [16, 1024, 32 * 1024, 2 * 1024 * 1024])
 TEST_DTYPES = get_ci_test_range(TEST_DTYPES, [torch.bfloat16])
@@ -177,6 +196,56 @@ def _init_comm_once(max_push_blocks: int | None = None) -> CustomAllReduceV2:
     return comm
 
 
+def _is_gfx1250() -> bool:
+    return bool(torch.version.hip) and torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).gcnArchName.startswith("gfx1250")
+
+
+@cache_once
+def _init_ring_once(buffer_size: int) -> RingSimpleAllReduce | None:
+    """A ring plane whatever the tuned table picks; None off ROCm gfx1250."""
+    comm = _init_comm_once()
+    if not _is_gfx1250():
+        return None
+    ring = RingSimpleAllReduce(
+        group=comm.group,
+        device=comm.device,
+        rank=comm.rank,
+        world_size=comm.world_size,
+        num_channels=comm.config.num_ring_simple_channels,
+        slot_bytes=buffer_size // 2,
+    )
+    register_comm_cleanup(ring)
+    return ring
+
+
+@cache_once
+def _init_hier_ring_once(buffer_size: int) -> HierRingSimpleAllReduce | None:
+    """A hier ring plane whatever the tuned table picks; None unless partition pairs."""
+    comm = _init_comm_once()
+    if not _is_gfx1250():
+        return None
+    from sglang.srt.distributed.device_communicators.gfx1250_fabric import (
+        probe_dpx_pairs,
+    )
+
+    pairs = probe_dpx_pairs(comm.group, comm.device)
+    if pairs is None or len(pairs) < 2:
+        return None
+    hier_ring = HierRingSimpleAllReduce(
+        group=comm.group,
+        device=comm.device,
+        rank=comm.rank,
+        world_size=comm.world_size,
+        pairs=pairs,
+        num_channels=comm.config.num_ring_simple_channels,
+        slot_bytes=buffer_size // 2,
+    )
+    register_comm_cleanup(hier_ring)
+    return hier_ring
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -211,16 +280,114 @@ def test_two_shot_push_single_block(
     )
 
 
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
+@torch.inference_mode()
+def test_ring_simple(size: int, dtype: torch.dtype, use_graph: bool) -> None:
+    _check_ring(size, dtype, use_graph, _init_ring_once(RING_SIMPLE_BUFFER_SIZE))
+
+
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
+@torch.inference_mode()
+def test_ring_small_fifo(size: int, dtype: torch.dtype, use_graph: bool) -> None:
+    _check_ring(size, dtype, use_graph, _init_ring_once(RING_SMALL_FIFO_BYTES))
+
+
+def _check_ring(size: int, dtype: torch.dtype, use_graph: bool, ring) -> None:
+    if ring is None:
+        pytest.skip("the ring all-reduce is only enabled on ROCm gfx1250")
+    _check_custom_all_reduce(
+        size, dtype, None, use_graph, _init_comm_once(), reduce=ring.all_reduce
+    )
+
+
+@pytest.mark.parametrize(
+    "buffer_size", [HIER_RING_SIMPLE_BUFFER_SIZE, RING_SMALL_FIFO_BYTES]
+)
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
+@torch.inference_mode()
+def test_hier_ring_simple(
+    size: int, dtype: torch.dtype, use_graph: bool, buffer_size: int
+) -> None:
+    hier_ring = _init_hier_ring_once(buffer_size)
+    if hier_ring is None:
+        pytest.skip(
+            "hier_ring_simple needs ROCm gfx1250 partition pairs on at least two accelerators"
+        )
+    _check_custom_all_reduce(
+        size, dtype, None, use_graph, _init_comm_once(), reduce=hier_ring.all_reduce
+    )
+
+
+@cache_once
+def _init_hier_comm_once() -> CustomAllReduceV2 | None:
+    """A communicator whose table takes hier_2shot_push from 256 KB to 32 MB."""
+    from sglang.srt.distributed.device_communicators import custom_all_reduce_v2 as v2
+    from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
+        Range,
+    )
+
+    cpu_group = _init_cpu_group_once()
+    world_size = dist.get_world_size(cpu_group)
+    if world_size < 4:  # the cross plane needs at least two accelerators
+        return None
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    base = v2.get_all_reduce_config(world_size)
+    hier = Range(256 * 1024, HIER_MAX_BYTES)
+    config = base._replace(
+        graph=base.graph._replace(hier_2shot_push=hier),
+        eager=base.eager._replace(hier_2shot_push=hier),
+    )
+    get_config = v2.get_all_reduce_config
+    v2.get_all_reduce_config = lambda ws: config if ws == world_size else get_config(ws)
+    try:
+        comm = CustomAllReduceV2(cpu_group, device, max_size=HIER_MAX_BYTES // 2)
+    finally:
+        v2.get_all_reduce_config = get_config
+    if comm.disabled:
+        return None
+    register_comm_cleanup(comm)
+    return comm
+
+
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("nbytes", HIER_TEST_BYTES)
+@torch.inference_mode()
+def test_hier_2shot_push(nbytes: int, dtype: torch.dtype, use_graph: bool) -> None:
+    comm = _init_hier_comm_once()
+    if comm is None or comm._hier is None:
+        pytest.skip(
+            "hier_2shot_push needs both DPX partitions of every gfx1250 "
+            "accelerator in the group"
+        )
+    size = nbytes // torch.tensor([], dtype=dtype).element_size()
+    _check_custom_all_reduce(
+        size, dtype, None, use_graph, comm, reduce=comm._hier.all_reduce
+    )
+
+
 def _check_custom_all_reduce(
     size: int,
     dtype: torch.dtype,
-    algo: AllReduceAlgo,
+    algo: AllReduceAlgo | None,
     use_graph: bool,
     comm: CustomAllReduceV2,
+    reduce=None,
 ) -> None:
+    """With ``reduce`` (a ring or hier all-reduce, not a forced-algo choice), ``algo`` is None."""
+    if reduce is not None:
+        comm.forced_algo = None
+    else:
+        comm.forced_algo = algo
+        reduce = comm.custom_all_reduce
     nccl_group = _init_nccl_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    comm.override_algo = algo
 
     if use_graph:
         graph = torch.cuda.CUDAGraph()
@@ -230,7 +397,7 @@ def _check_custom_all_reduce(
             # the reference NCCL group's watchdog thread queries events meanwhile
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 for i in range(TEST_LAYERS):
-                    outs.append(comm.custom_all_reduce(graph_inp[i]))
+                    outs.append(reduce(graph_inp[i]))
                 out_jit_stack = torch.stack(outs)
         torch.cuda.synchronize()
 
@@ -245,14 +412,14 @@ def _check_custom_all_reduce(
             eager_inp = x.clone()
             outs = []
             for i in range(TEST_LAYERS):
-                outs.append(comm.custom_all_reduce(eager_inp[i]))
+                outs.append(reduce(eager_inp[i]))
                 torch.cuda.synchronize()
             return torch.stack(outs)
 
     for _ in range(TEST_LOOP):
         # NOTE: 15 * 8 < 128, which is the precision limit for bf16
         inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
-        assert comm.should_custom_ar(inp[0])
+        assert algo is None or comm.should_custom_ar(inp[0])
         out_ref = inp.clone()
         dist.all_reduce(out_ref, group=nccl_group)
         out_jit = run(inp)
@@ -278,11 +445,11 @@ def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
     """Without an override, eager calls launch the tuned algorithm (cached per size)."""
     nccl_group = _init_nccl_group_once()
     comm = _init_comm_once()
-    comm.override_algo = None
+    comm.forced_algo = None
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
     nbytes = inp[0].numel() * inp.element_size()
-    tuned = comm._pick_config(nbytes, False) is not None
+    tuned = choose_algo(comm.config, nbytes, can_use_graph=False) is not None
     assert comm.should_custom_ar(inp[0]) == tuned
     if not tuned:
         return
@@ -295,11 +462,33 @@ def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
 
 
 @torch.inference_mode()
+def test_custom_all_reduce_tuned_ring() -> None:
+    """Where the tuned table picks ring_simple (or hier_ring_simple), eager calls launch it."""
+    comm = _init_comm_once()
+    comm.forced_algo = None
+    nbytes = 64 * 1024 * 1024
+    config = choose_algo(comm.config, nbytes, can_use_graph=False)
+    if config is None or not config.use_ring:
+        pytest.skip("the tuned table does not pick ring_simple on this system")
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+
+    def rank_input(rank: int) -> torch.Tensor:
+        gen = torch.Generator(device=device).manual_seed(rank)
+        shape = (2, nbytes // 2)
+        return torch.randint(0, 16, shape, generator=gen, device=device).bfloat16()
+
+    inp = rank_input(comm.rank)
+    assert comm.should_custom_ar(inp[0])
+    expected = sum(rank_input(r).float() for r in range(comm.world_size)).bfloat16()
+    torch.testing.assert_close(expected, _eager_all_reduce(comm, inp), atol=0, rtol=0)
+
+
+@torch.inference_mode()
 def test_custom_all_reduce_eager_plan_follows_config() -> None:
     """The cached eager launch is rebuilt when the config object is replaced."""
     nccl_group = _init_nccl_group_once()
     comm = _init_comm_once()
-    comm.override_algo = None
+    comm.forced_algo = None
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     inp = torch.randint(0, 16, (TEST_LAYERS, 1024), dtype=torch.bfloat16, device=device)
     assert comm.should_custom_ar(inp[0])  # cached under the tuned config

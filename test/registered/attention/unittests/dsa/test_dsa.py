@@ -254,8 +254,8 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
     # noise — same separation principle as the DSV4 SWA fixture so a
     # silent pack/write bug cannot corrupt both paths identically.
     #
-    # FP8 + `flashmla_sparse` prefill + EXTEND + non-empty prefix is the
-    # only combo that hits `TopkTransformMethod.RAGGED`
+    # FP8 + `flashmla_sparse` prefill + EXTEND (or MIXED) + non-empty prefix
+    # is the only combo that hits `TopkTransformMethod.RAGGED`
     # (`get_topk_transform_method`), which exercises
     # `dequantize_k_cache_paged_dsa` and the `topk_indices_offset` shift —
     # paths that the BF16 default suite never reaches.
@@ -303,6 +303,25 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                     else self.FP8_PREFILL_PAGED_CASE
                 )
                 run_dsa_sparse_fp8_prefill_case(self, case, dsa_prefill_backend=impl)
+
+    # --enable-mixed-chunk batch: one prefill chunk plus 1-token decode rows.
+    FP8_MIXED_CASE = DSAAttentionCase(
+        name="dsa_sparse_fp8_mixed_chunk",
+        backend="dsa",
+        forward_mode=ForwardMode.MIXED,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        prefix_lens=(2048, 2048, 2048),
+        extend_lens=(4, 1, 1),
+    )
+
+    def test_sparse_fp8_mixed_chunk_prefill_cases(self):
+        for impl in DSA_PREFILL_IMPL_VARIANTS:
+            with self.subTest(impl=impl):
+                run_dsa_sparse_fp8_prefill_case(
+                    self, self.FP8_MIXED_CASE, dsa_prefill_backend=impl
+                )
 
     def test_sparse_fp8_decode_cases(self):
         for impl in DSA_DECODE_IMPL_VARIANTS:

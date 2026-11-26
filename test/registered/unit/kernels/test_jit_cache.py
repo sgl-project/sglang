@@ -15,6 +15,8 @@ import sys
 import msgspec
 import pytest
 
+from sglang.kernels.jit.utils import arch
+from sglang.kernels.jit.utils.arch import CompileArch
 from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
@@ -153,6 +155,7 @@ def test_anchor_roots_are_symlink_resolved(tmp_path, monkeypatch):
         {"include_paths": ("/opt/extra",)},
         {"header_only": False, "cpp_files": ("/tmp/x.cpp",), "cpp_wrappers": ()},
         {"cuda_files": ("/tmp/x.cuh",), "cuda_units": (("UNIT=1",),)},
+        {"compile_arch": CompileArch(10, 0, "f")},
     ],
     ids=[
         "args",
@@ -163,6 +166,7 @@ def test_anchor_roots_are_symlink_resolved(tmp_path, monkeypatch):
         "includes",
         "mode",
         "units",
+        "compile_arch",
     ],
 )
 def test_build_key_separates_every_build_input(overrides):
@@ -368,6 +372,21 @@ def test_build_directory_entries_are_dropped(tmp_path):
     assert [entry.relpath for entry in entries] == [str(outside)]
 
 
+def test_build_directory_entries_are_dropped_behind_a_symlink(tmp_path):
+    """The staging dir's own files are dropped even behind a symlinked cache root.
+    Recorded, they vanish when the leaf is published, so the leaf never hits."""
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    (tmp_path / "cache").symlink_to(volume)
+    build_dir = tmp_path / "cache" / "build"
+    _write(build_dir / "cuda.cu", "// generated")
+    outside = _write(tmp_path / "real.h", "// real")
+    entries = cache._to_entries(
+        dependencies=[pathlib.Path("cuda.cu"), outside], build_dir=build_dir
+    )
+    assert [entry.relpath for entry in entries] == [str(outside)]
+
+
 def test_publish_loses_the_race_gracefully(tmp_path):
     """Two processes building identical content: the loser adopts the winner's leaf."""
     winner = tmp_path / "leaf"
@@ -557,6 +576,39 @@ def test_layout_is_readable_and_scoped_by_build_key():
     assert scope.name == "build-abc123"
     assert scope.parent.name == "sgl_kernel_jit_activation_bf16_t"
     assert scope.parent.parent.name == cache._target_tag()
+
+
+def test_a_family_target_compiles_and_caches_as_itself():
+    family = CompileArch(10, 0, "f")
+    assert "-gencode=arch=compute_100f,code=sm_100f" in ninja.generate(
+        _spec(compile_arch=family)
+    )
+    scope = cache.build_key_dir(
+        module_name="sgl_kernel_jit_activation_bf16_t", build_key="abc", arch=family
+    )
+    assert scope.parent.parent.name == "sm100f"
+
+
+@pytest.mark.parametrize(
+    "local, cuda, family",
+    [
+        (CompileArch(10, 3, "a"), (13, 1), CompileArch(10, 0, "f")),
+        (CompileArch(10, 0, "a"), (13, 1), CompileArch(10, 0, "f")),
+        (CompileArch(12, 1, "a"), (13, 1), CompileArch(12, 0, "f")),
+        (CompileArch(9, 0, "a"), (13, 1), CompileArch(9, 0, "a")),
+        (CompileArch(10, 3, "a"), (12, 8), CompileArch(10, 3, "a")),
+    ],
+)
+def test_cuda_arch_policy_resolves_the_family_target(monkeypatch, local, cuda, family):
+    monkeypatch.setattr(arch, "get_compile_arch", lambda kernel_name="": local)
+    monkeypatch.setattr(arch, "_jit_cuda_version", lambda: cuda)
+    monkeypatch.setattr(arch, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(arch, "is_musa_runtime", lambda: False)
+    monkeypatch.setattr(arch, "is_sail_runtime", lambda: False)
+    assert arch.resolve_compile_arch("specific") == local
+    assert arch.resolve_compile_arch("family") == family
+    with pytest.raises(ValueError, match="CUDA arch policy"):
+        arch.resolve_compile_arch("exact")
 
 
 def test_module_name_is_derived_from_the_args():

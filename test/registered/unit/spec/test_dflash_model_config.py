@@ -29,6 +29,8 @@ def single_rank_native():
             get_parallel().override(tp_size=1, tp_rank=0, tp_group=None),
             # CPU runners have no CUDA rope kernel; keep RoPE on the native path.
             patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True),
+            # The QK-norm reshape reads the CUDA graph config only on CUDA.
+            patch("sglang.srt.models.utils._is_cuda", False),
         ):
             yield
     finally:
@@ -213,6 +215,29 @@ def test_gemma_attention_and_npu_context_preparation_share_correct_qk_math(monke
 
     monkeypatch.setattr(attention.attn, "forward", capture_qkv)
     torch.testing.assert_close(attention(positions, hidden, None), expected_q)
+
+
+def test_npu_attention_projects_qkv_once_per_forward(monkeypatch):
+    """On NPU the draft attention must run a single QKV projection per call and
+    produce the same output as the default branch."""
+    attention = dflash.DFlashAttention(_config(use_gemma_norm=True), layer_id=0)
+    _load_norm(attention.q_norm)
+    _load_norm(attention.k_norm)
+    with torch.no_grad():
+        attention.qkv_proj.weight.copy_(torch.arange(128).reshape(16, 8) / 128)
+        attention.o_proj.weight.copy_(torch.eye(8))
+    hidden = torch.linspace(-1, 2, 16).reshape(2, 8)
+    positions = torch.tensor([1, 3])
+    monkeypatch.setattr(attention.attn, "forward", lambda q, k, v, forward_batch: q)
+    expected = attention(positions, hidden, None)
+
+    projections = []
+    attention.qkv_proj.register_forward_hook(
+        lambda module, args, output: projections.append(args[0])
+    )
+    monkeypatch.setattr(dflash, "_is_npu", True)
+    torch.testing.assert_close(attention(positions, hidden, None), expected)
+    assert len(projections) == 1
 
 
 def test_legacy_architecture_name_loads_the_generic_dflash2_state():
