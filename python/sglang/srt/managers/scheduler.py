@@ -6232,8 +6232,8 @@ class Scheduler(
                 # Their steps are counted through the batches above.
                 ListKind.DECODING,
                 ListKind.PREFILL_LAUNCHED,
-                # Only the part the last round ran is counted, via last_batch.
-                ListKind.DLLM,
+                # ListKind.DLLM stays busy: its requests hold KV and prefix
+                # locks between rounds, and a round may schedule none of them.
                 # Held across a weight update, whose cache flush needs idle.
                 ListKind.PD_HELD,
                 # Counted by uocr blocks_flush below.

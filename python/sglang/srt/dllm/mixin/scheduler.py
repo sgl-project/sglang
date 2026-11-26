@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Set
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.req_types import FINISH_LENGTH
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, retract_all
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -72,9 +72,27 @@ class SchedulerDllmMixin:
 
         # Process batches
         forward_mode = self._process_dllm_batches(adder, running_batch=running_batch)
+        if not adder.can_run_list and self.dllm_manager.get_prefill_requests():
+            # A prefill round that admitted nothing must not leave the waiting
+            # denoise blocks without a round.
+            decode_reqs = self.dllm_manager.get_decode_requests()
+            if decode_reqs:
+                running_batch.batch_is_full = False
+                adder = self._create_dllm_prefill_adder(
+                    running_bs, running_batch=running_batch
+                )
+                self.dllm_manager.last_add_result = self._process_batch_by_phase(
+                    adder,
+                    decode_reqs,
+                    DllmReqPhase.STAGING_DECODE,
+                    DllmReqPhase.INCOMING_DECODE,
+                    running_batch=running_batch,
+                )
+                forward_mode = ForwardMode.DLLM_EXTEND
 
         can_run_list = adder.can_run_list
         if not can_run_list:
+            self._retract_stuck_dllm_req(running_batch)
             return None
 
         # Record metrics and update state
@@ -238,6 +256,44 @@ class SchedulerDllmMixin:
             # releases its KV and tree lock through it.
             self.stash_chunked_request(req)
 
+    def _retract_stuck_dllm_req(self: Scheduler, running_batch: ScheduleBatch) -> None:
+        """Break a KV deadlock among the requests parked in the dLLM queue.
+
+        Admitted dLLM requests keep their rows (partial context, FDFO blocks)
+        between rounds, and admission does not reserve their remaining demand,
+        so concurrent long prompts can fill the pool with partial contexts that
+        none of them can extend. When a round admits nothing for lack of KV,
+        retract the most recently admitted holder (re-queued, re-prefilled
+        later) so the earlier ones can progress. A sole holder is left alone:
+        retracting it frees nothing another holder could use.
+        """
+        if self.dllm_manager.last_add_result != AddReqResult.NO_TOKEN:
+            return
+        if not running_batch.is_empty():
+            return
+        holders = [
+            r
+            for r in self.dllm_manager.waiting_queue
+            if r.kv.holds_kv and not r.finished()
+        ]
+        if len(holders) < 2:
+            return
+        victim = holders[-1]
+        logger.warning(
+            "dLLM KV cache pool is full and no request can progress; "
+            f"retracting {victim.rid=} ({len(holders)} requests hold KV)."
+        )
+        reqs_to_abort = retract_all(
+            reqs=[victim],
+            tree_cache=self.tree_cache,
+            request_retirer=self.request_retirer,
+            offload_kv=False,
+        )
+        if victim in reqs_to_abort:
+            self.request_retirer.abort_retracted(victim, reason=victim.to_finish)
+        else:
+            self._add_request_to_queue(victim, is_retracted=True)
+
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
         max_dllm_capacity = self.dllm_config.max_running_requests - len(
@@ -292,7 +348,7 @@ class SchedulerDllmMixin:
         # Try prefill batch first
         prefill_reqs = self.dllm_manager.get_prefill_requests()
         if prefill_reqs:
-            self._process_batch_by_phase(
+            self.dllm_manager.last_add_result = self._process_batch_by_phase(
                 adder,
                 prefill_reqs,
                 DllmReqPhase.STAGING_PREFILL,
@@ -307,7 +363,7 @@ class SchedulerDllmMixin:
         else:
             # Fall back to decode batch
             decode_reqs = self.dllm_manager.get_decode_requests()
-            self._process_batch_by_phase(
+            self.dllm_manager.last_add_result = self._process_batch_by_phase(
                 adder,
                 decode_reqs,
                 DllmReqPhase.STAGING_DECODE,
@@ -323,19 +379,20 @@ class SchedulerDllmMixin:
         staging_phase: DllmReqPhase,
         incoming_phase: DllmReqPhase,
         running_batch: ScheduleBatch,
-    ) -> None:
+    ) -> AddReqResult:
         """Process a batch, separating staging and incoming requests."""
         staging_reqs = [req for req in batch if req.dllm_phase == staging_phase]
         if staging_reqs:
             staging_result = self.process_dllm_staging_reqs(adder, staging_reqs)
             if staging_result != AddReqResult.CONTINUE:
-                return
+                return staging_result
 
         incoming_reqs = [req for req in batch if req.dllm_phase == incoming_phase]
         if incoming_reqs:
-            self.process_dllm_incoming_reqs(
+            return self.process_dllm_incoming_reqs(
                 adder, incoming_reqs, running_batch=running_batch
             )
+        return AddReqResult.CONTINUE
 
     def _update_state_for_batch(self: Scheduler, adder: PrefillAdder) -> None:
         """Update state for the batch."""
@@ -441,6 +498,8 @@ class DllmManager:
         self.dllm_config = dllm_config
         self.waiting_queue = IndexedReqList(ListKind.DLLM, abort=self._abort)
         self._abort_one = abort
+        # The admission result of the last round (NO_TOKEN: out of KV).
+        self.last_add_result = AddReqResult.CONTINUE
 
     def get_prefill_requests(self) -> List[Req]:
         """Get all prefill requests from waiting queue."""
