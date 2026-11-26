@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     bind_thread_to_device,
     build_dcp_token_transfer_plan,
+    contiguous_runs,
     group_concurrent_contiguous,
     pack_int_lists,
     run_on_device,
@@ -1379,18 +1380,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ``dst_device_entries`` lists the destination entries that use
         ``dst_device_data_indices``.
         """
-        # Host and device buffers may use different destination page spaces.
-        # Build both transfer plans once, then select per destination buffer.
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_data_indices, dst_data_indices
-        )
-        device_prefill_kv_blocks = device_dst_kv_blocks = None
-        if dst_device_data_indices is not None:
-            device_prefill_kv_blocks, device_dst_kv_blocks = (
-                group_concurrent_contiguous(
-                    prefill_data_indices, dst_device_data_indices
-                )
+
+        # Scattered pages yield one run per page, so list grouping causes GC churn.
+        def units_for(index_slice: slice) -> tuple:
+            def to_units(src_indices, dst_indices) -> npt.NDArray[np.uint64]:
+                runs = contiguous_runs(src_indices, dst_indices)
+                return np.stack(runs, axis=1).astype(np.uint64)
+
+            # Host and device buffers may use different destination page spaces.
+            kv_units = to_units(
+                prefill_data_indices[index_slice], dst_data_indices[index_slice]
             )
+            device_kv_units = None
+            if dst_device_data_indices is not None:
+                device_kv_units = to_units(
+                    prefill_data_indices[index_slice],
+                    dst_device_data_indices[index_slice],
+                )
+            return kv_units, device_kv_units
+
+        # Build both transfer plans once, then select per destination buffer.
+        units = units_for(slice(None))
 
         # Skipped once registration has cleared this peer's layout.
         if (
@@ -1428,40 +1438,45 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         if layers_params is None:
             return -1
+        # A negative page id would wrap to a huge uint64 offset.
+        for dst_indices in (dst_data_indices, dst_device_data_indices):
+            if (
+                dst_indices is not None
+                and prefill_data_indices.size
+                and dst_indices.size
+                and min(prefill_data_indices.min(), dst_indices.min()) < 0
+            ):
+                raise OverflowError("negative page index in a KV transfer")
 
-        kv_units = group_units(prefill_kv_blocks, dst_kv_blocks)
-        device_kv_units = (
-            group_units(device_prefill_kv_blocks, device_dst_kv_blocks)
-            if device_prefill_kv_blocks is not None
-            else None
-        )
-
-        def layer_copy(src_entry: int, dst_entry: int, item_len: int, units) -> Copy:
+        def make_layer_copy(
+            src_entry: int, dst_entry: int, item_len: int, units: tuple
+        ) -> Copy:
+            kv_units, device_kv_units = units
+            if dst_device_entries and dst_entry in dst_device_entries:
+                assert device_kv_units is not None
+                kv_units = device_kv_units
             return Copy(
                 src=src_keys[src_entry],
                 dst=dst_keys[dst_entry],
-                ranges=units * item_len,
+                ranges=kv_units * item_len,
             )
 
-        def make_layer_copy(src_entry: int, dst_entry: int, item_len: int) -> Copy:
-            if dst_device_entries and dst_entry in dst_device_entries:
-                assert device_kv_units is not None
-                units = device_kv_units
-            else:
-                units = kv_units
-            return layer_copy(src_entry, dst_entry, item_len, units)
-
         # Worker function for processing a single layer
-        def process_layer(src_entry: int, dst_entry: int, item_len: int) -> int:
+        def process_layer(
+            src_entry: int, dst_entry: int, item_len: int, units: tuple
+        ) -> int:
             return self._transfer_copies(
-                mooncake_session_id, [make_layer_copy(src_entry, dst_entry, item_len)]
+                mooncake_session_id,
+                [make_layer_copy(src_entry, dst_entry, item_len, units)],
             )
 
         # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
+        def process_layers(
+            layers_params: List[Tuple[int, int, int]], units: tuple
+        ) -> int:
             return self._transfer_copies(
                 mooncake_session_id,
-                [make_layer_copy(*params) for params in layers_params],
+                [make_layer_copy(*params, units) for params in layers_params],
             )
 
         if (
@@ -1469,7 +1484,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
             futures = [
-                executor.submit(process_layer, *params) for params in layers_params
+                executor.submit(process_layer, *params, units)
+                for params in layers_params
             ]
             return self._await_transfer_futures(futures)
         else:
@@ -1478,53 +1494,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # users explicitly opt in to bounded index batches.
             max_batch_indices = self.max_transfer_batch_indices
             if max_batch_indices <= 0 or prefill_data_indices.size <= max_batch_indices:
-                return process_layers(layers_params)
-
-            def process_index_batch(
-                prefill_blocks,
-                dst_blocks,
-                device_prefill_blocks=None,
-                device_dst_blocks=None,
-            ) -> int:
-                units = group_units(prefill_blocks, dst_blocks)
-                device_units = (
-                    group_units(device_prefill_blocks, device_dst_blocks)
-                    if device_prefill_blocks is not None
-                    else None
-                )
-                copies = []
-                for src_entry, dst_entry, item_len in layers_params:
-                    if dst_device_entries and dst_entry in dst_device_entries:
-                        assert device_units is not None
-                        copies.append(
-                            layer_copy(src_entry, dst_entry, item_len, device_units)
-                        )
-                    else:
-                        copies.append(layer_copy(src_entry, dst_entry, item_len, units))
-                return self._transfer_copies(mooncake_session_id, copies)
+                return process_layers(layers_params, units)
 
             for start in range(
                 0,
                 prefill_data_indices.size,
                 max_batch_indices,
             ):
-                batch_prefill_blocks, batch_dst_blocks = group_concurrent_contiguous(
-                    prefill_data_indices[start : start + max_batch_indices],
-                    dst_data_indices[start : start + max_batch_indices],
-                )
-                batch_device_prefill_blocks = batch_device_dst_blocks = None
-                if dst_device_data_indices is not None:
-                    batch_device_prefill_blocks, batch_device_dst_blocks = (
-                        group_concurrent_contiguous(
-                            prefill_data_indices[start : start + max_batch_indices],
-                            dst_device_data_indices[start : start + max_batch_indices],
-                        )
-                    )
-                ret = process_index_batch(
-                    batch_prefill_blocks,
-                    batch_dst_blocks,
-                    batch_device_prefill_blocks,
-                    batch_device_dst_blocks,
+                ret = process_layers(
+                    layers_params,
+                    units_for(slice(start, start + max_batch_indices)),
                 )
                 if ret != 0:
                     return ret

@@ -162,6 +162,26 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
+def contiguous_runs(
+    src_indices: npt.NDArray[np.integer], dst_indices: npt.NDArray[np.integer]
+) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """The runs of group_concurrent_contiguous as (src starts, dst starts,
+    lengths) arrays, without one Python list per run."""
+    src = np.asarray(src_indices, dtype=np.int64)
+    dst = np.asarray(dst_indices, dtype=np.int64)
+    if src.size == 0 or dst.size == 0:
+        return (np.empty((0,), dtype=np.int64),) * 3
+    if src.size != dst.size:
+        raise ValueError(
+            "contiguous_runs requires equal-length src/dst index arrays, "
+            f"got {src.size} and {dst.size}"
+        )
+    brk = np.flatnonzero((np.diff(src) != 1) | (np.diff(dst) != 1)) + 1
+    starts = np.concatenate(([0], brk))
+    lengths = np.diff(np.concatenate((starts, [src.size])))
+    return src[starts], dst[starts], lengths
+
+
 @dataclasses.dataclass(frozen=True)
 class DCPTokenTransferPlan:
     target_src_token_indices: npt.NDArray[np.int64]
