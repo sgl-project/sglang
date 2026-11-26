@@ -5,8 +5,10 @@ from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe.gate_topk import fpval_to_key, key_to_indx
+from sglang.srt.utils import is_hip
 
 PDL = is_arch_support_pdl()
+_is_hip = is_hip()
 
 ROUTE_MAX_ROWS = 512
 ROUTE_MAX_IDS = 4096
@@ -32,10 +34,36 @@ def _route_topk(
     TOPK_POW2: tl.constexpr,
     BLOCK_N: tl.constexpr,
     RENORM: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
-    row = tl.program_id(0)
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    _topk_row(
+        P, Bias, Logits, Ids, Weights, GlobalScale, route_scale, M,
+        tl.program_id(0), N, GROUPS, HAS_BIAS, TOPK, TOPK_POW2, BLOCK_N, RENORM,
+    )  # fmt: skip
+
+
+@triton.jit
+def _topk_row(
+    P,
+    Bias,
+    Logits,
+    Ids,
+    Weights,
+    GlobalScale,
+    route_scale,
+    M,
+    row,
+    N: tl.constexpr,
+    GROUPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    TOPK: tl.constexpr,
+    TOPK_POW2: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    RENORM: tl.constexpr,
+):
     cols = tl.arange(0, BLOCK_N)
     mask = cols < N
     logits = tl.load(P + row * N + cols, mask, other=0)
@@ -120,7 +148,7 @@ def route_topk(partials, bias, topk, route_scale=None, global_scale=None):
             triton.next_power_of_2(n),
             fuse_renorm,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **({"USE_PDL": True, "launch_pdl": True} if PDL else {}),
         )
     if fuse_renorm:
         return logits, ids, weights
@@ -149,9 +177,41 @@ def _route_metadata(
     BLOCK_M: tl.constexpr,
     SEARCH_N: tl.constexpr,
     SEARCH_E: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    _metadata(
+        Ids, Weights, SortedIds, Src2Dst, Dst2Src, Gammas, Counts, Offsets,
+        BlockOffsets, Schedule, n, start, max_blocks, E, BLOCK_N, BLOCK_E, BLOCK_S,
+        BLOCK_M, SEARCH_N, SEARCH_E,
+    )  # fmt: skip
+
+
+@triton.jit
+def _metadata(
+    Ids,
+    Weights,
+    SortedIds,
+    Src2Dst,
+    Dst2Src,
+    Gammas,
+    Counts,
+    Offsets,
+    BlockOffsets,
+    Schedule,
+    n,
+    start,
+    max_blocks,
+    E: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    SEARCH_N: tl.constexpr,
+    SEARCH_E: tl.constexpr,
+):
     offs = tl.arange(0, BLOCK_N)
     mask = offs < n
     ids = tl.load(Ids + offs, mask, other=65535)
@@ -229,7 +289,7 @@ def route_metadata(ids, weights, start, num_local, num_experts, block_size_m=128
     offsets = torch.empty(num_local + 1, device=device, dtype=torch.int32)
     block_offsets = torch.empty(num_local + 1, device=device, dtype=torch.int32)
     schedule = torch.empty(max_blocks, device=device, dtype=torch.int32)
-    if n > ROUTE_CUDA_MIN_IDS:
+    if n > ROUTE_CUDA_MIN_IDS and not _is_hip:
         _route_module().route_metadata(
             ids,
             weights,
@@ -269,8 +329,9 @@ def route_metadata(ids, weights, start, num_local, num_experts, block_size_m=128
             block_size_m,
             block_n.bit_length(),
             block_e.bit_length(),
-            num_warps=min(32, max(4, block_n // 128)),
-            launch_pdl=PDL,
+            # ROCm workgroups hold at most 16 wavefronts.
+            num_warps=min(16 if _is_hip else 32, max(4, block_n // 128)),
+            **({"USE_PDL": True, "launch_pdl": True} if PDL else {}),
         )
     return (
         src2dst,
