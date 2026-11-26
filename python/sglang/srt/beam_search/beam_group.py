@@ -135,7 +135,7 @@ class BeamGroup:
         return held - (end - start)
 
     def decode_slot_budget(self) -> Optional[int]:
-        """Unallocated decode slots needed to finish, for fixed-length (trie)
+        """Unallocated decode slots needed to finish, for fixed-length
         groups that never stop early; None defers to the generic estimate,
         also once the group has retired."""
         if not self.device_history or self.retired:
@@ -242,8 +242,9 @@ class BeamGroup:
     def _commit_final(self, sel: FinalSelect) -> bool:
         new_len = self.num_committed + 1
         if self.device_history:
-            parent_idx = sel.parent_idx
-            reversed_tokens = [sel.tokens]
+            # Fixed-length final candidates are already in descending score order.
+            parent_idx = sel.parent_idx[: self.num_return]
+            reversed_tokens = [sel.tokens[: self.num_return]]
             for tokens, parents in zip(
                 reversed(self._device_tokens),
                 reversed(self._device_parents),
@@ -254,7 +255,7 @@ class BeamGroup:
                 list(reversed(reversed_tokens)),
                 dim=1,
             )
-            self._device_final_cum_logprobs = sel.cum_logprobs
+            self._device_final_cum_logprobs = sel.cum_logprobs[: self.num_return]
             self._device_tokens.clear()
             self._device_parents.clear()
             self.num_committed = new_len
@@ -295,14 +296,14 @@ class BeamGroup:
         return cum_logprob / (num_tokens**self.length_penalty)
 
     def finalize(self) -> List[BeamResult]:
-        """Materialize the top beam_width sequences, best score first."""
+        """Materialize the best sequences in descending score order."""
         assert self.state == BeamGroupState.FINISHED
         if self.device_history:
             assert self._device_final_tokens is not None
             assert self._device_final_cum_logprobs is not None
             token_rows = self._device_final_tokens.tolist()
             cum_logprobs = self._device_final_cum_logprobs.tolist()
-            results = [
+            return [
                 BeamResult(
                     tokens=tokens,
                     cum_logprob=cum_logprob,
@@ -311,8 +312,6 @@ class BeamGroup:
                 )
                 for tokens, cum_logprob in zip(token_rows, cum_logprobs)
             ]
-            results.sort(key=lambda r: r.beam_score, reverse=True)
-            return results[: self.beam_width]
 
         results = [
             BeamResult(

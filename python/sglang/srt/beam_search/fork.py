@@ -119,6 +119,33 @@ def remap_kv_mapping(
     return old_mapping, new_mapping
 
 
+def plan_state_forks(
+    *,
+    slots: torch.Tensor,
+    parents: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Give one child each parent's slot and use dead slots for its siblings."""
+    width = slots.numel()
+    rows = torch.arange(width, dtype=parents.dtype, device=parents.device)
+    first_child = torch.full_like(rows, width).scatter_reduce_(
+        0, parents, rows, reduce="amin"
+    )
+    inherits = first_child[parents] == rows
+    dead = first_child == width
+    # Pack dead rows by prefix sum without synchronizing for a dynamic shape.
+    dead_rank = dead.cumsum(0) - 1
+    dead_rows = rows.new_zeros(width + 1)
+    dead_rows.scatter_(0, torch.where(dead, dead_rank, width), rows)
+    clone_rank = (~inherits).cumsum(0) - 1
+    src = slots[parents]
+    dst = slots[dead_rows[clone_rank.clamp_min(0)]]
+    return (
+        torch.where(inherits, src, dst),
+        torch.where(inherits, 0, src),
+        torch.where(inherits, 0, dst),
+    )
+
+
 def collect_orphan_slots(old_mapping: torch.Tensor, new_mapping: torch.Tensor):
     """Slots referenced before the remap and by nobody after it. Data-dependent
     shape (unique/isin), so it synchronizes -- keep it off the launch path."""

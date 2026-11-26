@@ -113,9 +113,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # defaults.
 
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
-        from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+        from sglang.srt.mem_cache.prefill_budget import (
+            PrefillBudget,
+            StaticStatePrefillBudget,
+        )
 
-        return PrefillBudget(
+        budget_cls = (
+            StaticStatePrefillBudget if self.state is not None else PrefillBudget
+        )
+        return budget_cls(
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 

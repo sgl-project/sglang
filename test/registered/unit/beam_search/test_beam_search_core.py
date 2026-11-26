@@ -253,6 +253,24 @@ class TestBeamGroup(CustomTestCase):
         group2 = self._make_group(length_penalty=1.0)
         self.assertAlmostEqual(group2.beam_score(-0.3, 2), -0.15, places=6)
 
+    def test_fixed_length_returns_top_n_without_pruning_the_frontier(self):
+        group = self._make_group(
+            stop_token_ids=[], max_new_tokens=2, num_return=1, device_history=True
+        )
+        first = run_select([0.0], [[-0.1, -0.2]], [[11, 12]], set(), 2)
+        self.assertFalse(group.advance(first))
+        self.assertEqual(group.frontier_cum_logprobs.numel(), 2)
+        final = select_final_topk(
+            group.frontier_cum_logprobs,
+            T([[-1.0, -1.1], [-0.1, -0.3]], torch.float32),
+            T([[21, 22], [31, 32]], torch.int64),
+            2,
+        )
+        self.assertTrue(group.advance_final(final))
+        results = group.finalize()
+        self.assertEqual([result.tokens for result in results], [[12, 31]])
+        self.assertAlmostEqual(results[0].beam_score, -0.15)
+
     def test_out_of_vocab_stop_ids_are_dropped(self):
         """Out-of-vocab stop ids never match and must not break the group's tensor."""
         from sglang.srt.beam_search.coordinator import BeamCoordinator

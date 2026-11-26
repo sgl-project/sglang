@@ -12,6 +12,7 @@ from sglang.srt.beam_search.fork import (
     collect_orphan_slots,
     free_member_rows,
     neutral_member_sampling_params,
+    plan_state_forks,
     remap_kv_mapping,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -106,6 +107,30 @@ class TestAliasMembersPromptKV(CustomTestCase):
         self.assertTrue(torch.equal(req_to_token[1, :5], leader_prompt))
         self.assertTrue(torch.equal(req_to_token[2, :5], leader_prompt))
         self.assertTrue(torch.equal(req_to_token[1:, 5:], tails_before))
+
+
+class TestRecurrentStateFork(CustomTestCase):
+    def test_repeated_parents_inherit_private_state(self):
+        # The first reparent changes which slot the leader runs in. The next
+        # step must read that remap, not the leader's original slot.
+        slots = torch.tensor([5, 3, 2, 7, 1], dtype=torch.int64)
+        allocated = slots.sort().values
+        state = torch.arange(8)
+        for parents, copies_needed in [
+            ([2, 2, 0, 2, 4], 2),
+            ([1, 3, 0, 2, 4], 0),
+            ([0, 0, 0, 0, 0], 4),
+        ]:
+            parents = torch.tensor(parents)
+            expected = state[slots[parents]]
+            slots, src, dst = plan_state_forks(slots=slots, parents=parents)
+            copied = src != dst
+            self.assertEqual(int(copied.sum()), copies_needed)
+            self.assertFalse(torch.isin(src[copied], dst[copied]).any())
+            state[dst[copied]] = state[src[copied]]
+            torch.testing.assert_close(slots.sort().values, allocated)
+            torch.testing.assert_close(state[slots], expected)
+            state[slots] += torch.arange(slots.numel())
 
 
 class _FakeReqToTokenPool:

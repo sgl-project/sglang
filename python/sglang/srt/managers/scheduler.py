@@ -4524,8 +4524,8 @@ class Scheduler(
         )
         res = min(pp_budget, row_budget)
         if beam_width is not None:
-            # A beam candidate owns beam_width rows once decoding.
-            res = min(res, row_budget // beam_width)
+            # Earlier beams already had their member rows subtracted above.
+            res = min(res, max(row_budget - (beam_width - 1), 0))
 
         return res
 

@@ -28,7 +28,6 @@ from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -53,10 +52,17 @@ def enabled() -> bool:
     return envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.get()
 
 
+def has_metadata(forward_batch: ForwardBatch) -> bool:
+    return (
+        forward_batch.beam is not None
+        and forward_batch.beam.attention_metadata is not None
+    )
+
+
 def _unsupported_reason(model_runner: ModelRunner) -> Optional[str]:
     from sglang.srt.configs.model_config import AttentionArch
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.runtime_context import get_exec
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
     if model_runner.decode_attention_backend_str != "flashinfer":
         return "the decode attention backend is not FlashInfer"
@@ -64,8 +70,15 @@ def _unsupported_reason(model_runner: ModelRunner) -> Optional[str]:
         return "sliding-window attention is not supported"
     if model_runner.model_config.is_encoder_decoder:
         return "encoder-decoder models are not supported"
-    if model_runner.model_config.attention_arch != AttentionArch.MHA:
-        return "only MHA attention is supported"
+    if model_runner.model_config.attention_arch not in (
+        AttentionArch.MHA,
+        AttentionArch.MLA,
+    ):
+        return "only dense MHA and MLA attention are supported"
+    if get_parallel().dcp_enabled:
+        return "decode context parallelism is not supported"
+    if model_runner.token_to_kv_pool_allocator.storage is not None:
+        return "unified memory uses virtual KV slot ids"
     if model_runner.kv_cache_dtype not in (torch.float16, torch.bfloat16):
         return "the KV cache dtype must be float16 or bfloat16"
     if get_exec().overlap.enable_two_batch_overlap:
@@ -74,8 +87,6 @@ def _unsupported_reason(model_runner: ModelRunner) -> Optional[str]:
         if isinstance(module, RadixAttention):
             if module.logit_cap > 0:
                 return "attention logit caps are not supported"
-            if module.v_head_dim != module.head_dim:
-                return "v_head_dim differs from head_dim"
     return None
 
 
@@ -214,26 +225,22 @@ def build_metadata(
 
 
 def forward(
+    *,
     q: torch.Tensor,
     layer: RadixAttention,
     forward_batch: ForwardBatch,
-    kv_layers: KVLayerRouter,
-) -> Optional[torch.Tensor]:
-    if forward_batch.beam is None:
-        return None
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+) -> torch.Tensor:
+    assert forward_batch.beam is not None
     metadata = forward_batch.beam.attention_metadata
-    if metadata is None:
-        return None
-    assert layer.logit_cap == 0
-
-    k_buffer, v_buffer = kv_layers.read(layer.layer_id).kv()
-    if k_buffer.ndim != 3 or v_buffer.ndim != 3:
-        raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
+    assert metadata is not None and layer.logit_cap == 0
 
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim
     flat_q = q.contiguous().view(metadata.num_rows, q_heads, head_dim)
-    output = torch.empty_like(flat_q)
+    value_dim = layer.v_head_dim
+    output = q.new_empty((metadata.num_rows, q_heads, value_dim))
     from sglang.kernels.ops.attention.beam_shared_context import (
         shared_context_attention,
     )
@@ -251,4 +258,4 @@ def forward(
             output=output,
             softmax_scale=layer.scaling,
         )
-    return output.view(-1, q_heads * head_dim)
+    return output.view(-1, q_heads * value_dim)

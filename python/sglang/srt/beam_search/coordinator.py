@@ -38,7 +38,7 @@ tick. Commits are tick-gated; BeamGroup.commit_pending documents why.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Sequence
 
 import msgspec
 import torch
@@ -51,6 +51,7 @@ from sglang.srt.beam_search.fork import (
     collect_orphan_slots,
     free_member_rows,
     neutral_member_sampling_params,
+    plan_state_forks,
     remap_kv_mapping,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
@@ -65,15 +66,17 @@ from sglang.srt.managers.req_types import (
     FINISH_MATCHED_TOKEN,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
-    get_schedule,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.batch_tail import BeamTail
+    from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
     from sglang.srt.beam_search.selection_cuda_graph import TrieSelectionGraphCache
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -84,20 +87,50 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# FP32 scores plus int64 token ids: cap the merged candidate payload at 48 MiB.
+_MAX_BATCHED_TOPK_CANDIDATES = 1 << 22
 
-def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
+
+class _StateFork(NamedTuple):
+    src: torch.Tensor
+    dst: torch.Tensor
+
+
+def _streamed_topk_logprobs(
+    logits: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from sglang.srt.layers.logsumexp import (
+        FUSED_TOPK_MAX_K,
+        row_logsumexp,
+        row_logsumexp_topk,
+    )
+
+    if k <= FUSED_TOPK_MAX_K:
+        row_max, log_sum, vals, tokens = row_logsumexp_topk(logits, k)
+    else:
+        row_max, log_sum = row_logsumexp(logits)
+        vals, tokens = torch.topk(logits, k, dim=-1)
+    return (vals.float() - row_max[:, None]) - log_sum[:, None], tokens
+
+
+def _rows_topk_logprobs(
+    pieces: Sequence[torch.Tensor], num_candidates: int, *, stream_normalizer: bool
+):
     # One logsumexp per piece: it is not batch-invariant on CUDA, and folding
     # pieces shifts the leader's lse by an ulp, flipping near-equal beams.
     vals, toks = [], []
     for piece in pieces:
         if piece.shape[0] == 0:
             continue
-        x = piece.float()
-        # lse instead of a full [rows, vocab] log_softmax; topk order on raw
-        # logits is identical under the monotone shift.
-        lse = torch.logsumexp(x, dim=-1, keepdim=True)
-        v, t = torch.topk(x, num_candidates, dim=-1)
-        vals.append(v - lse)
+        if stream_normalizer and piece.is_cuda:
+            # Avoid a full-vocabulary fp32 temporary on wide fixed-length beams.
+            v, t = _streamed_topk_logprobs(piece, num_candidates)
+            vals.append(v)
+        else:
+            x = piece.float()
+            lse = torch.logsumexp(x, dim=-1, keepdim=True)
+            v, t = torch.topk(x, num_candidates, dim=-1)
+            vals.append(v - lse)
         toks.append(t)
     return torch.cat(vals), torch.cat(toks)
 
@@ -149,7 +182,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return "Beam search is not supported with speculative decoding."
         if get_disagg().disaggregation_mode != "null":
             return "Beam search is not supported with PD disaggregation."
-        if get_schedule().page_size > 1:
+        if self.token_to_kv_pool_allocator.page_size != 1:
             return "Beam search currently requires --page-size 1."
         if self.dllm_enabled:
             return "Beam search is not supported with diffusion LLM."
@@ -165,8 +198,14 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return "Beam search is not supported with hierarchical cache."
         if self.model_config.is_encoder_decoder:
             return "Beam search is not supported with encoder-decoder models."
-        if self.tree_cache.supports_swa() or self.tree_cache.supports_mamba():
-            return "Beam search is not supported with SWA/mamba hybrid caches."
+        if self.tree_cache.supports_swa():
+            return "Beam search is not supported with sliding-window caches."
+        state = self.token_to_kv_pool_allocator.state
+        if state is not None and (
+            not isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            or state.own_state is not None
+        ):
+            return "Recurrent beam search requires a static, slot-backed state pool."
 
         if req.session_id is not None or recv_req.session_params is not None:
             return "Beam search is not supported for session requests."
@@ -222,28 +261,40 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 f"Beam search needs at least 1 generated token within the "
                 f"context budget (prompt_len={prompt_len}, max_req_len={self.max_req_len})."
             )
+        if state is not None:
+            member_slots = beam_width - 1 if max_new_tokens > 1 else 0
+            required_slots = member_slots + state.fresh_request_slots(
+                self.req_to_token_pool
+            )
+            if required_slots > state.slots.size:
+                return (
+                    f"beam_width ({beam_width}) needs {required_slots} recurrent state "
+                    f"slots but the pool holds only {state.slots.size}. Increase "
+                    "--max-mamba-cache-size or reduce beam_width."
+                )
         stop_token_ids = self._collect_stop_token_ids(
             req, user_params, vocab_size=self.model_config.vocab_size
         )
+        fixed_length = self.trie_constraint is not None or (
+            state is not None and not stop_token_ids
+        )
+        if fixed_length:
+            required_kv_slots = prompt_len + beam_width * (max_new_tokens - 1)
+            if required_kv_slots + self.token_to_kv_pool_allocator.page_size >= (
+                self.token_to_kv_pool_allocator.size
+            ):
+                return (
+                    f"beam_width ({beam_width}) with prompt length {prompt_len} and "
+                    f"max_new_tokens {max_new_tokens} needs up to {required_kv_slots} "
+                    f"KV slots, but the pool holds only "
+                    f"{self.token_to_kv_pool_allocator.size}."
+                )
         if self.trie_constraint is not None:
             config = self.trie_constraint.config
             if max_new_tokens != config.num_codebooks:
                 return (
                     "Trie-conditioned beam output requires max_new_tokens == "
                     f"{config.num_codebooks}; got {max_new_tokens}."
-                )
-            # Trie groups always decode max_new_tokens steps, so this bound is exact.
-            required_kv_slots = (
-                prompt_len
-                + beam_width * max(max_new_tokens - 1, 0)
-                + self.token_to_kv_pool_allocator.page_size
-            )
-            if required_kv_slots >= self.token_to_kv_pool_allocator.size:
-                return (
-                    f"beam_width ({beam_width}) with prompt length {prompt_len} and "
-                    f"max_new_tokens {max_new_tokens} needs up to {required_kv_slots} "
-                    f"KV slots, but the pool holds only "
-                    f"{self.token_to_kv_pool_allocator.size}."
                 )
             expandable_capacity = min(self.trie_constraint.level_cardinalities[1:])
             if beam_width > expandable_capacity:
@@ -267,7 +318,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # Frontier state lives on device: selection consumes device top-2k
             # tensors in place; only k-sized results ever reach the host.
             device=self.req_to_token_pool.device,
-            device_history=self.trie_constraint is not None,
+            device_history=fixed_length,
         )
         if self.trie_constraint is not None:
             group.trie_prefix_codes = torch.empty(
@@ -285,6 +336,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         neutral.no_stop_trim = user_params.no_stop_trim
         req.sampling_params = neutral
         req.beam_group = group
+        if state is not None:
+            req.kv.beam_mamba_slot_count = member_slots
         # The leader's decode suffix is a beam path, never a tree entry; this
         # also skips the prefill-time unfinished insert.
         req.skip_radix_cache_insert = True
@@ -345,6 +398,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                     capture.leader_rows if capture is not None else ()
                 )
             }
+            state_forks: list[_StateFork] = []
             for i, req in enumerate(batch.reqs):
                 group = req.beam_group
                 if (
@@ -360,9 +414,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                     "beam leader prefill logits were not captured pre-sample "
                     "(worker capture_pre_sample_logits wiring)"
                 )
-                self.select_leader_prefill(
+                state_fork = self.select_leader_prefill(
                     req, leader_pos[i], logits_output, tick=batch.forward_iter
                 )
+                if state_fork is not None:
+                    state_forks.append(state_fork)
+            self._copy_state_forks(state_forks)
 
     def select_leader_prefill(
         self,
@@ -370,7 +427,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         pos: int,
         logits_output: LogitsProcessorOutput,
         tick: int = 0,
-    ) -> None:
+    ) -> Optional[_StateFork]:
         """Launch half of the leader's prefill tick: first selection, member-row
         spawn, and the relay overwrite (the sampled token is void)."""
         group: BeamGroup = req.beam_group
@@ -388,10 +445,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # Prefill-terminated (max_new_tokens == 1): no spawn, but the relay
             # slot still needs a token so an overshoot step has a valid input.
             self._stash_next_tokens([req.kv.req_pool_idx], next_tokens[:1])
-            return
-        self._spawn_member_rows(group, req)
+            return None
+        state_fork = self._spawn_member_rows(group, req)
         req.output_ids.append(0)  # length placeholder; DAG owns history
         self._stash_next_tokens(group.all_rows, next_tokens)
+        return state_fork
 
     def commit_prefill(self, req: Req, up_to_tick: Optional[int] = None) -> None:
         """Deferred half of the leader's prefill tick: fold the staged selection
@@ -404,7 +462,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if group.commit_pending(up_to_tick):
             self._finish_group(group)
 
-    def _spawn_member_rows(self, group: BeamGroup, leader: Req) -> None:
+    def _spawn_member_rows(self, group: BeamGroup, leader: Req) -> Optional[_StateFork]:
         rows = self._storage().take_rows(group.beam_width - 1)
         assert rows is not None, (
             f"Beam member spawn needs {group.beam_width - 1} req-to-token slots "
@@ -430,6 +488,18 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             pin_memory=torch.device(device).type == "cuda",
         ).to(device, non_blocking=True)
         group.all_rows = torch.cat([leader_row, member_rows])
+        state = self.token_to_kv_pool_allocator.state
+        if state is not None:
+            pool = self.req_to_token_pool
+            assert isinstance(pool, HybridReqToTokenPool)
+            member_slots = leader.kv.beam_mamba_slots
+            leader_slot = leader.kv.mamba_pool_idx
+            assert member_slots is not None and leader_slot is not None
+            pool.req_index_to_mamba_index_mapping[member_rows] = member_slots.to(
+                torch.int32
+            )
+            return _StateFork(leader_slot.expand_as(member_slots), member_slots)
+        return None
 
     def select_and_relay_decode(
         self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
@@ -440,33 +510,75 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if tail is None:
             return
         capture = logits_output.beam
+        batch_topk = self._uniform_decode_topk(tail, capture)
+        state_forks: list[_StateFork] = []
         for gi, entry in enumerate(tail.entries):
             group = entry.group
             if group.retired or group.state != BeamGroupState.DECODING:
                 continue
-            pieces = [
-                capture.leader_logits[gi : gi + 1],
-                capture.tail_logits[entry.start : entry.end],
-            ]
-            normalizers = self._capture_normalizers(
-                capture,
-                leader_slice=slice(gi, gi + 1),
-                tail_slice=slice(entry.start, entry.end),
-            )
             selected = None
-            if self._trie_selection_graph_cache is not None:
-                selected = self._trie_selection_graph_cache.select(
-                    self, group, pieces, normalizers, batch.forward_iter
+            if batch_topk is not None:
+                leaders, members = batch_topk
+                top_logprobs, top_tokens = (
+                    torch.cat((leader[gi : gi + 1], member[entry.start : entry.end]))
+                    for leader, member in zip(leaders, members, strict=True)
                 )
+            else:
+                pieces = [
+                    capture.leader_logits[gi : gi + 1],
+                    capture.tail_logits[entry.start : entry.end],
+                ]
+                normalizers = self._capture_normalizers(
+                    capture,
+                    leader_slice=slice(gi, gi + 1),
+                    tail_slice=slice(entry.start, entry.end),
+                )
+                if self._trie_selection_graph_cache is not None:
+                    selected = self._trie_selection_graph_cache.select(
+                        self, group, pieces, normalizers, batch.forward_iter
+                    )
+                if selected is None:
+                    top_logprobs, top_tokens = self.group_topk_logprobs(
+                        group, pieces, normalizers
+                    )
             if selected is None:
-                top_logprobs, top_tokens = self.group_topk_logprobs(
-                    group, pieces, normalizers
-                )
                 selected = self.select_group(
                     group, top_logprobs, top_tokens, batch.forward_iter
                 )
             next_tokens, parent_idx = selected
-            self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
+            state_fork = self._apply_survivors(
+                group, next_tokens, parent_idx, batch.forward_iter
+            )
+            if state_fork is not None:
+                state_forks.append(state_fork)
+        self._copy_state_forks(state_forks)
+
+    def _uniform_decode_topk(
+        self, tail: BeamTail, capture: BeamLogitsCapture
+    ) -> Optional[
+        tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
+    ]:
+        if (
+            self.trie_constraint is not None
+            or len(tail.entries) < 2
+            or not capture.tail_logits.is_cuda
+        ):
+            return None
+        width = tail.entries[0].group.beam_width
+        if width * (
+            len(tail.entries) + capture.tail_logits.shape[0]
+        ) > _MAX_BATCHED_TOPK_CANDIDATES or any(
+            not entry.group.device_history or entry.group.beam_width != width
+            for entry in tail.entries
+        ):
+            return None
+        candidates = max(
+            self._dense_candidate_count(entry.group) for entry in tail.entries
+        )
+        return (
+            _streamed_topk_logprobs(capture.leader_logits, candidates),
+            _streamed_topk_logprobs(capture.tail_logits, candidates),
+        )
 
     def commit_decode(self, reqs: List[Req], forward_iter: int) -> None:
         """Deferred half: fold staged selections into the DAG and apply
@@ -499,7 +611,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # parent_idx is None on a final step: every selection finishes, so
             # no row moves onto another's slots.
             fsel = select_final_topk(
-                group.frontier_cum_logprobs, top_logprobs, top_tokens, k
+                group.frontier_cum_logprobs,
+                top_logprobs,
+                top_tokens,
+                group.num_return
+                if group.device_history and self.trie_constraint is None
+                else k,
             )
             group.advance_final_frontier(fsel, tick)
             return fsel.tokens, None
@@ -509,9 +626,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             top_tokens,
             group.stop_token_ids,
             k,
-            num_output_candidates=(
-                k if self.trie_constraint is not None else group.num_candidates
-            ),
+            num_output_candidates=k if group.device_history else group.num_candidates,
         )
         group.advance_frontier(sel, tick)
         if self.trie_constraint is not None:
@@ -545,7 +660,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         normalizers=None,
     ):
         if self.trie_constraint is None:
-            return _rows_topk_logprobs(pieces, group.num_candidates)
+            return _rows_topk_logprobs(
+                pieces,
+                self._dense_candidate_count(group),
+                stream_normalizer=group.device_history,
+            )
         # Admission pins max_new_tokens to num_codebooks, and launch-complete
         # groups leave the batch, so selection depth is always a valid codebook.
         assert group.num_generated < self.trie_constraint.config.num_codebooks
@@ -557,14 +676,22 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             normalizers,
         )
 
+    @staticmethod
+    def _dense_candidate_count(group: BeamGroup) -> int:
+        if not group.device_history:
+            return group.num_candidates
+        # At termination no extra candidate is needed for the next frontier.
+        return group.num_return if group.next_step_is_final() else group.beam_width
+
     def _apply_survivors(
         self,
         group: BeamGroup,
         next_tokens: torch.Tensor,
         parent_idx: Optional[torch.Tensor],
         tick: int,
-    ) -> None:
+    ) -> Optional[_StateFork]:
         rows = group.all_rows
+        state_fork = None
         if parent_idx is not None:
             # Final steps skip this: their KV is never read again. Orphans are
             # staged, not freed here -- the set difference must not block launch.
@@ -578,10 +705,36 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 seq_len=group.leader.kv.kv_committed_len,
             )
             group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
+            state = self.token_to_kv_pool_allocator.state
+            if state is not None:
+                pool = self.req_to_token_pool
+                assert isinstance(pool, HybridReqToTokenPool)
+                mapping = pool.req_index_to_mamba_index_mapping
+                slots, src, dst = plan_state_forks(
+                    slots=mapping[rows], parents=parent_idx
+                )
+                state_fork = _StateFork(src, dst)
+                # The leader's original slot remains its allocation for teardown;
+                # only the working row-to-slot bindings follow the new frontier.
+                mapping[rows] = slots
             # Length placeholder only; the DAG owns history and member rows
             # have no host state.
             group.leader.output_ids.append(0)
-        self._stash_next_tokens(rows, next_tokens)
+        self._stash_next_tokens(rows[: next_tokens.numel()], next_tokens)
+        return state_fork
+
+    def _copy_state_forks(self, forks: list[_StateFork]) -> None:
+        if not forks:
+            return
+        state = self.token_to_kv_pool_allocator.state
+        assert state is not None
+        if len(forks) == 1:
+            src, dst = forks[0]
+        else:
+            src = torch.cat([fork.src for fork in forks])
+            dst = torch.cat([fork.dst for fork in forks])
+        # Distinct groups own disjoint slots, so one copy can precede the next forward.
+        state.pool.copy_beam_slots(src=src, dst=dst)
 
     def _reclaim_orphans(
         self, group: BeamGroup, up_to_tick: Optional[int] = None

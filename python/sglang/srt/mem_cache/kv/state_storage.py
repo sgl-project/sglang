@@ -109,11 +109,18 @@ class StateStorage:
 
     def pending_request_slots(self, table, req: Req) -> int:
         """Slots acquire will allocate for this request's working/tracking state."""
-        return int(not req.kv.holds_mamba) + (
-            table.mamba_initial_tracking_slots
-            if table.enable_mamba_extra_buffer
-            and req.kv.mamba_ping_pong_track_buffer is None
-            else 0
+        beam_slots = (
+            req.kv.beam_mamba_slot_count if req.kv.beam_mamba_slots is None else 0
+        )
+        return (
+            beam_slots
+            + int(not req.kv.holds_mamba)
+            + (
+                table.mamba_initial_tracking_slots
+                if table.enable_mamba_extra_buffer
+                and req.kv.mamba_ping_pong_track_buffer is None
+                else 0
+            )
         )
 
     def held_request_slots(self, table, req: Req) -> int:
@@ -148,7 +155,13 @@ class StateStorage:
             else []
         )
         per_request = table.mamba_initial_tracking_slots if untracked else 0
-        count = len(needing) + per_request * len(untracked)
+        beam_leaders = [
+            req
+            for req in reqs
+            if req.kv.beam_mamba_slot_count and req.kv.beam_mamba_slots is None
+        ]
+        tracking_end = len(needing) + per_request * len(untracked)
+        count = tracking_end + sum(req.kv.beam_mamba_slot_count for req in beam_leaders)
         mids = buffers = None
         if count:
             slots = self.slots.alloc(count)
@@ -177,8 +190,13 @@ class StateStorage:
                 )
             if untracked:
                 buffers = self._hand_out_tracking(
-                    table, untracked, slots[len(needing) :]
+                    table, untracked, slots[len(needing) : tracking_end]
                 )
+            offset = tracking_end
+            for req in beam_leaders:
+                end = offset + req.kv.beam_mamba_slot_count
+                req.kv.beam_mamba_slots = slots[offset:end]
+                offset = end
         # Device rows: indexing a device tensor with a Python list syncs the host.
         row_ids = async_h2d(rows, dtype=torch.int64, device=table.device)
         mamba_index_tensor = (
@@ -265,6 +283,9 @@ class StateStorage:
         assert mamba_index is not None, "double free? mamba_index is None"
         self.slots.free(mamba_index.unsqueeze(0), owned=True)
         req.kv.mamba_pool_idx = None
+        if req.kv.beam_mamba_slots is not None:
+            self.slots.free(req.kv.beam_mamba_slots, owned=True)
+            req.kv.beam_mamba_slots = None
 
         if table.enable_mamba_extra_buffer:
             size = table.mamba_ping_pong_track_buffer_size

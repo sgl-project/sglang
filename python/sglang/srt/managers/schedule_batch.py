@@ -13,7 +13,11 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.utils.common import ceil_align, flatten_arrays_to_pinned_cpu
-from sglang.srt.utils.device import async_h2d, is_pin_memory_available
+from sglang.srt.utils.device import (
+    async_h2d,
+    async_h2d_tensor,
+    is_pin_memory_available,
+)
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpans,
@@ -303,6 +307,9 @@ class ReqKvInfo:
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
+    # Additional owned slots for a recurrent beam group, reserved with the leader.
+    beam_mamba_slot_count: int = 0
+    beam_mamba_slots: Optional[torch.Tensor] = None
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
     # Per entry of the ping-pong buffer: True where it holds no slot (-1).
     mamba_ping_pong_empty: Optional[list[bool]] = None
@@ -1826,8 +1833,16 @@ def set_mamba_track_indices_from_reqs(
         device=mapping.device,
     )
     batch.mamba_track_indices = _gather_mamba_track_indices(
-        mapping, batch.req_pool_indices, positions
+        mapping, batch.req_pool_indices[: len(batch.reqs)], positions
     )
+    extra_rows = len(batch.req_pool_indices) - len(batch.reqs)
+    if extra_rows:
+        batch.mamba_track_indices = torch.cat(
+            [
+                batch.mamba_track_indices,
+                batch.mamba_track_indices.new_zeros(extra_rows),
+            ]
+        )
 
 
 def unresumable_abort_message() -> str:
@@ -3344,8 +3359,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
-            track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
+            track_remainders_cpu = (
+                self.seq_lens_cpu[: len(self.reqs)] % mamba_track_interval
+            )
             track_mask_cpu = track_remainders_cpu == 0
+            track_next_cpu = track_remainders_cpu == mamba_track_interval - 1
+            if self.beam_tail is not None:
+                # Beam suffixes are never inserted into the prefix cache.
+                trackable = torch.tensor(
+                    [req.beam_group is None for req in self.reqs], dtype=torch.bool
+                )
+                track_mask_cpu = track_mask_cpu & trackable
+                track_next_cpu = track_next_cpu & trackable
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
@@ -3361,9 +3386,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             self.mamba_track_mask_cpu = track_mask_cpu.tolist()
             self.mamba_track_mask_next_cpu = (
-                (track_remainders_cpu == mamba_track_interval - 1).tolist()
-                if self.enable_overlap
-                else None
+                track_next_cpu.tolist() if self.enable_overlap else None
             )
             # ScheduleBatch.copy() snapshots the list of requests, but the Req
             # objects remain shared. The next overlapped decode can therefore
@@ -3371,10 +3394,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_decode_batch_idx_cpu = [
                 req.decode_batch_idx for req in self.reqs
             ]
-            # async H2D
-            self.mamba_track_mask = track_mask_cpu.pin_memory().to(
-                device=self.device, non_blocking=True
-            )
+            if self.beam_tail is not None:
+                track_mask_cpu = torch.cat(
+                    [
+                        track_mask_cpu,
+                        track_mask_cpu.new_zeros(
+                            len(self.seq_lens_cpu) - len(self.reqs)
+                        ),
+                    ]
+                )
+            self.mamba_track_mask = async_h2d_tensor(track_mask_cpu, self.device)
 
     def filter_batch(
         self,

@@ -211,7 +211,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
 ):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    nv_tiles = tl.cdiv(V, BV)
+    i_nh, i_v = tl.program_id(0) // nv_tiles, tl.program_id(0) % nv_tiles
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 
@@ -384,7 +385,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     stride_indices_seq = ssm_state_indices.stride(0)
 
     NV = triton.cdiv(V, BV)
-    grid = (NV, B * HV)
+    # The CUDA y-axis limit is too small for wide batches times value heads.
+    grid = (NV * B * HV,)
     fused_recurrent_gated_delta_rule_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
         a=a,
