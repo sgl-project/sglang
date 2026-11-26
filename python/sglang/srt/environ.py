@@ -1126,8 +1126,13 @@ class Envs:
     # INT4 at every size.
     SGLANG_ROCM_QUICK_REDUCE_INT8_BELOW_MB = EnvInt(64)
     # Quick all-reduce goes ahead of the custom all-reduce for all-reduces of at least this many
-    # bytes, below the codec's own minimum size too; 0 keeps the custom all-reduce first.
-    SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES = EnvInt(0)
+    # bytes, below the codec's own minimum size (_QR_MIN_SIZE) too; 0 keeps the custom all-reduce
+    # first. One integer for every TP size, or TP size:bytes pairs such as "4:2097152,8:6291456"
+    # (a TP size not listed keeps the custom all-reduce first). The best value depends on the GPU,
+    # the TP size and the codec: the MI355X FlyDSL INT4 value at TP4 (943718) is too low on gfx942.
+    # Bytes, not MB, because the useful values can be below 1 MiB. The fused all-reduce + RMSNorm
+    # paths keep the custom all-reduce, so the threshold has no effect there.
+    SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES = EnvStr("0")
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override

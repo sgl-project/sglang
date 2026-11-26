@@ -87,7 +87,7 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
-        self.first_min_bytes = envs.SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES.get()
+        self.first_min_bytes = 0
         if not qr_rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -203,6 +203,17 @@ class QuickAllReduce:
         # A qr_max_size of 0 keeps the kernel default (2GB).
         self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
+        self.first_min_bytes = parse_first_min_bytes(
+            value=envs.SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES.get(),
+            world_size=self.world_size,
+        )
+        if self.first_min_bytes > self.qr_max_size:
+            logger.warning(
+                "SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES (%d) is above the quick "
+                "all-reduce maximum size (%d), so it has no effect.",
+                self.first_min_bytes,
+                self.qr_max_size,
+            )
         self.create_shared_buffer()
         self.disabled = False
 
@@ -247,7 +258,8 @@ class QuickAllReduce:
 
     def should_quick_allreduce_first(self, inp: torch.Tensor) -> bool:
         """Whether ``inp`` takes quick all-reduce ahead of the custom all-reduce:
-        it is at least SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES (0 = never)."""
+        it is at least SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES for this world
+        size (0 = never)."""
         return self.first_min_bytes > 0 and self.should_quick_allreduce(
             inp, min_size=self.first_min_bytes
         )
@@ -272,3 +284,17 @@ class QuickAllReduce:
 
     def __del__(self):
         self.close()
+
+
+def parse_first_min_bytes(value: str, world_size: int) -> int:
+    """Read SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES for ``world_size``: one
+    integer for every world size, or ``world_size:bytes`` pairs such as
+    ``4:2097152,8:6291456``, where a world size that is not listed gets 0."""
+    if ":" not in value:
+        return int(value)
+    min_bytes = 0
+    for pair in value.split(","):
+        size, _, pair_bytes = pair.partition(":")
+        if int(size) == world_size:
+            min_bytes = int(pair_bytes)
+    return min_bytes

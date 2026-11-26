@@ -281,6 +281,60 @@ def test_quick_allreduce_first_min_bytes_needs_rocm_and_enabled_quick_allreduce(
     assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
 
 
+def test_quick_allreduce_first_min_bytes_bounded_by_max_size(monkeypatch):
+    from sglang.srt.distributed.device_communicators.quick_all_reduce import MB
+
+    quick_reduce = _quick_all_reduce_tp4_int4(monkeypatch, 1 << 20)
+    quick_reduce.qr_max_size = 1 * MB
+    coordinator = _coordinator_with_custom_allreduce(monkeypatch, quick_reduce)
+    input_ = torch.empty(192, 5120, dtype=torch.bfloat16)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
+
+
+@pytest.mark.parametrize(
+    "value,world_size,min_bytes",
+    [
+        ("0", 4, 0),
+        ("943718", 2, 943718),
+        ("943718", 8, 943718),
+        ("2:1048576,4:2097152,8:6291456", 4, 2097152),
+        ("2:1048576,4:2097152,8:6291456", 8, 6291456),
+        # A world size that is not listed keeps the custom all-reduce first.
+        ("4:2097152", 8, 0),
+    ],
+)
+def test_quick_allreduce_first_min_bytes_per_world_size(value, world_size, min_bytes):
+    from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+        parse_first_min_bytes,
+    )
+
+    assert parse_first_min_bytes(value=value, world_size=world_size) == min_bytes
+
+
+def test_quick_allreduce_first_min_bytes_above_max_size_warns(monkeypatch, caplog):
+    from sglang.srt.distributed.device_communicators import quick_all_reduce
+
+    monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
+    monkeypatch.setenv("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", "1")
+    monkeypatch.setenv("SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES", "4:2097152")
+    # No handle, so close() at garbage collection destroys nothing.
+    monkeypatch.setattr(
+        quick_all_reduce.ops, "init_custom_qr", lambda *args: 0, raising=False
+    )
+    monkeypatch.setattr(
+        quick_all_reduce.QuickAllReduce, "create_shared_buffer", lambda self: None
+    )
+    quick_reduce = quick_all_reduce.QuickAllReduce.__new__(
+        quick_all_reduce.QuickAllReduce
+    )
+    quick_reduce.rank = 0
+    quick_reduce.world_size = 4
+    with caplog.at_level("WARNING", logger=quick_all_reduce.logger.name):
+        quick_reduce.init_quick_all_reduce()
+    assert quick_reduce.first_min_bytes == 2097152
+    assert "has no effect" in caplog.text
+
+
 @pytest.mark.parametrize(
     "tp,cp,dp,pp,shared", [(8, 8, 1, 1, 8), (16, 8, 2, 2, 8), (8, 4, 1, 2, 4)]
 )
