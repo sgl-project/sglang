@@ -78,7 +78,7 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     # The request table (every plan) and the state storage (a plan with state).
     max_num_reqs: int = 0
     model_context_len: int = 0
-    extra_max_context_len: int = 0
+    req_to_token_headroom: int = 0
     state_cache_params: Optional[Any] = None
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
@@ -108,7 +108,7 @@ def _build_request_table(
         size=sized.max_running_requests,
         reserved_rows=sized.request_rows,
         pre_alloc_size=ctx.decode_pre_alloc_size,
-        max_context_len=ctx.model_context_len + ctx.extra_max_context_len,
+        max_context_len=ctx.model_context_len + ctx.req_to_token_headroom,
         state_sub_pool=None if state is None else state.name,
         tracking=(
             None
@@ -460,7 +460,7 @@ def build_unified_pools(
             lazy=ctx.enable_mamba_extra_buffer_lazy,
         ),
         pre_alloc_rows=ctx.decode_pre_alloc_size,
-        extra_context_len=ctx.extra_max_context_len,
+        req_to_token_headroom=ctx.req_to_token_headroom,
     )
     sized = size_plan(plan, sizing)
     return build_kv_storage(plan, sized, ctx)

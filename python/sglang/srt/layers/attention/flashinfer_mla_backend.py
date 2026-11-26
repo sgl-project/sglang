@@ -243,7 +243,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         super().__init__()
 
         # Parse constants
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
         # The paged MLA wrappers fix the mask when they plan a batch.
