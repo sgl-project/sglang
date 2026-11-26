@@ -835,9 +835,10 @@ class CudaPlatformBase(Platform):
                 target_backend == AttentionBackendEnum.TORCH_SDPA
                 and cls.is_sm120()
                 and dtype in (torch.float16, torch.bfloat16)
+                and "RTX PRO 6000 Blackwell" in cls.get_device_name()
             ):
-                # cuDNN's sm120 SDPA kernel beats PyTorch's FA2 kernel (the
-                # Torch SDPA default here) and the FA4 CuTe kernels on SM12.x;
+                # cuDNN is faster on the RTX PRO 6000. Keep the Torch SDPA
+                # default on GeForce, where video consistency regresses.
                 # DYNAMIC_CUDNN_SDPA keeps Torch SDPA as the fallback for
                 # causal/GQA calls and for shapes cuDNN has no kernel for.
                 return _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR

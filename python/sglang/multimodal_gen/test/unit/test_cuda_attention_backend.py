@@ -253,13 +253,25 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "12.0"):
             self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3)
 
-    def test_default_backend_uses_cudnn_first_sdpa_on_sm120(self):
+    @patch.object(
+        FakeCudaPlatform,
+        "get_device_name",
+        return_value="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    )
+    def test_default_backend_uses_cudnn_first_sdpa_on_rtx_pro_6000(self, _):
         FakeCudaPlatform.is_sm120_device = True
 
         self.assertEqual(
             self.resolve(None),
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend",
         )
+
+    @patch.object(
+        FakeCudaPlatform, "get_device_name", return_value="NVIDIA GeForce RTX 5090"
+    )
+    def test_default_backend_keeps_torch_sdpa_on_geforce_sm120(self, _):
+        FakeCudaPlatform.is_sm120_device = True
+        self.assertEqual(self.resolve(None), SDPA_BACKEND_CLS_STR)
 
     def test_default_backend_keeps_torch_sdpa_for_fp32_on_sm120(self):
         FakeCudaPlatform.is_sm120_device = True
