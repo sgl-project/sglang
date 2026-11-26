@@ -29,10 +29,6 @@ _POOL_FILES = [
     _MEM_CACHE / "memory_pool_host.py",
     *(_MEM_CACHE / "pool_host").glob("*.py"),
 ]
-# Pools that call kvcacheio ops but refuse unsupported devices on their own terms.
-_OWN_DEVICE_GATE = {
-    "UnifiedPageEnvelopeHostPool": "imports kvcacheio itself and raises off CUDA/ROCm",
-}
 
 
 def _shared_table(pool: str, name: str):
@@ -120,7 +116,7 @@ class TestHostPoolOpTables(unittest.TestCase):
         # A pool calling an op its table omits skips the construction check for it.
         checked = 0
         for name, cls in _POOLS.items():
-            if not cls.calls or name in _OWN_DEVICE_GATE:
+            if not cls.calls:
                 continue
             table = _table(name)
             with self.subTest(pool=name):

@@ -671,13 +671,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
-                    self._require_packed_device_rows("transfer_kv_per_layer_mla")
                     transfer_kv_per_layer_mla(
                         src=self.kv_buffer[host_layer_id],
                         dst=device_buffer,
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
+                        **self._device_row_stride_kwargs(
+                            "transfer_kv_per_layer_mla", device_is_src=False
+                        ),
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -690,7 +692,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
-                    self._require_packed_device_rows("transfer_kv_per_layer_mla_pf_lf")
                     transfer_kv_per_layer_mla_pf_lf(
                         src=self.kv_buffer,
                         dst=device_buffer,
@@ -699,6 +700,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         layer_id=host_layer_id,
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
+                        **self._device_row_stride_kwargs(
+                            "transfer_kv_per_layer_mla_pf_lf", device_is_src=False
+                        ),
                     )
             elif self.layout == "page_unified":
                 jit_transfer_hicache_one_layer_mla_page_unified_lf(
@@ -794,13 +798,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
-                    self._require_packed_device_rows("transfer_kv_per_layer_mla")
                     transfer_kv_per_layer_mla(
                         src=device_buffer,
                         dst=self.kv_buffer[host_layer_id],
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
+                        **self._device_row_stride_kwargs(
+                            "transfer_kv_per_layer_mla", device_is_src=True
+                        ),
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -1091,7 +1097,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
                     )
                 else:
-                    self._require_packed_device_rows("transfer_kv_all_layer_mla")
                     transfer_kv_all_layer_mla(
                         src_layers=device_data_ptrs,
                         dst_layers=self.data_ptrs,
@@ -1099,6 +1104,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
                         num_layers=self.layer_num,
+                        **self._device_row_stride_kwargs(
+                            "transfer_kv_all_layer_mla", device_is_src=True
+                        ),
                     )
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
@@ -1124,7 +1132,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
                     )
                 else:
-                    self._require_packed_device_rows("transfer_kv_all_layer_mla_lf_pf")
                     transfer_kv_all_layer_mla_lf_pf(
                         src_layers=device_data_ptrs,
                         dst=self.kv_buffer,
@@ -1133,6 +1140,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
+                        **self._device_row_stride_kwargs(
+                            "transfer_kv_all_layer_mla_lf_pf", device_is_src=True
+                        ),
                     )
             elif self.layout == "page_unified":
                 jit_transfer_hicache_all_layer_mla_staged_lf_page_unified(

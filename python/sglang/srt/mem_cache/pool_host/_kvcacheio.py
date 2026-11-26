@@ -10,6 +10,7 @@ does not import. Off XPU nothing is bound and `missing_ops` stays empty.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from types import MappingProxyType
 
@@ -87,6 +88,15 @@ def require_kvcacheio_ops(
             f"{io_backend} --hicache-mem-layout {layout} here: "
             f"{missing_ops[missing[0]]}. {fix} (--enable-hierarchical-cache)."
         )
+
+
+def xpu_transfer_ops_take_row_stride() -> bool:
+    """Whether this sgl-kernel-xpu build's KV transfer ops take device row strides.
+
+    sgl-kernel-xpu#608 added `src_row_stride` / `dst_row_stride` to every
+    kvcacheio transfer op at once, after the v0.6.0 wheel; one op stands for all.
+    """
+    return "src_row_stride" in inspect.signature(transfer_kv_per_layer).parameters
 
 
 missing_ops: dict[str, str] = {}
