@@ -15,7 +15,6 @@ from sglang.srt.mem_cache.page_interleave import (
 )
 from sglang.srt.runtime_context import (
     get_context,
-    get_disagg,
     get_memory,
     get_parallel,
     get_schedule,
@@ -1353,9 +1352,6 @@ class TestEagleConfigurator(CustomTestCase):
 
     def test_pd_sparse_best_effort_sets_the_running_limit(self):
         from sglang.srt.environ import envs
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-            get_sparse_kv_budget,
-        )
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
             resolve_sparse_kv_budget,
         )
@@ -1365,8 +1361,6 @@ class TestEagleConfigurator(CustomTestCase):
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
         page_size, token_limit = 128, 8192
-        decode_reserve = 512
-        min_tokens = page_size + decode_reserve
         max_running_requests, attn_dp_size, extra_rows = 8, 2, 3
         cache_tokens = 6144
         mr = _make_model_runner(
@@ -1405,7 +1399,7 @@ class TestEagleConfigurator(CustomTestCase):
             disaggregation_decode_extra_slots=extra_rows,
             page_size=page_size,
             max_running_requests=max_running_requests,
-            num_reserved_decode_tokens=decode_reserve,
+            num_reserved_decode_tokens=8192,
             speculative_algorithm="EAGLE",
             speculative_num_steps=2,
             speculative_num_draft_tokens=3,
@@ -1438,39 +1432,22 @@ class TestEagleConfigurator(CustomTestCase):
             context_len = (
                 mr.model_config.context_len + get_req_to_token_extra_context_len()
             )
-            one_request = get_sparse_kv_budget(
-                model_config=mr.model_config,
-                request_rows=extra_rows + 2,
-                resident_rows=2,
-                context_len=context_len,
-                num_layers=4,
-                top_k=2048,
-                kv_bytes_per_token=576 * 2,
-            )
-            aligned_context_len = one_request.context_len
+            aligned_context_len = (context_len + page_size - 1) // page_size * page_size
             request_bytes = (cache_tokens + aligned_context_len) * 4 * 576 * 2
-            one_request_tokens = (
-                (request_bytes - one_request.managed_hbm_bytes)
-                // (native_bytes_per_token * page_size)
-                * page_size
-            )
-            self.assertGreaterEqual(one_request_tokens, min_tokens)
-            self.assertLess(one_request_tokens, aligned_context_len)
 
-            # The native token cap still bounds admission, but HBM sizes C.
-            native_bs_limit = min_tokens // 2
-            for available, cap, resident_bs, bs, tokens in (
-                (request_bytes, None, 1, 1, one_request_tokens),
-                (2 * request_bytes - 1, None, 1, 1, aligned_context_len),
-                (2 * request_bytes, None, 2, 2, 2 * aligned_context_len),
-                (3 * request_bytes, token_limit, 3, 3, token_limit),
-                (5 * request_bytes, None, 4, 4, 4 * aligned_context_len),
+            # A cap that aligns to one page limits admission independently of residency.
+            native_bs_limit = page_size // 2
+            for available, cap, resident_bs, bs in (
+                (request_bytes, None, 1, 1),
+                (2 * request_bytes - 1, None, 1, 1),
+                (2 * request_bytes, None, 2, 2),
+                (3 * request_bytes, token_limit, 3, 3),
+                (5 * request_bytes, None, 4, 4),
                 (
                     (native_bs_limit + 1) * request_bytes,
-                    min_tokens,
+                    page_size + 1,
                     native_bs_limit + 1,
                     native_bs_limit,
-                    min_tokens,
                 ),
             ):
                 with self.subTest(available=available, cap=cap):
@@ -1493,8 +1470,14 @@ class TestEagleConfigurator(CustomTestCase):
                         )
                     self.assertEqual(resolve_plan.call_count, 1)
                     self.assertEqual(sizes.max_running_requests, bs)
-                    self.assertEqual(sizes.max_total_num_tokens, tokens)
                     plan = mr.sparse_kv_budget_plan
+                    tokens = (
+                        available - plan.managed_hbm_bytes
+                    ) // native_bytes_per_token
+                    if cap is not None:
+                        tokens = min(tokens, cap)
+                    tokens = tokens // page_size * page_size
+                    self.assertEqual(sizes.max_total_num_tokens, tokens)
                     native_bytes = tokens * native_bytes_per_token
                     planned_bytes = plan.managed_hbm_bytes + native_bytes
                     self.assertEqual(sizing.available_bytes, available)
@@ -1520,38 +1503,7 @@ class TestEagleConfigurator(CustomTestCase):
                 KVCacheConfigurator._resolve_memory_pool_config(
                     mr, pre_model_load_memory=0
                 )
-
-            mr.sparse_kv_budget_plan = None
-            mr._profile_available_bytes.return_value = 4 * request_bytes
-            with (
-                get_context().override_server_args(
-                    **server_args, max_total_tokens=min_tokens - 1
-                ),
-                self.assertRaisesRegex(
-                    RuntimeError, f"below the P/D Decode minimum of {min_tokens}"
-                ),
-            ):
-                KVCacheConfigurator._resolve_memory_pool_config(
-                    mr, pre_model_load_memory=0
-                )
-
-            mr.sparse_kv_budget_plan = None
-            mr._profile_available_bytes.return_value = request_bytes
-            with (
-                get_schedule().override(max_total_tokens=None),
-                get_disagg().override(num_reserved_decode_tokens=one_request_tokens),
-                self.assertRaisesRegex(RuntimeError, "P/D Decode native KV pool"),
-            ):
-                KVCacheConfigurator._resolve_memory_pool_config(
-                    mr, pre_model_load_memory=0
-                )
             self.assertIsNone(mr.sparse_kv_budget_plan)
-            with get_disagg().override(num_reserved_decode_tokens=decode_reserve):
-                sizes, sizing = KVCacheConfigurator._resolve_memory_pool_config(
-                    mr, pre_model_load_memory=0
-                )
-            self.assertEqual(sizes.max_running_requests, 1)
-            self.assertEqual(mr.sparse_kv_budget_plan.resident_rows, 2)
 
     def test_eagle_does_not_exceed_budget(self):
         """Total memory (target + draft KV cache) must not exceed available."""

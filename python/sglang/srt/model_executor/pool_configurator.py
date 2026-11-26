@@ -845,19 +845,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             else self._zero_kv_max_tokens
         )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        if self._is_fused_sparse_offload_pd_decode_worker:
-            running_rows = budget.resident_rows - 1
-            min_tokens = self._pd_decode_min_tokens(page_size)
-            if max_total_num_tokens < min_tokens:
-                raise RuntimeError(
-                    "Not enough HBM for the P/D Decode native KV pool: "
-                    f"{max_total_num_tokens} tokens available with {running_rows} "
-                    f"resident requests, need at least {min_tokens} tokens."
-                )
-            max_total_num_tokens = min(
-                max_total_num_tokens,
-                max(running_rows * budget.context_len, min_tokens),
-            )
         config = MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
         if published_budget is None and budget is not None:
             self._kvc.sparse_kv_budget_plan = budget
@@ -896,20 +883,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        if self._is_fused_sparse_offload_pd_decode_worker:
-            min_tokens = self._pd_decode_min_tokens(page_size)
-            if max_total_num_tokens < min_tokens:
-                raise RuntimeError(
-                    f"The constrained native KV capacity of {max_total_num_tokens} "
-                    f"page-aligned tokens is below the P/D Decode minimum of {min_tokens}."
-                )
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
-
-    @staticmethod
-    def _pd_decode_min_tokens(page_size: int) -> int:
-        return ceil_align(
-            page_size + get_disagg().num_reserved_decode_tokens, page_size
-        )
 
     def get_sparse_kv_hbm_sizing(
         self, available_bytes: int, max_total_num_tokens: int
