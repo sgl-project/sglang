@@ -109,6 +109,11 @@ class Step5AttentionProfile(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def parse_step5_attention_profile(config: Step5Config) -> Step5AttentionProfile:
+    from sglang.kernels.ops.attention.step5_dsa_indexer import (
+        STEP5_INDEX_HEAD_DIM,
+        STEP5_REGION_SIZE,
+    )
+
     sparse = config.sparse_config
     profile = Step5AttentionProfile(
         hidden_size=config.hidden_size,
@@ -122,8 +127,8 @@ def parse_step5_attention_profile(config: Step5Config) -> Step5AttentionProfile:
     )
     if (
         profile.head_dim != 192
-        or profile.index_head_dim != 256
-        or sparse["region_block_size"] != 8
+        or profile.index_head_dim != STEP5_INDEX_HEAD_DIM
+        or sparse["region_block_size"] != STEP5_REGION_SIZE
         or sparse["sparse_indexer_num_k_heads"] != 1
         or config.sliding_window != 512
     ):

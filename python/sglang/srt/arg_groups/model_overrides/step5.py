@@ -9,10 +9,8 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.runtime_context import get_platform
 
-_STEP5_PAGE_SIZE = 64
 
-
-def _validate_features(cfg: Any) -> None:
+def _validate_features(cfg: Any, *, page_size: int) -> None:
     if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
         raise ValueError("Step5 supports --kv-cache-dtype auto or bfloat16")
     if cfg.speculative_algorithm is not None:
@@ -27,8 +25,8 @@ def _validate_features(cfg: Any) -> None:
         raise ValueError("Step5 does not support attention data parallelism yet")
     if cfg.moe_a2a_backend != "none":
         raise ValueError("Step5 supports only --moe-a2a-backend none")
-    if cfg.page_size not in (None, _STEP5_PAGE_SIZE):
-        raise ValueError(f"Step5 requires --page-size {_STEP5_PAGE_SIZE}")
+    if cfg.page_size not in (None, page_size):
+        raise ValueError(f"Step5 requires --page-size {page_size}")
     if cfg.boundary_reduction not in ("auto", "ar"):
         raise ValueError("Step5 supports only --boundary-reduction ar")
     if not is_attention_backend_not_set(cfg) and cfg.attention_backend != "triton":
@@ -47,11 +45,13 @@ def _moe_runner_backend(cfg: Any) -> str:
 
 @_register_for("Step5ForCausalLM", "Step5ForConditionalGeneration")
 def _step5_overrides(server_args: Any, hf_config: Any) -> dict:
+    from sglang.kernels.ops.attention.step5_dsa_indexer import STEP5_PAGE_SIZE
+
     cfg = resolving_view(server_args)
-    _validate_features(cfg)
+    _validate_features(cfg, page_size=STEP5_PAGE_SIZE)
     return {
         "attention_backend": "triton",
-        "page_size": _STEP5_PAGE_SIZE,
+        "page_size": STEP5_PAGE_SIZE,
         "boundary_reduction": "ar",
         "moe_runner_backend": _moe_runner_backend(cfg),
     }

@@ -7,6 +7,9 @@ import torch
 
 from sglang.kernels.ops.attention.step5_dsa_indexer import (
     STEP5_HISTORY_BLOCKS,
+    STEP5_INDEX_HEAD_DIM,
+    STEP5_PAGE_SIZE,
+    STEP5_REGION_SIZE,
     Step5CompressionPlan,
     can_use_step5_dsa_topk_deepselect,
     deepselect_score_width,
@@ -28,11 +31,6 @@ from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.device import async_h2d
 
-STEP5_PAGE_SIZE = 64
-STEP5_COMPRESSION_RATIO = 8
-STEP5_INDEX_HEAD_DIM = 256
-STEP5_INDEX_RING_SIZE = 8
-STEP5_MAX_CONTEXT_LEN = 1048576
 STEP5_SELECTED_BLOCKS = STEP5_HISTORY_BLOCKS + 1
 
 # 512 MiB FP32 score budget, independent of packed prefill length.
@@ -107,7 +105,7 @@ def _allocate_selection_workspace(
     if use_deepselect:
         topk_lengths = torch.empty(rows, dtype=torch.int32, device=device)
         topk_lengths.copy_(
-            torch.where(row_to_req > 0, positions // STEP5_COMPRESSION_RATIO, 0)
+            torch.where(row_to_req > 0, positions // STEP5_REGION_SIZE, 0)
         )
     return Step5SelectionWorkspace(
         packed=torch.empty(
@@ -150,7 +148,7 @@ def _slice_selection_workspace(
     if workspace.use_deepselect:
         topk_lengths = workspace.topk_lengths[:rows]
         topk_lengths.copy_(
-            torch.where(row_to_req > 0, positions // STEP5_COMPRESSION_RATIO, 0)
+            torch.where(row_to_req > 0, positions // STEP5_REGION_SIZE, 0)
         )
     return Step5SelectionWorkspace(
         packed=workspace.packed[:rows],
@@ -191,7 +189,7 @@ def _build_prefill_compression_plan(
     uses = torch.zeros(req_to_token.shape[0], dtype=torch.int32, device=device)
     uses.scatter_add_(0, slots, active.to(torch.int32))
     admitted = (raw_slots == slots) & (uses[slots] == 1)
-    ratio = STEP5_COMPRESSION_RATIO
+    ratio = STEP5_REGION_SIZE
     max_blocks = max(((row[0] % ratio + row[2]) // ratio for row in rows), default=0)
     block_idx = torch.arange(max_blocks, device=device)[:, None]
     offsets = torch.arange(ratio, device=device)
@@ -222,7 +220,7 @@ def _build_prefill_compression_plan(
 
 
 def _num_blocks(num_tokens: int) -> int:
-    return (num_tokens + STEP5_COMPRESSION_RATIO - 1) // STEP5_COMPRESSION_RATIO
+    return (num_tokens + STEP5_REGION_SIZE - 1) // STEP5_REGION_SIZE
 
 
 def wrap_step5_attention_backend(runner, full_attn_backend: AttentionBackend):
@@ -234,10 +232,11 @@ def wrap_step5_attention_backend(runner, full_attn_backend: AttentionBackend):
         kv_pool=runner.token_to_kv_pool,
         req_to_token_pool=runner.req_to_token_pool,
         context_len=runner.model_config.context_len,
+        max_context_len=runner.model_config.hf_text_config.max_position_embeddings,
     )
 
 
-def _validate_config(*, kv_pool, context_len: int) -> None:
+def _validate_config(*, kv_pool, context_len: int, max_context_len: int) -> None:
     if not is_cuda():
         raise ValueError("Step5 sparse attention requires NVIDIA CUDA")
     if not isinstance(kv_pool, SWAKVPool):
@@ -248,10 +247,8 @@ def _validate_config(*, kv_pool, context_len: int) -> None:
         raise ValueError("Step5 sparse attention requires BF16 KV cache")
     if kv_pool.post_capture_active:
         raise ValueError("Step5 indexer state requires an allocated full KV pool")
-    if context_len > STEP5_MAX_CONTEXT_LEN:
-        raise ValueError(
-            f"Step5 context length must be at most {STEP5_MAX_CONTEXT_LEN}"
-        )
+    if context_len > max_context_len:
+        raise ValueError(f"Step5 context length must be at most {max_context_len}")
 
 
 def _allocate_indexer_states(
@@ -264,7 +261,7 @@ def _allocate_indexer_states(
     ring_shape = (
         num_layers,
         num_req_slots,
-        STEP5_INDEX_RING_SIZE,
+        STEP5_REGION_SIZE,
         1,
         STEP5_INDEX_HEAD_DIM,
     )
@@ -272,7 +269,7 @@ def _allocate_indexer_states(
         (
             num_layers,
             num_pages,
-            kv_pool.page_size // STEP5_COMPRESSION_RATIO,
+            kv_pool.page_size // STEP5_REGION_SIZE,
             1,
             STEP5_INDEX_HEAD_DIM,
         ),
@@ -287,7 +284,7 @@ def _allocate_indexer_states(
         ring_shape, dtype=torch.bfloat16, device=device
     )
     index_positions = torch.full(
-        (num_layers, num_req_slots, STEP5_INDEX_RING_SIZE),
+        (num_layers, num_req_slots, STEP5_REGION_SIZE),
         -1,
         dtype=torch.int64,
         device=device,
@@ -359,8 +356,11 @@ class Step5AttnBackend(AttentionBackend):
         kv_pool: SWAKVPool,
         req_to_token_pool,
         context_len: int,
+        max_context_len: int,
     ):
-        _validate_config(kv_pool=kv_pool, context_len=context_len)
+        _validate_config(
+            kv_pool=kv_pool, context_len=context_len, max_context_len=max_context_len
+        )
         self.swa_backend = swa_backend
         # Expose the child to the shared metadata snapshot/restore lifecycle.
         self.attn_backend_list = [swa_backend]
@@ -422,7 +422,7 @@ class Step5AttnBackend(AttentionBackend):
                 rows=positions.numel(),
                 score_width=score_width,
                 device=plan.request_slots.device,
-                max_score_width=req_to_token.shape[1] // STEP5_COMPRESSION_RATIO,
+                max_score_width=req_to_token.shape[1] // STEP5_REGION_SIZE,
                 row_to_req=row_to_req,
                 positions=positions,
             )
@@ -537,10 +537,7 @@ class Step5AttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         req_to_token = self.req_to_token_pool.req_to_token
-        if (
-            _num_blocks(self.context_len) * STEP5_COMPRESSION_RATIO
-            > req_to_token.shape[1]
-        ):
+        if _num_blocks(self.context_len) * STEP5_REGION_SIZE > req_to_token.shape[1]:
             raise ValueError("Step5 graph context exceeds native request capacity")
         self._cuda_graph_metadata.clear()
         self.forward_metadata = None
@@ -550,7 +547,7 @@ class Step5AttnBackend(AttentionBackend):
         self._graph_workspace = _allocate_selection_workspace(
             rows=max_bs,
             score_width=_num_blocks(self.context_len),
-            max_score_width=req_to_token.shape[1] // STEP5_COMPRESSION_RATIO,
+            max_score_width=req_to_token.shape[1] // STEP5_REGION_SIZE,
             row_to_req=torch.zeros(
                 max_bs, dtype=torch.int32, device=req_to_token.device
             ),

@@ -16,6 +16,11 @@ import triton.language as tl
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.deep_select import is_deep_select_supported, topk
 
+STEP5_PAGE_SIZE = 64
+STEP5_REGION_SIZE = 8
+STEP5_INDEX_HEAD_DIM = 256
+STEP5_HISTORY_BLOCKS = 512
+
 # Index Q/K normalization and RoPE.
 
 
@@ -23,7 +28,7 @@ from sglang.kernels.ops.attention.deep_select import is_deep_select_supported, t
     do_not_specialize=("ROWS",),
     do_not_specialize_on_alignment=("ROWS",),
 )
-def _indexer_norm_rope(
+def _indexer_norm_rope_kernel(
     Q,
     K,
     QW,
@@ -101,7 +106,7 @@ def step5_dsa_indexer_norm_rope(
     q_out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     k_out = torch.empty(k.shape, dtype=torch.bfloat16, device=k.device)
     if tokens:
-        _indexer_norm_rope[(tokens, heads + 1)](
+        _indexer_norm_rope_kernel[(tokens, heads + 1)](
             q,
             k,
             q_weight,
@@ -127,7 +132,7 @@ def step5_dsa_indexer_norm_rope(
 
 
 @triton.jit
-def _count_request_owners(
+def _count_request_owners_kernel(
     Slots, Live, Uses, ROWS: tl.constexpr, CAP: tl.constexpr, BLOCK: tl.constexpr
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -140,7 +145,7 @@ def _count_request_owners(
 
 
 @triton.jit
-def _build_request_metadata(
+def _build_request_metadata_kernel(
     Slots,
     Bases,
     Live,
@@ -288,10 +293,10 @@ def step5_dsa_build_compression_metadata(
     query_slots = torch.empty(rows, dtype=torch.int32, device=device)
     query_positions = torch.empty(rows, dtype=torch.int32, device=device)
     uses = torch.zeros(num_slots, dtype=torch.int32, device=device)
-    _count_request_owners[(triton.cdiv(rows, 128),)](
+    _count_request_owners_kernel[(triton.cdiv(rows, 128),)](
         request_slots, valid_rows, uses, rows, num_slots, 128
     )
-    _build_request_metadata[(rows,)](
+    _build_request_metadata_kernel[(rows,)](
         request_slots,
         positions,
         valid_rows,
@@ -394,7 +399,6 @@ def _admit_row(
     enabled,
     success,
     CAPACITY: tl.constexpr,
-    ASSERT_SUCCESS: tl.constexpr,
 ):
     live = tl.load(active + row) != 0
     ok = tl.full((), False, tl.int1)
@@ -408,13 +412,12 @@ def _admit_row(
     tl.store(enabled + row, ok)
     row_ok = (tl.load(count_valid) != 0) & (~live | ok)
     tl.store(success + row, row_ok)
-    if ASSERT_SUCCESS:
-        tl.device_assert(row_ok, "Step5 DSA ring history failed")
+    tl.device_assert(row_ok, "Step5 DSA ring history failed")
     return ok
 
 
 @triton.jit
-def _admit(
+def _admit_kernel(
     slots,
     bases,
     active,
@@ -424,7 +427,6 @@ def _admit(
     enabled,
     success,
     CAPACITY: tl.constexpr,
-    ASSERT_SUCCESS: tl.constexpr,
 ):
     _admit_row(
         tl.program_id(0),
@@ -437,12 +439,11 @@ def _admit(
         enabled,
         success,
         CAPACITY,
-        ASSERT_SUCCESS,
     )
 
 
 @triton.jit
-def _compress(
+def _compress_kernel(
     index_key,
     compression_logits,
     slots,
@@ -460,7 +461,6 @@ def _compress(
     tags,
     success,
     ADMIT: tl.constexpr,
-    ASSERT_SUCCESS: tl.constexpr,
     CAPACITY: tl.constexpr,
     ROWS: tl.constexpr,
     Z_ROW: tl.constexpr,
@@ -480,7 +480,6 @@ def _compress(
             enabled,
             success,
             CAPACITY,
-            ASSERT_SUCCESS,
         )
     else:
         ok = tl.load(enabled + row)
@@ -536,15 +535,14 @@ def _compress(
 
 
 @triton.jit
-def _write_row(
-    row,
-    enabled,
+def _write_ring_kernel(
     index_key,
     compression_logits,
     slots,
     bases,
     sources,
     lengths,
+    enabled,
     index_key_ring,
     compression_logits_ring,
     tags,
@@ -552,7 +550,8 @@ def _write_row(
     BLOCK: tl.constexpr,
     Z_ROW: tl.constexpr,
 ):
-    if enabled:
+    row = tl.program_id(0)
+    if tl.load(enabled + row):
         slot = tl.load(slots + row).to(tl.int64)
         base = tl.load(bases + row)
         end = base + tl.load(lengths + row)
@@ -587,41 +586,6 @@ def _write_row(
         tl.store(tags + slot * CAPACITY + cell, tag, cell < CAPACITY)
 
 
-@triton.jit
-def _write(
-    index_key,
-    compression_logits,
-    slots,
-    bases,
-    sources,
-    lengths,
-    enabled,
-    index_key_ring,
-    compression_logits_ring,
-    tags,
-    CAPACITY: tl.constexpr,
-    BLOCK: tl.constexpr,
-    Z_ROW: tl.constexpr,
-):
-    row = tl.program_id(0)
-    _write_row(
-        row,
-        tl.load(enabled + row),
-        index_key,
-        compression_logits,
-        slots,
-        bases,
-        sources,
-        lengths,
-        index_key_ring,
-        compression_logits_ring,
-        tags,
-        CAPACITY,
-        BLOCK,
-        Z_ROW,
-    )
-
-
 def step5_dsa_append_ring(
     *,
     slots: torch.Tensor,
@@ -647,9 +611,9 @@ def step5_dsa_append_ring(
     rows = slots.numel()
     max_blocks = physical_blocks.shape[0]
     capacity = index_key_ring.shape[1]
-    # Ring history is read by _compress before _write overwrites it.
+    # _compress_kernel reads the ring before _write_ring_kernel overwrites it.
     if max_blocks != 1:
-        _admit[(rows,)](
+        _admit_kernel[(rows,)](
             slots,
             bases,
             active,
@@ -659,11 +623,10 @@ def step5_dsa_append_ring(
             enabled,
             success,
             capacity,
-            True,
             debug=True,
         )
     if max_blocks:
-        _compress[(max_blocks, rows)](
+        _compress_kernel[(max_blocks, rows)](
             index_key,
             compression_logits,
             slots,
@@ -681,7 +644,6 @@ def step5_dsa_append_ring(
             ring_positions,
             success,
             max_blocks == 1,
-            True,
             capacity,
             rows,
             compression_logits.stride(0),
@@ -689,7 +651,7 @@ def step5_dsa_append_ring(
             enable_fp_fusion=True,
             debug=True,
         )
-    _write[(rows,)](
+    _write_ring_kernel[(rows,)](
         index_key,
         compression_logits,
         slots,
@@ -714,7 +676,7 @@ def step5_dsa_append_ring(
     do_not_specialize=("BLOCKS",),
     do_not_specialize_on_alignment=("BLOCKS",),
 )
-def _score_blocks(
+def _score_blocks_kernel(
     Q,
     W,
     CompressedIndexKeys,
@@ -802,7 +764,7 @@ def _indexer_logits(
     # D256 gathers are register-heavy; 32-block tiles also give small batches more CTAs.
     blocks_per_tile = 32
     grid_tiles = min(triton.cdiv(out.shape[1], blocks_per_tile), 128)
-    _score_blocks[(tokens, grid_tiles)](
+    _score_blocks_kernel[(tokens, grid_tiles)](
         q.to(torch.float8_e4m3fn),
         weights,
         compressed_index_keys,
@@ -824,7 +786,7 @@ def _indexer_logits(
 
 
 @triton.jit
-def _canonicalize_zero(Scores, Out, N: tl.constexpr, BLOCK: tl.constexpr):
+def _canonicalize_zero_kernel(Scores, Out, N: tl.constexpr, BLOCK: tl.constexpr):
     offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     bits = tl.load(Scores + offset, offset < N, other=0.0).to(tl.uint32, bitcast=True)
     # FlashInfer's radix ordering distinguishes signed zero. Preserve all other
@@ -834,7 +796,7 @@ def _canonicalize_zero(Scores, Out, N: tl.constexpr, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _pack_blocks(
+def _pack_blocks_kernel(
     Indices,
     Positions,
     Requests,
@@ -906,7 +868,7 @@ def _launch_block_pack(
     causal_lengths=None,
 ):
     rows = block_indices.shape[0]
-    _pack_blocks[(rows,)](
+    _pack_blocks_kernel[(rows,)](
         indices,
         positions,
         row_to_req,
@@ -922,7 +884,6 @@ def _launch_block_pack(
     )
 
 
-STEP5_HISTORY_BLOCKS = 512
 # Preserve the score workspace layout while sharing the public top-k kernel.
 _SCORE_STRIDE_ALIGNMENT = 256
 
@@ -1001,7 +962,7 @@ def _topk_blocks(
         # Keep the caller's scores intact, including during graph replay.
         ordered_scores = torch.empty_like(scores)
         size = scores.numel()
-        _canonicalize_zero[(triton.cdiv(size, 1024),)](
+        _canonicalize_zero_kernel[(triton.cdiv(size, 1024),)](
             scores, ordered_scores, size, 1024, num_warps=4
         )
         _, indices = flashinfer.top_k(
@@ -1025,7 +986,7 @@ def _topk_blocks(
 
 
 @triton.jit
-def _pack_decode_blocks(
+def _pack_decode_blocks_kernel(
     Ids,
     Counts,
     Mapping,
@@ -1075,7 +1036,7 @@ def _pack_selected_blocks(
     assert packed_blocks.shape[0] == rows and packed_blocks.shape[1] in (513, 514, 516)
     assert packed_blocks.dtype == torch.int64 and packed_blocks.is_contiguous()
     assert req_to_token.stride(1) == 1
-    _pack_decode_blocks[(rows,)](
+    _pack_decode_blocks_kernel[(rows,)](
         block_indices,
         counts,
         req_to_token,
