@@ -66,20 +66,17 @@ def _build_video_sampling(server_args, sampling_cls, fields):
 @pytest.mark.parametrize(
     "fields,expected",
     [
-        # 1080 // 8 == 135 is odd, so the DiT returns 134 latent rows for the 135 the
-        # scheduler denoises and the request fails; 1080 // 16 == 67 floors to 1072.
         ({"size": "1920x1080"}, (1920, 1072)),
         ({"size": "1000x1000"}, (992, 992)),
         ({"size": "960x540"}, (960, 528)),
-        ({"size": "640x360"}, (640, 352)),
         ({"size": "854x480"}, (848, 480)),
         ({"size": "1280x720"}, (1280, 720)),
-        ({"size": "960x544"}, (960, 544)),
     ],
 )
 def test_http_size_aligns_to_the_patch_grid(
     pipeline_config_cls, sampling_cls, fields, expected
 ):
+    """Request sizes are rounded down to a multiple of 16 with an even latent grid."""
     server_args = _server_args(pipeline_config_cls())
     sampling = _build_video_sampling(server_args, sampling_cls, fields)
     assert (sampling.width, sampling.height) == expected

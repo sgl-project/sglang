@@ -59,7 +59,7 @@ class HunyuanSamplingParams(SamplingParams):
 
     def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
         super().prepare_synthetic_warmup_request_for_queue(req, server_args)
-        # Warmup overwrites the dimensions after _adjust has run.
+        # Warmup requests are built directly and skip _adjust_visual_fields.
         self._align_resolution(server_args.pipeline_config)
 
     def _align_resolution(self, pipeline_config) -> None:
