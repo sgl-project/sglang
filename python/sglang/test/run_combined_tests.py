@@ -239,6 +239,8 @@ def run_combined_tests(
                     time.sleep(20)
 
         except Exception as exc:
+            if not share_server:
+                raise
             all_passed = False
             model_result["errors"].append(f"Model test exception: {exc}")
         finally:
@@ -260,7 +262,7 @@ def run_combined_tests(
             test_name, accuracy_params.dataset, accuracy_results
         )
 
-    if is_in_ci():
+    if share_server and is_in_ci():
         _write_combined_github_summary(test_name, all_results)
 
     # Print summary

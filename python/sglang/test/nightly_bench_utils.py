@@ -174,7 +174,7 @@ def save_results_as_pydantic_models(
             batch_size=res.batch_size,
             input_len=res.input_len,
             output_len=res.output_len,
-            total_output_tokens=getattr(res, "total_output_tokens", None),
+            total_output_tokens=res.total_output_tokens,
             latency=res.latency,
             input_throughput=res.input_throughput,
             output_throughput=res.output_throughput,
