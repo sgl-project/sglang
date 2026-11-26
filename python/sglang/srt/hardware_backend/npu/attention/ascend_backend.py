@@ -19,6 +19,11 @@ from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
 )
+from sglang.srt.hardware_backend.npu.attention.gqa_dcp import (
+    GQADCPMetadata,
+    forward_gqa_dcp,
+    prepare_gqa_dcp_metadata,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_cache import (
     build_mla_prefix_token_indices,
     gather_mla_cache_tokens,
@@ -141,6 +146,7 @@ class ForwardMetadata:
     dcp_seq_lens: Optional[torch.Tensor] = None
     dcp_block_tables: Optional[torch.Tensor] = None
     dcp_origin_out_cache_loc: Optional[torch.Tensor] = None
+    gqa_dcp: Optional[GQADCPMetadata] = None
     # DCP target-verify inputs, expanded to one row per speculative query.
     dcp_spec_seq_lens_cpu_int: Optional[torch.Tensor] = None
     dcp_spec_seq_lens: Optional[torch.Tensor] = None
@@ -395,6 +401,7 @@ class AscendAttnBackend(AttentionBackend):
         dense_mla = self.use_mla and not self.use_dsa
         self.dense_mla_dcp_target = dense_mla and self.dcp_size > 1
         self.dsa_dcp_target = self.use_dsa and self.dcp_size > 1
+        self.gqa_dcp_target = not self.use_mla and self.dcp_size > 1
         if self.use_mla:
             self.nope_padding_dtype = self.model_dtype or torch.bfloat16
             if (
@@ -468,6 +475,14 @@ class AscendAttnBackend(AttentionBackend):
                 self.sparse_kv_manager,
             )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        if self.gqa_dcp_target and (
+            not self.use_fia
+            or self.model_dtype != torch.bfloat16
+            or self.kv_cache_dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "Ascend GQA DCP requires ASCEND_USE_FIA=1 and BF16 model and KV."
+            )
         self.use_fias_v2_bsnd = (
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
@@ -598,7 +613,7 @@ class AscendAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         is_spec: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build rank-local paged KV metadata for NPU DSA DCP."""
+        """Build rank-local paged KV metadata for Ascend DCP."""
         parallel = get_parallel()
         if is_spec:
             local_kv_lens = get_dcp_chain_spec_lens(
@@ -667,6 +682,13 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = self._create_forward_metadata()
+        if self.gqa_dcp_target:
+            self.graph_mode = False
+            if not forward_batch.forward_mode.is_idle():
+                self.forward_metadata.gqa_dcp = prepare_gqa_dcp_metadata(
+                    self, forward_batch
+                )
+            return
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
@@ -1053,6 +1075,11 @@ class AscendAttnBackend(AttentionBackend):
         metadata.fa_metadata.copy_(schedule)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self.gqa_dcp_target:
+            raise ValueError(
+                "Ascend GQA DCP requires eager execution. Set both "
+                "--cuda-graph-backend-prefill and --cuda-graph-backend-decode to disabled."
+            )
         total_context_len = self.max_kv_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -2389,6 +2416,8 @@ class AscendAttnBackend(AttentionBackend):
         q_descale: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        if self.gqa_dcp_target:
+            return forward_gqa_dcp(self, q, k, v, layer, forward_batch, save_kv_cache)
         if is_mla_preprocess_enabled() and self.use_mla:
             # DSA callers set save_kv_cache based on whether preprocessing was used.
             # Only override it for the existing non-sparse MLA path.
@@ -4279,6 +4308,10 @@ class AscendAttnBackend(AttentionBackend):
         slopes: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        if self.gqa_dcp_target:
+            if forward_batch.forward_mode.is_idle():
+                return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
+            return forward_gqa_dcp(self, q, k, v, layer, forward_batch, save_kv_cache)
         return_softmax_lse = kwargs.pop("return_softmax_lse", False)
         if is_mla_preprocess_enabled() and self.use_mla:
             # DSA callers set save_kv_cache based on whether preprocessing was used.

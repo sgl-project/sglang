@@ -142,6 +142,22 @@ A DSA extend on Ascend picks one of two paths per forward. It either gathers the
 
 DCP adds a context-independent decode collective while cutting context-dependent KV storage and reads by about `c`. Extend is outside that decode cost model: it may gather cached prefix shards, restore token order, and append new tokens, and that work grows with prefix length.
 
+#### BF16 grouped-query attention
+
+On a single Ascend 910C node, the `ascend` backend can shard BF16 GQA KV by page across ranks that share the same KV head. Each group gathers its queries, runs FIA over the rank-local pages, and merges the partial output and FP32 LSE with packed HCCL all-to-all and AttentionUpdate. Prefill gathers the cached prefix and assembles a temporary paged KV buffer for causal attention. In hybrid models such as Qwen3.5, DCP shards only the full-attention KV. The linear-attention state stays indexed by request.
+
+Use eager prefill and decode, BF16 model and KV, and `ASCEND_USE_FIA=1`. Attention TP must be divisible by the total KV head count times DCP size. This example uses the Qwen3.5-122B-A10B BF16 checkpoint, with 32 query heads and two KV heads.
+
+```bash
+ASCEND_USE_FIA=1 sglang serve \
+  --model-path "$MODEL_PATH" \
+  --device npu --attention-backend ascend \
+  --dtype bfloat16 --kv-cache-dtype bf16 --mamba-ssm-dtype bfloat16 \
+  --tp-size 8 --dcp-size 2 --dcp-comm-backend a2a --page-size 128 \
+  --cuda-graph-backend-prefill disabled --cuda-graph-backend-decode disabled \
+  --disable-overlap-schedule
+```
+
 ## Compositions
 
 ### DCP × speculative decoding

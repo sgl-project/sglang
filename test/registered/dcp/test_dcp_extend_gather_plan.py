@@ -28,6 +28,9 @@ import torch
 
 from sglang.srt import runtime_context as rc
 from sglang.srt.hardware_backend.npu import dcp_extend_gather
+from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
+    build_gqa_dcp_extend_layout,
+)
 from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     DCP_EXTEND_QUERY_GATHER_MAX_TOKENS,
     build_dcp_extend_gather_plan,
@@ -45,6 +48,26 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+class TestGQAPagedExtendLayout(CustomTestCase):
+    def test_uneven_request_lengths_round_trip_through_page_table(self):
+        page_size = 128
+        lengths = [127, 0, 129, 257]
+        table, rows, capacity = build_gqa_dcp_extend_layout(lengths, page_size)
+        self.assertEqual(table.dtype, torch.int32)
+        self.assertEqual(capacity, 6 * page_size)
+        original = torch.arange(sum(lengths))
+        packed = torch.full((capacity,), -1).index_copy_(0, rows, original)
+        for request, (length, tokens) in enumerate(
+            zip(lengths, original.split(lengths))
+        ):
+            page_count = (length + page_size - 1) // page_size
+            pages = table[request, :page_count]
+            physical = (pages[:, None] * page_size + torch.arange(page_size)).flatten()
+            torch.testing.assert_close(packed[physical[:length]], tokens)
+        self.assertEqual(int((packed < 0).sum()), capacity - sum(lengths))
+
 
 DCP_SIZES = [1, 2, 3, 4, 16]
 # 1 is the round-robin rule; NPU serves at its page size.
