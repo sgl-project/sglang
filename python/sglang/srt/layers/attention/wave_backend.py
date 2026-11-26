@@ -117,8 +117,6 @@ class WaveAttnBackend(AttentionBackend):
 
         self.forward_metadata: ForwardMetadata = None
 
-        self.max_context_len = model_runner.req_to_token_pool.max_context_len
-
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
 
@@ -364,7 +362,7 @@ class WaveAttnBackend(AttentionBackend):
         )
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_bs * self.req_to_token_pool.row_width),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -373,7 +371,7 @@ class WaveAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_bs * self.req_to_token_pool.row_width),
                 dtype=torch.uint8,
                 device=self.device,
             )
