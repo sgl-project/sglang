@@ -1233,7 +1233,6 @@ _TRANSPORT_PLATFORMS = (
     NPUSRTPlatform,
 )
 _NO_TRANSPORT_PLATFORMS = (
-    XpuSRTPlatform,
     CpuSRTPlatform,
     MluSRTPlatform,
     MpsSRTPlatform,
@@ -1253,12 +1252,29 @@ class TestWeightCachePlatformHooks(CustomTestCase):
             self.assertEqual(platform_cls().weight_cache_transports(), ())
 
     def test_a_device_opts_in_by_overriding_the_hook(self):
-        class FakeXpu(XpuSRTPlatform):
+        class FakeCpu(CpuSRTPlatform):
             def weight_cache_transports(self):
                 return ("torch_ipc",)
 
-        self.assertEqual(XpuSRTPlatform().weight_cache_transports(), ())
-        self.assertEqual(FakeXpu().weight_cache_transports(), ("torch_ipc",))
+        self.assertEqual(CpuSRTPlatform().weight_cache_transports(), ())
+        self.assertEqual(FakeCpu().weight_cache_transports(), ("torch_ipc",))
+
+    def test_xpu_declares_vmm_fd_only_when_the_driver_can_share_memory(self):
+        """The Level Zero spec documents dma-buf export for zeMemAlloc*
+        allocations, not the zePhysicalMemCreate ones vmm_fd shares, so the
+        driver is probed instead of assumed: a daemon that started on a driver
+        without it would fail partway through its export. XPU never declares
+        torch_ipc, since torch-xpu registers no storage reducer."""
+        from sglang.srt.platforms import xpu as xpu_platform
+
+        for reason, expected in ((None, ("vmm_fd",)), ("no dma-buf fd", ())):
+            with (
+                self.subTest(reason=reason),
+                patch.object(
+                    xpu_platform, "_weight_cache_vmm_unsupported_reason", lambda: reason
+                ),
+            ):
+                self.assertEqual(XpuSRTPlatform().weight_cache_transports(), expected)
 
     def test_cuda_alike_platforms_reject_expandable_segments(self):
         for platform_cls in _TRANSPORT_PLATFORMS:

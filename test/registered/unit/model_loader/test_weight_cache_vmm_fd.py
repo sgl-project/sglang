@@ -7,7 +7,7 @@ standing in for the VMM allocations:
 
   - the packing plan: slots, alignment, allocation sizes, aliasing
   - the daemon's export path (WeightCacheDaemon._export_state ->
-    VmmFdTransportBackend.prepare_export): values, ties, and freeing every
+    CudaVmmFdTransportBackend.prepare_export): values, ties, and freeing every
     original as its allocation is filled
   - the packing plan's sizes and the free device memory, logged before
     anything is allocated or copied, and the warning when the free memory is
@@ -50,8 +50,8 @@ from sglang.srt.weight_cache.protocol import CacheConfig, recv_msg, send_msg
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
     VMM_FD_BACKEND,
+    CudaVmmFdTransportBackend,
     TorchIpcTransportBackend,
-    VmmFdTransportBackend,
     check_served_transport,
     create_daemon_transport_backend,
     get_client_transport_backend,
@@ -60,7 +60,10 @@ from sglang.srt.weight_cache.transport import (
     send_fds,
 )
 from sglang.srt.weight_cache.vmm_layout import (
+    LAYOUT_VERSION,
     SLOT_ALIGNMENT,
+    check_layout_device,
+    check_layout_version,
     plan_vmm_pack,
     validate_vmm_layout,
     view_from_entry,
@@ -72,6 +75,25 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 CPU = torch.device("cpu")
 GRANULARITY = 4096
+
+# What each platform's weight_cache_transports() reports, as the selection
+# tests below fake it.
+CUDA_TRANSPORTS = ("vmm_fd", "torch_ipc")
+NPU_TRANSPORTS = ("torch_ipc",)
+XPU_TRANSPORTS = ("vmm_fd",)
+
+
+@contextlib.contextmanager
+def _fake_platform(device_type: str, transports):
+    """Run with a platform that is ``device_type`` and serves ``transports``."""
+    platform = SimpleNamespace(
+        device_type=device_type,
+        weight_cache_transports=lambda: transports,
+        is_xpu=lambda: device_type == "xpu",
+        is_cuda_alike=lambda: device_type in ("cuda", "rocm", "musa", "sail"),
+    )
+    with mock.patch.object(transport, "current_platform", platform):
+        yield
 
 
 def _cpu_storage(pointer: int, nbytes: int) -> torch.UntypedStorage:
@@ -367,7 +389,7 @@ class TestVmmExportAndImport(CustomTestCase):
         del tensors
 
         # One slot per allocation, so packing runs over several allocations.
-        backend = VmmFdTransportBackend(
+        backend = CudaVmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
         )
         freed_at_each_empty_cache = []
@@ -409,7 +431,7 @@ class TestVmmExportAndImport(CustomTestCase):
         exported = _memfds([b"alloc-%d" % i for i in range(len(backend._alloc_sizes))])
         exported_inodes = [os.fstat(fd).st_ino for fd in exported]
         received_inodes = []
-        client = VmmFdTransportBackend()
+        client = CudaVmmFdTransportBackend()
 
         def fake_map(fds, sizes):
             # Stand-in for import + cuMemMap: map the same host memory.
@@ -478,7 +500,7 @@ class TestVmmExportAndImport(CustomTestCase):
         cache = {"example": cached_layer}
         daemon = _make_daemon(
             model,
-            VmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
+            CudaVmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
         )
         del model, cached_layer
         with mock.patch.object(factory, "_ROPE_DICT", cache), _host_vmm():
@@ -508,7 +530,7 @@ class TestVmmExportAndImport(CustomTestCase):
         registry = {"model.layers.0.mlp": moe_layer}
         daemon = _make_daemon(
             model,
-            VmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
+            CudaVmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
         )
         del model, moe_layer
         with (
@@ -527,7 +549,7 @@ class TestVmmExportAndImport(CustomTestCase):
     def test_export_log_reports_the_allocations(self):
         # vmm_fd entries carry no handle blob, so a handle-size estimate would
         # always read zero.
-        backend = VmmFdTransportBackend(
+        backend = CudaVmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
         )
         daemon = _make_daemon(_TinyModel(), backend)
@@ -556,7 +578,7 @@ class TestVmmExportAndImport(CustomTestCase):
             state_dict[prefix + "weight"] = state_dict[prefix + "weight"] * 2
 
         model._register_state_dict_hook(double_weight)
-        backend = VmmFdTransportBackend(
+        backend = CudaVmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=1 << 20
         )
         with _host_vmm():
@@ -596,7 +618,7 @@ class TestPackPlanLog(CustomTestCase):
     def _pack(self, state, max_alloc_bytes, free_bytes=1 << 40):
         """Pack ``state`` on host memory; returns the backend, the plan line
         and the warnings."""
-        backend = VmmFdTransportBackend(
+        backend = CudaVmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=max_alloc_bytes
         )
         with (
@@ -694,7 +716,7 @@ class TestPackPlanLog(CustomTestCase):
             events.append("mem_get_info")
             return 1 << 40, 1 << 40
 
-        backend = VmmFdTransportBackend(
+        backend = CudaVmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
         )
         self.addCleanup(backend.close)
@@ -775,6 +797,58 @@ class TestValidateVmmLayout(CustomTestCase):
         self._assert_rejected(
             lambda e: e["b"].__setitem__("offset", self.entries["w"]["offset"])
         )
+
+    def test_rejects_integers_that_would_overflow_a_driver_size(self):
+        """An empty view needs no bytes, so only the explicit bound stops a
+        storage_offset that ctypes would truncate modulo 2**64."""
+        self._assert_rejected(
+            lambda e: e["w"].update(shape=[0], stride=[1], storage_offset=1 << 70)
+        )
+        self._assert_rejected(lambda e: e["w"].update(shape=[1 << 70, 6]))
+        with self.assertRaises(ValueError):
+            validate_vmm_layout(self.entries, [1 << 70])
+
+    def test_rejects_entries_that_are_not_a_mapping_of_distinct_names(self):
+        """A pickled payload can hold any object here; read as pairs, a repeated
+        name would drop one tensor instead of being rejected."""
+        for entries in ([("w", self.entries["w"])], "w", None):
+            with self.subTest(entries=entries), self.assertRaises(ValueError):
+                validate_vmm_layout(entries, self.sizes)
+        with self.assertRaises(ValueError):
+            validate_vmm_layout({1: self.entries["w"]}, self.sizes)
+
+
+class TestLayoutCompatibility(CustomTestCase):
+    """The version and device stamped on a layout, which an engine checks
+    before it maps anything a daemon it cannot read sent."""
+
+    def test_the_current_version_and_a_daemon_that_predates_the_field_pass(self):
+        self.assertEqual(check_layout_version(LAYOUT_VERSION), LAYOUT_VERSION)
+        self.assertEqual(check_layout_version(None), 1)
+
+    def test_an_unknown_version_is_refused(self):
+        for version in (0, LAYOUT_VERSION + 1, "1", 1.0):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                check_layout_version(version)
+
+    def test_a_layout_from_another_device_type_is_refused(self):
+        check_layout_device("cuda", "cuda")
+        check_layout_device(None, "xpu")  # predates the field: CUDA-only then
+        with self.assertRaisesRegex(ValueError, "packed on a 'xpu' device"):
+            check_layout_device("xpu", "cuda")
+
+    def test_the_daemon_stamps_both_on_its_response(self):
+        backend = CudaVmmFdTransportBackend()
+        a, b = socket.socketpair()
+        try:
+            with mock.patch.object(backend, "_export_fds", return_value=[]):
+                backend.send_fetch_state_response(a, config={}, entries={}, pid=1)
+            response = recv_msg(b)
+        finally:
+            a.close()
+            b.close()
+        self.assertEqual(response["layout_version"], LAYOUT_VERSION)
+        self.assertEqual(response["device_type"], "cuda")
 
 
 class TestFdPassing(CustomTestCase):
@@ -889,7 +963,7 @@ class TestFdPassing(CustomTestCase):
 
     def test_daemon_closes_exported_fds_when_sending_fails(self):
         before = _open_fd_count()
-        backend = VmmFdTransportBackend()
+        backend = CudaVmmFdTransportBackend()
         backend._alloc_sizes = [GRANULARITY, GRANULARITY]
         a, b = socket.socketpair()
         b.close()
@@ -902,7 +976,7 @@ class TestFdPassing(CustomTestCase):
 
     def _send_layout(self, entries, sizes, fd_contents):
         """Daemon side of fetch_state; returns (daemon socket, engine socket)."""
-        backend = VmmFdTransportBackend()
+        backend = CudaVmmFdTransportBackend()
         backend._alloc_sizes = sizes
         a, b = socket.socketpair()
         with mock.patch.object(
@@ -926,7 +1000,7 @@ class TestFdPassing(CustomTestCase):
             }
         }
         a, b = self._send_layout(bad, [GRANULARITY], [b"a"])
-        client = VmmFdTransportBackend()
+        client = CudaVmmFdTransportBackend()
         try:
             with mock.patch.object(client, "_map_imported") as map_imported:
                 with self.assertRaisesRegex(ValueError, "does not fit"):
@@ -940,7 +1014,7 @@ class TestFdPassing(CustomTestCase):
     def test_engine_closes_received_fds_when_mapping_fails(self):
         before = _open_fd_count()
         a, b = self._send_layout({}, [GRANULARITY, GRANULARITY], [b"a", b"b"])
-        client = VmmFdTransportBackend()
+        client = CudaVmmFdTransportBackend()
         try:
             with mock.patch.object(
                 client, "_map_imported", side_effect=RuntimeError("map failed")
@@ -953,7 +1027,7 @@ class TestFdPassing(CustomTestCase):
         self.assertEqual(_open_fd_count(), before)
 
     def test_close_is_idempotent(self):
-        backend = VmmFdTransportBackend()
+        backend = CudaVmmFdTransportBackend()
         reservation = mock.Mock()
         backend._reservation = reservation
         backend._storages[(0, 0, 0)] = object()
@@ -994,7 +1068,7 @@ class TestAttachAfterAFailedAttach(CustomTestCase):
         self.expected = {name: t.detach().clone() for name, t in tensors.items()}
         del tensors
         # One slot per allocation, so that a fetch passes several fds.
-        backend = VmmFdTransportBackend(
+        backend = CudaVmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
         )
         self.daemon = _make_daemon(model, backend)
@@ -1066,7 +1140,7 @@ class TestAttachAfterAFailedAttach(CustomTestCase):
         if break_off == "after_request":
             client_sock.close()
         errors = []
-        client = VmmFdTransportBackend()
+        client = CudaVmmFdTransportBackend()
         with mock.patch.object(
             transport, "_send_fd", send_fd_after_half_waits_for_the_client
         ):
@@ -1143,13 +1217,42 @@ class TestAttachAfterAFailedAttach(CustomTestCase):
 
 
 class TestTransportSelection(CustomTestCase):
-    def test_daemon_resolution(self):
-        self.assertEqual(resolve_daemon_transport("auto"), TORCH_IPC_BACKEND)
-        self.assertEqual(resolve_daemon_transport(None), TORCH_IPC_BACKEND)
-        self.assertEqual(resolve_daemon_transport("torch_ipc"), TORCH_IPC_BACKEND)
-        self.assertEqual(resolve_daemon_transport("vmm_fd"), VMM_FD_BACKEND)
-        with self.assertRaises(ValueError):
-            resolve_daemon_transport("nccl")
+    """Which transport a daemon serves, and which implementation carries it.
+
+    The answers depend on the device, so each case states the platform it is
+    about instead of inheriting the host's.
+    """
+
+    def test_daemon_resolution_where_the_device_serves_both(self):
+        with _fake_platform("cuda", CUDA_TRANSPORTS):
+            self.assertEqual(resolve_daemon_transport("auto"), TORCH_IPC_BACKEND)
+            self.assertEqual(resolve_daemon_transport(None), TORCH_IPC_BACKEND)
+            self.assertEqual(resolve_daemon_transport("torch_ipc"), TORCH_IPC_BACKEND)
+            self.assertEqual(resolve_daemon_transport("vmm_fd"), VMM_FD_BACKEND)
+            with self.assertRaises(ValueError):
+                resolve_daemon_transport("nccl")
+
+    def test_auto_picks_the_only_transport_a_device_serves(self):
+        """XPU has no torch_ipc at all (torch-xpu registers no storage
+        reducer), so auto must not resolve to it there."""
+        with _fake_platform("xpu", XPU_TRANSPORTS):
+            self.assertEqual(resolve_daemon_transport("auto"), VMM_FD_BACKEND)
+            self.assertEqual(resolve_daemon_transport(None), VMM_FD_BACKEND)
+            self.assertEqual(resolve_daemon_transport("vmm_fd"), VMM_FD_BACKEND)
+            with self.assertRaisesRegex(ValueError, "not available on 'xpu'"):
+                resolve_daemon_transport("torch_ipc")
+
+    def test_a_transport_the_device_does_not_serve_is_refused(self):
+        with _fake_platform("npu", NPU_TRANSPORTS):
+            with self.assertRaisesRegex(ValueError, "not available on 'npu'"):
+                resolve_daemon_transport("vmm_fd")
+
+    def test_a_device_that_declares_nothing_is_left_to_the_daemons_gate(self):
+        """The daemon refuses to start on such a device with a message that
+        names it; resolution must not raise something vaguer first."""
+        with _fake_platform("cpu", ()):
+            self.assertEqual(resolve_daemon_transport("auto"), TORCH_IPC_BACKEND)
+            self.assertEqual(resolve_daemon_transport("vmm_fd"), VMM_FD_BACKEND)
 
     def test_daemon_backend_creation(self):
         self.assertIsInstance(
@@ -1172,10 +1275,28 @@ class TestTransportSelection(CustomTestCase):
         with self.assertRaises(RuntimeError):
             check_served_transport(TORCH_IPC_BACKEND, VMM_FD_BACKEND)
 
-    def test_engine_backend_for_vmm_fd(self):
-        self.assertIsInstance(
-            get_client_transport_backend(VMM_FD_BACKEND), VmmFdTransportBackend
-        )
+    def test_engine_backend_for_vmm_fd_follows_the_platform(self):
+        from sglang.srt.weight_cache.vmm_fd_xpu import XpuVmmFdTransportBackend
+
+        for device_type, transports, expected in (
+            ("cuda", CUDA_TRANSPORTS, CudaVmmFdTransportBackend),
+            ("xpu", XPU_TRANSPORTS, XpuVmmFdTransportBackend),
+        ):
+            with (
+                self.subTest(device_type=device_type),
+                _fake_platform(device_type, transports),
+            ):
+                self.assertIsInstance(
+                    get_client_transport_backend(VMM_FD_BACKEND), expected
+                )
+
+    def test_a_device_with_no_vmm_implementation_says_so(self):
+        """Before vmm_fd had an implementation per platform, asking for it on
+        NPU named the problem; a device without one must not fall through to
+        CUDA's and fail inside the driver instead."""
+        with _fake_platform("npu", NPU_TRANSPORTS):
+            with self.assertRaisesRegex(RuntimeError, "no implementation for 'npu'"):
+                get_client_transport_backend(VMM_FD_BACKEND)
 
     def test_cli_flag(self):
         from sglang.srt.server_args import ServerArgs

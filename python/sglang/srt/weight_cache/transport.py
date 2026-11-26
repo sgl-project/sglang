@@ -14,10 +14,19 @@ from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import MultiprocessingSerializer, is_npu
 
 from .protocol import send_msg
-from .vmm_layout import pack_slot, plan_vmm_pack, validate_vmm_layout, view_from_entry
+from .vmm_layout import (
+    LAYOUT_VERSION,
+    check_layout_device,
+    check_layout_version,
+    pack_slot,
+    plan_vmm_pack,
+    validate_vmm_layout,
+    view_from_entry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -237,42 +246,47 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
         return MultiprocessingSerializer.deserialize(entry["handle"])
 
 
-class VmmFdTransportBackend(WeightCacheTransportBackend):
-    """Share weights as CUDA VMM allocations passed as POSIX file descriptors.
+class VmmFdTransportBase(WeightCacheTransportBackend):
+    """Share weights as VMM allocations passed as POSIX file descriptors.
 
-    Daemon (``for_export`` + ``prepare_export``): copy every storage into a
-    few large ``cuMemCreate`` allocations that can be exported as POSIX fds
-    (layout in ``vmm_layout``), dropping its reference to each original once
-    it is copied. Each ``fetch_state`` gets the layout, then one freshly
-    exported fd per allocation over ``SCM_RIGHTS``.
+    One wire contract with one implementation per platform: the packing layout,
+    the fd framing and the engine-side tensor rebuild live here, and a subclass
+    supplies the driver calls that create, export, import and map memory.
+
+    Daemon (``for_export`` + ``prepare_export``): copy every storage into a few
+    large exportable allocations (layout in ``vmm_layout``), dropping its
+    reference to each original once it is copied. Each ``fetch_state`` gets the
+    layout, then one freshly exported fd per allocation over ``SCM_RIGHTS``.
 
     Engine (``recv_fetch_state_response`` + ``import_tensor``): reserve one
     virtual address range, import and map every allocation into it, and build
-    the tensors on top. CUDA frees a ``cuMemCreate`` allocation only after all
-    of its mappings and handles are released, so the engine's mappings keep
-    its weights valid even if the daemon exits. ``close`` unmaps them and
-    frees the address range; the IPC loader calls it only when a load fails,
-    since the tensors of a loaded model do not own the mappings (they stay
-    until the process exits).
+    the tensors on top. A driver frees such an allocation only once every
+    mapping and handle is released, so the engine's mappings keep its weights
+    valid even if the daemon exits. ``close`` unmaps them and frees the address
+    range; the IPC loader calls it only when a load fails, since the tensors of
+    a loaded model do not own the mappings (they stay until the process exits).
     """
 
     name = VMM_FD_BACKEND
+    # torch device type this implementation drives. It travels with the layout,
+    # so an engine refuses allocation handles that came from another driver.
+    device_type: str
 
     def __init__(
         self,
         *,
         device: Optional[torch.device] = None,
-        prop: Any = None,
         granularity: int = 0,
         max_alloc_bytes: int = VMM_FD_MAX_ALLOC_BYTES,
     ):
         # Daemon-side allocation parameters, filled in by for_export().
         self._device = device
-        self._prop = prop
         self._granularity = granularity
         self._max_alloc_bytes = max_alloc_bytes
-        self._reservation = None  # VmmReservation holding every allocation
-        self._handles: List[Any] = []  # daemon: retained handles to export
+        self._reservation = None  # the reservation holding every allocation
+        # Daemon: allocation handles retained for export. Engine: the handles
+        # imported from the daemon's fds, on a platform that must keep them.
+        self._handles: List[Any] = []
         self._alloc_sizes: List[int] = []
         self._alloc_offsets: List[int] = []  # allocation starts in the reservation
         # Engine: one storage per slot, so aliases share it.
@@ -284,42 +298,68 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         """Allocations packed (daemon) or mapped (engine)."""
         return len(self._alloc_sizes)
 
-    @classmethod
-    def for_export(cls, device_id: int) -> VmmFdTransportBackend:
-        """Daemon-side backend for ``device_id``.
+    # ------------------------------------------------------------------
+    # Driver hooks, implemented once per platform
+    # ------------------------------------------------------------------
 
-        Creates and exports one granule as a probe, so a GPU or driver that
-        cannot share POSIX-fd VMM memory fails before the model is loaded.
+    @property
+    @abstractmethod
+    def _reservation_base(self) -> int:
+        """Address the reservation starts at."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _empty_cache(self) -> None:
+        """Hand back what the torch allocator caches for this device."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _synchronize(self) -> None:
+        """Wait for this device's queued work to retire."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _free_device_bytes(self) -> int:
+        """Device memory free right now, for the pack-plan log."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _reserve(self, total_bytes: int):
+        """Reserve one address range that holds every allocation."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _create_and_map(self, offset: int, size: int):
+        """Create one exportable allocation, map it at ``offset`` in the
+        reservation, and return the handle to retain for export."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _tensor_from_pointer(self, pointer: int, nbytes: int) -> torch.Tensor:
+        """A uint8 tensor over ``nbytes`` at ``pointer``, on non-owning storage."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _export_fds(self) -> List[int]:
+        """Export a fresh fd per allocation; the caller closes them."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _map_imported(self, fds: Sequence[int], sizes: Sequence[int]) -> None:
+        """Import every allocation and map them back to back, in order, into
+        one reserved address range on the current device."""
+        raise NotImplementedError
+
+    def _release_handles(self, handles: Sequence[Any]) -> None:
+        """Release allocation handles once the reservation is unmapped.
+
+        The default suits a driver whose reservation releases the handles it
+        retained; a platform that owns them separately overrides this.
         """
-        from sglang.srt.utils.cuda_vmm_utils import (
-            _get_cuda_driver,
-            check_drv,
-            get_allocation_granularity,
-            make_device_allocation_prop,
-        )
 
-        drv = _get_cuda_driver()
-        posix_fd = (
-            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        )
-        prop = make_device_allocation_prop(device_id, handle_types=int(posix_fd))
-        granularity = get_allocation_granularity(prop)
-        handle = check_drv(
-            drv.cuMemCreate(granularity, prop, 0), "cuMemCreate(vmm_fd probe)"
-        )
-        try:
-            fd = check_drv(
-                drv.cuMemExportToShareableHandle(handle, posix_fd, 0),
-                "cuMemExportToShareableHandle(vmm_fd probe)",
-            )
-            os.close(int(fd))
-        finally:
-            check_drv(drv.cuMemRelease(handle), "cuMemRelease(vmm_fd probe)")
-        return cls(
-            device=torch.device("cuda", device_id),
-            prop=prop,
-            granularity=granularity,
-        )
+    # ------------------------------------------------------------------
+    # Daemon
+    # ------------------------------------------------------------------
 
     def prepare_export(
         self, state_tensors: MutableMapping[str, Tuple[torch.Tensor, bool]]
@@ -331,8 +371,6 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         copied originals can be reclaimed before the next allocation. Partial
         packing failures leave the daemon unusable and it exits.
         """
-        from sglang.srt.utils.cuda_vmm_utils import VmmReservation, tensor_from_pointer
-
         if self._reservation is not None:
             raise RuntimeError("vmm_fd state was already exported")
         tic = time.perf_counter()
@@ -347,36 +385,24 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
             return plan.entries
         # Hand back what torch still caches (e.g. from the released model), so
         # that the free memory read here is what the first allocation can use.
-        torch.cuda.empty_cache()
-        free_bytes, _ = torch.cuda.mem_get_info(self._device)
-        self._log_pack_plan(plan, free_bytes)
+        self._empty_cache()
+        self._log_pack_plan(plan, self._free_device_bytes())
 
         offsets = _prefix_offsets(plan.alloc_sizes)
-        self._reservation = VmmReservation(
-            sum(plan.alloc_sizes),
-            self._prop,
-            self._device.index,
-            alignment=self._granularity,
-        )
+        self._reservation = self._reserve(sum(plan.alloc_sizes))
         slots_by_alloc = [[] for _ in plan.alloc_sizes]
         for slot in plan.slots:
             slots_by_alloc[slot.alloc_index].append(slot)
         for alloc_index, size in enumerate(plan.alloc_sizes):
-            self._handles.append(
-                self._reservation.map(offsets[alloc_index], size, retain_handle=True)
-            )
-            alloc_base = self._reservation.base + offsets[alloc_index]
+            self._handles.append(self._create_and_map(offsets[alloc_index], size))
+            alloc_base = self._reservation_base + offsets[alloc_index]
             for slot in slots_by_alloc[alloc_index]:
-                dst = tensor_from_pointer(
-                    alloc_base + slot.offset,
-                    slot.nbytes,
-                    device_id=self._device.index,
-                )
+                dst = self._tensor_from_pointer(alloc_base + slot.offset, slot.nbytes)
                 pack_slot(slot, dst)
             # Wait for the copies, then hand the replaced originals back to
             # the driver so that they can back the next allocation.
-            torch.cuda.synchronize(self._device)
-            torch.cuda.empty_cache()
+            self._synchronize()
+            self._empty_cache()
 
         self._alloc_sizes = list(plan.alloc_sizes)
         self._alloc_offsets = offsets
@@ -399,7 +425,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         Free memory below the largest allocation only gets a warning: packing
         returns originals to the driver as it copies them, so the free memory
         before packing is not the exact need, and an allocation that does not
-        fit makes cuMemCreate fail before any engine attaches.
+        fit fails the driver call before any engine attaches.
         """
         largest = max(plan.slots, key=lambda slot: slot.nbytes)
         slot_key = (largest.alloc_index, largest.offset, largest.nbytes)
@@ -435,6 +461,182 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
                 largest_alloc,
             )
 
+    def send_fetch_state_response(
+        self,
+        conn: socket.socket,
+        *,
+        config: Dict[str, Any],
+        entries: Dict[str, Dict[str, Any]],
+        pid: int,
+        preloaded_weights_bytes: int = 0,
+    ) -> None:
+        fds = self._export_fds()
+        try:
+            send_msg(
+                conn,
+                {
+                    "status": "ok",
+                    "config": config,
+                    "entries": entries,
+                    "pid": pid,
+                    "transport_backend": self.name,
+                    "preloaded_weights_bytes": preloaded_weights_bytes,
+                    "allocation_sizes": list(self._alloc_sizes),
+                    "layout_version": LAYOUT_VERSION,
+                    "device_type": self.device_type,
+                },
+            )
+            send_fds(conn, fds)
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+    # ------------------------------------------------------------------
+    # Engine
+    # ------------------------------------------------------------------
+
+    def recv_fetch_state_response(
+        self, sock: socket.socket, result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        sizes = result.get("allocation_sizes")
+        # Reject a bad layout before reading any fd. Closing the socket makes
+        # the kernel drop the fds still queued on it. A daemon that predates
+        # either field sends neither, and read as version 1 on this device.
+        check_layout_version(result.get("layout_version"))
+        check_layout_device(result.get("device_type"), self.device_type)
+        validate_vmm_layout(result["entries"], sizes)
+        fds = recv_fds(sock, len(sizes))
+        try:
+            self._map_imported(fds, sizes)
+        finally:
+            for fd in fds:
+                os.close(fd)
+        return result
+
+    def import_tensor(self, entry: Dict[str, Any]) -> torch.Tensor:
+        if self._reservation is None:
+            raise RuntimeError("vmm_fd: no allocation is mapped")
+        key = (entry["alloc_index"], entry["offset"], entry["storage_nbytes"])
+        storage = self._storages.get(key)
+        if storage is None:
+            alloc_index, offset, nbytes = key
+            pointer = self._reservation_base + self._alloc_offsets[alloc_index]
+            storage = self._tensor_from_pointer(
+                pointer + offset, nbytes
+            ).untyped_storage()
+            self._storages[key] = storage
+        return view_from_entry(storage, entry, self._device)
+
+    def close(self) -> None:
+        """Unmap every allocation and free the address range; the daemon also
+        releases its allocation handles. Tensors built on these mappings must
+        not be used afterwards."""
+        self._storages.clear()
+        handles, self._handles = self._handles, []
+        reservation, self._reservation = self._reservation, None
+        try:
+            if reservation is not None:
+                reservation.close()
+        finally:
+            # Always, so a driver that refuses one unmap does not strand every
+            # handle: a platform that owns them must still get its chance.
+            self._release_handles(handles)
+
+
+class CudaVmmFdTransportBackend(VmmFdTransportBase):
+    """``vmm_fd`` over the CUDA driver.
+
+    Allocations come from ``cuMemCreate`` with the POSIX-fd handle type, are
+    mapped with ``cuMemMap`` into a ``cuMemAddressReserve`` range, and travel as
+    the fd ``cuMemExportToShareableHandle`` hands out. CUDA frees the memory only
+    after every mapping and handle is released, and ``VmmReservation.close``
+    releases the handles it retained, so this class owns no handle separately.
+    """
+
+    device_type = "cuda"
+
+    def __init__(
+        self,
+        *,
+        device: Optional[torch.device] = None,
+        prop: Any = None,
+        granularity: int = 0,
+        max_alloc_bytes: int = VMM_FD_MAX_ALLOC_BYTES,
+    ):
+        super().__init__(
+            device=device, granularity=granularity, max_alloc_bytes=max_alloc_bytes
+        )
+        self._prop = prop
+
+    @classmethod
+    def for_export(cls, device_id: int) -> CudaVmmFdTransportBackend:
+        """Daemon-side backend for ``device_id``.
+
+        Creates and exports one granule as a probe, so a GPU or driver that
+        cannot share POSIX-fd VMM memory fails before the model is loaded.
+        """
+        from sglang.srt.utils.cuda_vmm_utils import (
+            _get_cuda_driver,
+            check_drv,
+            get_allocation_granularity,
+            make_device_allocation_prop,
+        )
+
+        drv = _get_cuda_driver()
+        posix_fd = (
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        )
+        prop = make_device_allocation_prop(device_id, handle_types=int(posix_fd))
+        granularity = get_allocation_granularity(prop)
+        handle = check_drv(
+            drv.cuMemCreate(granularity, prop, 0), "cuMemCreate(vmm_fd probe)"
+        )
+        try:
+            fd = check_drv(
+                drv.cuMemExportToShareableHandle(handle, posix_fd, 0),
+                "cuMemExportToShareableHandle(vmm_fd probe)",
+            )
+            os.close(int(fd))
+        finally:
+            check_drv(drv.cuMemRelease(handle), "cuMemRelease(vmm_fd probe)")
+        return cls(
+            device=torch.device("cuda", device_id),
+            prop=prop,
+            granularity=granularity,
+        )
+
+    @property
+    def _reservation_base(self) -> int:
+        return self._reservation.base
+
+    def _empty_cache(self) -> None:
+        torch.cuda.empty_cache()
+
+    def _synchronize(self) -> None:
+        torch.cuda.synchronize(self._device)
+
+    def _free_device_bytes(self) -> int:
+        free_bytes, _ = torch.cuda.mem_get_info(self._device)
+        return int(free_bytes)
+
+    def _reserve(self, total_bytes: int):
+        from sglang.srt.utils.cuda_vmm_utils import VmmReservation
+
+        return VmmReservation(
+            total_bytes,
+            self._prop,
+            self._device.index,
+            alignment=self._granularity,
+        )
+
+    def _create_and_map(self, offset: int, size: int):
+        return self._reservation.map(offset, size, retain_handle=True)
+
+    def _tensor_from_pointer(self, pointer: int, nbytes: int) -> torch.Tensor:
+        from sglang.srt.utils.cuda_vmm_utils import tensor_from_pointer
+
+        return tensor_from_pointer(pointer, nbytes, device_id=self._device.index)
+
     def _export_fds(self) -> List[int]:
         """Export a fresh POSIX fd per allocation; the caller closes them."""
         from sglang.srt.utils.cuda_vmm_utils import _get_cuda_driver, check_drv
@@ -457,52 +659,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
             raise
         return fds
 
-    def send_fetch_state_response(
-        self,
-        conn: socket.socket,
-        *,
-        config: Dict[str, Any],
-        entries: Dict[str, Dict[str, Any]],
-        pid: int,
-        preloaded_weights_bytes: int = 0,
-    ) -> None:
-        fds = self._export_fds()
-        try:
-            send_msg(
-                conn,
-                {
-                    "status": "ok",
-                    "config": config,
-                    "entries": entries,
-                    "pid": pid,
-                    "transport_backend": self.name,
-                    "preloaded_weights_bytes": preloaded_weights_bytes,
-                    "allocation_sizes": list(self._alloc_sizes),
-                },
-            )
-            send_fds(conn, fds)
-        finally:
-            for fd in fds:
-                os.close(fd)
-
-    def recv_fetch_state_response(
-        self, sock: socket.socket, result: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        sizes = result.get("allocation_sizes")
-        # Reject a bad layout before reading any fd. Closing the socket makes
-        # the kernel drop the fds still queued on it.
-        validate_vmm_layout(result["entries"], sizes)
-        fds = recv_fds(sock, len(sizes))
-        try:
-            self._map_imported(fds, sizes)
-        finally:
-            for fd in fds:
-                os.close(fd)
-        return result
-
     def _map_imported(self, fds: Sequence[int], sizes: Sequence[int]) -> None:
-        """Import every allocation and map them back to back, in order, into
-        one reserved address range on the current device."""
         from sglang.srt.utils.cuda_vmm_utils import (
             VmmReservation,
             _get_cuda_driver,
@@ -567,53 +724,56 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
             reservation.base,
         )
 
-    def import_tensor(self, entry: Dict[str, Any]) -> torch.Tensor:
-        from sglang.srt.utils.cuda_vmm_utils import tensor_from_pointer
 
-        if self._reservation is None:
-            raise RuntimeError("vmm_fd: no allocation is mapped")
-        key = (entry["alloc_index"], entry["offset"], entry["storage_nbytes"])
-        storage = self._storages.get(key)
-        if storage is None:
-            alloc_index, offset, nbytes = key
-            pointer = self._reservation.base + self._alloc_offsets[alloc_index]
-            storage = tensor_from_pointer(
-                pointer + offset, nbytes, device_id=self._device.index
-            ).untyped_storage()
-            self._storages[key] = storage
-        return view_from_entry(storage, entry, self._device)
+def vmm_fd_backend_class() -> type:
+    """The ``vmm_fd`` implementation for the active platform.
 
-    def close(self) -> None:
-        """Unmap every allocation and free the address range; the daemon also
-        releases its allocation handles. Tensors built on these mappings must
-        not be used afterwards."""
-        self._storages.clear()
-        self._handles = []
-        reservation, self._reservation = self._reservation, None
-        if reservation is not None:
-            reservation.close()
+    One ``--weight-cache-transport vmm_fd`` names one wire contract, and the
+    platform decides which driver carries it; see ``VmmFdTransportBase``.
+    """
+    if current_platform.is_xpu():
+        from .vmm_fd_xpu import XpuVmmFdTransportBackend
+
+        return XpuVmmFdTransportBackend
+    if not current_platform.is_cuda_alike():
+        raise RuntimeError(
+            f"[weight_cache] The vmm_fd transport has no implementation for "
+            f"{current_platform.device_type!r}: it needs CUDA VMM or Level Zero "
+            f"VMM. Use --weight-cache-transport torch_ipc."
+        )
+    return CudaVmmFdTransportBackend
 
 
 def resolve_daemon_transport(requested: Optional[str]) -> str:
-    """The backend a daemon serves for ``--weight-cache-transport``."""
+    """The backend a daemon serves for ``--weight-cache-transport``.
+
+    ``auto`` keeps torch_ipc wherever the platform serves it, so CUDA stays on
+    torch_ipc until vmm_fd has GPU parity results, and a platform that serves
+    only vmm_fd gets the one transport it has. A platform that declares none is
+    left to the daemon's own gate, which names the problem properly.
+    """
+    transports = current_platform.weight_cache_transports()
     if requested in (None, "", AUTO_BACKEND):
-        # auto stays on torch_ipc until vmm_fd has GPU parity results.
-        return TORCH_IPC_BACKEND
-    if requested in (TORCH_IPC_BACKEND, VMM_FD_BACKEND):
-        return requested
-    raise ValueError(f"Unknown weight cache transport {requested!r}")
+        if TORCH_IPC_BACKEND in transports or not transports:
+            return TORCH_IPC_BACKEND
+        return transports[0]
+    if requested not in (TORCH_IPC_BACKEND, VMM_FD_BACKEND):
+        raise ValueError(f"Unknown weight cache transport {requested!r}")
+    if transports and requested not in transports:
+        raise ValueError(
+            f"[weight_cache] The {requested!r} transport is not available on "
+            f"{current_platform.device_type!r}, which serves "
+            f"{list(transports)}. Start the daemon with "
+            f"--weight-cache-transport {transports[0]} or auto."
+        )
+    return requested
 
 
 def create_daemon_transport_backend(
     name: str, device_id: int
 ) -> WeightCacheTransportBackend:
     if name == VMM_FD_BACKEND:
-        if is_npu():
-            raise RuntimeError(
-                "[weight_cache] The vmm_fd transport needs CUDA VMM and is not "
-                "available on NPU. Use --weight-cache-transport torch_ipc."
-            )
-        backend = VmmFdTransportBackend.for_export(device_id)
+        backend = vmm_fd_backend_class().for_export(device_id)
     elif name == TORCH_IPC_BACKEND:
         backend = TorchIpcTransportBackend()
     else:
@@ -638,5 +798,5 @@ def get_client_transport_backend(name: Optional[str]) -> WeightCacheTransportBac
     if name in (None, "", TORCH_IPC_BACKEND):
         return TorchIpcTransportBackend()
     if name == VMM_FD_BACKEND:
-        return VmmFdTransportBackend()
+        return vmm_fd_backend_class()()
     raise RuntimeError(f"Unknown weight cache transport backend {name!r}")

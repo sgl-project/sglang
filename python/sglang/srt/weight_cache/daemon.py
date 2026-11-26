@@ -5,7 +5,7 @@ TP-sharded model weights in GPU memory and serves them via pluggable transport b
 Each GPU runs one daemon process for its TP rank. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
 2. Exports every parameter/buffer through the selected transport
-   (--weight-cache-transport): CUDA IPC handles (torch_ipc), or CUDA VMM
+   (--weight-cache-transport): CUDA IPC handles (torch_ipc), or VMM
    allocations shared as file descriptors (vmm_fd)
 3. Serves transport entries over a Unix socket to requesting engine processes
 4. Validates CacheConfig compatibility before serving
@@ -153,8 +153,8 @@ class WeightCacheDaemon:
 
     Holds the complete post-quantization state_dict in GPU memory and
     serves it to engine processes over a Unix socket, through the selected
-    transport: CUDA IPC handles (torch_ipc) or CUDA VMM allocations passed as
-    file descriptors (vmm_fd).
+    transport: CUDA IPC handles (torch_ipc) or VMM allocations passed as file
+    descriptors (vmm_fd), which each platform implements with its own driver.
     """
 
     def __init__(
@@ -262,7 +262,6 @@ class WeightCacheDaemon:
 
     def load(self):
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
-        # Zero-copy IPC weight sharing requires a platform whose tensors can be
         # Fail loud here instead of dying deep inside the export with an
         # opaque error on a device no transport can serve.
         if not current_platform.weight_cache_transports():
@@ -415,7 +414,10 @@ class WeightCacheDaemon:
             # holds (originals that something else kept alive, if any).
             current_platform.empty_cache()
             self.preloaded_weights_bytes = (
-                max(0, current_platform.memory_reserved(self.gpu_id) - memory_before_load)
+                max(
+                    0,
+                    current_platform.memory_reserved(self.gpu_id) - memory_before_load,
+                )
                 + self.transport_backend.exported_bytes
             )
 

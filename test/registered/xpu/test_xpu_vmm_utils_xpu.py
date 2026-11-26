@@ -15,7 +15,7 @@ further checks do:
   other, in both directions.
 
 Sizes travel as ordinary metadata and only the fds go through ``send_fds``,
-matching how ``VmmFdTransportBackend`` splits the two on CUDA.
+matching how ``CudaVmmFdTransportBackend`` splits the two on CUDA.
 
 The CPU-only cases live in test/registered/unit/utils/test_xpu_vmm_utils.py.
 """
