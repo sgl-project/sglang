@@ -141,7 +141,6 @@ class MiniCPMSparseBackend(AttentionBackend):
             fa_impl_ver=fa_impl_ver,
         )
         self.forward_metadata: Optional[MiniCPMSparseMetadata] = None
-        self.max_context_len = self.flash_attn_backend.max_context_len
         self.device = self.flash_attn_backend.device
         self.model_dtype = model_runner.dtype
         self._use_cuda_graph_buffers = False
@@ -149,6 +148,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             self.flash_attn_backend.decode_cuda_graph_metadata
         )
         self.req_to_token_pool = self.flash_attn_backend.req_to_token_pool
+        self.max_kv_len = self.flash_attn_backend.max_kv_len
         self.token_to_kv_pool = self.flash_attn_backend.token_to_kv_pool
         self.page_size = self.flash_attn_backend.page_size
         tp_size = get_parallel().attn_tp_size
@@ -204,10 +204,12 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.sparse_topk = topk + (self.window_size // self.block_size)
         self.num_sparse_topk_tokens = self.block_size * self.sparse_topk
         required_context_len = max(self.config_dense_len, self.num_sparse_topk_tokens)
-        if self.max_context_len < required_context_len:
+        # The model's context, not the table row width, which carries headroom.
+        model_context_len = model_runner.model_config.context_len
+        if model_context_len < required_context_len:
             raise ValueError(
                 "MiniCPM sparse attention requires context_length >= "
-                f"{required_context_len}, got {self.max_context_len}."
+                f"{required_context_len}, got {model_context_len}."
             )
 
         # Head group number derived from model configuration
@@ -234,8 +236,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 f"got {self.model_dtype}."
             )
 
-        max_cache_len = self.max_context_len
-        pooled_k_len = (max_cache_len + self.block_size - 1) // self.block_size
+        pooled_k_len = (self.max_kv_len + self.block_size - 1) // self.block_size
 
         output_topk = min(self.sparse_topk, pooled_k_len)
 
@@ -427,7 +428,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             metadata=metadata,
             full_compressed_k1=compressed_k,
             full_compressed_k2=compressed_k2,
-            max_context_length=self.max_context_len,
+            max_context_length=self.max_kv_len,
             k1_kernel_size=self.k1_kernel_size,
             k1_kernel_stride=self.k1_kernel_stride,
             k2_kernel_size=self.k2_kernel_size,
@@ -458,7 +459,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 k2_kernel_stride=self.k2_kernel_stride,
                 dtype=key_states.dtype,
                 device=key_states.device,
-                max_context_length=self.max_context_len,
+                max_context_length=self.max_kv_len,
             )
 
             compressed = []
@@ -587,7 +588,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens,
                 compressed_cu_seqlens2,
                 max_seqlen_in_batch_q,
-                self.max_context_len,
+                self.max_kv_len,
                 init_blocks=self.init_blocks,
                 local_blocks=self.local_blocks,
                 cache_lens=cache_lens,
@@ -605,7 +606,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens,
                 cache_lens=cache_lens,
                 fused_kernel=fused_kernel,
-                max_cache_len=self.max_context_len,
+                max_cache_len=self.max_kv_len,
             )
 
         return topk_idx
@@ -703,7 +704,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 k2_kernel_stride=self.k2_kernel_stride,
                 dtype=k.dtype,
                 device=k.device,
-                max_context_length=self.max_context_len,
+                max_context_length=self.max_kv_len,
             )
 
         dense_layout_spans = [
@@ -914,14 +915,14 @@ class MiniCPMSparseBackend(AttentionBackend):
             max_num_pages = (
                 max(
                     0,
-                    (self.max_context_len - kernel_size) // kernel_stride + 1,
+                    (self.max_kv_len - kernel_size) // kernel_stride + 1,
                 )
                 + self.page_size
                 - 1
             ) // self.page_size
             buffers[f"compress_{name}"] = torch.zeros(
                 (
-                    max_bs * self.max_context_len // kernel_stride,
+                    max_bs * self.max_kv_len // kernel_stride,
                     self.head_group_num,
                     self.head_dim,
                 ),

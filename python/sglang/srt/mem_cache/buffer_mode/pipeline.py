@@ -292,7 +292,7 @@ class BufferModePipeline:
         cache: UnifiedRadixCache,
         swa_component: Optional[SWAComponent],
         write_backlog_cap: int,
-        max_context_len: int = 0,
+        context_length: int = 0,
         *,
         further_window_components: Sequence[SWAComponent] = (),
     ):
@@ -320,16 +320,16 @@ class BufferModePipeline:
             0,
             min(
                 int(envs.SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP.get() * full_pool.size),
-                full_pool.size - max_context_len,
+                full_pool.size - context_length,
             ),
         )
         if self.anchor_lock_cap_tokens == 0:
             logger.warning(
                 "BufferModePipeline anchor_lock_cap_tokens=0 (pool=%d, "
-                "max_context_len=%d): every prefetch launches with its splice "
+                "context_length=%d): every prefetch launches with its splice "
                 "base unpinned. Shrink --context-length or grow the KV pool.",
                 full_pool.size,
-                max_context_len,
+                context_length,
             )
         else:
             logger.info(
@@ -480,6 +480,27 @@ class BufferModePipeline:
         ack. A component that drops rows a pending write still reads asks
         here first; the pipeline pins the node only from D2H launch to ack."""
         return node_id in self.inflight_backup_pools
+
+    def order_parked_hits(
+        self, requests: Sequence[CacheRequestHandle]
+    ) -> CacheRequestHandle:
+        """Line the parked hits up in the order of ``requests``; a hit of none
+        of them goes first. Returns the request whose hit led the line: the
+        last drain could not commit it."""
+        head = self.pending_hit_allocs[0].handle
+        rank = {request: i for i, request in enumerate(requests)}
+        self.pending_hit_allocs = deque(
+            sorted(self.pending_hit_allocs, key=lambda op: rank.get(op.handle, -1))
+        )
+        return head
+
+    def holds_staging(self, request: CacheRequestHandle) -> bool:
+        """The request's prefetch holds host staging: its storage read is in
+        flight or staged."""
+        info = self._cache.ongoing_prefetch.get(request)
+        return request in self.staged_prefetches or (
+            info is not None and info.host_indices is not None
+        )
 
     def is_idle(self) -> bool:
         """No queued, staged, or in-flight buffer-mode work or anchor pins."""

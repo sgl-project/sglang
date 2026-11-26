@@ -47,9 +47,11 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_disagg
+from sglang.srt.sampling.sampler_params import SamplerParamsPool
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 from sglang.test.test_utils import CustomTestCase, enter_override
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -108,7 +110,7 @@ class _DecodeNode:
         self.next_room = 1000
         self.req_to_token_pool = DecodeReqToTokenPool(
             size=ROWS,
-            max_context_len=pool_size,
+            row_width=pool_size,
             device="cpu",
             enable_memory_saver=False,
             pre_alloc_size=ROWS,
@@ -182,6 +184,10 @@ class _DecodeNode:
             last_batch=None,
             tree_cache=self.tree_cache,
             req_to_token_pool=self.req_to_token_pool,
+            penalty_status_pool=idle_penalty_status_pool(),
+            sampler_params_pool=SamplerParamsPool(
+                num_rows=self.req_to_token_pool.req_to_token.shape[0], device="cpu"
+            ),
             token_to_kv_pool_allocator=self.allocator,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             max_running_requests=ROWS,
@@ -213,6 +219,7 @@ class _DecodeNode:
             beam_coordinator=SimpleNamespace(retire_group=lambda req: None),
             hisparse_coordinator=None,
             uocr_runtime=None,
+            penalty_status_pool=s.penalty_status_pool,
             send_abort_output=lambda abort_req, req: None,
             stream_output=lambda *a, **k: None,
         )

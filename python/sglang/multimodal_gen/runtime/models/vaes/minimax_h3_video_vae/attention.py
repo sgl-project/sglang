@@ -7,21 +7,34 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.utils import logging
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    aten_rms_norm_neox_rope_qk_rocm,
+    aten_rms_norm_rocm,
+    can_use_aten_rms_norm_neox_rope_qk_rocm,
+    can_use_aten_rms_norm_rocm,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-from .vit_utils import apply_rotary_pos_emb_qk
+from .vit_utils import apply_rotary_pos_emb_qk, native_rope_cache
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+logger = init_logger(__name__)
 _FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
     torch.cuda.get_device_properties(0).gcnArchName
 )
+_rocm_flash_attn = None
+if _FORCE_ROCM_MATH_SDPA:
+    try:
+        from aiter import flash_attn_func as _rocm_flash_attn
+    except ImportError:
+        pass
 
 
 def _math_sdpa(query, key, value):
@@ -49,11 +62,33 @@ def _math_sdpa(query, key, value):
 
 
 def _sdpa_attention(query, key, value):
-    query, key, value = (t.transpose(1, 2) for t in (query, key, value))
+    """query/key/value: [B, S, H, D]."""
     if _FORCE_ROCM_MATH_SDPA:
+        # torch's fused SDPA corrupts this decoder on gfx950; half inputs on the
+        # GPU take aiter's flash kernel (the fused class CUDA's SDPA picks, FP32
+        # accumulation), FP32 and CPU inputs the exact math replica.
+        device = query.device.type
+        if torch.is_autocast_enabled(device):
+            dtype = torch.get_autocast_dtype(device)
+            query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
+        if (
+            _rocm_flash_attn is not None
+            and query.is_cuda
+            and query.dtype in (torch.float16, torch.bfloat16)
+        ):
+            return _rocm_flash_attn(query, key, value, dropout_p=0.0, causal=False)
+        query, key, value = (t.transpose(1, 2) for t in (query, key, value))
         return _math_sdpa(query, key, value).transpose(1, 2)
+    query, key, value = (t.transpose(1, 2) for t in (query, key, value))
     out = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0)
     return out.transpose(1, 2)
+
+
+# ROCm runs these affine-free per-head RMSNorms one 256-thread block per
+# 64-wide row after a contiguous copy; the Triton replica gives the same bytes
+_ROCM_QK_RMS_NORM = BitExactFusionGate(
+    "H3 VAE qk RMSNorm (ROCm aten replica)", per_signature=True
+)
 
 
 def _vit_norm_input(module, hidden_states):
@@ -77,9 +112,70 @@ def _apply_qk_norm(module, hidden_states):
         # CUDA LayerNorm/RMSNorm accumulates half/bfloat16 inputs in FP32.
         # With no affine parameters its half output is bit-identical to the
         # released FP32-norm-then-cast recipe, without two full-tensor casts.
-        with torch.autocast("cuda", enabled=False):
-            return module(hidden_states)
+        def eager():
+            with torch.autocast("cuda", enabled=False):
+                return module(hidden_states)
+
+        if isinstance(module, nn.RMSNorm) and can_use_aten_rms_norm_rocm(hidden_states):
+            sig = (hidden_states.shape[-1], hidden_states.dtype)
+            if _ROCM_QK_RMS_NORM.can_attempt(sig):
+                eps = module.eps
+                if eps is None:
+                    eps = torch.finfo(hidden_states.dtype).eps
+                return _ROCM_QK_RMS_NORM.run(
+                    lambda: aten_rms_norm_rocm(hidden_states, eps),
+                    eager,
+                    sig=sig,
+                    logger=logger,
+                )
+        return eager()
     return module(_vit_norm_input(module, hidden_states)).to(hidden_states.dtype)
+
+
+# The two qk RMSNorms and the NeoX rope as one launch, same bytes as the three
+_ROCM_QK_NORM_ROPE = BitExactFusionGate(
+    "H3 VAE qk RMSNorm + rope (ROCm)", per_signature=True
+)
+
+
+def _rocm_qk_norm_rope(attn, query, key, rotary_pos_emb):
+    """``(query, key)`` normalized and rotated in one kernel, or None."""
+    norm_q, norm_k = attn.norm_q, attn.norm_k
+    if not (
+        envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM
+        and rotary_pos_emb is not None
+        and isinstance(norm_q, nn.RMSNorm)
+        and isinstance(norm_k, nn.RMSNorm)
+        and norm_q.weight is None
+        and norm_k.weight is None
+        and norm_q.eps == norm_k.eps
+        and not torch.is_grad_enabled()
+        and can_use_aten_rms_norm_rocm(query)
+    ):
+        return None
+    native = native_rope_cache(query, key, rotary_pos_emb)
+    if native is None:
+        return None
+    cache, positions = native
+    if not can_use_aten_rms_norm_neox_rope_qk_rocm(query, key, cache, positions):
+        return None
+    sig = (query.shape[-1], cache.shape[-1], query.dtype)
+    if not _ROCM_QK_NORM_ROPE.can_attempt(sig):
+        return None
+    eps = norm_q.eps if norm_q.eps is not None else torch.finfo(query.dtype).eps
+
+    def reference():
+        return apply_rotary_pos_emb_qk(
+            _apply_qk_norm(norm_q, query), _apply_qk_norm(norm_k, key), rotary_pos_emb
+        )
+
+    return _ROCM_QK_NORM_ROPE.run(
+        lambda: aten_rms_norm_neox_rope_qk_rocm(query, key, cache, positions, eps),
+        reference,
+        sig=sig,
+        equal=lambda a, b: all(map(torch.equal, a, b)),
+        logger=logger,
+    )
 
 
 class Attention(nn.Module):
@@ -159,12 +255,16 @@ class Attention(nn.Module):
         qkv = qkv.view(batch_size, seq_len, -1, 3 * self.dim_head)
         query, key, value = torch.chunk(qkv, 3, dim=-1)
 
-        if self.norm_q is not None:
-            query = _apply_qk_norm(self.norm_q, query)
-        if self.norm_k is not None:
-            key = _apply_qk_norm(self.norm_k, key)
-        if rotary_pos_emb is not None:
-            query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
+        fused = _rocm_qk_norm_rope(self, query, key, rotary_pos_emb)
+        if fused is not None:
+            query, key = fused
+        else:
+            if self.norm_q is not None:
+                query = _apply_qk_norm(self.norm_q, query)
+            if self.norm_k is not None:
+                key = _apply_qk_norm(self.norm_k, key)
+            if rotary_pos_emb is not None:
+                query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
         if self.attn is not None and query.dtype in (torch.float16, torch.bfloat16):
             hidden_states = self.attn(query, key, value)
