@@ -140,17 +140,20 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         k = self.original_max_position_embeddings
         if _is_cpu_amx_available and query.dtype == self.long_short_cos_sin_cache.dtype:
             # The whole batch switches to the long cache once any position exceeds k.
-            # All layers of a forward share `positions`, so compute idx once.
-            cache = self._cpu_idx_cache
-            if (
-                cache is not None
-                and cache[0] is positions
-                and cache[1] == positions._version
-            ):
-                idx = cache[2]
-            else:
+            if torch.compiler.is_compiling():
+                # the cache below would graph-break and recompile; the compiler dedups idx itself
                 idx = positions + (positions > k).any().long() * k
-                if not torch.compiler.is_compiling():
+            else:
+                # All layers of a forward share `positions`, so compute idx once.
+                cache = self._cpu_idx_cache
+                if (
+                    cache is not None
+                    and cache[0] is positions
+                    and cache[1] == positions._version
+                ):
+                    idx = cache[2]
+                else:
+                    idx = positions + (positions > k).any().long() * k
                     self._cpu_idx_cache = (positions, positions._version, idx)
             if offsets is not None:
                 idx = idx + offsets
