@@ -51,8 +51,10 @@ class TestDFlashSamplingVerify(CustomTestCase):
     def test_supports_sampling_verify_matches_the_accept_path(self):
         """Non-greedy rows fall back to argmax without a sampled head or the kernel."""
         cases = [
-            # Ascend keeps selector sampling off.
-            (dict(selector=True), True, False),
+            # Ascend: selector sampling off and no kernel.
+            (dict(selector=True), False, False),
+            # A selector draft without selector sampling verifies through the kernel.
+            (dict(selector=True), True, True),
             (dict(selector=True, selector_sampling=True), False, True),
             (dict(lilicorr=True, lilicorr_sampling=True), False, True),
             (dict(lilicorr=True), False, False),
@@ -69,7 +71,7 @@ class TestDFlashSamplingVerify(CustomTestCase):
                 patch(_KERNEL, return_value=kernel),
             ):
                 self.assertEqual(
-                    _dflash_worker(**worker_kwargs).supports_sampling_verify(),
+                    _dflash_worker(**worker_kwargs)._supports_sampling_verify(),
                     supported,
                 )
 

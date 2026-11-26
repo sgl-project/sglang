@@ -2925,13 +2925,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, cap_trim_lens
 
-    def supports_sampling_verify(self) -> bool:
-        """False means _accept_block verifies non-greedy rows by greedy argmax."""
+    def _supports_sampling_verify(self) -> bool:
+        """True when _accept_block verifies non-greedy rows by sampling."""
         if self._is_domino:
             # Domino proposes by greedy rollout; selector and LiLiCorr heads sit unused.
             return is_dflash_sampling_verify_available()
         if self.selector is not None:
-            return self._selector_sampling_enabled
+            return (
+                self._selector_sampling_enabled or is_dflash_sampling_verify_available()
+            )
         # The sampled head hands verify the q it drew from, so no fallback is needed.
         if self.lilicorr is not None and self._lilicorr_sampling_enabled:
             return True
@@ -2941,7 +2943,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # A PD prefill server never verifies.
         if (
             get_disagg().disaggregation_mode == "prefill"
-            or self.supports_sampling_verify()
+            or self._supports_sampling_verify()
         ):
             return
         if not get_spec().speculative_dflash_allow_greedy_verification:
