@@ -37,12 +37,24 @@ py_ge_min() {
 }
 
 find_python_ge_min() {
+    # Prefer a >=min interpreter that already provides evalscope so the venv
+    # can reuse it; otherwise fall back to the first >=min interpreter.
+    local first=""
     for candidate in python3.13 python3.12 python3 python; do
-        if command -v "${candidate}" >/dev/null 2>&1 && py_ge_min "${candidate}"; then
+        command -v "${candidate}" >/dev/null 2>&1 || continue
+        py_ge_min "${candidate}" || continue
+        if [ -z "${first}" ]; then
+            first="${candidate}"
+        fi
+        if "${candidate}" -c "import evalscope" >/dev/null 2>&1; then
             echo "${candidate}"
             return 0
         fi
     done
+    if [ -n "${first}" ]; then
+        echo "${first}"
+        return 0
+    fi
     return 1
 }
 
@@ -148,23 +160,23 @@ if [ "${EVALSCOPE_WITH_PIER}" = "1" ]; then
     fi
 fi
 
-# Highest priority (non-pier callers only): reuse a system-wide evalscope
-# (e.g. pre-installed in the image) via a --system-site-packages venv.
-if [ "${EVALSCOPE_WITH_PIER}" != "1" ] && python -c "import evalscope" >/dev/null 2>&1; then
-    echo "evalscope found in the system python, reuse it instead of installing."
-    if [ ! -x "${PYTHON_FOR_EVALSCOPE}" ]; then
-        python -m venv --system-site-packages ${PYTHON_ENV_FOR_EVALSCOPE}
-    fi
-    if evalscope_env_ready; then
-        log_env_versions
-        exit 0
-    fi
-    echo "The env cannot provide evalscope, install it instead."
+# Reuse evalscope already provided by the chosen interpreter (e.g. baked into
+# the sglang image) through a --system-site-packages venv, and only install the
+# extra pier package. This avoids reinstalling evalscope and its dependency
+# tree, which is a large chunk of the setup time.
+REUSE_SYSTEM_EVALSCOPE=0
+if "${BASE_PYTHON}" -c "import evalscope" >/dev/null 2>&1; then
+    REUSE_SYSTEM_EVALSCOPE=1
+    echo "evalscope found in ${BASE_PYTHON}; reusing it via --system-site-packages."
+fi
+
+if [ "${REUSE_SYSTEM_EVALSCOPE}" = "1" ] && [ ! -x "${PYTHON_FOR_EVALSCOPE}" ]; then
+    "${BASE_PYTHON}" -m venv --system-site-packages ${PYTHON_ENV_FOR_EVALSCOPE}
 fi
 
 # Reuse the existing venv when it already provides what is needed.
 if evalscope_env_ready; then
-    echo "evalscope already exists in ${PYTHON_ENV_FOR_EVALSCOPE}, skip installation."
+    echo "evalscope env already ready in ${PYTHON_ENV_FOR_EVALSCOPE}, skip installation."
     log_env_versions
     exit 0
 fi
