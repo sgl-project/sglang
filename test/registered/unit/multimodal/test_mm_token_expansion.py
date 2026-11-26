@@ -37,6 +37,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   budget or trusted URLs without --enable-token-space-preprocess-cache -> the core caches nothing
   --token-space-preprocess-cache-dir -> the core caches on disk; the check rate reaches the core
   adjacent images -> two offsets from mm_spans, not one scanned run
+  M-RoPE fallback -> none without M-RoPE, also for int item fields; the strategy's own with it
   equal features, different grids -> different item hashes
   equal feature bytes, different feature shapes -> different item hashes
   chat turns' media + partially expanded IDs -> prefix kept, new turn expanded
@@ -66,6 +67,7 @@ from sglang.srt.managers.multimodal_processor import (
     get_mm_processor,
     import_processors,
 )
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.multimodal.cache import DiskPreprocessCache, MultimodalPreprocessCache
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -983,6 +985,55 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             self._item_hash(_PixelShapeStrategy, (1, 2)),
             self._item_hash(_PixelShapeStrategy, (2, 1)),
         )
+
+    def test_mrope_fallback_rebuilds_fields_only_for_a_strategy_with_mrope(self):
+        """A strategy without M-RoPE answers the fallback with none, also for int item fields
+        a rebuild could not concatenate; one with M-RoPE still gets the rebuilt fields."""
+
+        class _WidthGridStrategy(_ImageWidthStrategy):
+            mm_item_fields = {"pixel_values": Modality.IMAGE, "width": Modality.IMAGE}
+
+        class _MropeStrategy(_WidthGridStrategy):
+            def compute_mrope_positions(self, output):
+                return output["width"].tolist(), None
+
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+
+        def items(width_of):
+            return [
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=torch.ones(width, 1),
+                    offsets=[(start, start + width - 1)],
+                    model_specific_data={"width": width_of(width)},
+                )
+                for start, width in ((1, 2), (4, 3))
+            ]
+
+        input_ids = [1, IMAGE, IMAGE, 2, IMAGE, IMAGE, IMAGE]
+        # Int grids as legacy DeepSeek-V4.1 keeps n_vit_h and n_vit_w; tensors for M-RoPE.
+        for strategy_class, width_of, positions in (
+            (_WidthGridStrategy, int, (None, None)),
+            (_MropeStrategy, lambda width: torch.tensor([width]), ([2, 3], None)),
+        ):
+            processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+                strategy_class, TokenSpaceServingSpec
+            )(None, server_args, _bare_tokenizer(), None)
+            self.addCleanup(processor.shutdown)
+            with self.subTest(strategy=strategy_class.__name__):
+                self.assertEqual(
+                    processor.compute_mrope_positions(input_ids, items(width_of)),
+                    positions,
+                )
 
 
 class TestStrategyLoaders(unittest.TestCase):
