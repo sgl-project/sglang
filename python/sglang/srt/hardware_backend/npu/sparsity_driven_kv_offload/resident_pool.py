@@ -70,16 +70,16 @@ class ResidentKVPool:
         self.last_prefix.index_fill_(0, resident_indices, -1)
 
     def clear(self) -> None:
-        self._resident_rows_by_request = [0] * self.request_rows
+        self._request_to_resident_cpu = [0] * self.request_rows
         self._free_resident_rows = list(range(self.resident_rows - 1, 0, -1))
 
     def available(self) -> int:
         return len(self._free_resident_rows)
 
     def release(self, req_id: int) -> None:
-        resident_id = self._resident_rows_by_request[req_id]
+        resident_id = self._request_to_resident_cpu[req_id]
         if resident_id:
-            self._resident_rows_by_request[req_id] = 0
+            self._request_to_resident_cpu[req_id] = 0
             self._free_resident_rows.append(resident_id)
 
     def admit(self, req_ids: list[int]) -> None:
@@ -89,7 +89,7 @@ class ResidentKVPool:
         new_req_ids = [
             req_id
             for req_id in dict.fromkeys(req_ids)
-            if not self._resident_rows_by_request[req_id]
+            if not self._request_to_resident_cpu[req_id]
         ]
         if not new_req_ids:
             return
@@ -101,7 +101,7 @@ class ResidentKVPool:
 
         # Keep the CPU ownership unchanged if reset or publication raises.
         resident_ids = self._free_resident_rows[-count:][::-1]
-        mapping = self._resident_rows_by_request.copy()
+        mapping = self._request_to_resident_cpu.copy()
         for req_id, resident_id in zip(new_req_ids, resident_ids):
             mapping[req_id] = resident_id
         self.reset_rows(new_req_ids, resident_ids)
@@ -110,5 +110,5 @@ class ResidentKVPool:
             torch.tensor(mapping, dtype=device_mapping.dtype, device="cpu"),
             non_blocking=True,
         )
-        self._resident_rows_by_request = mapping
+        self._request_to_resident_cpu = mapping
         del self._free_resident_rows[-count:]
