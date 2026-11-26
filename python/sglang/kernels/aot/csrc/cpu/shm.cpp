@@ -14,7 +14,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#include <chrono>
+#include <thread>
 
 // states for collectives
 enum coll_state {
@@ -37,40 +41,56 @@ enum coll_state {
 
 // SHM building blocks
 struct SharedData {
-  const char* name;
-  int descriptor;
   void* bytes;
-  size_t nbytes;
 };
 
-void shared_open(SharedData* data, const char* name, size_t nbytes) {
+bool shared_open(SharedData* data, const char* name, size_t nbytes) {
   int d = shm_open(name, O_RDWR, S_IRUSR | S_IWUSR);
   if (d != -1) {
-    void* bytes = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, d, 0);
-    data->name = name;
-    data->descriptor = d;
-    data->bytes = bytes;
-    data->nbytes = nbytes;
-  } else {
-    if (errno != ENOENT) {
-      // don't print if shm can not be found because we want to loop over from
-      // caller again until the other ranks created the shm
-      printf("shared_open %s failed, errno=%d\n", name, errno);
+    struct stat status;
+    int stat_result = fstat(d, &status);
+    int stat_errno = errno;
+    if (stat_result != 0) {
+      close(d);
+      TORCH_CHECK(false, "fstat failed for ", name, ": ", strerror(stat_errno));
     }
-    data->descriptor = -1;
+    if (status.st_size == 0) {
+      close(d);
+      return false;
+    }
+    if (status.st_size != static_cast<off_t>(nbytes)) {
+      close(d);
+      TORCH_CHECK(false, "Unexpected shared memory size for ", name);
+    }
+    void* bytes = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, d, 0);
+    int saved_errno = errno;
+    close(d);
+    TORCH_CHECK(bytes != MAP_FAILED, "mmap failed for ", name, ": ", strerror(saved_errno));
+    data->bytes = bytes;
+    return true;
+  } else {
+    TORCH_CHECK(errno == ENOENT, "shm_open failed for ", name, ": ", strerror(errno));
+    return false;
   }
 }
 
-void shared_create(SharedData* data, const char* name, void* bytes, size_t nbytes) {
-  int d = shm_open(name, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
-  if (d != -1) {
-    nbytes = write(d, bytes, nbytes);
-    if (nbytes > 0) {
-      shared_open(data, name, nbytes);
-    }
-  } else {
-    printf("shared_create %s failed\n", name);
+void shared_create(SharedData* data, const char* name, size_t nbytes) {
+  int d = shm_open(name, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
+  TORCH_CHECK(d != -1, "shm_open failed for ", name, ": ", strerror(errno));
+  int error = posix_fallocate(d, 0, nbytes);
+  if (error != 0) {
+    close(d);
+    shm_unlink(name);
+    TORCH_CHECK(false, "posix_fallocate failed for ", name, ": ", strerror(error));
   }
+  void* bytes = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, d, 0);
+  int saved_errno = errno;
+  close(d);
+  if (bytes == MAP_FAILED) {
+    shm_unlink(name);
+    TORCH_CHECK(false, "mmap failed for ", name, ": ", strerror(saved_errno));
+  }
+  data->bytes = bytes;
 }
 
 // SHM based allreduce helper functions
@@ -88,6 +108,7 @@ constexpr int kNumCollectiveStates = STATE_GROUP_ALL_TO_ALL + 1;
 // idx=5 -- state for all_to_all
 struct allreduce_workspace {
   enum coll_state states[kNumCollectiveStates];
+  int mapped;
   // double buffer to avoid syncing between rounds
   // offset=0 -- 2*NAIVE_ALLREDUCE_THRESHOLD : buffer for
   // symmetric_naive_all_reduce after that : buffer for
@@ -101,6 +122,15 @@ struct allreduce_workspace {
        2 * MAX_BUF_SIZE                 // all_to_all
 
   ];
+};
+
+struct ShmNameGuard {
+  const char* name;
+  bool active = true;
+
+  ~ShmNameGuard() {
+    if (active) shm_unlink(name);
+  }
 };
 
 #define BUFFER0_OFFSET(current_buffer) current_buffer* NAIVE_ALLREDUCE_THRESHOLD
@@ -230,10 +260,11 @@ int64_t shm_initialize(int size, int rank, const char* addr_string, const char* 
   // allocate workspace_buf for current rank
   struct allreduce_workspace* workspace_buf;
   struct allreduce_workspace* workspace_buf_other;
-  workspace_buf = (struct allreduce_workspace*)malloc(sizeof(struct allreduce_workspace));
   snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", shm_name_prefix, rank);
-  shared_create(&allreduce_buffer, shm_name, workspace_buf, sizeof(struct allreduce_workspace));
-  free(workspace_buf);
+  shared_create(&allreduce_buffer, shm_name, sizeof(struct allreduce_workspace));
+  char own_shm_name[NAME_BUF_SIZE];
+  snprintf(own_shm_name, NAME_BUF_SIZE, "%s", shm_name);
+  ShmNameGuard own_shm_guard{own_shm_name};
   workspace_buf = (struct allreduce_workspace*)allreduce_buffer.bytes;
   workspace_buf->states[STATE_GROUP_SYMMETRIC_ALLREDUCE] =
       coll_alt2_allreduce_naive__copy_in_done;                            // symmetric_naive_all_reduce
@@ -262,14 +293,16 @@ int64_t shm_initialize(int size, int rank, const char* addr_string, const char* 
   ctx->alltoall_buffer[0] = (char**)malloc(size * sizeof(char*));
   ctx->alltoall_buffer[1] = (char**)malloc(size * sizeof(char*));
 
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
   // map shm of all ranks
   for (int i = 0; i < size; i++) {
     if (i != rank) {
       snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", shm_name_prefix, i);
       // printf("open %s, %d\n", shm_name, rank);
-      do {
-        shared_open(&allreduce_buffer, shm_name, sizeof(struct allreduce_workspace));
-      } while (allreduce_buffer.descriptor == -1 && errno == ENOENT);
+      while (!shared_open(&allreduce_buffer, shm_name, sizeof(struct allreduce_workspace))) {
+        TORCH_CHECK(std::chrono::steady_clock::now() < deadline, "Timed out waiting for shared memory ", shm_name);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
       workspace_buf_other = (struct allreduce_workspace*)allreduce_buffer.bytes;
       ctx->workspace[i] = workspace_buf_other;
     } else {
@@ -294,6 +327,16 @@ int64_t shm_initialize(int size, int rank, const char* addr_string, const char* 
     ctx->alltoall_buffer[0][i] = ctx->workspace[i]->buffer + BUFFER5_OFFSET(0);
     ctx->alltoall_buffer[1][i] = ctx->workspace[i]->buffer + BUFFER5_OFFSET(1);
   }
+
+  __atomic_store_n(&workspace_buf->mapped, 1, __ATOMIC_RELEASE);
+  for (int i = 0; i < size; i++) {
+    while (!__atomic_load_n(&ctx->workspace[i]->mapped, __ATOMIC_ACQUIRE)) {
+      TORCH_CHECK(std::chrono::steady_clock::now() < deadline, "Timed out waiting for shared memory ranks");
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  TORCH_CHECK(shm_unlink(own_shm_name) == 0, "shm_unlink failed for ", own_shm_name, ": ", strerror(errno));
+  own_shm_guard.active = false;
 
   const int64_t handle = static_cast<int64_t>(shm_contexts.size());
   shm_contexts.push_back(ctx);

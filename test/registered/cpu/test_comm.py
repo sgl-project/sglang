@@ -1,9 +1,13 @@
 import copy
 import multiprocessing
 import os
+import time
 import traceback
 import unittest
+import uuid
 from multiprocessing import Process
+from pathlib import Path
+from unittest.mock import patch
 
 import sgl_kernel  # noqa: F401
 import torch
@@ -43,6 +47,33 @@ def run_distributed_test(
 
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def run_delayed_shm_test(
+    rank, master_port, group_name, delayed, proceed, output_writer
+):
+    try:
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = master_port
+        if rank == 1:
+            delayed.set()
+            if not proceed.wait(30):
+                raise TimeoutError("rank 1 was not released")
+        handle = torch.ops.sgl_kernel.shm_group_initialize(group_name, 2, rank)
+        path = Path(
+            f"/dev/shm/deepspeed_allreduce_buffer_{os.getuid()}_localhost_"
+            f"{master_port}_{group_name}_{rank}"
+        )
+        if path.exists():
+            raise AssertionError(f"shared memory still named: {path}")
+        tensor = torch.tensor([float(rank + 1)])
+        torch.ops.sgl_kernel.shm_allreduce(tensor, dist.ReduceOp.SUM, handle)
+        torch.testing.assert_close(tensor, torch.tensor([3.0]))
+        output_writer.send(None)
+    except Exception:
+        output_writer.send(traceback.format_exc())
+    finally:
+        output_writer.close()
 
 
 def all_reduce_fn(rank, world_size):
@@ -208,6 +239,93 @@ def group_all_to_all_fn(rank, world_size):
 
 
 class TestComm(CustomTestCase):
+    def test_group_shared_memory_unlinked(self):
+        """An initialized group must not leave named shared memory behind."""
+        group_name = f"test_{uuid.uuid4().hex}"
+        master_port = str(find_available_port(23456))
+        path = Path(
+            f"/dev/shm/deepspeed_allreduce_buffer_{os.getuid()}_localhost_"
+            f"{master_port}_{group_name}_0"
+        )
+        try:
+            with patch.dict(
+                os.environ, MASTER_ADDR="localhost", MASTER_PORT=master_port
+            ):
+                handle = torch.ops.sgl_kernel.shm_group_initialize(group_name, 1, 0)
+            self.assertFalse(path.exists())
+            tensor = torch.ones(1)
+            torch.ops.sgl_kernel.shm_allreduce(tensor, dist.ReduceOp.SUM, handle)
+            torch.testing.assert_close(tensor, torch.ones(1))
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_group_shared_memory_existing_name(self):
+        group_name = f"test_{uuid.uuid4().hex}"
+        master_port = str(find_available_port(23456))
+        path = Path(
+            f"/dev/shm/deepspeed_allreduce_buffer_{os.getuid()}_localhost_"
+            f"{master_port}_{group_name}_0"
+        )
+        try:
+            with path.open("xb") as existing:
+                existing.write(b"existing")
+            with patch.dict(
+                os.environ, MASTER_ADDR="localhost", MASTER_PORT=master_port
+            ):
+                with self.assertRaisesRegex(RuntimeError, "shm_open failed"):
+                    torch.ops.sgl_kernel.shm_group_initialize(group_name, 1, 0)
+            self.assertEqual(path.read_bytes(), b"existing")
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_group_shared_memory_delayed_rank(self):
+        """A slow rank must map each segment before its name is unlinked."""
+        mp.set_start_method("spawn", force=True)
+        group_name = f"test_{uuid.uuid4().hex}"
+        master_port = str(find_available_port(23456))
+        paths = [
+            Path(
+                f"/dev/shm/deepspeed_allreduce_buffer_{os.getuid()}_localhost_"
+                f"{master_port}_{group_name}_{rank}"
+            )
+            for rank in range(2)
+        ]
+        delayed = mp.Event()
+        proceed = mp.Event()
+        output_reader, output_writer = mp.Pipe(duplex=False)
+        processes = [
+            Process(
+                target=run_delayed_shm_test,
+                args=(rank, master_port, group_name, delayed, proceed, output_writer),
+            )
+            for rank in range(2)
+        ]
+        try:
+            for process in processes:
+                process.start()
+            self.assertTrue(delayed.wait(30), "rank 1 did not reach the delay")
+            deadline = time.monotonic() + 30
+            while not paths[0].exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(paths[0].exists(), "rank 0 did not create its segment")
+            proceed.set()
+            for _ in processes:
+                self.assertTrue(output_reader.poll(60), "rank did not complete")
+                self.assertIsNone(output_reader.recv())
+            for process in processes:
+                process.join(10)
+                self.assertEqual(process.exitcode, 0)
+        finally:
+            proceed.set()
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(10)
+            output_reader.close()
+            output_writer.close()
+            for path in paths:
+                path.unlink(missing_ok=True)
+
     def _spawn_and_check(self, fn, world_size=2, init_legacy_shm=True):
         mp.set_start_method("spawn", force=True)
         master_port = find_available_port(23456)
