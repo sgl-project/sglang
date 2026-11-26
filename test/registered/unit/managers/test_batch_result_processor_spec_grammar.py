@@ -338,7 +338,10 @@ class TestReasoningTokenAccounting(CustomTestCase):
 class TestFinishedMambaSpecCheckpoint(CustomTestCase):
     def test_finished_checkpoint_boundaries(self):
         processor = replace(
-            _make_processor(), tree_cache=SimpleNamespace(supports_mamba=lambda: True)
+            _make_processor(),
+            tree_cache=SimpleNamespace(
+                supports_mamba=lambda: True, request_mamba_only=False
+            ),
         )
         cases = (
             ("grammar", [4], 1, 1, 0, False),
@@ -390,6 +393,7 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
             batch.mamba_track_mask_cpu = None
             tree = MagicMock()
             tree.supports_mamba.return_value = True
+            tree.request_mamba_only = False
             tree.claim_kv_row.return_value = False
             tree.token_to_kv_pool_allocator.page_size = 1
             tree.logical_page_size = 1

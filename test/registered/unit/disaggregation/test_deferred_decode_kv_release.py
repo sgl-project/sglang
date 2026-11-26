@@ -12,6 +12,7 @@ All decode attention-TP ranks must agree on holding and releasing each request.
 import datetime
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,9 +32,12 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
+    _pp_held_key,
+    _PPStagingOutstanding,
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components import request_retirer as retirer_mod
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -1170,6 +1174,184 @@ class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
 
         self.assertEqual(at_failure, [("hisparse", "r13"), ("kv", "r13")])
         self.assertEqual(log, at_failure)
+
+
+class _ReadPausingStatusMap(dict):
+    """Parks the named thread right after its first ``get``."""
+
+    def __init__(self, pause_thread_name: str):
+        super().__init__()
+        self._pause_thread_name = pause_thread_name
+        self.paused = threading.Event()
+        self.resume = threading.Event()
+
+    def get(self, key, default=None):
+        value = super().get(key, default)
+        if (
+            threading.current_thread().name == self._pause_thread_name
+            and not self.paused.is_set()
+        ):
+            self.paused.set()
+            self.resume.wait(timeout=10)
+        return value
+
+
+class _ContentionSignalingLock:
+    """A lock that records when a second thread has to wait for it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.contended = threading.Event()
+
+    def __enter__(self):
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+
+
+class TestUpdateStatusOpeningRace(CustomTestCase):
+    def test_late_bootstrapping_does_not_overwrite_waiting_for_input(self):
+        room = 4242
+        mgr = _make_prefill_manager()
+        mgr._status_lock = _ContentionSignalingLock()
+        mgr.request_status = _ReadPausingStatusMap("sender-init")
+        sender = threading.Thread(
+            name="sender-init",
+            target=CommonKVManager.update_status,
+            args=(mgr, room, KVPoll.Bootstrapping),
+        )
+        bootstrap = threading.Thread(
+            name="bootstrap",
+            target=CommonKVManager.update_status,
+            args=(mgr, room, KVPoll.WaitingForInput),
+        )
+
+        sender.start()
+        self.assertTrue(mgr.request_status.paused.wait(timeout=10))
+        bootstrap.start()
+        deadline = time.monotonic() + 10
+        while (
+            bootstrap.is_alive()
+            and not mgr._status_lock.contended.is_set()
+            and time.monotonic() < deadline
+        ):
+            bootstrap.join(timeout=0.01)
+        mgr.request_status.resume.set()
+        sender.join(timeout=10)
+        bootstrap.join(timeout=10)
+
+        self.assertFalse(sender.is_alive())
+        self.assertFalse(bootstrap.is_alive())
+        self.assertEqual(mgr.request_status[room], KVPoll.WaitingForInput)
+
+
+class TestClearDoesNotRaceUpdateStatus(CustomTestCase):
+    """A status write that read the room before clear() must not recreate it."""
+
+    def test_trailing_status_write_cannot_resurrect_a_cleared_room(self):
+        room = 4243
+        mgr = _make_prefill_manager()
+        mgr._status_lock = _ContentionSignalingLock()
+        mgr.request_status = _ReadPausingStatusMap("worker")
+        mgr.request_status[room] = KVPoll.Transferring
+        sender = _TestSender.__new__(_TestSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = room
+        sender.conclude_state = KVPoll.Success
+        worker = threading.Thread(
+            name="worker",
+            target=CommonKVManager.update_status,
+            args=(mgr, room, KVPoll.Transferring),
+        )
+        scheduler = threading.Thread(name="scheduler", target=sender.clear)
+
+        worker.start()
+        self.assertTrue(mgr.request_status.paused.wait(timeout=10))
+        scheduler.start()
+        deadline = time.monotonic() + 10
+        while (
+            scheduler.is_alive()
+            and not mgr._status_lock.contended.is_set()
+            and time.monotonic() < deadline
+        ):
+            scheduler.join(timeout=0.01)
+        mgr.request_status.resume.set()
+        worker.join(timeout=10)
+        scheduler.join(timeout=10)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(scheduler.is_alive())
+        self.assertNotIn(room, mgr.request_status)
+
+
+def _bare_pp_store():
+    """A rank-0 PPConsensusStore without ZMQ: rank 0 never replicates."""
+    store = PPConsensusStore.__new__(PPConsensusStore)
+    store._pp_size = 1
+    store._pp_rank = 0
+    store._local_map = {}
+    store._peer_map = {}
+    store._cache_lock = threading.Lock()
+    return store
+
+
+class TestClearDoesNotRaceStagingSync(CustomTestCase):
+    """Under PP, a staging-count sync that saw the room before clear() must not
+    leave its held key behind."""
+
+    def test_trailing_held_key_sync_cannot_outlive_a_cleared_room(self):
+        room = 4244
+        mgr = _make_prefill_manager()
+        mgr._status_lock = threading.Lock()
+        mgr.request_status = _bare_pp_store()
+        mgr._staging_outstanding = _PPStagingOutstanding(mgr)
+        mgr._staging_outstanding._lock = _ContentionSignalingLock()
+        paused, resume = threading.Event(), threading.Event()
+        holds_success = mgr.staging_holds_success
+
+        def pausing_holds_success(bootstrap_room):
+            # Parks the worker between _sync's membership check and its write.
+            if threading.current_thread().name == "worker" and not paused.is_set():
+                paused.set()
+                resume.wait(timeout=10)
+            return holds_success(bootstrap_room)
+
+        mgr.staging_holds_success = pausing_holds_success
+        mgr.request_status[room] = KVPoll.Transferring
+        mgr._staging_outstanding[room] += 1
+        sender = _TestSender.__new__(_TestSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = room
+        sender.conclude_state = KVPoll.Success
+        worker = threading.Thread(
+            name="worker",
+            target=mgr._staging_outstanding.__setitem__,
+            args=(room, 0),
+        )
+        scheduler = threading.Thread(name="scheduler", target=sender.clear)
+
+        worker.start()
+        self.assertTrue(paused.wait(timeout=10))
+        scheduler.start()
+        deadline = time.monotonic() + 10
+        while (
+            scheduler.is_alive()
+            and not mgr._staging_outstanding._lock.contended.is_set()
+            and time.monotonic() < deadline
+        ):
+            scheduler.join(timeout=0.01)
+        resume.set()
+        worker.join(timeout=10)
+        scheduler.join(timeout=10)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(scheduler.is_alive())
+        self.assertNotIn(room, mgr.request_status)
+        self.assertNotIn(_pp_held_key(room), mgr.request_status)
 
 
 class TestBackendOptIn(CustomTestCase):

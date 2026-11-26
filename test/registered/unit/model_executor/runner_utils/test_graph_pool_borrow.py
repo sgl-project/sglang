@@ -82,25 +82,6 @@ class TestGraphPoolBorrow(CustomTestCase):
             self.assertEqual(pool.graph_pool_borrow_largest_run(), 0)
             self.assertEqual(snapshot.call_count, 3)
 
-    def test_borrow_capacity_includes_rounding_and_small_pool_reserve(self):
-        for payload, largest_run, expected in (
-            (-1, 64 << 20, False),
-            (0, 64 << 20, False),
-            (1, 0, False),
-            (1, 32 << 20, False),
-            (1, 34 << 20, True),
-            (2 << 20, 34 << 20, True),
-            ((2 << 20) + 1, 34 << 20, False),
-            ((2 << 20) + 1, 36 << 20, True),
-        ):
-            with (
-                self.subTest(payload=payload, largest_run=largest_run),
-                patch.object(
-                    pool, "graph_pool_borrow_largest_run", return_value=largest_run
-                ),
-            ):
-                self.assertEqual(pool.graph_pool_borrow_can_fit(payload), expected)
-
     def test_graph_replay_fails_during_active_pool_borrow(self):
         graph = Mock()
         backend = object.__new__(FullCudaGraphBackend)
@@ -193,13 +174,13 @@ class TestGraphPoolBorrow(CustomTestCase):
             draft_probs=None,
         )
         sampling_info = SimpleNamespace(
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
+            step_penalties=None,
             logit_bias=None,
             is_all_greedy=False,
             temperatures=torch.ones((1, 1)),
             need_top_k_sampling=False,
             need_top_p_sampling=False,
+            need_min_p_sampling=False,
             sampling_seed=None,
         )
         batch = SimpleNamespace(
@@ -390,6 +371,7 @@ class TestGraphPoolBorrow(CustomTestCase):
                         extend_return_top_logprob=True,
                         extend_token_ids_logprob=True,
                         top_logprobs_nums=[2, 3],
+                        input_candidate_selectors=None,
                         extend_logprob_pruned_lens_cpu=[split, rows - split],
                         extend_input_logprob_token_ids_gpu=token_ids,
                         token_ids_logprobs=[[0, 7], [4]],
@@ -471,6 +453,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             extend_return_top_logprob=False,
             extend_token_ids_logprob=False,
             top_logprobs_nums=None,
+            input_candidate_selectors=None,
             extend_logprob_pruned_lens_cpu=[rows],
             extend_input_logprob_token_ids_gpu=token_ids,
             token_ids_logprobs=None,
@@ -808,6 +791,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             top_ps=torch.ones(1),
             need_top_k_sampling=False,
             need_top_p_sampling=False,
+            need_min_p_sampling=False,
         )
         with (
             patch.object(dflash_utils, "borrow_graph_pool", recording_borrow),

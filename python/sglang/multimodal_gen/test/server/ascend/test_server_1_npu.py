@@ -1,9 +1,4 @@
-"""
-Config-driven diffusion performance test with pytest parametrization.
-
-
-If the actual run is significantly better than the baseline, the improved cases with their updated baseline will be printed
-"""
+"""Config-driven diffusion performance test with pytest parametrization."""
 
 from __future__ import annotations
 

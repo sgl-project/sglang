@@ -183,8 +183,8 @@ class _Case:
 def test_dcp_topk_merge(kind: str) -> None:
     merge = _init_once()
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
-    if world != 8:
-        pytest.skip("the merge needs 8 ranks")
+    if world not in (2, 4, 8):
+        pytest.skip("the merge needs 2, 4 or 8 ranks")
     if merge is None:
         pytest.skip("multimem multicast unavailable")
     span = PAGE_SIZE * world
@@ -197,7 +197,7 @@ def test_dcp_topk_merge(kind: str) -> None:
         assert _all_ranks_ok(not bad), bad or "failed on another rank"
         fell_back = merge.fallback[: case.rows].tolist()
         if kind.startswith("periodic"):
-            assert all(fell_back), fell_back
+            assert world != 8 or all(fell_back), fell_back
         elif kind in ("random", "short"):
             assert not any(fell_back), fell_back
 
@@ -214,4 +214,4 @@ def test_dcp_topk_merge(kind: str) -> None:
 
 
 if __name__ == "__main__":
-    multigpu_pytest_main(__name__, __file__, num_gpus=(8,))
+    multigpu_pytest_main(__name__, __file__, num_gpus=(2, 4, 8))

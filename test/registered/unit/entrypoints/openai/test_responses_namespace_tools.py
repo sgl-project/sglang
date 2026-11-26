@@ -149,7 +149,7 @@ class NamespaceToolTemplateTestCase(CustomTestCase):
             },
         }
         function = {k: v for k, v in LOOKUP.items() if k != "defer_loading"}
-        for parser in (None, "qwen25", "llama3"):
+        for parser in (None, "qwen", "llama3"):
             with self.subTest(parser=parser):
                 expected = self._template_tools(
                     _request(tools=[function, custom]), parser
@@ -230,7 +230,7 @@ class NamespaceToolCallOutputTestCase(CustomTestCase):
 
     def test_non_muse_full_response_keeps_dotted_function_names(self):
         """A namespace must not rename another model's ordinary function calls."""
-        for parser in (None, "qwen25"):
+        for parser in (None, "qwen"):
             with self.subTest(parser=parser):
                 items = self._serving(parser)._make_response_output_items(
                     _request(
@@ -251,7 +251,7 @@ class NamespaceToolCallOutputTestCase(CustomTestCase):
             tool_choice="required",
             stream=True,
         )
-        for parser in (None, "qwen25"):
+        for parser in (None, "qwen"):
             with self.subTest(parser=parser):
                 raw = (
                     '[{"name": "browser.search", "parameters": {"query": "news"}}]'
@@ -340,7 +340,7 @@ class NamespaceToolCallReplayTestCase(CustomTestCase):
                 },
             ]
         )
-        for parser in ("muse", None, "qwen25"):
+        for parser in ("muse", None, "qwen"):
             with self.subTest(parser=parser):
                 serving = make_serving()
                 serving.tool_call_parser = parser

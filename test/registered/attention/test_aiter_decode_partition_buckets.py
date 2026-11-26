@@ -17,7 +17,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd")
 
 _RUNNABLE = is_hip()
 if _RUNNABLE:
@@ -42,7 +42,7 @@ def _make_backend(context_len=131072, **flags):
     backend.use_mla = flags.get("use_mla", False)
     backend.use_triton_unified_attention = flags.get("unified", False)
     backend.kv_cache_is_vectorized_5d = flags.get("vec5d", False)
-    backend.max_context_len = context_len
+    backend.req_to_token_pool = SimpleNamespace(row_width=context_len)
     backend.max_num_partitions = -(-context_len // _AITER_PARTITION_SIZE_ROCM)
     backend._decode_partition_buckets = backend._build_decode_partition_buckets()
     return backend

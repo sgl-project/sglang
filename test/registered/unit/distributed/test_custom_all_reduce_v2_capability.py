@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import Mock
 
 import pytest
@@ -6,6 +7,7 @@ from sglang.srt.distributed.device_communicators import (
     custom_all_reduce_utils,
     custom_all_reduce_v2,
     dpx_hier_all_reduce,
+    quick_all_reduce,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -127,16 +129,20 @@ def test_rocm_multinode_uses_fabric_clique(monkeypatch, in_clique):
 _KB, _MB = 1024, 1024 * 1024
 
 
-def test_gfx1250_table_enables_hier_only_at_tp16():
+@pytest.mark.parametrize("dev_kernarg", [False, True])
+def test_gfx1250_table_hier_ranges(dev_kernarg):
     from sglang.srt.distributed.device_communicators.configs import (
         custom_all_reduce_v2 as cfg,
     )
 
-    configs = cfg._rocm_gfx1250_configs.__wrapped__(96)
-    assert configs[16].graph.hier_2shot_push == cfg.Range(256 * _KB, 64 * _MB)
-    assert configs[16].eager.hier_2shot_push == cfg.Range(256 * _KB, 64 * _MB)
+    configs = cfg._rocm_gfx1250_configs.__wrapped__(96, dev_kernarg)
+    assert configs[16].graph.hier_2shot_push == cfg.Range(2 * _MB + 16, 64 * _MB)
+    assert configs[16].eager.hier_2shot_push == cfg.Range(2 * _MB + 16, 64 * _MB)
+    tp8 = cfg.Range(8 * _MB + 16, 16 * _MB) if dev_kernarg else cfg.Range(0, 0)
     for world_size in range(2, 9):
-        assert configs[world_size].graph.hier_2shot_push.max_bytes == 0
+        want = tp8 if world_size == 8 else cfg.Range(0, 0)
+        assert configs[world_size].graph.hier_2shot_push == want
+        assert configs[world_size].eager.hier_2shot_push == want
 
 
 @pytest.mark.parametrize(
@@ -169,20 +175,31 @@ def test_gfx1250_table_picks_measured_best(world_size, nbytes, expected):
 @pytest.mark.parametrize(
     ("world_size", "nbytes", "expected"),
     [
-        (2, 2 * _MB, "ONE_SHOT_PUSH"),
-        (2, 2 * _MB + 16, "TWO_SHOT_PUSH"),
+        (2, 1 * _MB, "ONE_SHOT_PUSH"),
+        (2, 1 * _MB + 16, "TWO_SHOT_PUSH"),
         (2, 16 * _MB, "TWO_SHOT_PUSH"),
         (2, 16 * _MB + 16, "RING_SIMPLE"),
         (3, 64 * _KB + 16, "TWO_SHOT_PUSH"),
         (3, 8 * _MB + 16, "RING_SIMPLE"),
-        (4, 2 * _MB, "ONE_SHOT_PUSH"),
-        (4, 2 * _MB + 16, "TWO_SHOT_PUSH"),
-        (4, 32 * _MB, "TWO_SHOT_PUSH"),
-        (4, 32 * _MB + 16, "RING_SIMPLE"),
+        (4, 1 * _MB, "ONE_SHOT_PUSH"),
+        (4, 1 * _MB + 16, "TWO_SHOT_PUSH"),
+        (4, 8 * _MB, "TWO_SHOT_PUSH"),
+        # the raw table: planning keeps hier_ring_simple only for partition pairs
+        (4, 8 * _MB + 16, "HIER_RING_SIMPLE"),
+        (4, 32 * _MB + 16, "HIER_RING_SIMPLE"),
         (8, 768 * _KB, "ONE_SHOT_PUSH"),
         (8, 768 * _KB + 16, "TWO_SHOT_PUSH"),
-        (8, 32 * _MB, "TWO_SHOT_PUSH"),
-        (8, 32 * _MB + 16, "RING_SIMPLE"),
+        (8, 8 * _MB, "TWO_SHOT_PUSH"),
+        (8, 8 * _MB + 16, "TWO_SHOT_PUSH"),
+        (8, 8 * _MB + 32, "HIER_2SHOT_PUSH"),
+        (8, 16 * _MB, "HIER_2SHOT_PUSH"),
+        (8, 16 * _MB + 16, "HIER_RING_SIMPLE"),
+        (8, 16 * _MB + 32, "HIER_RING_SIMPLE"),
+        (8, 32 * _MB + 16, "HIER_RING_SIMPLE"),
+        # hier_2shot_push is tried before hier_ring_simple and keeps its range
+        (16, 32 * _MB + 32, "HIER_2SHOT_PUSH"),
+        (16, 64 * _MB, "HIER_2SHOT_PUSH"),
+        (16, 64 * _MB + 16, "HIER_RING_SIMPLE"),
     ],
 )
 def test_gfx1250_dev_kernarg_table(world_size, nbytes, expected):
@@ -207,6 +224,8 @@ def test_gfx1250_table_has_no_rccl_gap(world_size, dev_kernarg):
         heuristic.two_shot_push_threshold,
         heuristic.ring_simple.min_bytes,
         heuristic.ring_simple.max_bytes,
+        heuristic.hier_ring_simple.min_bytes,
+        heuristic.hier_ring_simple.max_bytes,
     }
     for edge in edges:
         for nbytes in (edge - 16, edge, edge + 16):
@@ -217,6 +236,54 @@ def test_gfx1250_table_has_no_rccl_gap(world_size, dev_kernarg):
                     )
                     is not None
                 ), nbytes
+
+
+@pytest.mark.parametrize("paired", [True, False])
+@pytest.mark.parametrize(
+    ("world_size", "two_shot", "hier_from"),
+    [
+        (4, 16 * _MB, 8 * _MB + 16),
+        (8, 32 * _MB, 16 * _MB + 16),
+        (16, 64 * _MB, 32 * _MB + 16),
+    ],
+)
+def test_hier_ring_plan(monkeypatch, paired, world_size, two_shot, hier_from):
+    """Partition pairs keep hier_ring_simple from its range up; other groups keep the table."""
+    from sglang.srt.distributed.device_communicators import (
+        gfx1250_fabric,
+        ring_simple_all_reduce,
+    )
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    pairs = [[2 * i, 2 * i + 1] for i in range(world_size // 2)] if paired else None
+    monkeypatch.setattr(gfx1250_fabric, "probe_dpx_pairs", lambda group, device: pairs)
+    config = cfg._rocm_gfx1250_configs.__wrapped__(96, True)[world_size]
+    planned, got_pairs, slot_bytes = (
+        ring_simple_all_reduce.HierRingSimpleAllReduce.plan(
+            group=object(),
+            device=object(),
+            config=config,
+            buffer_size=ring_simple_all_reduce.HIER_RING_SIMPLE_BUFFER_SIZE,
+        )
+    )
+    assert got_pairs == pairs
+    assert (slot_bytes > 0) is paired
+    for heuristic in (planned.graph, planned.eager):
+        if paired:
+            assert heuristic.hier_ring_simple == cfg.Range(hier_from, 4 * 1024 * _MB)
+            assert heuristic.two_shot_push_threshold == hier_from - 16
+            assert heuristic.ring_simple.max_bytes == 0
+        else:
+            assert heuristic.hier_ring_simple.max_bytes == 0
+            assert heuristic.two_shot_push_threshold == two_shot
+            assert heuristic.ring_simple == cfg.Range(two_shot + 16, 4 * 1024 * _MB)
+        for nbytes in (16, hier_from - 16, hier_from, 4 * 1024 * _MB):
+            assert (
+                custom_all_reduce_v2.choose_algo(planned, nbytes, can_use_graph=False)
+                is not None
+            )
 
 
 def _gfx1250_comm(world_size, dev_kernarg=False):
@@ -239,7 +306,7 @@ def _gfx1250_comm(world_size, dev_kernarg=False):
         # keeps the sizes above a hier range it no longer covers
         (16 * _MB, False, 32 * _MB, 64 * _MB),
         # hier covers 2shot_push: its slots stay at the hier minimum
-        (32 * _MB, False, 64 * _MB, 256 * _KB),
+        (32 * _MB, False, 64 * _MB, 2 * _MB + 16),
         # push-only, explicit or forced push sizes: no hier planes
         (32 * _MB, True, 0, 64 * _MB),
         # a cap at or below the hier minimum disables it
@@ -262,9 +329,49 @@ def test_hier_sizing(max_size, sizes_own_push, hier_max, two_shot):
         assert heuristic.two_shot_push_threshold == two_shot
 
 
+@pytest.mark.parametrize(
+    ("hier_max", "hier"),
+    [
+        # both DPX partitions of every accelerator
+        (32 * _MB, (8 * _MB + 16, 16 * _MB)),
+        # SPX or a partial group: no hier planes
+        (0, (0, 0)),
+    ],
+)
+def test_tp8_dev_kernarg_hier_fit(hier_max, hier):
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    config = cfg._rocm_gfx1250_configs.__wrapped__(96, True)[8]
+    fitted = dpx_hier_all_reduce._fit_hier(config, hier_max)
+    for heuristic in (fitted.graph, fitted.eager):
+        assert heuristic.hier_2shot_push == cfg.Range(*hier)
+        # hier stops below the 2shot_push cutoff, so it keeps its 32 MB
+        assert heuristic.two_shot_push_threshold == 32 * _MB
+    if hier_max:
+        # above hier, and sizes it cannot halve into 16 B vectors, go to
+        # hier_ring_simple
+        for nbytes, expected in (
+            (12 * _MB, "HIER_2SHOT_PUSH"),
+            (16 * _MB + 16, "HIER_RING_SIMPLE"),
+            (24 * _MB, "HIER_RING_SIMPLE"),
+        ):
+            assert (
+                _choice_name(
+                    custom_all_reduce_v2.choose_algo(
+                        fitted, nbytes, can_use_graph=False
+                    )
+                )
+                == expected
+            )
+
+
 def _choice_name(choice):
     if choice is None:
         return None
+    if choice.use_hier and choice.use_ring:
+        return "HIER_RING_SIMPLE"
     if choice.use_hier:
         return "HIER_2SHOT_PUSH"
     return "RING_SIMPLE" if choice.use_ring else choice.algo.name
@@ -273,6 +380,9 @@ def _choice_name(choice):
 @pytest.mark.parametrize(
     ("nbytes", "expected"),
     [
+        (256 * _KB, "ONE_SHOT_PUSH"),
+        (2 * _MB, "TWO_SHOT_PUSH"),
+        (2 * _MB + 32, "HIER_2SHOT_PUSH"),
         (16 * _MB, "HIER_2SHOT_PUSH"),
         (32 * _MB, "HIER_2SHOT_PUSH"),
         # above the clipped hier range, 2shot_push keeps its tuned sizes
@@ -292,6 +402,42 @@ def test_pick_config_hier_at_default_cap(nbytes, expected):
     )
     fitted = dpx_hier_all_reduce._fit_hier(config, hier_max)
     choice = custom_all_reduce_v2.choose_algo(fitted, nbytes, can_use_graph=False)
+    assert _choice_name(choice) == expected
+
+
+@pytest.mark.parametrize(
+    ("nbytes", "expected"),
+    [
+        (2 * _MB, "TWO_SHOT_PUSH"),
+        (32 * _MB, "HIER_2SHOT_PUSH"),
+        # past the clipped hier range, hier_ring_simple rather than 2shot_push
+        (32 * _MB + 32, "HIER_RING_SIMPLE"),
+        (48 * _MB, "HIER_RING_SIMPLE"),
+        (64 * _MB + 32, "HIER_RING_SIMPLE"),
+    ],
+)
+def test_tp16_dev_kernarg_plan_at_default_cap(monkeypatch, nbytes, expected):
+    from sglang.srt.distributed.device_communicators import (
+        gfx1250_fabric,
+        ring_simple_all_reduce,
+    )
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    pairs = [[2 * i, 2 * i + 1] for i in range(8)]
+    monkeypatch.setattr(gfx1250_fabric, "probe_dpx_pairs", lambda group, device: pairs)
+    config = cfg._rocm_gfx1250_configs.__wrapped__(96, True)[16]
+    hier_max = dpx_hier_all_reduce._hier_max_bytes(
+        config, 16 * _MB, sizes_own_push=False
+    )
+    planned, _, _ = ring_simple_all_reduce.HierRingSimpleAllReduce.plan(
+        group=object(),
+        device=object(),
+        config=dpx_hier_all_reduce._fit_hier(config, hier_max),
+        buffer_size=ring_simple_all_reduce.HIER_RING_SIMPLE_BUFFER_SIZE,
+    )
+    choice = custom_all_reduce_v2.choose_algo(planned, nbytes, can_use_graph=False)
     assert _choice_name(choice) == expected
 
 
@@ -380,6 +526,20 @@ def test_skip_p2p_check_accepts_true(monkeypatch):
         Mock(side_effect=AssertionError("ran the P2P probe")),
     )
     assert custom_all_reduce_utils.can_p2p(rank=0, world_size=2)
+
+
+def test_quick_all_reduce_names_invalid_quantization_level(monkeypatch, caplog):
+    """An unknown ROCM_QUICK_REDUCE_QUANTIZATION value leaves quick all-reduce
+    disabled and the warning names the rejected value."""
+    monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "int4")
+    quick = quick_all_reduce.QuickAllReduce.__new__(quick_all_reduce.QuickAllReduce)
+    quick.disabled = True
+
+    with caplog.at_level(logging.WARNING, logger=quick_all_reduce.logger.name):
+        quick.init_quick_all_reduce()
+
+    assert quick.disabled
+    assert "Invalid quantization level: int4" in caplog.text
 
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
             CacheInitParams(
                 disable=False,
                 req_to_token_pool=ReqToTokenPool(
-                    size=8, max_context_len=64, device="cpu", enable_memory_saver=False
+                    size=8, row_width=64, device="cpu", enable_memory_saver=False
                 ),
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,

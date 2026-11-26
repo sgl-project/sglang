@@ -1,5 +1,8 @@
 import unittest
+from unittest.mock import patch
 
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.quantization.modelslim import modelslim
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -58,6 +61,25 @@ class TestModelSlimMoESkip(CustomTestCase):
         )
 
         self.assertFalse(config._is_moe_layer_skipped(_MOE_PREFIX))
+
+
+class TestModelSlimRMSNormBiasPatch(CustomTestCase):
+    def test_rmsnorm_is_wrapped_once(self):
+        """RMSNorm gets one bias wrapper per process, not one per norm.bias key or
+        per config; nested wrappers re-create the bias on every construction."""
+        original_init, original_forward = RMSNorm.__init__, RMSNorm.forward_npu
+        self.addCleanup(setattr, RMSNorm, "__init__", original_init)
+        self.addCleanup(setattr, RMSNorm, "forward_npu", original_forward)
+        description = {f"model.layers.{i}.input_layernorm.bias": "x" for i in range(3)}
+
+        with patch.object(modelslim, "_rmsnorm_bias_patched", False, create=True):
+            ModelSlimConfig(dict(description))
+            wrapped_init = RMSNorm.__init__
+            self.assertIsNot(wrapped_init, original_init)
+            self.assertIs(wrapped_init.__closure__[0].cell_contents, original_init)
+
+            ModelSlimConfig(dict(description))
+            self.assertIs(RMSNorm.__init__, wrapped_init)
 
 
 if __name__ == "__main__":

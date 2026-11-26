@@ -343,7 +343,11 @@ class TestKdaCutedslVerifyStateDtypeGate(CustomTestCase):
             patch.object(
                 kda_backend.importlib.util, "find_spec", return_value=object()
             ),
-            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+            patch.object(
+                kda_backend,
+                "current_arch",
+                return_value=SimpleNamespace(cuda=SimpleNamespace(major=10)),
+            ),
         ):
             return KDAAttnBackend._can_run_dspark_cutedsl_mtp(
                 backend,

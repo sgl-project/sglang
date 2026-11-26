@@ -68,5 +68,34 @@ class TestGuidanceAcceptTokenReject(CustomTestCase):
         self.assertNotEqual(int(bitmask[1, b // 32] & (1 << (b % 32))), 0)
 
 
+class TestGuidanceAcceptEosLiteral(CustomTestCase):
+    """A grammar may end on a literal token that is also an EOS id."""
+
+    def setUp(self):
+        self.tokenizer = LLTokenizer("byte")
+        self.eos = self.tokenizer.eos_tokens[0]
+        self.grammar = GuidanceGrammar(
+            llguidance_tokenizer=self.tokenizer,
+            serialized_grammar=grammar_from(
+                "lark", f'start: "ab" end\nend: <[{self.eos}]>'
+            ),
+        )
+
+    def _accept(self, text):
+        for char in text:
+            self.grammar.accept_token(self.tokenizer.tokenize_str(char)[0])
+
+    def test_closing_eos_literal_terminates(self):
+        self._accept("ab")
+        self.grammar.accept_token(self.eos)
+        self.assertTrue(self.grammar.is_terminated())
+
+    def test_early_eos_literal_is_rejected(self):
+        self._accept("a")
+        with self.assertRaises(ValueError):
+            self.grammar.accept_token(self.eos)
+        self.assertFalse(self.grammar.ll_matcher.is_error())
+
+
 if __name__ == "__main__":
     unittest.main()

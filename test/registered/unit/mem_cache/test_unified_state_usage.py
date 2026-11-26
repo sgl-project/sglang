@@ -43,6 +43,7 @@ def _build():
             max_total_tokens=4096,
             max_running_requests=2,
             context_len=4096,
+            req_to_token_row_width=4096,
             alignment=1,
         ),
     )
@@ -57,7 +58,6 @@ def _build():
             need_sort=False,
             lazy_compaction=True,
             max_num_reqs=2,
-            model_context_len=4096,
             state_cache_params=SimpleNamespace(layers=(1,)),
         ),
     )

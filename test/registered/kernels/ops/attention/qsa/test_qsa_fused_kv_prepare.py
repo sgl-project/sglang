@@ -473,7 +473,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
         token_to_kv_pool=routed(pool),
         device="cuda",
         is_draft_worker=False,
-        req_to_token_pool=SimpleNamespace(req_to_token=table),
+        req_to_token_pool=SimpleNamespace(req_to_token=table, row_width=64),
         model_config=SimpleNamespace(hf_config=config, context_len=64),
     )
     backend = QwenSparseAttnBackend(runner)
@@ -494,6 +494,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
         spec_info=SimpleNamespace(draft_token_num=width, topk=1),
         input_ids=torch.zeros(width, device="cuda", dtype=torch.int32),
         extend_seq_lens=torch.tensor([width], device="cuda", dtype=torch.int32),
+        extend_seq_lens_cpu=[width],
         _original_forward_mode=None,
         mrope_positions=None,
     )

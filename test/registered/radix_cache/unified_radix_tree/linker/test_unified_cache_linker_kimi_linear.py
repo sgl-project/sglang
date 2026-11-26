@@ -1,4 +1,4 @@
-"""Mooncake direct linker on Kimi Linear (MLA + KDA, as Kimi-K3): a host hit decodes
+"""Mooncake direct linker on Kimi Linear (MLA + KDA, as Kimi-K3): an L3 hit decodes
 bit-for-bit like a device hit."""
 
 import unittest
@@ -80,7 +80,7 @@ class TestKimiLinearUnifiedCacheLinker(CustomTestCase):
             tokenizer_path=cls.model, num_samples=4, trust_remote_code=True
         )
 
-    def test_host_hit_matches_device_hit(self):
+    def test_l3_hit_matches_device_hit(self):
         prompts = [list(ids[: PREFIX_LEN + 1]) for ids in self.input_ids]
         for ids in prompts:
             _generate(self.base_url, [ids], 1)
@@ -97,17 +97,17 @@ class TestKimiLinearUnifiedCacheLinker(CustomTestCase):
         ]
         device_results = run()
         _flush_cache(self.base_url)
-        host_results = run()
+        l3_results = run()
 
-        for device, host in zip(device_results, host_results):
-            for result, host_tokens in ((device, 0), (host, PREFIX_LEN)):
+        for device, l3 in zip(device_results, l3_results):
+            for result, storage_tokens in ((device, 0), (l3, PREFIX_LEN)):
                 meta = result["meta_info"]
                 details = meta.get("cached_tokens_details") or {}
                 self.assertEqual(meta["cached_tokens"], PREFIX_LEN)
-                self.assertEqual(int(details.get("host", 0)), host_tokens)
-            self.assertEqual(host["output_ids"], device["output_ids"])
+                self.assertEqual(int(details.get("storage", 0)), storage_tokens)
+            self.assertEqual(l3["output_ids"], device["output_ids"])
             self.assertEqual(
-                _extract_output_logprobs(host), _extract_output_logprobs(device)
+                _extract_output_logprobs(l3), _extract_output_logprobs(device)
             )
 
 

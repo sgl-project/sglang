@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.registry import (
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -245,12 +246,13 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             result.init_cache_linker.assert_not_called()
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
-    def _build_with_mori_linker(self, linker_pools):
+    def _build_with_mori_linker(self, linker_pools, sidecar_draft_device_pools=()):
         from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
 
         has_state = PoolName.MAMBA in linker_pools
         ctx = _make_ctx(self, is_hybrid_ssm=has_state)
         ctx.params.req_to_token_pool = SimpleNamespace()
+        ctx.params.sidecar_draft_device_pools = sidecar_draft_device_pools
         # The factory reads the linker settings from the bags.
         enter_override(
             self,
@@ -271,6 +273,9 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         cache._components_tuple = tuple(cache.components.values())
         counter = MagicMock(name="layer_done_counter")
         linker = SimpleNamespace(pools=linker_pools, layer_done_counter=counter)
+        linker.draft_layer_counter = lambda: UnifiedCacheLinker.draft_layer_counter(
+            linker
+        )
         kvcache = ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value
         kvcache.start_layer = 4
         kvcache.layer_transfer_counter = None
@@ -328,6 +333,20 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         )
         self.assertIs(router.read(4, STATE_PART), router.layer(4, STATE_PART))
         counter.wait_until.assert_called_once_with(0)
+
+    def test_external_linker_sidecar_draft_waits_on_its_transfer_layers(self):
+        draft_pool = MagicMock()
+        _, counter = self._build_with_mori_linker(
+            {
+                PoolName.KV: object(),
+                PoolName.DRAFT: SimpleNamespace(layer_mapping={3: (0, 2), 4: (1, 3)}),
+            },
+            sidecar_draft_device_pools=(draft_pool,),
+        )
+        (draft_counter,), _ = draft_pool.register_layer_transfer_counter.call_args
+        draft_counter.wait_until(1)
+        # Draft layer 1 rides transfer layer 4; the target keeps the shared counter.
+        counter.wait_until.assert_called_once_with(4)
 
     def test_custom_unified_cache_keeps_host_pool_setup(self):
         ctx = _make_ctx(self)

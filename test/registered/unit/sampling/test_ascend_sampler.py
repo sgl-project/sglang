@@ -60,6 +60,39 @@ class TestAscendSamplerDispatch(unittest.TestCase):
                 self.assertIsNone(filtered_probs)
                 self.assertEqual(npu_top_k_top_p.called, eligible)
 
+    @torch.random.fork_rng(devices=[])
+    def test_min_p_filters_the_fused_top_k_top_p_output(self):
+        """With min_p set, the fused npu_top_k_top_p path must drop the tokens
+        below min_p * max probability, like the sorted fallback path."""
+        logits = torch.tensor([[4.0, 3.0, 0.0, -float("inf")]])
+        supports = {}
+        for eligible in (True, False):
+            with patch.object(
+                sampler_module,
+                "torch_npu",
+                SimpleNamespace(npu_top_k_top_p=lambda *_: logits.clone()),
+                create=True,
+            ):
+                token, weights = (
+                    sampler_module.top_k_top_p_min_p_sampling_from_logits_ascend(
+                        logits.clone(),
+                        torch.tensor([3], dtype=torch.int32),
+                        torch.ones(1),
+                        torch.tensor([0.1]),
+                        True,
+                        None,
+                        torch.zeros(1, dtype=torch.int64),
+                        npu_top_k_top_p_eligible=eligible,
+                        return_filtered_probs=True,
+                    )
+                )
+            supports[eligible] = (weights[0] > 0).nonzero().flatten().tolist()
+            self.assertIn(token.item(), supports[eligible])
+
+        # softmax is about [0.72, 0.27, 0.01, 0]; min_p 0.1 cuts below 0.072.
+        self.assertEqual(supports[True], [0, 1])
+        self.assertEqual(supports[False], [0, 1])
+
 
 @patch.object(sampler_module, "torch_npu", SimpleNamespace(), create=True)
 class TestAscendSamplingMaskCapture(unittest.TestCase):

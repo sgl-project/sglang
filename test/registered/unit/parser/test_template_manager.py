@@ -82,6 +82,20 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
         )
         return force, config, parser
 
+    def test_lfm3_template_ignores_legacy_lfm2_vocab(self):
+        template = (
+            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+            "<think><tool_call><function=get_weather><parameter=city>Warsaw"
+            "</parameter></function></tool_call>"
+        )
+        vocab = ["<|tool_call_start|>", "<|tool_call_end|>", "<tool_call>"]
+        force, config, parser = self._detect(template, vocab)
+        self.assertEqual(parser, "qwen3")
+        self.assertEqual(
+            detect_tool_call_parser(template, _DummyTokenizer(vocab), config, force),
+            "qwen3_coder",
+        )
+
     def test_iquest_template_wins_over_generic_think_and_xml_rules(self):
         template = "<|iquest_assistant|><think><iquest_tool_call><arg_key><arg_value>"
         force, config, parser = self._detect(template, [])
@@ -895,13 +909,13 @@ class TestToolCallParserDetection(unittest.TestCase):
                     "{% endfor %}"
                 ),
                 ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
-                "glm45",
+                "glm",
             ),
             (
                 "xml_kv_tool_call_via_vocab",
                 "{% set reasoning_effort = reasoning_effort | default('high', true) %}\n<think>",
                 ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
-                "glm45",
+                "glm",
             ),
         ]
         for name, template, vocab, expected in cases:
@@ -948,7 +962,7 @@ class TestToolCallParserDetection(unittest.TestCase):
 
     def test_glm45_rule_precedes_xml_kv_fallback(self):
         # The specific GLM-4.5 family check must run before the generic
-        # xml_kv_tool_call fallback. Both currently map to "glm45", so the
+        # xml_kv_tool_call fallback. Both currently map to "glm", so the
         # value-based test above can't catch a swap — assert positions directly.
         rule_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
         self.assertLess(rule_index["glm47"], rule_index["glm45"])

@@ -226,7 +226,7 @@ class TestPlainTreeReclaimsADemand(CustomTestCase):
             CacheInitParams(
                 disable=False,
                 req_to_token_pool=ReqToTokenPool(
-                    size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+                    size=4, row_width=64, device="cpu", enable_memory_saver=False
                 ),
                 token_to_kv_pool_allocator=allocator,
                 page_size=4,
@@ -261,9 +261,11 @@ class TestSpeculativeHeadroomAsksADemand(CustomTestCase):
             token_to_kv_pool_allocator=allocator,
         )
         aligned = -(-need // page) * page
-        return add_spec_decode_headroom_pages(
-            batch, [aligned], page, reserve=0, page_size=page
-        )
+        with patch(
+            "sglang.srt.mem_cache.allocation_sizing.get_spec_decode_reserve",
+            return_value=0,
+        ):
+            return add_spec_decode_headroom_pages(batch, [aligned], page)
 
     def test_headroom_only_where_its_pages_fit(self):
         allocator = build_swa_pool(page_size=4)

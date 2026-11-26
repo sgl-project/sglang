@@ -1,5 +1,6 @@
 """need_sort allocators stage released pages and merge only under allocation pressure."""
 
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -80,6 +81,18 @@ class TestPagedAllocatorLazyRelease(CustomTestCase):
         event.synchronize.assert_called_once_with()
         allocator.merge_and_sort_free()
         event.synchronize.assert_called_once_with()
+
+
+class TestPagedAllocatorDebugMode(CustomTestCase):
+    def test_debug_mode_accepts_every_spelling_of_the_declared_bool(self):
+        """SGLANG_DEBUG_MEMORY_POOL is one switch shared with the KV pool: a
+        value that turns on the pool's checks must turn on the allocator's."""
+        for value, expected in (("yes", True), ("1", True), ("no", False)):
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, {"SGLANG_DEBUG_MEMORY_POOL": value}),
+            ):
+                self.assertEqual(_make_allocator(need_sort=False).debug_mode, expected)
 
 
 if __name__ == "__main__":

@@ -129,7 +129,7 @@ class TestDecodeHiCacheL2(CustomTestCase):
             size=1024, dtype=torch.float32, device="cpu", kvcache=None, need_sort=False
         )
         self.pool = ReqToTokenPool(
-            size=8, max_context_len=1024, device="cpu", enable_memory_saver=False
+            size=8, row_width=1024, device="cpu", enable_memory_saver=False
         )
         self.cache = UnifiedRadixCache(
             CacheInitParams(
@@ -263,11 +263,7 @@ class TestDecodeHiCacheL2(CustomTestCase):
                     return_logprob=False,
                     model_config=SimpleNamespace(vocab_size=512),
                 )
-                with patch(
-                    "sglang.srt.disaggregation.decode_schedule_batch_mixin."
-                    "SamplingBatchInfo.from_schedule_batch"
-                ):
-                    ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
+                ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
                 self.cache.unlock(req.lock)
                 self.cache.evict(EvictParams(num_tokens=128))
                 self.assertEqual(req.cached_tokens, sum(expected))

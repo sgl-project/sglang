@@ -31,7 +31,9 @@ validate actually addresses the bytes the collective delivers:
    exact KV bytes, separate target/draft storage and scratch plans, fragmented
    pages, partial tail pages, both MLA write APIs, and local/nonzero draft
    layer IDs across batches.
-4. The multicast gather copies on copy engines (no NCCL kernel), and every
+4. QSA hybrid pools: sharded full-attention KV, replicated compressed keys,
+   and cached-prefix reads through the scratch-translated slot table.
+5. The multicast gather copies on copy engines (no NCCL kernel), and every
    rank falls back to NCCL together for a cross-node group or a rank without
    a multicast mapping.
 
@@ -45,6 +47,7 @@ when too few CUDA devices are visible. Run directly with:
 """
 
 import ctypes
+import functools
 import gc
 import math
 import os
@@ -60,6 +63,7 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.device_communicators.gated_transfer import CopyChunk
 from sglang.srt.distributed.device_communicators.multicast_all_gather import (
     _multicast_address,
     has_multicast_support,
@@ -68,6 +72,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     allocate_symmetric_buffer,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, get_kv_shard_group
@@ -75,6 +80,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
 )
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.runtime_context import get_context, get_parallel, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -706,6 +712,115 @@ def _run_mtp(rank, port, kind):
     torch.distributed.destroy_process_group()
 
 
+def _run_qsa(rank, world, port):
+    """Qwen4-Exp's QSA hybrid pool over a striped full-attention pool."""
+    _dist_init(rank, world, port, attn_cp_size=world)
+
+    group = get_parallel().attn_cp_group
+    spec = _gather_make_spec(shard_rank=group.rank_in_group)
+    ratio = 4
+    # Global ids of the full-attention layers; the wrapper maps them to the
+    # dense ids the striped pool's slots and layer-ahead gather run on.
+    full_layer_ids = [3, 7]
+    pool = QSATokenToKVPool(
+        size=_GATHER_SIZE,
+        dtype=_GATHER_DTYPE,
+        page_size=_GATHER_PAGE_SIZE,
+        head_num=_GATHER_HEAD_NUM,
+        head_dim=_GATHER_HEAD_DIM,
+        full_attention_layer_ids=full_layer_ids,
+        device=f"cuda:{rank}",
+        mamba_pool=None,
+        qsa_index_kv_heads=1,
+        qsa_index_head_dim=16,
+        qsa_compress_ratio=ratio,
+        qsa_token_topk=64,
+        num_request_slots=4,
+        full_kv_pool_class=functools.partial(
+            PageInterleaveMHATokenToKVPool, shard_spec=spec, shard_group=group
+        ),
+    )
+    shard_pool = get_kv_shard_pool(pool)
+    assert shard_pool is pool.full_kv_pool
+    device = shard_pool.k_buffer[0].device
+
+    # Every rank compresses the whole chunk, so the compressed keys stay
+    # replicated over the widened logical slots, up to the last logical page.
+    last_slot = (world * (_GATHER_SIZE + _GATHER_PAGE_SIZE) - 1) // ratio
+    assert pool.qsa_compressed_capacity == last_slot + 1
+    key = torch.full((1, 1, 16), 3.0, dtype=torch.bfloat16, device=device)
+    loc = torch.tensor([last_slot], device=device)
+    pool.set_qsa_compressed_k_buffer(full_layer_ids[-1], loc, key)
+    _check(
+        rank,
+        "qsa compressed last slot",
+        pool.get_qsa_compressed_k_buffer(full_layer_ids[-1])[loc],
+        key,
+    )
+
+    def kv_value(locs, layer_id, is_v):
+        base = locs.to(torch.float32) + layer_id * 1000 + (500000 if is_v else 0)
+        return (
+            base.view(-1, 1, 1)
+            + torch.arange(_GATHER_HEAD_NUM, device=device).view(1, -1, 1) * 0.01
+            + torch.arange(_GATHER_HEAD_DIM, device=device).view(1, 1, -1) * 0.0001
+        ).to(_GATHER_DTYPE)
+
+    def extend(groups, prefix_len, seq_len):
+        req_to_token = _fake_req_to_token(groups, seq_len, device)
+        chunk_locs = req_to_token[0, prefix_len:seq_len].long()
+        shard_pool.begin_shard_extend(
+            req_to_token, torch.tensor([0]), [prefix_len], [seq_len]
+        )
+        for layer_id in full_layer_ids:
+            layer = SimpleNamespace(layer_id=layer_id)
+            pool.set_kv_buffer(
+                layer,
+                chunk_locs,
+                kv_value(chunk_locs, layer_id, False),
+                kv_value(chunk_locs, layer_id, True),
+            )
+            # The backend reads [prefix | chunk] by the translated slot table.
+            all_locs = req_to_token[0, :seq_len].long()
+            rows = shard_pool.translate_loc_to_scratch(all_locs)
+            for is_v, buffer in (
+                (False, pool.get_key_buffer(layer_id)),
+                (True, pool.get_value_buffer(layer_id)),
+            ):
+                _check(
+                    rank,
+                    f"qsa seq read {'v' if is_v else 'k'} l{layer_id}",
+                    buffer[rows],
+                    kv_value(all_locs, layer_id, is_v),
+                )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+    extend([7, 3], 0, 2 * _GATHER_GRANULE)
+    # Only the owned stripe persists: group q is local page q on every rank.
+    for q in (7, 3):
+        owned_locs = (
+            q * _GATHER_GRANULE
+            + group.rank_in_group * _GATHER_PAGE_SIZE
+            + torch.arange(_GATHER_PAGE_SIZE, device=device)
+        )
+        local_rows = torch.arange(
+            q * _GATHER_PAGE_SIZE, (q + 1) * _GATHER_PAGE_SIZE, device=device
+        )
+        _check(
+            rank,
+            f"qsa owned stripe g{q}",
+            shard_pool.k_buffer[1][local_rows],
+            kv_value(owned_locs, full_layer_ids[1], False),
+        )
+    # The next chunk reads the prefix gathered from both ranks.
+    extend([7, 3, 11], 2 * _GATHER_GRANULE, 3 * _GATHER_GRANULE)
+
+    torch.distributed.barrier()
+    if rank == 0:
+        print("PASS: QSA hybrid pool over a page-interleave full pool")
+
+
 @unittest.skipIf(
     torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
 )
@@ -721,6 +836,9 @@ class TestPageInterleaveGatherMultiGpu(CustomTestCase):
 
     def test_mha_shard_over_attention_cp(self):
         mp.spawn(_run_mha, args=(_GATHER_WORLD, 29812), nprocs=_GATHER_WORLD, join=True)
+
+    def test_qsa_hybrid_pool_over_attention_cp(self):
+        mp.spawn(_run_qsa, args=(_GATHER_WORLD, 29815), nprocs=_GATHER_WORLD, join=True)
 
     def test_mtp_mla_shard_over_attention_tp(self):
         mp.spawn(_run_mtp, args=(29813, "mla"), nprocs=_GATHER_WORLD, join=True)
@@ -770,15 +888,28 @@ def _run_multicast_mla(rank, world, port):
     pool, req_to_token, prefix_len, seq_len = _run_mla(
         rank, world, port, multicast=True
     )
-    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    gather = pool._multicast_gather
+    output_start = gather._multicast_ptr
+    output_end = output_start + gather.output.nbytes
+    copies = []
+    enqueue = CopyChunk.__call__
+
+    def enqueue_counted(chunk, stream):
+        # The barrier signals target the control buffer, outside the output.
+        if output_start <= chunk.dst < output_end:
+            copies.append(chunk.nbytes)
+        enqueue(chunk, stream)
+
+    # Counted as enqueued, not profiled: the profiler of torch 2.14.1+cu130
+    # records none of these copies.
+    with unittest.mock.patch.object(CopyChunk, "__call__", enqueue_counted):
+        activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    assert activity, "the profiler recorded no GPU activity"
     nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
     assert not nccl_kernels, f"gather ran NCCL kernels: {nccl_kernels}"
-    # The multicast chunk copies are peer copies; the plan's own host syncs
-    # are device-to-host copies.
     block_bytes = pool._send_rows.numel() * pool._slots[0].tensors["kv"][0].nbytes
-    chunks = math.ceil(block_bytes / pool._multicast_gather.chunk_bytes)
-    copies = activity.count("Memcpy PtoP (Device -> Device)")
-    assert chunks > 1 and copies == _GATHER_LAYER_NUM * chunks, (copies, chunks)
+    chunks = math.ceil(block_bytes / gather.chunk_bytes)
+    assert chunks > 1 and len(copies) == _GATHER_LAYER_NUM * chunks, (copies, chunks)
     torch.distributed.barrier()
 
 

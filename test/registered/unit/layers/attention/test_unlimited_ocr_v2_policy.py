@@ -240,7 +240,7 @@ class TestUnlimitedOCRV2FusedDecodePaths(CustomTestCase):
         backend._coord_page_buf = torch.zeros(4, dtype=torch.int64)
         backend._allow_mask = torch.zeros(4, 8, dtype=torch.int8)
         backend.max_block_static = 8
-        backend.max_context_len = 256
+        backend.model_config = SimpleNamespace(context_len=256)
         backend.block_size = 32
         backend.image_bucket_constraint = True
         backend._cos_sin_cache = {}

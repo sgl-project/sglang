@@ -20,6 +20,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA
 from sglang.srt.model_executor.model_runner_components import weight_updater
@@ -83,7 +84,7 @@ class _FakeMoELayer(torch.nn.Module):
         self.num_local_experts = NUM_EXPERTS
         self.hidden_size = HIDDEN_SIZE
         self.intermediate_size_per_partition = INTERMEDIATE_SIZE
-        self.moe_runner_config = SimpleNamespace(is_gated=True)
+        self.moe_runner_config = MoeRunnerConfig()
         generator = torch.Generator().manual_seed(seed)
         self.w13_weight = torch.nn.Parameter(
             torch.randn(

@@ -77,7 +77,7 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
                 model_runner=runner,
                 model_config=runner.model_config,
                 tree_cache=Mock(),
-                req_to_token_pool=SimpleNamespace(max_context_len=mapping),
+                req_to_token_pool=SimpleNamespace(row_width=mapping),
                 token_to_kv_pool_allocator=Mock(),
                 spec_algorithm=Mock(),
                 chunked_prefill_size=base,

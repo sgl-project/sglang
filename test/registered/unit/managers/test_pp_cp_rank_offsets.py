@@ -52,13 +52,9 @@ def _fake_group() -> SimpleNamespace:
 def _make_receiver() -> SchedulerRequestReceiver:
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
-        recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        server_args=SimpleNamespace(
-            enable_dp_attention_local_control_broadcast=False,
-        ),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
         request_retirer=None,
@@ -76,7 +72,6 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         control_req = SimpleNamespace(kind="control")
         parallel = SimpleNamespace(
             attn_dp_enabled=True,
-            enable_dp_attention_local_control_broadcast=True,
             attn_tp_rank=0,
             attn_cp_rank=0,
             attn_tp_size=1,
@@ -89,6 +84,11 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
                 "sglang.srt.managers.scheduler_components.request_receiver."
                 "get_parallel",
                 return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "is_control_broadcast_local",
+                return_value=True,
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver."
@@ -110,7 +110,6 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         control_req = SimpleNamespace(kind="control")
         parallel = SimpleNamespace(
             attn_dp_enabled=True,
-            enable_dp_attention_local_control_broadcast=False,
             attn_tp_rank=0,
             attn_cp_rank=0,
             attn_tp_size=1,
@@ -126,10 +125,9 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
                 return_value=parallel,
             ),
             patch(
-                "sglang.srt.managers.scheduler_components.request_receiver.get_exec",
-                return_value=SimpleNamespace(
-                    moe=SimpleNamespace(is_ep_scale_joiner=False)
-                ),
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "is_control_broadcast_local",
+                return_value=False,
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver."
@@ -274,8 +272,8 @@ class TestReleaseVerdictRing(CustomTestCase):
             pp_group=SimpleNamespace(
                 is_first_rank=is_first_rank, is_last_rank=is_last_rank
             ),
-            _pp_release_reqs_awaiting_verdict=(),
-            _pp_release_verdict_send_work=[],
+            _pp_reqs_awaiting_verdict=(),
+            _pp_verdict_send_work=[],
             _pp_commit_comm_work=Mock(),
             _pp_send_pyobj_to_next_stage=Mock(return_value=["send"]),
             _pp_recv_pyobj_from_prev_stage=Mock(return_value=from_prev_stage),
@@ -286,25 +284,25 @@ class TestReleaseVerdictRing(CustomTestCase):
         """Answering at dispatch tells the caller memory is free while later stages hold it."""
         stage = self._stage(is_first_rank=True, from_prev_stage=[self.REFUSED])
 
-        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+        SchedulerPPMixin._pp_pass_verdict(stage, self.RELEASED, self.REQUEST)
         stage.send_control_output.assert_not_called()
 
-        SchedulerPPMixin._pp_answer_release_requests(stage)
+        SchedulerPPMixin._pp_answer_verdict_requests(stage)
         stage.send_control_output.assert_called_once_with(self.REFUSED, self.REQUEST)
 
     def test_a_busy_first_stage_answers_without_waiting_for_later_stages(self):
         """Later stages need the first stage's next iterations to reach the request."""
         stage = self._stage(is_first_rank=True)
 
-        SchedulerPPMixin._pp_pass_release_verdict(stage, self.REFUSED, self.REQUEST)
+        SchedulerPPMixin._pp_pass_verdict(stage, self.REFUSED, self.REQUEST)
 
         stage.send_control_output.assert_called_once_with(self.REFUSED, self.REQUEST)
-        self.assertEqual(stage._pp_release_reqs_awaiting_verdict, ())
+        self.assertEqual(stage._pp_reqs_awaiting_verdict, ())
 
     def test_a_later_stage_passes_on_an_earlier_refusal(self):
         stage = self._stage(is_first_rank=False, from_prev_stage=[True, self.REFUSED])
 
-        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+        SchedulerPPMixin._pp_pass_verdict(stage, self.RELEASED, self.REQUEST)
 
         (sent,), _ = stage._pp_send_pyobj_to_next_stage.call_args
         self.assertEqual(sent, [True, self.REFUSED])
@@ -315,14 +313,12 @@ class TestReleaseVerdictRing(CustomTestCase):
         stage = self._stage(is_first_rank=True)
 
         for _ in range(2):
-            SchedulerPPMixin._pp_pass_release_verdict(
-                stage, self.RELEASED, self.REQUEST
-            )
+            SchedulerPPMixin._pp_pass_verdict(stage, self.RELEASED, self.REQUEST)
         stage._pp_commit_comm_work.assert_not_called()
 
         relayed = SchedulerPPMixin._pp_send_reqs_to_next_stage(stage, [])
         self.assertEqual(relayed, ["send", "send", "send"])
-        self.assertEqual(stage._pp_release_verdict_send_work, [])
+        self.assertEqual(stage._pp_verdict_send_work, [])
 
     def test_the_last_stage_replies_only_to_a_first_stage_that_waits(self):
         stage = self._stage(
@@ -331,7 +327,7 @@ class TestReleaseVerdictRing(CustomTestCase):
             from_prev_stage=[False, self.REFUSED],
         )
 
-        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+        SchedulerPPMixin._pp_pass_verdict(stage, self.RELEASED, self.REQUEST)
 
         stage._pp_send_pyobj_to_next_stage.assert_not_called()
 

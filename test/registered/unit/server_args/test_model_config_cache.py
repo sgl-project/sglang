@@ -51,8 +51,7 @@ _OBJECT_STORE_URI = "gs://sglang-test-bucket/mini-llama/"
 
 class TestTheModelConfigCache(CustomTestCase):
     def setUp(self):
-        # Resolution writes the environment on the way through
-        # (`SGLANG_USE_CUDA_IPC_TRANSPORT` among others) and flips the
+        # Resolution can write the environment on the way through and flip the
         # descriptor-level flag `EnvField.set()` keeps, which `os.environ` does
         # not carry. The cases that resolve put both back.
         fields = {}

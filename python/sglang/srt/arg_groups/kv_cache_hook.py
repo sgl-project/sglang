@@ -19,7 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.platform_kv_cache_dtype import (
     registered_kv_cache_storage_dtype,
 )
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
@@ -109,6 +109,12 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
         raise ValueError(
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
+        )
+    # SM120 kernels read the per-layer pools' interleaved scales; the unified
+    # pool stores them token-major.
+    if get_platform().is_sm120 and cfg.enable_unified_memory:
+        raise ValueError(
+            "--kv-cache-dtype mxfp8 on SM120 does not support --enable-unified-memory."
         )
 
 
@@ -360,6 +366,39 @@ def handle_kv4_compatibility(server_args: Any) -> None:
         raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 
 
+def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
+    """Check the DSA lightning-indexer INT8 cache recipe.
+
+    npu_quant_lightning_indexer is a CANN op, so an explicitly requested
+    indexer recipe only makes sense on Ascend NPU and on a model that
+    actually has a DSA lightning indexer. The recipe itself is resolved
+    against the resolved KV cache dtype later, at pool-build time.
+    """
+    cfg = resolving_view(server_args)
+
+    if cfg.indexer_kv_cache_dtype is None:
+        return
+
+    if cfg.enable_hierarchical_cache:
+        raise ValueError(
+            f"--indexer-kv-cache-dtype={cfg.indexer_kv_cache_dtype} is not "
+            "supported with --enable-hierarchical-cache. Disable hierarchical "
+            "cache or use the default BF16 indexer cache."
+        )
+
+    if not get_platform().is_npu:
+        raise RuntimeError(
+            "--indexer-kv-cache-dtype is only supported on Ascend NPU "
+            "(npu_quant_lightning_indexer is a CANN op)."
+        )
+
+    if getattr(model_config_of(server_args), "index_head_dim", None) is None:
+        raise ValueError(
+            "--indexer-kv-cache-dtype requires a DSA model with a lightning "
+            "indexer; this model has none."
+        )
+
+
 def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
     """Validate --prefill-only-disable-kv-cache backend constraint.
 
@@ -593,17 +632,19 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"transfer backends: {', '.join(sorted(supported_backends))}; got "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
+        if cfg.disaggregation_transfer_backend == "nixl":
+            assert (
+                get_platform().is_cuda
+                and envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get() == "UCX"
+            ), "NIXL unified-memory PD currently requires CUDA and UCX"
         assert cfg.pp_size == 1, (
             "--enable-unified-memory with PD disaggregation does not support "
             "pipeline parallelism (whole-envelope transfer has no per-layer "
             "entries to subset)."
         )
-        assert not (
-            cfg.disaggregation_transfer_backend == "mooncake"
-            and cfg.speculative_algorithm is not None
-        ), (
+        assert cfg.speculative_algorithm is None, (
             "--enable-unified-memory with PD disaggregation does not support "
-            "speculative decoding with the Mooncake transfer backend."
+            "speculative decoding."
         )
         # This flag also selects decode's non-blocking metadata readback, which
         # records a receive as in flight before its destination is published.
@@ -744,7 +785,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         backends = set(attention_backends_of(resolved_view(server_args)))
         backends.discard(None)
         if not backends <= full_cg_backends:
-            _cg_cfg.prefill.backend = Backend.DISABLED
+            declare_resolution(
+                server_args,
+                "handle_unified_memory_pool",
+                cuda_graph_config=with_phase(
+                    _cg_cfg, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             logger.warning(
                 "--enable-unified-memory: disabling the FULL prefill "
                 "cuda-graph backend. It builds its block table in "

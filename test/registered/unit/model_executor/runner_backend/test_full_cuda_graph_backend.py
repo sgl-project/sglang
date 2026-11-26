@@ -27,7 +27,11 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend import (
+    full_cuda_graph_backend as full_backend_module,
+)
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
@@ -247,6 +251,30 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         # Schedule wait=2 + active=1 => one step per warmup (x2) + one post-capture.
         self.assertEqual(profiler.step.call_count, 3)
         self.assertEqual(forward_fn.call_count, 3)
+
+
+class TestMemorySaverEnv(CustomTestCase):
+    def test_every_declared_true_spelling_enables_the_adapter(self):
+        """``SGLANG_MEMORY_SAVER_CUDA_GRAPH=yes`` puts the communicators on the
+        memory-saver graph path; the graph backend must capture on it too."""
+        runner = SimpleNamespace(device_module=object())
+        with (
+            envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.override("yes"),
+            mock.patch.object(
+                full_backend_module,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_group=None),
+            ),
+            # torch-memory-saver is an optional dependency.
+            mock.patch.object(
+                full_backend_module.TorchMemorySaverAdapter,
+                "create",
+                side_effect=lambda enable: SimpleNamespace(enabled=enable),
+            ),
+        ):
+            backend = FullCudaGraphBackend(runner, enable_memory_saver=True)
+
+        self.assertTrue(backend._memory_saver_adapter.enabled)
 
 
 class TestCleanup(CustomTestCase):

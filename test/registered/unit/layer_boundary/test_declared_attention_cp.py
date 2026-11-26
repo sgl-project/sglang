@@ -7,7 +7,6 @@ attention-CP all-gather and reduce-scatter are replaced by what the ranks hand
 to them.
 """
 
-import contextlib
 import unittest
 from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
@@ -19,6 +18,7 @@ from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.cp import interleave as dsa_cp
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+from sglang.srt.runtime_context import ForwardFlags
 from sglang.test.boundary_fixtures import finish_exit, make_test_stages, prepare_input
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -40,22 +40,6 @@ def layernorm(hidden_states, residual=None):
         return hidden_states.clone()
     summed = hidden_states + residual
     return summed, summed.clone()
-
-
-class Flags:
-    def __init__(self):
-        self.mlp_reduce_scatter = False
-        self.defer_moe_finalize = False
-        self.sp_active = False
-
-    @contextlib.contextmanager
-    def scoped(self, **flags):
-        saved = {k: getattr(self, k) for k in flags}
-        self.__dict__.update(flags)
-        try:
-            yield
-        finally:
-            self.__dict__.update(saved)
 
 
 def group(name, ranks):
@@ -108,7 +92,7 @@ class TestAttentionCpBoundary(CustomTestCase):
             attn_tp_group=group("attn_tp", range(tp_rank, tp_rank + attn_tp_size)),
             attn_cp_group=group("attn_cp", range(0, tp_size, attn_tp_size)),
         )
-        flags = Flags()
+        flags = ForwardFlags()
         with ExitStack() as stack:
             for target, value in [
                 ((comm, "get_parallel"), lambda: parallel),

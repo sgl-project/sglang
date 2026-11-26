@@ -7,8 +7,12 @@ translates field annotations into argparse arguments.
 import argparse
 import contextlib
 import io
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
+from sglang.srt.arg_groups.choices import REMOVED_CHOICES
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.multimodal.media_io import (
     configure_media_url_security,
@@ -16,7 +20,8 @@ from sglang.srt.multimodal.media_io import (
     read_local_media_file,
 )
 from sglang.srt.runtime_context import get_model, publish, reset_context
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import REMOVED_FLAGS, ServerArgs, reject_removed_kwargs
+from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -141,11 +146,8 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def test_literal_auto_derives_choices(self):
         """Literal type annotations produce argparse choices automatically."""
-        sa = self._parse(
-            ["--deepep-mode", "low_latency", "--elastic-ep-backend", "none"]
-        )
+        sa = self._parse(["--deepep-mode", "low_latency"])
         self.assertEqual(sa.deepep_mode, "low_latency")
-        self.assertEqual(sa.elastic_ep_backend, "none")
 
     def test_startup_weight_load_mode(self):
         """The startup loading mode keeps serial as the safe default."""
@@ -170,101 +172,103 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 ]
             )
 
-    def test_the_deprecated_flag_still_reaches_its_replacement(self):
-        """`--disable-cuda-graph` is the one deprecated alias left standing.
+    def test_continuous_decode_steps_is_a_deprecated_noop(self):
+        from sglang.srt.entrypoints.engine import Engine
 
-        It is worth a test because it is not a rename. The flag writes
-        `disable_cuda_graph`, which is `no_cli=True` -- so this spelling is its
-        only way in -- and the cuda-graph hook is what turns that into the two
-        phase backends the replacement flag sets directly. Asserting the
-        backends, against the baseline of not passing it, covers that second
-        half; asserting the dest alone would not.
-        """
-        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
-        from sglang.srt.model_executor.cuda_graph_config import (
-            Backend,
-            default_prefill_backend,
-        )
+        flag = "--num-continuous-decode-steps"
+        field = "num_continuous_decode_steps"
+        with tempfile.TemporaryDirectory() as tmp:
+            config = os.path.join(tmp, "config.yaml")
+            with open(config, "w") as handle:
+                handle.write("num-continuous-decode-steps: 2\n")
+            yaml_args = ConfigArgumentMerger(self.parser).merge_config_with_args(
+                ["--config", config]
+            )
+            for source, argv in (("CLI", [flag, "2"]), ("YAML", yaml_args)):
+                with self.subTest(source=source):
+                    with self.assertLogs() as logs:
+                        args = self._parse(argv)
+                    self.assertIn(f"'{flag}' is deprecated", "\n".join(logs.output))
+                    self.assertIsNone(resolution_result(args, field))
 
-        def backends(argv):
-            sa = self._parse(argv)
-            parse_cuda_graph_config(sa)
-            config = resolution_result(sa, "cuda_graph_config")
-            return sa.disable_cuda_graph, config.decode.backend, config.prefill.backend
-
-        # Not a literal: the prefill default is BREAKABLE on CUDA and
-        # disabled elsewhere, and this file runs on the CPU runner.
-        self.assertEqual(backends([]), (False, Backend.FULL, default_prefill_backend()))
-        self.assertEqual(
-            backends(["--disable-cuda-graph"]),
-            (True, Backend.DISABLED, Backend.DISABLED),
-        )
-
-    def test_no_op_flags_still_parse_and_warn(self):
-        """Retired no-op flags keep old launch lines working: each one warns
-        and leaves the parsed arguments exactly as if it were absent."""
-        baseline = vars(self.parser.parse_args(["--model", "dummy"]))
-        for flag in (
-            "--disable-outlines-disk-cache",
-            "--show-time-cost",
-            "--triton-attention-reduce-in-fp32",
+        # Stop the offline Engine at the subprocess boundary.
+        with (
+            patch("sglang.srt.entrypoints.engine.atexit.register"),
+            patch.object(
+                Engine, "_launch_subprocesses", side_effect=StopIteration
+            ) as launch,
+            self.assertRaises(StopIteration),
         ):
-            with self.subTest(flag=flag):
-                with self.assertLogs(
-                    "sglang.srt.arg_groups.argparse_actions", level="WARNING"
-                ) as logs:
-                    args = self.parser.parse_args(["--model", "dummy", flag])
-                self.assertIn(f"'{flag}' is deprecated", "\n".join(logs.output))
-                self.assertEqual(vars(args), baseline)
+            Engine(model_path="dummy", num_continuous_decode_steps=2)
+        args = launch.call_args.kwargs["server_args"]
+        with self.assertLogs() as logs:
+            args.resolve_once()
+        self.assertIn(f"{field} is deprecated", "\n".join(logs.output))
+        self.assertIsNone(resolution_result(args, field))
 
-    def test_no_op_python_inputs_still_construct_and_warn(self):
-        """Engine kwargs reach the ServerArgs constructor without CLI parsing."""
-        with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
-            baseline = ServerArgs(model_path="dummy").resolved_dict()
-        for name in (
-            "disable_outlines_disk_cache",
-            "show_time_cost",
-            "triton_attention_reduce_in_fp32",
-        ):
-            for value in (True, False):
-                with self.subTest(name=name, value=value):
-                    with self.assertLogs(
-                        "sglang.srt.server_args", level="WARNING"
-                    ) as logs:
-                        sa = ServerArgs(model_path="dummy", **{name: value})
-                    self.assertIn(
-                        f"'{name}' is deprecated and has no effect",
-                        "\n".join(logs.output),
-                    )
-                    self.assertIs(getattr(sa, name), value)
-                    resolved = sa.resolved_dict()
-                    resolved[name] = baseline[name]
-                    self.assertEqual(resolved, baseline)
-
-    def test_retired_compressed_backend_names_its_replacement(self):
-        """The removed `compressed` alias stops the launch with a message naming
-        `dsv4`, not argparse's generic invalid-choice list."""
-        for flag in (
-            "--attention-backend",
-            "--decode-attention-backend",
-            "--prefill-attention-backend",
-        ):
+    def test_removed_flags_name_their_replacement(self):
+        """A flag removed in SGLang 1.0 stops the launch with a message naming
+        what to pass instead, not argparse's generic "unrecognized arguments";
+        so does its key in a YAML `--config` file and its keyword to `Engine`."""
+        # A bare flag, and one that took a value.
+        for argv in (["--show-time-cost"], ["--monokernel-backend", "amd"]):
+            flag = argv[0]
+            replacement = REMOVED_FLAGS[flag]
             with self.subTest(flag=flag):
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
                     with self.assertRaises(SystemExit):
-                        self.parser.parse_args(["--model", "dummy", flag, "compressed"])
-                self.assertIn("compressed was removed; use dsv4", stderr.getvalue())
-                args = self.parser.parse_args(["--model", "dummy", flag, "dsv4"])
-                self.assertEqual(getattr(args, flag[2:].replace("-", "_")), "dsv4")
+                        self.parser.parse_args(["--model", "dummy", *argv])
+                self.assertIn(
+                    f"{flag} was removed in SGLang 1.0; {replacement}.",
+                    " ".join(stderr.getvalue().split()),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = os.path.join(tmp, "config.yaml")
+            with open(config, "w") as handle:
+                handle.write("model-path: dummy\nshow-time-cost: true\n")
+            with self.assertRaises(ValueError) as raised:
+                ConfigArgumentMerger(self.parser).merge_config_with_args(
+                    ["--config", config]
+                )
+            self.assertEqual(
+                str(raised.exception),
+                "--show-time-cost was removed in SGLang 1.0; "
+                f"{REMOVED_FLAGS['--show-time-cost']}.",
+            )
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "enable_dp_attention was removed in SGLang 1.0; use --attn-dp-size",
+        ):
+            reject_removed_kwargs(ServerArgs, {"enable_dp_attention": True})
+        # `disable_cuda_graph` is still a field; only its flag was removed.
+        reject_removed_kwargs(ServerArgs, {"disable_cuda_graph": True})
+
+    def test_removed_choices_name_their_replacement(self):
+        """A removed choice value stops the launch with a message naming the
+        value to pass instead, not argparse's generic invalid-choice list.
+        Each field wires its own parser type, so each is checked once."""
+        for field, removed in REMOVED_CHOICES.items():
+            flag = "--" + field.replace("_", "-")
+            value, replacement = next(iter(removed.items()))
+            with self.subTest(flag=flag, value=value):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit):
+                        self.parser.parse_args(["--model", "dummy", flag, value])
+                self.assertIn(
+                    f"{value} was removed in SGLang 1.0; use {replacement}",
+                    " ".join(stderr.getvalue().split()),
+                )
 
     def test_each_deprecation_shape_does_its_job(self):
-        """The four `Deprecated*Action` shapes, on a throwaway parser.
+        """Four `Deprecated*Action` shapes, on a throwaway parser.
 
-        `ServerArgs` registers `DeprecatedStoreTrueAction`
-        (`--disable-cuda-graph`, covered above, and `--enable-dp-attention`)
-        and the no-op form of `DeprecatedAction` (covered above). The other
-        two, and `DeprecatedAction` with `error_message=`, are kept for the
+        `ServerArgs` registers `DeprecatedAction` with `error_message=` (the
+        removed flags, covered above) and `DeprecatedAliasStoreAction`
+        (`--mamba-max-states-per-path`). The other shapes are kept for the
         next flag that needs them, which makes this the only thing standing
         between them and silent rot -- and it doubles as the worked example of
         which shape to reach for.

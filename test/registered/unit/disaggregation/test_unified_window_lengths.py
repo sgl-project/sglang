@@ -71,6 +71,7 @@ def _storage(windows=_WINDOWS, device="cpu", state=False):
             state_slots=8 if state else 0,
             max_running_requests=3,
             context_len=128,
+            req_to_token_row_width=128,
             alignment=1,
         ),
     )
@@ -81,7 +82,6 @@ def _storage(windows=_WINDOWS, device="cpu", state=False):
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=3,
-        model_context_len=128,
         lazy_compaction=True,
         state_cache_params=SimpleNamespace(layers=(state_layer,)) if state else None,
     )

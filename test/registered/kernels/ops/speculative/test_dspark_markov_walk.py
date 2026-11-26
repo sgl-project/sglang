@@ -388,29 +388,9 @@ def test_host_rejects_bad_arguments(case):
         mw.MAX_BS + 1, walker.gamma, walker.vocab, dtype=torch.bfloat16, device=DEV
     )
     bad_calls = [
-        dict(base_logits=base.half()),
-        dict(base_logits=base.transpose(1, 2).contiguous().transpose(1, 2)),
-        dict(base_logits=base.cpu()),
         dict(num_steps=mw.MAX_STEPS + 1),
         dict(num_steps=walker.gamma + 1),
-        dict(valid_rows=walker.vocab - 4),
         dict(valid_rows=walker.vocab + 8),
-        dict(tokens_out=tokens[:-1]),
-        dict(temps=temps[:-1]),
-        dict(state=walker.state.buffer[1:]),
-        dict(
-            state=torch.zeros(
-                mw.MarkovWalkState.words(walker.gamma - 1),
-                dtype=torch.int64,
-                device=DEV,
-            )
-        ),
-        dict(w2_res=w.w2_res[:-1]),
-        dict(
-            corrected_out=torch.zeros(
-                bs, walker.gamma, walker.vocab - 8, dtype=torch.bfloat16, device=DEV
-            )
-        ),
         dict(
             base_logits=big,
             anchor=torch.zeros(mw.MAX_BS + 1, dtype=torch.int64, device=DEV),

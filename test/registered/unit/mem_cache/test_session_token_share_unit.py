@@ -72,6 +72,7 @@ def _recv(rid, input_ids, max_new_tokens=8, parent=None):
         cache_salt=None,
         http_worker_ipc=None,
         time_stats=None,
+        filler_seed=None,
     )
 
 
