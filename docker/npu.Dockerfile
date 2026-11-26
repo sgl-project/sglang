@@ -57,7 +57,7 @@ ARG TRITON_X86_64="https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/t
 
 ARG SGLANG_TAG=main
 
-ARG SGLANG_KERNEL_NPU_TAG=2026.11.0.post14
+ARG SGLANG_KERNEL_NPU_TAG=2026.11.0.post15
 
 ARG PIP_INDEX_URL="https://pypi.org/simple/"
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
