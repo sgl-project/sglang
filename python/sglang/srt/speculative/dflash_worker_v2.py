@@ -1509,8 +1509,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if mask.dtype != torch.bool:
             mask = mask.to(torch.bool)
 
-        table_width = int(req_to_token.shape[1])
-        if table_width <= 0:
+        req_to_token_row_width = int(req_to_token.shape[1])
+        if req_to_token_row_width <= 0:
             if bool(mask.any().item()):
                 raise RuntimeError(
                     f"{context} req_to_token table is empty but gather mask is non-empty."
