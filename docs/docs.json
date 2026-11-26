@@ -1655,6 +1655,13 @@
                     ]
                   },
                   {
+                    "group": "MAGI",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/MAGI/MAGI-2"
+                    ]
+                  },
+                  {
                     "group": "Meituan",
                     "pages": [
                       "cookbook/diffusion/LongCat/LongCat-Image"
