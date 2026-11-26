@@ -21,6 +21,7 @@ from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
+from sglang.srt.observability.kernel_profile import export_kernel_summary
 from sglang.srt.observability.profile_utils import ProfileManager
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
@@ -358,9 +359,9 @@ class SchedulerProfilerManager:
                     + ".trace.json.gz"
                 )
 
-                self.torch_profiler.export_chrome_trace(
-                    os.path.join(self.torch_profiler_output_dir, filename)
-                )
+                trace_path = self.torch_profiler_output_dir / filename
+                self.torch_profiler.export_chrome_trace(str(trace_path))
+                export_kernel_summary(trace_path)
             torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:
