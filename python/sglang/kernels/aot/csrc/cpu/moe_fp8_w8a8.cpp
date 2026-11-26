@@ -424,7 +424,7 @@ void fused_experts_fp8_a8_kernel_impl(
   // stage 1: intermediate_cache0 = hidden_states @ w1
   const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
-  const int64_t KB = K / BLOCK_K;  // use div_up
+  const int64_t KB = K / BLOCK_K;                       // use div_up
   int64_t blocks_n_per_group = block_size_N / BLOCK_N;  // use div_up
   int64_t num_groups = div_up(K, block_size_K);         // G, block_size_K is group size
   int64_t blocks_k_per_group = block_size_K / BLOCK_K;  // use div_up
