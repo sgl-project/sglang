@@ -22,7 +22,6 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
-    apply_dflash_verify_logits_adjustments,
     commit_accept,
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
@@ -37,6 +36,7 @@ from sglang.srt.speculative.spec_utils import (
     check_simulate_acc_token_mode,
     simulated_acc_len_generator,
 )
+from sglang.srt.speculative.target_verify import adjust_verify_logits
 
 
 class DFlyWorkerV2(BaseSpecWorker):
@@ -306,11 +306,12 @@ class DFlyWorkerV2(BaseSpecWorker):
     def _accept(self, batch, draft_input, candidates, next_token_logits):
         sampling_info = batch.sampling_info
         if sampling_info is not None:
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=next_token_logits,
+            adjust_verify_logits(
+                next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=self.block_size,
-                verify_tokens=candidates,
+                grammar_mask=None,
+                draft_tokens=candidates,
+                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
             )
         if (
             sampling_info is not None
