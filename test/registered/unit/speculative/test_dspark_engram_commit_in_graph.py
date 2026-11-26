@@ -8,10 +8,15 @@ import pytest
 import torch
 
 from sglang.srt.speculative.dspark_components import dspark_verify
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -56,6 +61,8 @@ def _commit_reference(history, tokens, slots, commit, live_rows, gate):
 
 def _epilogue_for_accept(*, fused, bs, stride, history):
     epi = dspark_verify.DsparkVerifyEpilogue.__new__(dspark_verify.DsparkVerifyEpilogue)
+    epi._draft_folds_static_commit_cache = False
+    epi._folds_static_commit_cache = None
     z = lambda *shape, dtype: torch.zeros(*shape, dtype=dtype)
     epi.stride, epi.gamma, epi.max_bs = stride, stride - 1, bs
     epi.verify_lens_buf = torch.full((bs,), stride, dtype=torch.int64)

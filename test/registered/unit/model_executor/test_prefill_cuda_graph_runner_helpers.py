@@ -60,7 +60,37 @@ def _make_pp_buffers_and_registry():
     return buffers, registry
 
 
+def _make_breakable_capture_recorder():
+    callbacks = []
+    recorder = SimpleNamespace(
+        end_current_segment=lambda: None,
+        begin_next_segment=lambda: None,
+        register_eager_call=callbacks.append,
+        retain_for_replay=lambda value: value,
+    )
+    return recorder, callbacks
+
+
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_input_embeds_buffer_takes_declared_dtype(self):
+        def create(**kwargs):
+            return PrefillInputBuffers.create(
+                device=torch.device("cpu"),
+                max_bs=1,
+                max_num_tokens=8,
+                cache_loc_dtype=torch.int64,
+                is_multimodal=True,
+                hidden_size=4,
+                dtype=torch.bfloat16,
+                enable_mamba_track=False,
+                **kwargs,
+            )
+
+        self.assertEqual(create().input_embeds.dtype, torch.bfloat16)
+        fp32 = create(input_embeds_dtype=torch.float32)
+        self.assertEqual(fp32.input_embeds.dtype, torch.float32)
+        self.assertEqual(fp32.input_embeds.shape, (8, 4))
+
     def test_attention_padding_respects_cuda_moe_and_quantization(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = True
@@ -216,7 +246,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             positions=None,
             forward_batch=batch,
         )
-        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture, callbacks = _make_breakable_capture_recorder()
         x = torch.full((8, 2), 3, dtype=torch.int32)
         with (
             patch.object(
@@ -230,7 +260,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 captured = call(x[:6])
             batch.rows = 2
             x.fill_(5)
-            capture.cuda_graph._break_fns[0]()
+            callbacks[0]()
         self.assertEqual(len(layer._qsa_prefill_topk_bridges), 1)
         self.assertEqual(captured.tolist(), [[5, 5]] * 2 + [[0, 0]] * 4)
 
@@ -255,7 +285,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             global_num_token_non_padded_cpu=None,
         )
         context = SimpleNamespace(forward_batch=batch)
-        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture, callbacks = _make_breakable_capture_recorder()
         pool = SimpleNamespace(
             state_sub_pool="mamba", get_mamba_indices=lambda indices: indices
         )
@@ -313,7 +343,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                         holder=holder,
                     )
                     self.assertIsNone(holder.batch)
-                for replay in capture.cuda_graph._break_fns:
+                for replay in callbacks:
                     replay()
                 self.assertEqual(holder.batch.lengths.tolist(), lengths)
                 self.assertEqual(holder.batch.processed_tokens, sum(lengths))

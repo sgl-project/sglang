@@ -44,7 +44,6 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # dspark
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
@@ -85,9 +84,8 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     16,
     "--pp-size",
     2,
-    "--dp-size",
+    "--attn-dp-size",
     8,
-    "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--load-balance-method",
     "total_tokens",
@@ -105,7 +103,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "--max-running-requests",
     64,
     "--mem-fraction-static",
-    0.82,
+    0.85,
     "--quantization",
     "modelslim",
     "--max-prefill-tokens",
@@ -116,7 +114,8 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "deepep",
     "--deepep-mode",
     "auto",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--enable-prefill-cp",
     "--cp-strategy",
     "interleave",
@@ -140,9 +139,8 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS = [
     2,
     "--tp-size",
     32,
-    "--dp-size",
+    "--attn-dp-size",
     4,
-    "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--load-balance-method",
     "round_robin",
@@ -220,15 +218,18 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(TestNpuAccuracyMultiNodePdSepTestCas
         self.run_accuracy()
 
     def test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_l2_host_hit_rate(self):
-        """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
-        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
-        # plus a 3200-token question, which exceeds L1 so evictions land in L2.
+        """Run the 28k GSP bench; assert_metrics checks the host hit rate"""
+        # 3 groups x 32 prompts share a 25200-token system prompt (28k * 0.9)
+        # plus a 2800-token question, which exceeds L1 so evictions land in L2.
+        # The prompt must stay below the prefill KV pool, which only holds
+        # ~31.5k tokens per rank once the DSPARK draft model is resident on
+        # prefill; a 32k prompt is rejected with a 400 and warmup fails.
         metrics = run_bench_serving(
             host=self.host,
             port=self.port,
             model_path=self.model_config.get("model_path"),
             dataset_name="generated-shared-prefix",
-            input_len=32000,
+            input_len=28000,
             output_len=1024,
             max_concurrency=32,
             gsp_num_groups=3,
