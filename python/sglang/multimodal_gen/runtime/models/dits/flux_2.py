@@ -44,6 +44,11 @@ from sglang.kernels.ops.diffusion import (
     xpu_gated_resnorm,
     xpu_layernorm_modulate,
 )
+from sglang.kernels.ops.diffusion.norm.gated_residual_layernorm_modulate_triton import (
+    can_use_gated_residual_layernorm_modulate,
+    gated_residual_layernorm_modulate,
+    layernorm_modulate,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
@@ -86,6 +91,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
     FluxPosEmbed as Flux2PosEmbed,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    request_allows_lossless,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -98,6 +106,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+_is_rocm = current_platform.is_rocm()
 
 _get_qkv_projections = get_qkv_projections
 
@@ -235,11 +244,36 @@ def _materialize_gated_residual(pending: PendingGatedResidual) -> torch.Tensor:
 def _defer_gated_residual(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor | PendingGatedResidual:
-    if can_defer_flux2_gated_residual(residual, update, gate) or _can_defer_xpu(
-        residual, update, gate
+    if (
+        can_defer_flux2_gated_residual(residual, update, gate)
+        or _can_defer_xpu(residual, update, gate)
+        or _can_defer_rocm(residual, update, gate)
     ):
         return residual, update, gate
     return residual_gate_add(residual, update, gate)
+
+
+def _rocm_lossless() -> bool:
+    # The ROCm Triton adaLN kernels reorder the LayerNorm reduction, so they need
+    # the lossless tier.
+    return _is_rocm and not torch.compiler.is_compiling() and request_allows_lossless()
+
+
+def _rocm_gated_residual_operands_ok(
+    residual: torch.Tensor, update: torch.Tensor, *per_batch: torch.Tensor
+) -> bool:
+    return (
+        update.shape == residual.shape
+        and update.dtype == residual.dtype
+        and update.is_contiguous()
+        and can_use_gated_residual_layernorm_modulate(residual, *per_batch)
+    )
+
+
+def _can_defer_rocm(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> bool:
+    return _rocm_lossless() and _rocm_gated_residual_operands_ok(residual, update, gate)
 
 
 def _can_defer_xpu(
@@ -295,6 +329,15 @@ def _flux2_gated_resnorm(
         fused = _xpu_gated_resnorm(norm, residual, update, gate, scale, shift)
         if fused is not None:
             return fused
+    if (
+        _rocm_lossless()
+        and is_plain_layer_norm(norm, residual.shape[-1])
+        and _rocm_gated_residual_operands_ok(residual, update, gate, scale, shift)
+    ):
+        residual, out = gated_residual_layernorm_modulate(
+            residual, update, gate, scale, norm.eps, shift=shift
+        )
+        return out, residual
 
     residual = residual_gate_add(residual, update, gate)
     return _flux2_norm_modulate(norm, residual, scale, shift), residual
@@ -388,6 +431,12 @@ def _flux2_norm_modulate(
     # Triton dispatch is intentionally an eager fast path.
     if torch.compiler.is_compiling():
         return norm(x) * (1 + scale) + shift
+    if (
+        _rocm_lossless()
+        and is_plain_layer_norm(norm, x.shape[-1])
+        and can_use_gated_residual_layernorm_modulate(x, scale, shift)
+    ):
+        return layernorm_modulate(x, scale, norm.eps, shift=shift)
 
     scale_row = scale.squeeze(1) if scale.dim() == 3 and scale.shape[1] == 1 else scale
     shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift

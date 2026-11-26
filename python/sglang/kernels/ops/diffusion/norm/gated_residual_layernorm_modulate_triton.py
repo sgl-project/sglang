@@ -1,11 +1,12 @@
-"""Portable Triton kernels for the adaLN block pattern of Qwen-Image 2.1.
+"""Portable Triton kernels for the adaLN block pattern of Qwen-Image 2.1 and FLUX.2.
 
-``r = residual + update * gate`` and ``y = LayerNorm(r) * (1 + scale)``, with
-an affine-free LayerNorm, BF16 activations and one gate/scale row per batch.
-The kernels keep every rounding point of the eager chain: the product and the
-sum of the residual update, ``1 + scale`` and the LayerNorm output are each
-rounded to the activation dtype. The residual result is therefore identical
-to eager; only the order of the LayerNorm mean and variance reduction differs.
+``r = residual + update * gate`` and ``y = LayerNorm(r) * (1 + scale) [+ shift]``,
+with an affine-free LayerNorm, BF16 activations and one gate/scale/shift row per
+batch. The kernels keep every rounding point of the eager chain: the product and
+the sum of the residual update, ``1 + scale``, the LayerNorm output, the
+modulation product and the shift sum are each rounded to the activation dtype.
+The residual result is therefore identical to eager; only the order of the
+LayerNorm mean and variance reduction differs.
 The kernels use plain Triton, so they run on CUDA and ROCm.
 """
 
@@ -24,15 +25,18 @@ def _gated_residual_layernorm_modulate_kernel(
     update_ptr,
     gate_ptr,
     scale_ptr,
+    shift_ptr,
     residual_out_ptr,
     out_ptr,
     seq_len,
     hidden,
     gate_batch_stride,
     scale_batch_stride,
+    shift_batch_stride,
     eps,
     HAS_UPDATE: tl.constexpr,
     HAS_NORM: tl.constexpr,
+    HAS_SHIFT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -63,7 +67,13 @@ def _gated_residual_layernorm_modulate_kernel(
             scale_ptr + batch * scale_batch_stride + cols, mask=mask, other=0.0
         ).to(tl.float32)
         one_plus_scale = (1.0 + scale).to(dtype).to(tl.float32)
-        tl.store(out_ptr + offsets, (normed * one_plus_scale).to(dtype), mask=mask)
+        y = (normed * one_plus_scale).to(dtype)
+        if HAS_SHIFT:
+            shift = tl.load(
+                shift_ptr + batch * shift_batch_stride + cols, mask=mask, other=0.0
+            ).to(tl.float32)
+            y = (y.to(tl.float32) + shift).to(dtype)
+        tl.store(out_ptr + offsets, y, mask=mask)
 
 
 def _batch_row_stride(t: torch.Tensor, batch: int, hidden: int) -> int | None:
@@ -99,20 +109,22 @@ def can_use_gated_residual_layernorm_modulate(
     )
 
 
-def _check_launch_args(residual, update, gate, scale):
-    per_batch = [t for t in (gate, scale) if t is not None]
+def _check_launch_args(residual, update, gate, scale, shift=None):
+    per_batch = [t for t in (gate, scale, shift) if t is not None]
     if not can_use_gated_residual_layernorm_modulate(residual, *per_batch):
         rows = [(t.dtype, tuple(t.shape), str(t.device), t.stride()) for t in per_batch]
         raise ValueError(
             "expected a contiguous non-empty bf16 [B, L, D] GPU tensor with "
-            "D <= 8192 and bf16 [B, 1, D] or [B, D] gate/scale rows on the same "
-            f"device; got residual dtype={residual.dtype} "
+            "D <= 8192 and bf16 [B, 1, D] or [B, D] gate/scale/shift rows on the "
+            f"same device; got residual dtype={residual.dtype} "
             f"shape={tuple(residual.shape)} device={residual.device} "
             f"strides={residual.stride()}, per-batch (dtype, shape, device, "
             f"strides)={rows}"
         )
     if (update is None) != (gate is None):
         raise ValueError("update and gate must be passed together")
+    if shift is not None and scale is None:
+        raise ValueError("shift requires scale")
     if update is None:
         return
     for attr, got, expected in (
@@ -126,38 +138,48 @@ def _check_launch_args(residual, update, gate, scale):
         raise ValueError(f"update must be contiguous, got strides {update.stride()}")
 
 
-def _launch(residual, update, gate, scale, eps, residual_out, out):
-    _check_launch_args(residual, update, gate, scale)
+def _launch(residual, update, gate, scale, eps, residual_out, out, shift=None):
+    _check_launch_args(residual, update, gate, scale, shift)
     batch, seq_len, hidden = residual.shape
     block = triton.next_power_of_2(hidden)
     has_update = update is not None
     has_norm = scale is not None
+    has_shift = shift is not None
     gate_stride = _batch_row_stride(gate, batch, hidden) if has_update else 0
     scale_stride = _batch_row_stride(scale, batch, hidden) if has_norm else 0
+    shift_stride = _batch_row_stride(shift, batch, hidden) if has_shift else 0
     with torch.cuda.device(residual.device):
         _gated_residual_layernorm_modulate_kernel[(batch * seq_len,)](
             residual,
             update if has_update else residual,
             gate if has_update else residual,
             scale if has_norm else residual,
+            shift if has_shift else residual,
             residual_out if residual_out is not None else residual,
             out if out is not None else residual,
             seq_len,
             hidden,
             gate_stride,
             scale_stride,
+            shift_stride,
             eps,
             HAS_UPDATE=has_update,
             HAS_NORM=has_norm,
+            HAS_SHIFT=has_shift,
             BLOCK=block,
             num_warps=8 if block >= 4096 else 4,
         )
 
 
-def layernorm_modulate(x: torch.Tensor, scale: torch.Tensor, eps: float):
-    """``LayerNorm(x) * (1 + scale)``."""
+def layernorm_modulate(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    shift: torch.Tensor | None = None,
+):
+    """``LayerNorm(x) * (1 + scale)``, plus ``shift`` when given."""
     out = torch.empty_like(x)
-    _launch(x, None, None, scale, eps, None, out)
+    _launch(x, None, None, scale, eps, None, out, shift)
     return out
 
 
@@ -176,9 +198,10 @@ def gated_residual_layernorm_modulate(
     gate: torch.Tensor,
     scale: torch.Tensor,
     eps: float,
+    shift: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``r = residual + update * gate``; returns ``(r, LayerNorm(r) * (1 + scale))``."""
+    """``r = residual + update * gate``; returns ``(r, LayerNorm(r) * (1 + scale) [+ shift])``."""
     residual_out = torch.empty_like(residual)
     out = torch.empty_like(residual)
-    _launch(residual, update, gate, scale, eps, residual_out, out)
+    _launch(residual, update, gate, scale, eps, residual_out, out, shift)
     return residual_out, out
