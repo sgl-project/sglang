@@ -16,6 +16,139 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=42, suite="base-a-test-cpu")
 
 
+@pytest.mark.parametrize("fields", [{}, {"shift_label": False}, {"shift_label": True}])
+def test_legacy_selector_shift_label_parsing_is_unchanged(fields):
+    config = parse_dflash_draft_config(
+        draft_hf_config={
+            "architectures": ["DFlash2DraftModel"],
+            # The new default belongs to the draft architecture, not every
+            # draft that happens to use the GigaChat config class/model_type.
+            "model_type": "gigachat4",
+            "num_hidden_layers": 2,
+            "shift_label": True,
+            "dflash_config": {"selector_rank": 2, "selector_top_k": 1, **fields},
+        }
+    )
+    assert config.shift_label is None
+
+
+def _tagged_selector_model(shift_label, observed):
+    """Use row tags as candidate IDs so choosing a wrong row changes tokens."""
+
+    def compute_candidates(hidden):
+        observed["candidate_hidden"] = hidden.clone()
+        return hidden[:, :1].long(), hidden[:, :1].float()
+
+    def build_lattice(**kwargs):
+        observed["selector_hidden"] = kwargs["hidden_states"].clone()
+        observed["anchor_ids"] = kwargs["anchor_token_ids"].clone()
+        return kwargs["unary_logits"].unsqueeze(-2)
+
+    def sample_path(**kwargs):
+        candidates = kwargs["candidate_ids"]
+        return candidates[..., 0], torch.ones_like(candidates, dtype=torch.float32)
+
+    return SimpleNamespace(
+        lm_head=None,
+        shift_label=shift_label,
+        candidate_selector=SimpleNamespace(
+            top_k=1, build_lattice=build_lattice, sample_path=sample_path
+        ),
+        compute_candidates=compute_candidates,
+    )
+
+
+@pytest.mark.parametrize("path", ["lattice", "eager", "graph_sampler"])
+@pytest.mark.parametrize(
+    "shift_label, positions",
+    [(True, [0, 1, 2]), (False, [1, 2, 3]), (None, [1, 2, 3])],
+    ids=["shifted", "unshifted", "legacy"],
+)
+def test_selector_prediction_rows_follow_shift_label(path, shift_label, positions):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    hidden = torch.arange(16, dtype=torch.float32).view(2, 4, 2)
+    block_ids = torch.tensor([[91, 0, 0, 0], [92, 0, 0, 0]])
+    observed = {}
+    model = _tagged_selector_model(shift_label, observed)
+    if path == "lattice":
+        candidates, _ = worker_mod._selector_lattice(model, hidden, block_ids[:, 0])
+        tokens = candidates[..., 0]
+    elif path == "eager":
+        worker = SimpleNamespace(
+            draft_model=model,
+            selector=model.candidate_selector,
+            block_size=4,
+            _selector_sampling_enabled=False,
+            _selector_sample=None,
+            _acceptance_estimator=None,
+        )
+        tokens = worker_mod.DFlashWorkerV2._propose_selector_block(
+            worker,
+            draft_logits_output=SimpleNamespace(hidden_states=hidden.view(-1, 2)),
+            bs=2,
+            lm_head=object(),
+            anchor_token_ids=block_ids[:, 0],
+            sampling_info=None,
+        )
+    else:
+        sampler = worker_mod._SelectorDraftSampler(
+            draft_model=model,
+            block_size=4,
+            max_bs=2,
+            device="cpu",
+            sampling_enabled=False,
+        )
+        sampler(hidden.view(-1, 2), block_ids.flatten())
+        tokens = sampler.out.view(2, 3)
+
+    expected = hidden[:, positions]
+    torch.testing.assert_close(tokens, expected[..., 0].long())
+    torch.testing.assert_close(observed["candidate_hidden"], expected.reshape(-1, 2))
+    torch.testing.assert_close(observed["selector_hidden"], expected)
+    torch.testing.assert_close(observed["anchor_ids"], block_ids[:, 0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "shift_label, positions",
+    [(True, [0, 1, 2]), (False, [1, 2, 3])],
+    ids=["shifted", "unshifted"],
+)
+def test_selector_prediction_rows_in_cuda_graph(shift_label, positions):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    hidden = torch.arange(16, dtype=torch.float32, device="cuda").view(2, 4, 2)
+    block_ids = torch.tensor([[91, 0, 0, 0], [92, 0, 0, 0]], device="cuda")
+    observed = {}
+    sampler = worker_mod._SelectorDraftSampler(
+        draft_model=_tagged_selector_model(shift_label, observed),
+        block_size=4,
+        max_bs=2,
+        device="cuda",
+        sampling_enabled=False,
+    )
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            sampler(hidden.view(-1, 2), block_ids.flatten())
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sampler(hidden.view(-1, 2), block_ids.flatten())
+
+    # Replay must read fresh rows and anchors, not warmup/capture values.
+    hidden.add_(100)
+    block_ids[:, 0].add_(1)
+    graph.replay()
+    expected = hidden[:, positions]
+    torch.testing.assert_close(sampler.out.view(2, 3), expected[..., 0].long())
+    torch.testing.assert_close(observed["candidate_hidden"], expected.reshape(-1, 2))
+    torch.testing.assert_close(observed["selector_hidden"], expected)
+    torch.testing.assert_close(observed["anchor_ids"], block_ids[:, 0])
+
+
 def test_dflash_unary_logit_transform():
     logits = torch.tensor([[-100.0, 0.0, 100.0]], dtype=torch.bfloat16)
     for fields in ({}, {"output_multiplier": 0.2, "final_logit_softcapping": 20.0}):
@@ -314,6 +447,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         device="cpu",
         _selector_sampling_enabled=True,
         _acceptance_estimator=None,
+        _runtime=None,
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
         ),
@@ -366,6 +500,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     )
     draft_model = SimpleNamespace(
         lm_head=None,
+        shift_label=False,
         candidate_selector=selector,
         compute_candidates=lambda hidden: (
             torch.zeros((1, 2), dtype=torch.int64),
@@ -443,6 +578,98 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     assert cap_trim_lens is None
     assert observed["target_predict"].tolist() == [[1, 0]]
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
+
+
+@pytest.mark.parametrize("branch", ["selector", "sampled", "cutoff", "triton_failed"])
+def test_accept_commits_the_block_in_one_launch_into_the_accept_ring(
+    monkeypatch, branch
+):
+    """Once the greedy Triton kernel fails, the eager commit returns no stale lengths."""
+    from types import MethodType
+
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    # Row 0 rejects every draft, row 1 accepts every draft, row 2 accepts one.
+    candidates = torch.tensor([[9, 1, 2, 3], [9, 4, 5, 6], [9, 7, 8, 0]])
+    target_predict = torch.tensor([[11, 0, 0, 0], [4, 5, 6, 12], [7, 13, 0, 0]])
+    accept_len = torch.tensor([0, 3, 1], dtype=torch.int32)
+    bonus = torch.tensor([11, 12, 13])
+    launches = []
+
+    def commit_block(**kwargs):
+        launches.append(kwargs)
+        tokens, num_accept = worker_mod._commit_accept(
+            kwargs["candidates"], kwargs["num_correct_drafts"], kwargs["bonus_tokens"]
+        )
+        kwargs["out_tokens"].copy_(tokens)
+        kwargs["num_accept_tokens_out"].copy_(num_accept)
+        kwargs["new_seq_lens_out"].copy_(kwargs["prefix_lens"] + num_accept)
+
+    monkeypatch.setattr(worker_mod, "dflash_commit_block", commit_block)
+    worker = SimpleNamespace(
+        device=torch.device("cpu"),
+        block_size=4,
+        _use_triton_accept_bonus=True,
+        _accept_bonus_buffer_cap=0,
+        _accept_bonus_buffer_slot=0,
+        _accept_len_buf=None,
+        _selector_sample=None,
+        _tp_sync=SimpleNamespace(sync=lambda site, tensor: None),
+    )
+    for name in ("_ensure_accept_bonus_buffers", "_next_accept_bonus_buffers"):
+        method = getattr(worker_mod.DFlashWorkerV2, name)
+        setattr(worker, name, MethodType(method, worker))
+    inputs = dict(
+        candidates=candidates,
+        next_token_logits=None,
+        sampling_info=SimpleNamespace(is_all_greedy=False),
+        draft_input=SimpleNamespace(max_top_k=4, uniform_top_k_value=None),
+        prefix_lens=torch.tensor([100, 200, 300]),
+        bs=3,
+    )
+    if branch == "selector":
+        worker._selector_sample = (None, None)
+        worker._selector_sampling_accept = lambda **kwargs: (
+            accept_len,
+            bonus,
+            torch.zeros(3, dtype=torch.int32),
+        )
+    elif branch == "sampled":
+        monkeypatch.setattr(
+            worker_mod, "is_dflash_sampling_verify_available", lambda: True
+        )
+        monkeypatch.setattr(
+            worker_mod,
+            "compute_dflash_sampling_correct_drafts_and_bonus",
+            lambda **kwargs: (accept_len, bonus),
+        )
+    else:
+        inputs["target_predict"] = target_predict
+    if branch == "cutoff":
+        inputs["cutoff_verify_lens"] = torch.full((3,), 4, dtype=torch.int32)
+    if branch == "triton_failed":
+
+        def fail(**kwargs):
+            raise ValueError("non-contiguous")
+
+        monkeypatch.setattr(
+            worker_mod, "_compute_dflash_accept_bonus_triton_unchecked", fail
+        )
+
+    rounds = [worker_mod.DFlashWorkerV2._accept_block(worker, **inputs) for _ in "ab"]
+
+    for slot, (_, commit_lens, _, out_tokens, new_seq_lens, _) in enumerate(rounds):
+        assert out_tokens.tolist() == [[11, 2, 3, 0], [4, 5, 6, 12], [7, 13, 0, 0]]
+        assert commit_lens.dtype == torch.int32
+        assert commit_lens.tolist() == [1, 4, 2]
+        if branch == "triton_failed":
+            assert new_seq_lens is None
+            continue
+        assert new_seq_lens.tolist() == [101, 204, 302]
+        assert out_tokens.data_ptr() == worker._out_tokens_bufs[slot].data_ptr()
+        assert commit_lens.data_ptr() == worker._commit_lens_bufs[slot].data_ptr()
+        assert new_seq_lens.data_ptr() == worker._new_seq_lens_bufs[slot].data_ptr()
+    assert len(launches) == (0 if branch == "triton_failed" else 2)
 
 
 def test_grouped_conv_supports_runtime_block_sizes():

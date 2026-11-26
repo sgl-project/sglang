@@ -56,10 +56,8 @@ reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2
 # Named directly for `Error::is_incomplete_message`, which reqwest does not expose.
 hyper = "1"
 sgl-kv-indexer = { path = "sgl-kv-indexer" }
-# sglang.api.v1 types for the typed generate response.
+# Native SglangService gRPC types, shared with the engine (proto/sglang/api/v1).
 sglang-api-types = { path = "../rust/sglang-api-types" }
-# Native SglangService gRPC types, shared with the engine (proto/sglang/runtime/v1).
-sglang-runtime-v1-types = { path = "../rust/sglang-runtime-v1-types" }
 tonic = { version = "0.14.6", features = ["transport"] }
 
 # Serialization
@@ -80,6 +78,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
 bytes = "1"
 # Gzips the /internal/kv_snapshot body once per build and inflates a peer's (see `fetch_body` in state/kv_events/bootstrap/fetch.rs).
+base64 = "0.22"
 flate2 = "1"
 rand = "0.8"
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -115,7 +114,6 @@ default = []
 fips = ["dep:aws-lc-rs", "dep:rustls"]
 
 [dev-dependencies]
-base64 = "0.22"
 dirs = "5"
 http-body-util = "0.1"
 # HTTP/2-only mock server for the proxy h2c forwarding tests (tests/proxy/h2c_forward.rs).

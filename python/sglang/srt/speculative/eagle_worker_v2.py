@@ -33,7 +33,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -43,7 +43,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import (
+    BaseRunner,
     DecodeCudaGraphRunner,
+    PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
@@ -93,6 +95,8 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
+    should_split_prefill_draft_extend,
+    split_prefill_draft_extend,
 )
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
@@ -173,6 +177,14 @@ def _qsa_index_share_requested(hf_config) -> bool:
     )
 
 
+def _prefill_graph_max_tokens(graph_runner: Optional[BaseRunner]) -> int:
+    """The largest prefill batch this runner captured a graph for; 0 for an eager
+    runner, which captures none."""
+    if isinstance(graph_runner, PrefillCudaGraphRunner):
+        return graph_runner.max_num_tokens
+    return 0
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     # Always-present draft dispatch. init_attention_backends resolves it before
     # graph capture; the class default keeps __new__-based test harnesses on stock.
@@ -192,7 +204,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self.target_worker = target_worker
 
         # Args for easy access
@@ -243,9 +254,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
+        self.can_split_prefill_draft_extend = self._can_split_prefill_draft_extend()
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+        self.target_embed_and_head_shared = False
+        self._maybe_share_embed_before_pool_sizing()
+
+    def _maybe_share_embed_before_pool_sizing(self):
+        """Under embedding replication the draft loads its own full embedding table on
+        every rank. Share the target's now, so that copy is freed before the scheduler
+        sizes the KV pool instead of after."""
+        if envs.SGLANG_ENABLE_EMBED_REPLICATION.get():
+            self._share_target_embed_and_head()
+
+    def _share_target_embed_and_head(self):
+        self.init_token_map()
+        self.init_lm_head()
+        self.target_embed_and_head_shared = True
 
     def alloc_memory_pool(
         self,
@@ -264,8 +291,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         check_draft_branch_tail_copy(
             self.draft_runner.token_to_kv_pool, self.topk, get_schedule().page_size
         )
-        self.init_token_map()
-        self.init_lm_head()
+        if not self.target_embed_and_head_shared:
+            self._share_target_embed_and_head()
         self._init_draft_probs_vocab_scatter()
         # The draft samples over its own logits: a hot-token map narrows them below the
         # target vocabulary, to widths the fused kernel may not take.
@@ -721,11 +748,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_translator=self.target_worker.model_runner.runner_ids,
             num_draft_tokens=self.speculative_num_draft_tokens,
         )
+        # A rank-local eager fallback can deadlock draft MoE collectives
+        # across attention-DP ranks.
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
             and self.seed_dsa_topk_from_draft_extend
             and draft_input.dsa_topk_indices is None
+            and not get_parallel().attn_dp_enabled
         ):
             can_run_decode_cuda_graph = False
         self.draft_runtime.begin_draft_round(
@@ -1087,6 +1117,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 slots.
         """
         self.draft_runtime.note_draft_extend()
+        if self.can_split_prefill_draft_extend and should_split_prefill_draft_extend(
+            batch,
+            mm_input_embeds=mm_input_embeds,
+            draft_prefill_graph_max_tokens=_prefill_graph_max_tokens(
+                self.draft_runner.prefill_cuda_graph_runner
+            ),
+            target_prefill_graph_max_tokens=_prefill_graph_max_tokens(
+                self.target_worker.model_runner.prefill_cuda_graph_runner
+            ),
+        ):
+            return self._draft_extend_for_prefill_split(
+                batch,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                mm_input_embeds=mm_input_embeds,
+                iteration_ids=iteration_ids,
+            )
+
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
@@ -1115,6 +1163,102 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if mm_input_embeds is not None:
                 mm_input_embeds = rotated_mm
 
+        return self._run_draft_extend_for_prefill(
+            batch,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            mm_input_embeds=mm_input_embeds,
+            iteration_ids=iteration_ids,
+        )
+
+    def _can_split_prefill_draft_extend(self) -> bool:
+        if not _is_cuda:
+            return False
+        from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
+
+        model = self.draft_runner.model
+        kv_cache_dtype = self.draft_runner.kv_cache_dtype
+        return (
+            isinstance(model, DeepseekV3ForCausalLMNextN)
+            and model.supports_forward_kv_only(kv_cache_dtype=kv_cache_dtype)
+            # With an FP8 cache and no prefix, these DSA prefills read fresh KV,
+            # while the last-token pass reads the cache; flashmla_auto may pick one.
+            and not (
+                kv_cache_dtype == torch.float8_e4m3fn
+                and get_exec().kernel.dsa_prefill_backend
+                in (
+                    "flashmla_sparse",
+                    "flashmla_sparse_q8",
+                    "triton_sparse_mla",
+                    "flashmla_auto",
+                )
+            )
+            and not get_parallel().attn_dp_enabled
+            and not get_parallel().enable_prefill_cp
+            # The split is not validated with decode context parallel's KV layout.
+            and not get_parallel().dcp_enabled
+            # The indexer top-k capturer copies the top-k rows per forward; the KV-only
+            # pass computes none. Read the flag: this runs before the capturer exists.
+            and not get_exec().features.enable_return_indexer_topk
+        )
+
+    def _draft_extend_for_prefill_split(
+        self,
+        batch: ScheduleBatch,
+        *,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        mm_input_embeds: Optional[torch.Tensor],
+        iteration_ids: Optional[IterationIds],
+    ) -> EagleDraftInput:
+        """Write the draft KV of every request's tokens but its last without attention
+        or MoE, then run the full draft layer on the last tokens."""
+        tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+        kv_batch, last_batch, kv_rows, last_rows = split_prefill_draft_extend(
+            batch, tail_tokens=tail_tokens
+        )
+
+        kv_batch.spec_info = EagleDraftExtendInput(
+            hidden_states=target_hidden_states[kv_rows],
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+            kv_only=True,
+        )
+        forward_batch = ForwardBatch.init_new(
+            kv_batch,
+            self.draft_runner,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_hidden_states_before_norm=False,
+            iteration_ids=iteration_ids,
+            write_cols=None if iteration_ids is None else kv_rows,
+        )
+        if mm_input_embeds is not None:
+            forward_batch.mm_input_embeds = mm_input_embeds[kv_rows + 1]
+        with self._draft_canary_ctx(forward_batch):
+            self.draft_runner.forward(forward_batch)
+
+        # The draft model embeds each last row from its tail token.
+        return self._run_draft_extend_for_prefill(
+            last_batch,
+            target_hidden_states=target_hidden_states[last_rows],
+            next_token_ids=next_token_ids,
+            mm_input_embeds=(
+                None if mm_input_embeds is None else mm_input_embeds[last_rows]
+            ),
+            iteration_ids=iteration_ids,
+            write_cols=None if iteration_ids is None else last_rows,
+        )
+
+    def _run_draft_extend_for_prefill(
+        self,
+        batch: ScheduleBatch,
+        *,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        mm_input_embeds: Optional[torch.Tensor],
+        iteration_ids: Optional[IterationIds] = None,
+        write_cols: Optional[Cols] = None,
+    ) -> EagleDraftInput:
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
         batch.spec_info = EagleDraftExtendInput(
@@ -1138,6 +1282,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=False,
             iteration_ids=iteration_ids,
+            write_cols=write_cols,
         )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
@@ -1158,18 +1303,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
             ).long()
 
-        canary_ctx = (
-            context_tuple(
-                c.with_ops_outside_graph(
-                    single_forward_indices=[0],
-                    maybe_inaccurate_forward_batch=forward_batch,
-                ),
-                c.with_active_single_forward_manager(0),
-            )
-            if (c := self.draft_runner.canary_manager) is not None
-            else contextlib.nullcontext()
-        )
-        with canary_ctx:
+        with self._draft_canary_ctx(forward_batch):
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
@@ -1205,6 +1339,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_for_logprob_per_req=1,
             dsa_topk_indices=prefill_dsa_topk,
             cuda_graph_compatible=not (seed_from_extend and prefill_dsa_topk is None),
+        )
+
+    def _draft_canary_ctx(self, forward_batch: ForwardBatch):
+        if (c := self.draft_runner.canary_manager) is None:
+            return contextlib.nullcontext()
+        return context_tuple(
+            c.with_ops_outside_graph(
+                single_forward_indices=[0],
+                maybe_inaccurate_forward_batch=forward_batch,
+            ),
+            c.with_active_single_forward_manager(0),
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
@@ -1480,12 +1625,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     cfg_path=get_spec().speculative_adaptive_config,
                 ),
             )
-
-        # Some dummy tensors
-        self.num_new_pages_per_topk = torch.empty(
-            (), dtype=torch.int64, device=self.device
-        )
-        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
@@ -1870,7 +2009,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             elif batch.seq_lens_cpu is not None:
                 seq_lens_sum = int(batch.seq_lens_cpu.sum())
             else:
-                seq_lens_sum = bs * attn_backend.max_context_len
+                seq_lens_sum = (
+                    bs * self._target_worker.model_runner.req_to_token_pool.row_width
+                )
             custom_mask = torch.ones(seq_lens_sum + bs, dtype=torch.bool, device=device)
 
         positions = batch.seq_lens.to(torch.int64)
@@ -2157,7 +2298,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             topk=self.topk,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
-            metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
             uno_target_max_top_k=max_top_k,

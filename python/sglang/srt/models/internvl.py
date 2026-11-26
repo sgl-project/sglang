@@ -489,7 +489,6 @@ class InternVLChatModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        use_flash_attn=True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -500,17 +499,11 @@ class InternVLChatModel(nn.Module):
         patch_size = config.vision_config.patch_size
         self.patch_size = patch_size
         self.select_layer = config.select_layer
-        self.template = config.template
         self.num_image_token = int(
             (image_size // patch_size) ** 2 * (config.downsample_ratio**2)
         )
         self.downsample_ratio = config.downsample_ratio
         self.ps_version = config.ps_version
-
-        config.vision_config.use_flash_attn = True if use_flash_attn else False
-        config.llm_config._attn_implementation = (
-            "flash_attention_2" if use_flash_attn else "eager"
-        )
 
         logger.info(f"num_image_token: {self.num_image_token}")
         logger.info(f"ps_version: {self.ps_version}")

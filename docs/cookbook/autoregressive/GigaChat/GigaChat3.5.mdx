@@ -1,7 +1,6 @@
 ---
 title: GigaChat 3.5
 description: "Deploy GigaChat 3.5 with SGLang — the 432B-A28B hybrid MLA + GDN Mixture-of-Experts instant model with MTP speculative decoding and tool calling, on H100 and H200 in FP8."
-tag: NEW
 ---
 
 ## Deployment

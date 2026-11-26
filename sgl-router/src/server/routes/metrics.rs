@@ -54,7 +54,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
         })
         .collect();
     let mut body = ctx.metrics.render_with_workers(&workers);
-    body.push_str(&ctx.tokenizers.stats().render());
+    body.push_str(&ctx.preprocessor.tokenizers().stats().render());
     // Pull-on-scrape, like the worker gauges above: the tree and the tally
     // own the numbers, so a worker that goes away stops emitting series
     // without anything having to reset a pushed counter.
@@ -330,6 +330,22 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
     out.push_str(&format!(
         "sgl_router_cache_pending_prefix_capped_total {}\n",
         kv.tree.pending().capped(),
+    ));
+    out.push_str(
+        "# HELP sgl_router_cache_media_affinity_hits_total Lookups of a chat with images where a placement remembered by --cache-media-affinity-ttl-ms matched deeper than any KV-event-confirmed prefix.\n",
+    );
+    out.push_str("# TYPE sgl_router_cache_media_affinity_hits_total counter\n");
+    out.push_str(&format!(
+        "sgl_router_cache_media_affinity_hits_total {}\n",
+        kv.tree.media().hits(),
+    ));
+    out.push_str(
+        "# HELP sgl_router_cache_media_affinity_tiebreaks_total Lookups of a chat with images, with no remembered placement, where workers tied on the confirmed prefix and the conversation's rendezvous hash ordered them.\n",
+    );
+    out.push_str("# TYPE sgl_router_cache_media_affinity_tiebreaks_total counter\n");
+    out.push_str(&format!(
+        "sgl_router_cache_media_affinity_tiebreaks_total {}\n",
+        kv.tree.media_tiebreaks(),
     ));
 
     out.push_str(
