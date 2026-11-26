@@ -97,6 +97,8 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
+from sglang.srt.environ import envs as srt_envs
+from sglang.srt.environ import validate_env_values
 from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
@@ -576,6 +578,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # entries; a request executing longer turns /health unhealthy. Unset: off.
     request_time_limit: list[str] | None = None
     enable_metrics: bool = False
+    # HTTP auth, as the LLM server's --api-key / --admin-api-key; kept out of logs.
+    api_key: str | None = field(default=None, repr=False)
+    admin_api_key: str | None = field(default=None, repr=False)
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -706,6 +711,9 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_path()
         if self.served_model_name is None:
             self.served_model_name = self.model_id or self.model_path
+        if self.admin_api_key is None:
+            # --admin-api-key wins; without it the server takes SGLANG_ADMIN_API_KEY.
+            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get() or None
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
@@ -721,6 +729,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        validate_env_values()
         self._validate_scheduler_rpc_timeout()
         timeout = self.http_graceful_shutdown_timeout
         if timeout is not None and (
@@ -3235,6 +3244,21 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.enable_metrics,
             help="Expose Prometheus metrics at /metrics.",
+        )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help="Set admin API key for management endpoints. Sensitive ones (e.g. weight "
+            "updates, LoRA loading, memory release, profiling) are refused unless it is "
+            "set. When set, admin endpoints require this key and do NOT accept --api-key. "
+            "Defaults to SGLANG_ADMIN_API_KEY.",
         )
         parser.add_argument(
             "--strict-ports",

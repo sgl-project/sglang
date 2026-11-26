@@ -145,12 +145,26 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
   {
     const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
     uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
-    for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
-      uint64_t lo, hi;
-      const uint64_t* s = src + j * 2;
-      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
-      uint64_t* d = dst + j * 2;
-      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
+    // Per 1 KiB chunk a lane loads both of its 16 B pairs before storing either,
+    // so a 656 B MLA row waits one host round trip, not two; ptxas can sink .nc loads below stores, so check the SASS.
+    constexpr int kPairsPerLane = 2;
+#pragma unroll 1
+    for (int p0 = 0; p0 < total_pairs; p0 += WARP_SIZE * kPairsPerLane) {
+      uint64_t lo[kPairsPerLane], hi[kPairsPerLane];
+#pragma unroll
+      for (int k = 0; k < kPairsPerLane; ++k) {
+        const int j = p0 + k * WARP_SIZE + lane_id;
+        if (j < total_pairs) {
+          asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo[k]), "=l"(hi[k]) : "l"(src + j * 2) : "memory");
+        }
+      }
+#pragma unroll
+      for (int k = 0; k < kPairsPerLane; ++k) {
+        const int j = p0 + k * WARP_SIZE + lane_id;
+        if (j < total_pairs) {
+          asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(dst + j * 2), "l"(lo[k]), "l"(hi[k]) : "memory");
+        }
+      }
     }
   }
 

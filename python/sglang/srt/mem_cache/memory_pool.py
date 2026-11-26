@@ -416,6 +416,9 @@ class ReqToTokenPool:
         # +1 padding row at index 0: cuda-graph padded batches default
         # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
         self._alloc_size = size + 1
+        # The row width: the model context plus room for over-allocation and
+        # drafts. A speculative step can read past the model context, so
+        # attention tables indexed by KV position are sized to this width.
         self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
