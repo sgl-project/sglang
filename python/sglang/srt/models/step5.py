@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Iterable
 from functools import partial
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -121,7 +122,7 @@ class Step5Indexer(nn.Module):
         tp_size: int,
         rotary_dim: int,
         rope_theta: float,
-        rope_scaling: dict,
+        rope_scaling: dict[str, Any] | None,
         max_position_embeddings: int,
         eps: float,
         prefix: str = "",
@@ -323,8 +324,7 @@ class Step5MoE(nn.Module):
             layer_id=layer_id,
         )
         keep_bf16 = quant_config is None or is_layer_skipped(
-            f"model.layers.{layer_id}.moe.experts.w13_weight",
-            quant_config.ignored_layers,
+            add_prefix("experts.w13_weight", prefix), quant_config.ignored_layers
         )
         self.experts = FusedMoE(
             num_experts=config.moe_num_experts,
@@ -340,6 +340,10 @@ class Step5MoE(nn.Module):
             gemm1_clamp_limit=config.swiglu_limits[layer_id],
             gate_up_interleaved=False,
             prefix=add_prefix("experts", prefix),
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -367,8 +371,18 @@ class Step5Attention(nn.Module):
         profile = parse_step5_attention_profile(config)
         parallel = get_parallel()
         self.is_dsa = config.layer_types[layer_id] == "full_attention"
+        attn_tp_size = parallel.attn_tp_size
+        if (
+            profile.num_heads % attn_tp_size
+            or attn_tp_size % profile.num_kv_heads
+            or attn_tp_size % profile.provider_groups
+        ):
+            raise ValueError(
+                "Step5 requires an attention TP size that is a multiple of "
+                f"{profile.num_kv_heads}, got {attn_tp_size}"
+            )
         self.head_dim = profile.head_dim
-        self.num_heads = profile.num_heads // parallel.attn_tp_size
+        self.num_heads = profile.num_heads // attn_tp_size
         self.eps = config.rms_norm_eps
         self.rotary_emb = get_rope(
             head_size=profile.head_dim,
@@ -388,6 +402,7 @@ class Step5Attention(nn.Module):
             bias=False,
             params_dtype=torch.bfloat16,
             quant_config=None,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.num_kv_heads = self.qkv_proj.num_kv_heads
@@ -400,6 +415,7 @@ class Step5Attention(nn.Module):
             gather_output=False,
             params_dtype=torch.bfloat16,
             quant_config=None,
+            parallel_group="attn_tp",
             prefix=add_prefix("g_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -408,6 +424,7 @@ class Step5Attention(nn.Module):
             bias=False,
             params_dtype=torch.bfloat16,
             quant_config=None,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -421,7 +438,7 @@ class Step5Attention(nn.Module):
             num_heads=self.num_heads,
             head_dim=profile.head_dim,
             scaling=profile.head_dim**-0.5,
-            num_kv_heads=1,
+            num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             quant_config=None,
             prefix=add_prefix("attn", prefix),
@@ -434,7 +451,7 @@ class Step5Attention(nn.Module):
                 index_head_dim=profile.index_head_dim,
                 num_index_heads=profile.index_num_heads,
                 index_tp_size=profile.provider_groups,
-                tp_size=parallel.attn_tp_size,
+                tp_size=attn_tp_size,
                 rotary_dim=profile.index_rope_dim,
                 rope_theta=config.rope_theta[layer_id],
                 rope_scaling=config.rope_scaling,
@@ -472,25 +489,23 @@ class Step5Attention(nn.Module):
         v = v.contiguous().view(-1, self.num_kv_heads, self.head_dim)
         if is_in_breakable_cuda_graph():
             output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
-            _bcg_step5_attention_core(
+            self._eager_attention(
                 q=q,
                 k=k,
                 v=v,
                 hidden_states=hidden_states,
                 positions=positions,
                 output=output,
-                layer=self,
             )
         elif self.is_dsa:
             output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
-            _step5_attention_core(
+            self._attention(
                 q=q,
                 k=k,
                 v=v,
                 hidden_states=hidden_states,
                 positions=positions,
                 output=output,
-                layer=self,
                 forward_batch=forward_batch,
             )
         else:
@@ -500,50 +515,66 @@ class Step5Attention(nn.Module):
         output, _ = self.o_proj(output.flatten(1))
         return output
 
-
-def _step5_attention_core(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    hidden_states: torch.Tensor,
-    positions: torch.Tensor,
-    output: torch.Tensor,
-    layer: Step5Attention,
-    forward_batch: ForwardBatch | None = None,
-) -> None:
-    if forward_batch is None:
-        forward_batch = get_forward_batch()
-    backend = get_attn_backend()
-    num_tokens = forward_batch.global_num_token_non_padded_cpu
-    kwargs = {}
-    if layer.is_dsa:
-        metadata = backend.get_indexer_metadata(layer.attn.layer_id, forward_batch)
-        if metadata is None:
-            output.zero_()
-            return
-        num_tokens = metadata.num_input_tokens
-        kwargs["index_selection"] = layer.indexer(
-            hidden_states[:num_tokens], positions[:num_tokens], metadata
+    @eager_on_graph
+    def _eager_attention(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        self._attention(
+            q=q,
+            k=k,
+            v=v,
+            hidden_states=hidden_states,
+            positions=positions,
+            output=output,
+            forward_batch=get_forward_batch(),
         )
-    batch_view = copy.copy(forward_batch)
-    batch_view.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
-    result = backend.forward(
-        q[:num_tokens],
-        k[:num_tokens],
-        v[:num_tokens],
-        layer.attn,
-        batch_view,
-        save_kv_cache=True,
-        **kwargs,
-    )
-    output[:num_tokens].copy_(result.reshape(num_tokens, -1))
-    output[num_tokens:].zero_()
+
+    def _attention(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        backend = get_attn_backend()
+        num_tokens = forward_batch.global_num_token_non_padded_cpu
+        kwargs = {}
+        if self.is_dsa:
+            metadata = backend.get_indexer_metadata(self.attn.layer_id, forward_batch)
+            if metadata is None:
+                output.zero_()
+                return
+            num_tokens = metadata.num_input_tokens
+            kwargs["index_selection"] = self.indexer(
+                hidden_states[:num_tokens], positions[:num_tokens], metadata
+            )
+        batch_view = copy.copy(forward_batch)
+        batch_view.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
+        result = backend.forward(
+            q[:num_tokens],
+            k[:num_tokens],
+            v[:num_tokens],
+            self.attn,
+            batch_view,
+            save_kv_cache=True,
+            **kwargs,
+        )
+        output[:num_tokens].copy_(result.reshape(num_tokens, -1))
+        output[num_tokens:].zero_()
 
 
-_bcg_step5_attention_core = eager_on_graph(_step5_attention_core)
-
-
-def _step5_stage_facts(config: Step5Config, layer_id: int) -> tuple:
+def _step5_stage_facts(config: Step5Config, layer_id: int):
     return (
         declare_attn(),
         declare_ffn(
