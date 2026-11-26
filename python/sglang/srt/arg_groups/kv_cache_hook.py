@@ -110,6 +110,12 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
         )
+    # SM120 kernels read the per-layer pools' interleaved scales; the unified
+    # pool stores them token-major.
+    if get_platform().is_sm120 and cfg.enable_unified_memory:
+        raise ValueError(
+            "--kv-cache-dtype mxfp8 on SM120 does not support --enable-unified-memory."
+        )
 
 
 def handle_platform_kv_cache_dtype_compatibility(server_args: Any) -> None:

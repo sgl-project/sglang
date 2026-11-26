@@ -294,7 +294,6 @@ class XverseModel(nn.Module):
                 forward_batch,
                 residual,
             )
-            # print(f"layer[{i}].hidden_states: {hidden_states}")
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -330,9 +329,7 @@ class XverseForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -373,10 +370,7 @@ class XverseForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-        if name is None or loaded_weight is None:
-            for name, loaded_weight in weights:
-                load_weights_per_param(name, loaded_weight)
-        else:
+        for name, loaded_weight in weights:
             load_weights_per_param(name, loaded_weight)
 
 

@@ -9,7 +9,6 @@ import functools
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import load_jit
 from sglang.kernels.ops.moe.inkling2_experts_sm90 import (
@@ -17,7 +16,11 @@ from sglang.kernels.ops.moe.inkling2_experts_sm90 import (
     _nvfp4_values,
     _ue8m0,
 )
-from sglang.kernels.ops.moe.inkling2_moe import _capped_swiglu, _mxfp8_block
+from sglang.kernels.ops.moe.inkling2_moe import (
+    _capped_swiglu,
+    _mxfp8_block,
+    _rcp_rn,
+)
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 from sglang.srt.layers.quantization.marlin_utils import (
@@ -39,6 +42,8 @@ from sglang.srt.layers.quantization.utils import get_scalar_types
 _, _scalar_types = get_scalar_types()
 ROUTE_BLOCKS = 256
 GEMV_MAX_EXPERTS = 128
+# kTileK in marlin_gemv.cuh.
+GEMV_TILE_K = 16
 SWIGLU_BLOCK = 256
 
 
@@ -244,8 +249,25 @@ def uses_gemv(marlin, tokens, num_local):
     return num_local <= GEMV_MAX_EXPERTS and tokens <= (8 if nvfp4 else 2)
 
 
-def _gemv_config(tokens, width):
-    return (4, 4) if tokens <= 2 or width > 2304 else (1, 8)
+def _gemv_config(tokens, width, nvfp4=False, num_local=None):
+    if nvfp4 and tokens <= 2 and width in (1152, 2304):
+        # Tuned on H200 for the 2304-wide looped 27B experts (128 or 32 local).
+        if width == 1152:
+            splits, warps = 1, 12
+        elif num_local is not None and num_local <= 32:
+            splits, warps = 2, 12
+        else:
+            splits, warps = (2, 4) if tokens == 1 else (1, 8)
+    else:
+        splits, warps = (4, 4) if tokens <= 2 or width > 2304 else (1, 8)
+    # The kernel needs the K tiles to divide evenly over splits x warps.
+    k_tiles = width // GEMV_TILE_K
+    while k_tiles % (splits * warps):
+        if splits > 1:
+            splits //= 2
+        else:
+            warps //= 2
+    return splits, warps
 
 
 def gemv(xq, marlin, out_size, metadata, top_k, tokens, splits=None, warps=None):
@@ -257,7 +279,9 @@ def gemv(xq, marlin, out_size, metadata, top_k, tokens, splits=None, warps=None)
     rows, width = xq.shape
     out = torch.empty((rows * top_k, out_size), dtype=torch.bfloat16, device=xq.device)
     if splits is None:
-        splits, warps = _gemv_config(tokens, width)
+        splits, warps = _gemv_config(
+            tokens, width, global_scale is not None, counts.numel()
+        )
     if out_size % 64 or width % (16 * splits * warps):
         raise ValueError(
             f"Marlin MoE GEMV needs N % 64 == 0 and K % {16 * splits * warps} == 0,"
@@ -271,11 +295,23 @@ def gemv(xq, marlin, out_size, metadata, top_k, tokens, splits=None, warps=None)
 
 
 @triton.jit
+def _split_sum(X, offs, mask, split_stride, SPLITS: tl.constexpr, ROUND: tl.constexpr):
+    """X[offs] where X holds SPLITS split-K partials split_stride apart (as
+    experts_hip.expert_gemm returns them): their sum in split order, rounded to BF16
+    with ROUND."""
+    x = tl.load(X + offs, mask, other=0)
+    if SPLITS > 1:
+        for split in tl.static_range(1, SPLITS):
+            x += tl.load(X + split * split_stride + offs, mask, other=0)
+        if ROUND:
+            x = x.to(tl.bfloat16)
+    return x
+
+
+@triton.jit
 def _row_scale(XAmax, WAmax, WDenominator, expert, amax_row):
     denominator = 1536.0 * tl.load(WDenominator)
-    return (tl.load(XAmax + amax_row) * tl.load(WAmax + expert)) * libdevice.rcp_rn(
-        denominator
-    )
+    return (tl.load(XAmax + amax_row) * tl.load(WAmax + expert)) * _rcp_rn(denominator)
 
 
 @triton.jit
@@ -295,6 +331,8 @@ def _swiglu_fake_quantize(
     BLOCK: tl.constexpr,
     GATE_CAP: tl.constexpr,
     UP_CAP: tl.constexpr,
+    split_stride=0,
+    SPLITS: tl.constexpr = 1,
 ):
     row = tl.program_id(0).to(tl.int64)
     expert = tl.load(Ids + row) - start
@@ -305,13 +343,17 @@ def _swiglu_fake_quantize(
     amax = tl.zeros((), tl.float32)
     for chunk in range(tl.cdiv(N, BLOCK)):
         cols = chunk * BLOCK + tl.arange(0, BLOCK)
-        y = _scaled_swiglu(X, row, cols, cols < N, scale, gamma, N, GATE_CAP, UP_CAP)
+        y = _scaled_swiglu(
+            X, row, cols, cols < N, scale, gamma, N, GATE_CAP, UP_CAP,
+            split_stride, SPLITS,
+        )  # fmt: skip
         amax = tl.maximum(amax, tl.max(tl.abs(y), 0))
     tl.store(YAmax + row, amax)
     for chunk in range(tl.cdiv(N, BLOCK)):
         _swiglu_quantize_chunk(
-            X, Y, row, chunk, scale, gamma, amax, N, BLOCK, GATE_CAP, UP_CAP
-        )
+            X, Y, row, chunk, scale, gamma, amax, N, BLOCK, GATE_CAP, UP_CAP,
+            split_stride, SPLITS,
+        )  # fmt: skip
 
 
 @triton.jit
@@ -332,6 +374,8 @@ def _swiglu_chunks(
     CHUNKS: tl.constexpr,
     GATE_CAP: tl.constexpr,
     UP_CAP: tl.constexpr,
+    split_stride=0,
+    SPLITS: tl.constexpr = 1,
 ):
     row = tl.program_id(0).to(tl.int64)
     chunk = tl.program_id(1)
@@ -342,8 +386,9 @@ def _swiglu_chunks(
     cols = chunk * BLOCK + tl.arange(0, BLOCK)
     mask = cols < N
     y = _scaled_swiglu(
-        X, row, cols, mask, scale, tl.load(Gammas + row), N, GATE_CAP, UP_CAP
-    )
+        X, row, cols, mask, scale, tl.load(Gammas + row), N, GATE_CAP, UP_CAP,
+        split_stride, SPLITS,
+    )  # fmt: skip
     tl.store(Y + row * N + cols, y.to(tl.bfloat16), mask)
     tl.store(Partials + row * CHUNKS + chunk, tl.max(tl.abs(y), 0))
 
@@ -352,6 +397,7 @@ def _swiglu_chunks(
 def _quantize_chunks(
     Ids,
     Y,
+    Q,
     Partials,
     YAmax,
     start,
@@ -376,7 +422,7 @@ def _quantize_chunks(
     mask = cols < N
     y = tl.load(Y + row * N + cols, mask, other=0).to(tl.float32)
     q = tl.reshape(_nvfp4_values(tl.reshape(y, (BLOCK // 16, 16)), amax), (BLOCK,))
-    tl.store(Y + row * N + cols, q.to(tl.bfloat16), mask)
+    tl.store(Q + row * N + cols, q.to(Q.dtype.element_ty), mask)
 
 
 @triton.jit
@@ -392,12 +438,16 @@ def _swiglu_quantize_chunk(
     BLOCK: tl.constexpr,
     GATE_CAP: tl.constexpr,
     UP_CAP: tl.constexpr,
+    split_stride=0,
+    SPLITS: tl.constexpr = 1,
 ):
     cols = chunk * BLOCK + tl.arange(0, BLOCK)
     mask = cols < N
-    y = _scaled_swiglu(X, row, cols, mask, scale, gamma, N, GATE_CAP, UP_CAP)
+    y = _scaled_swiglu(
+        X, row, cols, mask, scale, gamma, N, GATE_CAP, UP_CAP, split_stride, SPLITS
+    )
     q = tl.reshape(_nvfp4_values(tl.reshape(y, (BLOCK // 16, 16)), amax), (BLOCK,))
-    tl.store(Y + row * N + cols, q.to(tl.bfloat16), mask)
+    tl.store(Y + row * N + cols, q.to(Y.dtype.element_ty), mask)
 
 
 @triton.jit
@@ -411,20 +461,35 @@ def _scaled_swiglu(
     N: tl.constexpr,
     GATE_CAP: tl.constexpr,
     UP_CAP: tl.constexpr,
+    split_stride=0,
+    SPLITS: tl.constexpr = 1,
 ):
-    gate = tl.load(X + row * 2 * N + 2 * cols, mask, other=0)
-    up = tl.load(X + row * 2 * N + 2 * cols + 1, mask, other=0)
+    gate = _split_sum(X, row * 2 * N + 2 * cols, mask, split_stride, SPLITS, False)
+    up = _split_sum(X, row * 2 * N + 2 * cols + 1, mask, split_stride, SPLITS, False)
     gate = (gate * scale).to(tl.bfloat16).to(tl.float32)
     up = (up * scale).to(tl.bfloat16).to(tl.float32)
     y = _capped_swiglu(gate, up, gamma, GATE_CAP, UP_CAP)
     return y.to(tl.bfloat16).to(tl.float32)
 
 
-def swiglu_fake_quantize(acc, ids, gammas, scales, start, num_local, top_k, caps):
+def _splits(x):
+    """(the first split's 2-D view, split count) of a (splits, rows, n) partials
+    tensor; a 2-D tensor is one split."""
+    if x.dim() == 3:
+        return x[0], x.shape[0]
+    return x, 1
+
+
+def swiglu_fake_quantize(
+    acc, ids, gammas, scales, start, num_local, top_k, caps, out_dtype=torch.bfloat16
+):
     """routed_swiglu of the raw w13 accumulator rows (source order) followed by the
-    NVFP4 fake quantization of the w2 input; rows not routed here are left unset."""
+    NVFP4 fake quantization of the w2 input; rows not routed here are left unset.
+    acc may be (splits, rows, 2 * width) FP32 split-K partials, summed here."""
+    acc, splits = _splits(acc)
     rows, width = acc.shape[0], acc.shape[1] // 2
-    y = torch.empty((rows, width), dtype=torch.bfloat16, device=acc.device)
+    split = dict(split_stride=acc.numel() if splits > 1 else 0, SPLITS=splits)
+    y = torch.empty((rows, width), dtype=out_dtype, device=acc.device)
     amax = torch.empty(rows, dtype=torch.float32, device=acc.device)
     if not rows:
         return y, amax
@@ -445,6 +510,7 @@ def swiglu_fake_quantize(acc, ids, gammas, scales, start, num_local, top_k, caps
             width,
             SWIGLU_BLOCK,
             *caps,
+            **split,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -452,6 +518,10 @@ def swiglu_fake_quantize(acc, ids, gammas, scales, start, num_local, top_k, caps
     chunks = triton.cdiv(width, SWIGLU_BLOCK)
     partials = torch.empty((rows, chunks), dtype=torch.float32, device=acc.device)
     grid = (rows, chunks)
+    # The BF16-rounded activations, quantized from that rounding into y.
+    rounded = (
+        y if out_dtype == torch.bfloat16 else torch.empty_like(y, dtype=torch.bfloat16)
+    )
     _swiglu_chunks[grid](
         acc,
         ids,
@@ -459,7 +529,7 @@ def swiglu_fake_quantize(acc, ids, gammas, scales, start, num_local, top_k, caps
         x_amax,
         w_amax,
         w_denominator,
-        y,
+        rounded,
         partials,
         *common,
         top_k,
@@ -467,10 +537,12 @@ def swiglu_fake_quantize(acc, ids, gammas, scales, start, num_local, top_k, caps
         SWIGLU_BLOCK,
         chunks,
         *caps,
+        **split,
         enable_fp_fusion=False,
     )
     _quantize_chunks[grid](
         ids,
+        rounded,
         y,
         partials,
         amax,
@@ -497,6 +569,9 @@ def _source_partial(
     TOP_K: tl.constexpr,
     N: tl.constexpr,
     BLOCK: tl.constexpr,
+    split_stride=0,
+    SPLITS: tl.constexpr = 1,
+    ROUND: tl.constexpr = False,
 ):
     token = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -506,7 +581,7 @@ def _source_partial(
         row = token * TOP_K + k
         expert = tl.load(Ids + row) - start
         if (expert >= 0) & (expert < num_local):
-            x = tl.load(X + row * N + cols, mask, other=0)
+            x = _split_sum(X, row * N + cols, mask, split_stride, SPLITS, ROUND)
             if XAmax is not None:
                 scale = _row_scale(XAmax, WAmax, WDenominator, expert, row)
                 x = (x * scale).to(tl.bfloat16)
@@ -514,9 +589,11 @@ def _source_partial(
     tl.store(Y + token * N + cols, total, mask)
 
 
-def source_partial(x, ids, scales, start, num_local, top_k, out=None):
+def source_partial(x, ids, scales, start, num_local, top_k, out=None, round_bf16=False):
     """FP32 per-token sums, in top-k order, of the BF16-rounded (scaled, for NVFP4)
-    rows routed to this rank's experts."""
+    rows routed to this rank's experts. x may be (splits, rows, n) FP32 split-K
+    partials, summed here (and with round_bf16 rounded to BF16, as a BF16 reduce)."""
+    x, splits = _splits(x)
     tokens = x.shape[0] // top_k
     if out is None:
         out = torch.empty((tokens, x.shape[1]), dtype=torch.float32, device=x.device)
@@ -531,6 +608,9 @@ def source_partial(x, ids, scales, start, num_local, top_k, out=None):
             top_k,
             out.shape[1],
             1024,
+            split_stride=x.numel() if splits > 1 else 0,
+            SPLITS=splits,
+            ROUND=round_bf16 and splits > 1,
             enable_fp_fusion=False,
         )
     return out
@@ -548,6 +628,8 @@ def _swiglu_fake_quantize_mxfp8(
     BLOCK: tl.constexpr,
     GATE_CAP: tl.constexpr,
     UP_CAP: tl.constexpr,
+    split_stride=0,
+    SPLITS: tl.constexpr = 1,
 ):
     row = tl.program_id(0).to(tl.int64)
     expert = tl.load(Ids + row) - start
@@ -555,8 +637,10 @@ def _swiglu_fake_quantize_mxfp8(
         return
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = cols < N
-    gate = tl.load(X + row * 2 * N + 2 * cols, mask, other=0).to(tl.float32)
-    up = tl.load(X + row * 2 * N + 2 * cols + 1, mask, other=0).to(tl.float32)
+    # Split-K partials sum to what the BF16 reduce would have stored.
+    gate = _split_sum(X, row * 2 * N + 2 * cols, mask, split_stride, SPLITS, True)
+    up = _split_sum(X, row * 2 * N + 2 * cols + 1, mask, split_stride, SPLITS, True)
+    gate, up = gate.to(tl.float32), up.to(tl.float32)
     y = _capped_swiglu(gate, up, tl.load(Gammas + row), GATE_CAP, UP_CAP)
     y = y.to(tl.bfloat16).to(tl.float32)
     values, exponent = _mxfp8_block(tl.reshape(y, (BLOCK // 32, 32)))
@@ -566,7 +650,9 @@ def _swiglu_fake_quantize_mxfp8(
 
 def swiglu_fake_quantize_mxfp8(acc, ids, gammas, start, num_local, caps):
     """routed_swiglu of the BF16 w13 output rows (source order) followed by the MXFP8
-    fake quantization of the w2 input; rows not routed here are left unset."""
+    fake quantization of the w2 input; rows not routed here are left unset. acc may
+    be (splits, rows, 2 * width) FP32 split-K partials, summed and rounded here."""
+    acc, splits = _splits(acc)
     rows, width = acc.shape[0], acc.shape[1] // 2
     y = torch.empty((rows, width), dtype=torch.bfloat16, device=acc.device)
     if rows:
@@ -580,6 +666,8 @@ def swiglu_fake_quantize_mxfp8(acc, ids, gammas, start, num_local, caps):
             width,
             SWIGLU_BLOCK,
             *caps,
+            split_stride=acc.numel() if splits > 1 else 0,
+            SPLITS=splits,
             enable_fp_fusion=False,
         )
     return y
