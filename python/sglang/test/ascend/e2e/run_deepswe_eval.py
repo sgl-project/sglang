@@ -33,6 +33,11 @@ import sys
 # over HTTP and needs no NPU, so disable device-backend auto-loading. Belt and
 # braces with the pod env set by test_npu_accuracy_utils.
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+# The dind daemon is old (no BuildKit) and can't reach Docker Hub; force the
+# classic image builder so `docker compose build` does not try to pull
+# moby/buildkit.
+os.environ.setdefault("DOCKER_BUILDKIT", "0")
+os.environ.setdefault("COMPOSE_BAKE", "false")
 
 E2E_DIR = os.path.dirname(os.path.abspath(__file__))
 WORK_DIR = "/tmp/deepswe_eval"

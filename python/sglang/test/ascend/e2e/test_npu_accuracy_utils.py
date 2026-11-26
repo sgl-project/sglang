@@ -468,6 +468,11 @@ def _build_deepswe_eval_env(
         # (libascend_hal.so missing). DeepSWE runs against a remote API and
         # needs no NPU, so disable device-backend auto-loading.
         "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+        # The dind daemon is old (no BuildKit) and the pod can't reach Docker
+        # Hub, so compose's default Bake/buildx path fails pulling
+        # moby/buildkit. Force the classic builder instead.
+        "DOCKER_BUILDKIT": "0",
+        "COMPOSE_BAKE": "false",
     }
     if dataset_args:
         env["DEEPSWE_DATASET_ARGS"] = json.dumps(dataset_args, ensure_ascii=False)
