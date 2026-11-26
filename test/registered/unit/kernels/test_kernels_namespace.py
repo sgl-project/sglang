@@ -354,6 +354,27 @@ def test_router_gemv_is_inventoried_for_cuda_and_hip():
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 
+def test_glm_route_sort_is_inventoried_for_hip():
+    spec = K.select_kernel("moe.glm_route_sort", backend=KernelBackend.JIT)
+    assert spec.target == "sglang.kernels.ops.moe.glm_route_sort:glm_route_sort"
+    assert K.capabilities_satisfied(spec.capabilities, _HIP)
+    assert not K.capabilities_satisfied(spec.capabilities, _SM90)
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
+def test_glm_route_sort_refuses_to_build_off_its_target_devices():
+    from sglang.kernels.ops.moe import glm_route_sort
+
+    build = glm_route_sort.build.__wrapped__
+    with (
+        patch.object(glm_route_sort, "supported_hardware", return_value=False),
+        patch.object(glm_route_sort, "load_jit") as load_jit,
+    ):
+        with pytest.raises(RuntimeError, match="gfx942/gfx950"):
+            build()
+    load_jit.assert_not_called()
+
+
 def _readme() -> str:
     return (Path(K.__file__).resolve().parent / "README.md").read_text()
 

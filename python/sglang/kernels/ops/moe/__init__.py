@@ -61,6 +61,14 @@ register_kernel(
         capabilities=_HIP,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="moe.glm_route_sort",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.glm_route_sort:glm_route_sort",
+        capabilities=_HIP,
+    )
+)
 
 
 register_kernel(

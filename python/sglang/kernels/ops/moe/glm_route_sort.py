@@ -44,6 +44,8 @@ def supported_hardware() -> bool:
 
 @cache_once
 def build() -> Module:
+    if not supported_hardware():
+        raise RuntimeError("glm_route_sort targets gfx942/gfx950 (wave64, GFX9 DPP)")
     return load_jit(
         "glm_route_sort",
         cuda_files=["moe/glm_route_sort_hip.cuh"],
