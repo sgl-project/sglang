@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
+from transformers import PretrainedConfig
+
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
@@ -136,9 +138,13 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     enable_prefill_cp=prefill,
                     cp_strategy="interleave" if prefill else None,
                 )
+                hf_config = PretrainedConfig(
+                    architectures=["TestModel"], model_type=model_type
+                )
                 model = SimpleNamespace(
-                    hf_config=SimpleNamespace(architectures=["TestModel"]),
-                    hf_text_config=SimpleNamespace(model_type=model_type),
+                    hf_config=hf_config,
+                    hf_text_config=hf_config,
+                    linear_attn_registry_result=None,
                 )
                 with (
                     patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
@@ -192,8 +198,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "quantization",
                     "dp_size",
                     "attn_dp_size",
-                    "enable_dp_attention",
                     "enable_attn_tp_input_scattered",
+                    "disable_attn_tp_gather",
                     "enable_dp_lm_head",
                     "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",
@@ -204,8 +210,10 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dcp_replicate_q_proj",
                     "enable_cp_tp_group_sharing",
                     "disable_overlap_schedule",
+                    "num_continuous_decode_steps",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",
+                    "decode_state_free_radix_default",
                     "mamba_radix_cache_strategy",
                     "mamba_full_memory_ratio",
                     "ple_offload_embedding",
@@ -213,6 +221,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
                     "kv_cache_dtype",
+                    "reasoning_parser",
+                    "tool_call_parser",
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
@@ -226,6 +236,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "fp8_gemm_runner_backend",
                     "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
+                    "enable_p2p_check",
                     "boundary_reduction",
                     "speculative_boundary_reduction",
                     "enable_aiter_allreduce_fusion",
@@ -246,11 +257,17 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "watermark_key_b",
                     "watermark_max_probability",
                     "watermark_mixing_probability",
+                    "watermark_keys",
+                    "watermark_ngram_len",
+                    "watermark_num_candidates",
+                    "watermark_context_history_size",
+                    "watermark_skip_first_ngram_calls",
                     "prefill_decode_interval",
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
                     "mm_enable_dp_encoder",
+                    "enable_flashmla_prefill_token_packing",
                 }
             ),
         )
@@ -889,6 +906,91 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertTrue(self._resolved(sa, "uses_mamba_radix_cache"))
 
+    def test_sm100_leaves_awq_gptq_quantization_to_the_loader(self):
+        # ModelConfig converts awq/gptq checkpoints to awq_marlin/gptq_marlin only
+        # when --quantization is unset or names a Marlin method; CUDA registers no
+        # plain gptq method.
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.layers.quantization.awq import AWQMarlinConfig
+        from sglang.srt.layers.quantization.gptq import GPTQMarlinConfig
+
+        checkpoints = {
+            "gptq": {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "desc_act": False,
+            },
+            "awq": {
+                "quant_method": "awq",
+                "bits": 4,
+                "group_size": 128,
+                "zero_point": True,
+                "version": "gemm",
+            },
+        }
+        arches = (
+            ("Qwen3MoeForCausalLM", "qwen3_moe"),
+            ("Glm4MoeForCausalLM", "glm4_moe"),
+            ("DeepseekV3ForCausalLM", "deepseek_v3"),
+        )
+        for arch, model_type in arches:
+            for method, quant_cfg in checkpoints.items():
+                with self.subTest(arch=arch, method=method):
+                    # Marlin support is probed on the device; answer as a GPU would.
+                    with (
+                        override_platform(is_sm100=True, is_blackwell=True),
+                        patch.object(
+                            AWQMarlinConfig,
+                            "is_awq_marlin_compatible",
+                            side_effect=lambda cfg: cfg["quant_method"] == "awq",
+                        ),
+                        patch.object(
+                            GPTQMarlinConfig,
+                            "is_gptq_marlin_compatible",
+                            side_effect=lambda cfg: cfg["quant_method"] == "gptq",
+                        ),
+                    ):
+                        sa = self._construct(
+                            arch,
+                            model_type,
+                            config_extra={"quantization_config": quant_cfg},
+                        )
+                        self.assertIsNone(self._resolved(sa, "quantization"))
+                        self.assertEqual(
+                            ModelConfig.from_server_args(sa).quantization,
+                            f"{method}_marlin",
+                        )
+
+    def test_minimax_m3_leaves_awq_gptq_quantization_to_the_loader(self):
+        from sglang.srt.arg_groups.model_overrides.minimax_m3 import (
+            _minimax_m3_overrides,
+        )
+
+        for method in ("awq", "gptq"):
+            with (
+                self.subTest(method=method),
+                override_platform(is_cuda=True, is_hip=False, is_sm100=False),
+            ):
+                overrides = _minimax_m3_overrides(
+                    SimpleNamespace(
+                        quantization=None,
+                        _quantization_explicitly_unset=False,
+                        attention_backend=None,
+                        moe_runner_backend="auto",
+                        moe_a2a_backend="none",
+                        kv_cache_dtype="auto",
+                        page_size=None,
+                        ep_size=1,
+                    ),
+                    SimpleNamespace(
+                        architectures=["MiniMaxM3SparseForCausalLM"],
+                        quantization_config={"quant_method": method},
+                    ),
+                )
+                self.assertNotIn("quantization", overrides)
+
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
         self.assertEqual(
@@ -1195,6 +1297,60 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _cohere2_moe_runner_overrides(_args(None), SimpleNamespace()),
                 {"moe_runner_backend": "flashinfer_trtllm"},
             )
+
+    def test_inkling2_megamoe_default(self):
+        """Quantized Inkling2 experts with EP on SM100 / SM103 / SM107 default to
+        MegaMoE; an explicit backend, BF16 experts, SM90 and TP1 keep theirs."""
+        from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
+
+        def backend(
+            sm=100,
+            tp=4,
+            a2a="none",
+            quantization="inkling2",
+            intermediate=2304,
+            arch="Inkling2ForConditionalGeneration",
+        ):
+            text = SimpleNamespace(hidden_size=4608, intermediate_size=intermediate)
+            hf = SimpleNamespace(
+                architectures=[arch],
+                get_text_config=lambda: text,
+            )
+            args = SimpleNamespace(
+                tool_call_parser="inkling2",
+                reasoning_parser="inkling",
+                tp_size=tp,
+                moe_dp_size=1,
+                ep_size=tp,
+                attn_dp_size=1,
+                moe_a2a_backend=a2a,
+                encoder_only=False,
+                enable_two_batch_overlap=False,
+                enable_single_batch_overlap=False,
+                swa_full_tokens_ratio=0.1,
+                mamba_full_memory_ratio=0.1,
+                mamba_radix_cache_strategy="extra_buffer",
+                disable_radix_cache=False,
+                attention_backend="fa4",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                _model_config=SimpleNamespace(quantization=quantization),
+            )
+            with override_platform(is_cuda=True, device_sm=sm, is_sm120=False):
+                out = _inkling_overrides(args, hf)
+            return out.get("moe_a2a_backend", a2a), out.get("disable_attn_tp_gather")
+
+        self.assertEqual(backend(), ("megamoe", True))
+        self.assertEqual(backend(sm=103), ("megamoe", True))
+        self.assertEqual(backend(sm=107), ("megamoe", True))
+        self.assertEqual(backend(sm=90), ("none", None))
+        self.assertEqual(backend(tp=1), ("none", None))
+        self.assertEqual(backend(quantization=None), ("none", None))
+        self.assertEqual(backend(a2a="deepep"), ("deepep", None))
+        # Inkling2Experts pads 1152 to 1280 for NVFP4 MegaMoE.
+        self.assertEqual(backend(intermediate=1152)[0], "megamoe")
+        loop = "Inkling2LoopForConditionalGeneration"
+        self.assertEqual(backend(arch=loop), ("megamoe", True))
 
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
@@ -1957,6 +2113,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
         self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
 
+    def test_exaone_and_olmo2_default_to_fa3_only_on_sm8x_and_sm9x(self):
+        """The fa3 backend is built for SM 8.x and 9.x and refuses any other
+        device at construction, so the default on SM110 / SM120 / SM121 must be
+        triton, as it is on a platform that is not CUDA."""
+        from sglang.srt.arg_groups.model_overrides.exaone import _exaone_overrides
+        from sglang.srt.arg_groups.model_overrides.olmo2 import _olmo2_overrides
+
+        exaone_config = SimpleNamespace(
+            sliding_window_pattern="LLLG", architectures=["Exaone4ForCausalLM"]
+        )
+        args = SimpleNamespace(attention_backend=None)
+        cases = (
+            (True, 80, "fa3"),
+            (True, 89, "fa3"),
+            (True, 90, "fa3"),
+            (True, 100, "trtllm_mha"),
+            (True, 103, "trtllm_mha"),
+            (True, 110, "triton"),
+            (True, 120, "triton"),
+            (True, 121, "triton"),
+            # gfx950 reports capability (9, 5) through torch.cuda.
+            (False, 95, "triton"),
+        )
+        for is_cuda, device_sm, expected in cases:
+            with (
+                self.subTest(is_cuda=is_cuda, device_sm=device_sm),
+                override_platform(
+                    is_cuda=is_cuda,
+                    is_sm100=is_cuda and device_sm // 10 == 10,
+                    device_sm=device_sm,
+                ),
+            ):
+                self.assertEqual(
+                    _exaone_overrides(args, exaone_config),
+                    {"attention_backend": expected},
+                )
+                self.assertEqual(
+                    _olmo2_overrides(args, None), {"attention_backend": expected}
+                )
+
     def test_exaone_without_pattern_declares_nothing(self):
         from sglang.srt.arg_groups.model_overrides.exaone import _exaone_overrides
 
@@ -2362,6 +2558,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with self.assertRaisesRegex(ValueError, r"on the published config"):
             run_post_process_pass(sa, _declares_something)
+
+    def test_model_attention_default_precedes_mlu_fallback(self):
+        """Platform defaults must not suppress Llama4's compatible Triton default."""
+        with patch(
+            "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+            return_value=None,
+        ):
+            args = self._construct("Llama4ForCausalLM", "llama", device="mlu")
+        self.assertEqual(
+            base_module.attention_backends_of(base_module.resolved_view(args)),
+            ("triton", "triton"),
+        )
 
     def test_attention_backend_user_choice_declares_nothing_extra(self):
         sa = self._construct("LlamaForCausalLM", "llama", attention_backend="triton")
@@ -2889,7 +3097,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             defaults.update(kw)
             return ResolvedView(
-                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+                SimpleNamespace(
+                    _model_config=SimpleNamespace(
+                        hf_config=hf, kv_lora_rank=512, qk_rope_head_dim=64
+                    ),
+                    **defaults,
+                )
             )
 
         with (
@@ -4322,8 +4535,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             {
                                 "attention_backend": "dsa",
                                 "page_size": 64,
-                                "attn_dp_size": 1,
-                                "dp_size": 1,
                                 "moe_dense_tp_size": 1,
                                 "moe_a2a_backend": "deepep",
                                 "ep_size": 8,
@@ -4354,11 +4565,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 ),
                                 None,
                             )
-                            self.assertEqual(result["attn_dp_size"], attn_dp_size)
                             self.assertEqual(result["attn_cp_size"], expected_cp)
                             self.assertNotIn("moe_dense_tp_size", result)
                             self.assertNotIn("ep_size", result)
                             self.assertNotIn("moe_a2a_backend", result)
+                        # --dp-size N no longer means attention DP here.
+                        with self.assertRaisesRegex(ValueError, "use --attn-dp-size 2"):
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="interleave",
+                                    tp_size=8,
+                                    dp_size=2,
+                                    attn_dp_size=1,
+                                ),
+                                None,
+                            )
 
         # MLA path on sm100: trtllm_mla fill (all three backends unset)
         with patch(
@@ -4401,6 +4623,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         with override_platform(is_sm100=False):
             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
+
+    def test_qwen3_moe_family_covers_text_only_qwen3_5(self):
+        """Text-only Qwen3.5 checkpoints (Qwen3.8-2.4T-A95B ships as
+        Qwen3_5MoeForCausalLM) take the family's SM100 MoE runner rule, as their
+        multimodal siblings do. Under auto, ModelOpt NVFP4 MoE weights were
+        otherwise prepared for another runner than the kernel takes (#48108)."""
+        args = SimpleNamespace(
+            quantization="modelopt_mixed",
+            _quantization_explicitly_unset=False,
+            moe_a2a_backend="none",
+            moe_runner_backend="auto",
+        )
+        for arch in ("Qwen3_5MoeForCausalLM", "Qwen3_5ForCausalLM"):
+            hf_config = SimpleNamespace(
+                architectures=[arch],
+                quantization_config={
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}
+                    },
+                },
+            )
+            with self.subTest(arch=arch), override_platform(is_sm100=True):
+                self.assertEqual(
+                    collect_model_override_declarations(arch, args, hf_config),
+                    [
+                        (
+                            "_qwen3_moe_family_overrides",
+                            {"moe_runner_backend": "flashinfer_trtllm"},
+                        )
+                    ],
+                )
 
     def test_qwen3_moe_family_mixed_precision_moe_runner(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_moe import (
@@ -4629,6 +4883,37 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(updates, {})
         self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
+
+
+class TestLfm3SpeculativeDecoding(CustomTestCase):
+    def test_speculative_decoding_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                args = SimpleNamespace(speculative_algorithm=algorithm)
+                with self.assertRaisesRegex(ValueError, "speculative decoding"):
+                    _lfm3_overrides(args, None)
+
+    def test_dp_attention_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        args = SimpleNamespace(speculative_algorithm=None, attn_dp_size=2)
+        with self.assertRaisesRegex(ValueError, "DP attention"):
+            _lfm3_overrides(args, None)
+
+    def test_explicit_ragged_flashinfer_prefill_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        args = SimpleNamespace(
+            speculative_algorithm=None,
+            attn_dp_size=1,
+            attention_backend="flashinfer",
+            prefill_attention_backend=None,
+        )
+        with envs.SGLANG_FLASHINFER_USE_PAGED.override(False):
+            with self.assertRaisesRegex(ValueError, "paged prefill"):
+                _lfm3_overrides(args, None)
 
 
 class TestKimiK31HiSparseDsaBackends(CustomTestCase):

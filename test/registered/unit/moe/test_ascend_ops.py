@@ -13,11 +13,13 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.routing import (
     MXFP8_QUANT_MODE,
     RoutedTokens,
     npu_moe_token_unpermute,
 )
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
     AscendOpsCombineInput,
     AscendOpsDispatcher,
@@ -30,6 +32,7 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     MoeA2ABackend,
 )
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.srt.models.deepseek_common.moe_transport import MoeRowTransport
 from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -39,11 +42,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestAscendOpsConfig(CustomTestCase):
-    # Protects the configuration boundary from accepting an advertised but
-    # unimplemented decode implementation.
-    def test_fused_op_is_rejected_during_config_validation(self):
-        with self.assertRaisesRegex(ValueError, "fused_op.*not implemented"):
-            AscendOpsConfig.from_json_str('{"decode":"fused_op"}')
+    def test_fused_op_can_be_selected_independently(self):
+        prefill = AscendOpsConfig.from_json_str('{"prefill":"fused_op"}')
+        decode = AscendOpsConfig.from_json_str('{"decode":"fused_op"}')
+        self.assertEqual((prefill.prefill, prefill.decode), ("fused_op", "low_latency"))
+        self.assertEqual((decode.prefill, decode.decode), ("alltoallv", "fused_op"))
 
     # Protects the default path used when no Ascend Ops config is supplied.
     def test_low_latency_is_the_default_decode_mode(self):
@@ -56,6 +59,44 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
         dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
         dispatcher.quant_config = quant_config or {}
         return dispatcher
+
+    def test_prefill_graph_uses_prefill_capacity_with_extend_flag_false(self):
+        # Prefill graph capture clears the extend flag. Without the graph
+        # scope check, dispatch enforces the smaller decode limit.
+        module = "sglang.srt.layers.moe.token_dispatcher.ascend_ops"
+        ep_group = SimpleNamespace(device_group=object(), world_size=4, rank_in_group=0)
+        parallel = SimpleNamespace(tp_group=ep_group, moe_ep_group=ep_group)
+        runner_config = MoeRunnerConfig(
+            num_experts=4, num_local_experts=1, top_k=1, hidden_size=4
+        )
+        with (
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(f"{module}.max_prefill_buffer_tokens", return_value=4),
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1),
+        ):
+            dispatcher = AscendOpsDispatcher(
+                runner_config, AscendOpsConfig(prefill="fused_op", decode="fused_op")
+            )
+
+        hidden_states = torch.zeros((2, 4))
+        weights = torch.ones((2, 1))
+        ids = torch.zeros((2, 1), dtype=torch.int32)
+        topk_output = (weights, ids, None)
+
+        with (
+            get_forward().scoped(is_extend_in_batch=False),
+            get_flags().dp.override(enabled=False),
+        ):
+            decode_result = dispatcher.dispatch(
+                hidden_states[:1], (weights[:1], ids[:1], None)
+            )
+            with self.assertRaisesRegex(ValueError, "decode.*capacity of 1"):
+                dispatcher.dispatch(hidden_states, topk_output)
+            with prefill_graph_scope(full_graph=True):
+                prefill_result = dispatcher.dispatch(hidden_states, topk_output)
+        self.assertEqual(decode_result.forward_state.buffer_capacity, 4)
+        self.assertEqual(prefill_result.forward_state.buffer_capacity, 4)
+        self.assertIs(prefill_result.hidden_states, hidden_states)
 
     # Protects mode-specific quantization settings from being ignored in favor
     # of the shared dispatcher dtype.
@@ -357,6 +398,101 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
                     )
                 self.assertEqual(result, mode)
                 combine.assert_called_once_with(hidden_states, state)
+
+
+class TestAscendOpsPrefillGraph(CustomTestCase):
+    def _topk_output(self, num_tokens):
+        return (
+            torch.ones((num_tokens, 2)),
+            torch.zeros((num_tokens, 2), dtype=torch.int32),
+            None,
+        )
+
+    # Guards the capture path: prefill capture forces is_extend_in_batch False,
+    # so the prefill-graph scope is what keeps dispatch on allgather instead of
+    # falling into the decode MC2 path.
+    def test_prefill_capture_selects_allgather(self):
+        dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher.tp_group = None
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
+        hidden_states = torch.zeros((8, 4))
+        topk_weights, topk_ids, _ = self._topk_output(8)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",
+                return_value=False,
+            ),
+            patch.object(
+                dispatcher, "_dispatch_allgather", return_value="allgather"
+            ) as allgather,
+            patch.object(dispatcher, "_dispatch_low_latency") as low_latency,
+        ):
+            result = dispatcher.dispatch(hidden_states, (topk_weights, topk_ids, None))
+
+        self.assertEqual(result, "allgather")
+        allgather.assert_called_once_with(hidden_states, topk_weights, topk_ids, None)
+        low_latency.assert_not_called()
+
+    # Guards the eager path: an extend batch outside a prefill graph still
+    # selects allgather rather than the decode MC2 path.
+    def test_eager_extend_selects_allgather(self):
+        dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher.tp_group = None
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
+        hidden_states = torch.zeros((8, 4))
+        topk_weights, topk_ids, _ = self._topk_output(8)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",
+                return_value=True,
+            ),
+            patch.object(
+                dispatcher, "_dispatch_allgather", return_value="allgather"
+            ) as allgather,
+        ):
+            result = dispatcher.dispatch(hidden_states, (topk_weights, topk_ids, None))
+
+        self.assertEqual(result, "allgather")
+        allgather.assert_called_once_with(hidden_states, topk_weights, topk_ids, None)
+
+    # Guards the decode graph: capture mode is also set while a decode graph is
+    # captured, so the prefill scope is what keeps that on the MC2 path.
+    def test_decode_capture_keeps_low_latency(self):
+        dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher.tp_group = None
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
+        hidden_states = torch.zeros((8, 4))
+        topk_weights, topk_ids, _ = self._topk_output(8)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",
+                return_value=False,
+            ),
+            patch.object(dispatcher, "_dispatch_allgather") as allgather,
+            patch.object(
+                dispatcher, "_dispatch_low_latency", return_value="mc2"
+            ) as low_latency,
+        ):
+            result = dispatcher.dispatch(hidden_states, (topk_weights, topk_ids, None))
+
+        self.assertEqual(result, "mc2")
+        low_latency.assert_called_once_with(hidden_states, topk_weights, topk_ids)
+        allgather.assert_not_called()
 
 
 if __name__ == "__main__":

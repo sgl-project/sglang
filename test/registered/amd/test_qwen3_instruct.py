@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-8-gpu-qwen3-235b",
+    suite="nightly-test-8-gpu-amd-qwen3-235b",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

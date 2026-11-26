@@ -3,10 +3,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    FastWan2_1_T2V_480P_Config,
+    TurboWanT2V480PConfig,
+    Wan2_2_T2V_A14B_Config,
+    WanI2V480PConfig,
     WanT2V480PConfig,
+    WanT2V720PConfig,
     t5_postprocess_text,
 )
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 
 
 def test_wan_prompt_embed_accessors_return_transformer_tensor():
@@ -60,3 +67,49 @@ def test_wan_postprocess_keeps_embeds_512_and_mask_matches():
     assert result.prompt_embeds_mask.shape == (2, 512)
     assert result.prompt_embeds_mask.sum(dim=1).tolist() == [3, 2]
     assert result.prompt_seq_lens == [3, 2]
+
+
+def test_wan_arch_text_len_follows_the_checkpoint_config():
+    """A text_len in transformer/config.json must be the value the Wan model and
+    tokenizer read, not the class default."""
+    config = WanVideoConfig()
+    config.update_model_arch({"text_len": 226})
+    assert config.arch_config.text_len == 226
+
+
+@pytest.mark.parametrize(
+    "config_cls",
+    [
+        WanT2V480PConfig,
+        WanT2V720PConfig,
+        TurboWanT2V480PConfig,
+        FastWan2_1_T2V_480P_Config,
+        Wan2_2_T2V_A14B_Config,
+    ],
+)
+def test_wan_t2v_configs_load_only_the_vae_decoder(config_cls):
+    """Text-to-video never encodes with the VAE, so no T2V config may build the
+    encoder; a subclass hook that replaces the parent hook brings it back."""
+    vae_config = config_cls().vae_config
+    assert vae_config.load_encoder is False
+    assert vae_config.load_decoder is True
+
+
+@pytest.mark.parametrize(
+    "source,target",
+    [
+        ("blocks.3.cross_attn.k_img.lora_A", "blocks.3.attn2.add_k_proj.lora_A"),
+        ("blocks.3.cross_attn.v_img.lora_B", "blocks.3.attn2.add_v_proj.lora_B"),
+        ("blocks.3.cross_attn.k.lora_A", "blocks.3.attn2.to_k.lora_A"),
+    ],
+)
+def test_wan_i2v_lora_maps_official_cross_attn_names(source, target):
+    # Same two-step lookup as LoRAPipeline.load_lora_adapter.
+    arch = WanI2V480PConfig().dit_config.arch_config
+    lora_fn = get_param_names_mapping(arch.lora_param_names_mapping)
+    param_fn = get_param_names_mapping(arch.param_names_mapping)
+
+    name, _, _ = lora_fn(source)
+    mapped, _, _ = param_fn(name)
+
+    assert mapped == target
