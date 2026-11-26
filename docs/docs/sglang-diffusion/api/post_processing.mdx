@@ -235,3 +235,21 @@ sglang generate \
   --upscaling-scale 4 \
   --save-output
 ```
+
+---
+
+## Model Paths on a Server
+
+`sglang generate` and the Python API accept any model path described above.
+
+A server is stricter, because the path in a request is chosen by the client. A
+request to `sglang serve` may set `frame_interpolation_model_path` or
+`upscaling_model_path` only to the default repo (`elfgum/RIFE-4.22.lite`,
+`ai-forever/Real-ESRGAN`) or to a path listed at launch with
+`--postprocess-model-paths`. Any other value is rejected with HTTP 400.
+
+```bash
+sglang serve \
+  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --postprocess-model-paths /models/rife-custom my-org/my-esrgan:weights.pth
+```
