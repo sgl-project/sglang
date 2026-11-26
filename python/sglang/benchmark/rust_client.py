@@ -158,7 +158,7 @@ def build_config(args: Any) -> Dict[str, Any]:
 
     # The Rust flag takes a string so it can carry `inf`, which JSON cannot.
     rate = getattr(args, "request_rate", float("inf"))
-    config["request_rate"] = "inf" if rate is None or math.isinf(rate) else str(rate)
+    config["request_rate"] = "inf" if rate is None or rate == math.inf else str(rate)
 
     # The Python flag spells a header `Key=Value`; the Rust one `Key: Value`.
     config["headers"] = list(_as_headers(getattr(args, "header", None)))
