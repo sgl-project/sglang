@@ -92,6 +92,9 @@ class SchedulerDllmMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        # Commits every row without a membership check, so no step may be in
+        # flight when a request leaves.
+        assert not self.enable_overlap, "dLLM requires overlap scheduling off"
         if result.copy_done is not None:
             result.copy_done.synchronize()
 

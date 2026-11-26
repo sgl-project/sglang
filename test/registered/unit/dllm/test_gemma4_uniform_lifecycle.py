@@ -86,6 +86,7 @@ class _Batch:
 
 class _Scheduler(SchedulerDllmMixin):
     def __init__(self, *, fdfo, block_size=4, context_len=128):
+        self.enable_overlap = False
         self.dllm_config = DllmConfig(
             algorithm="Gemma4Renoise",
             algorithm_config={},
