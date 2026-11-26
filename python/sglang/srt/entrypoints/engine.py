@@ -111,6 +111,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import (
     TokenizerManager,
     get_tokenizer_worker_class,
+    wait_for_scheduler_connection,
 )
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.observability import metrics_collector
@@ -1420,6 +1421,7 @@ class Engine(EngineScoreMixin, EngineBase):
         try:
             # Wait for the model to finish loading
             scheduler_init_result.wait_for_ready()
+            wait_for_scheduler_connection(tokenizer_manager.send_to_scheduler)
 
             cls._set_startup_time(
                 tokenizer_manager.set_startup_time, scheduler_init_result, startup_tic

@@ -152,11 +152,11 @@ class TestEngineShutdown(CustomTestCase):
         )
         self.assertEqual(self.scheduler.poll(100), 0)
 
-    def test_request_waits_for_a_scheduler_still_connecting(self):
+    def test_startup_waits_for_a_scheduler_still_connecting(self):
         """The schedulers connect before the tokenizer binds its socket, and ZMQ
-        retries a connect every 100 ms, so an Engine shut down right after
-        startup can find no connected scheduler yet. The request used to fail at
-        once there, and the schedulers were killed without releasing."""
+        retries a connect every 100 ms, so startup could report ready before a
+        scheduler had connected. A shutdown right then could not send its
+        request, and the schedulers were killed without releasing."""
         address = f"ipc://{tempfile.mkdtemp()}/bound_late"
         self.scheduler = self.scheduler.context.socket(zmq.PULL)
         self.scheduler.connect(address)
@@ -165,20 +165,52 @@ class TestEngineShutdown(CustomTestCase):
         self.manager.send_to_scheduler = self.to_scheduler.context.socket(zmq.PUSH)
         self.manager.send_to_scheduler.bind(address)
 
+        tokenizer_manager_module.wait_for_scheduler_connection(
+            self.manager.send_to_scheduler
+        )
         self.manager.shutdown_schedulers()
 
         self.assertEqual(self.events, ["ShutdownReq"])
 
+    def test_startup_warns_when_no_scheduler_connects(self):
+        no_peer = self.to_scheduler.context.socket(zmq.PUSH)
+        no_peer.bind(f"ipc://{tempfile.mkdtemp()}/no_scheduler")
+
+        with (
+            patch.object(
+                tokenizer_manager_module, "_SCHEDULER_CONNECT_TIMEOUT_SECS", 0.1
+            ),
+            self.assertLogs(tokenizer_manager_module.logger, "WARNING") as logs,
+        ):
+            tokenizer_manager_module.wait_for_scheduler_connection(no_peer)
+
+        self.assertIn("No scheduler connected", logs.output[0])
+
+    def test_shutdown_does_not_wait_for_a_scheduler_that_went_away(self):
+        """RayEngine kills its scheduler actors before Engine.shutdown(), so its
+        scheduler is gone by the time the request would be sent."""
+        self.scheduler.close(linger=0)
+        to_scheduler = zmq.Socket.shadow(self.to_scheduler.underlying)
+        deadline = time.monotonic() + 5
+        while to_scheduler.poll(0, zmq.POLLOUT) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        start = time.monotonic()
+        self.engine.shutdown()
+
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(
+            self.events,
+            ["stop watchdog", "terminate daemons", "kill", "shutdown transport"],
+        )
+
     def test_unsendable_request_still_reaps_everything(self):
-        """No scheduler connects within the grace period."""
+        """A PUSH socket with no peer cannot take the request without blocking."""
         no_peer = self.to_scheduler.context.socket(zmq.PUSH)
         no_peer.bind(f"ipc://{tempfile.mkdtemp()}/no_scheduler")
         self.manager.send_to_scheduler = no_peer
 
-        with patch.object(
-            tokenizer_manager_module, "_SCHEDULER_EXIT_TIMEOUT_SECS", 0.1
-        ):
-            self.engine.shutdown()
+        self.engine.shutdown()
 
         self.assertEqual(
             self.events,
