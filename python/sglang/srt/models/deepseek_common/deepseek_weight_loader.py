@@ -35,6 +35,10 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16,
 )
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_mxfp8 import (
+    MXFP8_GROUP_SIZE,
+    dequant_mxfp8_weight,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
@@ -57,6 +61,7 @@ from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    resolve_expert_param_name,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -137,6 +142,29 @@ def _resolve_quark_fp8_block_scale_name(
         if candidate in params_dict:
             return candidate
     return name
+
+
+def _mxfp8_weight_scale(
+    layer: torch.nn.Module, weight: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """The group-32 e8m0 scale of an MXFP8 weight, or None if not MXFP8.
+
+    Block-scaled fp8 stores its scale under weight_scale_inv instead, and an
+    unquantized layer has no scale at all, so the attribute may be absent.
+
+    This runs before process_weights_after_loading, so the scale is still the
+    raw uint8 the checkpoint stores rather than float8_e8m0fnu.
+    """
+    if weight.dtype != torch.float8_e4m3fn:
+        return None
+
+    scale = layer.weight_scale if hasattr(layer, "weight_scale") else None
+    if scale is None or scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+        return None
+    if scale.dim() != 2 or scale.shape[-1] != weight.shape[-1] // MXFP8_GROUP_SIZE:
+        return None
+
+    return scale.view(torch.float8_e8m0fnu)
 
 
 def _resolve_layer_weight_block_size(
@@ -471,11 +499,11 @@ class DeepseekV2WeightLoaderMixin:
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
-                        if _is_npu:
-                            name = name.replace("weight_packed", "weight")
                         name = name.replace(weight_name, param_name)
-                        if name not in params_dict:
+                        resolved = resolve_expert_param_name(name, params_dict)
+                        if resolved is None:
                             continue
+                        name = resolved
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
@@ -744,6 +772,13 @@ class DeepseekV2WeightLoaderMixin:
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
+
+            # MXFP8 carries one e8m0 power-of-two scale per 32 input elements.
+            # MLA absorption has no block-scaled bmm, so dequantize to bf16 up
+            # front; the fp8 branches below then see an unquantized weight.
+            mxfp8_scale = _mxfp8_weight_scale(self_attn.kv_b_proj, w)
+            if mxfp8_scale is not None:
+                w = dequant_mxfp8_weight(w, mxfp8_scale)
 
             if w.dtype in (
                 torch.float8_e4m3fn,

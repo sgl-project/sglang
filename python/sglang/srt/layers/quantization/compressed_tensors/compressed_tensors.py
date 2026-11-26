@@ -30,7 +30,11 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
-from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
+from sglang.srt.layers.moe import (
+    MoeRunnerConfig,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -43,6 +47,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
+    CompressedTensorsW4A4Mxfp4MegaMoE,
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Mxfp4,
@@ -79,7 +84,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.platforms.device_mixin import DeviceCapability
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 
 _is_cpu = is_cpu()
@@ -268,6 +273,22 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
+            scheme_dict = self._get_moe_scheme_dict(layer, prefix)
+            config = self.config or {}
+            expert_layout = config.get("expert_layout")
+            is_split_mxfp4 = (
+                scheme_dict is not None
+                and (scheme_dict.get("format") or self.quant_format)
+                == CompressionFormat.mxfp4_pack_quantized.value
+                and (
+                    expert_layout == "split"
+                    or (
+                        expert_layout is None
+                        and str(config.get("provider", "")).lower()
+                        in {"auto-round", "autoround", "auto_round"}
+                    )
+                )
+            )
             # Detect MXFP4 before the scheme-based path: MXFP4 uses a
             # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
             # handles all MoE backends, bypassing the scheme abstraction.
@@ -277,7 +298,9 @@ class CompressedTensorsConfig(QuantizationConfig):
             # `weight_packed` expert names falls through too: Mxfp4MoEMethod
             # registers the fused `w13_weight`/`w2_weight` instead.
             if (
-                self._is_mxfp4_moe(layer_name=prefix)
+                scheme_dict is not None
+                and self._is_mxfp4_linear(scheme_dict.get("weights"))
+                and not is_split_mxfp4
                 and layer.serves_fused_mxfp4
                 and not _is_npu
             ):
@@ -288,7 +311,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
                 return Mxfp4MoEMethod(prefix=prefix)
 
-            layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
+            layer.scheme = self._get_moe_scheme_from_dict(scheme_dict)
             if layer.scheme is None:  # ignored layer
                 use_flashinfer_trtllm_moe = (
                     get_moe_runner_backend().is_flashinfer_trtllm()
@@ -709,7 +732,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         """MXFP4 dense linear: fp4 weights with E8M0 group scales, group_size 32.
 
         Selects the weight-only FP4 Marlin scheme, the only MXFP4 linear path in
-        tree; MoE is handled separately by Mxfp4MoEMethod via _is_mxfp4_moe.
+        tree; MoE uses the same weight predicate but selects its own method.
         Predicated on the weights alone so it covers both mxfp4a16 and the w4a4
         variant, whose weights blocks are byte-identical.
         """
@@ -766,28 +789,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_static = not weight_quant.dynamic
 
         return is_mxint4 and input_quant_none and is_symmetric and is_static
-
-    def _is_mxfp4_moe(self, layer_name: str) -> bool:
-        """Detect MXFP4-quantized MoE from global format or target scheme."""
-        if "mxfp4" in (self.quant_format or ""):
-            return True
-        self._add_fused_moe_to_target_scheme_map()
-        for key in ["FusedMoE", "Linear"]:
-            scheme = self.target_scheme_map.get(key)
-            if scheme is None:
-                continue
-            wq = scheme.get("weights")
-            if wq is None:
-                continue
-            if (
-                wq.num_bits == 4
-                and wq.type == QuantizationType.FLOAT
-                and wq.strategy == QuantizationStrategy.GROUP.value
-                and wq.group_size == 32
-                and wq.symmetric
-            ):
-                return True
-        return False
 
     def _is_dynamic_token_w4(
         self, weight_quant: BaseModel, input_quant: BaseModel
@@ -993,6 +994,13 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_moe_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
     ) -> Optional[CompressedTensorsMoEScheme]:
+        return self._get_moe_scheme_from_dict(
+            self._get_moe_scheme_dict(layer, layer_name)
+        )
+
+    def _get_moe_scheme_dict(
+        self, layer: torch.nn.Module, layer_name: str | None
+    ) -> dict[str, QuantizationArgs | str | None] | None:
         """
         compressed-tensors supports non uniform in the following way:
 
@@ -1010,7 +1018,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         # make sure quantization config for Linear can target it
         self._add_fused_moe_to_target_scheme_map()
         unfused_names = [
-            layer_name + proj_name
+            (layer_name or "") + proj_name
             for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
         ]
         # TODO: refactor this to use expert_mapping and check all layer numbers
@@ -1024,7 +1032,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                 "quantization scheme but found multiple"
             )
 
-        if scheme_dict is None:  # ignored layer
+        return scheme_dict
+
+    def _get_moe_scheme_from_dict(
+        self, scheme_dict: dict[str, QuantizationArgs | str | None] | None
+    ) -> CompressedTensorsMoEScheme | None:
+        if scheme_dict is None:
             return None
 
         weight_quant = scheme_dict.get("weights")
@@ -1034,9 +1047,35 @@ class CompressedTensorsConfig(QuantizationConfig):
         # it before the WNA16 branch: MXFP4 weights are FP4 (float) group-32 so
         # `_is_wNa16_group_channel` / `_is_dynamic_token_w4a8` would otherwise
         # misroute them to the INT4 WNA16 or W4A8-int8 schemes.
-        if _is_npu and self._is_mxfp4_moe(layer_name=layer_name):
-            logger.info_once("Using NPUCompressedTensorsW4A8mxfp4MoE")
-            return NPUCompressedTensorsW4A8mxfp4MoE()
+        if self._is_mxfp4_linear(weight_quant):
+            if _is_npu:
+                logger.info_once("Using NPUCompressedTensorsW4A8mxfp4MoE")
+                return NPUCompressedTensorsW4A8mxfp4MoE()
+            has_input_global_scale = input_quant is not None and not input_quant.dynamic
+            if get_moe_a2a_backend().is_megamoe():
+                if not (
+                    get_platform().is_sm100 and get_exec().moe.enable_w4a4_mxfp4_megamoe
+                ):
+                    raise ValueError(
+                        "Split-expert MXFP4 MegaMoE requires SM100 and "
+                        "--enable-w4a4-mxfp4-megamoe. For W4A16 use "
+                        "--moe-a2a-backend none."
+                    )
+                if input_quant is not None and not (
+                    self._is_mxfp4_linear(input_quant) and input_quant.dynamic
+                ):
+                    raise ValueError(
+                        "Split-expert MXFP4 MegaMoE requires either weight-only "
+                        "metadata or dynamic group-32 MXFP4 activations."
+                    )
+                return CompressedTensorsW4A4Mxfp4MegaMoE()
+            if input_quant is not None:
+                logger.warning_once(
+                    "Serving MXFP4 MoE weight-only; activation quantization is ignored."
+                )
+            return CompressedTensorsW4A16Mxfp4MoE(
+                has_input_global_scale=has_input_global_scale
+            )
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
@@ -1085,18 +1124,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
-        elif self._is_mxfp4_linear(weight_quant):
-            if input_quant is not None:
-                # MXFP4 has no FP4-activation MoE kernel in tree; the Marlin
-                # path is weight-only and the input global scales are dropped.
-                logger.warning_once(
-                    "MXFP4 w4a4 MoE is served weight-only via FP4 Marlin. "
-                    "Activation quantization is ignored."
-                )
-            logger.info_once("Using CompressedTensorsW4A16Mxfp4MoE")
-            return CompressedTensorsW4A16Mxfp4MoE(
-                has_input_global_scale=input_quant is not None
-            )
         elif self._is_fp4a16_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A16Nvfp4MoE")
             return CompressedTensorsW4A16Nvfp4MoE()
