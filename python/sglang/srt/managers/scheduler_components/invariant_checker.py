@@ -183,13 +183,16 @@ class SchedulerInvariantChecker:
         session_held: int,
         total: int,
         uncached: int = 0,
+        retired: int = 0,
     ) -> Tuple[bool, str]:
-        """Check: available + evictable + protected + session_held + uncached == total."""
-        total_accounted = available + evictable + protected + session_held + uncached
+        """All physical slots, including transfer-retired pages, equal capacity."""
+        total_accounted = (
+            available + evictable + protected + session_held + uncached + retired
+        )
         leak = total_accounted != total
         msg = (
             f"[{pool_name}] {total=}, {available=}, {evictable=}, "
-            f"{protected=}, {session_held=}, {uncached=}"
+            f"{protected=}, {session_held=}, {uncached=}, {retired=}"
         )
         return leak, msg
 
@@ -234,6 +237,7 @@ class SchedulerInvariantChecker:
             session_held,
             total,
             uncached,
+            retired=ps.full_retired_size,
         )
         msg += class_watermark_msg
         if kv_shard_size > 1:

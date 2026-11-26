@@ -294,6 +294,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def debug_print(self) -> str:
         return ""
 
+    def cpu_page_identity(self):
+        """Optional explicit CPU physical-page provenance capability."""
+        return None
+
+    def retired_size(self) -> int:
+        """Slots no longer locally owned but still awaiting safe physical reuse."""
+        return 0
+
     def available_size(self):
         return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 

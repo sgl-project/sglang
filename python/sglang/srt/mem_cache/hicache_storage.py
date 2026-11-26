@@ -209,6 +209,8 @@ class PoolTransfer:
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0
+    # Optional CPU physical-page provenance for guarded device allocations.
+    page_span: Any = None
 
     def __post_init__(self):
         self.name = host_pool_name(self.name)

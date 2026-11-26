@@ -89,6 +89,8 @@ class InsertParams:
 
     key: Optional[RadixKey] = None
     value: Optional[torch.Tensor] = None
+    # Optional physical-page provenance, maintained only by guarded allocators.
+    page_span: Any = dataclasses.field(default=None, kw_only=True)
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
@@ -596,6 +598,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
         allocator = self.token_to_kv_pool_allocator
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
+        from sglang.srt.mem_cache.allocator.page_identity import cpu_page_identity
+
+        identity = cpu_page_identity(allocator)
+        if identity is not None:
+            for start, end in coalesce_ranges(ranges):
+                allocator.free_segment(
+                    row[start:end],
+                    start_pos=start,
+                    page_span=identity.page_rows.get(kv.req_pool_idx, start, end),
+                )
+            return
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
         global_page_size = self.logical_page_size

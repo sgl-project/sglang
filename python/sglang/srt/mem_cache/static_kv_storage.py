@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, 
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.allocator.page_identity import page_span_kwargs
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv.advance import (
@@ -294,6 +295,7 @@ class StaticKVStorage:
         tree_cache: Optional[BasePrefixCache] = None,
         batch: Optional[ScheduleBatch] = None,
         receive: bool = False,
+        prefix_page_spans: Optional[tuple] = None,
     ) -> Optional[torch.Tensor]:
         # ``receive`` needs nothing here: static pages never move.
         # Over estimate the number of tokens: assume each request needs a new
@@ -316,6 +318,9 @@ class StaticKVStorage:
 
         is_dsv4 = rows is not None and hasattr(allocator, "c128_attn_allocator")
         extra_alloc_kwargs = {}
+        # An allocator with CPU page identity extends each row from its prefix pages.
+        if prefix_page_spans is not None:
+            extra_alloc_kwargs["prefix_page_spans"] = prefix_page_spans
         kv_shard_rotation_bases = None
         if shard_size > 1:
             kv_shard_rotation_bases = _kv_shard_rotation_bases(
@@ -382,6 +387,7 @@ class StaticKVStorage:
         req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         tree_cache: Optional[BasePrefixCache] = None,
         batch: Optional[ScheduleBatch] = None,
+        prefix_last_page_ids: Optional[tuple] = None,
     ) -> Optional[torch.Tensor]:
         allocator = self._allocator
         # Over estimate the number of tokens: assume each request needs a new page.
@@ -402,6 +408,8 @@ class StaticKVStorage:
             # Per-call per-req C128 table for the last_loc lookup.
             if batch is not None:
                 extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+        if prefix_last_page_ids is not None:
+            extra_alloc_kwargs["prefix_last_page_ids"] = prefix_last_page_ids
 
         out = allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs
@@ -549,17 +557,24 @@ class StaticKVStorage:
     def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         return self._band(sub_pool).alloc(count)
 
-    def release_taken(self, sub_pool: str, ids: torch.Tensor) -> None:
-        self._band(sub_pool).free(ids)
+    def release_taken(
+        self, sub_pool: str, ids: torch.Tensor, *, page_span: Any = None
+    ) -> None:
+        # A SlotGuard allocator frees by the CPU page span it recorded for ``ids``.
+        self._band(sub_pool).free(ids, **page_span_kwargs(page_span))
 
-    def free_units(self, sub_pool: str, ids: torch.Tensor) -> None:
+    def free_units(
+        self, sub_pool: str, ids: torch.Tensor, *, page_span: Any = None
+    ) -> None:
         if sub_pool == _WINDOW:
             self._allocator.free_swa_segment(ids, start_pos=0)
         else:
-            self._band(sub_pool).free_segment(ids, start_pos=0)
+            self._band(sub_pool).free_segment(
+                ids, start_pos=0, **page_span_kwargs(page_span)
+            )
 
-    def free_token_rows(self, ids: torch.Tensor) -> None:
-        self._allocator.free_segment(ids, start_pos=0)
+    def free_token_rows(self, ids: torch.Tensor, *, page_span: Any = None) -> None:
+        self._allocator.free_segment(ids, start_pos=0, **page_span_kwargs(page_span))
 
     def free_owner_rows(self, ids: torch.Tensor) -> None:
         self._allocator.free_full_segment(ids, start_pos=0)
