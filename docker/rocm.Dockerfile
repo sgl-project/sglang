@@ -188,6 +188,13 @@ ARG ROCM1000_TORCH_VERSION="2.11.0"
 ARG ROCM1000_TORCHVISION_VERSION="0.26.0"
 ARG ROCM1000_TORCHAUDIO_VERSION="2.11.0"
 ARG ROCM1000_TRITON_VERSION="3.8.0+git4cff872c"
+# torch 2.11.0+rocm10.0.0 pins triton==3.8.0+git4cff872c, which lacks
+# triton-lang/triton#11256 (ROCm/triton#963): a masked async buffer load to
+# LDS never writes its `other` value, so masked lanes read stale LDS. On gfx950
+# this turns AITER's Triton gemm_afp4wfp4 output into NaNs (ROCm/aiter#7595).
+# Replace it with AMD's 3.8.0 build for the same SDK that contains the fix, and
+# point torch's pin at it. Leave empty to keep the SDK's Triton.
+ARG ROCM1000_TRITON_OVERRIDE_VERSION="3.8.0+git669b31ac"
 
 ARG ROCM1010_SDK_VERSION="10.1.0"
 ARG ROCM1010_TORCH_VERSION="2.12.0"
@@ -234,11 +241,12 @@ RUN set -eux; \
       rocm1000) \
         sdk="${ROCM1000_SDK_VERSION}"; torch="${ROCM1000_TORCH_VERSION}"; \
         vision="${ROCM1000_TORCHVISION_VERSION}"; audio="${ROCM1000_TORCHAUDIO_VERSION}"; \
-        triton="${ROCM1000_TRITON_VERSION}" ;; \
+        triton="${ROCM1000_TRITON_VERSION}"; \
+        triton_override="${ROCM1000_TRITON_OVERRIDE_VERSION}" ;; \
       rocm1010) \
         sdk="${ROCM1010_SDK_VERSION}"; torch="${ROCM1010_TORCH_VERSION}"; \
         vision="${ROCM1010_TORCHVISION_VERSION}"; audio="${ROCM1010_TORCHAUDIO_VERSION}"; \
-        triton="${ROCM1010_TRITON_VERSION}" ;; \
+        triton="${ROCM1010_TRITON_VERSION}"; triton_override="" ;; \
       *) echo "No pinned ROCm stack for GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
     esac; \
     python3 -m pip install --no-cache-dir \
@@ -273,7 +281,12 @@ RUN set -eux; \
           exit 1; \
         fi; \
       done; \
-    done
+    done; \
+    if [ -n "${triton_override}" ]; then \
+      python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
+          --index-url ${ROCM_INDEX_URL} "triton==${triton_override}.rocm${sdk}"; \
+      python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); assert v=='${triton_override}.rocm${sdk}', v; t,n=re.subn(r'^Requires-Dist: triton==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t); print('[Triton] torch now requires triton', v)"; \
+    fi
 
 RUN rocm-sdk init && rocm-sdk targets
 
@@ -332,13 +345,14 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # Base image 950 with ROCm 10.0.0 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_950_ROCM1000 AS gfx950-rocm1000
 ENV BUILD_VLLM="0"
-# Keeps the SDK's Triton. uTLX (BUILD_UTLX=1, see the uTLX step) needs Triton
-# with plugin support, which the SDK's lacks, so then it is replaced by the
-# commit the SDK's wheel comes from, built from source like gfx1250's; the
-# suffix keeps the version torch pins.
+# Keeps the Triton wheel from rocm1000-base (ROCM1000_TRITON_OVERRIDE_VERSION).
+# uTLX (BUILD_UTLX=1, see the uTLX step) needs Triton with plugin support,
+# which that wheel lacks, so then it is replaced by the commit that wheel
+# comes from, built from source like gfx1250's; the suffix keeps the version
+# torch's (patched) pin names. Must include ROCm/triton#963.
 ENV BUILD_TRITON="0"
 ENV TRITON_REPO_DEFAULT="https://github.com/ROCm/triton.git"
-ENV TRITON_COMMIT_DEFAULT="4cff872ced001ea92d9fcf05b3f6517e2b486d19"
+ENV TRITON_COMMIT_DEFAULT="669b31acc1dd1b3fd93286afd5db67f65d9f7557"
 ENV TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
@@ -485,8 +499,9 @@ ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 ARG MOONCAKE_COMMIT="748af1a53dba2d57c110de0e7feb5613ddb8835b"
 
+# v0.1.12 (aligned with python/pyproject.toml and natively compatible with apache-tvm-ffi==0.1.11)
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
-ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
+ARG TILELANG_COMMIT="2d63708c8ad57196051c4636a1167c5453c73a48"
 
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
@@ -922,11 +937,11 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
-  # TVM Python bits need Cython + z3 before configure.
-  # Pin apache-tvm-ffi==0.1.11: preserves the ROCm DLPack fix and provides the
-  # extra_lib_paths loader argument required by xgrammar>=0.2.8 within TileLang 0.1.x.
+  # TVM/TileLang build needs Cython>=3.1, patchelf, and z3 before configure.
+  # Pin apache-tvm-ffi==0.1.11: matches TileLang v0.1.12 (>=0.1.10,<=0.1.11),
+  # preserves the ROCm DLPack fix, and provides extra_lib_paths for xgrammar>=0.2.8.
   # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
-  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi==0.1.11" "z3-solver==4.15.4.0"; \
+  "$VENV_PIP" install --no-cache-dir "cython>=3.1.0" "patchelf>=0.17.2" "apache-tvm-ffi==0.1.11" "z3-solver==4.15.4.0"; \
   \
   # Clone + pin TileLang (bundled TVM), then build
   git clone --recursive "${TILELANG_REPO}" /opt/tilelang; \
@@ -936,17 +951,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   fi; \
   git checkout -f "${TILELANG_COMMIT}"; \
   git submodule update --init --recursive; \
-  # Backport TileLang/tvm #32 and #33: apache-tvm-ffi 0.1.11 requires explicit slots on derived objects.
-  for tvm_commit in \
-    329056d80424f88cfff65ad9e74c0ef7e1c6c96f \
-    0e15b274bce8b46f971abf5ac390e844aa6acee5; do \
-    if ! git -C 3rdparty/tvm cat-file -e "${tvm_commit}^{commit}" 2>/dev/null; then \
-      git -C 3rdparty/tvm fetch origin "${tvm_commit}"; \
-    fi; \
-  done; \
-  git -C 3rdparty/tvm cherry-pick --no-commit \
-    329056d80424f88cfff65ad9e74c0ef7e1c6c96f \
-    0e15b274bce8b46f971abf5ac390e844aa6acee5; \
   if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
     export ROCM_PATH=${ROCM_HOME}; \
   else \
