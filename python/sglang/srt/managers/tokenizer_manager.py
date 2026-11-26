@@ -2918,6 +2918,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
 
+        if error := self._native_weight_update_error(obj):
+            return False, error, 0
         if obj.load_format is None:
             obj.load_format = self.config_value("load_format")
         logger.info("Start update_weights. Load format=%s", obj.load_format)
@@ -2925,24 +2927,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        (
+            success,
+            message,
+            num_paused_requests,
+        ) = await self._weight_update_session_replies(
+            self._update_weights_from_disk_and_commit, obj
         )
-        async with lock_context:
-            (
-                success,
-                message,
-                num_paused_requests,
-            ) = await self._wait_for_model_update_from_disk(obj)
 
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message, num_paused_requests
@@ -3002,7 +2997,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, Any, bool]:
         expected_workers = self.elastic_worker_count
         self.model_update_expected_workers = expected_workers
         self.model_update_tmp = []
@@ -3010,19 +3005,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._dispatch_to_scheduler(obj)
         if expected_workers == 1:
             result = await self.model_update_result
-            if result.success:
+            if result.weights_loaded:
                 self._update_model_path_info(obj.model_path, obj.load_format)
-            return result.success, result.message, result.num_paused_requests
+            return (
+                result.success,
+                result.message,
+                result.num_paused_requests,
+                result.weights_loaded,
+            )
         else:
             result = await self.model_update_result
 
             all_success = all([r.success for r in result])
-            if all_success is True:
+            weights_loaded = all(r.weights_loaded for r in result)
+            if weights_loaded:
                 self._update_model_path_info(obj.model_path, obj.load_format)
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
-            return all_success, all_message, all_paused_requests
+            return all_success, all_message, all_paused_requests, weights_loaded
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         self.request_logger.configure(

@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
+import msgspec
 import torch
 import torch.distributed
 
@@ -17,6 +18,7 @@ from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import UpdateWeightFromDiskReqOutput
 from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.req_types import FINISH_ABORT
@@ -60,6 +62,7 @@ if TYPE_CHECKING:
         ReleaseMemoryOccupationReqOutput,
         RpcReqInput,
         RpcReqOutput,
+        UpdateWeightFromDiskReqInput,
     )
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
@@ -145,7 +148,10 @@ class SchedulerPPMixin:
     _pp_checked_allocator: Optional[ChainAllocator] = None
     _pp_capacity_digest: Optional[bytes] = None
     _pp_reqs_awaiting_verdict: Tuple[
-        Union[ReleaseMemoryOccupationReqInput, RpcReqInput], ...
+        Union[
+            ReleaseMemoryOccupationReqInput, RpcReqInput, UpdateWeightFromDiskReqInput
+        ],
+        ...,
     ] = ()
 
     @DynamicGradMode()
@@ -892,23 +898,47 @@ class SchedulerPPMixin:
 
     def _pp_pass_verdict(
         self: Scheduler,
-        output: Union[ReleaseMemoryOccupationReqOutput, RpcReqOutput],
-        recv_req: Union[ReleaseMemoryOccupationReqInput, RpcReqInput],
+        output: Union[
+            ReleaseMemoryOccupationReqOutput,
+            RpcReqOutput,
+            UpdateWeightFromDiskReqOutput,
+        ],
+        recv_req: Union[
+            ReleaseMemoryOccupationReqInput, RpcReqInput, UpdateWeightFromDiskReqInput
+        ],
     ) -> None:
         """Fold this stage's verdict into the earlier stages' and send it on."""
+        if isinstance(output, UpdateWeightFromDiskReqOutput) and not output.success:
+            output = msgspec.structs.replace(
+                output, message=f"PP stage {get_parallel().pp_rank}: {output.message}"
+            )
         if self.pp_group.is_first_rank:
-            first_stage_ok = output.success
+            # A loaded checkpoint still needs every later stage's load verdict
+            # when this stage's cache flush was refused.
+            first_stage_ok = (
+                output.weights_loaded
+                if isinstance(output, UpdateWeightFromDiskReqOutput)
+                else output.success
+            )
             if first_stage_ok:
                 self._pp_reqs_awaiting_verdict += (recv_req,)
             else:
-                # Answer a failure at once: a release fails on a busy pipeline,
-                # which stalls if this stage waits on a later one.
+                # Busy releases/reloads and failed first-stage loads cannot
+                # publish success. Do not stall their pipeline on a later stage.
                 self.send_control_output(output, recv_req)
         else:
             first_stage_ok, earlier = self._pp_recv_pyobj_from_prev_stage(
                 tag=_VERDICT_TAG
             )
-            if not earlier.success:
+            if isinstance(output, UpdateWeightFromDiskReqOutput):
+                errors = [r.message for r in (earlier, output) if not r.success]
+                output = msgspec.structs.replace(
+                    output,
+                    success=earlier.success and output.success,
+                    weights_loaded=earlier.weights_loaded and output.weights_loaded,
+                    message=" | ".join(errors) if errors else output.message,
+                )
+            elif not earlier.success:
                 output = earlier
         if not self.pp_group.is_last_rank:
             self._pp_verdict_send_work += self._pp_send_pyobj_to_next_stage(
@@ -918,7 +948,7 @@ class SchedulerPPMixin:
             )
         elif first_stage_ok:
             # Blocking: a verdict is awaited only on an idle pipeline (a release
-            # succeeds only then, and an Engine RPC cannot overlap generation),
+            # or disk load succeeds only then; Engine RPCs exclude generation),
             # and the first stage receives it at the end of its iteration.
             self._pp_send_pyobj_to_next_stage([output], tag=_VERDICT_TAG)
 

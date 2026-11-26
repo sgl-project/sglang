@@ -1710,9 +1710,18 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.destroy_weights_update_group(obj, None)
         )
 
-    def begin_weight_update(self, selector: str = "all"):
-        """Open a weight-update session; close it with end_weight_update()."""
-        obj = BeginWeightUpdateReqInput(selector=selector)
+    def begin_weight_update(
+        self, selector: str = "all", *, weight_version: Optional[str] = None
+    ):
+        """Open a session; close it with end_weight_update().
+
+        Pass the intended version and check success before the trainer starts
+        broadcasting. Also pass weight_version on each load: preparation does
+        not retain or publish it.
+        """
+        obj = BeginWeightUpdateReqInput(
+            selector=selector, weight_version=weight_version
+        )
         return self.loop.run_until_complete(
             self.tokenizer_manager.begin_weight_update(obj, None)
         )
@@ -1732,6 +1741,7 @@ class Engine(EngineScoreMixin, EngineBase):
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
         load_format: Optional[str] = None,
+        weight_version: Optional[str] = None,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -1742,6 +1752,7 @@ class Engine(EngineScoreMixin, EngineBase):
             group_name=group_name,
             flush_cache=flush_cache,
             load_format=load_format,
+            weight_version=weight_version,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)

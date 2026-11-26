@@ -2207,6 +2207,8 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     flush_cache: bool = True
     # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
+    # Internal PP relay: an earlier busy stage refused before loading.
+    pp_load_error: Optional[str] = None
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
@@ -2214,6 +2216,8 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     message: str
     # Number of paused requests during weight sync.
     num_paused_requests: int = 0
+    # Loading can succeed even when the subsequent cache flush is refused.
+    weights_loaded: bool = False
 
 
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
@@ -2234,11 +2238,15 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    # Internal rejection fallback: receive an already-started round without
+    # installing it, then report this error to the caller.
+    receive_only_error: Optional[str] = None
 
 
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    weights_loaded: bool = False
 
 
 class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
@@ -2267,6 +2275,7 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
 class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    weights_loaded: bool = False
 
 
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq, kw_only=True):
@@ -2300,6 +2309,7 @@ class UpdateWeightsFromIPCReqInput(BaseReq, kw_only=True):
 class UpdateWeightsFromIPCReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    weights_loaded: bool = False
 
 
 class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq, kw_only=True):
@@ -2416,6 +2426,9 @@ class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     """Open a weight-update session: restore in-place-packed weights so new ones can load."""
 
     selector: Literal["target", "draft", "all"] = "all"
+    # Check version-update support before the trainer enters its broadcast.
+    # This does not publish a version or replace the version on each load call.
+    weight_version: Optional[str] = None
 
 
 class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):

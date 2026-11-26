@@ -3,16 +3,23 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import DEFAULT, MagicMock, Mock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.distributed.communication_op import control_request_all_gather_object
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
+    PauseGenerationReqInput,
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -22,6 +29,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
@@ -327,7 +335,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         )
         gather.start()
         self.addCleanup(gather.stop)
-        override = get_parallel().override(tp_rank=0, tp_size=1)
+        override = get_parallel().override(tp_rank=0, tp_size=1, pp_size=1)
         override.__enter__()
         self.addCleanup(override.__exit__, None, None, None)
         self.recorded = []
@@ -447,6 +455,288 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
+
+
+class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
+    _routes = ("disk", "distributed", "tensor", "ipc")
+
+    def test_rejected_receive_keeps_controls_behind_it_and_work_moving(self):
+        """A pending drain must let the late shard finish batch sync, while
+        a following pause or group teardown cannot overtake the receive."""
+        target = _runner()
+        updater = self._manager(target, session=False)
+        replies = []
+        updater.scheduler.require_mlp_sync = True
+        updater.scheduler.pause_state = PauseState()
+        updater.scheduler.send_control_output = lambda result, request: replies.append(
+            result
+        )
+        request = UpdateWeightsFromDistributedReqInput(
+            names=[], dtypes=[], shapes=[], receive_only_error="unsupported version"
+        )
+        pause = PauseGenerationReqInput()
+        with (
+            get_parallel().override(
+                pp_size=1,
+                num_dp_ranks=2,
+                attn_dp_enabled=True,
+                enable_dp_attention_local_control_broadcast=True,
+            ),
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
+        ):
+            self.assertTrue(updater.defer_control_request(request))
+            self.assertTrue(updater.defer_control_request(pause))
+            self.assertFalse(updater.defer_control_request(AbortReq()))
+            self.assertEqual(updater.take_held_control_requests(), [])
+            self.assertEqual(replies, [])
+            target.weight_updater.receive_weights_from_distributed.assert_not_called()
+            updater.drain_pending_rejected_receive()
+        self.assertFalse(replies[0].success)
+        self.assertFalse(replies[0].weights_loaded)
+        self.assertEqual(updater.take_held_control_requests(), [pause])
+        self.assertIsNone(updater._session)
+        self.assertEqual(self.recorded, [])
+        target.weight_updater.load_weights_from_distributed.assert_not_called()
+
+    def test_busy_pipeline_disk_reload_does_not_enter_the_loader(self):
+        """The verdict ring may wait only on an idle pipeline; refuse before
+        changing weights when microbatches are still in flight."""
+        target = _runner()
+        updater = self._manager(target, session=False)
+        updater.is_fully_idle = lambda: False
+        request = UpdateWeightFromDiskReqInput(model_path="checkpoint")
+        with get_parallel().override(pp_size=2):
+            result = updater.update_weights_from_disk(request)
+            relayed = msgspec.msgpack.decode(
+                msgspec.msgpack.encode(request), type=UpdateWeightFromDiskReqInput
+            )
+            later = self._manager(target, session=False)
+            later_result = later.update_weights_from_disk(relayed)
+        self.assertFalse(result.success)
+        self.assertFalse(later_result.success)
+        self.assertFalse(result.weights_loaded)
+        target.weight_updater.update_weights_from_disk.assert_not_called()
+
+    def test_staggered_attention_dp_updates_do_not_wait_for_other_shards(self):
+        """A shard receiving control early must finish its update while another
+        shard is still in batch sync, including reporting its own peer's refusal."""
+        for route in self._routes:
+            for attn_tp_size, attn_cp_size in ((2, 1), (1, 2), (2, 2)):
+                for peer_failure in (False, True):
+                    with self.subTest(
+                        route=route,
+                        attn_tp_size=attn_tp_size,
+                        attn_cp_size=attn_cp_size,
+                        peer_failure=peer_failure,
+                    ):
+                        self.recorded.clear()
+                        full_tp = SimpleNamespace(cpu_group=object())
+                        attn_tp = SimpleNamespace(
+                            cpu_group=object(), world_size=attn_tp_size
+                        )
+                        attn_cp = SimpleNamespace(
+                            cpu_group=object(), world_size=attn_cp_size
+                        )
+                        peer_failed = False
+
+                        def gather(outputs, value, group):
+                            nonlocal peer_failed
+                            if group is full_tp.cpu_group:
+                                raise RuntimeError(
+                                    "Other DP shard is still in batch synchronization"
+                                )
+                            peer = [None] * len(value)
+                            if peer_failure and not peer_failed:
+                                peer[0] = "TP rank 1: local shard refused the update"
+                                peer_failed = True
+                            outputs[:] = [value, peer]
+
+                        with (
+                            get_parallel().override(
+                                tp_rank=0,
+                                tp_size=2 * attn_tp_size * attn_cp_size,
+                                attn_tp_size=attn_tp_size,
+                                attn_cp_size=attn_cp_size,
+                                attn_dp_size=2,
+                                attn_dp_enabled=True,
+                                enable_dp_attention_local_control_broadcast=True,
+                                tp_group=full_tp,
+                                attn_tp_group=attn_tp,
+                                attn_cp_group=attn_cp,
+                            ),
+                            patch(
+                                "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+                                control_request_all_gather_object,
+                            ),
+                            patch(
+                                "torch.distributed.all_gather_object",
+                                side_effect=gather,
+                            ),
+                        ):
+                            manager = self._build_manager(_runner(), None)
+                            manager._session = _WeightUpdateSession(selector="all")
+                            output = getattr(manager, f"update_weights_from_{route}")(
+                                _request()
+                            )
+                        self.assertEqual(output.success, not peer_failure)
+                        self.assertEqual(self.recorded, [] if peer_failure else ["v2"])
+                        if peer_failure:
+                            self.assertIn("local shard refused", output.message)
+
+    def _case(
+        self,
+        route,
+        *,
+        local_error=False,
+        peer_receive_error=False,
+        peer_flush_error=False,
+        peer_draft_error=False,
+        events=None,
+    ):
+        events = [] if events is None else events
+        target, draft = _runner(), _runner()
+
+        def load(*args, **kwargs):
+            events.append("load")
+            if local_error:
+                raise ValueError("local loader failed")
+            return True, "ok"
+
+        def draft_load(*args, **kwargs):
+            events.append("draft_load")
+            return True, "ok"
+
+        for method in (
+            "update_weights_from_disk",
+            "load_weights_from_distributed",
+            "update_weights_from_tensor",
+            "update_weights_from_ipc",
+        ):
+            getattr(target.weight_updater, method).side_effect = load
+            getattr(draft.weight_updater, method).side_effect = draft_load
+
+        manager = self._manager(target, draft)
+
+        def flush(**kwargs):
+            events.append("flush")
+            return True
+
+        manager.flush_cache = flush
+        failed = False
+
+        def gather(value):
+            nonlocal failed
+            events.append("agree")
+            error = None
+            if not failed:
+                if peer_receive_error or (peer_flush_error and "flush" in events):
+                    error = "TP rank 1: peer phase failed"
+                elif peer_draft_error:
+                    if "draft_load" in events:
+                        error = "TP rank 1: peer draft failed"
+                elif not peer_flush_error and "load" in events:
+                    error = "TP rank 1: peer loader failed"
+                failed = error is not None
+            return [value, error]
+
+        with (
+            get_parallel().override(tp_rank=0, tp_size=2),
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+                side_effect=gather,
+            ),
+        ):
+            output = getattr(manager, f"update_weights_from_{route}")(_request())
+        return output, manager, draft, events
+
+    def test_peer_load_failure_stops_all_runners_and_preserves_the_version(self):
+        """Rank 0 reported success and loaded the draft after a peer target failed."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                output, manager, draft, events = self._case(route)
+                self.assertFalse(output.success)
+                self.assertIn("TP rank 1", output.message)
+                self.assertEqual(self.recorded, [])
+                self.assertFalse(manager._session.loaded_weights)
+                self.assertEqual(events.count("flush"), 1)
+                self.assertLess(events.index("agree"), events.index("flush"))
+                for method in (
+                    "update_weights_from_disk",
+                    "load_weights_from_distributed",
+                    "update_weights_from_tensor",
+                    "update_weights_from_ipc",
+                ):
+                    self.assertEqual(
+                        getattr(draft.weight_updater, method).call_count, 0
+                    )
+
+    def test_peer_draft_failure_fails_every_rank_and_preserves_the_version(self):
+        """A draft that loaded here still fails the update when a peer's draft did not,
+        so a mixed engine never records the new version."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                output, manager, _, events = self._case(route, peer_draft_error=True)
+                self.assertFalse(output.success)
+                self.assertIn("TP rank 1", output.message)
+                self.assertEqual(self.recorded, [])
+                self.assertFalse(manager._session.loaded_weights)
+                self.assertEqual(events.count("draft_load"), 1)
+                self.assertEqual(events.count("flush"), 1)
+
+    def test_local_exception_terminates_without_entering_the_agreement(self):
+        """A rank whose loader raised must not wait in the agreement gather: a healthy
+        peer can sit in graph capture's TP barrier, so the gather would hold the
+        scheduler's termination until a collective timeout."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                events = []
+                with self.assertRaisesRegex(ValueError, "local loader failed"):
+                    self._case(route, local_error=True, events=events)
+                self.assertNotIn("agree", events[events.index("load") :])
+                self.assertEqual(self.recorded, [])
+
+    def test_deserialization_exception_terminates_without_entering_the_agreement(self):
+        """A rank whose tensor intake raised must exit at once rather than wait in the
+        agreement gather, and must not start loading or record a version."""
+        for tp_size in (1, 2):
+            with self.subTest(tp_size=tp_size):
+                target = _runner()
+                manager = self._manager(target)
+                manager.tp_worker.deserialize_own_rank = Mock(
+                    side_effect=ValueError("invalid tensor payload")
+                )
+                with (
+                    get_parallel().override(tp_rank=0, tp_size=tp_size),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object"
+                    ) as gather,
+                    self.assertRaisesRegex(ValueError, "invalid tensor payload"),
+                ):
+                    manager.update_weights_from_tensor(_request())
+                gather.assert_not_called()
+                target.weight_updater.update_weights_from_tensor.assert_not_called()
+                self.assertEqual(self.recorded, [])
+
+    def test_distributed_receive_failure_on_a_peer_prevents_loading_any_runner(self):
+        """A healthy receiver must not start writing while a peer failed intake."""
+        output, _, _, events = self._case("distributed", peer_receive_error=True)
+        self.assertFalse(output.success)
+        self.assertNotIn("load", events)
+        self.assertNotIn("flush", events)
+        self.assertEqual(self.recorded, [])
+
+    def test_peer_flush_failure_is_reported_after_a_successful_load(self):
+        """New weights are recorded, but one rank refusing invalidation fails the RPC."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                output, manager, _, _ = self._case(route, peer_flush_error=True)
+                self.assertFalse(output.success)
+                self.assertIn("peer phase failed", output.message)
+                self.assertEqual(self.recorded, ["v2"])
 
 
 class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):

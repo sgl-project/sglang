@@ -175,6 +175,8 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    # A rejected trainer broadcast is queued until all active shards have it.
+    has_pending_weight_receive: bool = False
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -204,6 +206,7 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                int(self.has_pending_weight_receive),
             ],
             device=device,
             dtype=dtype,
@@ -225,6 +228,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                1,  # inactive slots must not block an active receive round
             ],
             device=device,
             dtype=dtype,
@@ -583,6 +587,16 @@ class DPShutdownVoteSent:
         self.value = False
 
 
+class DPWeightReceive:
+    """A receive may start only after every active shard has queued its round."""
+
+    __slots__ = ("local", "all_ready")
+
+    def __init__(self, local: bool) -> None:
+        self.local = local
+        self.all_ready = False
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -596,6 +610,7 @@ def prepare_mlp_sync_batch_raw(
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
     shutdown_vote: Optional[DPShutdownVote] = None,
     drain_column: Optional[DPDrainColumn] = None,
+    weight_receive: Optional[DPWeightReceive] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -713,6 +728,7 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        has_pending_weight_receive=weight_receive is not None and weight_receive.local,
     )
 
     if num_dp_ranks == 1:
@@ -729,6 +745,8 @@ def prepare_mlp_sync_batch_raw(
         shutdown_vote.any = mlp_sync_info.any_shutting_down
     if drain_column is not None and metadata_ready:
         drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
+    if weight_receive is not None and metadata_ready:
+        weight_receive.all_ready = bool(mlp_sync_info.tp0_info_cpu[:, 13].min())
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -814,6 +832,8 @@ class SchedulerDPAttnAdapter:
     # iteration (see DPDrainColumn).
     get_drain_state: Callable[[], int] = lambda: 0
     on_drain_rows: Optional[Callable[[list[int]], None]] = None
+    get_pending_weight_receive: Callable[[], bool] = lambda: False
+    on_weight_receive_ready: Optional[Callable[[], None]] = None
     # Set once a gather carried this rank's own shutdown vote.
     shutdown_vote_sent: DPShutdownVoteSent = field(
         default_factory=DPShutdownVoteSent, init=False
@@ -850,6 +870,7 @@ class SchedulerDPAttnAdapter:
 
         shutdown_vote = DPShutdownVote(self.get_shutting_down())
         drain_column = DPDrainColumn(self.get_drain_state())
+        weight_receive = DPWeightReceive(self.get_pending_weight_receive())
         batch = prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
@@ -863,7 +884,14 @@ class SchedulerDPAttnAdapter:
             sync_wait_carry=self.sync_wait_carry,
             shutdown_vote=shutdown_vote,
             drain_column=drain_column,
+            weight_receive=weight_receive,
         )
+        if (
+            weight_receive.local
+            and weight_receive.all_ready
+            and self.on_weight_receive_ready is not None
+        ):
+            self.on_weight_receive_ready()
         if drain_column.rows is not None and self.on_drain_rows is not None:
             self.on_drain_rows(drain_column.rows)
         if shutdown_vote.local:

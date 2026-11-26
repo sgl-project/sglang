@@ -40,6 +40,7 @@ def _scheduler(rust_server):
     scheduler = object.__new__(scheduler_module.Scheduler)
     scheduler.scheduler_stage_metrics = None
     scheduler.session_controller = SimpleNamespace(maybe_reap=MagicMock())
+    scheduler.weight_updater = SimpleNamespace(defer_control_request=lambda req: False)
     scheduler._request_dispatcher = MagicMock(return_value=None)
     scheduler.flush_wrapper = SimpleNamespace(check_pending=MagicMock())
     scheduler.external_corpus_manager = None

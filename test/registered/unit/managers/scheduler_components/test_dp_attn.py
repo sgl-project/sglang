@@ -101,6 +101,9 @@ class TestDPBalanceStats(CustomTestCase):
         get_idle_batch=None,
         sync_wait_carry=None,
         wait_seconds=None,
+        weight_receive=None,
+        peer_has_weight_receive=False,
+        peer_active=True,
     ):
         if reqs is None:
             # One-token rows, the shortest a decode row can be.
@@ -125,6 +128,7 @@ class TestDPBalanceStats(CustomTestCase):
             peer = local.clone()
             peer[0] = peer[1] = peer_tokens  # num_tokens, num_tokens_for_logprob
             peer[9] = int(peer_health_check)
+            peer[13] = int(peer_has_weight_receive)
             # attention_pairs; one-token rows unless the test says otherwise.
             peer[10] = (
                 peer_tokens if peer_attention_pairs is None else peer_attention_pairs
@@ -156,7 +160,9 @@ class TestDPBalanceStats(CustomTestCase):
                         device_group=object(),
                         device="cpu",
                         cpu_group=object(),
-                        active_ranks_cpu=torch.ones(2, dtype=torch.int64),
+                        active_ranks_cpu=torch.tensor(
+                            [1, int(peer_active)], dtype=torch.int64
+                        ),
                     ),
                 ),
             ),
@@ -179,7 +185,32 @@ class TestDPBalanceStats(CustomTestCase):
                 disable_overlap_schedule=True,
                 offload_tags=set(),
                 sync_wait_carry=sync_wait_carry,
+                weight_receive=weight_receive,
             )
+
+    def test_rejected_broadcast_waits_for_every_shards_receive(self):
+        """An early receiver must not block the batch sync that its late peer
+        needs to finish before it can dequeue the trainer's round."""
+        for local, peer in ((True, False), (False, True), (True, True), (False, False)):
+            with self.subTest(local=local, peer=peer):
+                pending = dp_attn.DPWeightReceive(local)
+                self._prepare_dp2_batch(
+                    ForwardMode.DECODE,
+                    local_tokens=1,
+                    peer_tokens=1,
+                    weight_receive=pending,
+                    peer_has_weight_receive=peer,
+                )
+                self.assertEqual(pending.all_ready, local and peer)
+        pending = dp_attn.DPWeightReceive(True)
+        self._prepare_dp2_batch(
+            ForwardMode.DECODE,
+            local_tokens=1,
+            peer_tokens=0,
+            weight_receive=pending,
+            peer_active=False,
+        )
+        self.assertTrue(pending.all_ready, "inactive DP slots cannot receive or vote")
 
     def test_attached_to_batch_after_dp_gather(self):
         result = self._prepare_dp2_batch(
@@ -711,7 +742,11 @@ class TestDPShutdownVote(CustomTestCase):
         scheduler.req_to_token_pool = Mock()
         scheduler.token_to_kv_pool_allocator = Mock()
         scheduler.tree_cache = Mock()
-        scheduler.weight_updater = SimpleNamespace(offload_tags=set())
+        scheduler.weight_updater = SimpleNamespace(
+            offload_tags=set(),
+            has_pending_rejected_receive=lambda: False,
+            drain_pending_rejected_receive=lambda: None,
+        )
         scheduler.model_config = Mock()
         scheduler.enable_overlap = False
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
@@ -749,7 +784,16 @@ class TestDPDrainColumn(CustomTestCase):
     """Every attention-DP group's listener drain state rides each step's
     MLP-sync gather to every listener."""
 
-    def _gather(self, *, local_state: int, peer_state: int, skip_gather=False):
+    def _gather(
+        self,
+        *,
+        local_state: int,
+        peer_state: int,
+        skip_gather=False,
+        pending=(False, False),
+        active=(1, 1),
+        on_receive=None,
+    ):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 1,
@@ -765,6 +809,7 @@ class TestDPDrainColumn(CustomTestCase):
         def fake_exchange(output, local, group, **_):
             peer = local.clone()
             peer[12] = peer_state
+            peer[13] = int(pending[1])
             output.copy_(torch.stack([local, peer]).flatten())
 
         on_drain_rows = Mock()
@@ -784,6 +829,8 @@ class TestDPDrainColumn(CustomTestCase):
             get_require_mlp_sync=lambda: True,
             get_drain_state=lambda: local_state,
             on_drain_rows=on_drain_rows,
+            get_pending_weight_receive=lambda: pending[0],
+            on_weight_receive_ready=on_receive,
         )
         with (
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip_gather),
@@ -801,7 +848,7 @@ class TestDPDrainColumn(CustomTestCase):
                         device_group=object(),
                         device="cpu",
                         cpu_group=object(),
-                        active_ranks_cpu=torch.ones(2, dtype=torch.int64),
+                        active_ranks_cpu=torch.tensor(active, dtype=torch.int64),
                     ),
                 ),
             ),
@@ -817,6 +864,26 @@ class TestDPDrainColumn(CustomTestCase):
         ):
             adapter.prepare_mlp_sync_batch(batch)
         return on_drain_rows
+
+    def test_only_a_pending_active_receiver_consumes_the_global_ready_vote(self):
+        """Inactive slots vote ready but do not own a queued receive. Calling
+        their drain would fail or consume a different round."""
+        for pending, active, expected in (
+            ((False, True), (0, 1), []),
+            ((True, False), (1, 0), ["received"]),
+            ((True, False), (1, 1), []),
+            ((True, True), (1, 1), ["received"]),
+        ):
+            with self.subTest(pending=pending, active=active):
+                received = []
+                self._gather(
+                    local_state=0,
+                    peer_state=0,
+                    pending=pending,
+                    active=active,
+                    on_receive=lambda: received.append("received"),
+                )
+                self.assertEqual(received, expected)
 
     def test_every_listener_row_reaches_the_callback(self):
         self._gather(local_state=5, peer_state=1).assert_called_once_with([5, 1])

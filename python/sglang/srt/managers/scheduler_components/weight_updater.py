@@ -32,6 +32,9 @@ from sglang.srt.distributed.communication_op import (
     control_request_barrier,
 )
 from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
     ChecksumInfo,
@@ -51,6 +54,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -70,7 +75,11 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
 )
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import (
+    get_model,
+    get_parallel,
+    is_control_broadcast_local,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -142,9 +151,64 @@ class SchedulerWeightUpdaterManager:
     _session: Optional[_WeightUpdateSession] = None
     _plugin_state: Dict[str, Any] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
+    _pending_rejected_receive: Optional[UpdateWeightsFromDistributedReqInput] = None
+    _held_control_requests: List[Any] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.tp_cpu_group = get_parallel().tp_group.cpu_group
+
+    def has_pending_rejected_receive(self) -> bool:
+        return self._pending_rejected_receive is not None
+
+    def take_held_control_requests(self) -> List[Any]:
+        if self.has_pending_rejected_receive():
+            return []
+        requests, self._held_control_requests = self._held_control_requests, []
+        return requests
+
+    def defer_control_request(self, recv_req) -> bool:
+        if self.has_pending_rejected_receive():
+            # Keep later pause/destroy/session controls behind the receive.
+            # Work and aborts must still reach batch sync while it is pending.
+            if isinstance(
+                recv_req,
+                (
+                    AbortReq,
+                    TokenizedGenerateReqInput,
+                    TokenizedEmbeddingReqInput,
+                    BatchTokenizedGenerateReqInput,
+                    BatchTokenizedEmbeddingReqInput,
+                ),
+            ):
+                return False
+            self._held_control_requests.append(recv_req)
+            return True
+        if not (
+            isinstance(recv_req, UpdateWeightsFromDistributedReqInput)
+            and recv_req.receive_only_error
+            and is_control_broadcast_local()
+            and get_parallel().pp_size == 1
+            and self.scheduler.require_mlp_sync
+            and not self.scheduler.pause_state.paused
+        ):
+            return False
+        from sglang.srt.managers.scheduler_components.dp_attn import (
+            should_skip_scheduler_all_gather,
+        )
+
+        if should_skip_scheduler_all_gather(get_parallel().num_dp_ranks):
+            return False
+        self._pending_rejected_receive = recv_req
+        return True
+
+    def drain_pending_rejected_receive(self) -> None:
+        # Called only after the batch-sync metadata says every active DP shard
+        # has this round. No shard can be waiting in that sync while we receive.
+        request = self._pending_rejected_receive
+        assert request is not None
+        result = self.update_weights_from_distributed(request)
+        self._pending_rejected_receive = None
+        self.scheduler.send_control_output(result, request)
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -179,32 +243,104 @@ class SchedulerWeightUpdaterManager:
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
+    def _agree_native_update(self, success: bool, message: str) -> Tuple[bool, str]:
+        parallel = get_parallel()
+        if parallel.tp_size == 1:
+            return success, message
+        # With local control broadcast, other attention-DP shards may still be
+        # running batch synchronization. Only the ranks handling this request
+        # can participate in its outcome agreement.
+        error = None if success else f"TP rank {parallel.tp_rank}: {message}"
+        errors = [
+            error
+            for error in control_request_all_gather_object(error)
+            if error is not None
+        ]
+        return (False, " | ".join(dict.fromkeys(errors))) if errors else (True, message)
+
+    def _run_native_update(
+        self, update: Callable[[], Tuple[bool, str]]
+    ) -> Tuple[bool, str]:
+        # An unexpected exception propagates at once to the scheduler's termination path:
+        # a peer may be in a collective (graph capture) that a gather here would not join.
+        try:
+            success, message = update()
+        except Exception:
+            logger.exception("Native weight update failed on this TP rank")
+            raise
+        return self._agree_native_update(success, message)
+
+    def _update_native_runners(
+        self,
+        recv_req,
+        *,
+        selector: str,
+        update: Callable[[Any], Tuple[bool, str]],
+        session_load: bool = False,
+        release_weights: Optional[Callable[[], None]] = None,
+    ) -> Tuple[bool, str, bool]:
+        success, message = True, "Success"
+        attempted = False
+        for _, runner in self._select_runners(selector):
+            attempted = True
+            # Agree after each runner: a peer that failed the target must not
+            # leave successful ranks entering the draft's loading operations.
+            success, message = self._run_native_update(lambda: update(runner))
+            if not success:
+                break
+
+        if release_weights is not None:
+            release_weights()
+
+        weights_loaded = success
+        if weights_loaded:
+            if session_load:
+                self._session = msgspec.structs.replace(
+                    self._session, loaded_weights=True
+                )
+            self.record_weight_version_after_update(recv_req.weight_version)
+        if attempted and recv_req.flush_cache:
+            # A failed loader may already have written weights. All ranks must
+            # enter invalidation, including those whose local loader failed.
+            flushed, flush_message = self._run_native_update(
+                lambda: self.flush_cache_after_weight_update(recv_req, True, "Success")
+            )
+            if not flushed:
+                message = flush_message if success else f"{message} | {flush_message}"
+                success = False
+        return success, message, weights_loaded
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if get_parallel().pp_size > 1:
+            if error := getattr(recv_req, "pp_load_error", None):
+                return UpdateWeightFromDiskReqOutput(success=False, message=error)
+            idle, message = self._agree_native_update(
+                self.is_fully_idle(), "Pipeline disk reload requires an idle engine."
+            )
+            if not idle:
+                # The same request is relayed after dispatch. A later idle
+                # stage must not reload behind a busy stage's refusal.
+                recv_req.pp_load_error = message
+                return UpdateWeightFromDiskReqOutput(success=False, message=message)
         with self._observe_weight_load("disk"):
             self.scheduler.wait_for_launched_forward()
-            success, message = True, "Succeeded to update model weights."
-            target_updated = False
-            for role, runner in self._select_runners():
-                success, message = runner.weight_updater.update_weights_from_disk(
+            success, message, weights_loaded = self._update_native_runners(
+                recv_req,
+                selector="all",
+                update=lambda runner: runner.weight_updater.update_weights_from_disk(
                     recv_req.model_path,
                     recv_req.load_format,
                     recapture_cuda_graph=recv_req.recapture_cuda_graph,
-                )
-                if not success:
-                    break
-                target_updated |= role == "target"
-            if success:
-                self.record_weight_version_after_update(recv_req.weight_version)
-            # the served weights changed even if a draft runner failed afterwards
-            if target_updated:
-                success, message = self.flush_cache_after_weight_update(
-                    recv_req, success, message
-                )
+                ),
+            )
             if not success:
                 logger.error(message)
             return UpdateWeightFromDiskReqOutput(
-                success=success, message=message, num_paused_requests=0
+                success=success,
+                message=message,
+                weights_loaded=weights_loaded,
+                num_paused_requests=0,
             )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
@@ -234,7 +370,8 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
-        if self._session is None:
+        receive_only_error = getattr(recv_req, "receive_only_error", None) or None
+        if self._session is None and receive_only_error is None:
             return UpdateWeightsFromDistributedReqOutput(
                 success=False,
                 message="update_weights_from_distributed must run between "
@@ -256,19 +393,30 @@ class SchedulerWeightUpdaterManager:
                 success, message = False, f"Failed to receive weights: {e}"
                 logger.error(message)
             else:
-                success, message = self._load_into_selected_runners(
-                    weights, recv_req.selector
+                success, message = True, "Success"
+            success, message = self._agree_native_update(success, message)
+            if receive_only_error is not None:
+                # Match the trainer's collective, but never install a rejected
+                # payload or alter an existing session/version/cache state.
+                return UpdateWeightsFromDistributedReqOutput(
+                    success=False,
+                    message=receive_only_error
+                    if success
+                    else f"{receive_only_error} | {message}",
+                    weights_loaded=False,
                 )
+            weights_loaded = False
             if success:
-                self._session = msgspec.structs.replace(
-                    self._session, loaded_weights=True
-                )
-                self.record_weight_version_after_update(recv_req.weight_version)
-                success, message = self.flush_cache_after_weight_update(
-                    recv_req, success, message
+                success, message, weights_loaded = self._update_native_runners(
+                    recv_req,
+                    selector=recv_req.selector,
+                    update=lambda runner: (
+                        runner.weight_updater.load_weights_from_distributed(weights)
+                    ),
+                    session_load=True,
                 )
             return UpdateWeightsFromDistributedReqOutput(
-                success=success, message=message
+                success=success, message=message, weights_loaded=weights_loaded
             )
 
     def _load_into_selected_runners(
@@ -294,62 +442,62 @@ class SchedulerWeightUpdaterManager:
             )
         with self._observe_weight_load("tensor"):
             self.scheduler.wait_for_launched_forward()
-            named_tensors = self.tp_worker.deserialize_own_rank(
-                recv_req.serialized_named_tensors
-            )
-            runners = self._select_runners(recv_req.selector)
-            # A PP stage hosting none of the selected runners must not open the handles.
-            if runners and recv_req.load_format != "flattened_bucket":
-                named_tensors = unwrap_local_serialized_tensors(
-                    named_tensors, device=self.tp_worker.model_runner.device
+            try:
+                named_tensors = self.tp_worker.deserialize_own_rank(
+                    recv_req.serialized_named_tensors
                 )
-            success, message = True, "Success"
-            for _, runner in runners:
-                success, message = runner.weight_updater.update_weights_from_tensor(
+                runners = self._select_runners(recv_req.selector)
+                # A PP stage hosting none of the selected runners must not open the handles.
+                if runners and recv_req.load_format != "flattened_bucket":
+                    named_tensors = unwrap_local_serialized_tensors(
+                        named_tensors, device=self.tp_worker.model_runner.device
+                    )
+            except Exception:
+                logger.exception("Failed to deserialize weights on this TP rank")
+                raise
+
+            def release_weights():
+                nonlocal named_tensors
+                # Match the native path: release rebuilt IPC tensors before
+                # torch_empty_cache runs during the cache flush.
+                del named_tensors
+
+            # Deserialization either succeeds or raises; there is no recoverable
+            # outcome to agree on before the per-runner load agreement below.
+            success, message, weights_loaded = self._update_native_runners(
+                recv_req,
+                selector=recv_req.selector,
+                update=lambda runner: runner.weight_updater.update_weights_from_tensor(
                     named_tensors=named_tensors,
                     load_format=recv_req.load_format,
-                )
-                if not success:
-                    break
-            # Dropped before the flush, so torch_empty_cache can return their blocks.
-            del named_tensors
-            if success:
-                self._session = msgspec.structs.replace(
-                    self._session, loaded_weights=True
-                )
-                self.record_weight_version_after_update(recv_req.weight_version)
-                success, message = self.flush_cache_after_weight_update(
-                    recv_req, success, message
-                )
+                ),
+                session_load=True,
+                release_weights=release_weights,
+            )
             if not success:
                 logger.error(message)
             control_request_barrier()
-            return UpdateWeightsFromTensorReqOutput(success=success, message=message)
+            return UpdateWeightsFromTensorReqOutput(
+                success=success, message=message, weights_loaded=weights_loaded
+            )
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
             self.scheduler.wait_for_launched_forward()
-            success, message = True, "Succeeded to update model weights."
-            target_updated = False
-            for role, runner in self._select_runners():
-                success, message = runner.weight_updater.update_weights_from_ipc(
+            success, message, weights_loaded = self._update_native_runners(
+                recv_req,
+                selector="all",
+                update=lambda runner: runner.weight_updater.update_weights_from_ipc(
                     recv_req
-                )
-                if not success:
-                    break
-                target_updated |= role == "target"
-            if success:
-                self.record_weight_version_after_update(recv_req.weight_version)
-            # the served weights changed even if a draft runner failed afterwards
-            if target_updated:
-                success, message = self.flush_cache_after_weight_update(
-                    recv_req, success, message
-                )
+                ),
+            )
             if not success:
                 logger.error(message)
             control_request_barrier()
-            return UpdateWeightsFromIPCReqOutput(success=success, message=message)
+            return UpdateWeightsFromIPCReqOutput(
+                success=success, message=message, weights_loaded=weights_loaded
+            )
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
