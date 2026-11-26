@@ -198,6 +198,8 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
     "pika-labs/pika-h3-flex": "PikaH3FlexPipeline",
     "lakonik/pi-h3": "PiH3Pipeline",
+    "sand-ai/magi-2-preview": "Magi2Pipeline",
+    "magi-2-preview": "Magi2Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
