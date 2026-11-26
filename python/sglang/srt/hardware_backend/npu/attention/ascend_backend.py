@@ -1080,6 +1080,8 @@ class AscendAttnBackend(AttentionBackend):
         metadata.fa_metadata.copy_(schedule)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self.use_fused_sparse_kv:
+            self.sparse_kv_manager.budget.validate_batch_size(max_bs, "graph")
         total_context_len = self.req_to_token_pool.row_width + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens

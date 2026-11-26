@@ -62,7 +62,6 @@ class BudgetPlan:
         kv_dtype: torch.dtype,
         copy_sfa_query_heads: int,
         max_query_width: int,
-        batch_capacity: int,
         cache_tokens: int,
         page_size: int,
         kv_head_num: int,
@@ -83,7 +82,6 @@ class BudgetPlan:
         self.kv_dtype = kv_dtype
         self.copy_sfa_query_heads = copy_sfa_query_heads
         self.max_query_width = max_query_width
-        self.batch_capacity = batch_capacity
         self.cache_tokens = cache_tokens
         self.page_size = page_size
         self.kv_head_num = kv_head_num
@@ -118,7 +116,7 @@ class BudgetPlan:
             )
         self.manager_buffers = {
             "planner_hbm_block_table": BufferSpec(
-                (batch_capacity, cache_tokens // page_size), metadata_dtype
+                (resident_rows, cache_tokens // page_size), metadata_dtype
             ),
         }
         if prefill_workspace_tokens:
@@ -132,20 +130,20 @@ class BudgetPlan:
             )
         self.adapter_buffers = {
             "source_ids": BufferSpec(
-                (batch_capacity * max_query_width, top_k), metadata_dtype
+                (resident_rows * max_query_width, top_k), metadata_dtype
             ),
             "device_slots": BufferSpec(
-                (batch_capacity * max_query_width, top_k), metadata_dtype
+                (resident_rows * max_query_width, top_k), metadata_dtype
             ),
             "topk_misses": BufferSpec(
-                (batch_capacity * max_query_width,), metadata_dtype
+                (resident_rows * max_query_width,), metadata_dtype
             ),
-            "miss_sources": BufferSpec((batch_capacity, MISS_CAPACITY), metadata_dtype),
-            "miss_slots": BufferSpec((batch_capacity, MISS_CAPACITY), metadata_dtype),
-            "miss_counts": BufferSpec((batch_capacity,), metadata_dtype),
-            "query_ends": BufferSpec((max_query_width, batch_capacity), metadata_dtype),
+            "miss_sources": BufferSpec((resident_rows, MISS_CAPACITY), metadata_dtype),
+            "miss_slots": BufferSpec((resident_rows, MISS_CAPACITY), metadata_dtype),
+            "miss_counts": BufferSpec((resident_rows,), metadata_dtype),
+            "query_ends": BufferSpec((max_query_width, resident_rows), metadata_dtype),
             "block_table": BufferSpec(
-                (batch_capacity, context_len // page_size), metadata_dtype
+                (resident_rows, context_len // page_size), metadata_dtype
             ),
         }
         for name in (
@@ -157,9 +155,9 @@ class BudgetPlan:
             "_pre_cache_sizes",
             "actual_seq_lengths_kv",
         ):
-            self.adapter_buffers[name] = BufferSpec((batch_capacity,), metadata_dtype)
+            self.adapter_buffers[name] = BufferSpec((resident_rows,), metadata_dtype)
         for name in ("_pre_sparse", "_pre_valid"):
-            self.adapter_buffers[name] = BufferSpec((batch_capacity,), torch.bool)
+            self.adapter_buffers[name] = BufferSpec((resident_rows,), torch.bool)
         self.device_kv_bytes = sum(
             self.resident_buffers[n].nbytes
             for n in ("device_k_buffer", "device_v_buffer")
@@ -173,6 +171,13 @@ class BudgetPlan:
         self.adapter_bytes = sum(s.nbytes for s in self.adapter_buffers.values())
         self.host_token_capacity = None
         self.host_kv_spec = None
+
+    def validate_batch_size(self, batch_size: int, mode: str) -> None:
+        if batch_size > self.resident_rows:
+            raise ValueError(
+                f"Fused sparse KV {mode} batch size {batch_size} exceeds "
+                f"allocated resident_rows={self.resident_rows}."
+            )
 
     @property
     def managed_hbm_bytes(self) -> int:
@@ -263,7 +268,6 @@ def resolve_sparse_kv_budget(
     kv_dtype: torch.dtype = torch.bfloat16,
     cache_tokens: int = 0,
     max_query_width: int = 1,
-    graph_batch_capacity: int = 0,
     prefill_workspace_tokens: int = 0,
     resident_rows: int | None = None,
 ) -> BudgetPlan:
@@ -291,7 +295,6 @@ def resolve_sparse_kv_budget(
         raise ValueError(
             f"Native LIM cache capacity must cover query width * TopK, be <= {MISS_CAPACITY - page_size} and aligned to {page_size}."
         )
-    resident_rows = request_rows if resident_rows is None else resident_rows
     return BudgetPlan(
         request_rows=request_rows,
         resident_rows=resident_rows,
@@ -301,7 +304,6 @@ def resolve_sparse_kv_budget(
         kv_dtype=kv_dtype,
         copy_sfa_query_heads=copy_sfa_query_heads,
         max_query_width=max_query_width,
-        batch_capacity=max(resident_rows, graph_batch_capacity),
         cache_tokens=cache_tokens,
         page_size=page_size,
         kv_head_num=kv_head_num,

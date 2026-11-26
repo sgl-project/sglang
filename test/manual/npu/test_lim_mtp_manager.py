@@ -143,7 +143,6 @@ def _run_manager_lifecycle(
         page_size=128,
         request_rows=7 if compact_pd else 3,
         resident_rows=3,
-        graph_batch_capacity=3,
         context_len=CONTEXT,
         cache_tokens=C,
         num_layers=num_layers,

@@ -190,7 +190,6 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     disaggregation_mode="null", enable_pd_role_switch=False
                 ),
             ),
-            patch(prefix + "get_eager_max_batch_size", return_value=4),
             patch(prefix + "get_sparse_kv_max_query_width", return_value=1),
         ):
             for total_heads, native_heads in ((80, 10), (384, 48), (768, 128)):
@@ -204,28 +203,17 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                         num_layers=2,
                         top_k=2048,
                         kv_bytes_per_token=1152,
-                        graph_batch_capacity=4,
                     )
                     self.assertEqual(plan.copy_sfa_query_heads, native_heads)
                     self.assertNotIn("query_scale", plan.adapter_buffers)
 
-    def test_graph_alignment_is_reserved_before_buckets_are_resolved(self):
+    def test_budget_sizes_batch_metadata_from_resident_rows(self):
         from sglang.srt.environ import envs
 
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."
         with (
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
-            patch(
-                prefix + "get_exec",
-                return_value=SimpleNamespace(
-                    graph=SimpleNamespace(
-                        disable_cuda_graph=False, cuda_graph_config=None
-                    )
-                ),
-            ),
-            patch(prefix + "get_cuda_graph_max_batch_size", return_value=32),
-            patch(prefix + "get_eager_max_batch_size", return_value=24),
             patch(
                 prefix + "get_parallel", return_value=SimpleNamespace(attn_tp_size=1)
             ),
@@ -270,7 +258,8 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                 top_k=2048,
                 kv_bytes_per_token=1152,
             )
-        self.assertEqual(plan.batch_capacity, 32)
+        self.assertEqual(plan.resident_rows, 18)
+        self.assertEqual(plan.adapter_buffers["miss_counts"].shape, (18,))
         self.assertEqual(plan.prefill_workspace_tokens, 4224)
 
     def test_prefill_workspace_role_and_request_cap(self):
@@ -310,7 +299,6 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     return_value=SimpleNamespace(attn_tp_size=1),
                 ),
                 patch(prefix + "get_sparse_kv_max_query_width", return_value=1),
-                patch(prefix + "get_eager_max_batch_size", return_value=4),
             ):
                 plan = get_sparse_kv_budget(
                     model_config=SimpleNamespace(
@@ -327,7 +315,6 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     num_layers=1,
                     top_k=2048,
                     kv_bytes_per_token=1152,
-                    graph_batch_capacity=4,
                 )
                 self.assertEqual(plan.resident_rows, 6 if switch else 3)
                 self.assertEqual(

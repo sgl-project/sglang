@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.resident_pool import (
     ResidentKVPool,
 )
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
@@ -53,6 +54,9 @@ class FusedSparseKVCacheManager:
         self.store_dtype = index_k_pool.store_dtype
         self.layer_num = index_k_pool.layer_num
         self.budget = index_k_pool.sparse_kv_budget_plan
+        self.budget.validate_batch_size(
+            get_eager_max_batch_size(req_to_token_pool.size), "eager"
+        )
         self.head_num = self.budget.kv_head_num
         self.size = self.budget.request_rows
         self.max_context_len = self.budget.context_len

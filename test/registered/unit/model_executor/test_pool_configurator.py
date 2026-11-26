@@ -1219,8 +1219,7 @@ class TestEagleConfigurator(CustomTestCase):
                 self.assertEqual(plan.cache_tokens, 3 * 2048)
                 self.assertEqual(plan.device_kv_bytes, 3 * 4 * (3 * 2048) * 1152)
 
-            # Eager MLP-sync can pad a one-row target to attention TP=8 even
-            # when graphs are disabled. Admission reserves the padded LIM metadata.
+            # Eager MLP-sync alignment does not change the allocated budget.
             with get_parallel().override(
                 tp_size=16,
                 attn_tp_size=8,
@@ -1231,13 +1230,11 @@ class TestEagleConfigurator(CustomTestCase):
                 moe_dp_size=1,
                 moe_tp_size=1,
             ):
-                padded = get_sparse_kv_budget(
-                    num_layers=4, graph_batch_capacity=0, **options
-                )
+                padded = get_sparse_kv_budget(num_layers=4, **options)
                 self.assertEqual(padded.device_kv_bytes, 3 * 4 * 8192 * 1152)
-                self.assertGreater(padded.batch_capacity, unpadded.batch_capacity)
+                self.assertEqual(padded.resident_rows, unpadded.resident_rows)
                 self.assertEqual(padded.copy_sfa_query_heads, 16)
-                self.assertGreater(padded.managed_hbm_bytes, unpadded.managed_hbm_bytes)
+                self.assertEqual(padded.managed_hbm_bytes, unpadded.managed_hbm_bytes)
 
     def test_sparse_mtp_budget_rows_follow_attention_dp_worker_capacity(self):
         """Budget the target manager per attention-DP worker, including PD slots."""

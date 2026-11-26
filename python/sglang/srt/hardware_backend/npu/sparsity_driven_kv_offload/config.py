@@ -19,15 +19,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget imp
     get_sparse_kv_cache_tokens,
     resolve_sparse_kv_budget,
 )
-from sglang.srt.layers.dp_attention import (
-    get_cuda_graph_max_batch_size,
-    get_eager_max_batch_size,
-)
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_row_width
 from sglang.srt.runtime_context import (
     attention_backends,
     get_disagg,
-    get_exec,
     get_parallel,
     get_schedule,
     get_spec,
@@ -243,7 +238,6 @@ def get_sparse_kv_budget(
     available_bytes: int,
     index_k_and_draft_bytes_per_token: int,
     attn_dp_size: int = 1,
-    graph_batch_capacity: Optional[int] = None,
     kv_dtype: torch.dtype = torch.bfloat16,
 ) -> BudgetPlan:
     schedule = get_schedule()
@@ -287,17 +281,6 @@ def get_sparse_kv_budget(
     query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
     # Native SFA accepts 1..64 or 128 query heads per KV head.
     copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
-    if graph_batch_capacity is None:
-        # Reserve before admission determines the final request-pool size.
-        # Capture buckets may round that size up for attention parallelism.
-        graph = get_exec().graph
-        config = graph.cuda_graph_config
-        decode = config.decode if config is not None else None
-        graph_batch_capacity = 0
-        if not graph.disable_cuda_graph:
-            graph_batch_capacity = get_cuda_graph_max_batch_size(resident_rows)
-            if decode is not None and decode.bs:
-                graph_batch_capacity = min(max(decode.bs), graph_batch_capacity)
     return resolve_sparse_kv_budget(
         model_config=model_config,
         page_size=page_size,
@@ -312,11 +295,6 @@ def get_sparse_kv_budget(
         prefill_workspace_tokens=prefill_rows * aligned_context,
         max_query_width=max_query_width,
         copy_sfa_query_heads=copy_sfa_query_heads,
-        graph_batch_capacity=max(
-            resident_rows,
-            graph_batch_capacity,
-            get_eager_max_batch_size(resident_rows - 1),
-        ),
     )
 
 

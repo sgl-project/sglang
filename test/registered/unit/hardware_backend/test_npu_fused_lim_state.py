@@ -52,7 +52,6 @@ class TestLIMState(CustomTestCase):
             page_size=128,
             copy_sfa_query_heads=128,
             request_rows=3,
-            graph_batch_capacity=8,
             context_len=32768,
             num_layers=2,
             top_k=2048,
@@ -95,22 +94,21 @@ class TestLIMState(CustomTestCase):
 
     def test_compact_resident_budget_preserves_raw_request_geometry(self):
         options = self.options(resident_rows=3)
-        options.update(request_rows=103, graph_batch_capacity=4)
+        options.update(request_rows=103)
         plan = resolve_sparse_kv_budget(**options)
         self.assertEqual((plan.request_rows, plan.resident_rows), (103, 3))
-        self.assertEqual(plan.batch_capacity, 4)
         self.assertEqual(plan.resident_buffers["device_k_buffer"].shape[0], 3)
         self.assertEqual(plan.resident_buffers["device_v_buffer"].shape[0], 3)
         self.assertEqual(plan.resident_buffers["device_slot_map"].shape[0], 4)
         self.assertEqual(plan.resident_buffers["short_resident_end"].shape, (2, 103))
         self.assertEqual(plan.resident_buffers["request_to_resident"].shape, (103,))
         self.assertEqual(plan.resident_buffers["last_prefix"].shape, (4,))
-        self.assertEqual(plan.adapter_buffers["resident_safe_slots"].shape, (4,))
+        self.assertEqual(plan.adapter_buffers["resident_safe_slots"].shape, (3,))
         options["request_rows"] = 3
         identity = resolve_sparse_kv_budget(**options)
         self.assertNotIn("request_to_resident", identity.resident_buffers)
         self.assertEqual(plan.device_kv_bytes, identity.device_kv_bytes)
-        self.assertEqual(plan.batch_capacity, identity.batch_capacity)
+        self.assertEqual(plan.resident_rows, identity.resident_rows)
 
     def test_optional_prefill_workspace_budget_and_fallback(self):
         base = resolve_sparse_kv_budget(**self.options())
@@ -214,18 +212,15 @@ class TestLIMState(CustomTestCase):
                 later.calculate_pool_sizes(0, 128)
             self.assertIs(later._kvc.sparse_kv_budget_plan, selected)
 
-    def test_graph_padding_grows_scratch_not_request_residency(self):
-        small = resolve_sparse_kv_budget(
-            **{**self.options(), "graph_batch_capacity": 3}
-        )
-        padded = resolve_sparse_kv_budget(**self.options())
-        self.assertEqual(small.device_kv_bytes, padded.device_kv_bytes)
-        self.assertEqual(small.slot_map_bytes, padded.slot_map_bytes)
-        self.assertGreater(padded.adapter_bytes, small.adapter_bytes)
-        self.assertEqual(
-            padded.managed_hbm_bytes - small.managed_hbm_bytes,
-            padded.adapter_bytes - small.adapter_bytes,
-        )
+    def test_batch_size_validation(self):
+        plan = resolve_sparse_kv_budget(**self.options())
+        for mode in ("graph", "eager"):
+            plan.validate_batch_size(2, mode)
+            plan.validate_batch_size(3, mode)
+            with self.assertRaisesRegex(
+                ValueError, f"{mode}.*exceeds.*resident_rows=3"
+            ):
+                plan.validate_batch_size(8, mode)
 
     def test_adapter_budget_matches_actual_dynamic_query_allocations(self):
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
@@ -269,12 +264,12 @@ class TestLIMState(CustomTestCase):
             self.assert_buffers_match(adapter, budget.adapter_buffers)
             self.assertEqual(
                 adapter.query_ends.tolist(),
-                [[i * j for j in range(1, 9)] for i in range(1, width + 1)],
+                [[i * j for j in range(1, 4)] for i in range(1, width + 1)],
             )
             self.assertFalse(hasattr(adapter, "query_scale"))
             self.assertFalse(hasattr(adapter, "key_scale"))
             for indices in (adapter.source_ids, adapter.device_slots):
-                self.assertEqual(indices.shape, (8 * width, 2048))
+                self.assertEqual(indices.shape, (3 * width, 2048))
 
     def test_plan_alignment_and_limits(self):
         for width in (1, 4):
@@ -283,12 +278,12 @@ class TestLIMState(CustomTestCase):
                     options = {
                         **self.options(),
                         "context_len": 4097,
-                        "graph_batch_capacity": batch,
+                        "request_rows": batch,
                         "max_query_width": width,
                     }
                     plan = resolve_sparse_kv_budget(**options)
                     self.assertEqual(plan.context_len, 4224)
-                    self.assertEqual(plan.batch_capacity, batch)
+                    self.assertEqual(plan.resident_rows, batch)
         with self.assertRaises(ValueError):
             resolve_sparse_kv_budget(**self.options(kv_dtype=torch.float32))
 
@@ -330,7 +325,6 @@ class TestLIMState(CustomTestCase):
             kv_bytes_per_token=1152,
             max_query_width=4,
             cache_tokens=8192,
-            graph_batch_capacity=8,
         )
         pool = object.__new__(MLATokenToKVPool)
         pool.size, pool.page_size, pool.layer_num, pool.start_layer = 4096, 128, 2, 0
@@ -402,6 +396,15 @@ class TestLIMState(CustomTestCase):
                 },
             ),
         ):
+            with (
+                patch.object(fused_manager, "get_eager_max_batch_size", return_value=8),
+                patch.object(fused_manager, "ResidentKVPool") as resident_pool,
+                self.assertRaisesRegex(ValueError, "eager.*exceeds.*resident_rows="),
+            ):
+                fused_manager.FusedSparseKVCacheManager(
+                    req_pool, 2048, index_k_pool=pool
+                )
+            resident_pool.assert_not_called()
             manager = fused_manager.FusedSparseKVCacheManager(
                 req_pool, 2048, index_k_pool=pool
             )

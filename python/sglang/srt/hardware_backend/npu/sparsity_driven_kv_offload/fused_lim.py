@@ -55,7 +55,6 @@ class LIMDecodeAdapter:
         self.capacity = budget.cache_tokens
         self.rows = budget.request_rows
         self.resident_rows = budget.resident_rows
-        self.batch_capacity = budget.batch_capacity
         self.max_query_width = budget.max_query_width
         self.last_prefix = last_prefix
         self.request_to_resident = request_to_resident
@@ -69,7 +68,7 @@ class LIMDecodeAdapter:
                         1, self.max_query_width + 1, dtype=spec.dtype, device=device
                     )[:, None]
                     * torch.arange(
-                        1, self.batch_capacity + 1, dtype=spec.dtype, device=device
+                        1, self.resident_rows + 1, dtype=spec.dtype, device=device
                     )[None, :]
                 )
             else:

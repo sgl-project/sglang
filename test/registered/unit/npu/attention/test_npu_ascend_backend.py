@@ -42,6 +42,21 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
 from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
+class TestSparseKVGraphCapacity(unittest.TestCase):
+    def test_graph_batch_is_checked_before_graph_state_allocation(self):
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+            BudgetPlan,
+        )
+
+        plan = BudgetPlan.__new__(BudgetPlan)
+        plan.resident_rows = 3
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_fused_sparse_kv = True
+        backend.sparse_kv_manager = SimpleNamespace(budget=plan)
+        with self.assertRaisesRegex(ValueError, "graph.*exceeds.*resident_rows=3"):
+            backend.init_cuda_graph_state(8, 8)
+
+
 class TestExpandDsaSparseIndices(unittest.TestCase):
     def test_2d_input_adds_unsqueeze(self):
         """A [T, K] tensor becomes [T, 1, K]."""

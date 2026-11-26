@@ -66,7 +66,6 @@ def test_budget_validates_normalized_query_geometry(
     monkeypatch.setattr(
         config, "get_spec", lambda: SimpleNamespace(speculative_num_draft_tokens=width)
     )
-    monkeypatch.setattr(config, "get_eager_max_batch_size", lambda _: 4)
     model = SimpleNamespace(**vars(MODEL_CONFIG))
     model.hf_config = SimpleNamespace(**vars(MODEL_CONFIG.hf_config))
     model.hf_config.index_topk = 2048
@@ -81,7 +80,6 @@ def test_budget_validates_normalized_query_geometry(
             num_layers=2,
             top_k=2048,
             kv_bytes_per_token=1152,
-            graph_batch_capacity=4,
         )
 
     with (
