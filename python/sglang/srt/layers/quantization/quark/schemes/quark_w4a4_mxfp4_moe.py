@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -48,7 +49,7 @@ _is_gfx95 = is_gfx95_supported()
 # This scheme runs only on the AITER runner, so on the arches AITER has an MXFP4
 # MoE layout for, that layout is bound whatever SGLANG_USE_AITER says.
 _use_aiter = _is_hip and (
-    get_bool_env_var("SGLANG_USE_AITER") or _is_gfx95 or is_gfx1250_supported()
+    envs.SGLANG_USE_AITER.get() or _is_gfx95 or is_gfx1250_supported()
 )
 _is_shuffle_moe_mxfp4 = _use_aiter and _is_gfx95
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
