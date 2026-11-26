@@ -427,7 +427,8 @@ class LiveScaleCoordinator:
         from sglang.srt.runtime_context import get_exec
 
         state = ElasticEPStateManager.instance()
-        if state.pending_ep_size is None:
+        # Shrink deadlines and barrier cleanup belong to the shrink state machine.
+        if state.pending_ep_size is None or ElasticEPStateManager.is_shrink_pending():
             return 0
         if self.candidate is None and state.pending_since is not None:
             if (

@@ -15,6 +15,10 @@ import torch.distributed as dist
 from sglang.srt import runtime_context
 from sglang.srt.distributed import utils as distributed_utils
 from sglang.srt.elastic_ep import elastic_ep, live_prepare, live_scale
+from sglang.srt.elastic_ep.scale_down_state import (
+    ScaleDownState,
+    ScaleDownStateMachine,
+)
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.layers.moe.token_dispatcher import nixl
 from sglang.srt.managers import scheduler as scheduler_module
@@ -267,6 +271,60 @@ class TestLiveScale(unittest.TestCase):
         for targets in ([8, 16], [-1, 0], [-2, -1]):
             with self.assertRaises(RuntimeError):
                 coordinator.observe_control_targets(targets)
+
+    def test_shrink_timeout_releases_state_before_retry(self):
+        runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
+        runner.server_args = self.moe
+        runner._elastic_global_rank = lambda: 1
+        runner.decode_cuda_graph_runner = None
+        runner._reset_eplb_after_elastic_scale_failure = Mock()
+        runner._narrow_to_reconciled_width = Mock()
+        runner._report_elastic_scale_failure = Mock()
+        runner._finalize_scale_down = Mock()
+        runner._fail_scale = Mock(wraps=runner._fail_scale)
+        driver = Mock()
+        self.patch(
+            model_runner,
+            ScaleDownDriver=lambda *args: driver,
+            reset_barriers_after_failure=Mock(),
+        )
+        coordinator = self.coordinator()
+        coordinator.runner = runner
+        manager = elastic_ep.ElasticEPStateManager
+        self.state.effective_ep_size = 8
+        self.state.active_ranks.fill_(1)
+        with patch.object(time, "monotonic", return_value=100):
+            self.assertTrue(manager.request_scale(4))
+        handle = object()
+        previous = runner._scale_down_sm = ScaleDownStateMachine(
+            is_retiree=False,
+            target_size=4,
+            effective_size=8,
+            ranks_to_retire=[4, 5, 6, 7],
+            my_global_rank=1,
+            state=ScaleDownState.DRAIN,
+            _drain_barrier_handle=handle,
+        )
+        # The deadline crosses between the shrink tick and the DP target gather.
+        with patch.object(time, "monotonic", return_value=103):
+            target = coordinator.local_control_target()
+            self.assertEqual(target, 0)
+            coordinator.observe_control_targets([target] * 8)
+            coordinator.tick()
+            runner._fail_scale.assert_not_called()
+            self.assertEqual(self.state.pending_ep_size, 4)
+
+            runner.maybe_retire_ep_ranks()
+            runner._fail_scale.assert_called_once()
+            driver.consume_barrier.assert_called_once_with(handle)
+            self.assertIsNone(runner._scale_down_sm)
+            self.assertIsNone(self.state.pending_ep_size)
+
+            self.assertTrue(manager.request_scale(6))
+            runner.maybe_retire_ep_ranks()
+        self.assertIsNot(runner._scale_down_sm, previous)
+        self.assertEqual(runner._scale_down_sm.target_size, 6)
+        self.assertEqual(runner._scale_down_sm.ranks_to_retire, [6, 7])
 
     def test_preparation_readiness_uses_collective_vote(self):
         coordinator = self.coordinator()
