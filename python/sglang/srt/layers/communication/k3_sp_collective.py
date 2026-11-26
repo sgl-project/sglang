@@ -487,8 +487,10 @@ def attn_res_all_gather(
 
 # Measured on GB300 TP8 at 16K rows; re-tune when the kernels change.
 _SP_RS_BLOCKS = 96
-# A low-SM launch for a reduce-scatter that overlaps GEMMs on another stream.
-SP_RS_OVERLAP_BLOCKS = 16
+# A low-SM launch for a reduce-scatter that overlaps GEMMs on another stream. At
+# most 8 blocks: the routed experts' cooperative routing kernel takes all but 8
+# SMs and cannot start beside a kernel that holds more.
+SP_RS_OVERLAP_BLOCKS = 8
 _SP_AG_BLOCKS = 32
 _SP_BLOCK_SIZE = 1024
 
