@@ -30,10 +30,10 @@ from sglang.srt.layers.moe.utils import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.runtime_context import get_lora, get_parallel
-from sglang.srt.utils.device import get_device
+from sglang.srt.utils.device import get_device, is_hip
 
 _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
-_MASK_DP_PAD_TOPK_HIP = _is_hip and _envs.SGLANG_HIP_DP_MASK_PAD_TOPK.get()
+_MASK_DP_PAD_TOPK_HIP = is_hip() and _envs.SGLANG_HIP_DP_MASK_PAD_TOPK.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.utils import MoeRunnerBackendLike
