@@ -49,6 +49,7 @@ class TestRustServerIdleSleep(unittest.TestCase):
                 )
                 scheduler.pause_state = PauseState()
                 scheduler.idle_sleeper = None
+                scheduler.input_blocker = None
                 with (
                     get_context().override_server_args(sleep_on_idle=sleep_on_idle),
                     envs.SGLANG_RUST_SERVER.override(True),
