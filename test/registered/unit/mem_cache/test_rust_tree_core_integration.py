@@ -3124,7 +3124,7 @@ def _swa_cache(
         ServerArgs(model_path="dummy", page_size=page_size)
     )
     req_to_token_pool = ReqToTokenPool(
-        size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+        size=4, row_width=64, device="cpu", enable_memory_saver=False
     )
     kv_pool = SWAKVPool(
         size=64,
@@ -6159,7 +6159,7 @@ def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
     # release_kv_cache reads the serving config off the published bags.
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
     req_to_token_pool = ReqToTokenPool(
-        size=2, max_context_len=16, device="cpu", enable_memory_saver=False
+        size=2, row_width=16, device="cpu", enable_memory_saver=False
     )
     allocator = TokenToKVPoolAllocator(
         size=16, dtype=torch.float32, device="cpu", kvcache=None, need_sort=False
