@@ -87,7 +87,7 @@ def _metadata(manager_type, endpoint, prompt_fingerprint):
     decode = manager_type.__new__(manager_type)
     decode.local_ip, decode.rank_port = endpoint
     decode.agent = SimpleNamespace(name=f"agent-{endpoint[1]}")
-    decode.engine = SimpleNamespace(get_session_id=lambda: f"session-{endpoint[1]}")
+    decode.transport = SimpleNamespace(session_id=f"session-{endpoint[1]}")
     return decode.build_receiver_metadata_message(
         bootstrap_room=ROOM,
         required_dst_info_num=1,
